@@ -4,9 +4,7 @@ import { useState } from "react";
 import { BentoGrid, BentoItem } from "@/components/sieve/shell/bento-grid";
 import type { CardState } from "@/components/sieve/shell/card";
 import { Page } from "@/components/sieve/shell/page";
-import { StatusChip } from "@/components/sieve/shell/status-chip";
 import type { SieveState } from "@/core/store";
-import { useRuntime } from "@/hooks/sieve-provider";
 import { useSetting, useSieve } from "@/hooks/use-sieve";
 import { ChartCard } from "./chart-card";
 import { Heatmap } from "./heatmap";
@@ -22,11 +20,13 @@ const selectError = (s: SieveState) => s.status.error;
 /**
  * Home: what apps are talking right now. Row 1 is the live per-app chart
  * (two thirds) and the 2 x 2 KPI block; row 2 is the top apps list and the
- * hour x weekday heatmap. At 1280 and wider the two rows share the window
- * height, so everything fits at 1280 x 800 without scrolling.
+ * hour x weekday heatmap. At 1280 and wider the two rows share the height
+ * left under the header (Page fill) and the paused banner sits inside the
+ * header row (Page notice), so everything fits at 1280 x 800 without
+ * scrolling, paused or not. Sampling status lives once,
+ * in the top bar chip; the header carries only the pause pill.
  */
 export function HomeScreen() {
-  const { source } = useRuntime();
   const [choice, setChoice] = useState<WindowChoice>("5m");
   useDeclaredWindow(choice);
   const view = useViewMs(choice);
@@ -53,17 +53,8 @@ export function HomeScreen() {
     heat.kind === "ready" ? { kind: "ready" } : heat.kind === "loading" ? { kind: "loading" } : { kind: "error", message: heat.message };
 
   return (
-    <Page
-      title="Sieving now"
-      action={
-        <>
-          <StatusChip announce={false} />
-          <PausePill />
-        </>
-      }
-    >
-      <HomeBanner />
-      <BentoGrid className="three:h-[max(40rem,calc(100dvh-var(--topbar-h)-var(--page-header-h)-var(--page-pad)))] three:grid-rows-[repeat(2,minmax(0,1fr))]">
+    <Page title="Sieving now" action={<PausePill />} notice={<HomeBanner />} fill>
+      <BentoGrid className="three:min-h-[34rem] three:flex-1 three:grid-rows-[repeat(2,minmax(0,1fr))]">
         <BentoItem span="two-thirds" className="min-h-0">
           <ChartCard model={model} choice={choice} onChoice={setChoice} base={chartBase} />
         </BentoItem>
@@ -76,7 +67,7 @@ export function HomeScreen() {
         <BentoItem span="two-thirds" className="min-h-0">
           <Heatmap
             grid={heat.kind === "ready" ? heat.grid : null}
-            caption={source.kind === "tauri" ? "Since Sieve started" : "Last 4 weeks"}
+            caption={heat.kind === "ready" ? heat.caption : ""}
             base={heatBase}
           />
         </BentoItem>

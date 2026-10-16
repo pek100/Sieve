@@ -10,7 +10,7 @@ import type { SeriesDef, SeriesModel } from "@/core/series";
 import { cn } from "@/lib/utils";
 import { ActivityChart } from "./activity-chart";
 import { seriesTone } from "./series-tone";
-import { WINDOWS, type WindowChoice } from "./use-home";
+import { WINDOWS, windowMs, type WindowChoice } from "./use-home";
 
 /** Legend chips double as toggles: off shows a hollow swatch and a muted label. */
 export function ChartLegend({
@@ -111,7 +111,14 @@ export function ChartCard({
     >
       <div className="flex min-h-0 flex-1 flex-col gap-3">
         <ChartLegend series={model.series} hidden={hidden} onToggle={toggle} />
-        <ActivityChart key={model.windowMs} model={model} hidden={hidden} className="h-44 three:h-auto three:flex-1" />
+        {/* Keyed by the window choice only: a view step on a live tick rescales the same paths. */}
+        <ActivityChart
+          key={choice}
+          model={model}
+          baseMs={windowMs(choice)}
+          hidden={hidden}
+          className="h-44 three:h-auto three:flex-1"
+        />
       </div>
     </Card>
   );

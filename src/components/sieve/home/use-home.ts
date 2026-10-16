@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { heatGrid, type HeatGrid } from "@/core/heat";
+import { heatCaption, heatGrid, type HeatGrid } from "@/core/heat";
 import { kpis, type Kpi } from "@/core/kpis";
 import { effectiveLevel, requestedLevel, type Level } from "@/core/policy";
 import { createSlotKeeper, windowSnapshots, type SeriesModel } from "@/core/series";
@@ -22,28 +22,34 @@ export function windowMs(choice: WindowChoice): number {
   return WINDOWS.find((w) => w.value === choice)?.ms ?? WINDOWS[0].ms;
 }
 
+/** The shortest span the chart shows, in samples: below this a view is mostly noise. */
+export const MIN_VIEW_SAMPLES = 16;
+
 /**
- * The span the chart shows: the data kept so far, rounded up to a step
- * (a fifth of the window, at most 5 minutes) and capped at the window. Right
- * after start the chart is therefore never a sliver at the right edge, and
- * the x scale changes once per step, not on every tick.
+ * The span the chart shows: the window halved as often as the data kept so
+ * far still fits, but never below MIN_VIEW_SAMPLES intervals. Past that floor
+ * the data always fills at least half the plot, so right after start the
+ * chart is never a sliver at the right edge. The x scale changes only when
+ * the span doubles, and the chart animates that as a rescale of the same
+ * paths (see activity-chart.tsx).
  */
-export function viewMs(choice: WindowChoice, dataSpanMs: number): number {
-  const cap = windowMs(choice);
-  const step = Math.min(cap / 5, 5 * 60_000);
-  return Math.min(cap, Math.max(step, Math.ceil(dataSpanMs / step) * step));
+export function viewMs(choice: WindowChoice, dataSpanMs: number, intervalMs = 1000): number {
+  const floor = MIN_VIEW_SAMPLES * Math.max(1, intervalMs);
+  let v = windowMs(choice);
+  while (v / 2 >= dataSpanMs && v / 2 >= floor) v /= 2;
+  return v;
 }
 
 const selectSpan = (s: SieveState) => (s.snapshots.length ? s.snapshots[s.snapshots.length - 1].t - s.snapshots[0].t : 0);
+const selectSnapshots = (s: SieveState) => s.snapshots;
+const selectInterval = (s: SieveState) => s.intervalMs;
 
 /** The chart and KPI span for a window choice. */
 export function useViewMs(choice: WindowChoice): number {
   const span = useSieve(selectSpan);
-  return viewMs(choice, span);
+  const intervalMs = useSieve(selectInterval);
+  return viewMs(choice, span, intervalMs);
 }
-
-const selectSnapshots = (s: SieveState) => s.snapshots;
-const selectInterval = (s: SieveState) => s.intervalMs;
 
 /** Declare the window to the store (sizes the ring) for as long as Home shows it. */
 export function useDeclaredWindow(choice: WindowChoice) {
@@ -75,13 +81,13 @@ export function useKpis(ms: number): Kpi[] | null {
 
 export type HistoryState =
   | { kind: "loading" }
-  | { kind: "ready"; grid: HeatGrid }
+  | { kind: "ready"; grid: HeatGrid; caption: string }
   | { kind: "error"; message: string };
 
 const DAY = 86_400_000;
 const HISTORY_REFRESH_MS = 60_000;
 
-/** Four weeks of hourly activity from the source, refreshed every minute. */
+/** Up to four weeks of hourly activity from the source, refreshed every minute; the caption says how far back it goes. */
 export function useHeat(): HistoryState {
   const { source } = useRuntime();
   const [state, setState] = useState<HistoryState>({ kind: "loading" });
@@ -89,8 +95,13 @@ export function useHeat(): HistoryState {
     let alive = true;
     const load = () => {
       const to = Date.now();
-      source.history({ from: to - 28 * DAY, to }).then(
-        (b) => alive && setState({ kind: "ready", grid: heatGrid(b) }),
+      const range = { from: to - 28 * DAY, to };
+      source.history(range).then(
+        (b) => {
+          if (!alive) return;
+          const grid = heatGrid(b);
+          setState({ kind: "ready", grid, caption: heatCaption(grid, range) });
+        },
         (e: unknown) => alive && setState({ kind: "error", message: e instanceof Error ? e.message : String(e) }),
       );
     };

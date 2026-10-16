@@ -42,8 +42,8 @@ export function PausePill() {
     banner.current = notices.push({
       kind: "info",
       surface: "banner",
+      // No action: Resume is the pill itself, one control for one job.
       text: `Sampling is paused${until === null ? "" : ` until ${clock(until)}`}. The chart and counts hold their last values.`,
-      action: { label: "Resume now", run: () => poller.resume() },
     });
   };
 

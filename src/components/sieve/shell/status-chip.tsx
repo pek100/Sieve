@@ -25,9 +25,9 @@ function clock(ms: number): string {
 }
 
 /**
- * Status chip with a live dot. Text says what sampling is doing; colour is never the only signal.
- * `announce` (default true) makes it the polite live region; a second copy on a screen passes
- * false so screen readers hear each change once.
+ * Status chip with a live dot. Text says what sampling is doing at every width (one word under
+ * 480 px); colour is never the only signal. `announce` (default true) makes it the polite live
+ * region. One chip per window: it lives in the top bar.
  */
 export function StatusChip({ className, announce = true }: { className?: string; announce?: boolean }) {
   const p = useSieve(phase);
@@ -49,7 +49,11 @@ export function StatusChip({ className, announce = true }: { className?: string;
         {p === "live" && <span className="absolute inset-0 animate-ping rounded-full bg-primary opacity-60 motion-reduce:hidden" />}
         <span className={cn("relative inline-flex size-2 rounded-full", DOT[p])} />
       </span>
+      {/* Narrow windows get the one-word phase, so the dot is never the only visible signal. */}
       <span className="max-[480px]:sr-only">{text}</span>
+      <span aria-hidden="true" data-short="" className="hidden max-[480px]:inline">
+        {COPY[p]}
+      </span>
     </span>
   );
 }

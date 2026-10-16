@@ -6,13 +6,13 @@ import { Button } from "@/components/ui/button";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useNotices } from "@/hooks/use-sieve";
 
-/** The Home banner slot: renders notices pushed with surface "banner" (B7). */
+/** The Home banner slot: renders notices pushed with surface "banner" (B7). Mounted in Page's `notice` slot. */
 export function HomeBanner() {
   const { notices } = useRuntime();
   const banners = useNotices().filter((n) => n.surface === "banner");
   if (banners.length === 0) return null;
   return (
-    <div className="flex flex-col gap-2 pb-4">
+    <div className="flex flex-col gap-2">
       {banners.map((n) => (
         <div
           key={n.id}

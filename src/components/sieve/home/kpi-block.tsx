@@ -12,7 +12,8 @@ import { useTicker } from "./use-home";
 /** Labels name connections, hosts or ports, never anything Sieve is not doing. */
 export const KPI_COPY: Record<KpiId, { label: string; icon: ReactNode; tone: IconTileTone }> = {
   // The one accent container tile on Home.
-  apps: { label: "Apps with connections", icon: <AppWindow strokeWidth={1.75} />, tone: "mint" },
+  // Counts apps sieved now (level watch or sieve, with an active connection), not every app online.
+  apps: { label: "Sieved apps with connections", icon: <AppWindow strokeWidth={1.75} />, tone: "mint" },
   connections: { label: "Active connections", icon: <Cable strokeWidth={1.75} />, tone: "neutral" },
   hosts: { label: "Remote hosts", icon: <Globe strokeWidth={1.75} />, tone: "neutral" },
   ports: { label: "Listening ports", icon: <RadioTower strokeWidth={1.75} />, tone: "neutral" },

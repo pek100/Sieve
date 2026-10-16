@@ -61,6 +61,14 @@ test.describe("home", () => {
     expect(Math.abs(chart.y - kpis.y)).toBeLessThan(2);
     expect(chart.width).toBeGreaterThan(kpis.width * 1.8);
 
+    // First minute: the data already spans a good part of the plot, not a sliver at the right edge.
+    const fill = await r.chart.evaluate((el) => {
+      const plot = el.querySelector("svg[data-chart-plot]")!.getBoundingClientRect();
+      const line = el.querySelector('path[data-part="line"]')!.getBoundingClientRect();
+      return line.width / plot.width;
+    });
+    expect(fill).toBeGreaterThan(0.3);
+
     await page.screenshot({ path: "test-results/screens/home-desktop.png" });
     expect(errors).toEqual([]);
   });
@@ -123,7 +131,31 @@ test.describe("home", () => {
     await expect(status).toHaveAttribute("data-phase", "paused");
     await expect(status).toContainText(/Paused until \d/);
     await expect(page.getByRole("note")).toContainText("Sampling is paused until");
+    // Resume is one control, and the status shows once per window (top bar).
+    await expect(page.getByRole("button", { name: /resume/i })).toHaveCount(1);
+    await expect(page.locator("[data-phase]")).toHaveCount(1);
+    // The chip says the phase in words at every width, not only by its dot colour.
+    await expect(status.locator("span:visible", { hasText: /Paused/ }).first()).toBeVisible();
+    // ...and the wider chip does not slide under the nav.
+    const nav = (await page.getByRole("navigation", { name: "Main" }).boundingBox())!;
+    const chip = (await status.boundingBox())!;
+    expect(chip.x).toBeGreaterThanOrEqual(nav.x + nav.width);
     await page.screenshot({ path: `test-results/screens/home-paused-${info.project.name}.png` });
+    if (info.project.name === "desktop") {
+      // The banner takes its height from the grid, not from the window: still no scroll at 1280x800.
+      const dims = await page.evaluate(() => ({ sh: document.documentElement.scrollHeight, ih: window.innerHeight }));
+      expect(dims.sh).toBeLessThanOrEqual(dims.ih);
+      for (const loc of [regions(page).heat, regions(page).top, regions(page).chart]) {
+        const b = (await loc.boundingBox())!;
+        expect(b.y + b.height).toBeLessThanOrEqual(800);
+      }
+      // No KPI number is clipped by its tile.
+      for (const tile of await page.locator("section[data-kpi]").all()) {
+        const t = (await tile.boundingBox())!;
+        const n = (await tile.locator("[data-numeric]").boundingBox())!;
+        expect(n.y + n.height).toBeLessThanOrEqual(t.y + t.height);
+      }
+    }
 
     // Paused means no new samples: the newest bucket stays put.
     const d1 = await page.locator('path[data-part="line"]').first().getAttribute("d");

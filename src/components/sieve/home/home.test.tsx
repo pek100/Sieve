@@ -8,7 +8,7 @@ import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { HomeScreen } from "./home-screen";
-import { viewMs } from "./use-home";
+import { MIN_VIEW_SAMPLES, viewMs, WINDOWS } from "./use-home";
 
 /** Manual clock: timers fire only when the test advances time (same idea as poller.test.ts). */
 function fakeClock(start = 1_760_000_000_000) {
@@ -44,7 +44,6 @@ function fakeClock(start = 1_760_000_000_000) {
   };
 }
 
-// 45 s keeps the 5 min chart inside its first 1 minute view step, so one more tick does not rescale it.
 async function setup(scenario: "steady" | "empty" | "error" = "steady", seconds = 45) {
   const fc = fakeClock();
   const source = createMockSource({ seed: 1, scenario, now: fc.clock.now });
@@ -70,11 +69,24 @@ const legendChips = () => within(within(chart()).getByRole("list", { name: "Seri
 const ys = (d: string) => d.slice(1).split("L").map((pt) => Number(pt.trim().split(" ")[1]));
 
 describe("chart view span", () => {
-  it("grows in steps of a fifth of the window (at most 5 min) and stops at the window", () => {
-    const m = 60_000;
-    expect([0, 30_000, m, m + 1, 4.5 * m, 9 * m].map((s) => viewMs("5m", s) / m)).toEqual([1, 1, 1, 2, 5, 5]);
-    expect([0, 7 * m, 70 * m].map((s) => viewMs("1h", s) / m)).toEqual([5, 10, 60]);
-    expect([0, 61 * m, 500 * m].map((s) => viewMs("session", s) / m)).toEqual([5, 65, 120]);
+  it("doubles as data accumulates, from a floor of MIN_VIEW_SAMPLES intervals up to the window", () => {
+    const s = 1000;
+    expect([0, 8 * s, 18 * s, 19 * s, 40 * s, 299 * s, 900 * s].map((x) => viewMs("5m", x) / s)).toEqual([
+      18.75, 18.75, 18.75, 37.5, 75, 300, 300,
+    ]);
+    // A slower interval raises the floor.
+    expect(viewMs("5m", 0, 5000)).toBe(300_000 / 2);
+  });
+
+  it("past the floor the data fills at least half the plot, for every window", () => {
+    for (const w of WINDOWS) {
+      for (let span = 0; span <= w.ms * 1.5; span += 7_919) {
+        const v = viewMs(w.value, span);
+        expect(v).toBeLessThanOrEqual(w.ms);
+        expect(v).toBeGreaterThanOrEqual(MIN_VIEW_SAMPLES * 1000);
+        if (v > MIN_VIEW_SAMPLES * 1000 * 2 && v < w.ms) expect(span / v).toBeGreaterThan(0.5);
+      }
+    }
   });
 });
 
@@ -132,6 +144,32 @@ describe("home chart", () => {
     // The tick moved the bucket times, so the plot slides instead of morphing.
     expect(svg).toHaveAttribute("data-sliding");
   });
+
+  it("ticks across view steps keep every path node; the step only rescales the plot group", async () => {
+    // From 10 s to 45 s the 5 min view doubles twice (18.75 s, 37.5 s, 75 s).
+    const { fc } = await setup("steady", 10);
+    const scales = new Set<string>();
+    const scaleNow = () => chart().querySelector("g[data-slide]")!.getAttribute("data-scale")!;
+    scales.add(scaleNow());
+    for (let i = 0; i < 35; i++) {
+      const before = new Map(areas().map((p) => [p.dataset.series!, p]));
+      const lineBefore = new Map(
+        [...chart().querySelectorAll<SVGPathElement>('path[data-part="line"]')].map((p) => [p.dataset.series!, p]),
+      );
+      await act(() => fc.advance(1000));
+      for (const p of areas()) {
+        const old = before.get(p.dataset.series!);
+        if (old) expect(p).toBe(old);
+      }
+      for (const p of chart().querySelectorAll<SVGPathElement>('path[data-part="line"]')) {
+        const old = lineBefore.get(p.dataset.series!);
+        if (old) expect(p).toBe(old);
+      }
+      scales.add(scaleNow());
+    }
+    // 300 / 18.75, 300 / 37.5, 300 / 75: the steps happened, as transform changes on the same nodes.
+    expect([...scales]).toEqual(["16", "8", "4"]);
+  });
 });
 
 describe("home copy and KPIs", () => {
@@ -141,6 +179,11 @@ describe("home copy and KPIs", () => {
     const tiles = screen.getByRole("group", { name: "Right now" }).querySelectorAll("section[data-kpi]");
     expect(tiles).toHaveLength(4);
     for (const t of tiles) expect(t.getAttribute("aria-label")).toMatch(/connections|hosts|ports/i);
+    // The apps count is isSieved (level watch or sieve), and its label says so.
+    expect(screen.getByRole("group", { name: "Right now" }).querySelector('section[data-kpi="apps"]')).toHaveAttribute(
+      "aria-label",
+      expect.stringMatching(/^Sieved apps/),
+    );
     // Numbers are shown, with a delta chip each.
     expect(within(tiles[1] as HTMLElement).getByText(/^\d+$/)).toBeInTheDocument();
     expect(tiles[1].querySelector("[data-dir]")).not.toBeNull();
@@ -172,8 +215,10 @@ describe("home pause", () => {
     await userEvent.click(await screen.findByRole("menuitem", { name: "For 15 minutes" }));
     const st = runtime.store.getState().status;
     expect(st.pausedUntil).not.toBeNull();
-    expect(screen.getAllByText(/^Paused until/).length).toBeGreaterThan(0);
     expect(screen.getByRole("note")).toHaveTextContent(/Sampling is paused until/);
+    // One control per job: Resume is the pill only, and the status chip lives in the top bar, not on Home.
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
+    expect(document.querySelectorAll("[data-phase]")).toHaveLength(0);
 
     await userEvent.click(screen.getByRole("button", { name: "Resume" }));
     expect(runtime.store.getState().status.pausedUntil).toBeNull();

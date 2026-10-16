@@ -11,9 +11,14 @@ import { seriesTone } from "./series-tone";
  * Hand-drawn SVG rather than Recharts: Recharts remounts its area paths on
  * every data change, and Home needs live ticks that keep the same path nodes
  * and never re-grow from zero. How it moves:
- * - x is absolute time from a fixed origin, and the plot group slides left by
- *   one bucket per tick (transform transition, --motion-chart). Existing
- *   vertices keep their coordinates, so a tick appends and slides.
+ * - x is absolute time from a fixed origin in units of the whole window
+ *   (`baseMs` spans W). The view span (`model.windowMs`, which doubles as data
+ *   accumulates) lives only in the plot group's transform: translateX slides
+ *   the newest bucket to the right edge, scaleX stretches baseMs onto the view.
+ *   A tick appends a vertex and slides; a view step changes the scale in the
+ *   same transform transition (--motion-chart). Existing vertices keep their
+ *   coordinates either way, and the parent keys this component by the window
+ *   choice only, so no live tick remounts it.
  * - When the bucket times did not change (a series toggled, the open bucket
  *   of a long window updated) the path `d` morphs over --motion-chart instead.
  * - The first render draws the data as is. Reduced motion sets
@@ -24,34 +29,47 @@ const W = 1000;
 const H = 200;
 
 const fmt1 = (x: number) => (Math.round(x * 10) / 10).toString();
+/** x keeps three decimals: the group can scale it up to baseMs / view (about 100x for Session). */
+const fmtX = (x: number) => (Math.round(x * 1000) / 1000).toString();
 
 function clock(ms: number, seconds = false): string {
   return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: seconds ? "2-digit" : undefined });
 }
 
+/** The plot group's transform: newest bucket at the right edge, baseMs stretched onto the view span. */
+export function plotTransform(lastT: number, origin: number, baseMs: number, viewMs: number): { tx: number; scale: number } {
+  const scale = baseMs / viewMs;
+  return { tx: W - (lastT - origin) * (W / baseMs) * scale, scale };
+}
+
 export function ActivityChart({
   model,
+  baseMs,
   hidden,
   className,
 }: {
   model: SeriesModel;
+  /** The window choice's full span: the x unit, fixed for this mount. */
+  baseMs: number;
   hidden: ReadonlySet<string>;
   className?: string;
 }) {
   const { layers, max } = useMemo(() => stackSeries(model, hidden), [model, hidden]);
   const pts = model.points;
   const lastT = pts.length ? pts[pts.length - 1].t : 0;
-  // Fixed per mount; the parent keys this component by the window length.
-  const [origin] = useState(lastT);
+  // Fixed once the first data arrives, for the life of this mount.
+  const [fixedOrigin, setOrigin] = useState<number | null>(pts.length ? lastT : null);
+  if (fixedOrigin === null && pts.length) setOrigin(lastT);
+  const origin = fixedOrigin ?? lastT;
   const yMax = niceCeiling(max);
-  const kx = W / model.windowMs;
+  const kx = W / baseMs;
   const xs = pts.map((p) => (p.t - origin) * kx);
-  const shift = (lastT - origin) * kx - W;
+  const { tx, scale } = plotTransform(lastT, origin, baseMs, model.windowMs);
   const y = (v: number) => H - (v / yMax) * H;
 
   const paths = layers.map((l) => {
-    const upper = xs.map((x, j) => `${fmt1(x)} ${fmt1(y(l.upper[j]))}`);
-    const lower = xs.map((x, j) => `${fmt1(x)} ${fmt1(y(l.lower[j]))}`).reverse();
+    const upper = xs.map((x, j) => `${fmtX(x)} ${fmt1(y(l.upper[j]))}`);
+    const lower = xs.map((x, j) => `${fmtX(x)} ${fmt1(y(l.lower[j]))}`).reverse();
     return {
       key: l.key,
       area: `M${upper.join("L")}L${lower.join("L")}Z`,
@@ -119,7 +137,8 @@ export function ActivityChart({
           <g
             data-slide=""
             className="transition-transform duration-(--motion-chart) ease-linear"
-            style={{ transform: `translateX(${fmt1(-shift)}px)` }}
+            data-scale={fmtX(scale)}
+            style={{ transform: `translateX(${fmtX(tx)}px) scaleX(${fmtX(scale)})`, transformOrigin: "0 0" }}
           >
             {paths.map((p) => {
               const tone = seriesTone(model.series.find((s) => s.key === p.key)?.slot ?? 0);
