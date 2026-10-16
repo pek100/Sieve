@@ -2812,6 +2812,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-store",
  "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]
