@@ -8,6 +8,7 @@ import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { HomeScreen } from "./home-screen";
+import { viewMs } from "./use-home";
 
 /** Manual clock: timers fire only when the test advances time (same idea as poller.test.ts). */
 function fakeClock(start = 1_760_000_000_000) {
@@ -43,7 +44,8 @@ function fakeClock(start = 1_760_000_000_000) {
   };
 }
 
-async function setup(scenario: "steady" | "empty" | "error" = "steady", seconds = 60) {
+// 45 s keeps the 5 min chart inside its first 1 minute view step, so one more tick does not rescale it.
+async function setup(scenario: "steady" | "empty" | "error" = "steady", seconds = 45) {
   const fc = fakeClock();
   const source = createMockSource({ seed: 1, scenario, now: fc.clock.now });
   const runtime = createRuntime({ source, settings: memoryBackend(), clock: fc.clock });
@@ -66,6 +68,15 @@ const legendChips = () => within(within(chart()).getByRole("list", { name: "Seri
 
 /** Upper-edge y values of a line path ("M x y L x y ..."). */
 const ys = (d: string) => d.slice(1).split("L").map((pt) => Number(pt.trim().split(" ")[1]));
+
+describe("chart view span", () => {
+  it("grows in steps of a fifth of the window (at most 5 min) and stops at the window", () => {
+    const m = 60_000;
+    expect([0, 30_000, m, m + 1, 4.5 * m, 9 * m].map((s) => viewMs("5m", s) / m)).toEqual([1, 1, 1, 2, 5, 5]);
+    expect([0, 7 * m, 70 * m].map((s) => viewMs("1h", s) / m)).toEqual([5, 10, 60]);
+    expect([0, 61 * m, 500 * m].map((s) => viewMs("session", s) / m)).toEqual([5, 65, 120]);
+  });
+});
 
 describe("home chart", () => {
   it("shows at most 6 named series plus Other; toggling a legend chip removes it and restacks", async () => {

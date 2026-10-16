@@ -49,7 +49,8 @@ export function Card({
     >
       <header className="flex min-h-10 flex-wrap items-center gap-3">
         {icon && <IconTile tone={tone}>{icon}</IconTile>}
-        <h2 className="min-w-0 flex-1 truncate text-title">{title}</h2>
+        {/* flex-auto (basis = text width) so a header too narrow for title and action wraps the action to a second line */}
+        <h2 className="min-w-0 flex-auto truncate text-title">{title}</h2>
         {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
       </header>
       <CardBoundary title={title}>

@@ -65,7 +65,7 @@ function Tile({ id, kpi, phase }: { id: KpiId; kpi: Kpi | null; phase: "loading"
         {phase === "ready" && kpi && <DeltaChip delta={kpi.delta} dir={kpi.dir} onAccent={accent} />}
       </div>
       <div className="flex min-w-0 flex-col gap-1">
-        <p className={cn("truncate text-label", accent ? "text-on-mint-container" : "text-on-surface-muted")}>{copy.label}</p>
+        <p className={cn("text-label",accent ? "text-on-mint-container" : "text-on-surface-muted")}>{copy.label}</p>
         {phase === "loading" ? (
           <Skeleton className="h-8 w-16" />
         ) : phase === "error" || !kpi ? (

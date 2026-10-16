@@ -22,16 +22,16 @@ export function windowMs(choice: WindowChoice): number {
   return WINDOWS.find((w) => w.value === choice)?.ms ?? WINDOWS[0].ms;
 }
 
-const VIEW_STEP_MS = 5 * 60_000;
-
 /**
- * The span the chart shows. Fixed windows show their length; Session shows
- * the data kept so far, rounded up to 5 minutes (so the scale changes once
- * every 5 minutes, not every tick), up to SESSION_MAX_MS.
+ * The span the chart shows: the data kept so far, rounded up to a step
+ * (a fifth of the window, at most 5 minutes) and capped at the window. Right
+ * after start the chart is therefore never a sliver at the right edge, and
+ * the x scale changes once per step, not on every tick.
  */
 export function viewMs(choice: WindowChoice, dataSpanMs: number): number {
-  if (choice !== "session") return windowMs(choice);
-  return Math.min(SESSION_MAX_MS, Math.max(VIEW_STEP_MS, Math.ceil(dataSpanMs / VIEW_STEP_MS) * VIEW_STEP_MS));
+  const cap = windowMs(choice);
+  const step = Math.min(cap / 5, 5 * 60_000);
+  return Math.min(cap, Math.max(step, Math.ceil(dataSpanMs / step) * step));
 }
 
 const selectSpan = (s: SieveState) => (s.snapshots.length ? s.snapshots[s.snapshots.length - 1].t - s.snapshots[0].t : 0);
