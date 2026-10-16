@@ -47,9 +47,10 @@ export function Card({
         className,
       )}
     >
-      <header className="flex min-h-10 items-center gap-3">
+      <header className="flex min-h-10 flex-wrap items-center gap-3">
         {icon && <IconTile tone={tone}>{icon}</IconTile>}
-        <h2 className="min-w-0 flex-1 truncate text-title">{title}</h2>
+        {/* flex-auto (basis = text width) so a header too narrow for title and action wraps the action to a second line */}
+        <h2 className="min-w-0 flex-auto truncate text-title">{title}</h2>
         {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
       </header>
       <CardBoundary title={title}>
@@ -91,7 +92,8 @@ export function CardError({ message }: { message: string }) {
   );
 }
 
-class CardBoundary extends Component<{ title: string; children: ReactNode }, { error: Error | null }> {
+/** The per-card error boundary, for blocks that are not a single Card (the Home KPI tiles). */
+export class CardBoundary extends Component<{ title: string; children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null };
 
   static getDerivedStateFromError(error: Error) {

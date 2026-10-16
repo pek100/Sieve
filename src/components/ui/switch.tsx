@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { cn } from "cn"
+import { cn } from "@/lib/utils"
 import { Switch as SwitchPrimitive } from "radix-ui"
 
 // Sieve: Material 3 style switch. Track 44x24 (sm 36x20), thumb grows when on.

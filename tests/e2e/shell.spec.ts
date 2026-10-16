@@ -13,7 +13,7 @@ test.describe("shell", () => {
     await expect(page.getByRole("link", { name: "Home" })).toHaveAttribute("aria-current", "page");
     await expect(page.getByRole("switch", { name: "Sieving" })).toBeChecked();
     await expect(page.getByRole("status")).toHaveAttribute("data-phase", "live");
-    await expect(page.getByRole("heading", { level: 1 })).toHaveText("Home");
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText("Sieving now");
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 
     await page.screenshot({ path: `test-results/screens/shell-${info.project.name}.png`, fullPage: true });
