@@ -4,6 +4,7 @@
  * which sockets they own. Changing the shape bumps PROTOCOL_VERSION and the
  * fixture (src/data/fixtures/snapshot-v1.json) in the same commit.
  */
+import { GRAIN_NAMES, type GrainName } from "@/core/history";
 
 export const PROTOCOL_VERSION = 1 as const;
 
@@ -105,6 +106,61 @@ function endpoint(x: unknown, where: string): Endpoint {
   const port = int(x.port, `${where}.port`);
   if (port > 65535) throw new ProtocolError(`${where}.port out of range`);
   return { addr: str(x.addr, `${where}.addr`), port };
+}
+
+// ---------------------------------------------------------------------------
+// Persisted history (plan row 77). Mirror of History in protocol.rs; fixture
+// src/data/fixtures/history-v1.json. Grain names and retention live in
+// src/core/history.ts (GRAINS).
+
+/** One sample folded into history: what the Tauri source sends after each sample. */
+export interface HistoryRecord {
+  t: number;
+  apps: { app: string; name: string; flows: number }[];
+}
+
+/** How many samples a bucket holds. A bucket with no samples is absent: no data, not zero. */
+export interface SampleBucket {
+  t: number;
+  n: number;
+}
+
+/** Active flows of one app summed over a bucket's samples. Absent in a sampled bucket means 0. */
+export interface AppBucket {
+  t: number;
+  app: string;
+  name: string;
+  flows: number;
+}
+
+export interface History {
+  v: typeof PROTOCOL_VERSION;
+  grain: GrainName;
+  step: number;
+  /** Oldest first. */
+  samples: SampleBucket[];
+  /** Oldest first, then by app key. */
+  apps: AppBucket[];
+}
+
+/** Validate an untrusted value as v1 History. Throws ProtocolError. */
+export function parseHistory(x: unknown): History {
+  if (!isRec(x)) throw new ProtocolError("history must be an object");
+  if (x.v !== PROTOCOL_VERSION) throw new ProtocolError(`history version ${String(x.v)} is not ${PROTOCOL_VERSION}`);
+  const grain = oneOf(x.grain, GRAIN_NAMES, "grain");
+  const step = int(x.step, "step");
+  if (!Array.isArray(x.samples)) throw new ProtocolError("samples must be an array");
+  if (!Array.isArray(x.apps)) throw new ProtocolError("apps must be an array");
+  const samples = x.samples.map((s, i): SampleBucket => {
+    if (!isRec(s)) throw new ProtocolError(`samples[${i}] must be an object`);
+    return { t: int(s.t, `samples[${i}].t`), n: int(s.n, `samples[${i}].n`) };
+  });
+  const apps = x.apps.map((a, i): AppBucket => {
+    const w = `apps[${i}]`;
+    if (!isRec(a)) throw new ProtocolError(`${w} must be an object`);
+    return { t: int(a.t, `${w}.t`), app: str(a.app, `${w}.app`), name: str(a.name, `${w}.name`), flows: int(a.flows, `${w}.flows`) };
+  });
+  return { v: PROTOCOL_VERSION, grain, step, samples, apps };
 }
 
 /** Validate an untrusted value as a v1 Snapshot. Throws ProtocolError. */

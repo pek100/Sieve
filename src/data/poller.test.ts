@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { createStore, phase } from "@/core/store";
 import fixture from "./fixtures/snapshot-v1.json";
 import { createPoller, type Clock } from "./poller";
-import type { SieveSource } from "./source";
-import type { Snapshot } from "./protocol";
+import type { HistoryQuery, SieveSource } from "./source";
+import type { History, Snapshot } from "./protocol";
 
 /** Manual clock: timers fire only when the test advances time. */
 function fakeClock(start = 1_000_000) {
@@ -50,8 +50,8 @@ function scriptedSource(results: Array<Snapshot | Error>): SieveSource & { calls
       if (r instanceof Error) throw r;
       return r;
     },
-    async history() {
-      return [];
+    async history(q: HistoryQuery): Promise<History> {
+      return { v: 1, grain: q.grain, step: q.step, samples: [], apps: [] };
     },
   };
   return src;
@@ -132,7 +132,7 @@ describe("poller (seam law: single writer, cadence, pause, errors keep data)", (
     const slow: SieveSource = {
       kind: "mock",
       sample: () => new Promise<Snapshot>((r) => (release = r)),
-      history: async () => [],
+      history: async (q) => ({ v: 1, grain: q.grain, step: q.step, samples: [], apps: [] }),
     };
     const p = createPoller({ source: slow, store, clock: fc.clock });
     p.start();

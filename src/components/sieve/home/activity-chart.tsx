@@ -32,8 +32,13 @@ const fmt1 = (x: number) => (Math.round(x * 10) / 10).toString();
 /** x keeps three decimals: the group can scale it up to baseMs / view (about 100x for Session). */
 const fmtX = (x: number) => (Math.round(x * 1000) / 1000).toString();
 
-function clock(ms: number, seconds = false): string {
-  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: seconds ? "2-digit" : undefined });
+const DAY = 86_400_000;
+
+/** A time label sized to the span: seconds for live minutes, the weekday once a span passes a day. */
+function clock(ms: number, seconds = false, spanMs = 0): string {
+  const d = new Date(ms);
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: seconds && spanMs <= DAY ? "2-digit" : undefined });
+  return spanMs > DAY ? `${d.toLocaleDateString([], { weekday: "short", day: "numeric" })} ${time}` : time;
 }
 
 /** The plot group's transform: newest bucket at the right edge, baseMs stretched onto the view span. */
@@ -182,7 +187,7 @@ export function ActivityChart({
               )}
               style={{ left: `${hover.f * 100}%` }}
             >
-              <p className="pb-2 text-caption text-on-surface-muted tabular">{clock(pts[hover.index].t, true)}</p>
+              <p className="pb-2 text-caption text-on-surface-muted tabular">{clock(pts[hover.index].t, model.bucketMs < 60_000, model.windowMs)}</p>
               <ul className="flex flex-col gap-1">
                 {visible.map((s) => (
                   <li key={s.key} className="flex items-center gap-2">
@@ -197,7 +202,7 @@ export function ActivityChart({
         )}
       </div>
       <div aria-hidden="true" className="flex justify-between text-caption text-on-surface-faint tabular">
-        <span>{clock(lastT - model.windowMs)}</span>
+        <span>{clock(lastT - model.windowMs, false, model.windowMs)}</span>
         <span>Now</span>
       </div>
     </div>

@@ -5,7 +5,7 @@
  */
 import { createNoticeBus, type NoticeBus } from "@/core/notices";
 import { createStore, type SieveStore } from "@/core/store";
-import { createPoller, type Clock, type Poller } from "@/data/poller";
+import { createPoller, realClock, type Clock, type Poller } from "@/data/poller";
 import { createSettingsStore, localBackend, memoryBackend, tauriBackend, type SettingsBackend, type SettingsStore } from "@/data/settings-store";
 import { createMockSource } from "@/data/mock-source";
 import { isTauriWindow, resolveSource, type SieveSource } from "@/data/source";
@@ -19,6 +19,8 @@ export interface Runtime {
   readonly notices: NoticeBus;
   /** Live checks (by settings key of their data switch) that passed this session. None yet. */
   readonly passedChecks: ReadonlySet<string>;
+  /** The window's clock (the poller's): "now" for history queries. Injected in tests. */
+  readonly clock: Clock;
 }
 
 export interface RuntimeOptions {
@@ -30,14 +32,16 @@ export interface RuntimeOptions {
 
 export function createRuntime(o: RuntimeOptions): Runtime {
   const store = createStore();
+  const clock = o.clock ?? realClock;
   return {
     isTauri: o.isTauri ?? false,
     source: o.source,
     store,
-    poller: createPoller({ source: o.source, store, clock: o.clock }),
+    poller: createPoller({ source: o.source, store, clock }),
     settings: createSettingsStore(o.settings),
     notices: createNoticeBus(),
     passedChecks: new Set<string>(),
+    clock,
   };
 }
 
