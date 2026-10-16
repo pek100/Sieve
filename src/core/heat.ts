@@ -32,6 +32,33 @@ export interface HeatGrid {
   max: number;
   /** Hour buckets seen in total. */
   hours: number;
+  /** Start of the earliest bucket, epoch ms; null when there is none. */
+  first: number | null;
+}
+
+const HOUR = 3_600_000;
+const DAY = 24 * HOUR;
+
+function spanWords(ms: number): string {
+  const days = Math.round(ms / DAY);
+  if (days >= 7 && days % 7 === 0) return days === 7 ? "week" : `${days / 7} weeks`;
+  if (days >= 1) return days === 1 ? "day" : `${days} days`;
+  const hours = Math.max(1, Math.round(ms / HOUR));
+  return hours === 1 ? "hour" : `${hours} hours`;
+}
+
+/**
+ * How far back the heatmap goes, from the buckets the source returned for
+ * the range asked: "Last 4 weeks" when they reach back to its start (within
+ * an hour), else "Since <first bucket>" (a session-only source, a short mock).
+ */
+export function heatCaption(grid: Pick<HeatGrid, "first">, range: { from: number; to: number }): string {
+  if (grid.first === null) return "No history yet";
+  if (grid.first - range.from < HOUR) return `Last ${spanWords(range.to - range.from)}`;
+  const first = new Date(grid.first);
+  const sameDay = first.toDateString() === new Date(range.to).toDateString();
+  const time = first.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return sameDay ? `Since ${time}` : `Since ${first.toLocaleDateString([], { weekday: "short" })} ${time}`;
 }
 
 /** Step for a value against the grid maximum: 0 for nothing, then thirds of the max. */
@@ -59,5 +86,6 @@ export function heatGrid(buckets: readonly HourActivity[]): HeatGrid {
     hours: counts[i],
     step: heatStep(value, max),
   }));
-  return { cells, max, hours: buckets.length };
+  const first = buckets.length ? Math.min(...buckets.map((b) => b.t)) : null;
+  return { cells, max, hours: buckets.length, first };
 }
