@@ -59,7 +59,7 @@ export function AppsScreen() {
       <BentoGrid>
         <BentoItem span="full">
           <Card
-            title="Apps on this computer"
+            title="All apps"
             icon={<AppWindow strokeWidth={1.75} />}
             tone="mint"
             state={state}

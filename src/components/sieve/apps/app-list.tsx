@@ -38,9 +38,16 @@ export function AppRow({ app, actions }: { app: AppEntry; actions: RowActions })
         className="relative flex h-11 min-w-0 flex-1 items-center gap-3 overflow-hidden rounded-sm pr-2 text-left"
       >
         <Monogram appKey={app.key} name={app.name} />
-        <span className="min-w-0 flex-1 truncate text-body-strong text-on-surface">{app.name}</span>
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="truncate text-body-strong text-on-surface">{app.name}</span>
+          {/* Narrow windows move the count under the name to give the name room. */}
+          <span aria-hidden="true" className="tabular hidden truncate text-caption text-on-surface-muted max-[640px]:block">
+            {n} {n === 1 ? "connection" : "connections"}
+          </span>
+        </span>
         <span
-          className={cn("tabular shrink-0 text-label", n > 0 ? "text-on-surface" : "text-on-surface-faint")}
+          aria-hidden="true"
+          className={cn("tabular shrink-0 text-label max-[640px]:hidden", n > 0 ? "text-on-surface" : "text-on-surface-faint")}
           title={`${n} active ${n === 1 ? "connection" : "connections"}`}
         >
           {n}
