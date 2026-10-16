@@ -78,6 +78,9 @@ test.describe("apps", () => {
 
   test("search with no match shows the no-results state and Escape clears it", async ({ page }) => {
     await page.goto(APPS);
+    // Rows come from client data, so this waits for hydration; typing into the static
+    // box before React attaches loses the value under a loaded machine.
+    await expect(row(page, CHROME)).toBeVisible();
     const box = page.getByRole("searchbox", { name: "Search apps" });
     await box.fill("zzzz-nothing");
     await expect(page.getByText("Nothing by that name")).toBeVisible();

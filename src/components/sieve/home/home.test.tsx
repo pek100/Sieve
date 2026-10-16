@@ -1,6 +1,6 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { OTHER_KEY, SERIES_COUNT } from "@/core/series";
 import { createMockSource } from "@/data/mock-source";
 import type { Clock } from "@/data/poller";
@@ -9,6 +9,10 @@ import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { HomeScreen } from "./home-screen";
 import { MIN_VIEW_SAMPLES, viewMs, WINDOWS } from "./use-home";
+
+// Each setup drives 45 one-second ticks through React (about 1.7 s alone); under the
+// full parallel suite that passed the 5 s default and the overrun cascaded into the next tests.
+vi.setConfig({ testTimeout: 20_000 });
 
 /** Manual clock: timers fire only when the test advances time (same idea as poller.test.ts). */
 function fakeClock(start = 1_760_000_000_000) {

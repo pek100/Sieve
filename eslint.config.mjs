@@ -13,6 +13,7 @@ const eslintConfig = defineConfig([
     "src-tauri/**",
     "test-results/**",
     "playwright-report/**",
+    ".claude/**",
   ]),
 ]);
 
