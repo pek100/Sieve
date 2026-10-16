@@ -2,7 +2,7 @@
  * Settings storage seam. The document format and rules live in
  * src/core/settings; this file only moves the document in and out of
  * storage: localStorage in the browser, tauri-plugin-store (settings.json
- * in the app config dir) in Tauri.
+ * in the app's data dir) in Tauri.
  */
 import { EMPTY_DOC, normalizeDoc, readValue, resetValue, writeValue, type SettingsDoc } from "@/core/settings/document";
 import type { SettingKey, SettingValue } from "@/core/settings/registry";
