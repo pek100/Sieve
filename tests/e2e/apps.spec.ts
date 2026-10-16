@@ -63,6 +63,10 @@ test.describe("apps", () => {
     expect(await host.evaluate((el) => getComputedStyle(el).fontFamily)).toContain("JetBrains Mono");
     const connection = await sheet.getByTestId("connection-row").first().boundingBox();
     expect(connection?.height).toBe(44);
+    // Let the slide-in finish so the screenshot shows the resting sheet.
+    await sheet.evaluate((el) => Promise.all(el.getAnimations({ subtree: true }).map((a) => a.finished)));
+    const rect = await sheet.boundingBox();
+    expect(rect!.x + rect!.width).toBeLessThanOrEqual(info.project.use.viewport!.width);
     await noHorizontalScroll(page);
     await page.screenshot({ path: `test-results/screens/apps-detail-${info.project.name}.png` });
 
