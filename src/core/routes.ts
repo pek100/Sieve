@@ -9,7 +9,10 @@ export interface RouteDef {
   icon: "activity" | "app-window" | "list" | "settings";
 }
 
-export const ROUTES: readonly RouteDef[] = [{ href: "/", label: "Home", icon: "activity" }];
+export const ROUTES: readonly RouteDef[] = [
+  { href: "/", label: "Home", icon: "activity" },
+  { href: "/apps", label: "Apps", icon: "app-window" },
+];
 
 /** Which route a pathname belongs to (static export uses trailing slashes). */
 export function activeRoute(pathname: string): RouteDef | undefined {
