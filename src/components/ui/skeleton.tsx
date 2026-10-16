@@ -1,4 +1,4 @@
-import { cn } from "cn"
+import { cn } from "@/lib/utils"
 
 // Sieve: shimmer at 1.2 s over surface-2; static under reduced motion (globals.css).
 function Skeleton({ className, ...props }: React.ComponentProps<"div">) {
