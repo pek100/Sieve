@@ -24,16 +24,20 @@ function clock(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-/** Status chip with a live dot. Text says what sampling is doing; colour is never the only signal. */
-export function StatusChip({ className }: { className?: string }) {
+/**
+ * Status chip with a live dot. Text says what sampling is doing; colour is never the only signal.
+ * `announce` (default true) makes it the polite live region; a second copy on a screen passes
+ * false so screen readers hear each change once.
+ */
+export function StatusChip({ className, announce = true }: { className?: string; announce?: boolean }) {
   const p = useSieve(phase);
   const pausedUntil = useSieve((s) => s.status.pausedUntil);
   const error = useSieve((s) => s.status.error);
   const text = p === "paused" && pausedUntil !== null ? `Paused until ${clock(pausedUntil)}` : COPY[p];
   return (
     <span
-      role="status"
-      aria-live="polite"
+      role={announce ? "status" : undefined}
+      aria-live={announce ? "polite" : undefined}
       title={p === "error" && error ? error : undefined}
       data-phase={p}
       className={cn(
