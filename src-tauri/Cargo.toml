@@ -22,3 +22,14 @@ thiserror = "2"
 tauri = { version = "2.12.4" }
 tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
+
+# Read-only Windows calls for the connection source (slice S1): the IP Helper
+# owner-pid tables, process image names and file version info. No writes.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
