@@ -1,0 +1,232 @@
+"use client";
+
+import { Check, Copy, Info, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { EmptyState } from "@/components/sieve/shell/empty-state";
+import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { StateLayer } from "@/components/sieve/primitives/state-layer";
+import { isActiveFlow } from "@/core/apps";
+import type { AppEntry } from "@/core/apps-actions";
+import type { Flow } from "@/data/protocol";
+import { CATEGORY_LABEL, type RowActions } from "./app-list";
+import { LevelControl } from "./level-control";
+import { Monogram } from "./monogram";
+
+const MAX_ROWS = 40;
+
+const STATE_LABEL: Partial<Record<Flow["state"], string>> = {
+  established: "Open",
+  time_wait: "Closing",
+  close_wait: "Closing",
+  fin_wait_1: "Closing",
+  fin_wait_2: "Closing",
+  last_ack: "Closing",
+  closing: "Closing",
+  syn_sent: "Opening",
+  syn_received: "Opening",
+  listen: "Listening",
+  none: "Bound",
+};
+
+function host(f: Flow): string {
+  if (!f.remote) return `local :${f.local.port}`;
+  return f.family === "v6" ? `[${f.remote.addr}]:${f.remote.port}` : `${f.remote.addr}:${f.remote.port}`;
+}
+
+/** Click to copy, with a checkmark for a moment. Falls back silently where the clipboard is denied. */
+function CopyPath({ path }: { path: string }) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => void (timer.current && clearTimeout(timer.current)), []);
+  return (
+    <button
+      type="button"
+      aria-label={copied ? `Copied ${path}` : `Copy path ${path}`}
+      onClick={async () => {
+        try {
+          await navigator.clipboard?.writeText(path);
+        } catch {
+          // Clipboard refused (permissions, insecure context): the path is still selectable.
+        }
+        setCopied(true);
+        if (timer.current) clearTimeout(timer.current);
+        timer.current = setTimeout(() => setCopied(false), 1500);
+      }}
+      className="relative flex min-h-11 w-full items-center gap-3 overflow-hidden rounded-sm bg-inset px-3 py-2 text-left shadow-inset"
+    >
+      <span className="min-w-0 flex-1 font-mono text-mono break-all text-on-surface">{path}</span>
+      {copied ? (
+        <Check className="size-4 shrink-0 text-primary" strokeWidth={1.75} aria-hidden="true" />
+      ) : (
+        <Copy className="size-4 shrink-0 text-on-surface-muted" strokeWidth={1.75} aria-hidden="true" />
+      )}
+      <StateLayer />
+    </button>
+  );
+}
+
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="flex flex-col gap-2">
+      <h3 className="text-label text-on-surface-muted">{title}</h3>
+      {children}
+    </section>
+  );
+}
+
+function ConnectionsTable({ flows }: { flows: Flow[] }) {
+  const sorted = [...flows].sort((a, b) => Number(isActiveFlow(b)) - Number(isActiveFlow(a)));
+  const shown = sorted.slice(0, MAX_ROWS);
+  if (flows.length === 0) return <p className="text-body text-on-surface-faint">No sockets open right now.</p>;
+  return (
+    <div className="overflow-hidden rounded-md bg-surface-2">
+      <table className="w-full table-fixed text-body" aria-label="Connections">
+        <thead>
+          <tr className="h-9 text-left text-label text-on-surface-muted">
+            <th scope="col" className="px-3 font-medium">Host</th>
+            <th scope="col" className="w-16 px-2 font-medium">Proto</th>
+            <th scope="col" className="w-24 px-3 font-medium">State</th>
+          </tr>
+        </thead>
+        <tbody>
+          {shown.map((f, i) => (
+            <tr key={`${f.proto}-${f.local.port}-${host(f)}-${i}`} data-testid="connection-row" className="h-11 border-t border-outline">
+              <td className="truncate px-3 font-mono text-mono text-on-surface" data-testid="host">
+                {host(f)}
+              </td>
+              <td className="px-2 text-label text-on-surface-muted uppercase">{f.proto}</td>
+              <td className="px-3 text-label text-on-surface-muted">{STATE_LABEL[f.state] ?? f.state}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {sorted.length > MAX_ROWS && (
+        <p className="border-t border-outline px-3 py-2 text-caption text-on-surface-faint">
+          {sorted.length - MAX_ROWS} more not shown
+        </p>
+      )}
+    </div>
+  );
+}
+
+function RemoteHosts({ flows }: { flows: Flow[] }) {
+  const counts = new Map<string, number>();
+  for (const f of flows) if (f.remote && isActiveFlow(f)) counts.set(f.remote.addr, (counts.get(f.remote.addr) ?? 0) + 1);
+  const rows = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (rows.length === 0) return <p className="text-body text-on-surface-faint">Not talking to anyone right now.</p>;
+  return (
+    <ul className="flex flex-col">
+      {rows.map(([addr, n]) => (
+        <li key={addr} className="flex h-9 items-center gap-3">
+          <span className="min-w-0 flex-1 truncate font-mono text-mono text-on-surface">{addr}</span>
+          <span className="tabular text-label text-on-surface-muted">{n}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function Detail({ app, actions }: { app: AppEntry; actions: RowActions }) {
+  const level = actions.levelOf(app.key);
+  const locked = actions.lockedReason("sieve");
+  const pids = app.pids.length;
+  return (
+    <div className="flex flex-col gap-6 overflow-y-auto px-5 pb-6">
+      <Section title="Level">
+        <LevelControl
+          appName={app.name}
+          value={level}
+          lockedReason={actions.lockedReason}
+          onChange={(l) => actions.setLevel(app.key, l)}
+          className="w-full"
+        />
+        {locked && (
+          <p className="flex items-center gap-2 text-label text-on-surface-muted" data-testid="sieve-locked">
+            <Info className="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+            Sieve: {locked}.
+          </p>
+        )}
+      </Section>
+
+      <Section title={app.exes.length === 1 ? "Path" : "Paths"}>
+        {app.exes.length === 0 ? (
+          <p className="text-body text-on-surface-faint">Windows does not say where this one lives.</p>
+        ) : (
+          app.exes.map((e) => <CopyPath key={e} path={e} />)
+        )}
+      </Section>
+
+      <Section title="Executables">
+        {pids === 0 ? (
+          <p className="text-body text-on-surface-faint">Not running right now.</p>
+        ) : (
+          <p className="text-body text-on-surface">
+            {pids} {pids === 1 ? "process" : "processes"}:{" "}
+            <span className="tabular font-mono text-mono text-on-surface-muted">{app.pids.map((p) => `pid ${p}`).join(", ")}</span>
+          </p>
+        )}
+      </Section>
+
+      <Section title={`Connections (${app.activeCount} active)`}>
+        <ConnectionsTable flows={app.flows} />
+      </Section>
+
+      <Section title="Remote hosts">
+        <RemoteHosts flows={app.flows} />
+      </Section>
+
+      {app.pinnedPaths.length > 0 && (
+        <div>
+          <Button variant="destructive" onClick={() => actions.unpin(app.key)}>
+            <Trash2 strokeWidth={1.75} />
+            Remove from my apps
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Right sheet for one app, opened from a row or straight from `?app=<key>`. */
+export function AppDetailSheet({
+  appKey,
+  app,
+  loading,
+  actions,
+  onClose,
+}: {
+  appKey: string | null;
+  app: AppEntry | undefined;
+  loading: boolean;
+  actions: RowActions;
+  onClose: () => void;
+}) {
+  return (
+    <Sheet open={appKey !== null} onOpenChange={(o) => !o && onClose()}>
+      <SheetContent
+        side="right"
+        className="gap-0 border-outline bg-surface-1 text-on-surface shadow-l4 data-[side=right]:w-full data-[side=right]:sm:max-w-none data-[side=right]:two:max-w-[480px]"
+      >
+        <SheetHeader className="flex-row items-center gap-3 p-5 pr-10">
+          {app && <Monogram appKey={app.key} name={app.name} size={40} />}
+          <div className="min-w-0">
+            <SheetTitle className="truncate text-title text-on-surface">{app?.name ?? appKey ?? ""}</SheetTitle>
+            <SheetDescription className="text-label text-on-surface-muted">
+              {app
+                ? `${CATEGORY_LABEL[app.category]} · ${app.activeCount} active ${app.activeCount === 1 ? "connection" : "connections"}`
+                : loading
+                  ? "Reading connections"
+                  : "Not running"}
+            </SheetDescription>
+          </div>
+        </SheetHeader>
+        {app ? (
+          <Detail app={app} actions={actions} />
+        ) : loading ? null : (
+          <EmptyState line="Not here right now" body="This app is not running and is not one of your apps." />
+        )}
+      </SheetContent>
+    </Sheet>
+  );
+}

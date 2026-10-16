@@ -112,12 +112,12 @@ Run in PowerShell from the repo or worktree root.
 |---|---|
 | `pnpm install` | install (first time per worktree) |
 | `pnpm dev` | Next dev server, http://localhost:3000, browser mode with the mock source |
-| `pnpm build` | static export to `out/` |
+| `pnpm build` | static export to `out/`, then `scripts/flatten-segments.mjs` (Next 16.4.2 writes nested segment prefetch files as `__next.apps/__PAGE__.txt` but the router fetches `__next.apps.__PAGE__.txt`; the script copies them to the flat name so no static host, Tauri included, answers 404) |
 | `pnpm typecheck` | `tsc --noEmit` |
 | `pnpm lint` | ESLint (next core-web-vitals + typescript, React compiler rules on) |
 | `pnpm test` | Vitest: `src/**/*.test.ts(x)` and `tests/laws/**` |
 | `pnpm check` | typecheck + lint + test: the gate before any merge |
-| `pnpm e2e` | `next build` then Playwright; serves `out/` on 127.0.0.1:3417 via `scripts/serve-out.mjs`; projects `desktop` 1280x800 and `mobile` 375x812; screenshots in `test-results/screens/` |
+| `pnpm e2e` | `pnpm build` then Playwright; serves `out/` on 127.0.0.1:3417 via `scripts/serve-out.mjs`; projects `desktop` 1280x800 and `mobile` 375x812; screenshots in `test-results/screens/` |
 | `pnpm rust:test` | `cargo test --manifest-path src-tauri/Cargo.toml` |
 | `pnpm rust:lint` | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` |
 | `pnpm tauri dev` | the real app (a person or a live check only, never in a slice run) |
@@ -131,6 +131,7 @@ Run in PowerShell from the repo or worktree root.
 - Rust tests live in `#[cfg(test)]` modules. A test that needs the real machine is `#[ignore]` and named `live_*`; its name is the live check (`cargo test --manifest-path src-tauri/Cargo.toml -- --ignored live_`).
 - The five laws (`tests/laws/`): 1 tokens (no colour literals outside tokens.css, no `dark:`, spacing ladder, no undefined variables, both themes define every role); 2 no em dash in `src`, `src-tauri/src`, `docs`, `tests`, `scripts`; 3 protocol parity with Rust and the fixture; 4 registry (data switches off with a `live_` check, `requires` valid, defaults valid, storage only through the settings seam); 5 core purity.
 - Every bug found becomes a test. A slice adds its own tests and keeps every existing one green.
+- Class merging: always `cn` from `@/lib/utils` (also inside `src/components/ui`). It is configured with the type scale (`text-label`, `text-body`, ...), so a text colour and a type size in one `cn` call both survive; the bare `cn` package read the sizes as colours and dropped one (`src/lib/utils.test.ts` keeps it that way).
 
 ## 8. Rust side
 
@@ -156,3 +157,4 @@ Run in PowerShell from the repo or worktree root.
 - `useSieve` rerenders every consumer on every store change (1 Hz by default). Home selects `s.snapshots` (same array until a new sample) and caches per-snapshot counts in a WeakMap, so a status change does not recompute the chart.
 - S2 kept the ProductName identity: the Windows exes show as one Home series, "Microsoft Windows Operating System". The exe-stem decision for system apps is left to S3 (Apps).
 - Home's Session window keeps at most 2 h (`SESSION_MAX_MS`), and the 1 h and Session windows hold every snapshot in the ring (about 3600 and 7200 full snapshots at 1 s). Memory at those sizes is not measured; a compact per-tick count history would be the fix if it is too much.
+- Apps screen (S3): levels and pins change only through the reducers in `src/core/apps-actions.ts` (`setLevel` clamps to the ceiling, reads go through `levelOf`); the screen hook is `src/components/sieve/apps/use-apps.ts`, the deep link `?app=<key>` lives in `use-app-param.ts`. S3 kept the ProductName identity rule, so Windows' own exes still show as one System app. The reason a level is locked is the disabled item's `title` (native tooltip) plus a visible line on the card and in the sheet; `Segmented` has no Radix tooltip slot for a disabled item.
