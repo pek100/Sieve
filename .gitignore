@@ -1,0 +1,30 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+
+# tests
+/coverage
+/test-results/
+/playwright-report/
+
+# next.js
+/.next/
+/out/
+/build
+
+# tauri (also src-tauri/.gitignore)
+/src-tauri/target/
+/src-tauri/gen/schemas
+
+# misc
+.DS_Store
+*.pem
+npm-debug.log*
+.pnpm-debug.log*
+.env*
+*.tsbuildinfo
+next-env.d.ts
+
+# agent worktrees
+/.claude/worktrees/

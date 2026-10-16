@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Sieve app icon source. Own artwork: a ring over a 3x3 mesh on the dark surface. Regenerate with `pnpm tauri icon src-tauri/icons/source.svg`. -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="#1C1B27"/>
+  <circle cx="256" cy="256" r="168" fill="none" stroke="#7FE3B5" stroke-width="28"/>
+  <g fill="#7FE3B5">
+    <circle cx="176" cy="176" r="26"/><circle cx="256" cy="176" r="26"/><circle cx="336" cy="176" r="26" fill="#B79CFF"/>
+    <circle cx="176" cy="256" r="26"/><circle cx="256" cy="256" r="26" fill="#FFB38A"/><circle cx="336" cy="256" r="26"/>
+    <circle cx="176" cy="336" r="26" fill="#FF7AB6"/><circle cx="256" cy="336" r="26"/><circle cx="336" cy="336" r="26"/>
+  </g>
+</svg>
