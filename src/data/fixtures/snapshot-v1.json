@@ -1,0 +1,91 @@
+{
+  "v": 1,
+  "t": 1792224000000,
+  "processes": [
+    { "pid": 0, "exe": null, "name": "System idle", "product": null },
+    { "pid": 4, "exe": null, "name": "System", "product": null },
+    {
+      "pid": 1288,
+      "exe": "C:\\Windows\\System32\\svchost.exe",
+      "name": "svchost.exe",
+      "product": "Microsoft Windows Operating System"
+    },
+    {
+      "pid": 9120,
+      "exe": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "name": "chrome.exe",
+      "product": "Google Chrome"
+    },
+    {
+      "pid": 9188,
+      "exe": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "name": "chrome.exe",
+      "product": "Google Chrome"
+    },
+    {
+      "pid": 14032,
+      "exe": "C:\\Users\\<user>\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
+      "name": "Code.exe",
+      "product": "Visual Studio Code"
+    },
+    { "pid": 15500, "exe": null, "name": "pid 15500", "product": null }
+  ],
+  "flows": [
+    {
+      "pid": 4,
+      "proto": "tcp",
+      "family": "v4",
+      "local": { "addr": "0.0.0.0", "port": 445 },
+      "remote": null,
+      "state": "listen"
+    },
+    {
+      "pid": 1288,
+      "proto": "udp",
+      "family": "v4",
+      "local": { "addr": "0.0.0.0", "port": 5353 },
+      "remote": null,
+      "state": "none"
+    },
+    {
+      "pid": 9120,
+      "proto": "tcp",
+      "family": "v4",
+      "local": { "addr": "192.168.1.20", "port": 51544 },
+      "remote": { "addr": "203.0.113.10", "port": 443 },
+      "state": "established"
+    },
+    {
+      "pid": 9188,
+      "proto": "tcp",
+      "family": "v6",
+      "local": { "addr": "2001:db8::20", "port": 51602 },
+      "remote": { "addr": "2001:db8:1::443", "port": 443 },
+      "state": "time_wait"
+    },
+    {
+      "pid": 14032,
+      "proto": "tcp",
+      "family": "v4",
+      "local": { "addr": "127.0.0.1", "port": 54012 },
+      "remote": null,
+      "state": "listen"
+    },
+    {
+      "pid": 14032,
+      "proto": "tcp",
+      "family": "v4",
+      "local": { "addr": "192.168.1.20", "port": 51611 },
+      "remote": { "addr": "198.51.100.7", "port": 443 },
+      "state": "established"
+    },
+    {
+      "pid": 15500,
+      "proto": "tcp",
+      "family": "v4",
+      "local": { "addr": "192.168.1.20", "port": 51700 },
+      "remote": { "addr": "192.0.2.55", "port": 8080 },
+      "state": "syn_sent"
+    }
+  ]
+}
