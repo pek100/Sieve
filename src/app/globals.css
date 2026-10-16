@@ -1,0 +1,262 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/inter";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+@import "@fontsource/instrument-serif/400-italic.css";
+@import "../styles/tokens.css";
+
+/*
+ * Tailwind theme = role tokens only. The default palette is removed so a raw
+ * colour class (bg-red-500, text-white) does not compile to anything.
+ */
+@theme {
+  --color-*: initial;
+  --breakpoint-two: 60rem; /* 960: two card columns */
+  --breakpoint-three: 80rem; /* 1280: three card columns */
+}
+
+@theme inline {
+  /* Sieve roles */
+  --color-bg: var(--bg);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-inset: var(--inset);
+  --color-outline: var(--outline);
+  --color-outline-strong: var(--outline-strong);
+  --color-scrim: var(--scrim);
+  --color-on-surface: var(--on-surface);
+  --color-on-surface-muted: var(--on-surface-muted);
+  --color-on-surface-faint: var(--on-surface-faint);
+  --color-primary: var(--primary);
+  --color-on-primary: var(--on-primary);
+  --color-blocked: var(--blocked);
+  --color-on-blocked: var(--on-blocked);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-mint-container: var(--mint-container);
+  --color-on-mint-container: var(--on-mint-container);
+  --color-peach-container: var(--peach-container);
+  --color-on-peach-container: var(--on-peach-container);
+  --color-lilac-container: var(--lilac-container);
+  --color-on-lilac-container: var(--on-lilac-container);
+  --color-series-1: var(--series-1);
+  --color-series-2: var(--series-2);
+  --color-series-3: var(--series-3);
+  --color-series-4: var(--series-4);
+  --color-series-5: var(--series-5);
+  --color-series-6: var(--series-6);
+  --color-series-other: var(--series-other);
+  --color-track: var(--track);
+  --color-selected: var(--selected-container);
+
+  /* shadcn names, aliases of the roles above (never separate values) */
+  --color-background: var(--bg);
+  --color-foreground: var(--on-surface);
+  --color-card: var(--surface-1);
+  --color-card-foreground: var(--on-surface);
+  --color-popover: var(--surface-3);
+  --color-popover-foreground: var(--on-surface);
+  --color-primary-foreground: var(--on-primary);
+  --color-secondary: var(--surface-2);
+  --color-secondary-foreground: var(--on-surface);
+  --color-muted: var(--surface-2);
+  --color-muted-foreground: var(--on-surface-muted);
+  --color-accent: var(--surface-2);
+  --color-accent-foreground: var(--on-surface);
+  --color-destructive: var(--blocked);
+  --color-border: var(--outline);
+  --color-input: var(--outline-strong);
+  --color-ring: var(--primary);
+  --color-chart-1: var(--series-1);
+  --color-chart-2: var(--series-2);
+  --color-chart-3: var(--series-3);
+  --color-chart-4: var(--series-4);
+  --color-chart-5: var(--series-5);
+
+  /* Fonts (bundled, never fetched) */
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-heading: var(--font-sans);
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --font-serif: "Instrument Serif", ui-serif, serif;
+
+  /* Type scale (size / line height / weight) */
+  --text-display: 2rem;
+  --text-display--line-height: 2.375rem;
+  --text-display--font-weight: 600;
+  --text-display--letter-spacing: -0.01em;
+  --text-title-lg: 1.5rem;
+  --text-title-lg--line-height: 1.875rem;
+  --text-title-lg--font-weight: 600;
+  --text-title-lg--letter-spacing: -0.01em;
+  --text-title: 1.125rem;
+  --text-title--line-height: 1.5rem;
+  --text-title--font-weight: 600;
+  --text-kpi: 1.75rem;
+  --text-kpi--line-height: 2rem;
+  --text-kpi--font-weight: 600;
+  --text-kpi--letter-spacing: -0.01em;
+  --text-body: 0.875rem;
+  --text-body--line-height: 1.25rem;
+  --text-body--font-weight: 400;
+  --text-body-strong: 0.875rem;
+  --text-body-strong--line-height: 1.25rem;
+  --text-body-strong--font-weight: 500;
+  --text-label: 0.75rem;
+  --text-label--line-height: 1rem;
+  --text-label--font-weight: 500;
+  --text-caption: 0.6875rem;
+  --text-caption--line-height: 0.875rem;
+  --text-caption--font-weight: 400;
+  --text-mono: 0.78125rem;
+  --text-mono--line-height: 1.125rem;
+
+  /* Radii */
+  --radius: var(--corner-lg);
+  --radius-xs: var(--corner-xs);
+  --radius-sm: var(--corner-sm);
+  --radius-md: var(--corner-md);
+  --radius-lg: var(--corner-lg);
+  --radius-xl: var(--corner-xl);
+  --radius-2xl: var(--corner-xl);
+  --radius-3xl: var(--corner-xl);
+  --radius-4xl: var(--corner-xl);
+
+  /* Elevation: shadow-l1..l4, shadow-inset, shadow-glow */
+  --shadow-l1: var(--elev-l1);
+  --shadow-l2: var(--elev-l2);
+  --shadow-l3: var(--elev-l3);
+  --shadow-l4: var(--elev-l4);
+  --shadow-inset: var(--elev-inset);
+  --shadow-glow: var(--elev-glow);
+
+  /* Motion: ease-standard, ease-emph-in, ease-emph-out; durations via duration-(--motion-*) */
+  --ease-standard: var(--easing-standard);
+  --ease-emph-in: var(--easing-emph-in);
+  --ease-emph-out: var(--easing-emph-out);
+  --animate-breathe: breathe var(--motion-pulse) var(--easing-standard) infinite;
+  --animate-shimmer: shimmer 1.2s linear infinite;
+
+  @keyframes breathe {
+    0%,
+    100% {
+      box-shadow: 0 0 0 0 transparent;
+    }
+    50% {
+      box-shadow: var(--elev-glow);
+    }
+  }
+  @keyframes shimmer {
+    from {
+      background-position: 200% 0;
+    }
+    to {
+      background-position: -200% 0;
+    }
+  }
+}
+
+@layer base {
+  * {
+    @apply border-outline;
+  }
+  html {
+    @apply bg-bg font-sans text-on-surface;
+    font-feature-settings: "cv11", "ss01";
+  }
+  body {
+    @apply bg-bg text-body text-on-surface;
+  }
+  :root[data-theme="light"] body {
+    background-image:
+      radial-gradient(60% 50% at 100% 0%, var(--wash-a), transparent 70%),
+      radial-gradient(50% 60% at 0% 50%, var(--wash-b), transparent 70%);
+    background-attachment: fixed;
+  }
+  /* Numbers are heroes: every number is tabular */
+  .tabular,
+  [data-numeric] {
+    font-variant-numeric: tabular-nums;
+  }
+  /* Focus ring: 2 px mint, 2 px offset, keyboard only */
+  :focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+  }
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+}
+
+/*
+ * State layer and ripple (Material). One implementation for every pressable:
+ * put <StateLayer /> as a child of a positioned, overflow-hidden element.
+ */
+@layer components {
+  [data-state-layer] {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    overflow: hidden;
+  }
+  [data-state-layer]::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: currentColor;
+    opacity: 0;
+    transition: opacity var(--motion-fast) var(--easing-standard);
+  }
+  :hover > [data-state-layer]::before {
+    opacity: var(--state-hover);
+  }
+  :focus-visible > [data-state-layer]::before {
+    opacity: var(--state-focus);
+  }
+  :active > [data-state-layer]::before {
+    opacity: var(--state-pressed);
+  }
+  :disabled > [data-state-layer],
+  [data-disabled] > [data-state-layer],
+  [aria-disabled="true"] > [data-state-layer] {
+    display: none;
+  }
+  [data-ripple] {
+    position: absolute;
+    border-radius: 9999px;
+    background: currentColor;
+    opacity: var(--state-pressed);
+    transform: scale(0);
+    animation:
+      ripple-expand var(--motion-ripple) var(--easing-standard) forwards,
+      ripple-fade var(--motion-ripple-fade) linear var(--motion-ripple) forwards;
+  }
+  @keyframes ripple-expand {
+    to {
+      transform: scale(1);
+    }
+  }
+  @keyframes ripple-fade {
+    to {
+      opacity: 0;
+    }
+  }
+}
+
+/* Reduced motion drops ripple expansion, chart morphs and the pulse */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-chart: 0ms;
+    --motion-ripple: 0ms;
+  }
+  [data-ripple] {
+    display: none;
+  }
+  .animate-breathe,
+  .animate-shimmer {
+    animation: none;
+  }
+}

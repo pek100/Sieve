@@ -1,0 +1,200 @@
+/*
+ * Sieve design tokens. The only file in src/ allowed to hold colour literals.
+ * Source: docs/research/2026-10-17-parity/design-language.md (sections 3 to 9).
+ * Every name here is a ROLE. Components use roles only (through the Tailwind
+ * utilities mapped in globals.css). Light swaps the same names.
+ *
+ * Tags: [M] measured in a reference, [S] Sieve decision, [U] unverified.
+ */
+
+/* ---------- Theme independent ---------- */
+:root {
+  /* Spacing ladder, base 4 [S]. Tailwind's --spacing (4px) already yields
+     1=4, 2=8, 3=12, 4=16, 5=20, 6=24, 8=32, 10=40; these names are for CSS. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  /* Layout [S] */
+  --topbar-h: 56px;
+  --page-pad: 24px;
+  --page-header-h: 64px;
+  --gutter: 16px;
+  --row-h: 44px;
+  --row-h-compact: 36px;
+  --card-pad: 20px;
+  --card-pad-dense: 16px;
+  --settings-rail-w: 240px;
+  --settings-content-max: 720px;
+
+  /* Radii [S] (measured D cards 12 to 16, icon tiles 8, cells 4) */
+  --corner-xs: 4px;
+  --corner-sm: 8px;
+  --corner-md: 12px;
+  --corner-lg: 16px;
+  --corner-xl: 24px;
+  --corner-full: 9999px;
+
+  /* Motion [S][U]: neither reference moves, every value is a proposal. */
+  --motion-fast: 100ms;
+  --motion-base: 200ms;
+  --motion-emph-in: 300ms;
+  --motion-emph-out: 200ms;
+  --motion-chart: 400ms;
+  --motion-ripple: 450ms;
+  --motion-ripple-fade: 150ms;
+  --motion-pulse: 4s;
+  --easing-standard: cubic-bezier(0.2, 0, 0, 1);
+  --easing-emph-in: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --easing-emph-out: cubic-bezier(0.3, 0, 0.8, 0.15);
+
+  /* Material state layers [S] */
+  --state-hover: 0.08;
+  --state-focus: 0.1;
+  --state-pressed: 0.1;
+  --state-dragged: 0.16;
+  --state-selected: 0.16;
+  --disabled-content: 0.38;
+  --disabled-container: 0.12;
+}
+
+/* ---------- Dark (default) [S], tuned from D [M] ---------- */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Surfaces: D's tone steps, tinted toward lilac */
+  --bg: #14131c;
+  --surface-1: #1c1b27;
+  --surface-2: #252433;
+  --surface-3: #2e2c3e;
+  --inset: #0f0e16;
+  --outline: #3a3850; /* 1.5:1, decorative only */
+  --outline-strong: #4a4766; /* 1.9:1, inputs and focus base */
+  --scrim: rgb(5 4 10 / 0.6);
+  --rim: rgb(255 255 255 / 0.05);
+  --rim-2: rgb(255 255 255 / 0.07);
+  --rim-3: rgb(255 255 255 / 0.08);
+
+  /* Text */
+  --on-surface: #ece8f4; /* 14.1:1 on surface-1 */
+  --on-surface-muted: #a9a4bc; /* 7.1:1 */
+  --on-surface-faint: #8a85a0; /* [U] about 4.6:1; #7d7893 measured 4.0 and was rejected */
+
+  /* Accents, vibrant retro (contrast on surface-1) */
+  --primary: #7fe3b5; /* mint, allowed, protection on, 11.0:1 */
+  --on-primary: #0b2a1c; /* 10.0:1 */
+  --blocked: #ff7ab6; /* pink, 7.1:1; also the error colour, always with icon and text */
+  --on-blocked: #3a0b22;
+  --warning: #ffb38a; /* peach, 9.8:1 */
+  --info: #b79cff; /* lilac, 7.5:1 */
+
+  /* Containers (one filled pastel tile per row at most) */
+  --mint-container: #b4e4cb;
+  --on-mint-container: #0b2a1c; /* 10.9:1 */
+  --peach-container: #f9ccae;
+  --on-peach-container: #3a1e0e; /* 10.4:1 */
+  --lilac-container: #d9c8f5;
+  --on-lilac-container: #24123a; /* 11.1:1 */
+
+  /* Chart series, in order: mint, lilac, peach, pink, cyan, yellow, then other */
+  --series-1: #7fe3b5;
+  --series-2: #b79cff;
+  --series-3: #ffb38a;
+  --series-4: #ff7ab6;
+  --series-5: #6fd3ff; /* chart only, 10.1:1 */
+  --series-6: #ffd45c; /* chart only, 12.0:1 */
+  --series-other: var(--on-surface-faint);
+
+  /* Elevation [S]: tone first, soft shadow second, 5% white rim (D [M]) */
+  --elev-l1: 0 1px 2px rgb(0 0 0 / 0.3), inset 0 0 0 1px var(--rim);
+  --elev-l2: 0 2px 6px rgb(0 0 0 / 0.35), inset 0 0 0 1px var(--rim-2);
+  --elev-l3: 0 8px 24px rgb(0 0 0 / 0.45), inset 0 0 0 1px var(--rim-3);
+  --elev-l4: 0 16px 40px rgb(0 0 0 / 0.55), inset 0 0 0 1px var(--rim-3);
+  --elev-inset: inset 0 1px 0 rgb(0 0 0 / 0.4);
+  --elev-glow: 0 0 24px rgb(127 227 181 / 0.35); /* the one glow: protection on */
+  --blur-l3: 0px;
+}
+
+/* ---------- Light [S], from P [M] ---------- */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f6f2fb;
+  --surface-1: rgb(255 255 255 / 0.72); /* frosted over the wash */
+  --surface-2: #f0ebf7;
+  --surface-3: #ffffff;
+  --inset: #ebe5f3;
+  --outline: #ddd6ea;
+  --outline-strong: #c3bad6;
+  --scrim: rgb(42 38 56 / 0.25);
+  --rim: rgb(255 255 255 / 0.7);
+  --rim-2: rgb(255 255 255 / 0.8);
+  --rim-3: rgb(255 255 255 / 0.9);
+
+  --on-surface: #2a2638; /* 13.3:1 */
+  --on-surface-muted: #5e5873; /* 6.1:1 on bg, 6.7:1 on white */
+  --on-surface-faint: #8e87a3; /* 3.1:1: disabled and decorative only */
+
+  --primary: #1f7a55; /* mint-deep, 5.3:1 on white */
+  --on-primary: #ffffff;
+  --blocked: #c2306e; /* [U] contrast not measured */
+  --on-blocked: #ffffff;
+  --warning: #b4532a; /* 5.0:1 */
+  --info: #6a4bd1; /* 5.9:1 */
+
+  --mint-container: #b4e4cb;
+  --on-mint-container: #0b2a1c;
+  --peach-container: #f9ccae;
+  --on-peach-container: #3a1e0e;
+  --lilac-container: #d9c8f5;
+  --on-lilac-container: #24123a;
+
+  /* [S][U] deep tones of the same hue order, for fills on white */
+  --series-1: #1f9e6c;
+  --series-2: #7a5ce0;
+  --series-3: #e07a45;
+  --series-4: #d6407f;
+  --series-5: #1f93c9;
+  --series-6: #c99400;
+  --series-other: var(--on-surface-faint);
+
+  --elev-l1: 0 1px 2px rgb(42 38 56 / 0.06), inset 0 0 0 1px var(--rim);
+  --elev-l2: 0 2px 6px rgb(42 38 56 / 0.08), inset 0 0 0 1px var(--rim-2);
+  --elev-l3: 0 8px 24px rgb(42 38 56 / 0.12), inset 0 0 0 1px var(--rim-3);
+  --elev-l4: 0 16px 40px rgb(42 38 56 / 0.16), inset 0 0 0 1px var(--rim-3);
+  --elev-inset: inset 0 1px 0 rgb(42 38 56 / 0.08);
+  --elev-glow: 0 0 24px rgb(31 122 85 / 0.3);
+  --blur-l3: 16px;
+
+  /* Soft wash behind the light theme (P's gradient at 20%) */
+  --wash-a: rgb(251 207 224 / 0.2);
+  --wash-b: rgb(191 197 245 / 0.2);
+}
+
+/* ---------- Derived roles (same formula in both themes) ---------- */
+:root {
+  /* Heatmap: 4 steps per hue = surface-2, 35%, 65%, 100% */
+  --heat-mint-0: var(--surface-2);
+  --heat-mint-1: color-mix(in oklab, var(--series-1) 35%, var(--surface-2));
+  --heat-mint-2: color-mix(in oklab, var(--series-1) 65%, var(--surface-2));
+  --heat-mint-3: var(--series-1);
+  --heat-lilac-0: var(--surface-2);
+  --heat-lilac-1: color-mix(in oklab, var(--series-2) 35%, var(--surface-2));
+  --heat-lilac-2: color-mix(in oklab, var(--series-2) 65%, var(--surface-2));
+  --heat-lilac-3: var(--series-2);
+  --heat-peach-0: var(--surface-2);
+  --heat-peach-1: color-mix(in oklab, var(--series-3) 35%, var(--surface-2));
+  --heat-peach-2: color-mix(in oklab, var(--series-3) 65%, var(--surface-2));
+  --heat-peach-3: var(--series-3);
+
+  /* Selected = accent at 16% */
+  --selected-container: color-mix(in oklab, var(--primary) 16%, transparent);
+  /* Track for thin progress bars (D #404448 [M], lilac tinted) */
+  --track: var(--outline-strong);
+}
