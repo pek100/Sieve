@@ -6,7 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { LEVEL_REQUIRES } from "@/core/policy";
 import { normalizeDoc, readValue } from "@/core/settings/document";
-import { REGISTRY, SETTING_KEYS, isValidValue, settingDef, type SettingDef } from "@/core/settings/registry";
+import { REGISTRY, SECTIONS, SETTING_KEYS, isValidValue, settingDef, type SettingDef } from "@/core/settings/registry";
 import { hits, walk } from "./files";
 
 const defs = SETTING_KEYS.map((k) => [k, settingDef(k)] as const);
@@ -45,6 +45,13 @@ describe("registry law", () => {
     expect(readValue(doc, "apps.pinned")).toEqual([]);
     // Every map and list declares the shape of its elements.
     for (const [key, def] of defs) if (def.kind === "map" || def.kind === "list") expect(def.of, key).toBeDefined();
+  });
+
+  it("every section a setting uses is declared once, and every declared section has a setting", () => {
+    const ids = SECTIONS.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const [key, def] of defs) expect(ids, key).toContain(def.section);
+    for (const id of ids) expect(defs.some(([, d]) => d.section === id), id).toBe(true);
   });
 
   it("keys are dotted section names and their section matches", () => {

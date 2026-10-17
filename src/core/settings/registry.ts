@@ -11,7 +11,16 @@ import { LEVELS, type Level } from "../policy";
 
 export const SETTINGS_SCHEMA = 1;
 
-export type Section = "appearance" | "sampling" | "apps" | "filtering";
+/** Settings sections in the order the settings view shows them; a key's prefix is its section. */
+export const SECTIONS = [
+  { id: "appearance", label: "Appearance" },
+  { id: "sampling", label: "Sampling" },
+  { id: "startup", label: "Startup" },
+  { id: "apps", label: "Apps" },
+  { id: "filtering", label: "Filtering" },
+] as const;
+
+export type Section = (typeof SECTIONS)[number]["id"];
 
 interface Base<T> {
   section: Section;
@@ -20,6 +29,8 @@ interface Base<T> {
   default: T;
   /** Settings key of a data switch that must be on for this one to apply. */
   requires?: string;
+  /** Only the desktop app can apply it (it talks to Windows through a Tauri plugin). */
+  desktopOnly?: boolean;
 }
 
 /** Shape of one element of a map or list setting. */
@@ -99,6 +110,17 @@ export const REGISTRY = {
     step: 500,
     unit: "ms",
   } satisfies NumberSetting,
+  // Not a data switch: it changes no traffic, needs no admin and writes only
+  // the current user's Run entry, through tauri-plugin-autostart, when the
+  // user turns it on (declared exception, docs/conventions.md section 6).
+  "startup.launchAtLogin": {
+    kind: "boolean",
+    section: "startup",
+    label: "Launch at startup",
+    help: "Start Sieve when you sign in to Windows. Adds Sieve to your own startup apps; off removes it.",
+    default: false,
+    desktopOnly: true,
+  } satisfies BooleanSetting,
   "apps.levels": {
     kind: "map",
     section: "apps",

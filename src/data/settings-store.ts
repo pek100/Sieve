@@ -68,6 +68,8 @@ export interface SettingsStore {
   get<K extends SettingKey>(key: K): SettingValue<K>;
   set<K extends SettingKey>(key: K, value: SettingValue<K>): Promise<void>;
   reset(key: SettingKey): Promise<void>;
+  /** Swap in a whole document (import, reset all, their undo) in one write. */
+  replace(doc: SettingsDoc): Promise<void>;
   subscribe(listener: () => void): () => void;
 }
 
@@ -103,6 +105,10 @@ export function createSettingsStore(backend: SettingsBackend): SettingsStore {
     reset: async (key) => {
       await ready;
       return commit(resetValue(doc, key));
+    },
+    replace: async (next) => {
+      await ready;
+      return commit(normalizeDoc(next));
     },
     subscribe(listener) {
       listeners.add(listener);
