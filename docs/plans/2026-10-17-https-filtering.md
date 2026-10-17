@@ -8,6 +8,22 @@ So Sieve filters all traffic by default, the way AdGuard for Windows does: HTTPS
 
 Inputs: `docs/research/2026-10-17-parity/*` (the survey of AdGuard 8.0.5584 at `E:\AdGuard`), `docs/plans/2026-10-17-parity.md`, `docs/conventions.md`, the Wintun spike (branch `worktree-agent-a025d1b361c8851d3`: `spikes/wintun/`, `docs/research/2026-10-17-wintun-spike.md`), and `src-tauri/src/dns/` and `sysdns/` on main at f5775c6. New read-only facts from `E:\AdGuard` are in section 0, paraphrased in my own words.
 
+## Decisions by the user (2026-10-17), these override anything below
+
+| Question | Decision |
+|---|---|
+| AdGuard protection running | Detect it and OFFER TO PAUSE it from Sieve. First find a supported way AdGuard exposes to pause protection (read-only inspection of `E:\AdGuard`); if none exists, the offer stops the AdGuard service with the user's own UAC approval, and the UI says exactly that. Sieve never filters while AdGuard intercepts (probe run 2: every flow became AdguardSvc.exe and Sieve's connections looped). |
+| Sensitive never-decrypt list | WRITE OUR OWN: categories (banking, payments, health, government and military TLDs, password managers, OS update endpoints) plus a curated domain list Sieve owns and ships. AdGuard's unlicensed exclusions list is NOT used. |
+| Sieve's licence | GPL-3.0. |
+| Decryption scope on day one | BROWSERS FIRST (Chrome, Edge, Firefox, Brave, Opera, Vivaldi and other Chromium/Gecko builds, detected from the exe, not a hardcoded list where avoidable). Every other app gets domain-level blocking. Widen to all apps after self-healing exclusions are proven live. |
+| Firefox | YES: set the machine policy so Firefox trusts the Windows store (ImportEnterpriseRoots); remove it on uninstall. |
+| Shared PC | One machine-wide engine; the account that enabled filtering (and admins) owns the log and settings. |
+| Root certificate | 1-year lifetime, SILENT ROTATION a month before expiry; the old root is removed after the switch; status in Settings > Filtering. |
+| Scriptlet resources | SEPARATE SIGNED UPDATE checked daily and verified against a published hash, independent of app releases. |
+| Health sites | Covered by our own list's health category. |
+
+Live probe results (slice 0, done): runs 3 and 4 with AdGuard paused proved per-flow app attribution, live QUIC SNI decoding, per-app blocking (one domain dropped for curl.exe, passed for a copy) and clean teardown. The spike's fixes (multicast filter, source-address pinning, bounded shutdown) are on branch `worktree-agent-a025d1b361c8851d3`.
+
 How to read this: every section states decisions and the reason for each. "UNVERIFIED" marks claims that only a live run can settle. "PROBE" marks the ones the Wintun probe settles.
 
 ## 0. Evidence from the installed AdGuard (new, read only)
