@@ -374,6 +374,28 @@ export function parseSystemDns(raw: unknown): SystemDnsState {
   };
 }
 
+/**
+ * An app's icon (Rust `icons::AppIcon`, command `app_icon`): PNG bytes,
+ * base64, at 32 px (x1) and 64 px (x2, HiDPI). Fetched per app, never part
+ * of a snapshot.
+ */
+export interface AppIcon {
+  x1: string;
+  x2: string;
+}
+
+const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/**
+ * An icon answer, or null for "no icon" and for anything malformed: an icon
+ * is decoration, so a bad one shows the monogram instead of an error.
+ */
+export function parseAppIcon(x: unknown): AppIcon | null {
+  if (!isRec(x)) return null;
+  const { x1, x2 } = x;
+  return typeof x1 === "string" && typeof x2 === "string" && BASE64.test(x1) && BASE64.test(x2) ? { x1, x2 } : null;
+}
+
 /** Validate an untrusted value as a v1 Snapshot. Throws ProtocolError. */
 export function parseSnapshot(x: unknown): Snapshot {
   if (!isRec(x)) throw new ProtocolError("snapshot must be an object");

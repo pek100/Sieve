@@ -31,6 +31,9 @@ hickory-proto = "0.26"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
+# App icons (src/icons): the shell's icon of an exe, encoded as PNG for the UI.
+png = "0.18"
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -39,15 +42,18 @@ tempfile = "3"
 # service names of a process whose exe Windows hides (EnumServicesStatusExW
 # with SC_MANAGER_ENUMERATE_SERVICE, no admin); adapter DNS servers
 # (GetAdaptersAddresses), the Tcpip NameServer registry values and the process
-# list (sysdns). The one write: sysdns runs one PowerShell script elevated
+# list (sysdns); app icons (icons: SHCreateItemFromParsingName and
+# IShellItemImageFactory under COM, the bitmap read with GetDIBits). The one write: sysdns runs one PowerShell script elevated
 # (ShellExecuteExW "runas", the user approves the UAC prompt).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Registry",
     "Win32_System_Services",

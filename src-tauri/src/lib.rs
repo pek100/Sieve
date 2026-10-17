@@ -10,6 +10,7 @@
 pub mod commands;
 pub mod dns;
 pub mod history;
+pub mod icons;
 pub mod netstat;
 pub mod protocol;
 pub mod sysdns;
@@ -27,6 +28,7 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             app.manage(history::HistoryState::open_at(&dir));
+            app.manage(icons::IconStore::open_at(&dir));
             tray::install(app)?;
             Ok(())
         })
@@ -36,6 +38,7 @@ pub fn run() {
             commands::history_buckets,
             commands::tray_set_state,
             commands::app_quit,
+            icons::commands::app_icon,
             dns::commands::dns_start,
             dns::commands::dns_stop,
             dns::commands::dns_status,

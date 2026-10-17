@@ -12,6 +12,7 @@ import { GRAINS, grainMs, type HistoryQuery } from "@/core/history";
 import type { Flow, History, ProcessInfo, Snapshot } from "./protocol";
 import { PROTOCOL_VERSION } from "./protocol";
 import { hash01, mulberry32 } from "./prng";
+import { mockIcon } from "./mock-icons";
 import type { SieveSource } from "./source";
 
 export const MOCK_SCENARIOS = ["steady", "busy", "empty", "error"] as const;
@@ -78,9 +79,11 @@ export interface MockOptions {
   scenario?: MockScenario;
   /** Clock for snapshot `t`. Tests pass a fake; content never depends on it. */
   now?: () => number;
+  /** Generated icons for apps outside the Windows dir (?icons=1); otherwise none, so the UI shows monograms. */
+  icons?: boolean;
 }
 
-export function createMockSource({ seed, scenario = "steady", now = Date.now }: MockOptions): SieveSource {
+export function createMockSource({ seed, scenario = "steady", now = Date.now, icons = false }: MockOptions): SieveSource {
   const rand = mulberry32(seed);
   const scale = scenario === "busy" ? 2.5 : scenario === "empty" ? 0 : 1;
 
@@ -200,6 +203,9 @@ export function createMockSource({ seed, scenario = "steady", now = Date.now }: 
     async history(q: HistoryQuery): Promise<History> {
       if (scenario === "error") throw new Error("Mock source: scenario error (no data on purpose)");
       return mockHistory(q, { seed, scale, now: now() });
+    },
+    async appIcon(exe: string) {
+      return icons && !/^[a-z]:\\windows\\/i.test(exe) ? mockIcon(exe) : null;
     },
   };
 }

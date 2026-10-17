@@ -2,6 +2,7 @@
 
 import { CalendarDays } from "lucide-react";
 import { useState } from "react";
+import { FloatingTooltip } from "@/components/sieve/primitives/floating-tooltip";
 import { Card, type CardState } from "@/components/sieve/shell/card";
 import { WEEKDAYS, type HeatCell, type HeatGrid } from "@/core/heat";
 import { cn } from "@/lib/utils";
@@ -51,18 +52,16 @@ export function Heatmap({
           >
             {WEEKDAYS.map((d, day) => (
               <div key={d} className="contents">
-                <span aria-hidden="true" className="flex items-center pr-2 text-caption text-on-surface-faint">
+                <span aria-hidden="true" data-day-label="" className="flex items-center pr-2 text-caption text-on-surface-faint">
                   {d}
                 </span>
                 {grid.cells.slice(day * 24, day * 24 + 24).map((c) => (
                   <span
                     key={c.hour}
                     data-step={c.step}
-                    title={describe(c)}
-                    onPointerEnter={(e) => {
-                      const el = e.currentTarget;
-                      setHover({ cell: c, x: el.offsetLeft + el.offsetWidth / 2, y: el.offsetTop });
-                    }}
+                    data-day={day}
+                    data-hour={c.hour}
+                    onPointerMove={(e) => setHover({ cell: c, x: e.clientX, y: e.clientY })}
                     className={cn("min-h-2 rounded-xs", STEP_BG[c.step])}
                   />
                 ))}
@@ -70,18 +69,15 @@ export function Heatmap({
             ))}
             <span aria-hidden="true" />
             {Array.from({ length: 24 }, (_, h) => (
-              <span key={h} aria-hidden="true" className="text-caption text-on-surface-faint tabular">
+              <span key={h} aria-hidden="true" data-hour-label={h % 6 === 0 ? h : undefined} className="text-caption text-on-surface-faint tabular">
                 {h % 6 === 0 ? h : ""}
               </span>
             ))}
+            {/* In a portal, fixed, beside the pointer and kept inside the window: never widens the page. */}
             {hover && (
-              <div
-                role="tooltip"
-                className="pointer-events-none absolute z-10 w-max max-w-64 -translate-x-1/2 -translate-y-[calc(100%+8px)] rounded-md bg-surface-3 px-3 py-2 text-label text-on-surface shadow-l3"
-                style={{ left: hover.x, top: hover.y }}
-              >
+              <FloatingTooltip x={hover.x} y={hover.y} data-heat-tooltip="">
                 {describe(hover.cell)}
-              </div>
+              </FloatingTooltip>
             )}
           </div>
           <div aria-hidden="true" className="flex items-center justify-end gap-1 text-caption text-on-surface-faint">

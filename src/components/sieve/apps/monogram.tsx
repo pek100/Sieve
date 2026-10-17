@@ -23,7 +23,7 @@ export function initials(name: string): string {
   return (words.slice(0, 2).map((w) => w[0]).join("") || "?").toUpperCase();
 }
 
-/** App icon stand-in: a monogram on the app's series tint (Sieve has no app icons yet). */
+/** The stand-in for an app's icon (AppIcon's fallback, while it loads or when the exe has none): a monogram on the app's tint. */
 export function Monogram({ appKey, name, size = 32 }: { appKey: string; name: string; size?: 32 | 40 }) {
   return (
     <span

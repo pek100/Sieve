@@ -24,6 +24,16 @@ describe("tauri source (seam law: validated, never silently empty)", () => {
     expect(calls).toEqual(["net_snapshot", "history_record"]);
   });
 
+  it("asks app_icon with the exe path; a malformed or empty answer is no icon, never an error", async () => {
+    const asked: unknown[] = [];
+    const answers: unknown[] = [{ x1: "iVBORw0KGgo=", x2: "iVBORw0KGgo=" }, null, { x1: 3 }, "garbage", { x1: "not base64!", x2: "x" }];
+    const invoke = ((cmd: string, args?: Record<string, unknown>) => (asked.push([cmd, args]), Promise.resolve(answers.shift()))) as Invoke;
+    const src = createTauriSource(invoke);
+    await expect(src.appIcon("C:\\A\\a.exe")).resolves.toEqual({ x1: "iVBORw0KGgo=", x2: "iVBORw0KGgo=" });
+    for (let i = 0; i < 4; i++) await expect(src.appIcon("C:\\A\\a.exe")).resolves.toBeNull();
+    expect(asked[0]).toEqual(["app_icon", { exePath: "C:\\A\\a.exe" }]);
+  });
+
   it("throws a ProtocolError naming both versions on a version mismatch", async () => {
     const src = createTauriSource(fake(async () => ({ ...fixture, v: 2 })));
     const err = await src.sample().then(

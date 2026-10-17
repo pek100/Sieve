@@ -6,7 +6,7 @@ import { trackedSnapshot } from "@/core/apps";
 import { historySeries, hourActivity, periodQuery, trackedHistory, type HistoryQuery } from "@/core/history";
 import type { History, Snapshot } from "@/data/protocol";
 import { kpis, type Kpi } from "@/core/kpis";
-import { createSlotKeeper, windowSnapshots, type SeriesModel } from "@/core/series";
+import { buildSeries, createSlotKeeper, windowSnapshots, type SeriesModel, type SeriesSet } from "@/core/series";
 import type { SieveState } from "@/core/store";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useSieve, useTracking } from "@/hooks/use-sieve";
@@ -41,34 +41,8 @@ export function liveWindow(choice: WindowChoice): WindowChoice {
   return isHistoryWindow(choice) ? "session" : choice;
 }
 
-/** The shortest span the chart shows, in samples: below this a view is mostly noise. */
-export const MIN_VIEW_SAMPLES = 16;
-
-/**
- * The span the chart shows: the window halved as often as the data kept so
- * far still fits, but never below MIN_VIEW_SAMPLES intervals. Past that floor
- * the data always fills at least half the plot, so right after start the
- * chart is never a sliver at the right edge. The x scale changes only when
- * the span doubles, and the chart animates that as a rescale of the same
- * paths (see activity-chart.tsx).
- */
-export function viewMs(choice: WindowChoice, dataSpanMs: number, intervalMs = 1000): number {
-  const floor = MIN_VIEW_SAMPLES * Math.max(1, intervalMs);
-  let v = windowMs(choice);
-  while (v / 2 >= dataSpanMs && v / 2 >= floor) v /= 2;
-  return v;
-}
-
-const selectSpan = (s: SieveState) => (s.snapshots.length ? s.snapshots[s.snapshots.length - 1].t - s.snapshots[0].t : 0);
 const selectSnapshots = (s: SieveState) => s.snapshots;
 const selectInterval = (s: SieveState) => s.intervalMs;
-
-/** The chart and KPI span for a window choice. */
-export function useViewMs(choice: WindowChoice): number {
-  const span = useSieve(selectSpan);
-  const intervalMs = useSieve(selectInterval);
-  return viewMs(choice, span, intervalMs);
-}
 
 /** Declare the window to the store (sizes the ring) for as long as Home shows it. */
 export function useDeclaredWindow(choice: WindowChoice) {
@@ -84,12 +58,23 @@ export function useTrackedSnapshots(): readonly Snapshot[] {
   return useMemo(() => (off.size === 0 ? snapshots : snapshots.map((s) => trackedSnapshot(s, off))), [snapshots, off]);
 }
 
-/** The per-app series for the window; colours stay sticky across ticks. */
-export function useSeriesModel(ms: number): SeriesModel {
+/**
+ * The chart's series set, derived once from what every window shares: the
+ * live session (Home keeps the whole session in the ring). Every window, live
+ * or history, draws this set, so switching the window changes only the time
+ * range. Colours stay sticky across ticks.
+ */
+export function useSeriesSet(): SeriesSet {
+  const snapshots = useTrackedSnapshots();
+  const [keeper] = useState(createSlotKeeper);
+  return useMemo(() => keeper.set(snapshots), [keeper, snapshots]);
+}
+
+/** The live chart model for a window, drawing `set`. */
+export function useSeriesModel(ms: number, set: SeriesSet): SeriesModel {
   const snapshots = useTrackedSnapshots();
   const intervalMs = useSieve(selectInterval);
-  const [keeper] = useState(createSlotKeeper);
-  return useMemo(() => keeper.build(snapshots, { windowMs: ms, intervalMs }), [keeper, snapshots, ms, intervalMs]);
+  return useMemo(() => buildSeries(snapshots, { windowMs: ms, intervalMs }, set), [snapshots, ms, intervalMs, set]);
 }
 
 export function useKpis(ms: number): Kpi[] | null {
@@ -155,22 +140,22 @@ export function useHeat(): HistoryState {
   return useHistory(heatQuery, fold);
 }
 
-/** The chart model for a history period (24 h, 7 d, 14 d); colours stay sticky across refreshes. */
-export function useHistoryModel(choice: WindowChoice): Loaded<{ model: SeriesModel }> {
+/**
+ * The chart model for a history period (24 h, 7 d, 14 d), drawing `set`. The
+ * fold keeps the raw answer; the model is made from it and the current set,
+ * so a new set (a live tick that reranks) never needs a new read.
+ */
+export function useHistoryModel(choice: WindowChoice, set: SeriesSet): Loaded<{ model: SeriesModel }> {
   const history = isHistoryWindow(choice);
   const ms = windowMs(choice);
-  const slots = useRef<Readonly<Record<string, number>>>({});
   const query = useMemo(() => (history ? (to: number) => periodQuery(ms, to) : null), [history, ms]);
   const { off } = useTracking();
-  const fold = useCallback(
-    (h: History) => {
-      const model = historySeries(trackedHistory(h, off), { periodMs: ms, previousSlots: slots.current });
-      slots.current = model.slots;
-      return { model };
-    },
-    [ms, off],
+  const fold = useCallback((h: History, q: HistoryQuery) => ({ history: trackedHistory(h, off), to: q.to }), [off]);
+  const read = useHistory(query, fold);
+  return useMemo<Loaded<{ model: SeriesModel }>>(
+    () => (read.kind === "ready" ? { kind: "ready", model: historySeries(read.history, { periodMs: ms, to: read.to }, set) } : read),
+    [read, ms, set],
   );
-  return useHistory(query, fold);
 }
 
 function prefersReducedMotion(): boolean {

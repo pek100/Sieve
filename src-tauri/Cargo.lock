@@ -3248,6 +3248,7 @@ name = "sieve"
 version = "0.1.0"
 dependencies = [
  "hickory-proto",
+ "png 0.18.1",
  "reqwest",
  "rusqlite",
  "serde",

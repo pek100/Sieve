@@ -62,19 +62,14 @@ test.describe("home", () => {
     expect(Math.abs(chart.y - kpis.y)).toBeLessThan(2);
     expect(chart.width).toBeGreaterThan(kpis.width * 1.8);
 
-    // First minute: the data already spans a good part of the plot, not a sliver at the right edge.
-    const fill = await r.chart.evaluate((el) => {
-      const plot = el.querySelector("svg[data-chart-plot]")!.getBoundingClientRect();
-      const line = el.querySelector('path[data-part="line"]')!.getBoundingClientRect();
-      return line.width / plot.width;
-    });
-    expect(fill).toBeGreaterThan(0.3);
+    // First minute: the plot shows the whole 5 min window and says plainly where the data starts.
+    await expect(r.chart.locator("[data-data-start]")).toContainText(/^Sieve started \d/);
 
     await page.screenshot({ path: "test-results/screens/home-desktop.png" });
     expect(errors).toEqual([]);
   });
 
-  test("at 960x800 the grid is two columns", async ({ page }, info) => {
+  test("at 960x800 the grid is the same two columns, 8 and 4", async ({ page }, info) => {
     test.skip(info.project.name !== "desktop", "desktop project resizes to 960");
     await page.setViewportSize({ width: 960, height: 800 });
     await openHome(page);
@@ -83,10 +78,12 @@ test.describe("home", () => {
     const kpis = (await r.kpis.boundingBox())!;
     const top = (await r.top.boundingBox())!;
     const chart = (await r.chart.boundingBox())!;
-    // KPI block and top apps share a row, side by side, each about half the width.
-    expect(Math.abs(kpis.y - top.y)).toBeLessThan(2);
-    expect(top.x).toBeGreaterThan(kpis.x + kpis.width);
-    expect(Math.abs(kpis.width - top.width)).toBeLessThan(2);
+    const heat = (await r.heat.boundingBox())!;
+    // The KPI block beside the chart, top apps beside the heatmap, on one split line.
+    expect(Math.abs(kpis.y - chart.y)).toBeLessThan(2);
+    expect(Math.abs(top.y - heat.y)).toBeLessThan(2);
+    expect(Math.abs(kpis.x - top.x)).toBeLessThan(2);
+    expect(kpis.x).toBeGreaterThan(chart.x + chart.width);
     expect(chart.width).toBeGreaterThan(kpis.width * 1.9);
     const sw = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     expect(sw).toBeLessThanOrEqual(0);
@@ -194,8 +191,8 @@ test.describe("home", () => {
       expect(b.x + b.width).toBeLessThanOrEqual(x1);
     }
     await page.screenshot({ path: `test-results/screens/home-tooltip-${info.project.name}.png` });
-    // It follows the cursor.
-    const x2 = plot.x + plot.width / 2;
+    // It follows the cursor (still over the data: in the first seconds it covers only the right edge of the 5 min window).
+    const x2 = plot.x + plot.width - 10;
     await page.mouse.move(x2, y1 + 20);
     await expect.poll(async () => (await tip.boundingBox())!.y).toBeGreaterThan(b.y);
     b = (await tip.boundingBox())!;

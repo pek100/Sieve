@@ -29,22 +29,26 @@ export function TopBar() {
     return { href: r.href, label: r.label, icon: <Icon strokeWidth={1.75} /> };
   });
   return (
-    <header
-      data-tauri-drag-region
-      className={
-        // Under 480 the side columns stop being equal: the right cluster (switch, theme)
-        // takes its own width and the nav centres in what is left, so nothing overlaps.
-        "sticky top-0 z-40 grid h-14 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3 bg-bg px-6 max-[640px]:gap-2 max-[640px]:px-4 max-[480px]:grid-cols-[auto_minmax(0,1fr)_auto] max-[480px]:justify-items-center"
-      }
-    >
-      <div data-tauri-drag-region className="flex min-w-0 items-center">
-        <Wordmark />
-      </div>
-      <SegmentedNav items={items} active={active?.href} label="Main" />
-      <div data-tauri-drag-region className="flex min-w-0 items-center justify-end gap-2 max-[640px]:gap-1">
-        <MasterSwitch />
-        <ThemeMenu />
-        <WindowControls />
+    <header data-tauri-drag-region className="relative z-40 h-14 shrink-0 bg-bg pr-(--scrollbar-w)">
+      <div
+        data-tauri-drag-region
+        className={
+          // The page container (globals.css), short of the content area's scrollbar gutter on the right
+          // (pr-(--scrollbar-w)), so the logo starts on the page title's line and the right
+          // cluster ends on the header actions' line. Under 480 the side columns stop being equal:
+          // the right cluster takes its own width and the nav centres in what is left.
+          "page-container grid h-full grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3 max-[640px]:gap-2 max-[480px]:grid-cols-[auto_minmax(0,1fr)_auto] max-[480px]:justify-items-center"
+        }
+      >
+        <div data-tauri-drag-region className="flex min-w-0 items-center">
+          <Wordmark />
+        </div>
+        <SegmentedNav items={items} active={active?.href} label="Main" />
+        <div data-tauri-drag-region className="flex min-w-0 items-center justify-end gap-2 max-[640px]:gap-1">
+          <MasterSwitch />
+          <ThemeMenu />
+          <WindowControls />
+        </div>
       </div>
     </header>
   );

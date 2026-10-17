@@ -61,6 +61,26 @@ export function groupApps(snapshot: Snapshot): AppGroup[] {
   return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** The exe whose icon stands for an app: its first exe (exes are sorted), or null when Windows hides them all. */
+export function iconExe(app: Pick<AppGroup, "exes">): string | null {
+  return app.exes[0] ?? null;
+}
+
+const iconCache = new WeakMap<Snapshot, ReadonlyMap<string, string>>();
+
+/** Every app's icon exe in a snapshot, by app key (apps with no readable exe are left out). */
+export function iconExes(snapshot: Snapshot): ReadonlyMap<string, string> {
+  const hit = iconCache.get(snapshot);
+  if (hit) return hit;
+  const out = new Map<string, string>();
+  for (const g of groupApps(snapshot)) {
+    const exe = iconExe(g);
+    if (exe !== null) out.set(g.key, exe);
+  }
+  iconCache.set(snapshot, out);
+  return out;
+}
+
 const WINDOWS_DIR = /^[a-z]:\\windows\\/i;
 
 function samePath(a: string, b: string): boolean {

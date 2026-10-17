@@ -45,7 +45,8 @@ export function Card({
       aria-busy={state.kind === "loading" || undefined}
       className={cn("flex min-w-0 flex-col gap-3 text-on-surface", className)}
     >
-      <header className="flex min-h-9 flex-wrap items-center gap-2">
+      {/* Header rows in one grid row share a height (--section-header-h), so titles share a top and a baseline. */}
+      <header className="flex min-h-(--section-header-h) flex-wrap items-center gap-2">
         {icon && <SectionIcon tone={tone}>{icon}</SectionIcon>}
         {/* flex-auto (basis = text width) so a header too narrow for title and action wraps the action to a second line */}
         <h2 className="min-w-0 flex-auto truncate text-title">{title}</h2>

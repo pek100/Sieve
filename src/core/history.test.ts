@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createMockSource } from "@/data/mock-source";
 import type { History } from "@/data/protocol";
 import { GRAINS, grainFor, historySeries, hourActivity, periodQuery, trackedHistory } from "./history";
-import { MAX_POINTS, OTHER_KEY, SERIES_COUNT } from "./series";
+import { EMPTY_SET, MAX_POINTS, OTHER_KEY, rankSeries, SERIES_COUNT } from "./series";
 
 const MIN = 60_000;
 const HOUR = 3_600_000;
@@ -65,7 +65,7 @@ describe("history folds", () => {
   it("the chart model averages per sample, names the top apps and folds the rest into Other", () => {
     const apps: [number, string, number][] = [];
     for (let i = 0; i < SERIES_COUNT + 2; i++) apps.push([0, `app${i}`, (i + 1) * 60]);
-    const m = historySeries(h([[0, 60]], apps), { periodMs: 7 * DAY });
+    const m = historySeries(h([[0, 60]], apps), { periodMs: 7 * DAY, to: DAY }, EMPTY_SET);
     expect(m.series.filter((s) => s.key !== OTHER_KEY)).toHaveLength(SERIES_COUNT);
     expect(m.series.at(-1)?.key).toBe(OTHER_KEY);
     expect(m.points).toHaveLength(1);
@@ -77,16 +77,29 @@ describe("history folds", () => {
     expect(m.bucketMs).toBe(HOUR);
   });
 
-  it("slots stay sticky across refreshes", () => {
-    const one = historySeries(h([[0, 1]], [[0, "a", 5], [0, "b", 4]]), { periodMs: DAY });
-    const two = historySeries(h([[0, 1]], [[0, "b", 9], [0, "a", 5]]), { periodMs: DAY, previousSlots: one.slots });
-    expect(two.slots).toEqual(one.slots);
+  it("draws the live session's set: same series and order; an app with no saved data is flat, others fold into Other", () => {
+    const set = rankSeries(
+      new Map([
+        ["a", 10],
+        ["z", 8],
+      ]),
+      new Map([
+        ["a", "A"],
+        ["z", "Z"],
+      ]),
+      {},
+    );
+    const m = historySeries(h([[0, 2]], [[0, "a", 4], [0, "b", 6]]), { periodMs: DAY, to: DAY }, set);
+    expect(m.series).toBe(set.series);
+    expect(m.series.map((s) => s.key)).toEqual(["a", "z", OTHER_KEY]);
+    expect(m.points[0].values).toEqual({ a: 2, z: 0, [OTHER_KEY]: 3 });
+    expect(m.end).toBe(DAY);
   });
 
   it("the 24 h, 7 d and 14 d mock periods all draw named series", async () => {
     const src = createMockSource({ seed: 1, now: () => NOW });
     for (const period of [DAY, 7 * DAY, 14 * DAY]) {
-      const m = historySeries(await src.history(periodQuery(period, NOW)), { periodMs: period });
+      const m = historySeries(await src.history(periodQuery(period, NOW)), { periodMs: period, to: NOW }, EMPTY_SET);
       expect(m.series.length).toBeGreaterThan(1);
       expect(m.points.length).toBeGreaterThan(80);
       expect(m.points.length).toBeLessThanOrEqual(MAX_POINTS);
@@ -101,7 +114,7 @@ describe("trackedHistory", () => {
     const out = trackedHistory(hist, new Set(["a"]));
     expect(out.apps.map((x) => x.app)).toEqual(["b"]);
     expect(out.samples).toEqual(hist.samples);
-    expect(historySeries(out, { periodMs: HOUR }).series.map((x) => x.key)).toEqual(["b"]);
+    expect(historySeries(out, { periodMs: HOUR, to: HOUR }, EMPTY_SET).series.map((x) => x.key)).toEqual(["b", OTHER_KEY]);
     expect(trackedHistory(hist, new Set())).toBe(hist);
   });
 });

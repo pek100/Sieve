@@ -15,7 +15,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type { HistoryQuery } from "@/core/history";
 import { trackedSnapshot } from "@/core/apps";
 import { tickCounts } from "@/core/series";
-import { PROTOCOL_VERSION, ProtocolError, parseHistory, parseSnapshot, type History, type HistoryRecord, type Snapshot } from "./protocol";
+import { PROTOCOL_VERSION, ProtocolError, parseAppIcon, parseHistory, parseSnapshot, type History, type HistoryRecord, type Snapshot } from "./protocol";
 import type { SieveSource } from "./source";
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -63,6 +63,9 @@ export function createTauriSource(invoke: Invoke = tauriInvoke, untracked: () =>
     async history(query: HistoryQuery): Promise<History> {
       if (writeError !== null) throw new Error(`History is not being saved: ${writeError}`);
       return parseHistory(await invoke<unknown>("history_buckets", { query }));
+    },
+    async appIcon(exe: string) {
+      return parseAppIcon(await invoke<unknown>("app_icon", { exePath: exe }));
     },
   };
 }

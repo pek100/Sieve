@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import fixture from "@/data/fixtures/snapshot-v1.json";
 import type { Snapshot } from "@/data/protocol";
-import { category, groupApps, isActiveFlow, isSieved, trackedSnapshot } from "./apps";
+import { category, groupApps, iconExe, iconExes, isActiveFlow, isSieved, trackedSnapshot } from "./apps";
 
 const snapshot = fixture as Snapshot;
 
@@ -66,5 +66,16 @@ describe("trackedSnapshot (the one place per-app Off applies)", () => {
     expect(trackedSnapshot(snapshot, new Set())).toBe(snapshot);
     const off = new Set(["google chrome"]);
     expect(trackedSnapshot(snapshot, off)).toBe(trackedSnapshot(snapshot, off));
+  });
+});
+
+describe("app icons by app", () => {
+  it("an app's icon is its first exe's; apps whose exes Windows hides have none", () => {
+    expect(iconExe({ exes: ["C:\\b\\b.exe", "C:\\a\\a.exe"].sort() })).toBe("C:\\a\\a.exe");
+    expect(iconExe({ exes: [] })).toBeNull();
+    const map = iconExes(snapshot);
+    for (const g of groupApps(snapshot)) expect(map.get(g.key) ?? null).toBe(g.exes[0] ?? null);
+    // Cached per snapshot: the same map back.
+    expect(iconExes(snapshot)).toBe(map);
   });
 });

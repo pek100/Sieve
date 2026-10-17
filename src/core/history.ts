@@ -10,7 +10,7 @@
  */
 import type { History } from "@/data/protocol";
 import type { HourActivity } from "./heat";
-import { bucketSize, rankSeries, type SeriesModel, type SeriesPoint, OTHER_KEY } from "./series";
+import { bucketSize, rankSeries, type SeriesModel, type SeriesPoint, type SeriesSet, OTHER_KEY } from "./series";
 
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
@@ -75,21 +75,25 @@ const round2 = (x: number) => Math.round(x * 100) / 100;
 
 /**
  * The Home chart model for a history period: one point per sampled bucket,
- * each app's mean active connections over the bucket's samples. Ranking,
- * slots and the Other fold are the live chart's (rankSeries), so the two
- * views of the chart cannot disagree on who is named.
+ * each app's mean active connections over the bucket's samples. The series
+ * are `set`, the live session's series set, so a period names, orders and
+ * colours exactly what the live windows do (an app with no saved data draws
+ * flat at zero, apps outside the set go to Other). Only with no live session
+ * to rank by (an empty set) does the period rank its own apps, with the same
+ * rankSeries.
  */
-export function historySeries(
-  h: History,
-  o: { periodMs: number; previousSlots?: Readonly<Record<string, number>> },
-): SeriesModel {
-  const totals = new Map<string, number>();
-  const names = new Map<string, string>();
-  for (const a of h.apps) {
-    totals.set(a.app, (totals.get(a.app) ?? 0) + a.flows);
-    names.set(a.app, a.name);
+export function historySeries(h: History, o: { periodMs: number; to: number }, set: SeriesSet): SeriesModel {
+  let named = set;
+  if (named.series.length === 0) {
+    const totals = new Map<string, number>();
+    const names = new Map<string, string>();
+    for (const a of h.apps) {
+      totals.set(a.app, (totals.get(a.app) ?? 0) + a.flows);
+      names.set(a.app, a.name);
+    }
+    named = rankSeries(totals, names, {});
   }
-  const { series, slots, top } = rankSeries(totals, names, o.previousSlots ?? {});
+  const { series, top } = named;
   const byBucket = new Map<number, Record<string, number>>();
   for (const a of h.apps) {
     const key = top.has(a.app) ? a.app : OTHER_KEY;
@@ -105,5 +109,5 @@ export function historySeries(
       for (const d of series) values[d.key] = round2((row[d.key] ?? 0) / s.n);
       return { t: s.t, values };
     });
-  return { series, points, bucketMs: h.step, windowMs: o.periodMs, slots };
+  return { series, points, bucketMs: h.step, windowMs: o.periodMs, end: o.to };
 }

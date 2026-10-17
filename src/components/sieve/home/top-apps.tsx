@@ -2,10 +2,12 @@
 
 import { ListOrdered } from "lucide-react";
 import { useMemo } from "react";
+import { AppIcon } from "@/components/sieve/primitives/app-icon";
 import { Card, type CardState } from "@/components/sieve/shell/card";
 import { trackedSnapshot } from "@/core/apps";
 import { SERIES_COUNT, tickCounts } from "@/core/series";
 import { newest, type SieveState } from "@/core/store";
+import { useIconExes } from "@/hooks/use-app-icon";
 import { useSieve, useTracking } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
 import { seriesTone } from "./series-tone";
@@ -29,6 +31,7 @@ export function monogram(name: string): string {
 export function TopApps({ slots, base, className }: { slots: Readonly<Record<string, number>>; base: CardState; className?: string }) {
   const snap = useSieve(selectNewest);
   const { off } = useTracking();
+  const exes = useIconExes();
   const apps = useMemo<TopApp[]>(() => {
     if (!snap) return [];
     // Apps turned off are not tracked (apps.trackedSnapshot).
@@ -50,12 +53,9 @@ export function TopApps({ slots, base, className }: { slots: Readonly<Record<str
             const tone = seriesTone(a.slot);
             return (
               <li key={a.key} data-app={a.key} className="flex h-9 items-center gap-3">
-                <span
-                  aria-hidden="true"
-                  className={cn("inline-flex size-8 shrink-0 items-center justify-center rounded-sm text-label", tone.soft, tone.text)}
-                >
-                  {monogram(a.name)}
-                </span>
+                <AppIcon exe={exes.get(a.key) ?? null}>
+                  <span className={cn("inline-flex size-8 items-center justify-center rounded-sm text-label", tone.soft, tone.text)}>{monogram(a.name)}</span>
+                </AppIcon>
                 <div className="flex min-w-0 flex-1 flex-col gap-1">
                   <span className="truncate text-body-strong text-on-surface">{a.name}</span>
                   <span aria-hidden="true" className="h-1 overflow-hidden rounded-full bg-track">
@@ -65,7 +65,7 @@ export function TopApps({ slots, base, className }: { slots: Readonly<Record<str
                     />
                   </span>
                 </div>
-                <span className="w-16 shrink-0 text-right text-label text-on-surface-muted tabular">
+                <span data-count="" className="w-16 shrink-0 text-right text-label text-on-surface-muted tabular">
                   {a.count} <span className="sr-only">active connections</span>
                 </span>
               </li>

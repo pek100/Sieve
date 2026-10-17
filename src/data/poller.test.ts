@@ -53,6 +53,9 @@ function scriptedSource(results: Array<Snapshot | Error>): SieveSource & { calls
     async history(q: HistoryQuery): Promise<History> {
       return { v: 1, grain: q.grain, step: q.step, samples: [], apps: [] };
     },
+    async appIcon() {
+      return null;
+    },
   };
   return src;
 }
@@ -133,6 +136,7 @@ describe("poller (seam law: single writer, cadence, pause, errors keep data)", (
       kind: "mock",
       sample: () => new Promise<Snapshot>((r) => (release = r)),
       history: async (q) => ({ v: 1, grain: q.grain, step: q.step, samples: [], apps: [] }),
+      appIcon: async () => null,
     };
     const p = createPoller({ source: slow, store, clock: fc.clock });
     p.start();

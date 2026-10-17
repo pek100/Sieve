@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { tooltipPosition } from "./activity-chart";
+import { tooltipPosition } from "@/components/sieve/primitives/floating-tooltip";
 
 const VW = 1280;
 const VH = 800;

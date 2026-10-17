@@ -11,7 +11,7 @@ import type { SeriesDef, SeriesModel } from "@/core/series";
 import { cn } from "@/lib/utils";
 import { ActivityChart } from "./activity-chart";
 import { seriesTone } from "./series-tone";
-import { isHistoryWindow, WINDOWS, windowMs, type WindowChoice } from "./use-home";
+import { isHistoryWindow, WINDOWS, type WindowChoice } from "./use-home";
 
 /** Legend chips double as toggles: off shows a hollow swatch and a muted label. */
 export function ChartLegend({
@@ -29,14 +29,14 @@ export function ChartLegend({
         const on = !hidden.has(s.key);
         const tone = seriesTone(s.slot);
         return (
-          <li key={s.key}>
+          <li key={s.key} className="max-w-full min-w-0">
             <button
               type="button"
               aria-pressed={on}
               title={on ? `Hide ${s.name}` : `Show ${s.name}`}
               onClick={() => onToggle(s.key)}
               className={cn(
-                "relative inline-flex h-7 max-w-40 items-center gap-2 overflow-hidden rounded-full bg-surface-2 px-3 text-label transition-colors duration-(--motion-fast) ease-standard",
+                "relative inline-flex h-7 max-w-full items-center gap-2 overflow-hidden rounded-full bg-surface-2 px-3 text-label transition-colors duration-(--motion-fast) ease-standard",
                 on ? "text-on-surface" : "text-on-surface-faint",
               )}
             >
@@ -60,6 +60,7 @@ export function ChartCard({
   choice,
   onChoice,
   base,
+  loading,
   className,
 }: {
   model: SeriesModel;
@@ -67,6 +68,8 @@ export function ChartCard({
   onChoice: (c: WindowChoice) => void;
   /** Loading or error decided by the screen; ready means draw the data. */
   base: CardState;
+  /** A period is being read: the chart keeps its series and span, with no points yet. */
+  loading: boolean;
   className?: string;
 }) {
   const [hidden, setHidden] = useState<ReadonlySet<string>>(() => new Set());
@@ -129,11 +132,11 @@ export function ChartCard({
     >
       <div className="flex min-h-0 flex-1 flex-col gap-3">
         <ChartLegend series={model.series} hidden={hidden} onToggle={toggle} />
-        {/* Keyed by the window choice only: a view step on a live tick rescales the same paths. */}
+        {/* Never keyed: a window switch rescales the same paths, so only the time range changes. */}
         <ActivityChart
-          key={choice}
           model={model}
-          baseMs={windowMs(choice)}
+          source={isHistoryWindow(choice) ? "history" : "live"}
+          empty={loading ? null : isHistoryWindow(choice) ? "No history for this period yet" : "No samples in this window yet"}
           hidden={hidden}
           className="h-44 three:h-auto three:flex-1"
         />

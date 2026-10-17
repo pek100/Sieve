@@ -20,15 +20,27 @@
   --space-8: 32px;
   --space-10: 40px;
 
-  /* Layout [S] */
+  /* Layout grid [S]: one for every page (the user: "alignment, alignment, alignment").
+     The top bar, the page header and the content share one container
+     (`page-container` in globals.css): at most --page-max wide, centred,
+     --page-pad on each side. Inside it a 12 column grid (`layout-grid`)
+     with --gutter between columns and rows. Padding and gutter are equal,
+     24 px, and 16 px under 640 px (below). */
   --topbar-h: 56px;
+  --page-max: 1920px;
   --page-pad: 24px;
   --page-header-h: 64px;
-  --gutter: 16px;
+  /* The content area's scrollbar (vertical only): its gutter is always reserved, and the top bar
+     keeps the same width free on its right, so both containers end on one line. */
+  --scrollbar-w: 8px;
+  --gutter: 24px;
+  /* A section header row (title, icon, action) and the KPI label rows beside it share this height,
+     so their text sits on one line. The chart's time axis row is the space the KPI block keeps
+     under it, so the KPI block ends on the plot's bottom edge. */
+  --section-header-h: 40px;
+  --chart-axis-h: 24px;
   --row-h: 44px;
   --row-h-compact: 36px;
-  --settings-rail-w: 240px;
-  --settings-content-max: 720px;
 
   /* Radii [S] (measured D cards 12 to 16, icon tiles 8, cells 4) */
   --corner-xs: 4px;
@@ -59,6 +71,14 @@
   --state-selected: 0.16;
   --disabled-content: 0.38;
   --disabled-container: 0.12;
+}
+
+/* Narrow windows: 16 px side padding and gutter (same breakpoint as Tailwind's max-[640px]). */
+@media (width < 640px) {
+  :root {
+    --page-pad: 16px;
+    --gutter: 16px;
+  }
 }
 
 /* ---------- Dark (default) [S], tuned from D [M] ---------- */
