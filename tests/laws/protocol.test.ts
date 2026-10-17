@@ -11,7 +11,9 @@ import historyFixture from "@/data/fixtures/history-v1.json";
 import dnsFixture from "@/data/fixtures/dns-status-v3.json";
 import fixture from "@/data/fixtures/snapshot-v1.json";
 import systemFixture from "@/data/fixtures/system-dns-v1.json";
+import { MOCK_CANARY } from "@/data/dns-mock";
 import {
+  CHECK_KINDS,
   DNS_STATUS_VERSION,
   FLOW_STATES,
   PROTOCOL_VERSION,
@@ -103,10 +105,22 @@ describe("protocol law", () => {
   it("dns_self_check: the Rust Check fields are the ones parsed", () => {
     const probe = read("src-tauri/src/dns/probe.rs");
     const fields = [...(probe.match(/pub struct Check \{([\s\S]*?)\}/)?.[1] ?? "").matchAll(/pub (\w+):/g)].map((m) => m[1]);
-    const check = { server: "127.0.0.1:53", name: "doubleclick.net", expect: "x", got: "y", pass: true };
+    const check = { kind: "canary", server: "127.0.0.1:53", name: "selfcheck.sieve.invalid", expect: "x", got: "y", pass: true };
     expect(fields).toEqual(Object.keys(check));
     expect(parseSelfCheck({ pass: true, checks: [check] })).toEqual({ pass: true, checks: [check] });
     expect(() => parseSelfCheck({ pass: "yes", checks: [] })).toThrow(/pass/);
+    expect(() => parseSelfCheck({ pass: true, checks: [{ ...check, kind: "call" }] })).toThrow(/checks\[0\]\.kind/);
+    expect(() => parseSelfCheck({ pass: true, checks: [{ ...check, kind: undefined }] })).toThrow(/checks\[0\]\.kind/);
+  });
+
+  it("dns_self_check: the Rust CheckKind variants are CHECK_KINDS, and the canary name agrees", () => {
+    const probe = read("src-tauri/src/dns/probe.rs");
+    const body = probe.match(/pub enum CheckKind \{([\s\S]*?)\}/)?.[1] ?? "";
+    const variants = [...body.matchAll(/^\s*(\w+),/gm)].map((m) => m[1].toLowerCase());
+    expect(variants).toEqual([...CHECK_KINDS]);
+    expect(probe).toContain('#[serde(rename_all = "lowercase")]');
+    const rules = read("src-tauri/src/dns/rules.rs");
+    expect(rules.match(/pub const CANARY_NAME: &str = "([^"]+)";/)?.[1]).toBe(MOCK_CANARY);
   });
 
   it("rejects a snapshot from another version or with a broken flow", () => {

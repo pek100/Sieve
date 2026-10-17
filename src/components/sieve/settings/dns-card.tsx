@@ -7,7 +7,7 @@ import { Card } from "@/components/sieve/shell/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { blockRate, dnsPhase, DNS_SWITCH, isUpstream, SYSTEM_DNS_SWITCH, UPSTREAMS_KEY, type DnsPhase, type DnsSlice } from "@/core/dns";
+import { blockRate, checkDetails, checkFailedLine, dnsPhase, DNS_SWITCH, isUpstream, SYSTEM_DNS_SWITCH, UPSTREAMS_KEY, type DnsPhase, type DnsSlice } from "@/core/dns";
 import type { SettingKey } from "@/core/settings/registry";
 import type { FamilyDns, InterfaceDns, SelfCheck } from "@/data/protocol";
 import { useCheckPassed, useDns, useDnsActions, useSetting } from "@/hooks/use-sieve";
@@ -46,16 +46,31 @@ function statusLine(phase: DnsPhase, d: DnsSlice): string {
   }
 }
 
+/** One short line; a failure's technical replies are in `CheckDetails`. */
 function checkLine(c: SelfCheck): string {
   if (c.pass) {
-    const blocked = c.checks.filter((x) => x.expect.includes("blocked"));
-    const name = blocked[0]?.name ?? "a listed name";
-    return `Self check passed: ${name} is blocked on ${blocked.map((x) => x.server).join(" and ")}, and a normal name resolves.`;
+    const servers = [...new Set((c.checks ?? []).filter((x) => x.kind === "canary").map((x) => x.server))];
+    return `Self check passed: the test name is blocked on ${servers.join(" and ")}, and a normal name resolves.`;
   }
-  return `Self check failed: ${c.checks
-    .filter((x) => !x.pass)
-    .map((x) => `${x.name || "blocked name"} on ${x.server || "the filter"} got ${x.got}`)
-    .join("; ")}.`;
+  return checkFailedLine(c);
+}
+
+/** The failed checks' replies as the filter gave them, folded away, each line once. */
+function CheckDetails({ c }: { c: SelfCheck }) {
+  const lines = checkDetails(c);
+  if (lines.length === 0) return null;
+  return (
+    <details className="text-label text-on-surface-muted" data-dns-check-details="">
+      <summary className="cursor-pointer select-none">Self check details</summary>
+      <ul className="mt-2 flex flex-col gap-1">
+        {lines.map((line) => (
+          <li key={line} className="font-mono text-mono break-all text-on-surface">
+            {line}
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
 }
 
 function Note({ tone, children, label }: { tone: "warning" | "error" | "info"; children: ReactNode; label?: string }) {
@@ -241,16 +256,26 @@ export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH | typeof S
           </Note>
         )}
 
-        {d.error && (phase === "error" || phase === "running") && <Note tone="error">{d.error}</Note>}
+        {/* A failed check's line is said once, by the check line below. */}
+        {d.error && (phase === "error" || phase === "running") && d.error !== (d.check && checkLine(d.check)) && (
+          <Note tone="error">{d.error}</Note>
+        )}
 
         {running && system !== null && !pointed && (
           <Note tone="info">Windows does not use Sieve for DNS yet, so nothing is blocked. Point Windows at Sieve below.</Note>
         )}
 
         {d.check && (
-          <p className={cn("text-label", d.check.pass ? "text-on-surface-muted" : "text-blocked")} data-dns-check={d.check.pass ? "pass" : "fail"}>
-            {checkLine(d.check)}
-          </p>
+          <div className="flex flex-col gap-2">
+            <p
+              role={d.check.pass ? undefined : "alert"}
+              className={cn("text-label", d.check.pass ? "text-on-surface-muted" : "text-blocked")}
+              data-dns-check={d.check.pass ? "pass" : "fail"}
+            >
+              {checkLine(d.check)}
+            </p>
+            {!d.check.pass && <CheckDetails c={d.check} />}
+          </div>
         )}
 
         {running && c && (

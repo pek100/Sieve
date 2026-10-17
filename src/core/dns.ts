@@ -8,7 +8,7 @@
  *
  * The slice has one writer, the DNS controller (src/data/dns-controller.ts).
  */
-import type { DnsCounters, DnsStatus, SelfCheck, SystemDnsState } from "@/data/protocol";
+import type { DnsCheck, DnsCounters, DnsStatus, SelfCheck, SystemDnsState } from "@/data/protocol";
 import type { SettingKey } from "./settings/registry";
 
 /** The data switch that runs the filter. UI reads it from here, never spelled out. */
@@ -115,11 +115,54 @@ export function mustAskBeforeQuit(system: SystemDnsState | null): boolean {
   return system !== null && (system.pointed || system.backup);
 }
 
-/** The failed checks of a self check, in words: "doubleclick.net: expected NOERROR 0.0.0.0 (blocked), got no answer". */
-export function failedChecks(c: SelfCheck): string {
-  const bad = c.checks.filter((x) => !x.pass);
-  if (bad.length === 0) return "no check ran";
-  return bad.map((x) => `${x.name || "blocked name"}: expected ${x.expect}, got ${x.got}`).join("; ");
+/** Where the self check's full detail is shown (the DNS card in Settings). */
+export const CHECK_DETAILS_AT = "Settings > Filtering";
+
+/** A failed check in plain words, without the technical reply. */
+function failureReason(c: DnsCheck): string {
+  const silent = c.got.startsWith("no answer");
+  switch (c.kind) {
+    case "rules":
+      return "no filter list is loaded";
+    case "canary":
+      return silent ? "the test name got no answer" : "the test name was not blocked";
+    case "resolve":
+      return silent ? "a normal name got no answer" : "a normal name did not resolve";
+    case "call":
+      return "the check could not run";
+  }
+}
+
+/**
+ * Where and why a self check failed, short and plain, each reason once with
+ * the listeners it failed on: `on 127.0.0.1:53 and [::1]:53 (the test name
+ * got no answer)`. The technical replies are `checkDetails`.
+ */
+export function checkFailure(c: SelfCheck): string {
+  const groups = new Map<string, string[]>();
+  for (const x of c.checks) {
+    if (x.pass) continue;
+    const servers = groups.get(failureReason(x)) ?? [];
+    if (x.server !== "" && !servers.includes(x.server)) servers.push(x.server);
+    groups.set(failureReason(x), servers);
+  }
+  if (groups.size === 0) return "(no check ran)";
+  return [...groups.entries()]
+    .map(([reason, servers]) => (servers.length === 0 ? `(${reason})` : `on ${servers.join(" and ")} (${reason})`))
+    .join("; ");
+}
+
+/** The DNS card's line for a failed self check (also the slice's `error` after one). */
+export function checkFailedLine(c: SelfCheck): string {
+  return `The self check failed ${checkFailure(c)}.`;
+}
+
+/** The failed checks' technical replies, one line each, identical lines once. */
+export function checkDetails(c: SelfCheck): string[] {
+  const lines = c.checks
+    .filter((x) => !x.pass)
+    .map((x) => `${x.server || "filter"}: ${x.name || x.kind} expected ${x.expect}, got ${x.got}`);
+  return [...new Set(lines)];
 }
 
 /** Lookups go nowhere unless Sieve answers them: Windows points at loopback and Sieve made the backup. */

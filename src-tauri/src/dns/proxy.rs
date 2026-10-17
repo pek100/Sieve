@@ -21,6 +21,10 @@
 //! is forwarded, blocked names too, and nothing is counted as blocked. The
 //! proxy keeps answering, so Windows DNS pointed here keeps working.
 //!
+//! The self check's canary (`rules::CANARY_NAME`, `.invalid`) always gets
+//! the block answer, pass-through or not, and is never counted: not in
+//! `queries`, `blocked` or the top blocked names.
+//!
 //! Lifecycle: `Proxy::start` binds a UDP and a TCP socket on every listen
 //! address (a requested port 0 gets the same free port for UDP and TCP of
 //! that address), `stop` ends every server and every in-flight task, which
@@ -370,22 +374,32 @@ async fn serve_tcp_conn(mut stream: TcpStream, shared: Arc<Shared>) {
 impl Shared {
     /// The reply bytes for one query, or None when there is nothing to say.
     async fn answer(&self, query: &[u8], transport: Transport) -> Option<Vec<u8>> {
-        self.stats.queries.fetch_add(1, Ordering::Relaxed);
         let msg = match Message::from_vec(query) {
             Ok(m) => m,
             Err(e) => {
+                self.stats.queries.fetch_add(1, Ordering::Relaxed);
                 self.stats.note_error(format!("malformed query: {e}"));
                 return formerr(query);
             }
         };
-        if !self.pass_through.load(Ordering::SeqCst)
-            && let Some(name) = filterable_name(&msg)
-        {
-            let rules = self.rules.read().unwrap_or_else(PoisonError::into_inner).clone();
-            if rules.verdict(&name) == Verdict::Block {
-                self.stats.note_blocked(&name);
-                return encode(&block_response(&msg), &self.stats);
+        let (name, verdict) = match filterable_name(&msg) {
+            Some(name) => {
+                let rules = self.rules.read().unwrap_or_else(PoisonError::into_inner).clone();
+                let verdict = rules.verdict(&name);
+                (name, verdict)
             }
+            None => (String::new(), Verdict::None),
+        };
+        // The self check's canary: answered here in every mode (it proves
+        // this listener answers) and kept out of every counter and the top
+        // blocked list, which count the user's own lookups only.
+        if verdict == Verdict::Canary {
+            return encode(&block_response(&msg), &self.stats);
+        }
+        self.stats.queries.fetch_add(1, Ordering::Relaxed);
+        if verdict == Verdict::Block && !self.pass_through.load(Ordering::SeqCst) {
+            self.stats.note_blocked(&name);
+            return encode(&block_response(&msg), &self.stats);
         }
         let client_max = match transport {
             Transport::Udp => usize::from(msg.max_payload()),
@@ -561,6 +575,7 @@ async fn tcp_exchange(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::super::rules::CANARY_NAME;
     use super::*;
     use hickory_proto::op::Query;
     use hickory_proto::rr::Name;
@@ -848,6 +863,37 @@ pub(crate) mod tests {
         ];
         expected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         assert_eq!(s.top_blocked, expected);
+        proxy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_canary_is_answered_here_and_never_counted_or_shown() {
+        let up = FakeUpstream::start(false).await;
+        let config = ProxyConfig {
+            binds: vec!["127.0.0.1:0".parse().expect("addr")],
+            upstreams: vec![up.addr],
+            upstream_timeout: Duration::from_millis(UPSTREAM_TIMEOUT_MS),
+        };
+        // No list at all: the canary is a built-in rule.
+        let proxy = Proxy::start(config, RuleSet::new()).await.expect("start");
+        let addr = proxy.local_addr();
+        let canary = format!("{CANARY_NAME}.");
+        let first = ask_udp(addr, &canary, RecordType::A).await;
+        assert_eq!(ips(&first), vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)]);
+        tokio::time::sleep(Duration::from_millis(RETRANSMIT_MS * 3 / 2)).await;
+        let aaaa = ask_udp(addr, &canary, RecordType::AAAA).await;
+        assert_eq!(ips(&aaaa), vec![IpAddr::V6(Ipv6Addr::UNSPECIFIED)]);
+        let tcp = ask_tcp(addr, &canary, RecordType::A).await;
+        assert_eq!(ips(&tcp), vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)]);
+        proxy.set_pass_through(true);
+        let paused = ask_udp(addr, &canary, RecordType::A).await;
+        assert_eq!(ips(&paused), vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)], "answered while passing through too");
+        assert_eq!(up.udp_queries.load(Ordering::SeqCst) + up.tcp_queries.load(Ordering::SeqCst), 0, "never forwarded");
+        assert_eq!(proxy.stats(), StatsSnapshot::default(), "no counter, no top blocked entry");
+        // A real lookup after it is counted as usual (the law can fail).
+        proxy.set_pass_through(false);
+        ask_udp(addr, "example.com.", RecordType::A).await;
+        assert_eq!(proxy.stats().queries, 1);
         proxy.stop().await;
     }
 

@@ -31,7 +31,9 @@ import {
   DNS_SWITCH,
   SYSTEM_DNS_SWITCH,
   UPSTREAMS_KEY,
-  failedChecks,
+  CHECK_DETAILS_AT,
+  checkFailedLine,
+  checkFailure,
   mustAskBeforeQuit,
   needsProxyAtStart,
   type DnsSlice,
@@ -183,7 +185,7 @@ export function createDnsController(d: DnsControllerDeps): DnsController {
 
   const failedCheck = (e: unknown): SelfCheck => ({
     pass: false,
-    checks: [{ server: "", name: "", expect: "an answer from the filter", got: message(e), pass: false }],
+    checks: [{ kind: "call", server: "", name: "", expect: "an answer from the filter", got: message(e), pass: false }],
   });
 
   /**
@@ -220,10 +222,13 @@ export function createDnsController(d: DnsControllerDeps): DnsController {
       if (!safety) notices.push({ kind: "success", text: "DNS filtering is on. It answers for every app once Windows uses Sieve for DNS." });
       return { started: true, error: null };
     }
-    const why = failedChecks(check);
+    // Short and plain in the toast and the card; the technical replies stay
+    // in the card's self check details (checkDetails).
+    const where = checkFailure(check);
+    const more = `Details in ${CHECK_DETAILS_AT}.`;
     if (safety) {
-      set({ error: `Self check failed: ${why}` });
-      notices.push({ kind: "error", text: `Sieve's DNS filter is running but its self check failed: ${why}` });
+      set({ error: checkFailedLine(check) });
+      notices.push({ kind: "error", text: `Sieve's DNS filter is running, but its self check failed ${where}. ${more}` });
       return { started: true, error: null };
     }
     set({ busy: "stop" });
@@ -233,10 +238,10 @@ export function createDnsController(d: DnsControllerDeps): DnsController {
       set({ error: message(e) });
     }
     stopPolling();
-    set({ busy: null, error: `Self check failed: ${why}` });
+    set({ busy: null, error: checkFailedLine(check) });
     await settings.set(DNS_SWITCH, false);
-    notices.push({ kind: "error", text: `DNS filtering was turned off: its self check failed (${why}).` });
-    return { started: false, error: why };
+    notices.push({ kind: "error", text: `DNS filtering could not start: its self check failed ${where}. ${more}` });
+    return { started: false, error: checkFailedLine(check) };
   };
 
   /** Follow the global switch: pass everything through while it is off. */

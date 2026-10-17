@@ -166,8 +166,15 @@ mod tests {
         for i in &ifaces {
             assert!(super::super::uses_sieve(i), "{} does not use Sieve: {:?} / {:?}", i.alias, i.v4.servers, i.v6.servers);
         }
-        let check = crate::dns::probe::self_check(&sieve_addrs(), Some("doubleclick.net".into()), "example.com").await;
+        use crate::dns::probe;
+        // The app's rule count cannot be read from here (1 skips the rules
+        // check); a listed name answered with the block answer proves a list.
+        let check = probe::self_check(&sieve_addrs(), 1, "example.com").await;
         println!("{}", serde_json::to_string(&check).expect("json"));
         assert!(check.pass);
+        for addr in sieve_addrs() {
+            let m = probe::query_a(addr, "doubleclick.net").await.expect("answered");
+            assert!(probe::is_block_answer(&m), "doubleclick.net on {addr}: {}", probe::describe(&m));
+        }
     }
 }

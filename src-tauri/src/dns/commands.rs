@@ -6,7 +6,8 @@
 //! - `dns_start(config?)` -> `DnsStatus` (fails when already running)
 //! - `dns_stop()` -> `DnsStatus` (stopped; a no-op when not running)
 //! - `dns_status()` -> `DnsStatus` (see `status.rs` for the shape)
-//! - `dns_self_check()` -> `SelfCheck` (fails when not running)
+//! - `dns_self_check()` -> `SelfCheck` (fails when not running; see
+//!   `probe::self_check`: the canary and a normal name on every listener)
 //! - `dns_set_pass_through(on)` -> `DnsStatus` (forward everything, block
 //!   nothing, while the global Sieving switch is off; fails when not running)
 
