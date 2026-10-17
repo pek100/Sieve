@@ -1,4 +1,4 @@
-//! Raw IP packet parsing (what the WinDivert NETWORK layer hands us):
+//! Raw IP packet parsing (what a TUN read hands us):
 //! IPv4 or IPv6, then TCP or UDP, down to the transport payload.
 //!
 //! Fragments are not reassembled (None): a ClientHello or QUIC Initial in
@@ -123,7 +123,7 @@ fn transport(proto: Proto, src: IpAddr, dst: IpAddr, seg: &[u8]) -> Option<Packe
 }
 
 /// Packet builders for tests and the benchmark (checksums left zero: the
-/// parser does not check them, WinDivert recomputes on reinject).
+/// parser does not check them).
 pub mod build {
     use super::Proto;
     use std::net::IpAddr;
