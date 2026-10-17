@@ -270,7 +270,7 @@ describe("home pause", () => {
     const st = runtime.store.getState().status;
     expect(st.pausedUntil).not.toBeNull();
     expect(screen.getByRole("note")).toHaveTextContent(/Sampling is paused until/);
-    // One control per job: Resume is the pill only, and the status chip lives in the top bar, not on Home.
+    // One control per job: Resume is the pill only; the phase lives on the top bar's master switch, not on Home.
     expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
     expect(document.querySelectorAll("[data-phase]")).toHaveLength(0);
 

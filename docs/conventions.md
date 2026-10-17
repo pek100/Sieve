@@ -26,7 +26,7 @@ src/styles/tokens.css       every design value (the only file allowed colour lit
 src/components/ui/          shadcn primitives, owned by us, already restyled to tokens
 src/components/sieve/
   primitives/               state-layer, icon-button, section-icon, segmented
-  shell/                    app-shell, top-bar, page, bento-grid, card, empty-state, status-chip,
+  shell/                    app-shell, top-bar, page, bento-grid, card, empty-state,
                             master-switch, theme-menu, window-controls, wordmark, notice-toaster
   <area>/                   one folder per screen area: home/ (S2), apps/ (S3), ...
 src/core/                   pure TS: store, policy, apps, routes, notices, settings/
@@ -96,13 +96,13 @@ Hooks: `useRuntime()`, `useSieve(selector)` (rerenders on every store change; de
 
 - A screen is `src/app/<route>/page.tsx` that renders `<Page title action? notice? fill?>` with a `<BentoGrid>` of `<BentoItem span="third|two-thirds|half|full">`. Spans: at 1280+ third 4, two-thirds 8, half 6; at 960 to 1279 third and half 6, two-thirds 12; below 960 everything 12. Gutter 32 across, 24 down. Page header row is 64 px; outer padding 24 px (16 below 640). The Apps screen has no grid: search, count and groups sit on the page (max 880 px wide).
 - A titled block of content is a `<Card title icon? tone? action? state?>`, flat (see section 4). `state` is `{kind:"ready"}` (default), `{kind:"loading"}` (skeleton), `{kind:"empty", line, body?, action?}`, or `{kind:"error", message}`. Each has its own error boundary (`CardBoundary` and `CardBody` are exported for blocks that are not one Card, such as the Home KPI tiles and the Apps list). A Card is as tall as its content; Home passes `className="h-full"` to fill a bento cell (a built-in `h-full` stretched the Settings Filtering card to the height of the wrapper it shares with the DNS filter card). When title and action do not fit on one line, the action wraps under the title.
-- One status chip per window, in the top bar. A screen does not repeat it. Under 480 px it shows the one-word phase, never a bare dot.
+- No status chip (the user: the Live chip was redundant beside the Sieving switch). The master switch carries `data-phase` and a screen-reader-only live region that speaks the phase; a timed pause is shown once, on Home, as the paused banner (until when) with the Resume pill as its one control.
 - `<Page fill>` makes the page exactly window-tall at 1280+, so a `three:flex-1` grid takes the height left under the header. Do not subtract sibling heights in a calc.
 - Live charts: the Home chart (`home/activity-chart.tsx`) is hand-drawn SVG, not Recharts, because Recharts remounts its area paths on every data change. x is absolute time in units of the whole window choice; the view span (`viewMs`, which doubles as data accumulates, from 16 samples) lives only in the plot group's transform (`translateX` slides a bucket per tick, `scaleX` rescales on a view step), so path nodes and existing vertices survive both. Key the chart by the window choice only, never by anything that changes on a tick. `d` morphs only when the bucket times did not change (legend toggle). Use Recharts through `ui/chart.tsx` for static charts.
 - Pressables: shadcn `<Button>` (pill; variants `default` filled mint, `secondary` tonal, `outline`, `ghost` text, `destructive` tonal pink, `link`), `<IconButton label>` (round 36, `label` is required and becomes `aria-label`, optional `badge`, `toggled`), `<Segmented items value onChange label>` for in-page choices (Day/Month/Year, chart windows), `<SegmentedNav>` only in the top bar. Anything custom and pressable is `relative overflow-hidden` with `<StateLayer />` as its last child.
 - Icons: lucide-react, `strokeWidth={1.75}`, sizes 16/20/24; beside a title or a KPI label as a plain `<SectionIcon size={16|20} tone>` (no tile; `mint` tints it when something is on). A missing app icon is a monogram on the app's series tint (S2/S3 build it).
 - Copy: sentence case, plain words, no em dashes. Never claim filtering that is not happening. Home law (`home.test.tsx`, `dns.spec.ts`): while the DNS filter is not running, Home never says ads, trackers or blocked; while it runs, "blocked" appears only inside `[data-dns-derived]` tiles and ads or trackers never. DNS filtering is system wide: no copy says an app is filtered or blocked. One warm serif line per screen at most.
-- Accessibility: every icon-only control has an accessible name (shell test checks the shell); dialog titles may be `sr-only`; status text never relies on colour alone (the status chip has text and `data-phase`).
+- Accessibility: every icon-only control has an accessible name (shell test checks the shell); dialog titles may be `sr-only`; status text never relies on colour alone (the master switch speaks the phase in words).
 
 ## 6. Settings and data switches
 

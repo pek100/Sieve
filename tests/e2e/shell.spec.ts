@@ -12,7 +12,11 @@ test.describe("shell", () => {
     await expect(page.getByRole("navigation", { name: "Main" })).toBeVisible();
     await expect(page.getByRole("link", { name: "Home" })).toHaveAttribute("aria-current", "page");
     await expect(page.getByRole("switch", { name: "Sieving" })).toBeChecked();
-    await expect(page.getByRole("status")).toHaveAttribute("data-phase", "live");
+    // No Live chip: the phase is on the master switch (spoken, not shown twice).
+    await expect(page.locator("[data-phase]")).toHaveAttribute("data-phase", "live");
+    expect(await page.getByRole("banner").evaluate((bar) =>
+      [...bar.querySelectorAll("*")].filter((e) => e.childElementCount === 0 && !e.closest(".sr-only") && /Live/.test(e.textContent ?? "")).length,
+    )).toBe(0);
     await expect(page.getByRole("heading", { level: 1 })).toHaveText("Sieving now");
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 
@@ -30,7 +34,7 @@ test.describe("shell", () => {
   test("the master switch stops sampling and the theme menu switches to light", async ({ page }, info) => {
     await page.goto(HOME);
     await page.getByRole("switch", { name: "Sieving" }).click();
-    await expect(page.getByRole("status")).toHaveAttribute("data-phase", "off");
+    await expect(page.locator("[data-phase]")).toHaveAttribute("data-phase", "off");
 
     await page.getByRole("button", { name: /^Theme/ }).click();
     await page.getByRole("menuitem", { name: "Light" }).click();
@@ -52,6 +56,6 @@ test.describe("shell", () => {
 
   test("scenario error shows the error phase, never mock data", async ({ page }) => {
     await page.goto("/?source=mock&scenario=error");
-    await expect(page.getByRole("status")).toHaveAttribute("data-phase", "error");
+    await expect(page.locator("[data-phase]")).toHaveAttribute("data-phase", "error");
   });
 });

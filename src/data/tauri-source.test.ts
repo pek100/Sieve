@@ -61,7 +61,7 @@ describe("tauri source (seam law: validated, never silently empty)", () => {
     poller.stop();
     expect(s.status.error).toMatch(/version 2 is not 1/);
     expect(s.snapshots).toHaveLength(0);
-    // The status chip reads "No data" with the message as its title.
+    // The master switch speaks "No data"; Home's blocks show the message.
     expect(phase(s)).toBe("error");
   });
 

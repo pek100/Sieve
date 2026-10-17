@@ -127,22 +127,21 @@ test.describe("home", () => {
   test("the pause pill pauses until the chosen time and resume restarts sampling", async ({ page }, info) => {
     await openHome(page);
     await waitForData(page, 4);
-    const status = page.getByRole("status");
+    const status = page.locator("[data-phase]");
     await expect(status).toHaveAttribute("data-phase", "live");
     await page.getByRole("main").getByRole("button", { name: "Pause" }).click();
     await page.getByRole("menuitem", { name: "For 5 minutes" }).click();
     await expect(status).toHaveAttribute("data-phase", "paused");
-    await expect(status).toContainText(/Paused until \d/);
+    await expect(page.getByRole("status")).toContainText(/Paused until \d/);
+    // One clear visible indicator: the banner says until when; Resume is the one control.
     await expect(page.getByRole("note")).toContainText("Sampling is paused until");
-    // Resume is one control, and the status shows once per window (top bar).
+    await expect(page.getByRole("note")).toBeVisible();
     await expect(page.getByRole("button", { name: /resume/i })).toHaveCount(1);
     await expect(page.locator("[data-phase]")).toHaveCount(1);
-    // The chip says the phase in words at every width, not only by its dot colour.
-    await expect(status.locator("span:visible", { hasText: /Paused/ }).first()).toBeVisible();
-    // ...and the wider chip does not slide under the nav.
-    const nav = (await page.getByRole("navigation", { name: "Main" }).boundingBox())!;
-    const chip = (await status.boundingBox())!;
-    expect(chip.x).toBeGreaterThanOrEqual(nav.x + nav.width);
+    // No status chip in the top bar repeats it.
+    expect(await page.getByRole("banner").evaluate((bar) =>
+      [...bar.querySelectorAll("*")].filter((e) => e.childElementCount === 0 && !e.closest(".sr-only") && /Paused/.test(e.textContent ?? "")).length,
+    )).toBe(0);
     await page.screenshot({ path: `test-results/screens/home-paused-${info.project.name}.png` });
     if (info.project.name === "desktop") {
       // The banner takes its height from the grid, not from the window: still no scroll at 1280x800.

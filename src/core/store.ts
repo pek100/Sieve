@@ -33,7 +33,7 @@ export interface SieveState {
 
 export type Phase = "starting" | "live" | "paused" | "off" | "error";
 
-/** What the status chip says, derived from status and data, never stored. */
+/** The sampling phase (the master switch's data-phase and spoken status), derived from status and data, never stored. */
 export function phase(s: Pick<SieveState, "status" | "snapshots">): Phase {
   if (s.status.pausedUntil !== null) return "paused";
   if (!s.status.running) return "off";
