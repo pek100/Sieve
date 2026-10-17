@@ -1,47 +1,30 @@
 /**
  * Apps screen data (slice S3): pure reducers over the two settings values
- * `apps.levels` (map app key -> level, only non-default entries) and
+ * `apps.levels` (map app key -> "off", only apps the user turned off) and
  * `apps.pinned` (exe paths the user added), plus the derived app list.
- *
- * Nothing here reads a level above the ceiling: setLevel clamps on write and
- * every read goes through policy.effectiveLevel, so a stored value from a
- * time when the ceiling was higher is still shown and counted as clamped.
  */
 import type { Snapshot } from "@/data/protocol";
-import { appIdentity, category, exeStem, groupApps, isActiveFlow, isSieved, type AppGroup, type Category } from "./apps";
-import { DEFAULT_LEVEL, effectiveLevel, minLevel, requestedLevel, type Level } from "./policy";
+import { appIdentity, category, exeStem, groupApps, isActiveFlow, isSieved, trackedSnapshot, type AppGroup, type Category } from "./apps";
+import { DEFAULT_APP_STATE, effectiveOn, offKeys, type AppState, type AppStates } from "./policy";
 
-export type Levels = Readonly<Record<string, Level>>;
 export type Pinned = readonly string[];
 
-/** Store only what differs from the default, so "reset" and "never touched" read the same. */
-function withLevel(levels: Levels, key: string, level: Level): Levels {
-  const next: Record<string, Level> = { ...levels };
-  if (level === DEFAULT_LEVEL) delete next[key];
-  else next[key] = level;
+/** Set one app on or off. Only "off" is stored, so "on" and "never touched" read the same. */
+export function setAppState(states: AppStates, key: string, state: AppState): AppStates {
+  const next: Record<string, AppState> = { ...states };
+  if (state === DEFAULT_APP_STATE) delete next[key];
+  else next[key] = state;
   return next;
 }
 
-/** Set one app's level, clamped to the ceiling (`top`) so nothing above it is ever stored. */
-export function setLevel(levels: Levels, key: string, level: Level, top: Level): Levels {
-  return withLevel(levels, key, minLevel(level, top));
-}
-
-/** Every app that was off goes back to watch. Apps at sieve keep it. */
-export function watchAll(levels: Levels): Levels {
-  const next: Record<string, Level> = {};
-  for (const [k, v] of Object.entries(levels)) if (v !== "off") next[k] = v;
-  return next;
-}
-
-/** Every listed app goes to off. */
-export function stopAll(levels: Levels, keys: readonly string[]): Levels {
-  return keys.reduce((acc, k) => withLevel(acc, k, "off"), levels);
-}
-
-/** Forget every choice: all apps read the default level again. */
-export function resetLevels(): Levels {
+/** Turn every app on: forget every Off. */
+export function sieveAll(): AppStates {
   return {};
+}
+
+/** Turn every listed app off. */
+export function offAll(states: AppStates, keys: readonly string[]): AppStates {
+  return keys.reduce((acc, k) => setAppState(acc, k, "off"), states);
 }
 
 function samePath(a: string, b: string): boolean {
@@ -117,13 +100,8 @@ export function matchesQuery(app: Pick<AppEntry, "name" | "key" | "exes">, query
   return app.name.toLowerCase().includes(q) || app.key.includes(q) || app.exes.some((e) => e.toLowerCase().includes(q));
 }
 
-/** The level an app actually runs at: its stored choice clamped to the ceiling. */
-export function levelOf(levels: Levels, key: string, top: Level): Level {
-  return effectiveLevel(requestedLevel(levels, key), top);
-}
-
-/** How many apps are being sieved now (effective level at least watch and an active flow). */
-export function sievedCount(snapshot: Snapshot | null, levels: Levels, top: Level): number {
+/** How many apps are being sieved now: effectively on (global and app) with an active flow. */
+export function sievedCount(snapshot: Snapshot | null, states: AppStates, globalOn: boolean): number {
   if (!snapshot) return 0;
-  return groupApps(snapshot).filter((a) => isSieved(a, levelOf(levels, a.key, top))).length;
+  return groupApps(trackedSnapshot(snapshot, offKeys(states))).filter((a) => isSieved(a, effectiveOn(globalOn, states, a.key))).length;
 }

@@ -81,7 +81,7 @@ test.describe("dns filter", () => {
     const tile = page.locator('section[data-kpi="blocked"]');
     await expect(tile).toHaveAttribute("aria-label", "DNS filter");
     await expect(tile).toContainText("Off");
-    await expect(page.locator('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Watched apps");
+    await expect(page.locator('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Sieved apps");
     expect(await page.locator("body").innerText()).not.toMatch(/\b(ads|trackers|blocked)\b/i);
     await noHorizontalScroll(page);
     await page.getByRole("group", { name: "Right now" }).screenshot({ path: `test-results/screens/dns-home-off-${info.project.name}.png` });
@@ -107,6 +107,26 @@ test.describe("dns filter", () => {
     expect(await page.locator("body").innerText()).not.toMatch(/\b(ads|trackers)\b/i);
     await noHorizontalScroll(page);
     await page.getByRole("group", { name: "Right now" }).screenshot({ path: `test-results/screens/dns-home-running-${info.project.name}.png` });
+    expect(errors).toEqual([]);
+  });
+
+  test("global Sieving off: the running filter passes everything through and says Paused, never stops", async ({ page }, info) => {
+    const errors = await open(page, `${HOME}&dns=running`);
+    const tile = page.locator('section[data-kpi="blocked"]');
+    await expect(tile).toHaveAttribute("aria-label", "Blocked lookups");
+    await page.getByRole("switch", { name: "Sieving" }).click();
+    await expect(tile).toHaveAttribute("aria-label", "DNS filter");
+    await expect(tile.locator("[data-dns-paused]")).toContainText("Paused");
+    await page.getByRole("group", { name: "Right now" }).screenshot({ path: `test-results/screens/dns-home-paused-${info.project.name}.png` });
+    // Settings says the same: still running, in pass-through.
+    await page.getByRole("link", { name: "Settings" }).click();
+    await expect(phase(page)).toHaveAttribute("data-dns-phase", "paused");
+    await expect(card(page)).toContainText("Paused while Sieving is off");
+    await expect(page.locator('[data-setting="filtering.dns"]').getByRole("switch")).toBeChecked();
+    // On again: blocking resumes.
+    await page.getByRole("switch", { name: "Sieving" }).click();
+    await expect(phase(page)).toHaveAttribute("data-dns-phase", "running");
+    await noHorizontalScroll(page);
     expect(errors).toEqual([]);
   });
 });

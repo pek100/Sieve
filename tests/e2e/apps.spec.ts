@@ -19,7 +19,7 @@ async function noHorizontalScroll(page: Page) {
 }
 
 test.describe("apps", () => {
-  test("lists apps by derived category with 44 px rows and a disabled sieve level", async ({ page }, info) => {
+  test("lists apps by derived category with 44 px rows, each sieved by default", async ({ page }, info) => {
     const errors = collectErrors(page);
     await page.goto(APPS);
     await expect(page.getByRole("heading", { level: 1 })).toHaveText("Apps");
@@ -33,25 +33,26 @@ test.describe("apps", () => {
     const box = await row(page, CHROME).boundingBox();
     expect(box?.height).toBe(44);
 
-    const sieve = row(page, CHROME).getByRole("radio", { name: "Sieve" });
-    await expect(sieve).toBeDisabled();
-    // Per-app filtering is not something DNS can do: the reason says so, from the registry.
-    await expect(sieve).toHaveAttribute("title", /^Needs Per-app filtering\. .*network driver/);
-    await expect(page.getByTestId("sieve-locked")).toContainText("Needs Per-app filtering.");
+    const toggle = row(page, CHROME).getByRole("switch", { name: "Sieve Google Chrome" });
+    await expect(toggle).toBeChecked();
+    // Off is honest about DNS: said once, as the toggle's description and tooltip.
+    await expect(toggle).toHaveAttribute("title", /DNS blocking still covers it/);
+    await expect(page.getByTestId("sieved-count")).toContainText(/^\d+ being sieved$/);
+    await expect(page.getByRole("radio")).toHaveCount(0);
 
     await noHorizontalScroll(page);
     await page.screenshot({ path: `test-results/screens/apps-${info.project.name}.png`, fullPage: true });
     expect(errors).toEqual([]);
   });
 
-  test("setting an app to off survives a reload", async ({ page }) => {
+  test("turning an app off survives a reload; other apps stay on", async ({ page }) => {
     await page.goto(APPS);
-    const off = row(page, CHROME).getByRole("radio", { name: "Off" });
-    await off.click();
-    await expect(off).toHaveAttribute("aria-checked", "true");
+    const toggle = row(page, CHROME).getByRole("switch");
+    await toggle.click();
+    await expect(toggle).not.toBeChecked();
     await page.reload();
-    await expect(row(page, CHROME).getByRole("radio", { name: "Off" })).toHaveAttribute("aria-checked", "true");
-    await expect(row(page, "discord").getByRole("radio", { name: "Watch" })).toHaveAttribute("aria-checked", "true");
+    await expect(row(page, CHROME).getByRole("switch")).not.toBeChecked();
+    await expect(row(page, "discord").getByRole("switch")).toBeChecked();
   });
 
   test("?app=<key> opens that app's panel directly, hosts in mono", async ({ page }, info) => {

@@ -4,6 +4,7 @@
  * Tests build their own with createRuntime and inject a source and backend.
  */
 import { createNoticeBus, type NoticeBus } from "@/core/notices";
+import { offKeys } from "@/core/policy";
 import { createStore, phase, type SieveStore } from "@/core/store";
 import { trayState } from "@/core/tray";
 import { tauriDesktop, type Desktop } from "@/data/desktop";
@@ -83,13 +84,17 @@ export function createBrowserRuntime(): Runtime {
   }
   const isTauri = isTauriWindow();
   const options = sourceOptions({ search: window.location.search, isTauri });
-  return createRuntime({
-    source: createSource(options),
+  // The source reads the apps turned off at every sample, from this runtime's settings.
+  let settings: SettingsStore | null = null;
+  const rt = createRuntime({
+    source: createSource(options, () => offKeys(settings?.get("apps.levels") ?? {})),
     dns: createDnsSource(options),
     settings: isTauri ? tauriBackend() : localBackend(),
     isTauri,
     desktop: isTauri ? tauriDesktop() : null,
   });
+  settings = rt.settings;
+  return rt;
 }
 
 /** Run the DNS controller (load, safety rule, follow the switches, poll). Returns the undo. */

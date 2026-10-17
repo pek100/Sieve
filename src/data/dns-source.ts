@@ -20,6 +20,8 @@ export interface DnsSource {
   stop(): Promise<DnsStatus>;
   status(): Promise<DnsStatus>;
   selfCheck(): Promise<SelfCheck>;
+  /** Forward everything and block nothing (true), or filter again (false). Fails when not running. */
+  setPassThrough(on: boolean): Promise<DnsStatus>;
   /** Read only: Windows DNS per active adapter. */
   systemState(): Promise<SystemDnsState>;
   /** Backup first, then one elevated script (Windows asks for administrator rights). */
@@ -39,6 +41,7 @@ export function createTauriDns(invoke: Invoke = tauriInvoke): DnsSource {
     stop: async () => parseDnsStatus(await invoke<unknown>("dns_stop")),
     status: async () => parseDnsStatus(await invoke<unknown>("dns_status")),
     selfCheck: async () => parseSelfCheck(await invoke<unknown>("dns_self_check")),
+    setPassThrough: async (on) => parseDnsStatus(await invoke<unknown>("dns_set_pass_through", { on })),
     systemState: async () => parseSystemDns(await invoke<unknown>("system_dns_state")),
     pointSystem: async () => parseSystemDns(await invoke<unknown>("system_dns_point")),
     restoreSystem: async () => parseSystemDns(await invoke<unknown>("system_dns_restore")),

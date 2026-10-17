@@ -4,7 +4,7 @@ import { useCallback, useMemo, useSyncExternalStore } from "react";
 import type { DnsSlice } from "@/core/dns";
 import type { Notice } from "@/core/notices";
 import type { DnsController } from "@/data/dns-controller";
-import { ceiling, type Level } from "@/core/policy";
+import { effectiveOn, GLOBAL_SWITCH, offKeys, type AppStates } from "@/core/policy";
 import { readValue } from "@/core/settings/document";
 import { isSettingKey, type SettingKey, type SettingValue } from "@/core/settings/registry";
 import type { SieveState } from "@/core/store";
@@ -32,7 +32,7 @@ export function useSetting<K extends SettingKey>(key: K): [SettingValue<K>, (v: 
   return [value, set];
 }
 
-/** Whether a setting (by key) is on, for data switches named by data (LEVEL_REQUIRES, `requires`). */
+/** Whether a setting (by key) is on, for data switches named by data (`requires`). */
 export function useSwitchOn(): (key: string) => boolean {
   const { settings } = useRuntime();
   const doc = useSyncExternalStore(settings.subscribe, settings.doc, settings.doc);
@@ -48,12 +48,25 @@ export function useCheckPassed(): (key: string) => boolean {
   return useCallback((k: string) => passedChecks.has(k), [passedChecks, version]);
 }
 
-/** The highest per-app level reachable now (from data switches and passed live checks). */
-export function useLevelCeiling(): Level {
-  const { settings } = useRuntime();
-  const doc = useSyncExternalStore(settings.subscribe, settings.doc, settings.doc);
-  const passed = useCheckPassed();
-  return useMemo(() => ceiling((k) => isSettingKey(k) && readValue(doc, k) === true, passed), [doc, passed]);
+export interface Tracking {
+  /** The global Sieving switch. */
+  globalOn: boolean;
+  /** Stored per-app choices (only apps turned off). */
+  states: AppStates;
+  /** Keys of the apps turned off; same identity while the setting is unchanged (trackedSnapshot caches on it). */
+  off: ReadonlySet<string>;
+  /** policy.effectiveOn for one app key. */
+  isOn: (appKey: string) => boolean;
+}
+
+/** What Sieve tracks: the global switch and the per-app on/off (policy.ts). */
+export function useTracking(): Tracking {
+  const [globalOn] = useSetting(GLOBAL_SWITCH);
+  const [states] = useSetting("apps.levels");
+  return useMemo(
+    () => ({ globalOn, states, off: offKeys(states), isOn: (k: string) => effectiveOn(globalOn, states, k) }),
+    [globalOn, states],
+  );
 }
 
 const selectDns = (s: SieveState): DnsSlice => s.dns;

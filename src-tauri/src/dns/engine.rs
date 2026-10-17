@@ -89,6 +89,7 @@ impl Engine {
         DnsStatus {
             v: DNS_STATUS_VERSION,
             running: true,
+            pass_through: self.proxy.pass_through(),
             binds: self.proxy.local_addrs().iter().map(SocketAddr::to_string).collect(),
             started_at: Some(self.started_at),
             upstreams: self.config.upstreams.iter().map(SocketAddr::to_string).collect(),
@@ -107,6 +108,13 @@ impl Engine {
                 .map(|(domain, count)| DomainCount { domain, count })
                 .collect(),
         }
+    }
+
+    /// Forward every lookup and block nothing (true), or filter again
+    /// (false). The global Sieving switch off sets it; the proxy keeps
+    /// answering, so Windows DNS pointed here keeps working.
+    pub fn set_pass_through(&self, on: bool) {
+        self.proxy.set_pass_through(on);
     }
 
     /// Asks the running proxy, on every listen address, for a name its
@@ -241,6 +249,33 @@ mod tests {
         let addr = engine.local_addr();
         engine.stop().await;
         std::net::UdpSocket::bind(addr).expect("port free after stop");
+    }
+
+    #[tokio::test]
+    async fn pass_through_forwards_a_blocked_name_and_says_so_in_the_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let up = FakeUpstream::start(false).await;
+        let engine = Engine::start(config(dir.path(), vec![up.addr]), fetch_ok(FIXTURE), fixed_clock(T0))
+            .await
+            .expect("start");
+        let addr = engine.local_addr();
+        assert!(!engine.status().pass_through);
+        let m = query_a(addr, "doubleclick.net").await.expect("answer");
+        assert!(is_block_answer(&m), "filtering by default");
+
+        engine.set_pass_through(true);
+        let s = engine.status();
+        assert!(s.running && s.pass_through, "still running, passing through");
+        let blocked_before = s.counters.blocked;
+        let m = query_a(addr, "doubleclick.net").await.expect("answer");
+        assert!(is_resolved(&m), "a blocked name is forwarded while passing through");
+        assert_eq!(engine.status().counters.blocked, blocked_before, "nothing counted as blocked");
+
+        engine.set_pass_through(false);
+        assert!(!engine.status().pass_through);
+        let m = query_a(addr, "doubleclick.net").await.expect("answer");
+        assert!(is_block_answer(&m), "filtering again");
+        engine.stop().await;
     }
 
     #[tokio::test]

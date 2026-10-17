@@ -21,9 +21,9 @@ test.describe("settings", () => {
     await expect(page.getByRole("link", { name: "Settings" })).toHaveAttribute("aria-current", "page");
     const rail = page.getByRole("navigation", { name: "Settings sections" });
     await expect(rail.getByRole("link")).toHaveText(["Appearance", "Sampling", "Startup", "Apps", "Filtering"]);
-    // Ten registry keys: theme, sieving, interval, launch at startup, levels, my apps,
-    // DNS filtering, upstreams, Windows uses Sieve, per-app filtering.
-    await expect(page.locator("[data-setting]")).toHaveCount(10);
+    // Nine registry keys: theme, sieving, interval, launch at startup, apps turned off, my apps,
+    // DNS filtering, upstreams, Windows uses Sieve.
+    await expect(page.locator("[data-setting]")).toHaveCount(9);
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
 
     if (info.project.name === "desktop") {
@@ -43,14 +43,11 @@ test.describe("settings", () => {
     expect(errors).toEqual([]);
   });
 
-  test("per-app filtering is a locked switch that says why; DNS filtering is a live switch", async ({ page }, info) => {
+  test("there is no per-app filtering row; DNS filtering is a live switch", async ({ page }, info) => {
     await openSettings(page);
-    const perApp = row(page, "filtering.perApp");
-    await perApp.scrollIntoViewIfNeeded();
-    await expect(perApp.getByRole("switch")).toBeDisabled();
-    await expect(perApp.getByRole("switch")).not.toBeChecked();
-    await expect(perApp).toContainText("network driver");
-    await expect(perApp).toContainText("live_per_app_filter_blocks_one_app");
+    await expect(row(page, "filtering.perApp")).toHaveCount(0);
+    const systemDns = row(page, "filtering.systemDns");
+    await systemDns.scrollIntoViewIfNeeded();
     await expect(row(page, "filtering.dns").getByRole("switch")).toBeEnabled();
     await expect(row(page, "filtering.systemDns").getByRole("switch")).toBeDisabled();
     await expect(row(page, "filtering.systemDns")).toContainText("Needs DNS filtering, which is off.");
@@ -58,7 +55,7 @@ test.describe("settings", () => {
     await expect(row(page, "startup.launchAtLogin").getByRole("switch")).toBeDisabled();
     await expect(row(page, "startup.launchAtLogin")).toContainText("Only the desktop app");
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
-    await perApp.screenshot({ path: `test-results/screens/settings-locked-${info.project.name}.png` });
+    await systemDns.screenshot({ path: `test-results/screens/settings-locked-${info.project.name}.png` });
   });
 
   test("search narrows the rows; a change persists across a reload", async ({ page }) => {

@@ -1,16 +1,19 @@
-//! `dns_status` wire shape, version 2. The TypeScript mirror is
+//! `dns_status` wire shape, version 3. The TypeScript mirror is
 //! `parseDnsStatus` in src/data/protocol.ts; both read the fixture
-//! src/data/fixtures/dns-status-v2.json. Changing a key or its meaning bumps
+//! src/data/fixtures/dns-status-v3.json. Changing a key or its meaning bumps
 //! `DNS_STATUS_VERSION`, the fixture and the mirror in the same commit.
 //!
 //! v2 (phase B): `bind` (one address or null) became `binds` (every listen
 //! address, empty when stopped), because the proxy listens on 127.0.0.1 and
 //! ::1 at once so Windows can point both address families at it.
+//! v3: `pass_through` (the global Sieving switch is off: running, forwarding
+//! every lookup, blocking nothing).
 //!
 //! ```json
 //! {
-//!   "v": 2,
+//!   "v": 3,
 //!   "running": true,
+//!   "pass_through": false,             // true: forwards everything, blocks nothing
 //!   "binds": ["127.0.0.1:53", "[::1]:53"], // empty when stopped
 //!   "started_at": 1800000000000,       // ms since the Unix epoch, null when stopped
 //!   "upstreams": ["1.1.1.1:53", "9.9.9.9:53"],
@@ -38,7 +41,7 @@
 
 use serde::Serialize;
 
-pub const DNS_STATUS_VERSION: u32 = 2;
+pub const DNS_STATUS_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Counters {
@@ -70,6 +73,7 @@ pub struct DomainCount {
 pub struct DnsStatus {
     pub v: u32,
     pub running: bool,
+    pub pass_through: bool,
     pub binds: Vec<String>,
     pub started_at: Option<u64>,
     pub upstreams: Vec<String>,
@@ -85,6 +89,7 @@ impl DnsStatus {
         DnsStatus {
             v: DNS_STATUS_VERSION,
             running: false,
+            pass_through: false,
             binds: Vec::new(),
             started_at: None,
             upstreams: Vec::new(),
@@ -100,13 +105,14 @@ impl DnsStatus {
 mod tests {
     use super::*;
 
-    const FIXTURE: &str = include_str!("../../../src/data/fixtures/dns-status-v2.json");
+    const FIXTURE: &str = include_str!("../../../src/data/fixtures/dns-status-v3.json");
 
     #[test]
-    fn running_status_serialises_to_the_shared_v2_fixture() {
+    fn running_status_serialises_to_the_shared_v3_fixture() {
         let status = DnsStatus {
             v: DNS_STATUS_VERSION,
             running: true,
+            pass_through: false,
             binds: vec!["127.0.0.1:53".into(), "[::1]:53".into()],
             started_at: Some(1_800_000_000_000),
             upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
@@ -130,7 +136,8 @@ mod tests {
     #[test]
     fn stopped_status_has_nulls_and_no_binds_not_zero_timestamps() {
         let v = serde_json::to_value(DnsStatus::stopped()).expect("serialises");
-        assert_eq!(v["v"], 2);
+        assert_eq!(v["v"], 3);
+        assert_eq!(v["pass_through"], false);
         assert_eq!(v["running"], false);
         assert_eq!(v["binds"], serde_json::json!([]));
         assert!(v["started_at"].is_null());

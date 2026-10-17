@@ -167,9 +167,9 @@ export function parseHistory(x: unknown): History {
 // DNS filter (phase B). Mirrors of src-tauri/src/dns/status.rs (dns_status),
 // src-tauri/src/dns/probe.rs (dns_self_check) and src-tauri/src/sysdns
 // (system_dns_state). Wire names are Rust's snake_case. Fixtures:
-// src/data/fixtures/dns-status-v2.json, system-dns-v1.json (Rust reads them too).
+// src/data/fixtures/dns-status-v3.json, system-dns-v1.json (Rust reads them too).
 
-export const DNS_STATUS_VERSION = 2 as const;
+export const DNS_STATUS_VERSION = 3 as const;
 export const SYSTEM_DNS_VERSION = 1 as const;
 
 export interface DnsCounters {
@@ -205,6 +205,8 @@ export interface DomainCount {
 export interface DnsStatus {
   v: typeof DNS_STATUS_VERSION;
   running: boolean;
+  /** Running but forwarding everything, blocking nothing (the global Sieving switch is off). */
+  pass_through: boolean;
   /** Every address the proxy listens on; empty when stopped. */
   binds: string[];
   started_at: number | null;
@@ -295,6 +297,7 @@ export function parseDnsStatus(raw: unknown): DnsStatus {
   return {
     v: DNS_STATUS_VERSION,
     running: bool(x.running, "running"),
+    pass_through: bool(x.pass_through, "pass_through"),
     binds: strings(x.binds, "binds"),
     started_at: intOrNull(x.started_at, "started_at"),
     upstreams: strings(x.upstreams, "upstreams"),

@@ -13,6 +13,7 @@
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type { HistoryQuery } from "@/core/history";
+import { trackedSnapshot } from "@/core/apps";
 import { tickCounts } from "@/core/series";
 import { PROTOCOL_VERSION, ProtocolError, parseHistory, parseSnapshot, type History, type HistoryRecord, type Snapshot } from "./protocol";
 import type { SieveSource } from "./source";
@@ -38,7 +39,14 @@ export function historyRecord(snap: Snapshot): HistoryRecord {
   };
 }
 
-export function createTauriSource(invoke: Invoke = tauriInvoke): SieveSource {
+const NONE: ReadonlySet<string> = new Set();
+
+/**
+ * @param untracked the app keys the user turned off, read at every sample:
+ *   their counts are not saved (apps.trackedSnapshot). The window passes the
+ *   setting (createSource); tests that do not care leave none off.
+ */
+export function createTauriSource(invoke: Invoke = tauriInvoke, untracked: () => ReadonlySet<string> = () => NONE): SieveSource {
   let writeError: string | null = null;
   return {
     kind: "tauri",
@@ -46,7 +54,7 @@ export function createTauriSource(invoke: Invoke = tauriInvoke): SieveSource {
       const raw = await invoke<unknown>("net_snapshot");
       checkVersion(raw);
       const snap = parseSnapshot(raw);
-      invoke<void>("history_record", { record: historyRecord(snap) }).then(
+      invoke<void>("history_record", { record: historyRecord(trackedSnapshot(snap, untracked())) }).then(
         () => (writeError = null),
         (e: unknown) => (writeError = e instanceof Error ? e.message : String(e)),
       );

@@ -16,7 +16,7 @@ import { useAppParam } from "./use-app-param";
 import { useApps } from "./use-apps";
 
 /**
- * The Apps screen: every app grouped by derived category, a level per app,
+ * The Apps screen: every app grouped by derived category, on or off per app,
  * the detail sheet deep-linked by ?app=<key>, add and remove, bulk actions.
  */
 export function AppsScreen() {
@@ -30,9 +30,8 @@ export function AppsScreen() {
   const waiting = model.phase === "starting" && model.apps.length === 0;
 
   const actions: RowActions = {
-    levelOf: model.levelOf,
-    lockedReason: model.lockedReason,
-    setLevel: model.setLevel,
+    isOn: model.isOn,
+    setOn: model.setOn,
     open: setOpenKey,
     unpin: model.unpin,
   };
@@ -43,7 +42,6 @@ export function AppsScreen() {
       ? { kind: "error", message: model.error ?? "Could not read connections" }
       : { kind: "ready" };
 
-  const locked = model.lockedReason("sieve");
   const n = model.sievedNow;
 
   return (
@@ -52,7 +50,7 @@ export function AppsScreen() {
       action={
         <>
           <AddApp onAdd={model.pin} />
-          <BulkMenu onWatchAll={model.watchAll} onStopAll={model.stopAll} onReset={model.resetLevels} />
+          <BulkMenu onSieveAll={model.sieveAll} onOffAll={model.offAll} />
         </>
       }
     >
@@ -71,10 +69,10 @@ export function AppsScreen() {
           >
             <div className="flex flex-col gap-4">
               <AppSearch value={query} onChange={setQuery} />
-              {locked && (
-                <p className="flex items-center gap-2 text-label text-on-surface-muted" data-testid="sieve-locked">
+              {!model.globalOn && (
+                <p className="flex items-center gap-2 text-label text-on-surface-muted" data-testid="sieving-off">
                   <Info className="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" />
-                  Sieve: {locked}. Apps can be watched or off for now.
+                  Sieving is off for every app. Turn it on in the top bar.
                 </p>
               )}
               {filtered && visible.length === 0 ? (

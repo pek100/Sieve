@@ -1,6 +1,6 @@
 "use client";
 
-import { Check, Copy, Info, Trash2 } from "lucide-react";
+import { Check, Copy, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { Button } from "@/components/ui/button";
@@ -10,7 +10,7 @@ import { isActiveFlow } from "@/core/apps";
 import type { AppEntry } from "@/core/apps-actions";
 import type { Flow } from "@/data/protocol";
 import { CATEGORY_LABEL, type RowActions } from "./app-list";
-import { LevelControl } from "./level-control";
+import { AppToggle, APP_OFF_MEANS } from "./app-toggle";
 import { Monogram } from "./monogram";
 
 const MAX_ROWS = 40;
@@ -128,25 +128,18 @@ function RemoteHosts({ flows }: { flows: Flow[] }) {
 }
 
 function Detail({ app, actions }: { app: AppEntry; actions: RowActions }) {
-  const level = actions.levelOf(app.key);
-  const locked = actions.lockedReason("sieve");
+  const on = actions.isOn(app.key);
   const pids = app.pids.length;
   return (
     <div className="flex flex-col gap-6 overflow-y-auto px-5 pb-6">
-      <Section title="Level">
-        <LevelControl
-          appName={app.name}
-          value={level}
-          lockedReason={actions.lockedReason}
-          onChange={(l) => actions.setLevel(app.key, l)}
-          className="w-full"
-        />
-        {locked && (
-          <p className="flex items-center gap-2 text-label text-on-surface-muted" data-testid="sieve-locked">
-            <Info className="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" />
-            Sieve: {locked}.
-          </p>
-        )}
+      <Section title="Sieve">
+        <div className="flex items-center gap-3">
+          <AppToggle appName={app.name} on={on} onChange={(v) => actions.setOn(app.key, v)} />
+          <span className="text-body text-on-surface">{on ? "On" : "Off"}</span>
+        </div>
+        <p className="text-label text-on-surface-muted" data-testid="app-off-means">
+          {APP_OFF_MEANS}
+        </p>
       </Section>
 
       <Section title={app.exes.length === 1 ? "Path" : "Paths"}>

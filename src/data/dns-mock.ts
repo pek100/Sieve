@@ -83,6 +83,7 @@ export function createMockDns(o: MockDnsOptions): DnsSource {
   const scenario = o.scenario ?? "off";
   const now = o.now ?? (() => Date.now());
   let running = false;
+  let passThrough = false;
   let startedAt: number | null = null;
   let upstreams: string[] = [];
   let reads = 0;
@@ -102,6 +103,7 @@ export function createMockDns(o: MockDnsOptions): DnsSource {
   const status = (): DnsStatus => ({
     v: DNS_STATUS_VERSION,
     running,
+    pass_through: running && passThrough,
     binds: running ? [...BINDS] : [],
     started_at: running ? startedAt : null,
     upstreams: running ? [...upstreams] : [],
@@ -116,13 +118,13 @@ export function createMockDns(o: MockDnsOptions): DnsSource {
       .slice(0, 20),
   });
 
-  /** One poll's worth of lookups: only while Windows uses the filter does anything get blocked. */
+  /** One poll's worth of lookups: only while Windows uses the filter, and not passing through, does anything get blocked. */
   const traffic = () => {
     reads += 1;
     const lookups = pointed ? 6 + Math.floor(hash01(o.seed, reads, 1) * 10) : 0;
     for (let i = 0; i < lookups; i++) {
       counters.queries += 1;
-      if (hash01(o.seed, reads, i, 2) < 0.18) {
+      if (!passThrough && hash01(o.seed, reads, i, 2) < 0.18) {
         const r = hash01(o.seed, reads, i, 3);
         const domain = DOMAINS[Math.floor(r * r * DOMAINS.length)];
         counters.blocked += 1;
@@ -139,6 +141,7 @@ export function createMockDns(o: MockDnsOptions): DnsSource {
       if (scenario === "error") throw new Error(MOCK_PORT_BUSY);
       if (running) throw new Error("DNS filter is already running; stop it first");
       running = true;
+      passThrough = false;
       startedAt = now();
       upstreams = config.upstreams.map(socketAddr);
       reads = 0;
@@ -169,6 +172,11 @@ export function createMockDns(o: MockDnsOptions): DnsSource {
           { server: BINDS[0], name: "example.com", expect: "NOERROR with a real address", got: "NOERROR 192.0.2.10", pass: true },
         ],
       };
+    },
+    async setPassThrough(on) {
+      if (!running) throw new Error("DNS filter is not running");
+      passThrough = on;
+      return status();
     },
     async systemState() {
       return system();

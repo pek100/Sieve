@@ -199,8 +199,8 @@ describe("home copy and KPIs", () => {
     for (const t of group.querySelectorAll("section[data-kpi]:not([data-dns-derived])")) {
       expect(t.getAttribute("aria-label")).toMatch(/apps|connections|hosts/i);
     }
-    // The apps count is isSieved (level watch or sieve): watched apps, and its label says so.
-    expect(group.querySelector('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Watched apps");
+    // The apps count is isSieved (effectively on, with a connection): sieved apps, and its label says so.
+    expect(group.querySelector('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Sieved apps");
     const dns = group.querySelector<HTMLElement>('section[data-kpi="blocked"]')!;
     expect(dns).toHaveAttribute("aria-label", "DNS filter");
     expect(within(dns).getByText("Off")).toBeInTheDocument();

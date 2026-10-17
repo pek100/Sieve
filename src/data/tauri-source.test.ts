@@ -89,6 +89,25 @@ describe("tauri source (seam law: validated, never silently empty)", () => {
     expect(r).toEqual(historyRecord(parseSnapshot(fixture)));
   });
 
+  it("an app the user turned off is not saved to history (Off stops tracking)", async () => {
+    const records: HistoryRecord[] = [];
+    const invoke = (async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "history_record") return void records.push(args?.record as HistoryRecord);
+      return fixture;
+    }) as Invoke;
+    let off: ReadonlySet<string> = new Set(["google chrome"]);
+    const src = createTauriSource(invoke, () => off);
+    const snap = await src.sample();
+    // The sample itself is whole: the Apps screen still lists the app so it can be turned back on.
+    expect(snap).toEqual(fixture);
+    expect(records[0].apps.map((a) => a.app)).not.toContain("google chrome");
+    expect(historyRecord(parseSnapshot(fixture)).apps.map((a) => a.app)).toContain("google chrome");
+    // Read at every sample: turned back on, it is saved again.
+    off = new Set();
+    await src.sample();
+    expect(records[1].apps.map((a) => a.app)).toContain("google chrome");
+  });
+
   it("reads history through history_buckets and validates it", async () => {
     const asked: unknown[] = [];
     const src = createTauriSource((async (cmd: string, args?: Record<string, unknown>) => {

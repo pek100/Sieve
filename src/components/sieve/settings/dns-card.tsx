@@ -32,6 +32,8 @@ function statusLine(phase: DnsPhase, d: DnsSlice): string {
       return "Stopping...";
     case "running":
       return `Running on ${(d.status?.binds ?? []).join(" and ")}.`;
+    case "paused":
+      return "Paused while Sieving is off: lookups pass through to the upstream servers, nothing is blocked.";
     case "error":
       return "Off: the last attempt failed.";
   }

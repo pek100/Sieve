@@ -40,6 +40,7 @@ pub fn run() {
             dns::commands::dns_stop,
             dns::commands::dns_status,
             dns::commands::dns_self_check,
+            dns::commands::dns_set_pass_through,
             sysdns::commands::system_dns_state,
             sysdns::commands::system_dns_point,
             sysdns::commands::system_dns_restore,

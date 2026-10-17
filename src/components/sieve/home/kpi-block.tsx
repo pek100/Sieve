@@ -6,17 +6,17 @@ import type { ReactNode } from "react";
 import { IconTile, type IconTileTone } from "@/components/sieve/primitives/icon-tile";
 import { CardBoundary } from "@/components/sieve/shell/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { isFiltering } from "@/core/dns";
+import { dnsPhase, isFiltering } from "@/core/dns";
 import type { DeltaDir, Kpi, KpiId } from "@/core/kpis";
 import { useDns } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
 import { useTicker } from "./use-home";
 
-/** Snapshot tiles name apps, connections or hosts: what Sieve watches, never a claim of filtering. */
+/** Snapshot tiles name apps, connections or hosts: what Sieve tracks, never a claim of filtering. */
 export const KPI_COPY: Record<KpiId, { label: string; icon: ReactNode; tone: IconTileTone }> = {
   // The one accent container tile on Home.
-  // Counts watched apps (level watch or sieve) with an active connection, not every app online.
-  apps: { label: "Watched apps", icon: <AppWindow strokeWidth={1.75} />, tone: "mint" },
+  // Counts sieved apps (effectively on: global and per app) with an active connection, not every app online.
+  apps: { label: "Sieved apps", icon: <AppWindow strokeWidth={1.75} />, tone: "mint" },
   connections: { label: "Active connections", icon: <Cable strokeWidth={1.75} />, tone: "neutral" },
   hosts: { label: "Remote hosts", icon: <Globe strokeWidth={1.75} />, tone: "neutral" },
 };
@@ -95,6 +95,8 @@ function Tile({ id, kpi, phase }: { id: KpiId; kpi: Kpi | null; phase: "loading"
 function BlockedTile() {
   const dns = useDns();
   const on = isFiltering(dns);
+  // Running in pass-through (global Sieving off): answering, blocking nothing.
+  const paused = dnsPhase(dns) === "paused";
   const blocked = dns.status?.counters.blocked ?? 0;
   const lookups = dns.status?.counters.queries ?? 0;
   const label = on ? "Blocked lookups" : "DNS filter";
@@ -118,6 +120,11 @@ function BlockedTile() {
         {on ? (
           <p className="text-kpi tabular" data-numeric="">
             <Ticker value={blocked} />
+          </p>
+        ) : paused ? (
+          <p className="flex flex-wrap items-baseline gap-x-2 text-body" data-dns-paused="">
+            <span className="text-title text-on-surface-muted">Paused</span>
+            <span className="text-label text-on-surface-muted">Lookups pass through while Sieving is off</span>
           </p>
         ) : (
           <p className="flex flex-wrap items-baseline gap-x-2 text-body">

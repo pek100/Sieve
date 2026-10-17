@@ -120,7 +120,7 @@ test.describe("home", () => {
     for (const tile of await page.locator("section[data-kpi]:not([data-dns-derived])").all()) {
       expect(await tile.getAttribute("aria-label")).toMatch(/apps|connections|hosts/i);
     }
-    await expect(page.locator('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Watched apps");
+    await expect(page.locator('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Sieved apps");
     await expect(page.locator('section[data-kpi="blocked"]')).toHaveAttribute("aria-label", "DNS filter");
   });
 

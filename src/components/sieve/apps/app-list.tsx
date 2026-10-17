@@ -6,9 +6,8 @@ import { IconButton } from "@/components/sieve/primitives/icon-button";
 import { StateLayer } from "@/components/sieve/primitives/state-layer";
 import type { Category } from "@/core/apps";
 import type { AppEntry, AppSection } from "@/core/apps-actions";
-import type { Level } from "@/core/policy";
 import { cn } from "@/lib/utils";
-import { LevelControl } from "./level-control";
+import { AppToggle } from "./app-toggle";
 import { Monogram } from "./monogram";
 
 export const CATEGORY_LABEL: Record<Category, string> = { mine: "Mine", apps: "Apps", system: "System" };
@@ -20,17 +19,18 @@ const EMPTY_HINT: Record<Category, string> = {
 };
 
 export interface RowActions {
-  levelOf: (key: string) => Level;
-  lockedReason: (level: Level) => string | null;
-  setLevel: (key: string, level: Level) => void;
+  /** The user has not turned this app off. */
+  isOn: (key: string) => boolean;
+  setOn: (key: string, on: boolean) => void;
   open: (key: string) => void;
   unpin: (key: string) => void;
 }
 
 export function AppRow({ app, actions }: { app: AppEntry; actions: RowActions }) {
   const n = app.activeCount;
+  const on = actions.isOn(app.key);
   return (
-    <li data-testid="app-row" data-app={app.key} className="flex h-11 items-center gap-2">
+    <li data-testid="app-row" data-app={app.key} data-off={on ? undefined : ""} className="flex h-11 items-center gap-2">
       <button
         type="button"
         onClick={() => actions.open(app.key)}
@@ -39,7 +39,7 @@ export function AppRow({ app, actions }: { app: AppEntry; actions: RowActions })
       >
         <Monogram appKey={app.key} name={app.name} />
         <span className="flex min-w-0 flex-1 flex-col">
-          <span className="truncate text-body-strong text-on-surface">{app.name}</span>
+          <span className={cn("truncate text-body-strong", on ? "text-on-surface" : "text-on-surface-muted")}>{app.name}</span>
           {/* Narrow windows move the count under the name to give the name room. */}
           <span aria-hidden="true" className="tabular hidden truncate text-caption text-on-surface-muted max-[640px]:block">
             {n} {n === 1 ? "connection" : "connections"}
@@ -47,20 +47,14 @@ export function AppRow({ app, actions }: { app: AppEntry; actions: RowActions })
         </span>
         <span
           aria-hidden="true"
-          className={cn("tabular shrink-0 text-label max-[640px]:hidden", n > 0 ? "text-on-surface" : "text-on-surface-faint")}
+          className={cn("tabular shrink-0 text-label max-[640px]:hidden", n > 0 && on ? "text-on-surface" : "text-on-surface-faint")}
           title={`${n} active ${n === 1 ? "connection" : "connections"}`}
         >
           {n}
         </span>
         <StateLayer />
       </button>
-      <LevelControl
-        compact
-        appName={app.name}
-        value={actions.levelOf(app.key)}
-        lockedReason={actions.lockedReason}
-        onChange={(l) => actions.setLevel(app.key, l)}
-      />
+      <AppToggle appName={app.name} on={on} onChange={(v) => actions.setOn(app.key, v)} />
       {app.pinnedPaths.length > 0 && (
         <IconButton label={`Remove ${app.name} from my apps`} onClick={() => actions.unpin(app.key)}>
           <X strokeWidth={1.75} />
