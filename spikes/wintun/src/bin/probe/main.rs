@@ -285,11 +285,15 @@ mod live {
             Some(e) => {
                 let ip = ips.iter().find(|i| i.is_ipv4()).unwrap_or(&ips[0]);
                 let host_ip = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
-                println!("ENFORCE TEST: dropping {} for {} only. Try, in another terminal:", e.domain, e.exe);
-                println!("    curl.exe -sk -m 8 -o NUL -w \"%{{http_code}}\\n\" --resolve {d}:443:{host_ip} https://{d}/", d = e.domain);
-                println!("    copy C:\\Windows\\System32\\curl.exe %TEMP%\\curl-other.exe");
-                println!("    %TEMP%\\curl-other.exe -sk -m 8 -o NUL -w \"%{{http_code}}\\n\" --resolve {d}:443:{host_ip} https://{d}/", d = e.domain);
-                println!("  expected: the first fails (connection closed, code 000), the second prints an HTTP code.");
+                println!("ENFORCE TEST: dropping {} for {} only. In a second (normal) PowerShell:", e.domain, e.exe);
+                println!("    Copy-Item C:\\Windows\\System32\\curl.exe $env:TEMP\\curl-other.exe");
+                println!("  HTTP (clean signal: blocked prints 000, passed prints the server's status code):");
+                println!("    curl.exe -s -m 8 -o NUL -w \"%{{http_code}}`n\" --resolve {d}:80:{host_ip} http://{d}/", d = e.domain);
+                println!("    & $env:TEMP\\curl-other.exe -s -m 8 -o NUL -w \"%{{http_code}}`n\" --resolve {d}:80:{host_ip} http://{d}/", d = e.domain);
+                println!("  TLS (both may print 000: the server rejects the test name; compare the -v error text):");
+                println!("    curl.exe -vk -m 8 -o NUL --resolve {d}:443:{host_ip} https://{d}/", d = e.domain);
+                println!("    & $env:TEMP\\curl-other.exe -vk -m 8 -o NUL --resolve {d}:443:{host_ip} https://{d}/", d = e.domain);
+                println!("  this window logs verdict=drop for curl.exe and verdict=pass for curl-other.exe.");
             }
             None => println!("OBSERVE: nothing is dropped; verdicts are what Sieve would do."),
         }
