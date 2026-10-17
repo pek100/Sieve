@@ -6,6 +6,8 @@ import { Switch as SwitchPrimitive } from "radix-ui"
 
 // Sieve: Material 3 style switch. Track 44x24 (sm 36x20), thumb grows when on.
 // Off: outlined track, muted thumb. On: mint track, dark thumb.
+// Hit area 44x44 (an ::after), grown only where the track is short of 44, so a switch that ends a
+// row on the grid line does not poke past it (the alignment law measures overflow).
 function Switch({
   className,
   size = "default",
@@ -18,7 +20,7 @@ function Switch({
       data-slot="switch"
       data-size={size}
       className={cn(
-        "peer group/switch relative inline-flex shrink-0 items-center rounded-full border-2 transition-[background-color,border-color,box-shadow] duration-(--motion-base) ease-standard outline-none after:absolute after:-inset-x-3 after:-inset-y-2 data-[size=default]:h-6 data-[size=default]:w-11 data-[size=sm]:h-5 data-[size=sm]:w-9 data-checked:border-primary data-checked:bg-primary data-unchecked:border-outline-strong data-unchecked:bg-surface-3 data-disabled:cursor-not-allowed data-disabled:opacity-(--disabled-content) aria-invalid:border-blocked",
+        "peer group/switch relative inline-flex shrink-0 items-center rounded-full border-2 transition-[background-color,border-color,box-shadow] duration-(--motion-base) ease-standard outline-none after:absolute after:inset-x-0 after:-inset-y-2.5 data-[size=sm]:after:-inset-x-1 data-[size=sm]:after:-inset-y-3 data-[size=default]:h-6 data-[size=default]:w-11 data-[size=sm]:h-5 data-[size=sm]:w-9 data-checked:border-primary data-checked:bg-primary data-unchecked:border-outline-strong data-unchecked:bg-surface-3 data-disabled:cursor-not-allowed data-disabled:opacity-(--disabled-content) aria-invalid:border-blocked",
         className
       )}
       {...props}

@@ -54,12 +54,13 @@ export function AppRow({ app, actions }: { app: AppEntry; actions: RowActions })
         </span>
         <StateLayer />
       </button>
-      <AppToggle appName={app.name} on={on} onChange={(v) => actions.setOn(app.key, v)} />
+      {/* The toggle is last, so every toggle ends on the header actions' line. */}
       {app.pinnedPaths.length > 0 && (
         <IconButton label={`Remove ${app.name} from my apps`} onClick={() => actions.unpin(app.key)}>
           <X strokeWidth={1.75} />
         </IconButton>
       )}
+      <AppToggle appName={app.name} on={on} onChange={(v) => actions.setOn(app.key, v)} />
     </li>
   );
 }
@@ -86,7 +87,7 @@ export function AppSectionView({
           aria-expanded={open}
           aria-controls={id}
           onClick={() => setOpen((o) => !o)}
-          className="relative flex h-9 w-full items-center gap-2 overflow-hidden rounded-full px-2 text-left"
+          className="relative flex h-9 w-full items-center gap-2 overflow-hidden rounded-sm text-left"
         >
           <ChevronDown
             className={cn("size-4 transition-transform duration-(--motion-base) ease-standard", !open && "-rotate-90")}
@@ -101,7 +102,7 @@ export function AppSectionView({
       {open && (
         <div id={id}>
           {apps.length === 0 ? (
-            <p className="flex h-11 items-center px-2 text-body text-on-surface-faint">{EMPTY_HINT[category]}</p>
+            <p className="flex h-11 items-center text-body text-on-surface-faint">{EMPTY_HINT[category]}</p>
           ) : (
             <ul className="flex flex-col">
               {apps.map((a) => (

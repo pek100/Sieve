@@ -4,6 +4,7 @@ import { Info } from "lucide-react";
 import { useMemo, useState } from "react";
 import { CardBody, CardBoundary, type CardState } from "@/components/sieve/shell/card";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
+import { GridRegion, LayoutGrid } from "@/components/sieve/shell/layout-grid";
 import { Page } from "@/components/sieve/shell/page";
 import { matchesQuery, sections } from "@/core/apps-actions";
 import { AddApp } from "./add-app";
@@ -17,7 +18,8 @@ import { useApps } from "./use-apps";
 /**
  * The Apps screen: every app grouped by derived category, on or off per app,
  * the detail sheet deep-linked by ?app=<key>, add and remove, bulk actions.
- * Flat on the page (no card): search and the count, then the groups.
+ * Flat on the page grid (no card): the count beside the title, the search,
+ * then the groups, edge to edge of the page container.
  */
 export function AppsScreen() {
   const model = useApps();
@@ -47,6 +49,11 @@ export function AppsScreen() {
   return (
     <Page
       title="Apps"
+      meta={
+        <span className="tabular text-label text-on-surface-muted" data-testid="sieved-count">
+          {n} being sieved
+        </span>
+      }
       action={
         <>
           <AddApp onAdd={model.pin} />
@@ -55,33 +62,35 @@ export function AppsScreen() {
       }
     >
       <CardBoundary title="Apps">
-        <section aria-label="All apps" aria-busy={state.kind === "loading" || undefined} className="flex max-w-[880px] flex-col gap-4">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-            <div className="min-w-0 flex-1 basis-60">
-              <AppSearch value={query} onChange={setQuery} />
-            </div>
-            <span className="tabular text-label text-on-surface-muted" data-testid="sieved-count">
-              {n} being sieved
-            </span>
-          </div>
+        {/* On the page grid: the search takes half the width, the list runs edge to edge so every toggle ends on the header actions' line. */}
+        <LayoutGrid>
+          <GridRegion span={6}>
+            <AppSearch value={query} onChange={setQuery} />
+          </GridRegion>
           {!model.globalOn && (
-            <p className="flex items-center gap-2 text-label text-on-surface-muted" data-testid="sieving-off">
-              <Info className="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" />
-              Sieving is off for every app. Turn it on in the top bar.
-            </p>
+            <GridRegion span={12}>
+              <p className="flex items-center gap-2 text-label text-on-surface-muted" data-testid="sieving-off">
+                <Info className="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+                Sieving is off for every app. Turn it on in the top bar.
+              </p>
+            </GridRegion>
           )}
-          <CardBody state={state}>
-            {filtered && visible.length === 0 ? (
-              <EmptyState line="Nothing by that name" body={`No app or path matches "${query.trim()}".`} />
-            ) : (
-              <div className="flex flex-col gap-4">
-                {grouped.map((s) => (
-                  <AppSectionView key={s.category} section={s} actions={actions} filtered={filtered} />
-                ))}
-              </div>
-            )}
-          </CardBody>
-        </section>
+          <GridRegion span={12}>
+            <section aria-label="All apps" aria-busy={state.kind === "loading" || undefined} className="flex flex-col">
+              <CardBody state={state}>
+                {filtered && visible.length === 0 ? (
+                  <EmptyState line="Nothing by that name" body={`No app or path matches "${query.trim()}".`} />
+                ) : (
+                  <div className="flex flex-col gap-4">
+                    {grouped.map((s) => (
+                      <AppSectionView key={s.category} section={s} actions={actions} filtered={filtered} />
+                    ))}
+                  </div>
+                )}
+              </CardBody>
+            </section>
+          </GridRegion>
+        </LayoutGrid>
       </CardBoundary>
       <AppDetailSheet
         appKey={openKey}
