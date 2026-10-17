@@ -1,10 +1,11 @@
 /**
  * Per-app activity series for the Home chart (B3 derivation, pure).
  * One point per time bucket: how many active (non-listening) flows each app
- * held, averaged over the samples in the bucket. The top SERIES_COUNT apps by
- * window total get a named series and a colour slot; the rest fold into
- * Other. Slots are sticky: an app keeps its slot (its colour) for as long as
- * it stays in the top set, so a live tick never repaints the chart.
+ * held, averaged over the samples in the bucket. Which apps are named is the
+ * series set (seriesSet): the top SERIES_COUNT apps of the live session get a
+ * named series and a colour slot, the rest fold into Other, and every window
+ * draws that same set. Slots are sticky: an app keeps its slot (its colour)
+ * for as long as it stays in the top set, so a live tick never repaints the chart.
  */
 import type { Snapshot } from "@/data/protocol";
 import { appIdentity, isActiveFlow } from "./apps";
@@ -106,35 +107,50 @@ export interface SeriesPoint {
 }
 
 export interface SeriesModel {
-  /** Named series by slot, then Other when anything folded into it. */
+  /** Named series by slot, then Other: the shared series set, the same in every window. */
   series: SeriesDef[];
   points: SeriesPoint[];
   bucketMs: number;
+  /** The span the chart shows: the window choice, never less. */
   windowMs: number;
-  /** Slot of every named key, to feed back as `previousSlots` on the next tick. */
-  slots: Readonly<Record<string, number>>;
+  /** The right edge of the window, epoch ms: the newest sample (live) or the end of the query (history). */
+  end: number;
 }
+
+/**
+ * Who is named and in which colour: the top SERIES_COUNT apps with their
+ * slots, then Other. Derived once from data every window shares (the live
+ * session) and handed to every window's model, so switching the window
+ * never renames, reorders or recolours a series.
+ */
+export interface SeriesSet {
+  series: SeriesDef[];
+  slots: Readonly<Record<string, number>>;
+  top: ReadonlySet<string>;
+}
+
+export const EMPTY_SET: SeriesSet = { series: [], slots: {}, top: new Set() };
 
 export interface SeriesOptions {
   windowMs: number;
   intervalMs: number;
-  /** Slots from the previous build; keeps colours sticky. */
-  previousSlots?: Readonly<Record<string, number>>;
 }
 
 const round2 = (x: number) => Math.round(x * 100) / 100;
 
 /**
  * Who gets named: rank apps by total, keep the top SERIES_COUNT with sticky
- * slots, fold the rest into Other. Shared by the live chart (buildSeries) and
- * the history periods (historySeries in ./history).
+ * slots, and add Other for the rest (always, once anything is named: a window
+ * may hold apps the ranking data did not, and the legend must not change by
+ * window). The one ranking: the live session's set (seriesSet) and a history
+ * period with no live session to rank by (historySeries) both use it.
  */
 export function rankSeries(
   totals: ReadonlyMap<string, number>,
   names: ReadonlyMap<string, string>,
   previous: Readonly<Record<string, number>>,
-): { series: SeriesDef[]; slots: Record<string, number>; top: ReadonlySet<string> } {
-  // Rank by window total; on a tie an app that already holds a slot stays ahead.
+): SeriesSet {
+  // Rank by total; on a tie an app that already holds a slot stays ahead.
   const ranked = [...totals.entries()]
     .filter(([, n]) => n > 0)
     .sort(
@@ -150,21 +166,27 @@ export function rankSeries(
   const series: SeriesDef[] = top
     .map((key) => ({ key, name: names.get(key) ?? key, slot: slots[key], total: totals.get(key) ?? 0 }))
     .sort((a, b) => a.slot - b.slot);
-  if (otherTotal > 0) series.push({ key: OTHER_KEY, name: "Other", slot: 0, total: otherTotal });
+  if (series.length > 0) series.push({ key: OTHER_KEY, name: "Other", slot: 0, total: otherTotal });
   return { series, slots, top: new Set(top) };
 }
 
-export function buildSeries(snapshots: readonly Snapshot[], o: SeriesOptions): SeriesModel {
-  const bucketMs = bucketSize(o.windowMs, o.intervalMs);
-  const ticks = windowSnapshots(snapshots, o.windowMs).map(tickCounts);
-
+/** The series set of a run of snapshots: every app's total over all of them. */
+export function seriesSet(snapshots: readonly Snapshot[], previous: Readonly<Record<string, number>> = {}): SeriesSet {
   const totals = new Map<string, number>();
   const names = new Map<string, string>();
-  for (const tick of ticks) {
+  for (const s of snapshots) {
+    const tick = tickCounts(s);
     for (const [k, n] of tick.byApp) totals.set(k, (totals.get(k) ?? 0) + n);
     for (const [k, name] of tick.names) names.set(k, name);
   }
-  const { series, slots, top: topSet } = rankSeries(totals, names, o.previousSlots ?? {});
+  return rankSeries(totals, names, previous);
+}
+
+/** The live chart model for a window: one point per bucket, each series of `set` (apps outside it in Other). */
+export function buildSeries(snapshots: readonly Snapshot[], o: SeriesOptions, set: SeriesSet): SeriesModel {
+  const bucketMs = bucketSize(o.windowMs, o.intervalMs);
+  const ticks = windowSnapshots(snapshots, o.windowMs).map(tickCounts);
+  const { series, top } = set;
   const points: SeriesPoint[] = [];
   let i = 0;
   while (i < ticks.length) {
@@ -174,7 +196,7 @@ export function buildSeries(snapshots: readonly Snapshot[], o: SeriesOptions): S
     let n = 0;
     while (i < ticks.length && ticks[i].t < start + bucketMs) {
       for (const [k, c] of ticks[i].byApp) {
-        const key = topSet.has(k) ? k : OTHER_KEY;
+        const key = top.has(k) ? k : OTHER_KEY;
         if (key in sums) sums[key] += c;
       }
       n += 1;
@@ -184,18 +206,18 @@ export function buildSeries(snapshots: readonly Snapshot[], o: SeriesOptions): S
     for (const s of series) values[s.key] = round2(sums[s.key] / n);
     points.push({ t: start, values });
   }
-
-  return { series, points, bucketMs, windowMs: o.windowMs, slots };
+  const end = snapshots.length ? snapshots[snapshots.length - 1].t : 0;
+  return { series, points, bucketMs, windowMs: o.windowMs, end };
 }
 
-/** Remembers slots between builds. One per chart. */
+/** Remembers slots between derivations of the series set, so colours stay sticky. One per chart. */
 export function createSlotKeeper() {
   let slots: Readonly<Record<string, number>> = {};
   return {
-    build(snapshots: readonly Snapshot[], o: Omit<SeriesOptions, "previousSlots">): SeriesModel {
-      const model = buildSeries(snapshots, { ...o, previousSlots: slots });
-      slots = model.slots;
-      return model;
+    set(snapshots: readonly Snapshot[]): SeriesSet {
+      const s = seriesSet(snapshots, slots);
+      slots = s.slots;
+      return s;
     },
   };
 }

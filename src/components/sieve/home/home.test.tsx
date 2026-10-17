@@ -10,7 +10,7 @@ import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { HomeScreen } from "./home-screen";
-import { MIN_VIEW_SAMPLES, viewMs, WINDOWS } from "./use-home";
+import { WINDOWS } from "./use-home";
 
 // Each setup drives 45 one-second ticks through React (about 1.7 s alone); under the
 // full parallel suite that passed the 5 s default and the overrun cascaded into the next tests.
@@ -74,28 +74,6 @@ const legendChips = () => within(within(chart()).getByRole("list", { name: "Seri
 /** Upper-edge y values of a line path ("M x y L x y ..."). */
 const ys = (d: string) => d.slice(1).split("L").map((pt) => Number(pt.trim().split(" ")[1]));
 
-describe("chart view span", () => {
-  it("doubles as data accumulates, from a floor of MIN_VIEW_SAMPLES intervals up to the window", () => {
-    const s = 1000;
-    expect([0, 8 * s, 18 * s, 19 * s, 40 * s, 299 * s, 900 * s].map((x) => viewMs("5m", x) / s)).toEqual([
-      18.75, 18.75, 18.75, 37.5, 75, 300, 300,
-    ]);
-    // A slower interval raises the floor.
-    expect(viewMs("5m", 0, 5000)).toBe(300_000 / 2);
-  });
-
-  it("past the floor the data fills at least half the plot, for every live window", () => {
-    for (const w of WINDOWS.filter((x) => !x.history)) {
-      for (let span = 0; span <= w.ms * 1.5; span += 7_919) {
-        const v = viewMs(w.value, span);
-        expect(v).toBeLessThanOrEqual(w.ms);
-        expect(v).toBeGreaterThanOrEqual(MIN_VIEW_SAMPLES * 1000);
-        if (v > MIN_VIEW_SAMPLES * 1000 * 2 && v < w.ms) expect(span / v).toBeGreaterThan(0.5);
-      }
-    }
-  });
-});
-
 describe("home chart", () => {
   it("shows at most 6 named series plus Other; toggling a legend chip removes it and restacks", async () => {
     await setup();
@@ -151,33 +129,38 @@ describe("home chart", () => {
     expect(svg).toHaveAttribute("data-sliding");
   });
 
-  it("ticks across view steps keep every path node; the step only rescales the plot group", async () => {
-    // From 10 s to 45 s the 5 min view doubles twice (18.75 s, 37.5 s, 75 s).
-    const { fc } = await setup("steady", 10);
-    const scales = new Set<string>();
+  it("switching the window changes only the time range: same legend, same path nodes, new scale", async () => {
+    const { runtime } = await setup("steady", 30);
+    // Freeze the data so only the switch can change anything.
+    act(() => runtime.poller.pauseFor(5));
+    const legend = () => legendChips().map((b) => b.textContent);
+    const before = legend();
+    const nodes = [...chart().querySelectorAll("svg[data-chart-plot] path")];
     const scaleNow = () => chart().querySelector("g[data-slide]")!.getAttribute("data-scale")!;
-    scales.add(scaleNow());
-    for (let i = 0; i < 35; i++) {
-      const before = new Map(areas().map((p) => [p.dataset.series!, p]));
-      const lineBefore = new Map(
-        [...chart().querySelectorAll<SVGPathElement>('path[data-part="line"]')].map((p) => [p.dataset.series!, p]),
-      );
-      await act(() => fc.advance(1000));
-      for (const p of areas()) {
-        const old = before.get(p.dataset.series!);
-        if (old) expect(p).toBe(old);
-      }
-      for (const p of chart().querySelectorAll<SVGPathElement>('path[data-part="line"]')) {
-        const old = lineBefore.get(p.dataset.series!);
-        if (old) expect(p).toBe(old);
-      }
-      scales.add(scaleNow());
+    const scales: string[] = [];
+    for (const w of [...WINDOWS.slice(1), WINDOWS[0]]) {
+      await userEvent.click(within(chart()).getByRole("radio", { name: w.label }));
+      if (w.history) await vi.waitFor(() => expect(chart().querySelector('path[data-part="line"]')!.getAttribute("d")!.split("L").length).toBeGreaterThan(80));
+      expect(legend()).toEqual(before);
+      const now = [...chart().querySelectorAll("svg[data-chart-plot] path")];
+      expect(now).toHaveLength(nodes.length);
+      now.forEach((p, i) => expect(p).toBe(nodes[i]));
+      scales.push(scaleNow());
     }
-    // 300 / 18.75, 300 / 37.5, 300 / 75: the steps happened, as transform changes on the same nodes.
-    expect([...scales]).toEqual(["16", "8", "4"]);
+    // One hour spans the unit: 1 h is scale 1, 5 min 12, 14 d 1/336.
+    expect(scales).toEqual(["1", "0.5", "0.042", "0.006", "0.003", "12"]);
+  });
+
+  it("when the data covers less than the window, the plot says where it starts", async () => {
+    await setup("steady", 30);
+    await userEvent.click(within(chart()).getByRole("radio", { name: "1 h" }));
+    const start = chart().querySelector<HTMLElement>("[data-data-start]")!;
+    expect(start).not.toBeNull();
+    expect(start).toHaveTextContent(/^Sieve started \d/);
+    // 30 s of a 1 h window: the boundary sits near the right edge.
+    expect(parseFloat(start.style.width)).toBeGreaterThan(95);
   });
 });
-
 /** Home's text with the DNS-derived tiles taken out. */
 function textOutsideDnsTiles(): string {
   const copy = document.body.cloneNode(true) as HTMLElement;

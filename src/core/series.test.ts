@@ -6,10 +6,12 @@ import {
   bucketSize,
   buildSeries,
   createSlotKeeper,
+  EMPTY_SET,
   MAX_POINTS,
   niceCeiling,
   OTHER_KEY,
   SERIES_COUNT,
+  seriesSet,
   stackSeries,
   tickCounts,
   windowSnapshots,
@@ -30,6 +32,10 @@ async function mockTicks(n: number, seed = 1, scenario: "steady" | "busy" | "emp
 
 const W5 = 5 * 60_000;
 
+/** The model of one window, named by that window's own set. */
+const windowModel = (out: readonly Snapshot[], windowMs: number) =>
+  buildSeries(out, { windowMs, intervalMs: 1000 }, seriesSet(windowSnapshots(out, windowMs)));
+
 describe("series derivation", () => {
   it("has SERIES_COUNT 6, matching the six series tokens", () => {
     expect(SERIES_COUNT).toBe(6);
@@ -47,7 +53,7 @@ describe("series derivation", () => {
 
   it("shows at most 6 named series plus Other, ranked by window total, Other holding the rest", async () => {
     const { out } = await mockTicks(120);
-    const m = buildSeries(out, { windowMs: W5, intervalMs: 1000 });
+    const m = windowModel(out, W5);
     const named = m.series.filter((s) => s.key !== OTHER_KEY);
     expect(named.length).toBe(SERIES_COUNT);
     expect(m.series.at(-1)?.key).toBe(OTHER_KEY);
@@ -68,12 +74,12 @@ describe("series derivation", () => {
     const { out, next } = await mockTicks(60);
     const keeper = createSlotKeeper();
     const snaps = [...out];
-    const before = keeper.build(snaps, { windowMs: W5, intervalMs: 1000 });
+    const before = keeper.set(snaps);
     const slotsBefore = new Map(before.series.map((s) => [s.key, s.slot]));
     let after = before;
     for (let i = 0; i < 10; i++) {
       snaps.push(await next());
-      after = keeper.build(snaps, { windowMs: W5, intervalMs: 1000 });
+      after = keeper.set(snaps);
       for (const s of after.series) {
         if (slotsBefore.has(s.key)) expect([s.key, s.slot]).toEqual([s.key, slotsBefore.get(s.key)]);
       }
@@ -81,6 +87,26 @@ describe("series derivation", () => {
     // Most of the top set survives 10 ticks; the check above is not vacuous.
     const kept = after.series.filter((s) => s.key !== OTHER_KEY && slotsBefore.has(s.key));
     expect(kept.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("one set, every window: the same series, order and colours in 5 min and 1 h; apps with no data draw flat", async () => {
+    const { out } = await mockTicks(900);
+    const set = seriesSet(out);
+    const five = buildSeries(out, { windowMs: W5, intervalMs: 1000 }, set);
+    const hour = buildSeries(out, { windowMs: 3_600_000, intervalMs: 1000 }, set);
+    expect(five.series).toBe(set.series);
+    expect(hour.series).toBe(set.series);
+    expect(five.windowMs).toBe(W5);
+    expect(hour.windowMs).toBe(3_600_000);
+    expect(five.end).toBe(out.at(-1)!.t);
+    // Every point carries every series of the set, zero when the app had nothing then.
+    for (const p of [...five.points, ...hour.points]) expect(Object.keys(p.values).sort()).toEqual(set.series.map((s) => s.key).sort());
+  });
+
+  it("Other is part of every non-empty set, so the legend never gains or loses it by window", async () => {
+    const { out } = await mockTicks(30);
+    expect(seriesSet(out).series.at(-1)?.key).toBe(OTHER_KEY);
+    expect(seriesSet([])).toEqual({ ...EMPTY_SET, top: new Set() });
   });
 
   it("assignSlots keeps incumbents and gives newcomers the lowest free slot", () => {
@@ -96,22 +122,22 @@ describe("series derivation", () => {
     expect(bucketSize(W5, 1000)).toBe(1000);
     expect(bucketSize(3_600_000, 1000)).toBe(12_000);
     expect(bucketSize(3_600_000, 5000)).toBe(15_000);
-    const hour = buildSeries(out, { windowMs: 3_600_000, intervalMs: 1000 });
+    const hour = windowModel(out, 3_600_000);
     expect(hour.points.length).toBeLessThanOrEqual(MAX_POINTS);
     expect(hour.points.length).toBeGreaterThan(30);
   });
 
   it("empty input and scenario empty give no series", async () => {
-    expect(buildSeries([], { windowMs: W5, intervalMs: 1000 }).series).toEqual([]);
+    expect(windowModel([], W5).series).toEqual([]);
     const { out } = await mockTicks(5, 1, "empty");
-    const m = buildSeries(out, { windowMs: W5, intervalMs: 1000 });
+    const m = windowModel(out, W5);
     expect(m.series).toEqual([]);
     expect(m.points.length).toBe(5);
   });
 
   it("stacking drops hidden series and the ones above fall down", async () => {
     const { out } = await mockTicks(60);
-    const m = buildSeries(out, { windowMs: W5, intervalMs: 1000 });
+    const m = windowModel(out, W5);
     const all = stackSeries(m, new Set());
     expect(all.layers.map((l) => l.key)).toEqual(m.series.map((s) => s.key));
     const first = m.series[0].key;
