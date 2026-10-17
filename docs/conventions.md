@@ -153,7 +153,7 @@ Run in PowerShell from the repo or worktree root.
 - `lib.rs` registers plugins and `generate_handler![...]`; each command lives in `commands.rs` and is `async`, running blocking work in `tauri::async_runtime::spawn_blocking`; it returns `Result<T, String>`.
 - Module errors are `thiserror` enums (`NetstatError`), turned into strings only at the command boundary. No `unwrap`/`expect` outside tests; clippy runs with `-D warnings`.
 - Read calls to Windows only, with one declared exception: `sysdns::win::run_elevated` (one PowerShell script, verb "runas", UAC). The `windows` crate features each module needs are listed with a comment in `Cargo.toml`. No drivers.
-- Tests never bind port 53 (use `127.0.0.1:0` / `[::1]:0`). `bind_pair` picks the port on TCP first: Windows reserves large TCP port ranges, and a UDP-picked port inside one failed the TCP bind with WSAEACCES.
+- Tests never bind port 53 (use `127.0.0.1:0` / `[::1]:0`). For port 0, `bind_pair` tries random ports of the dynamic range for UDP and TCP together: Windows reserves separate, moving TCP and UDP port ranges, and a port the OS picked for one protocol kept landing in the other's exclusion (WSAEACCES, 10013).
 - Capabilities (`src-tauri/capabilities/default.json`) grant window controls, `store:default` and `dialog:default`. Add a permission only with the command or plugin that needs it.
 - Each worktree keeps its own `src-tauri/target` (the default). First build is about 2 minutes.
 

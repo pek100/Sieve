@@ -62,8 +62,8 @@ pub const MAX_TRACKED_DOMAINS: usize = 4_096;
 
 /// Largest DNS message (the TCP length prefix is a u16).
 const MAX_MESSAGE: usize = 65_535;
-/// With port 0, how often to retry when the UDP port is taken for TCP.
-const BIND_ATTEMPTS: usize = 8;
+/// With port 0, how many random ports to try for a UDP and TCP pair.
+const BIND_ATTEMPTS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -230,28 +230,50 @@ impl Proxy {
     }
 }
 
-/// UDP and TCP on the same address. For port 0 the OS picks a TCP port and
-/// UDP takes the same one, retried if that UDP port happens to be taken.
+/// UDP and TCP on the same address. A fixed port is bound once. For port 0
+/// (tests) a random port of the dynamic range is tried for both, again on
+/// any failure.
 ///
-/// TCP picks first because Windows reserves large TCP port ranges (Hyper-V,
-/// WinNAT: `netsh int ipv4 show excludedportrange protocol=tcp`, about 1500
-/// ports in 100-port blocks on the dev machine, 2026-10-17). A UDP-chosen
-/// port then landed inside one often enough that the TCP bind failed with
-/// WSAEACCES (10013) on all retries in one run in two; a TCP-chosen port is
-/// never in a TCP exclusion.
+/// Why not let the OS pick for one protocol and reuse it for the other:
+/// Windows reserves TCP and UDP port ranges separately and they move
+/// (Hyper-V, WinNAT: `netsh int ipv4 show excludedportrange protocol=udp`,
+/// about 1500 ports in 100-port blocks on the dev machine, 2026-10-17), and
+/// the OS hands out ephemeral ports nearly in sequence. A port picked by one
+/// protocol sat inside the other's exclusion for every retry: 4 of 54 DNS
+/// tests failed with WSAEACCES (10013) with UDP picking, 20 of 118 with TCP
+/// picking, on different runs. Random ports spread over the range escape a
+/// block within a few tries.
 async fn bind_pair(addr: SocketAddr) -> Result<(UdpSocket, TcpListener), DnsError> {
-    let attempts = if addr.port() == 0 { BIND_ATTEMPTS } else { 1 };
-    let mut last = None;
-    for _ in 0..attempts {
+    if addr.port() != 0 {
         let tcp = TcpListener::bind(addr).await.map_err(|source| DnsError::Bind { addr, source })?;
-        let actual = tcp.local_addr().map_err(|source| DnsError::Bind { addr, source })?;
-        match UdpSocket::bind(actual).await {
-            Ok(udp) => return Ok((udp, tcp)),
+        let udp = UdpSocket::bind(addr).await.map_err(|source| DnsError::Bind { addr, source })?;
+        return Ok((udp, tcp));
+    }
+    let mut last = None;
+    for _ in 0..BIND_ATTEMPTS {
+        let candidate = SocketAddr::new(addr.ip(), random_dynamic_port());
+        match TcpListener::bind(candidate).await {
+            Ok(tcp) => match UdpSocket::bind(candidate).await {
+                Ok(udp) => return Ok((udp, tcp)),
+                Err(e) => last = Some(e),
+            },
             Err(e) => last = Some(e),
         }
     }
     let source = last.unwrap_or_else(|| std::io::Error::other("no bind attempt made"));
     Err(DnsError::Bind { addr, source })
+}
+
+/// First port of the IANA dynamic range (also Windows' default for both protocols).
+const DYNAMIC_PORTS_START: u16 = 49_152;
+
+/// A random port in 49152..=65535. RandomState is seeded per instance by the
+/// standard library, so no random-number crate is needed for this.
+fn random_dynamic_port() -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    let r = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    let span = u64::from(u16::MAX - DYNAMIC_PORTS_START) + 1;
+    DYNAMIC_PORTS_START + u16::try_from(r % span).unwrap_or(0)
 }
 
 async fn serve_udp(socket: UdpSocket, shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
@@ -875,6 +897,13 @@ pub(crate) mod tests {
         assert!(matches!(Proxy::start(config, RuleSet::new()).await, Err(DnsError::Config(_))));
     }
 
+    #[test]
+    fn random_ports_stay_in_the_dynamic_range_and_vary() {
+        let ports: std::collections::HashSet<u16> = (0..200).map(|_| random_dynamic_port()).collect();
+        assert!(ports.iter().all(|&p| p >= DYNAMIC_PORTS_START));
+        assert!(ports.len() > 150, "spread over the range, got {} distinct", ports.len());
+    }
+
     #[tokio::test]
     async fn no_listen_address_is_a_config_error() {
         let config = ProxyConfig {
@@ -917,9 +946,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_taken_second_address_fails_the_whole_start_and_frees_the_first() {
         let taken = UdpSocket::bind("[::1]:0").await.expect("bind");
-        let free = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
-        let first = free.local_addr().expect("addr");
-        drop(free);
+        // A port free for both protocols, found the way the proxy finds one, then released.
+        let (udp, tcp) = bind_pair("127.0.0.1:0".parse().expect("addr")).await.expect("bind");
+        let first = udp.local_addr().expect("addr");
+        drop((udp, tcp));
         let config = ProxyConfig {
             binds: vec![first, taken.local_addr().expect("addr")],
             upstreams: vec!["127.0.0.1:9".parse().expect("addr")],
