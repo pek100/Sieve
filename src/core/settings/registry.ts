@@ -7,7 +7,7 @@
  * "dataSwitch", defaults to false and names the live check that proves it
  * works on the real machine (a `live_*` test). The registry law enforces it.
  */
-import type { Level } from "../policy";
+import { LEVELS, type Level } from "../policy";
 
 export const SETTINGS_SCHEMA = 1;
 
@@ -20,6 +20,14 @@ interface Base<T> {
   default: T;
   /** Settings key of a data switch that must be on for this one to apply. */
   requires?: string;
+}
+
+/** Shape of one element of a map or list setting. */
+export type ElementSpec = { type: "string" } | { type: "enum"; options: readonly string[] };
+
+export function isValidElement(spec: ElementSpec, v: unknown): boolean {
+  if (typeof v !== "string") return false;
+  return spec.type === "string" ? v.trim().length > 0 : spec.options.includes(v);
 }
 
 export interface EnumSetting<O extends string = string> extends Base<O> {
@@ -38,9 +46,13 @@ export interface NumberSetting extends Base<number> {
 }
 export interface MapSetting<V> extends Base<Readonly<Record<string, V>>> {
   kind: "map";
+  /** Shape of every value in the map. */
+  of: ElementSpec;
 }
 export interface ListSetting<V> extends Base<readonly V[]> {
   kind: "list";
+  /** Shape of every item in the list. */
+  of: ElementSpec;
 }
 export interface DataSwitchSetting extends Base<false | boolean> {
   kind: "dataSwitch";
@@ -93,6 +105,7 @@ export const REGISTRY = {
     label: "Per-app level",
     help: "Off, watch or sieve, per app. Apps not listed use watch.",
     default: {} as Readonly<Record<string, Level>>,
+    of: { type: "enum", options: LEVELS },
   } satisfies MapSetting<Level>,
   "apps.pinned": {
     kind: "list",
@@ -100,6 +113,7 @@ export const REGISTRY = {
     label: "My apps",
     help: "Executables you added by hand. They show under Mine even when not running.",
     default: [] as readonly string[],
+    of: { type: "string" },
   } satisfies ListSetting<string>,
   "filtering.dns": {
     kind: "dataSwitch",
@@ -153,8 +167,13 @@ export function isValidValue(key: SettingKey, value: unknown): boolean {
     case "number":
       return typeof value === "number" && Number.isFinite(value) && value >= def.min && value <= def.max;
     case "map":
-      return typeof value === "object" && value !== null && !Array.isArray(value);
+      return (
+        typeof value === "object" &&
+        value !== null &&
+        !Array.isArray(value) &&
+        Object.values(value).every((v) => isValidElement(def.of, v))
+      );
     case "list":
-      return Array.isArray(value);
+      return Array.isArray(value) && value.every((v) => isValidElement(def.of, v));
   }
 }
