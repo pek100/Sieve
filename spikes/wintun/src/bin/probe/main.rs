@@ -47,6 +47,7 @@ mod live {
     use ipstack::{IpStack, IpStackConfig, IpStackStream};
     use spike::flows::{Attributor, ExeCache, os::IpHelper};
     use spike::probe_support::{self, Args, FlowLog, MAX_ROUTES, Summary, USAGE};
+    use spike::tasks::FlowTasks;
 
     use crate::forward::{self, Shared};
     use crate::os;
@@ -131,15 +132,42 @@ mod live {
         }));
 
         let code = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-            Ok(rt) => rt.block_on(session(args, ips, egress, list_text)),
+            Ok(rt) => {
+                let code = rt.block_on(session(args, ips, egress, list_text));
+                // Never a plain drop: a drop waits without bound for every
+                // remaining task and blocking thread.
+                rt.shutdown_timeout(RUNTIME_BOUND);
+                code
+            }
             Err(e) => {
                 eprintln!("error: tokio runtime: {e}");
                 2
             }
         };
         let (ok, failed) = os::cleanup();
-        println!("cleanup: removed {ok} route/address entries ({failed} failed)");
+        println!("cleanup: removed {ok} route/address entries ({failed} failed); exiting");
         code
+    }
+
+    /// Bound for cancelled flow tasks to finish.
+    const TASKS_BOUND: Duration = Duration::from_secs(5);
+    /// Bound for the runtime's own shutdown after the session.
+    const RUNTIME_BOUND: Duration = Duration::from_secs(3);
+    /// Hard limit from "stopping" to process exit, whatever hangs.
+    const EXIT_WATCHDOG: Duration = Duration::from_secs(30);
+
+    /// After `after`, removes the routes and address (idempotent) and exits
+    /// the process. A normal exit happens long before and ends this thread.
+    fn arm_exit_watchdog(after: Duration) {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            let (ok, failed) = os::cleanup();
+            eprintln!(
+                "watchdog: shutdown took longer than {} s; removed {ok} route/address entries ({failed} failed); exiting",
+                after.as_secs()
+            );
+            std::process::exit(6);
+        });
     }
 
     fn route_ips(args: &Args) -> Result<Vec<IpAddr>, String> {
@@ -244,6 +272,7 @@ mod live {
         let device = TunDevice::new(session.clone(), ips.clone(), counters.clone());
         let mut stack = IpStack::new(config, device);
 
+        let mut tasks = FlowTasks::new();
         let deadline = tokio::time::sleep(Duration::from_secs(args.seconds));
         tokio::pin!(deadline);
         let reason = loop {
@@ -251,18 +280,32 @@ mod live {
                 _ = &mut deadline => break "time up",
                 _ = tokio::signal::ctrl_c() => break "Ctrl+C",
                 s = stack.accept() => match s {
-                    Ok(IpStackStream::Tcp(t)) => { tokio::spawn(forward::handle_tcp(shared.clone(), t)); }
-                    Ok(IpStackStream::Udp(u)) => { tokio::spawn(forward::handle_udp(shared.clone(), u)); }
+                    Ok(IpStackStream::Tcp(t)) => tasks.spawn(forward::handle_tcp(shared.clone(), t)),
+                    Ok(IpStackStream::Udp(u)) => tasks.spawn(forward::handle_udp(shared.clone(), u)),
                     Ok(_) => {}
                     Err(_) => break "stack stopped",
                 },
             }
         };
         println!("\nstopping ({reason})");
+        // From here the process is guaranteed to end: if any step below
+        // hangs, the watchdog removes the routes and exits.
+        arm_exit_watchdog(EXIT_WATCHDOG);
+        // 1. Close the Wintun session: the reader thread's blocking read
+        //    returns, the device reports EOF, ipstack's packet loop ends.
+        let _ = session.shutdown();
+        // 2. Cancel every flow task while the runtime still runs, so each
+        //    ipstack stream's blocking Drop can complete (run 2's hang).
+        let report = tasks.shutdown(TASKS_BOUND).await;
+        println!(
+            "flow tasks cancelled: {} live at stop, {}",
+            report.live,
+            if report.drained { "all finished" } else { "some did not finish in time (the watchdog guards the exit)" }
+        );
+        // 3. Stop the stack, remove routes and address, close the adapter.
         drop(stack);
         let (ok, failed) = os::cleanup();
         println!("routes and address removed: {ok} ({failed} failed)");
-        let _ = session.shutdown();
         drop(session);
         drop(adapter);
         println!("adapter \"{ADAPTER_NAME}\" closed (Wintun removes it)");

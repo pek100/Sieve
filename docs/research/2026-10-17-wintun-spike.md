@@ -162,6 +162,13 @@ Tests added: destination admission (all multicast and link-local destinations fr
   - **Regression tests:** the TCP relay moved into `spike::relay::relay_tcp`, generic over the stream types, and the probe calls it for every TCP flow, so TLS and HTTP share one path. Eight tests drive it with an in-memory app stream and a real loopback upstream: an HTTP request is replayed exactly once and the 200 response reaches the app; a request in 7-byte pieces arrives whole; reply-then-close delivers the whole reply; close-without-reply gives the app EOF with 0 bytes, not a hang (the quic.nginx.org case); TLS in two writes is replayed, then both directions flow; drop sends nothing upstream; a server-first banner reaches the app before any client byte; client EOF before any byte stops without deciding.
   - **Enforce test clarity:** a made-up test name gets rejected by any real server, so its pass case is not a clean signal. `--block-domain` may now also be the routed host itself (only flows to its routed addresses can reach the stack, so nothing else can be dropped). The banner then prints plain HTTPS commands: blocked prints 000, passed prints 200.
 
+- **Run 2 never exited** (it printed the summary and wrote both reports, but the process was still alive 25 minutes later and had to be killed). Root cause: `run()` let the tokio runtime drop while thousands of stuck flow tasks were still live. Each task owned an ipstack TCP stream, whose `Drop` waits synchronously (`block_in_place` + `block_on`) for the stream's own session task. A runtime that is shutting down no longer drives that task, so the drop waited forever. Runs 3 and 4 had no live streams at the end, so they exited. Fix:
+  - All flow tasks live in `spike::tasks::FlowTasks` (a `JoinSet`).
+  - At stop, the probe arms a 30 s exit watchdog, closes the Wintun session (the blocking read returns), and aborts and drains every flow task within 5 s while the runtime still runs.
+  - It then removes routes, closes the adapter, writes the reports, and ends the runtime with `shutdown_timeout(3 s)` instead of a drop.
+  - If anything still hangs, the watchdog removes the routes (idempotent) and calls `std::process::exit(6)`.
+  - Tests: 40 relays stuck on a loopback upstream that never answers, plus 40 forwarder connects that never complete, each holding a guard whose `Drop` blocks exactly like ipstack's. All are cancelled and the runtime is shut down within the bound (well under a second here). A second test covers reaping finished flows and an immediate shutdown of an empty set.
+
 ### Next live run (observe)
 
 In Terminal (Admin):

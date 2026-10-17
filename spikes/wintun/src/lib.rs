@@ -23,6 +23,7 @@ pub mod relay;
 pub mod rules;
 pub mod sni;
 pub mod stream;
+pub mod tasks;
 
 /// The answer of an incremental parser that is fed bytes as they arrive.
 #[derive(Debug, Clone, PartialEq, Eq)]
