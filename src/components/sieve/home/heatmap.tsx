@@ -1,7 +1,7 @@
 "use client";
 
 import { CalendarDays } from "lucide-react";
-import { useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent, type RefObject } from "react";
 import { FloatingTooltip } from "@/components/sieve/primitives/floating-tooltip";
 import { Card, type CardState } from "@/components/sieve/shell/card";
 import { HEAT_GAP_PX, heatStack, sharePercents, WEEKDAYS, type HeatCell, type HeatGrid } from "@/core/heat";
@@ -60,6 +60,30 @@ export function cellAt(x: number, y: number, w: number, h: number): { day: numbe
   const ch = (h - 6 * GAP) / 7;
   const clamp = (v: number, n: number) => Math.max(0, Math.min(n - 1, v));
   return { hour: clamp(Math.floor(x / (cw + GAP)), 24), day: clamp(Math.floor(y / (ch + GAP)), 7) };
+}
+
+/** A tooltip to show: for which cell, beside which viewport point. */
+interface Tip {
+  index: number;
+  x: number;
+  y: number;
+}
+
+/** Keyboard moves: [hours, days]. Home and End go to the row's ends. */
+const KEY_STEPS: Record<string, readonly [number, number] | undefined> = {
+  ArrowLeft: [-1, 0],
+  ArrowRight: [1, 0],
+  ArrowUp: [0, -1],
+  ArrowDown: [0, 1],
+  Home: [-24, 0],
+  End: [24, 0],
+};
+
+/** The cell index a keyboard move lands on, stopping at the map's edges. */
+export function moveCell(index: number, [dh, dd]: readonly [number, number]): number {
+  const day = Math.max(0, Math.min(6, Math.floor(index / 24) + dd));
+  const hour = Math.max(0, Math.min(23, (index % 24) + dh));
+  return day * 24 + hour;
 }
 
 /** The element's content size, kept current by a ResizeObserver; null until measured. */
@@ -124,14 +148,30 @@ function HeatTip({ cell }: { cell: HeatCell }) {
   );
 }
 
-/** The 168 cells: a quiet track each, and the stack on it. Pure of hover, so pointer moves never rebuild it. */
-function Cells({ grid, w, h }: { grid: HeatGrid; w: number; h: number }) {
-  return grid.cells.map((c) => {
+/**
+ * The 168 cells: a quiet track each, and the stack on it. Each cell is an
+ * image with its own accessible name; one of them (`active`) is the map's
+ * single tab stop and the arrow keys move it. Pure of hover, so pointer moves
+ * never rebuild it.
+ */
+function Cells({ grid, w, h, active }: { grid: HeatGrid; w: number; h: number; active: number }) {
+  return grid.cells.map((c, i) => {
     const b = cellBox(c.day, c.hour, w, h);
     const bottom = b.y + b.h;
     const segments = heatStack(c, grid.max, b.h);
     return (
-      <g key={c.day * 24 + c.hour} data-cell="" data-day={c.day} data-hour={c.hour} data-segments={segments.length}>
+      <g
+        key={c.day * 24 + c.hour}
+        role="img"
+        aria-label={cellLabel(c)}
+        tabIndex={i === active ? 0 : -1}
+        data-cell=""
+        data-index={i}
+        data-day={c.day}
+        data-hour={c.hour}
+        data-segments={segments.length}
+        className="outline-none"
+      >
         <rect x={b.x} y={b.y} width={b.w} height={b.h} rx={2} className={cn("fill-surface-2", c.hours === 0 && "opacity-50")} />
         {segments.map((s, i) => (
           <rect
@@ -184,11 +224,30 @@ export function Heatmap({
   const plotRef = useRef<HTMLDivElement>(null);
   const measured = useSize(plotRef);
   const { w, h } = measured ?? FALLBACK;
-  const [hover, setHover] = useState<{ index: number; x: number; y: number } | null>(null);
+  const [hover, setHover] = useState<Tip | null>(null);
+  // Keyboard: the cell holding the tab stop, and the focused one (its tooltip sits beside it).
+  const [active, setActive] = useState(0);
+  const [focused, setFocused] = useState<Tip | null>(null);
   const busiest = grid && grid.max > 0 ? grid.cells.reduce((a, b) => (b.total > a.total ? b : a)) : null;
-  const cells = useMemo(() => (grid ? <Cells grid={grid} w={w} h={h} /> : null), [grid, w, h]);
-  const hovered = grid && hover ? grid.cells[hover.index] : null;
-  const hoverBox = hovered ? cellBox(hovered.day, hovered.hour, w, h) : null;
+  const cells = useMemo(() => (grid ? <Cells grid={grid} w={w} h={h} active={active} /> : null), [grid, w, h, active]);
+  const tip = hover ?? focused;
+  const shown = grid && tip ? grid.cells[tip.index] : null;
+  const shownBox = shown ? cellBox(shown.day, shown.hour, w, h) : null;
+
+  const onKeyDown = (e: KeyboardEvent<SVGSVGElement>) => {
+    const step = KEY_STEPS[e.key];
+    if (!step) return;
+    e.preventDefault();
+    const next = moveCell(active, step);
+    e.currentTarget.querySelector<SVGGElement>(`[data-index="${next}"]`)?.focus();
+  };
+  const onFocus = (e: FocusEvent<SVGSVGElement>) => {
+    const index = Number((e.target as Element).getAttribute("data-index"));
+    if (!Number.isInteger(index) || (e.target as Element).getAttribute("data-cell") === null) return;
+    const r = (e.target as Element).getBoundingClientRect();
+    setActive(index);
+    setFocused({ index, x: r.right, y: r.bottom });
+  };
 
   return (
     <Card
@@ -203,8 +262,6 @@ export function Heatmap({
       ) : (
         <div className="flex min-h-0 flex-1 flex-col gap-2">
           <div
-            role="img"
-            aria-label={`Activity by weekday and hour, ${caption.toLowerCase()}.${busiest ? ` Busiest: ${WEEKDAYS[busiest.day]} ${hh(busiest.hour)}.` : ""}`}
             className="grid h-44 min-h-0 grid-cols-[auto_repeat(24,minmax(0,1fr))] grid-rows-[repeat(7,minmax(0,1fr))_auto] gap-1 three:h-auto three:flex-1"
           >
             {WEEKDAYS.map((d, day) => (
@@ -221,8 +278,14 @@ export function Heatmap({
             {/* The plot spans the 24 hour columns and 7 day rows; the SVG draws the cells on those same lines. */}
             <div ref={plotRef} style={{ gridColumn: "2 / -1", gridRow: "1 / 8" }} className="relative min-h-0 min-w-0">
               <svg
-                aria-hidden="true"
+                role="group"
+                aria-label={`Connections by app, weekday and hour, ${caption.toLowerCase()}.${busiest ? ` Busiest: ${WEEKDAYS[busiest.day]} ${hh(busiest.hour)}.` : ""} Arrow keys move between hours and days.`}
                 data-heat-plot=""
+                onKeyDown={onKeyDown}
+                onFocus={onFocus}
+                onBlur={(e) => {
+                  if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocused(null);
+                }}
                 viewBox={`0 0 ${w} ${h}`}
                 preserveAspectRatio="none"
                 className="absolute inset-0 size-full overflow-visible"
@@ -235,16 +298,18 @@ export function Heatmap({
                 onPointerLeave={() => setHover(null)}
               >
                 {cells}
-                {hoverBox && (
+                {shownBox && (
+                  // The pointed or focused cell: a ring outside it (a focus ring, not a separator).
                   <rect
                     aria-hidden="true"
-                    x={hoverBox.x - 0.5}
-                    y={hoverBox.y - 0.5}
-                    width={hoverBox.w + 1}
-                    height={hoverBox.h + 1}
-                    rx={2.5}
-                    className="pointer-events-none fill-none stroke-on-surface-muted"
-                    strokeWidth={1}
+                    data-heat-ring=""
+                    x={shownBox.x - 1}
+                    y={shownBox.y - 1}
+                    width={shownBox.w + 2}
+                    height={shownBox.h + 2}
+                    rx={3}
+                    className={cn("pointer-events-none fill-none", hover ? "stroke-on-surface-muted" : "stroke-ring")}
+                    strokeWidth={hover ? 1 : 2}
                   />
                 )}
               </svg>
@@ -261,9 +326,9 @@ export function Heatmap({
               </span>
             ))}
             {/* In a portal, fixed, beside the pointer and kept inside the window: never widens the page. */}
-            {hover && hovered && (
-              <FloatingTooltip x={hover.x} y={hover.y} data-heat-tooltip="" className="p-3">
-                <HeatTip cell={hovered} />
+            {tip && shown && (
+              <FloatingTooltip x={tip.x} y={tip.y} data-heat-tooltip="" className="p-3">
+                <HeatTip cell={shown} />
               </FloatingTooltip>
             )}
           </div>
