@@ -137,7 +137,7 @@ export function SettingRow({
       data-setting={k}
       role="group"
       aria-labelledby={labelId}
-      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-outline py-4 last:border-b-0"
+      className="flex min-h-11 flex-wrap items-center justify-between gap-x-4 gap-y-2"
     >
       <div className="min-w-0 flex-1 basis-60">
         <p id={labelId} className="text-body-strong text-on-surface">

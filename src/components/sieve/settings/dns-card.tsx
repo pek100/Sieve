@@ -77,7 +77,7 @@ function Note({ tone, children, label }: { tone: "warning" | "error" | "info"; c
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <section aria-label={title} className="flex flex-col gap-2 border-t border-outline pt-4">
+    <section aria-label={title} className="flex flex-col gap-2">
       <h3 className="text-body-strong text-on-surface">{title}</h3>
       {children}
     </section>
@@ -102,7 +102,7 @@ function familyText(f: FamilyDns): string {
 
 function AdapterRow({ it }: { it: InterfaceDns & { uses_sieve: boolean } }) {
   return (
-    <li className="flex min-w-0 flex-col gap-1 border-b border-outline py-3 last:border-b-0" data-adapter={it.alias}>
+    <li className="flex min-w-0 flex-col gap-1" data-adapter={it.alias}>
       <p className="flex flex-wrap items-center gap-2 text-body-strong">
         {it.alias}
         {it.uses_sieve && <span className="text-caption text-primary">Uses Sieve</span>}
@@ -223,7 +223,7 @@ export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH | typeof S
         />
       }
     >
-      <div className="flex flex-col gap-4" data-dns-card="" data-dns-phase={phase}>
+      <div className="flex flex-col gap-6" data-dns-card="" data-dns-phase={phase}>
         <div className="flex flex-col gap-1">
           <p className="text-body text-on-surface" data-dns-status="">
             {statusLine(phase, d)}
@@ -281,7 +281,7 @@ export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH | typeof S
             ) : (
               <ol aria-label="Most blocked domains" className="flex flex-col">
                 {top.map((t) => (
-                  <li key={t.domain} className="flex h-9 items-center justify-between gap-3 border-b border-outline last:border-b-0">
+                  <li key={t.domain} className="flex h-9 items-center justify-between gap-3">
                     <span className="min-w-0 truncate font-mono text-mono">{t.domain}</span>
                     <span className="text-label text-on-surface-muted tabular">{count(t.count)}</span>
                   </li>
@@ -302,7 +302,7 @@ export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH | typeof S
                 : "Windows uses its own DNS servers. Pointing it at Sieve saves a backup first; Windows asks for administrator rights."}
           </p>
           {system !== null && system.interfaces.length > 0 && (
-            <ul aria-label="Network adapters" className="flex flex-col">
+            <ul aria-label="Network adapters" className="flex flex-col gap-3">
               {system.interfaces.map((it) => (
                 <AdapterRow key={`${it.index}-${it.alias}`} it={it} />
               ))}

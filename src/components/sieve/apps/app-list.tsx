@@ -30,7 +30,7 @@ export function AppRow({ app, actions }: { app: AppEntry; actions: RowActions })
   const n = app.activeCount;
   const on = actions.isOn(app.key);
   return (
-    <li data-testid="app-row" data-app={app.key} data-off={on ? undefined : ""} className="flex h-11 items-center gap-2 border-b border-outline last:border-b-0">
+    <li data-testid="app-row" data-app={app.key} data-off={on ? undefined : ""} className="flex h-11 items-center gap-2">
       <button
         type="button"
         onClick={() => actions.open(app.key)}
@@ -104,7 +104,7 @@ export function AppSectionView({
           {apps.length === 0 ? (
             <p className="flex h-11 items-center text-body text-on-surface-faint">{EMPTY_HINT[category]}</p>
           ) : (
-            <ul className="flex flex-col">
+            <ul className="flex flex-col gap-1">
               {apps.map((a) => (
                 <AppRow key={a.key} app={a} actions={actions} />
               ))}

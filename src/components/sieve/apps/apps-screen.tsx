@@ -81,7 +81,7 @@ export function AppsScreen() {
                 {filtered && visible.length === 0 ? (
                   <EmptyState line="Nothing by that name" body={`No app or path matches "${query.trim()}".`} />
                 ) : (
-                  <div className="flex flex-col gap-4">
+                  <div className="flex flex-col gap-6">
                     {grouped.map((s) => (
                       <AppSectionView key={s.category} section={s} actions={actions} filtered={filtered} />
                     ))}

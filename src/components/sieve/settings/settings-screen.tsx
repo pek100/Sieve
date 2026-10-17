@@ -74,7 +74,7 @@ export function SettingsScreen() {
                 <div key={s.id} id={`section-${s.id}`} className="scroll-mt-4">
                   {keys.length > 0 && (
                     <Card title={s.label}>
-                      <div className="flex flex-col">
+                      <div className="flex flex-col gap-4">
                         {keys.map((k) => (
                           <SettingRow
                             key={k}

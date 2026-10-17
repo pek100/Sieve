@@ -91,7 +91,7 @@ function ConnectionsTable({ flows }: { flows: Flow[] }) {
         </thead>
         <tbody>
           {shown.map((f, i) => (
-            <tr key={`${f.proto}-${f.local.port}-${host(f)}-${i}`} data-testid="connection-row" className="h-11 border-t border-outline">
+            <tr key={`${f.proto}-${f.local.port}-${host(f)}-${i}`} data-testid="connection-row" className="h-11">
               <td className="truncate pr-3 font-mono text-mono text-on-surface" data-testid="host">
                 {host(f)}
               </td>
@@ -102,7 +102,7 @@ function ConnectionsTable({ flows }: { flows: Flow[] }) {
         </tbody>
       </table>
       {sorted.length > MAX_ROWS && (
-        <p className="border-t border-outline py-2 text-caption text-on-surface-faint">
+        <p className="pt-2 text-caption text-on-surface-faint">
           {sorted.length - MAX_ROWS} more not shown
         </p>
       )}

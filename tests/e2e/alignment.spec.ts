@@ -296,6 +296,37 @@ test.describe("alignment law", () => {
     expect(errors).toEqual([]);
   });
 
+  test("list rows are set apart by space, never a line, and keep 44 px rows where they are pressed", async ({ page }) => {
+    const lined = (sel: string) =>
+      page.evaluate((s) => {
+        const out: string[] = [];
+        for (const el of document.querySelectorAll<HTMLElement>(s)) {
+          const cs = getComputedStyle(el);
+          for (const side of ["Top", "Bottom"] as const) {
+            const w = parseFloat(cs.getPropertyValue(`border-${side.toLowerCase()}-width`));
+            const style = cs.getPropertyValue(`border-${side.toLowerCase()}-style`);
+            if (w > 0 && style !== "none") out.push(`${s} ${el.textContent?.slice(0, 20)}: ${side} border ${w}px`);
+          }
+        }
+        return out;
+      }, sel);
+    const failures: string[] = [];
+    await page.goto("/apps/?source=mock&seed=1");
+    await expect(page.getByTestId("app-row").first()).toBeVisible();
+    failures.push(...(await lined("[data-testid=app-row]")));
+    for (const r of (await page.getByTestId("app-row").all()).slice(0, 5)) {
+      const h = (await r.boundingBox())!.height;
+      if (h < 44) failures.push(`app row ${h}px tall`);
+    }
+    await page.goto("/settings/?source=mock&seed=1");
+    await expect(page.locator("[data-setting]").first()).toBeVisible();
+    failures.push(...(await lined("[data-setting]")), ...(await lined("[data-adapter]")), ...(await lined("main section")));
+    await page.goto("/?source=mock&seed=1");
+    await expect(page.getByRole("region", { name: "Top apps" }).locator("li").first()).toBeVisible();
+    failures.push(...(await lined("main li")));
+    expect(failures, failures.join("\n")).toEqual([]);
+  });
+
   test("switching the time window changes only the time range", async ({ page }, info) => {
     test.skip(info.project.name !== "desktop", "the segmented control is the desktop control");
     await openHome(page);
