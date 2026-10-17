@@ -81,7 +81,7 @@ function socketAddr(raw: string): string {
 
 export function createMockDns(o: MockDnsOptions): DnsSource {
   const scenario = o.scenario ?? "off";
-  const now = o.now ?? (() => 1_760_000_000_000);
+  const now = o.now ?? (() => Date.now());
   let running = false;
   let startedAt: number | null = null;
   let upstreams: string[] = [];

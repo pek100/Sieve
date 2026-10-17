@@ -205,6 +205,8 @@ export function createDnsController(d: DnsControllerDeps): DnsController {
     } catch (e) {
       check = failedCheck(e);
     }
+    // The check's own lookups are in the counters now.
+    await readStatus();
     set({ check, busy: null });
     schedulePoll();
     if (check.pass) {

@@ -24,7 +24,7 @@ const snap = (flows: Flow[], t = 1): Snapshot => ({
 const watchAll = (): Level => "watch";
 
 describe("kpis", () => {
-  it("counts apps with active flows, connections, distinct hosts and listening ports", () => {
+  it("counts watched apps with active flows, connections and distinct hosts; listeners are not connections", () => {
     const s = snap([
       tcp(10, "203.0.113.5", "established", 50001),
       tcp(10, "203.0.113.5", "time_wait", 50002),
@@ -32,7 +32,7 @@ describe("kpis", () => {
       tcp(30, null, "listen", 3000),
       { pid: 30, proto: "udp", family: "v4", local: { addr: "0.0.0.0", port: 5353 }, remote: null, state: "none" },
     ]);
-    expect(kpiValues(s, watchAll)).toEqual({ apps: 2, connections: 3, hosts: 2, ports: 2 });
+    expect(kpiValues(s, watchAll)).toEqual({ apps: 2, connections: 3, hosts: 2 });
   });
 
   it("an app at level off is not counted as sieved", () => {
@@ -49,17 +49,18 @@ describe("kpis", () => {
       ["apps", 1, 0, "flat"],
       ["connections", 2, 1, "up"],
       ["hosts", 2, 1, "up"],
-      ["ports", 0, 0, "flat"],
     ]);
     expect(kpis([], watchAll)).toBeNull();
     expect([deltaDir(-2), deltaDir(0), deltaDir(3)]).toEqual(["down", "flat", "up"]);
   });
 
-  it("works on mock data: System listens but is never a sieved app", async () => {
+  it("works on mock data: System listens but is never a watched app", async () => {
     const src = createMockSource({ seed: 1, now: () => 1 });
-    const v = kpiValues(await src.sample(), watchAll);
+    const s = await src.sample();
+    const v = kpiValues(s, watchAll);
     expect(v.apps).toBeGreaterThan(5);
     expect(v.connections).toBeGreaterThan(v.apps);
-    expect(v.ports).toBeGreaterThanOrEqual(5);
+    expect(s.flows.some((f) => f.pid === 4 && f.state === "listen")).toBe(true);
+    expect(v.apps).toBe(kpiValues({ ...s, flows: s.flows.filter((f) => f.pid !== 4) }, watchAll).apps);
   });
 });
