@@ -5,6 +5,7 @@ import { useLayoutEffect, useMemo, useRef, useState, type RefObject } from "reac
 import { FloatingTooltip } from "@/components/sieve/primitives/floating-tooltip";
 import { Card, type CardState } from "@/components/sieve/shell/card";
 import { HEAT_GAP_PX, heatStack, WEEKDAYS, type HeatCell, type HeatGrid } from "@/core/heat";
+import type { SeriesDef } from "@/core/series";
 import { cn } from "@/lib/utils";
 import { seriesTone } from "./series-tone";
 
@@ -110,6 +111,24 @@ function Cells({ grid, w, h }: { grid: HeatGrid; w: number; h: number }) {
   });
 }
 
+/**
+ * The map's key: the chart's series in the chart's order and colours, as a
+ * compact static list (the chart's chips are toggles; these are not, so they
+ * do not look pressable).
+ */
+export function HeatLegend({ series }: { series: readonly SeriesDef[] }) {
+  return (
+    <ul aria-label="Apps in the map" className="flex min-w-0 flex-wrap gap-x-4 gap-y-1">
+      {series.map((s) => (
+        <li key={s.key} className="flex max-w-40 min-w-0 items-center gap-2 text-caption text-on-surface-muted">
+          <span aria-hidden="true" className={cn("size-2 shrink-0 rounded-full", seriesTone(s.slot).bg)} />
+          <span className="truncate">{s.name}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 /** Hour x weekday activity by app. Caption says how far back the data goes. */
 export function Heatmap({
   grid,
@@ -208,6 +227,7 @@ export function Heatmap({
               </FloatingTooltip>
             )}
           </div>
+          <HeatLegend series={grid.series} />
         </div>
       )}
     </Card>
