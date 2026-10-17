@@ -4,7 +4,7 @@ import { CalendarDays } from "lucide-react";
 import { useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { FloatingTooltip } from "@/components/sieve/primitives/floating-tooltip";
 import { Card, type CardState } from "@/components/sieve/shell/card";
-import { HEAT_GAP_PX, heatStack, WEEKDAYS, type HeatCell, type HeatGrid } from "@/core/heat";
+import { HEAT_GAP_PX, heatStack, sharePercents, WEEKDAYS, type HeatCell, type HeatGrid } from "@/core/heat";
 import type { SeriesDef } from "@/core/series";
 import { cn } from "@/lib/utils";
 import { seriesTone } from "./series-tone";
@@ -79,9 +79,49 @@ function useSize(ref: RefObject<HTMLElement | null>): { w: number; h: number } |
   return size;
 }
 
-function describe(c: HeatCell): string {
-  if (c.hours === 0) return `${WEEKDAYS[c.day]} ${hh(c.hour)}: no data yet`;
-  return `${WEEKDAYS[c.day]} ${hh(c.hour)} to ${hh((c.hour + 1) % 24)}: about ${Math.round(c.total).toLocaleString()} active connections`;
+/** Mean connections as said: whole numbers from 10 up, one decimal below. */
+const amount = (x: number) => (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10).toLocaleString();
+
+/** What a cell says, in words: the tooltip and the accessible name both read this. */
+export function cellSummary(c: HeatCell) {
+  const pcts = sharePercents(c.mix);
+  const parts = c.mix
+    .map((m, i) => ({ key: m.key, name: m.name, slot: m.slot, share: m.share, pct: pcts[i] === 0 && m.share > 0 ? "<1%" : `${pcts[i]}%` }))
+    .sort((a, b) => b.share - a.share);
+  const amountLine =
+    c.hours === 0 ? "No data for this hour yet" : c.total === 0 ? "No open connections" : `${amount(c.total)} open connections on average`;
+  return { when: `${WEEKDAYS[c.day]} ${hh(c.hour)}`, amountLine, parts };
+}
+
+/** The accessible name of a cell, for example "Tue 14:00, 31 open connections on average: Chrome 41%, Slack 30%". */
+export function cellLabel(c: HeatCell): string {
+  const s = cellSummary(c);
+  const mix = s.parts.map((p) => `${p.name} ${p.pct}`).join(", ");
+  return `${s.when}, ${s.amountLine.charAt(0).toLowerCase()}${s.amountLine.slice(1)}${mix ? `: ${mix}` : ""}`;
+}
+
+/** The tooltip body: the hour, how busy, then who, largest first, with their colour dots. */
+function HeatTip({ cell }: { cell: HeatCell }) {
+  const s = cellSummary(cell);
+  return (
+    <div className="flex min-w-40 flex-col gap-2">
+      <p className="text-caption text-on-surface-muted tabular">
+        {s.when} to {hh((cell.hour + 1) % 24)}
+      </p>
+      <p className="text-label text-on-surface">{s.amountLine}</p>
+      {s.parts.length > 0 && (
+        <ul className="flex flex-col gap-1">
+          {s.parts.map((p) => (
+            <li key={p.key} className="flex items-center gap-2">
+              <span aria-hidden="true" className={cn("size-2 shrink-0 rounded-full", seriesTone(p.slot).bg)} />
+              <span className="min-w-0 flex-1 truncate text-on-surface-muted">{p.name}</span>
+              <span className="text-on-surface tabular">{p.pct}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 /** The 168 cells: a quiet track each, and the stack on it. Pure of hover, so pointer moves never rebuild it. */
@@ -222,8 +262,8 @@ export function Heatmap({
             ))}
             {/* In a portal, fixed, beside the pointer and kept inside the window: never widens the page. */}
             {hover && hovered && (
-              <FloatingTooltip x={hover.x} y={hover.y} data-heat-tooltip="">
-                {describe(hovered)}
+              <FloatingTooltip x={hover.x} y={hover.y} data-heat-tooltip="" className="p-3">
+                <HeatTip cell={hovered} />
               </FloatingTooltip>
             )}
           </div>
