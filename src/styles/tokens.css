@@ -30,6 +30,9 @@
   --page-max: 1920px;
   --page-pad: 24px;
   --page-header-h: 64px;
+  /* The content area's scrollbar (vertical only): its gutter is always reserved, and the top bar
+     keeps the same width free on its right, so both containers end on one line. */
+  --scrollbar-w: 8px;
   --gutter: 24px;
   /* A section header row (title, icon, action) and the KPI label rows beside it share this height,
      so their text sits on one line. The chart's time axis row is the space the KPI block keeps

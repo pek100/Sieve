@@ -62,13 +62,8 @@ test.describe("home", () => {
     expect(Math.abs(chart.y - kpis.y)).toBeLessThan(2);
     expect(chart.width).toBeGreaterThan(kpis.width * 1.8);
 
-    // First minute: the data already spans a good part of the plot, not a sliver at the right edge.
-    const fill = await r.chart.evaluate((el) => {
-      const plot = el.querySelector("svg[data-chart-plot]")!.getBoundingClientRect();
-      const line = el.querySelector('path[data-part="line"]')!.getBoundingClientRect();
-      return line.width / plot.width;
-    });
-    expect(fill).toBeGreaterThan(0.3);
+    // First minute: the plot shows the whole 5 min window and says plainly where the data starts.
+    await expect(r.chart.locator("[data-data-start]")).toContainText(/^Sieve started \d/);
 
     await page.screenshot({ path: "test-results/screens/home-desktop.png" });
     expect(errors).toEqual([]);

@@ -13,10 +13,11 @@ import { cn } from "@/lib/utils";
  * the title and the action, so a banner costs no height; narrower, it wraps
  * to its own line under them. An empty slot takes no space.
  *
- * `fill`: at >= 1280 the page is a column exactly as tall as the window
- * under the top bar, so a `three:flex-1` child takes whatever height is left
- * after the header. No child has to know the other children's heights. A
- * child's own min-height still wins on a short window; the page then scrolls.
+ * `fill`: at >= 1280 the page is a column exactly as tall as the content
+ * area under the top bar, so a `three:flex-1` child takes whatever height is
+ * left after the header. No child has to know the other children's heights.
+ * A child's own min-height still wins on a short window; the content area
+ * (never the window) then scrolls.
  */
 export function Page({
   title,
@@ -41,7 +42,7 @@ export function Page({
       className={cn(
         "page-container pb-6",
         // A definite height (not just flex-1), so grid fr rows resolve against it.
-        fill && "three:flex three:h-[calc(100dvh-var(--topbar-h))] three:flex-col",
+        fill && "three:flex three:h-full three:flex-col",
         className,
       )}
     >

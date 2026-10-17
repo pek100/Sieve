@@ -29,11 +29,12 @@ export function TopBar() {
     return { href: r.href, label: r.label, icon: <Icon strokeWidth={1.75} /> };
   });
   return (
-    <header data-tauri-drag-region className="sticky top-0 z-40 h-14 shrink-0 bg-bg">
+    <header data-tauri-drag-region className="relative z-40 h-14 shrink-0 bg-bg pr-(--scrollbar-w)">
       <div
         data-tauri-drag-region
         className={
-          // The page container (globals.css): the logo starts on the page title's line, the right
+          // The page container (globals.css), short of the content area's scrollbar gutter on the right
+          // (pr-(--scrollbar-w)), so the logo starts on the page title's line and the right
           // cluster ends on the header actions' line. Under 480 the side columns stop being equal:
           // the right cluster takes its own width and the nav centres in what is left.
           "page-container grid h-full grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3 max-[640px]:gap-2 max-[480px]:grid-cols-[auto_minmax(0,1fr)_auto] max-[480px]:justify-items-center"

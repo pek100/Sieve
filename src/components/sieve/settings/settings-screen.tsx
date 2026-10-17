@@ -37,7 +37,7 @@ export function SettingsScreen() {
   return (
     <Page title="Settings" action={<TransferMenu view={view} />}>
       <LayoutGrid>
-        <GridRegion span={3} className="two:sticky two:top-20 two:self-start">
+        <GridRegion span={3} className="two:sticky two:top-4 two:self-start">
           <nav aria-label="Settings sections">
             <ul className="flex flex-wrap gap-2 two:flex-col two:gap-1">
               {view.sections.map((s) => (
@@ -71,7 +71,7 @@ export function SettingsScreen() {
               const keys = s.keys.filter((k) => !DNS_CARD_KEYS.has(k));
               const dns = s.id === DNS_SECTION;
               return (
-                <div key={s.id} id={`section-${s.id}`} className="scroll-mt-20">
+                <div key={s.id} id={`section-${s.id}`} className="scroll-mt-4">
                   {keys.length > 0 && (
                     <Card title={s.label}>
                       <div className="flex flex-col">

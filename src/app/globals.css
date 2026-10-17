@@ -211,6 +211,44 @@
 }
 
 /*
+ * Scrolling: only vertically, only inside the content area under the top bar
+ * ([data-scroll-root] in app-shell.tsx; the window itself never scrolls), and
+ * always with a thin overlay-style scrollbar in the theme's tokens, never the
+ * default Windows one. WebView2 and Chromium style it with ::-webkit-scrollbar
+ * (the standard scrollbar-width / scrollbar-color would switch those rules
+ * off in Chromium, so they are only for engines without them). The content
+ * area reserves the gutter (stable) so its width does not jump when a page
+ * starts to scroll; the top bar keeps --scrollbar-w free to match.
+ */
+@layer base {
+  [data-scroll-root] {
+    scrollbar-gutter: stable;
+  }
+  ::-webkit-scrollbar {
+    width: var(--scrollbar-w);
+    height: var(--scrollbar-w);
+  }
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 9999px;
+    background: var(--outline-strong) padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--on-surface-faint) padding-box;
+  }
+  @supports not selector(::-webkit-scrollbar) {
+    * {
+      scrollbar-width: thin;
+      scrollbar-color: var(--outline-strong) transparent;
+    }
+  }
+}
+
+/*
  * State layer and ripple (Material). One implementation for every pressable:
  * put <StateLayer /> as a child of a positioned, overflow-hidden element.
  */

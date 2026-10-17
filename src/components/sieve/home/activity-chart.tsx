@@ -4,6 +4,7 @@ import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "
 import { createPortal } from "react-dom";
 import { niceCeiling, stackSeries, type SeriesModel } from "@/core/series";
 import { cn } from "@/lib/utils";
+import { placeTooltip } from "@/components/sieve/primitives/floating-tooltip";
 import { seriesTone } from "./series-tone";
 
 /**
@@ -59,26 +60,6 @@ export function dataStart(firstT: number | undefined, end: number, windowMs: num
   // Within a bucket of the left edge the data covers the window.
   return firstT - (end - windowMs) <= bucketMs ? null : Math.min(1, f);
 }
-/** Gap between the cursor and the tooltip, and the least room kept to the viewport edge. */
-const TIP_GAP = 12;
-const TIP_EDGE = 8;
-
-/**
- * Where a tooltip of size (w, h) goes for a pointer at (x, y) in a viewport
- * of (vw, vh): right of and below the cursor, flipped to the left or above
- * when it would leave the viewport, and never closer than TIP_EDGE to an edge.
- */
-export function tooltipPosition(x: number, y: number, w: number, h: number, vw: number, vh: number): { left: number; top: number } {
-  let left = x + TIP_GAP;
-  if (left + w > vw - TIP_EDGE) left = x - TIP_GAP - w;
-  let top = y + TIP_GAP;
-  if (top + h > vh - TIP_EDGE) top = y - TIP_GAP - h;
-  return {
-    left: Math.max(TIP_EDGE, Math.min(left, vw - TIP_EDGE - w)),
-    top: Math.max(TIP_EDGE, Math.min(top, vh - TIP_EDGE - h)),
-  };
-}
-
 export function ActivityChart({
   model,
   source,
@@ -143,10 +124,7 @@ export function ActivityChart({
   const tipRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const tip = tipRef.current;
-    if (!tip) return;
-    const { left, top } = tooltipPosition(pointer.current.x, pointer.current.y, tip.offsetWidth, tip.offsetHeight, window.innerWidth, window.innerHeight);
-    tip.style.left = `${left}px`;
-    tip.style.top = `${top}px`;
+    if (tip) placeTooltip(tip, pointer.current.x, pointer.current.y);
   });
   const hover = useMemo(() => {
     if (hoverF === null || pts.length === 0) return null;
@@ -176,11 +154,7 @@ export function ActivityChart({
           if (r.width > 0) setHoverF(Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)));
           // Same bucket, new spot: move the tooltip without a render.
           const tip = tipRef.current;
-          if (tip) {
-            const p = tooltipPosition(e.clientX, e.clientY, tip.offsetWidth, tip.offsetHeight, window.innerWidth, window.innerHeight);
-            tip.style.left = `${p.left}px`;
-            tip.style.top = `${p.top}px`;
-          }
+          if (tip) placeTooltip(tip, e.clientX, e.clientY);
         }}
         onPointerLeave={() => setHoverF(null)}
       >
@@ -194,7 +168,6 @@ export function ActivityChart({
         {start !== null && (
           // Before this line there is no data: Sieve was not running (live), or nothing was saved yet (history).
           <div aria-hidden="true" data-data-start="" className="pointer-events-none absolute inset-y-0 left-0 transition-[width] duration-(--motion-chart) ease-standard" style={{ width: `${start * 100}%` }}>
-            <div className="absolute inset-0 bg-surface-2/40" />
             <div className="absolute inset-y-0 right-0 w-px bg-outline-strong" />
             <span
               className={cn(
