@@ -135,6 +135,41 @@ Expected: `curl.exe` prints `000` (connection closed, no response) and the probe
 
 TLS check (same pattern on port 443 with `-vk`): both may end without an HTTP code, because the server rejects the test name. The difference is where: the blocked one never receives a server hello (connection closed right after the client hello), the passed one gets the server's TLS alert or certificate. The probe's log lines are the authoritative evidence.
 
+### Live run 1 (observe, `--route-host example.com`, AdGuard and AdGuard VPN running): findings and fixes
+
+What happened: 20,827 flows, all UDP, almost all owned by `probe.exe`, 790,887 packets in and 18 out. The curls took 20 s and failed, then 2 s and succeeded, then succeeded quickly. Routes and adapter were removed at exit, as designed.
+
+1. **Self-loop: multicast, not byte order.** Every flow's destination was multicast: 239.255.255.250 (SSDP) 8,864, ff02::1:3 (LLMNR) 4,388, 224.0.0.252 (LLMNR) 3,933, ff02::c 1,996, ff02::1 886, 224.0.0.251 and ff02::fb (mDNS). The first was Steam's LAN discovery to `ff02::1:27036`, sent on every interface, including the new TUN's auto-assigned link-local address. The forwarder re-sent each datagram from a new socket. `IP_UNICAST_IF` / `IPV6_UNICAST_IF` do not apply to multicast, so Windows sent it out of the TUN again. A new source port each time made a "new flow" owned by `probe.exe` every 31 ms, which then multiplied. The byte order was already correct (IPv4 in network order, IPv6 in host order); it now lives in a tested helper (`unicast_if_value`). Fixes:
+   - The TUN reader hands the stack only packets whose destination is a routed test address. Multicast, broadcast and link-local traffic is counted as "not unicast", anything else as "not a routed address", and both are discarded before any per-flow work. This is tested on every destination class the run looped on.
+   - Loop guard: a flow owned by the probe's own pid is refused, logged once and then counted (`own-process flows refused`).
+2. **TCP did reach the stack; the count missed it.** Four IPv6 TCP flows from curl to `2606:4700:10::ac42:93f3` (ports 80 and 443) arrived and were accepted. The upstream connect failed with 10049 ("address not valid in its context"), and the handler returned before logging, so the summary said `tcp 0`.
+   - Cause: with a /128 route to the TUN, Windows picks the TUN's ULA (`fd53:...::1`) as the source address for the destination, while `IPV6_UNICAST_IF` forces the packet out of Wi-Fi, where that source does not exist.
+   - Fix: before adding any route, the probe asks Windows for the source address it would use for each test address (UDP connect, nothing sent) and binds every forwarder socket to it, plus the interface pin. An address with no usable source is not routed at all.
+   - Failed connects are now logged and counted as flows (`upstream connect failed`).
+   - The app side is closed with a FIN on any drop or failure. An ipstack stream that is only dropped sends nothing, so curl waited for its own timeout. That explains the 20 s failure: curl tried IPv6 first, which hung in the forwarder.
+   - No IPv4 TCP and no UDP 443 to the routed addresses arrived during the whole run. The later 200s were most likely IPv4 connections that AdGuard's driver redirected to its local proxy before routing; AdGuard then connected out itself without passing through the TUN. That would also explain why the browser showed no QUIC, since AdGuard may block or proxy HTTP/3. Unconfirmed: the new counters `to routed addresses: TCP SYN v4/v6, UDP v4/v6` answer it on the next run. Then repeat with AdGuard protection paused.
+3. **Test host.** example.com is a shared Cloudflare anycast front, so its addresses carry many unrelated sites. (Steam itself was multicast, not routed traffic.) The default is now `quic.nginx.org`: nginx's own HTTP/3 test site on dedicated AWS addresses (3.125.64.247 and 18.193.151.235 on 2026-10-17, IPv4 only), serving HTTP, HTTPS and HTTP/3. `--route-ip` takes explicit public addresses; the public-only guard is unchanged.
+4. **Logging.** The console prints the first 200 flow lines, then a note; the reports keep the first 2,000 records; every flow is still counted in the summary.
+
+Tests added: destination admission (all multicast and link-local destinations from the run), own-pid refusal, the byte-order helper, the log cap, the default host and the destination helper. 100 tests pass.
+
+### Next live run (observe)
+
+In Terminal (Admin):
+
+```
+& "F:\Projects\Code\Sieve\.claude\worktrees\agent-a025d1b361c8851d3\spikes\wintun\target\release\probe.exe" --seconds 90 --out $env:TEMP
+```
+
+(Default host quic.nginx.org.) The banner prints the curl commands. In a normal PowerShell run them twice each, then open https://quic.nginx.org/ in a browser and reload twice. Then, if AdGuard allows it, pause AdGuard protection and run all of it once more within the same 90 s, or in a second run.
+
+What to look for in the summary:
+- `TUN packets discarded before the stack: not unicast N`: OS chatter, now harmless. `own-process flows refused` must be 0.
+- `to routed addresses: TCP SYN v4 N`: IPv4 connects reached the TUN. 0 with AdGuard on and above 0 with AdGuard paused means AdGuard's redirect takes TCP before routing.
+- `UDP v4 N` and `decoded domains by kind: quic=N` mean the browser used HTTP/3 through the TUN and the QUIC decoder read its SNI live.
+- `tls`, `http` entries and `attributed` equal to `flows`, with `curl.exe` and the browser named as the exe.
+- `forwarder errors: none`, and curl prints 200 (or a redirect code) in well under a second.
+
 ## 7. Performance (measured, CPU only)
 
 `cargo run --release --example bench` on this machine:

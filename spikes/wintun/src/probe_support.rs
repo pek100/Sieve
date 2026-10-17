@@ -13,6 +13,16 @@ use crate::classify::{Decoded, Kind};
 use crate::flows::{Action, AppPolicy, Decision, Level, Reason};
 use crate::rules::RuleSet;
 
+/// Default test host: nginx's own HTTP/3 test site. Its addresses are
+/// dedicated (AWS, IPv4 only today) rather than a shared CDN anycast front
+/// like example.com (Cloudflare), so routing them catches no other sites.
+/// It serves HTTP, HTTPS and HTTP/3, so one route exercises all three
+/// decoders.
+pub const DEFAULT_ROUTE_HOST: &str = "quic.nginx.org";
+/// Flow lines printed to the console; the rest are only counted.
+pub const LOG_PRINT_CAP: u64 = 200;
+/// Flow records kept for the JSON and text reports.
+pub const RECORD_CAP: usize = 2_000;
 pub const DEFAULT_SECONDS: u64 = 60;
 pub const MAX_SECONDS: u64 = 600;
 pub const DEFAULT_WINTUN_DLL: &str = r"E:\ml-tools\wintun\wintun\bin\amd64\wintun.dll";
@@ -55,8 +65,10 @@ each flow to its app, decodes TLS SNI / HTTP Host / QUIC Initial SNI, logs the
 verdict it would give and forwards everything (observe), or drops one test
 domain for one exe (enforce test). Needs an elevated (admin) terminal.
 
-  probe --route-host <name>          host to route through the TUN (resolved once)
-        [--route-ip <ip>]...         or explicit IPv4/IPv6 addresses (repeatable)
+  probe [--route-host <name>]        host to route through the TUN (resolved once),
+                                     default quic.nginx.org (dedicated addresses;
+                                     avoid shared CDN fronts such as example.com)
+        [--route-ip <ip>]...         or explicit public IPv4/IPv6 addresses
         [--seconds <n>]              run time, default 60, max 600
         [--wintun-dll <path>]        default E:\\ml-tools\\wintun\\wintun\\bin\\amd64\\wintun.dll
         [--out <dir>]                report folder, default the current folder
@@ -71,7 +83,7 @@ domain for one exe (enforce test). Needs an elevated (admin) terminal.
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
     let mut it = args.into_iter();
     let mut a = Args {
-        route_host: String::new(),
+        route_host: DEFAULT_ROUTE_HOST.to_string(),
         route_ips: Vec::new(),
         seconds: DEFAULT_SECONDS,
         wintun_dll: PathBuf::from(DEFAULT_WINTUN_DLL),
@@ -115,7 +127,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, Strin
         }
     }
     if a.route_host.is_empty() && a.route_ips.is_empty() {
-        return Err("--route-host or --route-ip is required (the probe never routes everything)".into());
+        return Err("--route-host or --route-ip must name a host (the probe never routes everything)".into());
     }
     match (enforce, block_domain, block_exe) {
         (false, None, None) => {}
@@ -175,6 +187,75 @@ pub fn check_route_target(ip: IpAddr) -> Result<(), String> {
         }
     };
     if bad { Err(format!("{ip} is not a public unicast address; refusing to route it into the TUN")) } else { Ok(()) }
+}
+
+/// Why a TUN flow is not handled at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Multicast, broadcast, unspecified or link-local destination: OS
+    /// chatter that Windows sends on every interface (SSDP, LLMNR, mDNS,
+    /// Steam discovery). Forwarding it re-sends it on the TUN (unicast-if
+    /// does not apply to multicast): the live run's loop.
+    NotUnicast,
+    /// A unicast destination that is not one of the routed test addresses.
+    NotRouted,
+    /// The flow belongs to this probe: a loop, never forwarded.
+    OwnProcess,
+}
+
+/// Admission by destination, before any work on the flow.
+pub fn admit_destination(remote: IpAddr, routed: &[IpAddr]) -> Result<(), Refusal> {
+    let not_unicast = match remote {
+        IpAddr::V4(v4) => v4.is_multicast() || v4.is_broadcast() || v4.is_unspecified() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_multicast() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+    };
+    if not_unicast {
+        Err(Refusal::NotUnicast)
+    } else if !routed.contains(&remote) {
+        Err(Refusal::NotRouted)
+    } else {
+        Ok(())
+    }
+}
+
+/// Admission by owner: the probe's own flows are never forwarded.
+pub fn admit_owner(pid: Option<u32>, own_pid: u32) -> Result<(), Refusal> {
+    if pid == Some(own_pid) { Err(Refusal::OwnProcess) } else { Ok(()) }
+}
+
+/// The 4-byte option value for IP_UNICAST_IF (IPv4: interface index in
+/// network byte order) or IPV6_UNICAST_IF (IPv6: host byte order).
+pub fn unicast_if_value(index: u32, ipv4: bool) -> [u8; 4] {
+    if ipv4 { index.to_be_bytes() } else { index.to_ne_bytes() }
+}
+
+/// The flow log: every flow is counted, the first [`LOG_PRINT_CAP`] are
+/// printed, the first [`RECORD_CAP`] are kept for the reports.
+#[derive(Debug, Default)]
+pub struct FlowLog {
+    pub seen: u64,
+    pub records: Vec<FlowRecord>,
+    pub records_dropped: u64,
+}
+
+impl FlowLog {
+    /// Adds a record; returns the console line(s) to print, if any.
+    pub fn push(&mut self, r: FlowRecord) -> Option<String> {
+        self.seen += 1;
+        let line = match self.seen {
+            n if n < LOG_PRINT_CAP => Some(r.line()),
+            n if n == LOG_PRINT_CAP => {
+                Some(format!("{}\n(flow lines capped at {LOG_PRINT_CAP}; the rest are counted in the summary)", r.line()))
+            }
+            _ => None,
+        };
+        if self.records.len() < RECORD_CAP {
+            self.records.push(r);
+        } else {
+            self.records_dropped += 1;
+        }
+        line
+    }
 }
 
 /// The rules and per-app policy the run decides with.
@@ -298,6 +379,18 @@ pub struct Summary {
     pub forwarder_errors: BTreeMap<String, u64>,
     pub tun_packets_in: u64,
     pub tun_packets_out: u64,
+    /// Packets read from the TUN and discarded before the stack.
+    pub tun_dropped_not_unicast: u64,
+    pub tun_dropped_not_routed: u64,
+    /// Packets to the routed addresses, by kind: did apps' traffic arrive?
+    pub routed_tcp_syn_v4: u64,
+    pub routed_tcp_syn_v6: u64,
+    pub routed_udp_v4: u64,
+    pub routed_udp_v6: u64,
+    /// Flows owned by the probe itself (a loop), refused.
+    pub own_process_dropped: u64,
+    /// Flow records beyond the report cap (counted, not kept).
+    pub flow_records_dropped: u64,
     pub table_reads: u64,
     pub table_read_errors: u64,
 }
@@ -353,7 +446,10 @@ impl Summary {
              no domain, by reason: {}\n\
              would drop (observe): {}, dropped (enforce test): {}\n\
              forwarder errors: {}\n\
-             TUN packets in/out: {}/{}, owner-table reads: {} (errors {})\n",
+             TUN packets in/out: {}/{}, owner-table reads: {} (errors {})\n\
+             TUN packets discarded before the stack: not unicast {}, not a routed address {}\n\
+             to routed addresses: TCP SYN v4 {} v6 {}, UDP v4 {} v6 {}\n\
+             own-process flows refused (loop guard): {}, flow records over the report cap: {}\n",
             self.flows,
             self.tcp_flows,
             self.udp_flows,
@@ -372,6 +468,14 @@ impl Summary {
             self.tun_packets_out,
             self.table_reads,
             self.table_read_errors,
+            self.tun_dropped_not_unicast,
+            self.tun_dropped_not_routed,
+            self.routed_tcp_syn_v4,
+            self.routed_tcp_syn_v6,
+            self.routed_udp_v4,
+            self.routed_udp_v6,
+            self.own_process_dropped,
+            self.flow_records_dropped,
         )
     }
 }
@@ -398,8 +502,8 @@ mod tests {
     }
 
     #[test]
-    fn route_host_is_required_and_defaults_apply() {
-        assert!(args("").is_err());
+    fn route_host_defaults_to_a_dedicated_test_host() {
+        assert_eq!(args("").unwrap().route_host, DEFAULT_ROUTE_HOST);
         let a = args("--route-host example.com").unwrap();
         assert_eq!(a.seconds, 60);
         assert_eq!(a.enforce, None);
@@ -490,6 +594,58 @@ mod tests {
         ] {
             assert!(check_route_target(bad.parse().unwrap()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn multicast_and_unrouted_destinations_are_refused_before_any_work() {
+        let routed: Vec<IpAddr> = vec!["3.125.64.247".parse().unwrap(), "2606:4700::1".parse().unwrap()];
+        // Every destination the live run looped on.
+        for chatter in ["239.255.255.250", "224.0.0.252", "224.0.0.251", "224.0.0.0", "255.255.255.255", "ff02::1", "ff02::1:3", "ff02::c", "ff02::fb", "fe80::1", "0.0.0.0", "169.254.1.1"] {
+            assert_eq!(admit_destination(chatter.parse().unwrap(), &routed), Err(Refusal::NotUnicast), "{chatter}");
+        }
+        assert_eq!(admit_destination("8.8.8.8".parse().unwrap(), &routed), Err(Refusal::NotRouted));
+        assert_eq!(admit_destination("3.125.64.247".parse().unwrap(), &routed), Ok(()));
+        assert_eq!(admit_destination("2606:4700::1".parse().unwrap(), &routed), Ok(()));
+    }
+
+    #[test]
+    fn own_process_flows_are_refused() {
+        assert_eq!(admit_owner(Some(57712), 57712), Err(Refusal::OwnProcess));
+        assert_eq!(admit_owner(Some(15788), 57712), Ok(()));
+        assert_eq!(admit_owner(None, 57712), Ok(()));
+    }
+
+    #[test]
+    fn unicast_if_byte_order_is_network_for_v4_and_host_for_v6() {
+        // htonl(8) for IP_UNICAST_IF; plain DWORD for IPV6_UNICAST_IF.
+        assert_eq!(unicast_if_value(8, true), [0, 0, 0, 8]);
+        assert_eq!(unicast_if_value(8, false), 8u32.to_ne_bytes());
+        assert_eq!(u32::from_be_bytes(unicast_if_value(0x0102_0304, true)), 0x0102_0304);
+        #[cfg(target_endian = "little")]
+        assert_eq!(unicast_if_value(8, false), [8, 0, 0, 0]);
+    }
+
+    #[test]
+    fn flow_log_prints_a_capped_number_of_lines_and_keeps_counting() {
+        let d = Decoded::default();
+        let pass = Decision { action: Action::Pass, reason: Reason::UnknownDomain };
+        let l = "198.18.211.1:5000".parse().unwrap();
+        let r = "239.255.255.250:1900".parse().unwrap();
+        let mut log = FlowLog::default();
+        let total = RECORD_CAP as u64 + 500;
+        let mut printed = 0u64;
+        for i in 0..total {
+            if let Some(line) = log.push(record(i, "udp", l, r, Some(1), None, &d, pass, false)) {
+                printed += 1;
+                if i + 1 == LOG_PRINT_CAP {
+                    assert!(line.contains("capped"), "{line}");
+                }
+            }
+        }
+        assert_eq!(printed, LOG_PRINT_CAP);
+        assert_eq!(log.seen, total);
+        assert_eq!(log.records.len(), RECORD_CAP);
+        assert_eq!(log.records_dropped, 500);
     }
 
     #[test]

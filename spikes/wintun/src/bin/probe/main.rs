@@ -4,8 +4,9 @@
 //! 1. refuses to start unless elevated, printing the exact admin command;
 //! 2. resolves the ONE test host (or takes --route-ip) and refuses any
 //!    address that is not public unicast; never touches the default route;
-//! 3. reads, before any change, which physical interface reaches each test
-//!    address (forwarder sockets are pinned to it with IP_UNICAST_IF);
+//! 3. reads, before any change, which physical interface and source address
+//!    reach each test address (forwarder sockets bind to that source and are
+//!    pinned with IP_UNICAST_IF); an address with no usable source is skipped;
 //! 4. loads wintun.dll (signature checked: signer must be WireGuard LLC),
 //!    creates the adapter "Sieve Spike" with a fixed GUID, gives it a host
 //!    address in 198.18.0.0/15 (benchmark range) and fd53:6965:7665::1;
@@ -45,11 +46,11 @@ mod live {
 
     use ipstack::{IpStack, IpStackConfig, IpStackStream};
     use spike::flows::{Attributor, ExeCache, os::IpHelper};
-    use spike::probe_support::{self, Args, MAX_ROUTES, USAGE, Summary};
+    use spike::probe_support::{self, Args, FlowLog, MAX_ROUTES, Summary, USAGE};
 
     use crate::forward::{self, Shared};
     use crate::os;
-    use crate::tun::TunDevice;
+    use crate::tun::{TunCounters, TunDevice};
 
     /// The adapter's fixed identity, so a leftover is recognisable.
     pub const ADAPTER_NAME: &str = "Sieve Spike";
@@ -93,7 +94,7 @@ mod live {
             },
             None => None,
         };
-        let ips = match route_ips(&args) {
+        let candidates = match route_ips(&args) {
             Ok(ips) => ips,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -101,18 +102,24 @@ mod live {
             }
         };
 
-        // Physical interface per test address, read before any change.
-        let mut physical = HashMap::new();
-        for ip in &ips {
-            match os::best_interface(*ip) {
-                Ok(i) => {
-                    physical.insert(*ip, i);
+        // Egress (physical interface and its source address) per test
+        // address, read before any change. An address without one is not
+        // routed at all (its flows keep going the normal way).
+        let mut egress = HashMap::new();
+        let mut ips = Vec::new();
+        for ip in candidates {
+            match (os::best_interface(ip), os::egress_source(ip)) {
+                (Ok(if_index), Ok(source)) => {
+                    println!("test address {ip}: leaves via interface {if_index} from {source}");
+                    egress.insert(ip, forward::Egress { if_index, source });
+                    ips.push(ip);
                 }
-                Err(e) => {
-                    eprintln!("error: no route to {ip} today ({e}); nothing was changed");
-                    return 2;
-                }
+                (Err(e), _) | (_, Err(e)) => println!("skipping {ip}: {e} (not routed; its traffic is untouched)"),
             }
+        }
+        if ips.is_empty() {
+            eprintln!("error: no test address is reachable from a physical interface; nothing was changed");
+            return 2;
         }
 
         // Undo on panic too (the default hook still prints the panic).
@@ -124,7 +131,7 @@ mod live {
         }));
 
         let code = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-            Ok(rt) => rt.block_on(session(args, ips, physical, list_text)),
+            Ok(rt) => rt.block_on(session(args, ips, egress, list_text)),
             Err(e) => {
                 eprintln!("error: tokio runtime: {e}");
                 2
@@ -162,7 +169,7 @@ mod live {
     async fn session(
         args: Args,
         ips: Vec<IpAddr>,
-        physical: HashMap<IpAddr, u32>,
+        egress: HashMap<IpAddr, forward::Egress>,
         list_text: Option<String>,
     ) -> i32 {
         // SAFETY: loads the DLL the user pointed at; the
@@ -213,19 +220,18 @@ mod live {
         }
 
         let (rules, policy) = probe_support::policy_for(&args, list_text.as_deref());
-        let packets_in = Arc::new(AtomicU64::new(0));
-        let packets_out = Arc::new(AtomicU64::new(0));
+        let counters = Arc::new(TunCounters::default());
         let shared = Arc::new(Shared {
             start: Instant::now(),
+            own_pid: std::process::id(),
             attributor: Mutex::new(Attributor::new(IpHelper)),
             exes: Mutex::new(ExeCache::new(spike::flows::os::exe_path as fn(u32) -> Option<String>)),
             rules,
             policy,
             enforce: args.enforce.is_some(),
-            tun_if_index,
-            physical,
+            egress,
             dns_via: args.dns_via,
-            records: Mutex::new(Vec::new()),
+            log: Mutex::new(FlowLog::default()),
             summary: Mutex::new(Summary::default()),
         });
 
@@ -235,7 +241,7 @@ mod live {
             return 4;
         }
         config.udp_timeout(Duration::from_secs(30));
-        let device = TunDevice::new(session.clone(), packets_in.clone(), packets_out.clone());
+        let device = TunDevice::new(session.clone(), ips.clone(), counters.clone());
         let mut stack = IpStack::new(config, device);
 
         let deadline = tokio::time::sleep(Duration::from_secs(args.seconds));
@@ -262,14 +268,25 @@ mod live {
         println!("adapter \"{ADAPTER_NAME}\" closed (Wintun removes it)");
 
         let mut summary = shared.summary.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        summary.tun_packets_in = packets_in.load(Ordering::Relaxed);
-        summary.tun_packets_out = packets_out.load(Ordering::Relaxed);
+        let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        summary.tun_packets_in = load(&counters.packets_in);
+        summary.tun_packets_out = load(&counters.packets_out);
+        summary.tun_dropped_not_unicast = load(&counters.not_unicast);
+        summary.tun_dropped_not_routed = load(&counters.not_routed);
+        summary.routed_tcp_syn_v4 = load(&counters.syn_v4);
+        summary.routed_tcp_syn_v6 = load(&counters.syn_v6);
+        summary.routed_udp_v4 = load(&counters.udp_v4);
+        summary.routed_udp_v6 = load(&counters.udp_v6);
         {
             let a = shared.attributor.lock().unwrap_or_else(|p| p.into_inner());
             summary.table_reads = a.stats.table_reads;
             summary.table_read_errors = a.stats.table_read_errors;
         }
-        let records = shared.records.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let records = {
+            let log = shared.log.lock().unwrap_or_else(|p| p.into_inner());
+            summary.flow_records_dropped = log.records_dropped;
+            log.records.clone()
+        };
         let text = summary.text();
         println!("\n==== summary ====\n{text}");
         write_reports(&args, &ips, &summary, &records, &text);
@@ -295,7 +312,16 @@ mod live {
                 println!("    & $env:TEMP\\curl-other.exe -vk -m 8 -o NUL --resolve {d}:443:{host_ip} https://{d}/", d = e.domain);
                 println!("  this window logs verdict=drop for curl.exe and verdict=pass for curl-other.exe.");
             }
-            None => println!("OBSERVE: nothing is dropped; verdicts are what Sieve would do."),
+            None => {
+                println!("OBSERVE: nothing is dropped; verdicts are what Sieve would do.");
+                if args.route_ips.is_empty() {
+                    let h = &args.route_host;
+                    println!("In a second (normal) PowerShell, while this runs:");
+                    println!("    curl.exe -s -m 10 -o NUL -w \"%{{http_code}} %{{time_total}}s`n\" https://{h}/");
+                    println!("    curl.exe -s -m 10 -o NUL -w \"%{{http_code}} %{{time_total}}s`n\" http://{h}/");
+                    println!("  and open https://{h}/ in a browser, reload twice (HTTP/3 starts after the first visit).");
+                }
+            }
         }
         println!("running {} s; Ctrl+C stops early.\n", args.seconds);
     }

@@ -48,11 +48,26 @@ pub struct Packet<'a> {
 pub const TCP_FIN: u8 = 0x01;
 pub const TCP_SYN: u8 = 0x02;
 pub const TCP_RST: u8 = 0x04;
+pub const TCP_ACK: u8 = 0x10;
 
 pub fn parse(ip: &[u8]) -> Option<Packet<'_>> {
     match ip.first()? >> 4 {
         4 => parse_v4(ip),
         6 => parse_v6(ip),
+        _ => None,
+    }
+}
+
+/// The destination address of any IPv4 or IPv6 packet (any protocol,
+/// fragments included). The TUN reader uses it to keep only packets for
+/// the routed test addresses.
+pub fn dst_ip(ip: &[u8]) -> Option<IpAddr> {
+    match ip.first()? >> 4 {
+        4 => {
+            let b = ip.get(16..20)?;
+            Some(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])))
+        }
+        6 => Some(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(ip.get(24..40)?).ok()?))),
         _ => None,
     }
 }
@@ -219,6 +234,19 @@ mod tests {
         assert!(parse(&[0x45]).is_none());
     }
 
+    #[test]
+    fn dst_ip_reads_both_families_and_any_protocol() {
+        let p = build::ip(Proto::Udp, v4("198.18.211.1"), v4("239.255.255.250"), 1900, 1900, 0, b"M-SEARCH");
+        assert_eq!(dst_ip(&p), Some(v4("239.255.255.250")));
+        let p = build::ip(Proto::Tcp, v4("fd53::1"), v4("2606:4700::1"), 1, 443, 0, b"");
+        assert_eq!(dst_ip(&p), Some(v4("2606:4700::1")));
+        let mut icmp = build::ip(Proto::Tcp, v4("1.1.1.1"), v4("2.2.2.2"), 1, 2, 0, b"x");
+        icmp[9] = 1;
+        assert_eq!(dst_ip(&icmp), Some(v4("2.2.2.2")));
+        assert_eq!(dst_ip(&[0x45, 0, 0]), None);
+        assert_eq!(dst_ip(&[]), None);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(4096))]
         #[test]
@@ -226,6 +254,7 @@ mod tests {
             let mut b = bytes;
             if let Some(f) = b.first_mut() { *f = (v << 4) | (*f & 0x0f); }
             let _ = parse(&b);
+            let _ = dst_ip(&b);
         }
     }
 }

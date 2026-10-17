@@ -154,17 +154,38 @@ pub fn best_interface(ip: IpAddr) -> Result<u32, String> {
     if code == 0 { Ok(index) } else { Err(format!("GetBestInterfaceEx({ip}) failed: {code}")) }
 }
 
-/// Forces a socket's unicast traffic out of interface `index`
-/// (IP_UNICAST_IF takes the index in network byte order, IPV6_UNICAST_IF in
-/// host order), so forwarded flows never re-enter the TUN.
+/// The source address Windows picks for `ip` right now, read with a UDP
+/// connect (no packet is sent). Call before adding the TUN route: the
+/// answer is an address of the physical interface. Forwarder sockets bind
+/// to it; without that, an IPv6 connect pinned to the physical interface
+/// picked the TUN's ULA as source and failed with 10049 (live run 1).
+pub fn egress_source(ip: IpAddr) -> Result<IpAddr, String> {
+    let any: SocketAddr = if ip.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+    let s = std::net::UdpSocket::bind(any).map_err(|e| format!("udp bind: {e}"))?;
+    s.connect(SocketAddr::new(ip, 443)).map_err(|e| format!("no route to {ip}: {e}"))?;
+    let src = s.local_addr().map_err(|e| format!("local_addr: {e}"))?.ip();
+    let link_local = match src {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    };
+    if src.is_unspecified() || link_local {
+        return Err(format!("no usable source address for {ip} (got {src})"));
+    }
+    Ok(src)
+}
+
+/// Forces a socket's unicast traffic out of interface `index`, so forwarded
+/// flows never re-enter the TUN. Byte order per family comes from the
+/// tested helper (IPv4 network order, IPv6 host order).
 pub fn bind_to_interface(sock: &socket2::Socket, target: SocketAddr, index: u32) -> Result<(), String> {
     use std::os::windows::io::AsRawSocket;
     let s = SOCKET(sock.as_raw_socket() as usize);
-    let (level, name, value) = match target {
-        SocketAddr::V4(_) => (IPPROTO_IP.0, IP_UNICAST_IF, index.to_be()),
-        SocketAddr::V6(_) => (IPPROTO_IPV6.0, IPV6_UNICAST_IF, index),
+    let (level, name) = match target {
+        SocketAddr::V4(_) => (IPPROTO_IP.0, IP_UNICAST_IF),
+        SocketAddr::V6(_) => (IPPROTO_IPV6.0, IPV6_UNICAST_IF),
     };
+    let value = spike::probe_support::unicast_if_value(index, target.is_ipv4());
     // SAFETY: `s` is a live socket; the option value is a 4-byte DWORD.
-    let r = unsafe { setsockopt(s, level, name, Some(&value.to_ne_bytes())) };
+    let r = unsafe { setsockopt(s, level, name, Some(&value)) };
     if r == 0 { Ok(()) } else { Err(format!("setsockopt UNICAST_IF failed: {}", std::io::Error::last_os_error())) }
 }
