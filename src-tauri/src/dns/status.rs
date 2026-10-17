@@ -23,7 +23,7 @@
 //!     "rules": 51234,                  // block rules in force (list plus user)
 //!     "allow": 812,                    // allow rules in force
 //!     "skipped": 97,                   // lines not understood, so not applied
-//!     "user_rules": true,              // a user rules file was read
+//!     "user_rules": true,              // user-rules.txt exists and is not blank
 //!     "error": null                    // why the list is stale or missing, or null
 //!   },
 //!   "top_blocked": [{ "domain": "doubleclick.net", "count": 9 }]  // at most 20

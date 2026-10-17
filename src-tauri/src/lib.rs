@@ -12,7 +12,14 @@ pub fn run() {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![commands::net_snapshot])
+        .manage(dns::commands::DnsState::default())
+        .invoke_handler(tauri::generate_handler![
+            commands::net_snapshot,
+            dns::commands::dns_start,
+            dns::commands::dns_stop,
+            dns::commands::dns_status,
+            dns::commands::dns_self_check,
+        ])
         .run(tauri::generate_context!());
     if let Err(e) = result {
         eprintln!("Sieve failed to start: {e}");

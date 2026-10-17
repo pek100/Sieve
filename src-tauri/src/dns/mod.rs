@@ -6,10 +6,15 @@
 //! - `proxy`: the UDP and TCP server, block answers, forwarding, counters.
 //! - `probe`: a plain UDP client; the self check and the live test use it.
 //! - `status`: the versioned `dns_status` wire shape.
+//! - `engine`: rules + proxy + refresher as one start/status/check/stop unit.
+//! - `commands`: the Tauri commands over the engine.
 //!
 //! Nothing here changes Windows DNS settings. Pointing the system at the
-//! proxy is phase B, behind the `filtering.dns` data switch.
+//! proxy is phase B, behind the `filtering.dns` data switch. The live check
+//! for that switch is `engine::tests::live_dns_filter_resolves_blocked_domain`.
 
+pub mod commands;
+pub mod engine;
 pub mod lists;
 pub mod probe;
 pub mod proxy;

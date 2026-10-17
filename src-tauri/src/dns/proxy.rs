@@ -537,11 +537,20 @@ pub(crate) mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(300), socket.recv_from(&mut buf)).await;
     }
 
+    /// The same for a fresh TCP listener: one connection, accepted and closed.
+    async fn warm_tcp(listener: &TcpListener) {
+        let addr = listener.local_addr().expect("addr");
+        let connect = tokio::spawn(TcpStream::connect(addr));
+        let _ = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
+        let _ = connect.await;
+    }
+
     impl FakeUpstream {
         pub(crate) async fn start(truncate_udp: bool) -> FakeUpstream {
             let (udp, tcp) = bind_pair("127.0.0.1:0".parse().expect("addr")).await.expect("bind");
             let addr = udp.local_addr().expect("addr");
             warm(&udp).await;
+            warm_tcp(&tcp).await;
             let (udp_queries, tcp_queries) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
             let uq = udp_queries.clone();
             let udp_task = tokio::spawn(async move {
@@ -604,9 +613,19 @@ pub(crate) mod tests {
         let config = ProxyConfig {
             bind: "127.0.0.1:0".parse().expect("addr"),
             upstreams,
-            upstream_timeout: Duration::from_millis(500),
+            upstream_timeout: Duration::from_millis(UPSTREAM_TIMEOUT_MS),
         };
         Proxy::start(config, fixture_rules()).await.expect("proxy starts")
+    }
+
+    /// Spends a fresh proxy's first datagram (dropped on some machines, see
+    /// `udp_exchange`) on a blocked name of its own, then waits out any
+    /// resend, so counts taken after this are exact. The warm name is
+    /// blocked, so upstream counts are untouched.
+    const WARM_NAME: &str = "warm.ads.sieve-test.invalid.";
+    async fn warm_proxy(addr: SocketAddr) {
+        ask_udp(addr, WARM_NAME, RecordType::A).await;
+        tokio::time::sleep(Duration::from_millis(RETRANSMIT_MS * 3 / 2)).await;
     }
 
     fn ips(m: &Message) -> Vec<IpAddr> {
@@ -667,6 +686,7 @@ pub(crate) mod tests {
     async fn allowed_and_unlisted_names_are_forwarded() {
         let up = FakeUpstream::start(false).await;
         let proxy = start_with(vec![up.addr]).await;
+        warm_proxy(proxy.local_addr()).await;
         for name in ["example.com.", "ok.doubleclick.net."] {
             let r = ask_udp(proxy.local_addr(), name, RecordType::A).await;
             assert_eq!(ips(&r), vec![IpAddr::V4(FAKE_ANSWER)], "{name}");
@@ -690,6 +710,7 @@ pub(crate) mod tests {
     async fn truncated_upstream_answer_is_retried_over_tcp() {
         let up = FakeUpstream::start(true).await;
         let proxy = start_with(vec![up.addr]).await;
+        warm_proxy(proxy.local_addr()).await;
         let r = ask_udp(proxy.local_addr(), "big.example.com.", RecordType::A).await;
         assert!(!r.metadata.truncation);
         assert_eq!(ips(&r), vec![IpAddr::V4(FAKE_ANSWER)]);
@@ -712,11 +733,20 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn all_upstreams_failing_gives_servfail_and_records_the_error() {
         let silent = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
-        let proxy = start_with(vec![silent.local_addr().expect("addr")]).await;
+        // Upstream timeout under RETRANSMIT_MS, so SERVFAIL lands before the
+        // client would resend and exactly one query is counted.
+        let config = ProxyConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            upstreams: vec![silent.local_addr().expect("addr")],
+            upstream_timeout: Duration::from_millis(RETRANSMIT_MS / 2),
+        };
+        let proxy = Proxy::start(config, fixture_rules()).await.expect("start");
+        warm_proxy(proxy.local_addr()).await;
+        let before = proxy.stats();
         let r = ask_udp(proxy.local_addr(), "example.com.", RecordType::A).await;
         assert_eq!(r.metadata.response_code, ResponseCode::ServFail);
         let s = proxy.stats();
-        assert_eq!((s.queries, s.failed, s.forwarded), (1, 1, 0));
+        assert_eq!((s.queries - before.queries, s.failed, s.forwarded), (1, 1, 0));
         assert!(s.last_error.is_some_and(|e| e.contains("all upstreams failed")));
         proxy.stop().await;
     }
@@ -726,17 +756,26 @@ pub(crate) mod tests {
         let up = FakeUpstream::start(false).await;
         let proxy = start_with(vec![up.addr]).await;
         let addr = proxy.local_addr();
+        warm_proxy(addr).await;
+        let before = proxy.stats();
         for _ in 0..3 {
             ask_udp(addr, "doubleclick.net.", RecordType::A).await;
         }
         ask_udp(addr, "ADS.sieve-test.invalid.", RecordType::A).await;
         ask_udp(addr, "example.com.", RecordType::A).await;
         let s = proxy.stats();
-        assert_eq!((s.queries, s.blocked, s.forwarded, s.failed), (5, 4, 1, 0));
         assert_eq!(
-            s.top_blocked,
-            vec![("doubleclick.net".to_owned(), 3), ("ads.sieve-test.invalid".to_owned(), 1)]
+            (s.queries - before.queries, s.blocked - before.blocked, s.forwarded, s.failed),
+            (5, 4, 1, 0)
         );
+        let warm = before.blocked;
+        let mut expected = vec![
+            ("doubleclick.net".to_owned(), 3),
+            ("ads.sieve-test.invalid".to_owned(), 1),
+            (WARM_NAME.trim_end_matches('.').to_owned(), warm),
+        ];
+        expected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        assert_eq!(s.top_blocked, expected);
         proxy.stop().await;
     }
 
