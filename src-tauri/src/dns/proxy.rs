@@ -17,10 +17,12 @@
 //! truncated one (it then retries over TCP itself). Sequential, not raced:
 //! a race would send every query to every upstream.
 //!
-//! Lifecycle: `Proxy::start` binds both sockets (a requested port 0 gets
-//! the same free port for UDP and TCP), `stop` ends both servers and every
-//! in-flight task, which frees the port. Dropping a `Proxy` also stops its
-//! servers (the shutdown channel closes), without waiting.
+//! Lifecycle: `Proxy::start` binds a UDP and a TCP socket on every listen
+//! address (a requested port 0 gets the same free port for UDP and TCP of
+//! that address), `stop` ends every server and every in-flight task, which
+//! frees the ports. Dropping a `Proxy` also stops its servers (the shutdown
+//! channel closes), without waiting. Listening on both 127.0.0.1 and ::1 is
+//! what lets Windows point both its IPv4 and IPv6 DNS here.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -39,7 +41,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use super::DnsError;
 use super::rules::{RuleSet, Verdict, normalize_query};
 
-pub const DEFAULT_BIND: &str = "127.0.0.1:53";
+/// Where the proxy listens by default: the IPv4 and IPv6 loopback, port 53.
+/// These are the two addresses `sysdns` points Windows at.
+pub const DEFAULT_BINDS: [&str; 2] = ["127.0.0.1:53", "[::1]:53"];
 pub const DEFAULT_UPSTREAMS: [&str; 2] = ["1.1.1.1:53", "9.9.9.9:53"];
 /// TTL of a block answer, seconds (AdGuard's default too).
 pub const BLOCK_TTL_SECS: u32 = 10;
@@ -63,7 +67,8 @@ const BIND_ATTEMPTS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
-    pub bind: SocketAddr,
+    /// Listen addresses, at least one; each gets a UDP and a TCP server.
+    pub binds: Vec<SocketAddr>,
     pub upstreams: Vec<SocketAddr>,
     pub upstream_timeout: Duration,
 }
@@ -151,7 +156,8 @@ enum Transport {
 
 /// A running proxy. See the module doc for the lifecycle.
 pub struct Proxy {
-    local_addr: SocketAddr,
+    /// One per listen address, in the configured order; never empty.
+    local_addrs: Vec<SocketAddr>,
     shared: Arc<Shared>,
     shutdown: watch::Sender<bool>,
     servers: Vec<JoinHandle<()>>,
@@ -162,10 +168,18 @@ impl Proxy {
         if config.upstreams.is_empty() {
             return Err(DnsError::Config("at least one upstream is needed".to_owned()));
         }
-        let (udp, tcp) = bind_pair(config.bind).await?;
-        let local_addr = udp
-            .local_addr()
-            .map_err(|source| DnsError::Bind { addr: config.bind, source })?;
+        if config.binds.is_empty() {
+            return Err(DnsError::Config("at least one listen address is needed".to_owned()));
+        }
+        // Bind everything before serving anything: a taken second address
+        // fails the start as a whole (the bound sockets drop here).
+        let mut pairs = Vec::with_capacity(config.binds.len());
+        let mut local_addrs = Vec::with_capacity(config.binds.len());
+        for &bind in &config.binds {
+            let (udp, tcp) = bind_pair(bind).await?;
+            local_addrs.push(udp.local_addr().map_err(|source| DnsError::Bind { addr: bind, source })?);
+            pairs.push((udp, tcp));
+        }
         let shared = Arc::new(Shared {
             rules: Arc::new(RwLock::new(Arc::new(rules))),
             upstreams: config.upstreams,
@@ -173,16 +187,26 @@ impl Proxy {
             stats: Stats::default(),
         });
         let (shutdown, rx) = watch::channel(false);
-        let servers = vec![
-            tokio::spawn(serve_udp(udp, shared.clone(), rx.clone())),
-            tokio::spawn(serve_tcp(tcp, shared.clone(), rx)),
-        ];
-        Ok(Proxy { local_addr, shared, shutdown, servers })
+        let servers = pairs
+            .into_iter()
+            .flat_map(|(udp, tcp)| {
+                [
+                    tokio::spawn(serve_udp(udp, shared.clone(), rx.clone())),
+                    tokio::spawn(serve_tcp(tcp, shared.clone(), rx.clone())),
+                ]
+            })
+            .collect();
+        Ok(Proxy { local_addrs, shared, shutdown, servers })
     }
 
-    /// The bound address (the real port when 0 was asked for).
+    /// The first bound address (the real port when 0 was asked for).
     pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.local_addrs[0]
+    }
+
+    /// Every bound address, in the configured order.
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.local_addrs
     }
 
     /// The live rules, for a refresher to swap.
@@ -206,16 +230,23 @@ impl Proxy {
     }
 }
 
-/// UDP and TCP on the same address. For port 0 the OS picks a UDP port and
-/// TCP takes the same one, retried if that TCP port happens to be taken.
+/// UDP and TCP on the same address. For port 0 the OS picks a TCP port and
+/// UDP takes the same one, retried if that UDP port happens to be taken.
+///
+/// TCP picks first because Windows reserves large TCP port ranges (Hyper-V,
+/// WinNAT: `netsh int ipv4 show excludedportrange protocol=tcp`, about 1500
+/// ports in 100-port blocks on the dev machine, 2026-10-17). A UDP-chosen
+/// port then landed inside one often enough that the TCP bind failed with
+/// WSAEACCES (10013) on all retries in one run in two; a TCP-chosen port is
+/// never in a TCP exclusion.
 async fn bind_pair(addr: SocketAddr) -> Result<(UdpSocket, TcpListener), DnsError> {
     let attempts = if addr.port() == 0 { BIND_ATTEMPTS } else { 1 };
     let mut last = None;
     for _ in 0..attempts {
-        let udp = UdpSocket::bind(addr).await.map_err(|source| DnsError::Bind { addr, source })?;
-        let actual = udp.local_addr().map_err(|source| DnsError::Bind { addr, source })?;
-        match TcpListener::bind(actual).await {
-            Ok(tcp) => return Ok((udp, tcp)),
+        let tcp = TcpListener::bind(addr).await.map_err(|source| DnsError::Bind { addr, source })?;
+        let actual = tcp.local_addr().map_err(|source| DnsError::Bind { addr, source })?;
+        match UdpSocket::bind(actual).await {
+            Ok(udp) => return Ok((udp, tcp)),
             Err(e) => last = Some(e),
         }
     }
@@ -611,7 +642,7 @@ pub(crate) mod tests {
 
     async fn start_with(upstreams: Vec<SocketAddr>) -> Proxy {
         let config = ProxyConfig {
-            bind: "127.0.0.1:0".parse().expect("addr"),
+            binds: vec!["127.0.0.1:0".parse().expect("addr")],
             upstreams,
             upstream_timeout: Duration::from_millis(UPSTREAM_TIMEOUT_MS),
         };
@@ -736,7 +767,7 @@ pub(crate) mod tests {
         // Upstream timeout under RETRANSMIT_MS, so SERVFAIL lands before the
         // client would resend and exactly one query is counted.
         let config = ProxyConfig {
-            bind: "127.0.0.1:0".parse().expect("addr"),
+            binds: vec!["127.0.0.1:0".parse().expect("addr")],
             upstreams: vec![silent.local_addr().expect("addr")],
             upstream_timeout: Duration::from_millis(RETRANSMIT_MS / 2),
         };
@@ -837,7 +868,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn no_upstream_is_a_config_error() {
         let config = ProxyConfig {
-            bind: "127.0.0.1:0".parse().expect("addr"),
+            binds: vec!["127.0.0.1:0".parse().expect("addr")],
             upstreams: vec![],
             upstream_timeout: Duration::from_millis(100),
         };
@@ -845,10 +876,64 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn no_listen_address_is_a_config_error() {
+        let config = ProxyConfig {
+            binds: vec![],
+            upstreams: vec!["127.0.0.1:9".parse().expect("addr")],
+            upstream_timeout: Duration::from_millis(100),
+        };
+        assert!(matches!(Proxy::start(config, RuleSet::new()).await, Err(DnsError::Config(_))));
+    }
+
+    /// Windows' IPv6 DNS is pointed at ::1, so the proxy must answer there
+    /// too, over UDP and TCP, with the same rules and counters.
+    #[tokio::test]
+    async fn listens_on_ipv4_and_ipv6_loopback_at_once() {
+        let up = FakeUpstream::start(false).await;
+        let config = ProxyConfig {
+            binds: vec!["127.0.0.1:0".parse().expect("addr"), "[::1]:0".parse().expect("addr")],
+            upstreams: vec![up.addr],
+            upstream_timeout: Duration::from_millis(UPSTREAM_TIMEOUT_MS),
+        };
+        let proxy = Proxy::start(config, fixture_rules()).await.expect("proxy starts on both");
+        let addrs = proxy.local_addrs().to_vec();
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs[0].is_ipv4() && addrs[0].ip().is_loopback());
+        assert!(addrs[1].is_ipv6() && addrs[1].ip().is_loopback());
+        for addr in &addrs {
+            let a = ask_udp(*addr, "ads.sieve-test.invalid.", RecordType::A).await;
+            assert_eq!(ips(&a), vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)], "udp {addr}");
+            let t = ask_tcp(*addr, "doubleclick.net.", RecordType::AAAA).await;
+            assert_eq!(ips(&t), vec![IpAddr::V6(Ipv6Addr::UNSPECIFIED)], "tcp {addr}");
+        }
+        assert_eq!(proxy.stats().top_blocked.iter().map(|(_, n)| n).sum::<u64>(), proxy.stats().blocked);
+        proxy.stop().await;
+        for addr in addrs {
+            UdpSocket::bind(addr).await.expect("udp port is free after stop");
+            TcpListener::bind(addr).await.expect("tcp port is free after stop");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_taken_second_address_fails_the_whole_start_and_frees_the_first() {
+        let taken = UdpSocket::bind("[::1]:0").await.expect("bind");
+        let free = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let first = free.local_addr().expect("addr");
+        drop(free);
+        let config = ProxyConfig {
+            binds: vec![first, taken.local_addr().expect("addr")],
+            upstreams: vec!["127.0.0.1:9".parse().expect("addr")],
+            upstream_timeout: Duration::from_millis(100),
+        };
+        assert!(matches!(Proxy::start(config, RuleSet::new()).await, Err(DnsError::Bind { .. })));
+        UdpSocket::bind(first).await.expect("the first address was released");
+    }
+
+    #[tokio::test]
     async fn a_taken_port_is_a_bind_error() {
         let taken = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
         let config = ProxyConfig {
-            bind: taken.local_addr().expect("addr"),
+            binds: vec![taken.local_addr().expect("addr")],
             upstreams: vec!["127.0.0.1:9".parse().expect("addr")],
             upstream_timeout: Duration::from_millis(100),
         };

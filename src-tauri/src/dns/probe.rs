@@ -72,6 +72,8 @@ pub fn describe(m: &Message) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Check {
+    /// The address that was asked.
+    pub server: String,
     pub name: String,
     pub expect: String,
     pub got: String,
@@ -85,21 +87,32 @@ pub struct SelfCheck {
     pub checks: Vec<Check>,
 }
 
-/// Asks the proxy at `server` for `blocked` (a name its rules block) and
-/// for `good` (expected to resolve through the upstreams).
-pub async fn self_check(server: SocketAddr, blocked: Option<String>, good: &str) -> SelfCheck {
-    let blocked_check = match blocked {
-        Some(name) => run(server, &name, "NOERROR 0.0.0.0 (blocked)", is_block_answer).await,
-        None => Check {
-            name: String::new(),
-            expect: "NOERROR 0.0.0.0 (blocked)".to_owned(),
-            got: "no block rule is loaded".to_owned(),
-            pass: false,
-        },
-    };
-    let good_check = run(server, good, "NOERROR with a real address", is_resolved).await;
-    let checks = vec![blocked_check, good_check];
-    SelfCheck { pass: checks.iter().all(|c| c.pass), checks }
+const EXPECT_BLOCKED: &str = "NOERROR 0.0.0.0 (blocked)";
+
+/// Asks the proxy for `blocked` (a name its rules block) on every listen
+/// address in `servers`, and for `good` (expected to resolve through the
+/// upstreams) on the first. A blocked name never leaves the machine, so
+/// only one forwarded lookup is made however many addresses there are.
+pub async fn self_check(servers: &[SocketAddr], blocked: Option<String>, good: &str) -> SelfCheck {
+    let mut checks = Vec::with_capacity(servers.len() + 1);
+    for &server in servers {
+        checks.push(match &blocked {
+            Some(name) => run(server, name, EXPECT_BLOCKED, is_block_answer).await,
+            None => Check {
+                server: server.to_string(),
+                name: String::new(),
+                expect: EXPECT_BLOCKED.to_owned(),
+                got: "no block rule is loaded".to_owned(),
+                pass: false,
+            },
+        });
+    }
+    if let Some(&first) = servers.first() {
+        checks.push(run(first, good, "NOERROR with a real address", is_resolved).await);
+    }
+    // No server, no check: an empty list never passes.
+    let pass = !checks.is_empty() && checks.iter().all(|c| c.pass);
+    SelfCheck { pass, checks }
 }
 
 async fn run(server: SocketAddr, name: &str, expect: &str, ok: fn(&Message) -> bool) -> Check {
@@ -107,7 +120,7 @@ async fn run(server: SocketAddr, name: &str, expect: &str, ok: fn(&Message) -> b
         Ok(m) => (describe(&m), ok(&m)),
         Err(e) => (format!("no answer: {e}"), false),
     };
-    Check { name: name.to_owned(), expect: expect.to_owned(), got, pass }
+    Check { server: server.to_string(), name: name.to_owned(), expect: expect.to_owned(), got, pass }
 }
 
 #[cfg(test)]
@@ -121,7 +134,7 @@ mod tests {
         let mut r = RuleSet::new();
         r.add_text(rules);
         let config = ProxyConfig {
-            bind: "127.0.0.1:0".parse().expect("addr"),
+            binds: vec!["127.0.0.1:0".parse().expect("addr")],
             upstreams: vec![upstream],
             upstream_timeout: Duration::from_millis(500),
         };
@@ -133,11 +146,33 @@ mod tests {
         let up = FakeUpstream::start(false).await;
         let proxy = proxy_with("||doubleclick.net^", up.addr).await;
         let rules = proxy.rules().read().expect("lock").clone();
-        let got = self_check(proxy.local_addr(), rules.sample_blocked(), "example.com").await;
+        let got = self_check(proxy.local_addrs(), rules.sample_blocked(), "example.com").await;
         assert!(got.pass, "{got:?}");
         assert_eq!(got.checks[0].name, "doubleclick.net");
+        assert_eq!(got.checks[0].server, proxy.local_addr().to_string());
         assert_eq!(got.checks[0].got, "NOERROR 0.0.0.0");
         assert_eq!(got.checks[1].got, format!("NOERROR {FAKE_ANSWER}"));
+        proxy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn self_check_asks_every_listen_address_for_the_blocked_name() {
+        let up = FakeUpstream::start(false).await;
+        let mut r = RuleSet::new();
+        r.add_text("||doubleclick.net^");
+        let config = ProxyConfig {
+            binds: vec!["127.0.0.1:0".parse().expect("addr"), "[::1]:0".parse().expect("addr")],
+            upstreams: vec![up.addr],
+            upstream_timeout: Duration::from_millis(500),
+        };
+        let proxy = Proxy::start(config, r).await.expect("start");
+        let got = self_check(proxy.local_addrs(), Some("doubleclick.net".into()), "example.com").await;
+        assert!(got.pass, "{got:?}");
+        let servers: Vec<&str> = got.checks.iter().map(|c| c.server.as_str()).collect();
+        let a = proxy.local_addrs()[0].to_string();
+        let b = proxy.local_addrs()[1].to_string();
+        assert_eq!(servers, vec![a.as_str(), b.as_str(), a.as_str()], "blocked on both, good on the first");
+        assert_eq!(proxy.stats().forwarded, 1);
         proxy.stop().await;
     }
 
@@ -145,7 +180,7 @@ mod tests {
     async fn self_check_fails_when_the_name_is_not_blocked() {
         let up = FakeUpstream::start(false).await;
         let proxy = proxy_with("||doubleclick.net^", up.addr).await;
-        let got = self_check(proxy.local_addr(), Some("not-blocked.example".into()), "example.com").await;
+        let got = self_check(proxy.local_addrs(), Some("not-blocked.example".into()), "example.com").await;
         assert!(!got.pass);
         assert!(!got.checks[0].pass);
         assert!(got.checks[1].pass);
@@ -156,13 +191,14 @@ mod tests {
     async fn self_check_fails_without_rules_or_without_a_server() {
         let up = FakeUpstream::start(false).await;
         let proxy = proxy_with("", up.addr).await;
-        let got = self_check(proxy.local_addr(), None, "example.com").await;
+        let got = self_check(proxy.local_addrs(), None, "example.com").await;
         assert!(!got.pass);
         let addr = proxy.local_addr();
         proxy.stop().await;
-        let gone = self_check(addr, Some("doubleclick.net".into()), "example.com").await;
+        let gone = self_check(&[addr], Some("doubleclick.net".into()), "example.com").await;
         assert!(!gone.pass);
         assert!(gone.checks.iter().all(|c| c.got.starts_with("no answer")), "{gone:?}");
+        assert!(!self_check(&[], Some("doubleclick.net".into()), "example.com").await.pass, "no server never passes");
     }
 
     #[test]
