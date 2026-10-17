@@ -7,6 +7,7 @@ import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { AppShell } from "./app-shell";
 import { Card } from "./card";
+import MARK from "./sieve-mark.json";
 
 vi.mock("next/navigation", () => ({ usePathname: () => "/" }));
 
@@ -56,13 +57,14 @@ describe("app shell (seam law: shell renders ROUTES and binds the master switch 
     expect(status.className).toContain("sr-only");
   });
 
-  it("the logo is the Sieve mark: a ring with its mesh lines clipped inside, in the mint primary", () => {
+  it("the logo is the Sieve mark: a rim and a bowl cut by masked slots, in the mint primary", () => {
     setup();
     const svg = screen.getByRole("banner").querySelector("svg.text-primary")!;
-    expect(svg.querySelectorAll("line")).toHaveLength(3);
-    const clip = svg.querySelector("clipPath")!.id;
-    expect(svg.querySelector("g")!.getAttribute("clip-path")).toBe(`url(#${clip})`);
-    expect(clip).toMatch(/^[a-zA-Z0-9_-]+$/);
+    expect(svg.querySelectorAll("mask line")).toHaveLength(MARK.slots.lines.length);
+    const mask = svg.querySelector("mask")!.id;
+    expect(mask).toMatch(/^[a-zA-Z0-9_-]+$/);
+    expect(svg.querySelector(`[mask="url(#${mask})"]`)).not.toBeNull();
+    expect(svg.querySelector("rect")!.getAttribute("fill")).toBe("currentColor");
   });
 
   it("gives every icon-only button an accessible name", () => {
