@@ -4,7 +4,8 @@ import { ChevronDown, X } from "lucide-react";
 import { useState } from "react";
 import { IconButton } from "@/components/sieve/primitives/icon-button";
 import { StateLayer } from "@/components/sieve/primitives/state-layer";
-import type { Category } from "@/core/apps";
+import { AppIcon } from "@/components/sieve/primitives/app-icon";
+import { iconExe, type Category } from "@/core/apps";
 import type { AppEntry, AppSection } from "@/core/apps-actions";
 import { cn } from "@/lib/utils";
 import { AppToggle } from "./app-toggle";
@@ -37,7 +38,9 @@ export function AppRow({ app, actions }: { app: AppEntry; actions: RowActions })
         aria-label={`${app.name}, ${n} ${n === 1 ? "connection" : "connections"}. Open details`}
         className="relative flex h-11 min-w-0 flex-1 items-center gap-3 overflow-hidden rounded-sm pr-2 text-left"
       >
-        <Monogram appKey={app.key} name={app.name} />
+        <AppIcon exe={iconExe(app)}>
+          <Monogram appKey={app.key} name={app.name} />
+        </AppIcon>
         <span className="flex min-w-0 flex-1 flex-col">
           <span className={cn("truncate text-body-strong", on ? "text-on-surface" : "text-on-surface-muted")}>{app.name}</span>
           {/* Narrow windows move the count under the name to give the name room. */}

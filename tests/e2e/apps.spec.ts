@@ -45,6 +45,32 @@ test.describe("apps", () => {
     expect(errors).toEqual([]);
   });
 
+  test("with real icons (?icons=1): rows, the sheet and Top apps show the app's own icon, bare, in the monogram's box", async ({ page }, info) => {
+    const errors = collectErrors(page);
+    await page.goto(`${APPS}&icons=1`);
+    const chrome = row(page, CHROME).locator("[data-app-icon]");
+    await expect(chrome).toHaveAttribute("data-app-icon", "image");
+    const img = chrome.locator("img");
+    await expect(img).toHaveAttribute("src", /^data:image\/png;base64,/);
+    expect(await img.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth > 0)).toBe(true);
+    // The box is the monogram's: 32 px, and the row stays 44 px.
+    const b = (await chrome.boundingBox())!;
+    expect([b.width, b.height]).toEqual([32, 32]);
+    expect((await row(page, CHROME).boundingBox())!.height).toBe(44);
+    // No tile behind a real icon.
+    expect(await chrome.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgba(0, 0, 0, 0)");
+    // Windows' own exes have no generated icon in the mock: their monogram stays.
+    const system = page.getByRole("region", { name: /^System/ }).locator("[data-app-icon]").first();
+    await expect(system).toHaveAttribute("data-app-icon", "fallback");
+    await page.screenshot({ path: `test-results/screens/apps-icons-${info.project.name}.png` });
+    await row(page, CHROME).getByRole("button", { name: /Google Chrome/ }).click();
+    await expect(page.getByRole("dialog").locator("[data-app-icon=image]")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.goto("/?source=mock&seed=1&icons=1");
+    await expect(page.getByRole("region", { name: "Top apps" }).locator("[data-app-icon=image]").first()).toBeVisible();
+    expect(errors).toEqual([]);
+  });
+
   test("turning an app off survives a reload; other apps stay on", async ({ page }) => {
     await page.goto(APPS);
     const toggle = row(page, CHROME).getByRole("switch");

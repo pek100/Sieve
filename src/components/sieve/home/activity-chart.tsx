@@ -2,7 +2,9 @@
 
 import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { niceCeiling, stackSeries, type SeriesModel } from "@/core/series";
+import { AppIcon } from "@/components/sieve/primitives/app-icon";
+import { niceCeiling, OTHER_KEY, stackSeries, type SeriesModel } from "@/core/series";
+import { useIconExes } from "@/hooks/use-app-icon";
 import { cn } from "@/lib/utils";
 import { placeTooltip } from "@/components/sieve/primitives/floating-tooltip";
 import { seriesTone } from "./series-tone";
@@ -136,6 +138,7 @@ export function ActivityChart({
     return f < 0 || (start !== null && hoverF < start - 0.01) ? null : { index: best, f };
   }, [hoverF, pts, end, model.windowMs, start]);
 
+  const exes = useIconExes();
   const visible = model.series.filter((s) => !hidden.has(s.key));
   const now = pts.length ? pts[pts.length - 1].values : {};
   const summary = [...visible]
@@ -245,6 +248,9 @@ export function ActivityChart({
                   {visible.map((s) => (
                     <li key={s.key} className="flex items-center gap-2">
                       <span aria-hidden="true" className={cn("size-2 shrink-0 rounded-full", seriesTone(s.slot).bg)} />
+                      <AppIcon exe={exes.get(s.key) ?? null} size={16}>
+                        <span className="text-caption text-on-surface-faint">{s.key === OTHER_KEY ? "" : (s.name.match(/[\p{L}\p{N}]/u)?.[0] ?? "").toUpperCase()}</span>
+                      </AppIcon>
                       <span className="min-w-0 flex-1 truncate text-on-surface-muted">{s.name}</span>
                       <span className="text-on-surface tabular">{fmt1(pts[hover.index].values[s.key] ?? 0)}</span>
                     </li>

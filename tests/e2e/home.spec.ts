@@ -191,8 +191,8 @@ test.describe("home", () => {
       expect(b.x + b.width).toBeLessThanOrEqual(x1);
     }
     await page.screenshot({ path: `test-results/screens/home-tooltip-${info.project.name}.png` });
-    // It follows the cursor.
-    const x2 = plot.x + plot.width / 2;
+    // It follows the cursor (still over the data: in the first seconds it covers only the right edge of the 5 min window).
+    const x2 = plot.x + plot.width - 10;
     await page.mouse.move(x2, y1 + 20);
     await expect.poll(async () => (await tip.boundingBox())!.y).toBeGreaterThan(b.y);
     b = (await tip.boundingBox())!;

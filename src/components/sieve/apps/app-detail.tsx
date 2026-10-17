@@ -6,7 +6,8 @@ import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { StateLayer } from "@/components/sieve/primitives/state-layer";
-import { isActiveFlow } from "@/core/apps";
+import { AppIcon } from "@/components/sieve/primitives/app-icon";
+import { iconExe, isActiveFlow } from "@/core/apps";
 import type { AppEntry } from "@/core/apps-actions";
 import type { Flow } from "@/data/protocol";
 import { CATEGORY_LABEL, type RowActions } from "./app-list";
@@ -202,7 +203,11 @@ export function AppDetailSheet({
         className="gap-0 border-outline bg-surface-1 text-on-surface shadow-l4 data-[side=right]:w-full data-[side=right]:sm:max-w-none data-[side=right]:two:max-w-[480px]"
       >
         <SheetHeader className="flex-row items-center gap-3 p-5 pr-10">
-          {app && <Monogram appKey={app.key} name={app.name} size={40} />}
+          {app && (
+            <AppIcon exe={iconExe(app)} size={40}>
+              <Monogram appKey={app.key} name={app.name} size={40} />
+            </AppIcon>
+          )}
           <div className="min-w-0">
             <SheetTitle className="truncate text-title text-on-surface">{app?.name ?? appKey ?? ""}</SheetTitle>
             <SheetDescription className="text-label text-on-surface-muted">

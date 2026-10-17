@@ -138,8 +138,8 @@ async function noSidewaysOverflow(page: Page) {
 
 // ---------------------------------------------------------------- Home
 
-async function openHome(page: Page) {
-  await page.goto("/?source=mock&seed=1");
+async function openHome(page: Page, extra = "") {
+  await page.goto(`/?source=mock&seed=1${extra}`);
   const line = page.getByRole("region", { name: "Connections per app" }).locator('path[data-part="line"]').first();
   await expect(line).toBeAttached();
   await expect.poll(async () => ((await line.getAttribute("d")) ?? "").split("L").length, { timeout: 15_000 }).toBeGreaterThanOrEqual(4);
@@ -226,14 +226,18 @@ async function homeLaw(page: Page) {
 }
 
 test.describe("alignment law", () => {
-  test("Home snaps to the grid", async ({ page }) => {
-    const errors = collectErrors(page);
-    await openHome(page);
-    const { failures } = await homeLaw(page);
-    expect(failures, failures.join("\n")).toEqual([]);
-    expect(await noSidewaysOverflow(page)).toBeLessThanOrEqual(0);
-    expect(errors).toEqual([]);
-  });
+  // With the mock's generated app icons too (&icons=1): real icons must not move a line.
+  for (const extra of ["", "&icons=1"]) {
+    test(`Home snaps to the grid${extra}`, async ({ page }) => {
+      const errors = collectErrors(page);
+      await openHome(page, extra);
+      if (extra) await expect(page.getByRole("region", { name: "Top apps" }).locator("[data-app-icon=image]").first()).toBeVisible();
+      const { failures } = await homeLaw(page);
+      expect(failures, failures.join("\n")).toEqual([]);
+      expect(await noSidewaysOverflow(page)).toBeLessThanOrEqual(0);
+      expect(errors).toEqual([]);
+    });
+  }
 
   test("Home snaps to the grid at 960x800", async ({ page }, info) => {
     test.skip(info.project.name !== "desktop", "desktop project resizes to 960");
@@ -243,11 +247,13 @@ test.describe("alignment law", () => {
     expect(failures, failures.join("\n")).toEqual([]);
   });
 
-  test("Apps snaps to the grid; toggles end on the header actions' line", async ({ page }) => {
+  for (const extra of ["", "&icons=1"]) {
+  test(`Apps snaps to the grid; toggles end on the header actions' line${extra}`, async ({ page }) => {
     const errors = collectErrors(page);
-    await page.goto("/apps/?source=mock&seed=1");
+    await page.goto(`/apps/?source=mock&seed=1${extra}`);
     const rows = page.getByTestId("app-row");
     await expect(rows.first()).toBeVisible();
+    if (extra) await expect(page.locator("[data-testid=app-row] [data-app-icon=image]").first()).toBeVisible();
     const { grid, failures } = await expectOnGrid(page, { list: page.getByRole("region", { name: "All apps" }) }, { rows });
     for (const sw of (await page.getByRole("main").getByRole("switch").all()).slice(0, 12)) {
       const b = (await sw.boundingBox())!;
@@ -261,6 +267,7 @@ test.describe("alignment law", () => {
     expect(await noSidewaysOverflow(page)).toBeLessThanOrEqual(0);
     expect(errors).toEqual([]);
   });
+  }
 
   test("Settings snaps to the grid: rail on the title's line, content to the actions' line", async ({ page }) => {
     const errors = collectErrors(page);

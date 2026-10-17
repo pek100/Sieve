@@ -8,7 +8,7 @@
 import type { SourceKind } from "@/core/store";
 import { createMockSource, MOCK_SCENARIOS, type MockScenario } from "./mock-source";
 import type { HistoryQuery } from "@/core/history";
-import type { History, Snapshot } from "./protocol";
+import type { AppIcon, History, Snapshot } from "./protocol";
 import { createTauriSource } from "./tauri-source";
 import { createMockDns, DNS_SCENARIOS, type DnsScenario } from "./dns-mock";
 import { createTauriDns, type DnsSource } from "./dns-source";
@@ -27,6 +27,12 @@ export interface SieveSource {
    * shape. Rejects on failure.
    */
   history(query: HistoryQuery): Promise<History>;
+  /**
+   * The icon of one exe (an app's first exe), or null when it has none to
+   * show (Windows hides the path, no icon, the mock without ?icons=1). Never
+   * part of a snapshot. Rejects only when the source itself failed.
+   */
+  appIcon(exe: string): Promise<AppIcon | null>;
 }
 
 export interface SourceOptions {
@@ -37,6 +43,8 @@ export interface SourceOptions {
   dns: DnsScenario;
   /** Mock: report AdGuard as running (?adguard=1). */
   adguard: boolean;
+  /** Mock: generated app icons (?icons=1); without it the mock has none, as for unreadable exes. */
+  icons: boolean;
 }
 
 /** Read the source choice from the environment: query string and Tauri presence. */
@@ -50,7 +58,7 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   const scenario = (MOCK_SCENARIOS as readonly string[]).includes(sc ?? "") ? (sc as MockScenario) : "steady";
   const d = q.get("dns");
   const dns = (DNS_SCENARIOS as readonly string[]).includes(d ?? "") ? (d as DnsScenario) : "off";
-  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1" };
+  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1", icons: q.get("icons") === "1" };
 }
 
 /**
@@ -59,7 +67,7 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
  *   of its own: its history is computed, and the window filters what it shows.)
  */
 export function createSource(o: SourceOptions, untracked: () => ReadonlySet<string>): SieveSource {
-  return o.kind === "tauri" ? createTauriSource(undefined, untracked) : createMockSource({ seed: o.seed, scenario: o.scenario });
+  return o.kind === "tauri" ? createTauriSource(undefined, untracked) : createMockSource({ seed: o.seed, scenario: o.scenario, icons: o.icons });
 }
 
 /** The DNS seam follows the same choice: Tauri commands, or the mock. */
