@@ -153,6 +153,15 @@ What happened: 20,827 flows, all UDP, almost all owned by `probe.exe`, 790,887 p
 
 Tests added: destination admission (all multicast and link-local destinations from the run), own-pid refusal, the byte-order helper, the log cap, the default host and the destination helper. 100 tests pass.
 
+### Live runs 2 to 4 (after the fixes)
+
+- **probe2, AdGuard protection ON:** all 3,570 flows were `AdguardSvc.exe`. AdGuard's driver redirects apps to its proxy before routing, and then re-captures the forwarder's own outbound connections, so they loop; curl timed out. Conclusion: the per-app engine must refuse to run while AdGuard protection is on (detect and say so).
+- **probe3, AdGuard paused, observe:** 6 flows, all attributed (curl.exe TLS and HTTP, claude.exe TLS, plus QUIC decoded live with `ech=true`). No loop, no forwarder errors, cleanup OK. HTTPS through the TUN returned 200 (1.1 s first, then 0.27 s). Counters: TCP SYN v4 5, UDP v4 72, 261 multicast packets discarded.
+- **probe4, enforce test:** curl.exe was dropped and curl-other.exe passed, as designed.
+- **Plain HTTP "empty reply" (curl exit 52) on `http://quic.nginx.org/`: not a probe bug.** The same curl from this machine with no TUN at all gives exit 52 too ("Request completely sent off", then "Empty reply from server"): quic.nginx.org accepts port 80, reads the request and closes without answering. `http://nginx.org/` returns 200 from the same machine. The probe did its job: it decoded the Host (`kind=http`), passed the flow, replayed the request and relayed the server's close.
+  - **Regression tests:** the TCP relay moved into `spike::relay::relay_tcp`, generic over the stream types, and the probe calls it for every TCP flow, so TLS and HTTP share one path. Eight tests drive it with an in-memory app stream and a real loopback upstream: an HTTP request is replayed exactly once and the 200 response reaches the app; a request in 7-byte pieces arrives whole; reply-then-close delivers the whole reply; close-without-reply gives the app EOF with 0 bytes, not a hang (the quic.nginx.org case); TLS in two writes is replayed, then both directions flow; drop sends nothing upstream; a server-first banner reaches the app before any client byte; client EOF before any byte stops without deciding.
+  - **Enforce test clarity:** a made-up test name gets rejected by any real server, so its pass case is not a clean signal. `--block-domain` may now also be the routed host itself (only flows to its routed addresses can reach the stack, so nothing else can be dropped). The banner then prints plain HTTPS commands: blocked prints 000, passed prints 200.
+
 ### Next live run (observe)
 
 In Terminal (Admin):
@@ -161,7 +170,13 @@ In Terminal (Admin):
 & "F:\Projects\Code\Sieve\.claude\worktrees\agent-a025d1b361c8851d3\spikes\wintun\target\release\probe.exe" --seconds 90 --out $env:TEMP
 ```
 
-(Default host quic.nginx.org.) The banner prints the curl commands. In a normal PowerShell run them twice each, then open https://quic.nginx.org/ in a browser and reload twice. Then, if AdGuard allows it, pause AdGuard protection and run all of it once more within the same 90 s, or in a second run.
+(Default host quic.nginx.org; its plain HTTP gives curl exit 52 with or without the TUN, see above.) Enforce test with a clean pass signal (AdGuard protection paused):
+
+```
+& "F:\Projects\Code\Sieve\.claude\worktrees\agent-a025d1b361c8851d3\spikes\wintun\target\release\probe.exe" --seconds 90 --out $env:TEMP --enforce-test --block-domain quic.nginx.org --block-exe curl.exe
+```
+
+Expected: `curl.exe https://quic.nginx.org/` prints 000, the copied `curl-other.exe` prints 200, and the log shows `verdict=drop` and `verdict=pass`. The banner prints the curl commands. In a normal PowerShell run them twice each, then open https://quic.nginx.org/ in a browser and reload twice. Then, if AdGuard allows it, pause AdGuard protection and run all of it once more within the same 90 s, or in a second run.
 
 What to look for in the summary:
 - `TUN packets discarded before the stack: not unicast N`: OS chatter, now harmless. `own-process flows refused` must be 0.

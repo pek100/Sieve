@@ -76,8 +76,9 @@ domain for one exe (enforce test). Needs an elevated (admin) terminal.
         [--exempt <exe>]...          apps set to off in observe mode
         [--dns-via <ip:port>]        send TUN DNS flows here (e.g. 127.0.0.1:53)
         [--enforce-test --block-domain <name> --block-exe <exe>]
-                                     drop <name> (must end in .example, .test,
-                                     .invalid or .localhost) for <exe> only
+                                     drop <name> for <exe> only; <name> is the
+                                     routed host itself, or ends in .example,
+                                     .test, .invalid or .localhost
 ";
 
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
@@ -131,7 +132,20 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, Strin
     }
     match (enforce, block_domain, block_exe) {
         (false, None, None) => {}
-        (true, Some(d), Some(e)) => a.enforce = Some(EnforceTest { domain: checked_test_domain(&d)?, exe: e }),
+        (true, Some(d), Some(e)) => {
+            // The routed host itself is also allowed (only flows to its
+            // routed addresses ever reach the stack, so a drop cannot touch
+            // anything else); `--route-ip` runs keep the reserved-TLD rule.
+            let own_host = (a.route_ips.is_empty())
+                .then(|| crate::sni::host_name(a.route_host.as_bytes()))
+                .flatten()
+                .filter(|h| crate::sni::host_name(d.as_bytes()).as_deref() == Some(h.as_str()));
+            let domain = match own_host {
+                Some(h) => h,
+                None => checked_test_domain(&d)?,
+            };
+            a.enforce = Some(EnforceTest { domain, exe: e });
+        }
         (true, _, _) => return Err("--enforce-test needs both --block-domain and --block-exe".into()),
         (false, _, _) => return Err("--block-domain/--block-exe only work with --enforce-test".into()),
     }
@@ -526,6 +540,18 @@ mod tests {
         for ok in ["a.test", "x.y.invalid", "spike.localhost"] {
             assert!(checked_test_domain(ok).is_ok(), "{ok}");
         }
+    }
+
+    #[test]
+    fn enforce_test_may_block_the_routed_host_itself_and_nothing_else() {
+        let a = args("--enforce-test --block-domain QUIC.nginx.org --block-exe curl.exe").unwrap();
+        assert_eq!(a.enforce.unwrap().domain, "quic.nginx.org");
+        let a = args("--route-host nginx.org --block-exe curl.exe --enforce-test --block-domain nginx.org").unwrap();
+        assert_eq!(a.enforce.unwrap().domain, "nginx.org");
+        // Another real name, a parent of the routed host, or a --route-ip run: refused.
+        assert!(args("--enforce-test --block-domain google.com --block-exe curl.exe").is_err());
+        assert!(args("--enforce-test --block-domain nginx.org --block-exe curl.exe").is_err());
+        assert!(args("--route-ip 3.125.64.247 --enforce-test --block-domain quic.nginx.org --block-exe curl.exe").is_err());
     }
 
     #[test]

@@ -304,12 +304,18 @@ mod live {
                 let host_ip = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
                 println!("ENFORCE TEST: dropping {} for {} only. In a second (normal) PowerShell:", e.domain, e.exe);
                 println!("    Copy-Item C:\\Windows\\System32\\curl.exe $env:TEMP\\curl-other.exe");
-                println!("  HTTP (clean signal: blocked prints 000, passed prints the server's status code):");
-                println!("    curl.exe -s -m 8 -o NUL -w \"%{{http_code}}`n\" --resolve {d}:80:{host_ip} http://{d}/", d = e.domain);
-                println!("    & $env:TEMP\\curl-other.exe -s -m 8 -o NUL -w \"%{{http_code}}`n\" --resolve {d}:80:{host_ip} http://{d}/", d = e.domain);
-                println!("  TLS (both may print 000: the server rejects the test name; compare the -v error text):");
-                println!("    curl.exe -vk -m 8 -o NUL --resolve {d}:443:{host_ip} https://{d}/", d = e.domain);
-                println!("    & $env:TEMP\\curl-other.exe -vk -m 8 -o NUL --resolve {d}:443:{host_ip} https://{d}/", d = e.domain);
+                if e.domain == args.route_host {
+                    // The routed host itself: a real name, so the pass case is a clean 200.
+                    println!("    curl.exe -s -m 8 -o NUL -w \"%{{http_code}}`n\" https://{d}/", d = e.domain);
+                    println!("    & $env:TEMP\\curl-other.exe -s -m 8 -o NUL -w \"%{{http_code}}`n\" https://{d}/", d = e.domain);
+                    println!("  expected: curl.exe prints 000 (handshake cut), curl-other.exe prints 200.");
+                } else {
+                    println!("    curl.exe -vk -m 8 -o NUL --resolve {d}:443:{host_ip} https://{d}/", d = e.domain);
+                    println!("    & $env:TEMP\\curl-other.exe -vk -m 8 -o NUL --resolve {d}:443:{host_ip} https://{d}/", d = e.domain);
+                    println!("  a real server rejects a made-up name, so both curls may fail; the difference is");
+                    println!("  where (no server hello at all when dropped). For a clean 200 pass case, use");
+                    println!("  --block-domain {} (the routed host itself).", args.route_host);
+                }
                 println!("  this window logs verdict=drop for curl.exe and verdict=pass for curl-other.exe.");
             }
             None => {
@@ -319,6 +325,10 @@ mod live {
                     println!("In a second (normal) PowerShell, while this runs:");
                     println!("    curl.exe -s -m 10 -o NUL -w \"%{{http_code}} %{{time_total}}s`n\" https://{h}/");
                     println!("    curl.exe -s -m 10 -o NUL -w \"%{{http_code}} %{{time_total}}s`n\" http://{h}/");
+                    if h == probe_support::DEFAULT_ROUTE_HOST {
+                        println!("  (quic.nginx.org has no plain HTTP: it reads the request and closes, so curl");
+                        println!("   says 'empty reply' (exit 52) with or without the TUN; the log still shows kind=http)");
+                    }
                     println!("  and open https://{h}/ in a browser, reload twice (HTTP/3 starts after the first visit).");
                 }
             }

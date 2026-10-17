@@ -25,7 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ipstack::{IpStackTcpStream, IpStackUdpStream};
-use spike::classify::{Decoded, TcpClassifier, UdpClassifier};
+use spike::classify::{Decoded, UdpClassifier};
+use spike::relay::relay_tcp;
 use spike::flows::{Action, AppPolicy, Attributor, ExeCache, FiveTuple, Owner, os::IpHelper, verdict};
 use spike::packet::Proto;
 use spike::probe_support::{FlowLog, Summary, admit_owner, record};
@@ -196,47 +197,13 @@ pub async fn handle_tcp(shared: Arc<Shared>, mut app: IpStackTcpStream) {
             return close_app(&mut app).await;
         }
     };
-    let stop = {
-        let (mut up_read, mut up_write) = upstream.into_split();
-        let (mut app_read, mut app_write) = tokio::io::split(&mut app);
-        // Server -> app at once; client -> server waits for the verdict.
-        let server_to_app = async {
-            let _ = tokio::io::copy(&mut up_read, &mut app_write).await;
-            let _ = app_write.shutdown().await;
-        };
-        // true: end the flow now (dropped or broken before a decision).
-        let client_to_server = async {
-            let mut classifier = TcpClassifier::new();
-            let mut buf = vec![0u8; 16 * 1024];
-            let decided = loop {
-                match tokio::time::timeout(FIRST_BYTES_WAIT, app_read.read(&mut buf)).await {
-                    Ok(Ok(0)) | Ok(Err(_)) => return true,
-                    Ok(Ok(n)) => {
-                        if let Some(d) = classifier.push(&buf[..n]) {
-                            break d;
-                        }
-                    }
-                    Err(_) => break Decoded { failure: Some("no client bytes in time"), ..Decoded::default() },
-                }
-            };
-            if shared.decide("tcp", &flow, pid, retried, &decided) == Action::Drop {
-                return true;
-            }
-            if up_write.write_all(&classifier.take_held()).await.is_err() {
-                shared.error("tcp write upstream");
-                return true;
-            }
-            let _ = tokio::io::copy(&mut app_read, &mut up_write).await;
-            let _ = up_write.shutdown().await;
-            false
-        };
-        tokio::pin!(server_to_app, client_to_server);
-        tokio::select! {
-            stop = &mut client_to_server => { if !stop { server_to_app.await; } stop }
-            _ = &mut server_to_app => client_to_server.await,
-        }
-    };
-    if stop {
+    // The same relay the offline tests drive (spike::relay): TLS, HTTP and
+    // everything else take this one path.
+    let out = relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, |d| shared.decide("tcp", &flow, pid, retried, d)).await;
+    if out.upstream_write_failed {
+        shared.error("tcp write upstream");
+    }
+    if out.stop {
         close_app(&mut app).await;
     }
 }
