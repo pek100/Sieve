@@ -117,12 +117,13 @@ impl Engine {
         self.proxy.set_pass_through(on);
     }
 
-    /// Asks the running proxy, on every listen address, for a name its
-    /// loaded rules block, and on the first for `KNOWN_GOOD_NAME`. These
-    /// queries show up in the counters (one blocked per address, one forwarded).
+    /// Asks the running proxy, on every listen address, for the canary
+    /// (`rules::CANARY_NAME`) and for `KNOWN_GOOD_NAME`, and fails when no
+    /// block rule is loaded. The canary is never counted; the good name is
+    /// one forwarded lookup per listen address.
     pub async fn self_check(&self) -> SelfCheck {
-        let blocked = current(&self.proxy.rules()).sample_blocked();
-        probe::self_check(self.proxy.local_addrs(), blocked, KNOWN_GOOD_NAME).await
+        let block_rules = current(&self.proxy.rules()).counts().block;
+        probe::self_check(self.proxy.local_addrs(), block_rules, KNOWN_GOOD_NAME).await
     }
 
     /// One refresh pass now (the refresher calls the same function).
@@ -189,9 +190,10 @@ async fn refresh_loop(
 #[cfg(test)]
 mod tests {
     use super::super::lists::{MAX_AGE_MS, USER_RULES_FILE, write_cache};
-    use super::super::probe::{is_block_answer, is_resolved, query_a};
+    use super::super::probe::{CheckKind, is_block_answer, is_resolved, query_a};
     use super::super::proxy::DEFAULT_UPSTREAMS;
     use super::super::proxy::tests::FakeUpstream;
+    use super::super::rules::CANARY_NAME;
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -241,10 +243,14 @@ mod tests {
 
         let check = engine.self_check().await;
         assert!(check.pass, "{check:?}");
-        assert_eq!(check.checks[0].name, "ads.sieve-test.invalid");
+        assert_eq!(check.checks[0].name, CANARY_NAME);
         let s = engine.status();
-        assert_eq!((s.counters.blocked, s.counters.forwarded), (1, 1));
-        assert_eq!(s.top_blocked[0].domain, "ads.sieve-test.invalid");
+        assert_eq!(
+            (s.counters.queries, s.counters.blocked, s.counters.forwarded),
+            (1, 0, 1),
+            "the canary is in no user-facing counter; the normal name is one forwarded lookup"
+        );
+        assert!(s.top_blocked.is_empty(), "the canary is not a top blocked domain");
 
         let addr = engine.local_addr();
         engine.stop().await;
@@ -309,6 +315,7 @@ mod tests {
         assert!(s.list.error.is_some());
         let check = engine.self_check().await;
         assert!(!check.pass);
+        assert_eq!(check.checks[0].kind, CheckKind::Rules);
         assert_eq!(check.checks[0].got, "no block rule is loaded");
         engine.stop().await;
     }

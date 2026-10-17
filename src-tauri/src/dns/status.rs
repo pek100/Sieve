@@ -37,7 +37,8 @@
 //!   "top_blocked": [{ "domain": "doubleclick.net", "count": 9 }]  // at most 20
 //! }
 //! ```
-//! Counters restart from zero on every `dns_start`.
+//! Counters restart from zero on every `dns_start`. The self check's canary
+//! (`rules::CANARY_NAME`) is in no counter and never in `top_blocked`.
 
 use serde::Serialize;
 

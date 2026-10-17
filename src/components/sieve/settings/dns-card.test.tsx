@@ -58,9 +58,14 @@ describe("DNS card", () => {
     await userEvent.click(within(card()).getByRole("switch", { name: "DNS filtering" }));
     await vi.waitFor(() => expect(phase()).toBe("running"));
     expect(card()).toHaveTextContent("Running on 127.0.0.1:53 and [::1]:53.");
-    expect(card().querySelector("[data-dns-check=pass]")).toHaveTextContent(/Self check passed: doubleclick\.net is blocked on 127\.0\.0\.1:53 and \[::1\]:53/);
+    expect(card().querySelector("[data-dns-check=pass]")).toHaveTextContent(
+      /Self check passed: the test name is blocked on 127\.0\.0\.1:53 and \[::1\]:53, and a normal name resolves\./,
+    );
     expect(card()).toHaveTextContent("Windows does not use Sieve for DNS yet, so nothing is blocked.");
-    expect(card().querySelector("[data-stat=queries] [data-numeric]")).toHaveTextContent("3");
+    // The self check's normal name once per listener; its canary is never counted.
+    expect(card().querySelector("[data-stat=queries] [data-numeric]")).toHaveTextContent("2");
+    expect(card().querySelector("[data-stat=blocked] [data-numeric]")).toHaveTextContent("0");
+    expect(within(card()).queryByText("selfcheck.sieve.invalid")).toBeNull();
     expect(card().querySelector("[data-dns-list]")).toHaveTextContent(/51,234 block rules, 812 allow rules, 97 lines skipped\. Updated/);
     const point = within(card()).getByRole("button", { name: "Point Windows at Sieve" });
     await vi.waitFor(() => expect(point).toBeEnabled());

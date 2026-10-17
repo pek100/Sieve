@@ -183,7 +183,7 @@ export function createDnsController(d: DnsControllerDeps): DnsController {
 
   const failedCheck = (e: unknown): SelfCheck => ({
     pass: false,
-    checks: [{ server: "", name: "", expect: "an answer from the filter", got: message(e), pass: false }],
+    checks: [{ kind: "call", server: "", name: "", expect: "an answer from the filter", got: message(e), pass: false }],
   });
 
   /**

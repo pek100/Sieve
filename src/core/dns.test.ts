@@ -53,8 +53,8 @@ describe("dns derivations", () => {
       failedChecks({
         pass: false,
         checks: [
-          { server: "127.0.0.1:53", name: "doubleclick.net", expect: "NOERROR 0.0.0.0 (blocked)", got: "no answer: timed out", pass: false },
-          { server: "127.0.0.1:53", name: "example.com", expect: "x", got: "x", pass: true },
+          { kind: "canary", server: "127.0.0.1:53", name: "doubleclick.net", expect: "NOERROR 0.0.0.0 (blocked)", got: "no answer: timed out", pass: false },
+          { kind: "resolve", server: "127.0.0.1:53", name: "example.com", expect: "x", got: "x", pass: true },
         ],
       }),
     ).toBe("doubleclick.net: expected NOERROR 0.0.0.0 (blocked), got no answer: timed out");

@@ -10,6 +10,7 @@ use hickory_proto::rr::{Name, RecordType};
 use serde::Serialize;
 
 use super::proxy::udp_exchange;
+use super::rules::CANARY_NAME;
 
 /// A name that exists and is not on any ad list.
 pub const KNOWN_GOOD_NAME: &str = "example.com";
@@ -70,9 +71,23 @@ pub fn describe(m: &Message) -> String {
     if ips.is_empty() { format!("{code} (no records)") } else { format!("{code} {}", ips.join(", ")) }
 }
 
+/// What a check tests. The TypeScript mirror is `CHECK_KINDS` in
+/// src/data/protocol.ts (protocol law).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckKind {
+    /// At least one block rule is loaded (asks no listener; `server` empty).
+    Rules,
+    /// The built-in canary gets the block answer on this listener.
+    Canary,
+    /// A normal name resolves through the upstreams via this listener.
+    Resolve,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Check {
-    /// The address that was asked.
+    pub kind: CheckKind,
+    /// The address that was asked; empty for `Rules`.
     pub server: String,
     pub name: String,
     pub expect: String,
@@ -88,39 +103,41 @@ pub struct SelfCheck {
 }
 
 const EXPECT_BLOCKED: &str = "NOERROR 0.0.0.0 (blocked)";
+const EXPECT_RESOLVED: &str = "NOERROR with a real address";
 
-/// Asks the proxy for `blocked` (a name its rules block) on every listen
-/// address in `servers`, and for `good` (expected to resolve through the
-/// upstreams) on the first. A blocked name never leaves the machine, so
-/// only one forwarded lookup is made however many addresses there are.
-pub async fn self_check(servers: &[SocketAddr], blocked: Option<String>, good: &str) -> SelfCheck {
-    let mut checks = Vec::with_capacity(servers.len() + 1);
-    for &server in servers {
-        checks.push(match &blocked {
-            Some(name) => run(server, name, EXPECT_BLOCKED, is_block_answer).await,
-            None => Check {
-                server: server.to_string(),
-                name: String::new(),
-                expect: EXPECT_BLOCKED.to_owned(),
-                got: "no block rule is loaded".to_owned(),
-                pass: false,
-            },
+/// The self check of a proxy listening on `servers` with `block_rules`
+/// block rules loaded. On every listen address it asks for `CANARY_NAME`
+/// (answered by the proxy itself, whatever the list holds, so the check is
+/// the same on every machine and every list) and for `good` (a normal name,
+/// forwarded to the upstreams). With no block rule loaded the filter would
+/// block nothing, so that fails too. The canary never leaves the machine.
+pub async fn self_check(servers: &[SocketAddr], block_rules: usize, good: &str) -> SelfCheck {
+    let mut checks = Vec::with_capacity(2 * servers.len() + 1);
+    if block_rules == 0 {
+        checks.push(Check {
+            kind: CheckKind::Rules,
+            server: String::new(),
+            name: String::new(),
+            expect: "at least one block rule".to_owned(),
+            got: "no block rule is loaded".to_owned(),
+            pass: false,
         });
     }
-    if let Some(&first) = servers.first() {
-        checks.push(run(first, good, "NOERROR with a real address", is_resolved).await);
+    for &server in servers {
+        checks.push(run(CheckKind::Canary, server, CANARY_NAME, EXPECT_BLOCKED, is_block_answer).await);
+        checks.push(run(CheckKind::Resolve, server, good, EXPECT_RESOLVED, is_resolved).await);
     }
     // No server, no check: an empty list never passes.
-    let pass = !checks.is_empty() && checks.iter().all(|c| c.pass);
+    let pass = !servers.is_empty() && checks.iter().all(|c| c.pass);
     SelfCheck { pass, checks }
 }
 
-async fn run(server: SocketAddr, name: &str, expect: &str, ok: fn(&Message) -> bool) -> Check {
+async fn run(kind: CheckKind, server: SocketAddr, name: &str, expect: &str, ok: fn(&Message) -> bool) -> Check {
     let (got, pass) = match query_a(server, name).await {
         Ok(m) => (describe(&m), ok(&m)),
         Err(e) => (format!("no answer: {e}"), false),
     };
-    Check { server: server.to_string(), name: name.to_owned(), expect: expect.to_owned(), got, pass }
+    Check { kind, server: server.to_string(), name: name.to_owned(), expect: expect.to_owned(), got, pass }
 }
 
 #[cfg(test)]
@@ -145,18 +162,20 @@ mod tests {
     async fn self_check_passes_against_a_working_proxy() {
         let up = FakeUpstream::start(false).await;
         let proxy = proxy_with("||doubleclick.net^", up.addr).await;
-        let rules = proxy.rules().read().expect("lock").clone();
-        let got = self_check(proxy.local_addrs(), rules.sample_blocked(), "example.com").await;
+        let got = self_check(proxy.local_addrs(), 1, "example.com").await;
         assert!(got.pass, "{got:?}");
-        assert_eq!(got.checks[0].name, "doubleclick.net");
+        let kinds: Vec<CheckKind> = got.checks.iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, vec![CheckKind::Canary, CheckKind::Resolve]);
+        assert_eq!(got.checks[0].name, CANARY_NAME);
         assert_eq!(got.checks[0].server, proxy.local_addr().to_string());
         assert_eq!(got.checks[0].got, "NOERROR 0.0.0.0");
         assert_eq!(got.checks[1].got, format!("NOERROR {FAKE_ANSWER}"));
+        assert_eq!(proxy.stats().top_blocked, vec![], "the canary is not a blocked domain");
         proxy.stop().await;
     }
 
     #[tokio::test]
-    async fn self_check_asks_every_listen_address_for_the_blocked_name() {
+    async fn self_check_asks_every_listen_address_for_both_names() {
         let up = FakeUpstream::start(false).await;
         let mut r = RuleSet::new();
         r.add_text("||doubleclick.net^");
@@ -166,24 +185,43 @@ mod tests {
             upstream_timeout: Duration::from_millis(500),
         };
         let proxy = Proxy::start(config, r).await.expect("start");
-        let got = self_check(proxy.local_addrs(), Some("doubleclick.net".into()), "example.com").await;
+        let got = self_check(proxy.local_addrs(), 1, "example.com").await;
         assert!(got.pass, "{got:?}");
-        let servers: Vec<&str> = got.checks.iter().map(|c| c.server.as_str()).collect();
+        let asked: Vec<(&str, CheckKind)> = got.checks.iter().map(|c| (c.server.as_str(), c.kind)).collect();
         let a = proxy.local_addrs()[0].to_string();
         let b = proxy.local_addrs()[1].to_string();
-        assert_eq!(servers, vec![a.as_str(), b.as_str(), a.as_str()], "blocked on both, good on the first");
-        assert_eq!(proxy.stats().forwarded, 1);
+        assert_eq!(
+            asked,
+            vec![
+                (a.as_str(), CheckKind::Canary),
+                (a.as_str(), CheckKind::Resolve),
+                (b.as_str(), CheckKind::Canary),
+                (b.as_str(), CheckKind::Resolve),
+            ],
+        );
+        let s = proxy.stats();
+        assert_eq!((s.blocked, s.forwarded), (0, 2), "the canary is never counted; the normal name once per listener");
         proxy.stop().await;
     }
 
     #[tokio::test]
-    async fn self_check_fails_when_the_name_is_not_blocked() {
+    async fn the_canary_passes_whatever_the_list_holds() {
+        let up = FakeUpstream::start(false).await;
+        // The real list's line that broke the old check: now never a rule.
+        let proxy = proxy_with("-tototix.gif\n||doubleclick.net^\n@@||sieve.invalid^", up.addr).await;
+        let got = self_check(proxy.local_addrs(), 1, "example.com").await;
+        assert!(got.pass, "{got:?}");
+        proxy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn self_check_fails_when_the_normal_name_does_not_resolve() {
         let up = FakeUpstream::start(false).await;
         let proxy = proxy_with("||doubleclick.net^", up.addr).await;
-        let got = self_check(proxy.local_addrs(), Some("not-blocked.example".into()), "example.com").await;
+        let got = self_check(proxy.local_addrs(), 1, "doubleclick.net").await;
         assert!(!got.pass);
-        assert!(!got.checks[0].pass);
-        assert!(got.checks[1].pass);
+        assert!(got.checks[0].pass, "canary");
+        assert!(!got.checks[1].pass, "a blocked name does not resolve");
         proxy.stop().await;
     }
 
@@ -191,14 +229,23 @@ mod tests {
     async fn self_check_fails_without_rules_or_without_a_server() {
         let up = FakeUpstream::start(false).await;
         let proxy = proxy_with("", up.addr).await;
-        let got = self_check(proxy.local_addrs(), None, "example.com").await;
+        let got = self_check(proxy.local_addrs(), 0, "example.com").await;
         assert!(!got.pass);
+        assert_eq!(got.checks[0].kind, CheckKind::Rules);
+        assert_eq!((got.checks[0].server.as_str(), got.checks[0].pass), ("", false));
+        assert!(got.checks[1..].iter().all(|c| c.pass), "the proxy itself works: {got:?}");
         let addr = proxy.local_addr();
         proxy.stop().await;
-        let gone = self_check(&[addr], Some("doubleclick.net".into()), "example.com").await;
+        let gone = self_check(&[addr], 1, "example.com").await;
         assert!(!gone.pass);
         assert!(gone.checks.iter().all(|c| c.got.starts_with("no answer")), "{gone:?}");
-        assert!(!self_check(&[], Some("doubleclick.net".into()), "example.com").await.pass, "no server never passes");
+        assert!(!self_check(&[], 1, "example.com").await.pass, "no server never passes");
+    }
+
+    #[test]
+    fn check_kinds_serialise_lower_case() {
+        let v = serde_json::to_value([CheckKind::Rules, CheckKind::Canary, CheckKind::Resolve]).expect("json");
+        assert_eq!(v, serde_json::json!(["rules", "canary", "resolve"]));
     }
 
     #[test]

@@ -31,6 +31,12 @@
 
 use std::collections::HashSet;
 
+/// The self check's test name: blocked by a built-in rule in every rule set,
+/// so the check never depends on what a list holds. `.invalid` is reserved
+/// (RFC 6761): no resolver anywhere answers it, so it can never reach a real
+/// host and no list or user rule can name anything real by it.
+pub const CANARY_NAME: &str = "selfcheck.sieve.invalid";
+
 /// What the rules say about one query name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -40,6 +46,9 @@ pub enum Verdict {
     Allow,
     /// A block rule matched and no allow rule did.
     Block,
+    /// Exactly `CANARY_NAME` (the built-in rule, which no allow rule
+    /// overrides): the block answer, never counted as a user's lookup.
+    Canary,
 }
 
 /// Rule counts as loaded (distinct rules, duplicates collapse).
@@ -154,6 +163,9 @@ impl RuleSet {
         if name.is_empty() {
             return Verdict::None;
         }
+        if name == CANARY_NAME {
+            return Verdict::Canary;
+        }
         if suffixes(&name).any(|s| self.allow_tree.contains(s)) {
             return Verdict::Allow;
         }
@@ -161,17 +173,6 @@ impl RuleSet {
             return Verdict::Block;
         }
         Verdict::None
-    }
-
-    /// A name these rules block, chosen deterministically (the smallest in
-    /// byte order), for the self check. None when nothing is blocked.
-    pub fn sample_blocked(&self) -> Option<String> {
-        self.block_tree
-            .iter()
-            .chain(self.block_exact.iter())
-            .filter(|d| self.verdict(d) == Verdict::Block)
-            .min()
-            .cloned()
     }
 }
 
@@ -385,10 +386,17 @@ mod tests {
     }
 
     #[test]
-    fn sample_blocked_is_deterministic_and_actually_blocked() {
-        let r = rules("||zz.com^\n||aa.com^\n@@||aa.com^\nmm.com");
-        assert_eq!(r.sample_blocked().as_deref(), Some("mm.com"));
-        assert_eq!(RuleSet::new().sample_blocked(), None);
+    fn the_canary_is_built_in_exact_and_wins_over_allow_rules() {
+        assert_eq!(host_name(CANARY_NAME).as_deref(), Ok(CANARY_NAME), "the canary is a host name the probe can ask for");
+        assert_eq!(RuleSet::new().verdict(CANARY_NAME), Verdict::Canary, "no list needed");
+        assert_eq!(RuleSet::new().verdict("SelfCheck.Sieve.Invalid."), Verdict::Canary);
+        let r = rules("@@||sieve.invalid^\n@@||invalid^\n||selfcheck.sieve.invalid^");
+        assert_eq!(r.verdict(CANARY_NAME), Verdict::Canary, "no rule changes the canary");
+        assert_eq!(r.verdict("a.selfcheck.sieve.invalid"), Verdict::Allow, "only the exact name is the canary");
+        let block = rules("||selfcheck.sieve.invalid^");
+        assert_eq!(block.verdict("a.selfcheck.sieve.invalid"), Verdict::Block, "only the exact name is the canary");
+        assert_eq!(RuleSet::new().verdict("other.sieve.invalid"), Verdict::None);
+        assert_eq!(RuleSet::new().counts(), RuleCounts::default(), "the built-in rule is not counted as a rule");
     }
 
     /// Not a law: parses the list file named by `SIEVE_LIST_FILE` (read

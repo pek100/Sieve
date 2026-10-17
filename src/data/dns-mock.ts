@@ -29,6 +29,8 @@ export const MOCK_LIST_URL = "https://adguardteam.github.io/AdGuardSDNSFilter/Fi
 export const MOCK_PORT_BUSY =
   "cannot listen on 127.0.0.1:53: Only one usage of each socket address (protocol/network address/port) is normally permitted. (os error 10048)";
 const BINDS = ["127.0.0.1:53", "[::1]:53"];
+/** Rust's `rules::CANARY_NAME`, the self check's test name. */
+export const MOCK_CANARY = "selfcheck.sieve.invalid";
 const MOCK_BACKUP_DIR = "C:\\Users\\<user>\\AppData\\Roaming\\app.sieve.desktop\\system-dns";
 
 /** Plausible ad and tracker domains, most blocked first (weights fall off). */
@@ -160,17 +162,16 @@ export function createMockDns(o: MockDnsOptions): DnsSource {
     },
     async selfCheck(): Promise<SelfCheck> {
       if (!running) throw new Error("DNS filter is not running");
-      // The probe queries count, as in Rust: one blocked per listen address, one forwarded.
-      counters.queries += BINDS.length + 1;
-      counters.blocked += BINDS.length;
-      counters.forwarded += 1;
-      perDomain.set(DOMAINS[0], (perDomain.get(DOMAINS[0]) ?? 0) + BINDS.length);
+      // As in Rust: the canary is answered by the filter and never counted;
+      // the normal name is a real forwarded lookup on each listen address.
+      counters.queries += BINDS.length;
+      counters.forwarded += BINDS.length;
       return {
         pass: true,
-        checks: [
-          ...BINDS.map((server) => ({ server, name: DOMAINS[0], expect: "NOERROR 0.0.0.0 (blocked)", got: "NOERROR 0.0.0.0", pass: true })),
-          { server: BINDS[0], name: "example.com", expect: "NOERROR with a real address", got: "NOERROR 192.0.2.10", pass: true },
-        ],
+        checks: BINDS.flatMap((server) => [
+          { kind: "canary" as const, server, name: MOCK_CANARY, expect: "NOERROR 0.0.0.0 (blocked)", got: "NOERROR 0.0.0.0", pass: true },
+          { kind: "resolve" as const, server, name: "example.com", expect: "NOERROR with a real address", got: "NOERROR 192.0.2.10", pass: true },
+        ]),
       };
     },
     async setPassThrough(on) {

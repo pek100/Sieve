@@ -132,7 +132,9 @@ describe("DNS controller: the filtering.dns switch", () => {
     const t = await setup("off", {}, {
       selfCheck: async () => ({
         pass: false,
-        checks: [{ server: "127.0.0.1:53", name: "doubleclick.net", expect: "NOERROR 0.0.0.0 (blocked)", got: "no answer: timed out", pass: false }],
+        checks: [
+          { kind: "canary", server: "127.0.0.1:53", name: "selfcheck.sieve.invalid", expect: "NOERROR 0.0.0.0 (blocked)", got: "no answer: timed out", pass: false },
+        ],
       }),
     });
     await t.settings.set(DNS_SWITCH, true);
@@ -141,7 +143,7 @@ describe("DNS controller: the filtering.dns switch", () => {
     expect(t.dns().status?.running).toBe(false);
     expect(t.settings.get(DNS_SWITCH)).toBe(false);
     expect(t.checks.has(DNS_SWITCH)).toBe(false);
-    expect(t.texts().at(-1)).toMatch(/DNS filtering was turned off: its self check failed \(doubleclick\.net: expected .* got no answer: timed out\)/);
+    expect(t.texts().at(-1)).toMatch(/DNS filtering was turned off: its self check failed \(selfcheck\.sieve\.invalid: expected .* got no answer: timed out\)/);
     t.undo();
   });
 

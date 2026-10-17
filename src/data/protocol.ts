@@ -218,8 +218,19 @@ export interface DnsStatus {
   top_blocked: DomainCount[];
 }
 
+/**
+ * What a check tests, as Rust's `CheckKind` (probe.rs) names it:
+ * `rules` at least one block rule is loaded (no server), `canary` the
+ * built-in test name gets the block answer, `resolve` a normal name
+ * resolves through the upstreams.
+ */
+export const CHECK_KINDS = ["rules", "canary", "resolve"] as const;
+/** `call` is never on the wire: the window's own record that the dns_self_check command itself failed. */
+export type DnsCheckKind = (typeof CHECK_KINDS)[number] | "call";
+
 export interface DnsCheck {
-  /** The listen address that was asked. */
+  kind: DnsCheckKind;
+  /** The listen address that was asked; empty for a check no listener answers (`rules`, `call`). */
   server: string;
   name: string;
   expect: string;
@@ -334,7 +345,10 @@ export function parseSelfCheck(raw: unknown): SelfCheck {
     checks: x.checks.map((c, i) => {
       const r = rec(c, `checks[${i}]`);
       const w = `checks[${i}]`;
+      const kind = CHECK_KINDS.find((k) => k === r.kind);
+      if (kind === undefined) throw new ProtocolError(`${w}.kind must be one of ${CHECK_KINDS.join(", ")}`);
       return {
+        kind,
         server: str(r.server, `${w}.server`),
         name: str(r.name, `${w}.name`),
         expect: str(r.expect, `${w}.expect`),

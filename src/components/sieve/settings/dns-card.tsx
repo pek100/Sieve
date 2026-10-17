@@ -48,9 +48,8 @@ function statusLine(phase: DnsPhase, d: DnsSlice): string {
 
 function checkLine(c: SelfCheck): string {
   if (c.pass) {
-    const blocked = c.checks.filter((x) => x.expect.includes("blocked"));
-    const name = blocked[0]?.name ?? "a listed name";
-    return `Self check passed: ${name} is blocked on ${blocked.map((x) => x.server).join(" and ")}, and a normal name resolves.`;
+    const servers = [...new Set(c.checks.filter((x) => x.kind === "canary").map((x) => x.server))];
+    return `Self check passed: the test name is blocked on ${servers.join(" and ")}, and a normal name resolves.`;
   }
   return `Self check failed: ${c.checks
     .filter((x) => !x.pass)
