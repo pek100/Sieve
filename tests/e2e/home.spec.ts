@@ -74,7 +74,7 @@ test.describe("home", () => {
     expect(errors).toEqual([]);
   });
 
-  test("at 960x800 the grid is two columns", async ({ page }, info) => {
+  test("at 960x800 the grid is the same two columns, 8 and 4", async ({ page }, info) => {
     test.skip(info.project.name !== "desktop", "desktop project resizes to 960");
     await page.setViewportSize({ width: 960, height: 800 });
     await openHome(page);
@@ -83,10 +83,12 @@ test.describe("home", () => {
     const kpis = (await r.kpis.boundingBox())!;
     const top = (await r.top.boundingBox())!;
     const chart = (await r.chart.boundingBox())!;
-    // KPI block and top apps share a row, side by side, each about half the width.
-    expect(Math.abs(kpis.y - top.y)).toBeLessThan(2);
-    expect(top.x).toBeGreaterThan(kpis.x + kpis.width);
-    expect(Math.abs(kpis.width - top.width)).toBeLessThan(2);
+    const heat = (await r.heat.boundingBox())!;
+    // The KPI block beside the chart, top apps beside the heatmap, on one split line.
+    expect(Math.abs(kpis.y - chart.y)).toBeLessThan(2);
+    expect(Math.abs(top.y - heat.y)).toBeLessThan(2);
+    expect(Math.abs(kpis.x - top.x)).toBeLessThan(2);
+    expect(kpis.x).toBeGreaterThan(chart.x + chart.width);
     expect(chart.width).toBeGreaterThan(kpis.width * 1.9);
     const sw = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     expect(sw).toBeLessThanOrEqual(0);

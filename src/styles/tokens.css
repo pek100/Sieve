@@ -31,6 +31,11 @@
   --page-pad: 24px;
   --page-header-h: 64px;
   --gutter: 24px;
+  /* A section header row (title, icon, action) and the KPI label rows beside it share this height,
+     so their text sits on one line. The chart's time axis row is the space the KPI block keeps
+     under it, so the KPI block ends on the plot's bottom edge. */
+  --section-header-h: 40px;
+  --chart-axis-h: 24px;
   --row-h: 44px;
   --row-h-compact: 36px;
 

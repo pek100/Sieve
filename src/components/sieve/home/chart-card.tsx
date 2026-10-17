@@ -29,14 +29,14 @@ export function ChartLegend({
         const on = !hidden.has(s.key);
         const tone = seriesTone(s.slot);
         return (
-          <li key={s.key}>
+          <li key={s.key} className="max-w-full min-w-0">
             <button
               type="button"
               aria-pressed={on}
               title={on ? `Hide ${s.name}` : `Show ${s.name}`}
               onClick={() => onToggle(s.key)}
               className={cn(
-                "relative inline-flex h-7 max-w-40 items-center gap-2 overflow-hidden rounded-full bg-surface-2 px-3 text-label transition-colors duration-(--motion-fast) ease-standard",
+                "relative inline-flex h-7 max-w-full items-center gap-2 overflow-hidden rounded-full bg-surface-2 px-3 text-label transition-colors duration-(--motion-fast) ease-standard",
                 on ? "text-on-surface" : "text-on-surface-faint",
               )}
             >

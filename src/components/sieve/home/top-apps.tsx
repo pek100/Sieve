@@ -65,7 +65,7 @@ export function TopApps({ slots, base, className }: { slots: Readonly<Record<str
                     />
                   </span>
                 </div>
-                <span className="w-16 shrink-0 text-right text-label text-on-surface-muted tabular">
+                <span data-count="" className="w-16 shrink-0 text-right text-label text-on-surface-muted tabular">
                   {a.count} <span className="sr-only">active connections</span>
                 </span>
               </li>

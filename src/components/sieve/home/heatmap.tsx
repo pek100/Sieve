@@ -51,13 +51,15 @@ export function Heatmap({
           >
             {WEEKDAYS.map((d, day) => (
               <div key={d} className="contents">
-                <span aria-hidden="true" className="flex items-center pr-2 text-caption text-on-surface-faint">
+                <span aria-hidden="true" data-day-label="" className="flex items-center pr-2 text-caption text-on-surface-faint">
                   {d}
                 </span>
                 {grid.cells.slice(day * 24, day * 24 + 24).map((c) => (
                   <span
                     key={c.hour}
                     data-step={c.step}
+                    data-day={day}
+                    data-hour={c.hour}
                     title={describe(c)}
                     onPointerEnter={(e) => {
                       const el = e.currentTarget;
@@ -70,7 +72,7 @@ export function Heatmap({
             ))}
             <span aria-hidden="true" />
             {Array.from({ length: 24 }, (_, h) => (
-              <span key={h} aria-hidden="true" className="text-caption text-on-surface-faint tabular">
+              <span key={h} aria-hidden="true" data-hour-label={h % 6 === 0 ? h : undefined} className="text-caption text-on-surface-faint tabular">
                 {h % 6 === 0 ? h : ""}
               </span>
             ))}

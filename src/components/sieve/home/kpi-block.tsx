@@ -49,8 +49,8 @@ function Tile({ id, kpi, phase }: { id: KpiId; kpi: Kpi | null; phase: "loading"
   const copy = KPI_COPY[id];
   const accent = copy.tone === "mint";
   return (
-    <section aria-label={copy.label} data-kpi={id} data-accent={accent ? "" : undefined} className="flex min-w-0 flex-col gap-1 text-on-surface">
-      <p className="flex items-center gap-2 text-label text-on-surface-muted">
+    <section aria-label={copy.label} data-kpi={id} data-accent={accent ? "" : undefined} className="flex min-w-0 flex-col text-on-surface">
+      <p data-kpi-label="" className="flex h-(--section-header-h) items-center gap-2 text-label text-on-surface-muted">
         <SectionIcon size={16} tone={copy.tone}>
           {copy.icon}
         </SectionIcon>
@@ -88,8 +88,8 @@ function BlockedTile() {
   const lookups = dns.status?.counters.queries ?? 0;
   const label = on ? "Blocked lookups" : "DNS filter";
   return (
-    <section aria-label={label} data-kpi="blocked" data-dns-derived="" className="flex min-w-0 flex-col gap-1 text-on-surface">
-      <p className="flex items-center gap-2 text-label text-on-surface-muted">
+    <section aria-label={label} data-kpi="blocked" data-dns-derived="" className="flex min-w-0 flex-col text-on-surface">
+      <p data-kpi-label="" className="flex h-(--section-header-h) items-center gap-2 text-label text-on-surface-muted">
         <SectionIcon size={16}>{on ? <ShieldCheck strokeWidth={1.75} /> : <ShieldOff strokeWidth={1.75} />}</SectionIcon>
         {label}
       </p>
@@ -122,7 +122,17 @@ export function KpiBlock({ kpis, phase, className }: { kpis: Kpi[] | null; phase
   const byId = new Map((kpis ?? []).map((k) => [k.id, k]));
   return (
     <CardBoundary title="Right now">
-      <div aria-label="Right now" role="group" className={cn("grid h-full grid-cols-2 content-start gap-x-6 gap-y-8 pt-2", className)}>
+      <div
+        aria-label="Right now"
+        role="group"
+        className={cn(
+          // Beside the chart (960 up) the block runs from the chart header's top to the plot's bottom:
+          // the label rows match the header height, the second row sits on the bottom, and the
+          // block keeps the chart's time axis row free under it.
+          "grid h-full grid-cols-2 content-start gap-x-(--gutter) gap-y-6 two:content-between two:pb-(--chart-axis-h)",
+          className,
+        )}
+      >
         {(Object.keys(KPI_COPY) as KpiId[]).map((id) => (
           <Tile key={id} id={id} kpi={byId.get(id) ?? null} phase={phase} />
         ))}

@@ -147,9 +147,9 @@ export function ActivityChart({
     .join(", ");
 
   return (
-    <div className={cn("flex min-h-0 flex-col gap-2", className)}>
+    <div className={cn("flex min-h-0 flex-col", className)}>
       <div
-        className="relative min-h-0 flex-1 overflow-hidden border-b border-outline"
+        className="relative min-h-0 flex-1 overflow-hidden"
         onPointerMove={(e) => {
           const r = e.currentTarget.getBoundingClientRect();
           pointer.current = { x: e.clientX, y: e.clientY };
@@ -164,12 +164,13 @@ export function ActivityChart({
         }}
         onPointerLeave={() => setHoverF(null)}
       >
-        {/* Grid lines and y labels */}
+        {/* Grid lines and y labels; the zero line is the plot's bottom edge (drawn, not a border, so the plot ends exactly there). */}
         {[0.5, 1].map((g) => (
-          <div key={g} aria-hidden="true" className="pointer-events-none absolute inset-x-0 border-t border-outline/60" style={{ top: `${(1 - g) * 100}%` }}>
+          <div key={g} aria-hidden="true" className="pointer-events-none absolute inset-x-0 h-px bg-outline/60" style={{ top: `${(1 - g) * 100}%` }}>
             <span className="absolute top-1 left-2 text-caption text-on-surface-faint tabular">{fmt1(yMax * g)}</span>
           </div>
         ))}
+        <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-outline" />
         <svg
           ref={svgRef}
           role="img"
@@ -245,7 +246,7 @@ export function ActivityChart({
           </>
         )}
       </div>
-      <div aria-hidden="true" className="flex justify-between text-caption text-on-surface-faint tabular">
+      <div aria-hidden="true" className="flex h-(--chart-axis-h) shrink-0 items-end justify-between text-caption text-on-surface-faint tabular">
         <span>{clock(lastT - model.windowMs, false, model.windowMs)}</span>
         <span>Now</span>
       </div>
