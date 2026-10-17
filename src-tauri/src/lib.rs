@@ -3,6 +3,7 @@
 //! no writes to system state.
 
 pub mod commands;
+pub mod dns;
 pub mod netstat;
 pub mod protocol;
 
