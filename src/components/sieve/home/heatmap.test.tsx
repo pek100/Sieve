@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { heatGrid, type HeatGrid } from "@/core/heat";
@@ -136,6 +136,36 @@ describe("heatmap cells", () => {
       const slot = grid.series[i].slot;
       expect(li.querySelector("span")!.className).toContain(slot === 0 ? "bg-series-other" : `bg-series-${slot}`);
     });
+  });
+
+  it("measures the plot that mounts after loading, so cells land on the label grid (bug: it kept the fallback scale)", async () => {
+    const grid = await mockGrid();
+    const observed: { el: Element; cb: ResizeObserverCallback }[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(private cb: ResizeObserverCallback) {}
+        observe(el: Element) {
+          observed.push({ el, cb: this.cb });
+        }
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    try {
+      const { container, rerender } = render(<Heatmap grid={null} caption="" base={{ kind: "loading" }} />);
+      rerender(<Heatmap grid={grid} caption="Last 4 weeks" base={{ kind: "ready" }} />);
+      expect(observed).toHaveLength(1);
+      act(() => observed[0].cb([{ contentRect: { width: 777, height: 196 } } as ResizeObserverEntry], {} as ResizeObserver));
+      expect(plot(container).getAttribute("viewBox")).toBe("0 0 777 196");
+      // Hour 18's left edge is the CSS grid's column 18 start (4 px gaps), rounded.
+      const cw = (777 - 23 * 4) / 24;
+      expect(cellBox(6, 18, 777, 196).x).toBe(Math.round(18 * (cw + 4)));
+      const track = plot(container).querySelector('g[data-day="6"][data-hour="18"] rect')!;
+      expect(Number(track.getAttribute("x"))).toBe(Math.round(18 * (cw + 4)));
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("no history: says so, draws no map", () => {

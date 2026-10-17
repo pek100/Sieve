@@ -1,7 +1,7 @@
 "use client";
 
 import { CalendarDays } from "lucide-react";
-import { useLayoutEffect, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent, type RefObject } from "react";
+import { useLayoutEffect, useMemo, useState, type FocusEvent, type KeyboardEvent } from "react";
 import { FloatingTooltip } from "@/components/sieve/primitives/floating-tooltip";
 import { Card, type CardState } from "@/components/sieve/shell/card";
 import { HEAT_GAP_PX, heatStack, sharePercents, WEEKDAYS, type HeatCell, type HeatGrid } from "@/core/heat";
@@ -86,11 +86,16 @@ export function moveCell(index: number, [dh, dd]: readonly [number, number]): nu
   return day * 24 + hour;
 }
 
-/** The element's content size, kept current by a ResizeObserver; null until measured. */
-function useSize(ref: RefObject<HTMLElement | null>): { w: number; h: number } | null {
+/**
+ * The content size of `el`, kept current by a ResizeObserver; null until
+ * measured. Takes the element itself (from a callback ref), not a ref object:
+ * the plot mounts after the card's loading state, and an effect keyed on a
+ * ref object never saw it (the map drew at the fallback scale, 1 px off the
+ * hour labels by 18:00).
+ */
+function useSize(el: HTMLElement | null): { w: number; h: number } | null {
   const [size, setSize] = useState<{ w: number; h: number } | null>(null);
   useLayoutEffect(() => {
-    const el = ref.current;
     if (!el || typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver((entries) => {
       const r = entries[0]?.contentRect;
@@ -99,7 +104,7 @@ function useSize(ref: RefObject<HTMLElement | null>): { w: number; h: number } |
     });
     ro.observe(el);
     return () => ro.disconnect();
-  }, [ref]);
+  }, [el]);
   return size;
 }
 
@@ -221,8 +226,8 @@ export function Heatmap({
   base: CardState;
   className?: string;
 }) {
-  const plotRef = useRef<HTMLDivElement>(null);
-  const measured = useSize(plotRef);
+  const [plotEl, setPlotEl] = useState<HTMLDivElement | null>(null);
+  const measured = useSize(plotEl);
   const { w, h } = measured ?? FALLBACK;
   const [hover, setHover] = useState<Tip | null>(null);
   // Keyboard: the cell holding the tab stop, and the focused one (its tooltip sits beside it).
@@ -276,7 +281,7 @@ export function Heatmap({
               </span>
             ))}
             {/* The plot spans the 24 hour columns and 7 day rows; the SVG draws the cells on those same lines. */}
-            <div ref={plotRef} style={{ gridColumn: "2 / -1", gridRow: "1 / 8" }} className="relative min-h-0 min-w-0">
+            <div ref={setPlotEl} style={{ gridColumn: "2 / -1", gridRow: "1 / 8" }} className="relative min-h-0 min-w-0">
               <svg
                 role="group"
                 aria-label={`Connections by app, weekday and hour, ${caption.toLowerCase()}.${busiest ? ` Busiest: ${WEEKDAYS[busiest.day]} ${hh(busiest.hour)}.` : ""} Arrow keys move between hours and days.`}
