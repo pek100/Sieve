@@ -3,18 +3,33 @@
 //!
 //! - `rules`: the filter-list syntax and the O(labels) matcher.
 //! - `lists`: the downloaded list, its 24 h cache, and the user's rules.
+//! - `proxy`: the UDP and TCP server, block answers, forwarding, counters.
+//! - `probe`: a plain UDP client; the self check and the live test use it.
+//! - `status`: the versioned `dns_status` wire shape.
 //!
 //! Nothing here changes Windows DNS settings. Pointing the system at the
 //! proxy is phase B, behind the `filtering.dns` data switch.
 
 pub mod lists;
+pub mod probe;
+pub mod proxy;
 pub mod rules;
+pub mod status;
 
+use std::net::SocketAddr;
 use std::path::Path;
 
 /// Errors of the DNS engine; strings only at the command boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum DnsError {
+    #[error("cannot listen on {addr}: {source}")]
+    Bind {
+        addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("config: {0}")]
+    Config(String),
     #[error("{path}: {source}")]
     Io {
         path: String,
