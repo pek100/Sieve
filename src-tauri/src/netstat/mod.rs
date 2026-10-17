@@ -36,12 +36,22 @@ pub fn snapshot() -> Result<Snapshot, NetstatError> {
         let buf = tables::read_table(kind)?;
         flows.extend(decode::decode_table(kind, &buf)?);
     }
-    Ok(assemble(t, flows, |pid| process::describe(pid, process::exe_path, process::product_name)))
+    // One service list per snapshot: a hidden exe is named by the services it hosts.
+    let services = process::service_names();
+    let service_of = process::service_lookup(&services);
+    Ok(assemble(t, flows, |pid| process::describe(pid, process::exe_path, process::product_name, &service_of)))
 }
 
+/// The System Idle Process. It owns no socket: rows under it are closed
+/// connections waiting out TIME_WAIT after their process let go, so they are
+/// not an app and not a connection anyone holds.
+pub const IDLE_PID: u32 = 0;
+
 /// Build the snapshot: one process entry per distinct pid that owns a flow,
-/// sorted by pid. `describe` is the per-pid lookup (injected for tests).
-pub fn assemble(t: u64, flows: Vec<Flow>, describe: impl Fn(u32) -> ProcessInfo) -> Snapshot {
+/// sorted by pid, without the System Idle Process's rows (IDLE_PID).
+/// `describe` is the per-pid lookup (injected for tests).
+pub fn assemble(t: u64, mut flows: Vec<Flow>, describe: impl Fn(u32) -> ProcessInfo) -> Snapshot {
+    flows.retain(|f| f.pid != IDLE_PID);
     let mut pids: Vec<u32> = flows.iter().map(|f| f.pid).collect();
     pids.sort_unstable();
     pids.dedup();
@@ -74,7 +84,7 @@ mod tests {
     #[test]
     fn assemble_lists_each_owning_pid_once_in_order() {
         let snap = assemble(1_792_224_000_000, vec![flow(9120, 1), flow(4, 2), flow(9120, 3)], |pid| {
-            process::describe(pid, |_| None, |_| None)
+            process::describe(pid, |_| None, |_| None, |_| None)
         });
         assert_eq!(snap.v, PROTOCOL_VERSION);
         assert_eq!(snap.t, 1_792_224_000_000);
@@ -87,13 +97,24 @@ mod tests {
 
     #[test]
     fn assembled_snapshot_serialises_to_protocol_v1() {
-        let snap = assemble(5, vec![flow(4, 53)], |pid| process::describe(pid, |_| None, |_| None));
+        let snap = assemble(5, vec![flow(4, 53)], |pid| process::describe(pid, |_| None, |_| None, |_| None));
         let json = serde_json::to_value(&snap).expect("serialises");
         assert_eq!(json["v"], 1);
         assert_eq!(json["processes"][0]["exe"], serde_json::Value::Null);
         assert_eq!(json["flows"][0]["state"], "none");
         let back: Snapshot = serde_json::from_value(json).expect("deserialises");
         assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn the_system_idle_process_is_not_an_app_and_its_rows_are_not_counted() {
+        let snap = assemble(5, vec![flow(0, 1), flow(0, 2), flow(9120, 3)], |pid| {
+            assert_ne!(pid, IDLE_PID, "pid 0 is never described");
+            process::describe(pid, |_| None, |_| None, |_| None)
+        });
+        assert_eq!(snap.processes.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![9120]);
+        assert_eq!(snap.flows.len(), 1);
+        assert!(snap.flows.iter().all(|f| f.pid != IDLE_PID));
     }
 
     #[test]
@@ -128,14 +149,17 @@ mod tests {
         let exe = exe.to_string_lossy();
         let got = me.exe.as_deref().expect("own exe path is readable");
         assert!(got.eq_ignore_ascii_case(&exe), "exe {got} != {exe}");
-        assert_eq!(me.name, process::label(pid, Some(&exe)));
+        assert_eq!(me.name, process::label(pid, Some(&exe), None));
+        assert!(snap.processes.iter().all(|p| p.pid != IDLE_PID), "no System idle rows");
 
         let hidden = snap.processes.iter().filter(|p| p.exe.is_none()).count();
+        let unnamed = snap.processes.iter().filter(|p| p.name.starts_with("pid ")).count();
         eprintln!(
-            "live snapshot: {} flows, {} processes, {} without a readable exe",
+            "live snapshot: {} flows, {} processes, {} without a readable exe, {} of those still 'pid <n>' (no service)",
             snap.flows.len(),
             snap.processes.len(),
-            hidden
+            hidden,
+            unnamed
         );
         drop(listener);
     }

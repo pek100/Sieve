@@ -35,7 +35,9 @@ reqwest = { version = "0.13", default-features = false, features = ["native-tls"
 tempfile = "3"
 
 # Windows calls. Read only: the IP Helper owner-pid tables, process image
-# names and file version info (slice S1); adapter DNS servers
+# names and file version info (slice S1); the service list, for the
+# service names of a process whose exe Windows hides (EnumServicesStatusExW
+# with SC_MANAGER_ENUMERATE_SERVICE, no admin); adapter DNS servers
 # (GetAdaptersAddresses), the Tcpip NameServer registry values and the process
 # list (sysdns). The one write: sysdns runs one PowerShell script elevated
 # (ShellExecuteExW "runas", the user approves the UAC prompt).
@@ -48,6 +50,7 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Registry",
+    "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
