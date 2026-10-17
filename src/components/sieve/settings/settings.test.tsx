@@ -9,6 +9,7 @@ import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { NoticeToaster } from "@/components/sieve/shell/notice-toaster";
+import { DNS_CARD_KEYS } from "./dns-card";
 import { SettingsScreen } from "./settings-screen";
 
 vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
@@ -31,10 +32,16 @@ async function setup(stored?: unknown) {
 const row = (key: string) => document.querySelector<HTMLElement>(`[data-setting="${key}"]`)!;
 
 describe("settings view (rendered from the registry)", () => {
-  it("shows one row per registry key under its section, and the rail lists the sections in order", async () => {
+  it("shows one row per registry key under its section (the DNS card's own keys only there), and the rail lists the sections in order", async () => {
     await setup();
     for (const key of SETTING_KEYS) {
       const r = row(key);
+      if (DNS_CARD_KEYS.has(key)) {
+        // One owner on screen: the DNS filter section edits it, no row repeats it.
+        expect(r, key).toBeNull();
+        expect(screen.getAllByText(settingDef(key).label)).toHaveLength(1);
+        continue;
+      }
       expect(r, key).not.toBeNull();
       expect(r).toHaveTextContent(settingDef(key).label);
     }
@@ -125,7 +132,7 @@ describe("settings view (rendered from the registry)", () => {
     fireEvent.change(search, { target: { value: "zzz" } });
     expect(screen.getByText("No setting matches")).toBeInTheDocument();
     fireEvent.keyDown(search, { key: "Escape" });
-    expect(document.querySelectorAll("[data-setting]")).toHaveLength(SETTING_KEYS.length);
+    expect(document.querySelectorAll("[data-setting]")).toHaveLength(SETTING_KEYS.length - DNS_CARD_KEYS.size);
   });
 
   it("import previews every change before applying, never turns a data switch on, and undo restores", async () => {

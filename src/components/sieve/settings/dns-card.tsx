@@ -8,10 +8,17 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { blockRate, dnsPhase, DNS_SWITCH, isUpstream, SYSTEM_DNS_SWITCH, UPSTREAMS_KEY, type DnsPhase, type DnsSlice } from "@/core/dns";
+import type { SettingKey } from "@/core/settings/registry";
 import type { FamilyDns, InterfaceDns, SelfCheck } from "@/data/protocol";
 import { useCheckPassed, useDns, useDnsActions, useSetting } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
 import type { Lock } from "./use-settings-view";
+
+/**
+ * Settings this card edits in place (the upstream list). The Settings screen
+ * gives them no row of their own, so each one has a single owner on screen.
+ */
+export const DNS_CARD_KEYS: ReadonlySet<SettingKey> = new Set<SettingKey>([UPSTREAMS_KEY]);
 
 /** How many blocked domains the card lists (Rust keeps 20). */
 const TOP_SHOWN = 10;

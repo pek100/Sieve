@@ -21,18 +21,18 @@ test.describe("settings", () => {
     await expect(page.getByRole("link", { name: "Settings" })).toHaveAttribute("aria-current", "page");
     const rail = page.getByRole("navigation", { name: "Settings sections" });
     await expect(rail.getByRole("link")).toHaveText(["Appearance", "Sampling", "Startup", "Apps", "Filtering"]);
-    // Nine registry keys: theme, sieving, interval, launch at startup, apps turned off, my apps,
-    // DNS filtering, upstreams, Windows uses Sieve.
-    await expect(page.locator("[data-setting]")).toHaveCount(9);
+    // Eight rows: theme, sieving, interval, launch at startup, apps turned off, my apps, DNS filtering,
+    // Windows uses Sieve. The upstream servers are edited in the DNS filter section only (one owner).
+    await expect(page.locator("[data-setting]")).toHaveCount(8);
+    await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(1);
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
 
     if (info.project.name === "desktop") {
-      // Rail on the left, a column of about 720 px beside it.
+      // Rail on the left (3 grid columns), the content beside it (9 columns; alignment.spec.ts checks the lines).
       const r = (await rail.boundingBox())!;
       const col = (await page.getByRole("region", { name: "Appearance" }).boundingBox())!;
       expect(r.x + r.width).toBeLessThanOrEqual(col.x);
-      expect(col.width).toBeLessThanOrEqual(721);
-      expect(col.width).toBeGreaterThan(600);
+      expect(col.width).toBeGreaterThan(r.width * 2.5);
     } else {
       // One column: the rail wraps above the cards.
       const r = (await rail.boundingBox())!;
