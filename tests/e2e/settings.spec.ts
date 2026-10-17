@@ -58,6 +58,25 @@ test.describe("settings", () => {
     await systemDns.screenshot({ path: `test-results/screens/settings-locked-${info.project.name}.png` });
   });
 
+  test("every section ends at its content: the last one (Filtering, then the DNS filter) is not stretched", async ({ page }) => {
+    await openSettings(page);
+    const gaps = await page.evaluate(() =>
+      [...document.querySelectorAll<HTMLElement>("main [id^='section-'] > section, main [id^='section-'] > div > section")].map((s) => {
+        const own = s.getBoundingClientRect();
+        let content = own.top;
+        // Leaves only: a wrapper stretched with the section would hide the gap.
+        for (const d of s.querySelectorAll("*")) if (d.childElementCount === 0) content = Math.max(content, d.getBoundingClientRect().bottom);
+        return { name: s.getAttribute("aria-label"), height: own.height, gap: own.bottom - content };
+      }),
+    );
+    // Five registry sections plus the DNS filter.
+    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "DNS filter"]);
+    // Was 686 px of empty space under Filtering's rows: its card took the height of the
+    // wrapper that also holds the DNS filter (Card h-full).
+    // Allowed: a row's own bottom padding (16) and at most a section's padding.
+    for (const g of gaps) expect(g.gap, `${g.name} ends ${g.gap}px below its content`).toBeLessThanOrEqual(40);
+  });
+
   test("search narrows the rows; a change persists across a reload", async ({ page }) => {
     await openSettings(page);
     await page.getByRole("searchbox", { name: "Search settings" }).fill("theme");

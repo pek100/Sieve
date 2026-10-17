@@ -42,7 +42,9 @@ export function Card({
       aria-label={title}
       aria-busy={state.kind === "loading" || undefined}
       className={cn(
-        "flex h-full min-w-0 flex-col gap-4 rounded-lg bg-surface-1 text-on-surface shadow-l1",
+        // No h-full here: a Settings section wraps its card and the DNS card in one div, and a
+        // full-height card took that div's height (its own plus the DNS card's). Home passes h-full.
+        "flex min-w-0 flex-col gap-4 rounded-lg bg-surface-1 text-on-surface shadow-l1",
         dense ? "p-4" : "p-5",
         className,
       )}

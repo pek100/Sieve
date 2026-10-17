@@ -76,16 +76,17 @@ export function HomeScreen() {
     <Page title="Sieving now" action={<PausePill />} notice={<HomeBanner />} fill>
       <BentoGrid className="three:min-h-[34rem] three:flex-1 three:grid-rows-[repeat(2,minmax(0,1fr))]">
         <BentoItem span="two-thirds" className="min-h-0">
-          <ChartCard model={model} choice={choice} onChoice={setChoice} base={chartBase} />
+          <ChartCard model={model} choice={choice} onChoice={setChoice} base={chartBase} className="h-full" />
         </BentoItem>
         <BentoItem span="third" className="min-h-0">
           <KpiBlock kpis={kpis} phase={kpiPhase} />
         </BentoItem>
         <BentoItem span="third" className="min-h-0">
-          <TopApps slots={liveModel.slots} base={base} />
+          <TopApps slots={liveModel.slots} base={base} className="h-full" />
         </BentoItem>
         <BentoItem span="two-thirds" className="min-h-0">
           <Heatmap
+            className="h-full"
             grid={heat.kind === "ready" ? heat.grid : null}
             caption={heat.kind === "ready" ? heat.caption : ""}
             base={heatBase}
