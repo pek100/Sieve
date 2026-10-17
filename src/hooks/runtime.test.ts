@@ -4,7 +4,7 @@ import type { Desktop } from "@/data/desktop";
 import { createMockSource } from "@/data/mock-source";
 import type { Clock } from "@/data/poller";
 import { memoryBackend } from "@/data/settings-store";
-import { bindDesktop, createRuntime } from "./runtime";
+import { bindDesktop, bindSampling, createRuntime } from "./runtime";
 
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
 /** Timers never fire: only explicit poller calls change the status. */
@@ -106,5 +106,57 @@ describe("desktop binding: launch at startup", () => {
     const rt = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend() });
     expect(rt.desktop).toBeNull();
     expect(() => bindDesktop(rt)()).not.toThrow();
+  });
+});
+
+describe("sampling binding: the poller follows sampling.enabled and sampling.intervalMs", () => {
+  function sampling(stored?: unknown) {
+    const rt = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(stored), clock: still });
+    const undo = bindSampling(rt);
+    return { rt, undo, status: () => rt.store.getState().status };
+  }
+
+  it("nothing starts before the settings load; then the stored values are applied", async () => {
+    const { rt, status } = sampling({ schema: 1, values: { "sampling.intervalMs": 5000 } });
+    expect(status().running).toBe(false);
+    await rt.settings.ready;
+    await flush();
+    expect(status().running).toBe(true);
+    expect(rt.store.getState().intervalMs).toBe(5000);
+  });
+
+  it("stored off stays off; turning it on starts, turning it off stops", async () => {
+    const { rt, status } = sampling({ schema: 1, values: { "sampling.enabled": false } });
+    await rt.settings.ready;
+    await flush();
+    expect(status().running).toBe(false);
+    await rt.settings.set("sampling.enabled", true);
+    expect(status().running).toBe(true);
+    await rt.settings.set("sampling.enabled", false);
+    expect(status()).toMatchObject({ running: false, pausedUntil: null });
+  });
+
+  it("a new interval changes the cadence without restarting, and an unrelated change keeps a pause", async () => {
+    const { rt, status } = sampling();
+    await rt.settings.ready;
+    await flush();
+    rt.poller.pauseFor(5);
+    await rt.settings.set("sampling.intervalMs", 2000);
+    expect(rt.store.getState().intervalMs).toBe(2000);
+    await rt.settings.set("appearance.theme", "light");
+    expect(status().pausedUntil).toBe(1_000_000 + 5 * 60_000);
+  });
+
+  it("the undo stops the poller and later setting changes are ignored", async () => {
+    const { rt, undo, status } = sampling();
+    await rt.settings.ready;
+    await flush();
+    undo();
+    expect(status().running).toBe(false);
+    await rt.settings.set("sampling.intervalMs", 2000);
+    await rt.settings.set("sampling.enabled", false);
+    await rt.settings.set("sampling.enabled", true);
+    expect(status().running).toBe(false);
+    expect(rt.store.getState().intervalMs).toBe(1000);
   });
 });

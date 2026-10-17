@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { SECTIONS, SETTING_KEYS, settingDef } from "@/core/settings/registry";
 import { EXPORT_KIND } from "@/core/settings/transfer";
+import type { Desktop } from "@/data/desktop";
 import { createMockSource } from "@/data/mock-source";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
@@ -58,6 +59,38 @@ describe("settings view (rendered from the registry)", () => {
     const r = row("startup.launchAtLogin");
     expect(within(r).getByRole("switch")).toBeDisabled();
     expect(r.querySelector("[data-lock=desktop]")).toBeInTheDocument();
+  });
+
+  it("in the desktop app, launch at startup is a live switch that the OS entry follows", async () => {
+    const autostart: boolean[] = [];
+    const desktop: Desktop = {
+      setTray: async () => {},
+      onTrayAction: async () => () => {},
+      autostart: { isEnabled: async () => autostart.at(-1) ?? false, set: async (on) => void autostart.push(on) },
+    };
+    const rt = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(), isTauri: true, desktop });
+    render(
+      <SieveProvider runtime={rt}>
+        <SettingsScreen />
+      </SieveProvider>,
+    );
+    await act(async () => {
+      await rt.settings.ready;
+    });
+    const r = row("startup.launchAtLogin");
+    const sw = within(r).getByRole("switch");
+    expect(sw).toBeEnabled();
+    expect(sw).not.toBeChecked();
+    expect(r.querySelector("[data-lock]")).toBeNull();
+    // Default off and the OS entry is off: nothing is written.
+    expect(autostart).toEqual([]);
+
+    await userEvent.click(sw);
+    expect(rt.settings.get("startup.launchAtLogin")).toBe(true);
+    await vi.waitFor(() => expect(autostart).toEqual([true]));
+    expect(within(row("startup.launchAtLogin")).getByRole("switch")).toBeChecked();
+    // A data switch stays locked in the desktop app too: only a passed live check unlocks it.
+    expect(within(row("filtering.dns")).getByRole("switch")).toBeDisabled();
   });
 
   it("changing a control writes the setting", async () => {

@@ -5,6 +5,8 @@
  */
 import { describe, expect, it } from "vitest";
 import { GRAINS } from "@/core/history";
+import { parseTrayAction } from "@/core/tray";
+import { TRAY_EVENT } from "@/data/desktop";
 import historyFixture from "@/data/fixtures/history-v1.json";
 import fixture from "@/data/fixtures/snapshot-v1.json";
 import { FLOW_STATES, PROTOCOL_VERSION, parseHistory, parseSnapshot, ProtocolError } from "@/data/protocol";
@@ -45,6 +47,19 @@ describe("protocol law", () => {
     expect(arr("GRAIN_NAMES")).toEqual(GRAINS.map((g) => g.name));
     expect(arr("GRAIN_MS")).toEqual(GRAINS.map((g) => g.ms));
     expect(arr("GRAIN_KEEP_MS")).toEqual(GRAINS.map((g) => g.keepMs));
+  });
+
+  it("the tray speaks the same event name and actions as src-tauri/src/tray.rs", () => {
+    const tray = read("src-tauri/src/tray.rs");
+    expect(tray.match(/pub const TRAY_EVENT: &str = "([^"]+)";/)?.[1]).toBe(TRAY_EVENT);
+    const minutes = Number(tray.match(/pub const TRAY_PAUSE_MINUTES: u32 = (\d+);/)?.[1]);
+    const ids = [...(tray.match(/pub const MENU: [^=]+= \[([\s\S]*?)\];/)?.[1] ?? "").matchAll(/\("([a-z_]+)", "([^"]+)"\)/g)];
+    // What Rust emits for its Pause and Resume items (serde tag "kind", snake_case) is what the window accepts.
+    expect(parseTrayAction({ kind: "pause", minutes })).toEqual({ kind: "pause", minutes });
+    expect(parseTrayAction({ kind: "resume" })).toEqual({ kind: "resume" });
+    expect(ids.map((m) => m[1])).toEqual(["pause", "resume", "open", "quit"]);
+    // The Pause item's label states the same minutes it sends.
+    expect(ids[0][2]).toBe(`Pause ${minutes} min`);
   });
 
   it("rejects a snapshot from another version or with a broken flow", () => {
