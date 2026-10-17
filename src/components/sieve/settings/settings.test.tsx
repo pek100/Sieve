@@ -44,14 +44,31 @@ describe("settings view (rendered from the registry)", () => {
     );
   });
 
-  it("a data switch is a locked, disabled switch that names its live check, and the value in force is off", async () => {
-    await setup({ schema: 1, values: { "filtering.dns": true } });
-    const dns = row("filtering.dns");
-    const sw = within(dns).getByRole("switch");
+  it("per-app filtering is a locked switch that says why it cannot exist here, and the value in force is off", async () => {
+    await setup({ schema: 1, values: { "filtering.perApp": true } });
+    const perApp = row("filtering.perApp");
+    const sw = within(perApp).getByRole("switch");
     expect(sw).toBeDisabled();
     expect(sw).not.toBeChecked();
-    expect(dns.querySelector("[data-lock=liveCheck]")).toHaveTextContent(/live_dns_filter_resolves_blocked_domain/);
-    expect(dns).toHaveTextContent(/Needed by the sieve level for apps/);
+    const lock = perApp.querySelector("[data-lock=unavailable]");
+    expect(lock).toHaveTextContent(/network driver/);
+    expect(lock).toHaveTextContent(/live_per_app_filter_blocks_one_app/);
+    expect(perApp).toHaveTextContent(/Needed by the sieve level for apps/);
+  });
+
+  it("DNS filtering is a live switch: on starts the filter and records its passed self check", async () => {
+    const rt = await setup();
+    const dns = row("filtering.dns");
+    expect(dns.querySelector("[data-lock]")).toBeNull();
+    expect(dns).toHaveTextContent(/every app on this computer/);
+    // Pointing Windows waits for DNS filtering.
+    expect(within(row("filtering.systemDns")).getByRole("switch")).toBeDisabled();
+    expect(row("filtering.systemDns").querySelector("[data-lock=requires]")).toHaveTextContent("Needs DNS filtering, which is off.");
+    await userEvent.click(within(dns).getByRole("switch"));
+    await vi.waitFor(() => expect(rt.passedChecks.has("filtering.dns")).toBe(true));
+    expect(rt.store.getState().dns.status?.running).toBe(true);
+    expect(within(row("filtering.dns")).getByRole("switch")).toBeChecked();
+    await vi.waitFor(() => expect(within(row("filtering.systemDns")).getByRole("switch")).toBeEnabled());
   });
 
   it("launch at startup is a switch only the desktop app can change", async () => {
@@ -67,6 +84,8 @@ describe("settings view (rendered from the registry)", () => {
       setTray: async () => {},
       onTrayAction: async () => () => {},
       autostart: { isEnabled: async () => autostart.at(-1) ?? false, set: async (on) => void autostart.push(on) },
+      onCloseRequested: async () => () => {},
+      quit: async () => {},
     };
     const rt = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(), isTauri: true, desktop });
     render(
@@ -89,8 +108,8 @@ describe("settings view (rendered from the registry)", () => {
     expect(rt.settings.get("startup.launchAtLogin")).toBe(true);
     await vi.waitFor(() => expect(autostart).toEqual([true]));
     expect(within(row("startup.launchAtLogin")).getByRole("switch")).toBeChecked();
-    // A data switch stays locked in the desktop app too: only a passed live check unlocks it.
-    expect(within(row("filtering.dns")).getByRole("switch")).toBeDisabled();
+    // An unavailable data switch stays locked in the desktop app too.
+    expect(within(row("filtering.perApp")).getByRole("switch")).toBeDisabled();
   });
 
   it("changing a control writes the setting", async () => {
@@ -116,7 +135,7 @@ describe("settings view (rendered from the registry)", () => {
     expect(document.querySelectorAll("[data-setting]")).toHaveLength(SETTING_KEYS.length);
   });
 
-  it("import previews every change before applying, refuses a locked switch, and undo restores", async () => {
+  it("import previews every change before applying, never turns a data switch on, and undo restores", async () => {
     const rt = await setup();
     await userEvent.click(screen.getByRole("button", { name: "Settings actions" }));
     await userEvent.click(await screen.findByRole("menuitem", { name: "Import settings" }));
@@ -127,7 +146,7 @@ describe("settings view (rendered from the registry)", () => {
     const changes = screen.getByRole("list", { name: "Changes" });
     expect(within(changes).getAllByRole("listitem")).toHaveLength(1);
     expect(changes).toHaveTextContent(/Theme\s*Dark.*Light/);
-    expect(screen.getByRole("list", { name: "Not imported" })).toHaveTextContent(/filtering\.dns.*live check/);
+    expect(screen.getByRole("list", { name: "Not imported" })).toHaveTextContent(/filtering\.dns.*never turns this on/);
     // Nothing applied yet.
     expect(rt.settings.get("appearance.theme")).toBe("dark");
 

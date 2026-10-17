@@ -163,6 +163,214 @@ export function parseHistory(x: unknown): History {
   return { v: PROTOCOL_VERSION, grain, step, samples, apps };
 }
 
+// ---------------------------------------------------------------------------
+// DNS filter (phase B). Mirrors of src-tauri/src/dns/status.rs (dns_status),
+// src-tauri/src/dns/probe.rs (dns_self_check) and src-tauri/src/sysdns
+// (system_dns_state). Wire names are Rust's snake_case. Fixtures:
+// src/data/fixtures/dns-status-v2.json, system-dns-v1.json (Rust reads them too).
+
+export const DNS_STATUS_VERSION = 2 as const;
+export const SYSTEM_DNS_VERSION = 1 as const;
+
+export interface DnsCounters {
+  /** Every query received. */
+  queries: number;
+  /** Answered by Sieve with the block answer. */
+  blocked: number;
+  /** Answered by an upstream. */
+  forwarded: number;
+  /** Every upstream failed: SERVFAIL sent. */
+  failed: number;
+  /** Blocked but past the per-name tracking cap. */
+  untracked: number;
+}
+
+export interface DnsListInfo {
+  url: string | null;
+  /** When the list in use was downloaded, ms since the epoch; null: no list. */
+  fetched_at: number | null;
+  rules: number;
+  allow: number;
+  skipped: number;
+  user_rules: boolean;
+  /** Why the list is stale or missing, or null. */
+  error: string | null;
+}
+
+export interface DomainCount {
+  domain: string;
+  count: number;
+}
+
+export interface DnsStatus {
+  v: typeof DNS_STATUS_VERSION;
+  running: boolean;
+  /** Every address the proxy listens on; empty when stopped. */
+  binds: string[];
+  started_at: number | null;
+  upstreams: string[];
+  counters: DnsCounters;
+  last_error: string | null;
+  list: DnsListInfo;
+  /** At most 20, most blocked first. */
+  top_blocked: DomainCount[];
+}
+
+export interface DnsCheck {
+  /** The listen address that was asked. */
+  server: string;
+  name: string;
+  expect: string;
+  got: string;
+  pass: boolean;
+}
+
+export interface SelfCheck {
+  pass: boolean;
+  checks: DnsCheck[];
+}
+
+export interface FamilyDns {
+  /** Servers in force, in order. */
+  servers: string[];
+  /** True when the servers come from DHCP (or the adapter's defaults), false when set by hand. */
+  dhcp: boolean;
+}
+
+export interface InterfaceDns {
+  alias: string;
+  index: number;
+  v4: FamilyDns;
+  v6: FamilyDns;
+  /** IPv4 DNS is exactly 127.0.0.1 and IPv6 DNS exactly ::1. */
+  uses_sieve: boolean;
+}
+
+export interface SystemDnsState {
+  v: typeof SYSTEM_DNS_VERSION;
+  /** Active (up, not loopback) adapters. */
+  interfaces: InterfaceDns[];
+  /** Some active adapter sends lookups to a loopback address. */
+  pointed: boolean;
+  /** Sieve's backup of the DNS before it pointed Windows here exists. */
+  backup: boolean;
+  /** Folder of the backup and restore-dns.ps1. */
+  backup_dir: string | null;
+}
+
+function bool(x: unknown, where: string): boolean {
+  if (typeof x !== "boolean") throw new ProtocolError(`${where} must be a boolean`);
+  return x;
+}
+
+function intOrNull(x: unknown, where: string): number | null {
+  return x === null ? null : int(x, where);
+}
+
+function strings(x: unknown, where: string): string[] {
+  if (!Array.isArray(x)) throw new ProtocolError(`${where} must be an array`);
+  return x.map((s, i) => str(s, `${where}[${i}]`));
+}
+
+function rec(x: unknown, where: string): Rec {
+  if (!isRec(x)) throw new ProtocolError(`${where} must be an object`);
+  return x;
+}
+
+function version(x: Rec, want: number, what: string): void {
+  if (x.v !== want) {
+    throw new ProtocolError(
+      `${what} version ${String(x.v)} is not ${want}: the Sieve backend and this window disagree. Restart Sieve after updating.`,
+    );
+  }
+}
+
+/** Validate an untrusted `dns_status` answer. Throws ProtocolError. */
+export function parseDnsStatus(raw: unknown): DnsStatus {
+  const x = rec(raw, "dns status");
+  version(x, DNS_STATUS_VERSION, "dns status");
+  const c = rec(x.counters, "counters");
+  const l = rec(x.list, "list");
+  if (!Array.isArray(x.top_blocked)) throw new ProtocolError("top_blocked must be an array");
+  return {
+    v: DNS_STATUS_VERSION,
+    running: bool(x.running, "running"),
+    binds: strings(x.binds, "binds"),
+    started_at: intOrNull(x.started_at, "started_at"),
+    upstreams: strings(x.upstreams, "upstreams"),
+    counters: {
+      queries: int(c.queries, "counters.queries"),
+      blocked: int(c.blocked, "counters.blocked"),
+      forwarded: int(c.forwarded, "counters.forwarded"),
+      failed: int(c.failed, "counters.failed"),
+      untracked: int(c.untracked, "counters.untracked"),
+    },
+    last_error: strOrNull(x.last_error, "last_error"),
+    list: {
+      url: strOrNull(l.url, "list.url"),
+      fetched_at: intOrNull(l.fetched_at, "list.fetched_at"),
+      rules: int(l.rules, "list.rules"),
+      allow: int(l.allow, "list.allow"),
+      skipped: int(l.skipped, "list.skipped"),
+      user_rules: bool(l.user_rules, "list.user_rules"),
+      error: strOrNull(l.error, "list.error"),
+    },
+    top_blocked: x.top_blocked.map((d, i) => {
+      const r = rec(d, `top_blocked[${i}]`);
+      return { domain: str(r.domain, `top_blocked[${i}].domain`), count: int(r.count, `top_blocked[${i}].count`) };
+    }),
+  };
+}
+
+/** Validate an untrusted `dns_self_check` answer. Throws ProtocolError. */
+export function parseSelfCheck(raw: unknown): SelfCheck {
+  const x = rec(raw, "self check");
+  if (!Array.isArray(x.checks)) throw new ProtocolError("checks must be an array");
+  return {
+    pass: bool(x.pass, "pass"),
+    checks: x.checks.map((c, i) => {
+      const r = rec(c, `checks[${i}]`);
+      const w = `checks[${i}]`;
+      return {
+        server: str(r.server, `${w}.server`),
+        name: str(r.name, `${w}.name`),
+        expect: str(r.expect, `${w}.expect`),
+        got: str(r.got, `${w}.got`),
+        pass: bool(r.pass, `${w}.pass`),
+      };
+    }),
+  };
+}
+
+function family(x: unknown, where: string): FamilyDns {
+  const r = rec(x, where);
+  return { servers: strings(r.servers, `${where}.servers`), dhcp: bool(r.dhcp, `${where}.dhcp`) };
+}
+
+/** Validate an untrusted `system_dns_state` answer. Throws ProtocolError. */
+export function parseSystemDns(raw: unknown): SystemDnsState {
+  const x = rec(raw, "system dns");
+  version(x, SYSTEM_DNS_VERSION, "system dns");
+  if (!Array.isArray(x.interfaces)) throw new ProtocolError("interfaces must be an array");
+  return {
+    v: SYSTEM_DNS_VERSION,
+    interfaces: x.interfaces.map((it, i) => {
+      const r = rec(it, `interfaces[${i}]`);
+      const w = `interfaces[${i}]`;
+      return {
+        alias: str(r.alias, `${w}.alias`),
+        index: int(r.index, `${w}.index`),
+        v4: family(r.v4, `${w}.v4`),
+        v6: family(r.v6, `${w}.v6`),
+        uses_sieve: bool(r.uses_sieve, `${w}.uses_sieve`),
+      };
+    }),
+    pointed: bool(x.pointed, "pointed"),
+    backup: bool(x.backup, "backup"),
+    backup_dir: strOrNull(x.backup_dir, "backup_dir"),
+  };
+}
+
 /** Validate an untrusted value as a v1 Snapshot. Throws ProtocolError. */
 export function parseSnapshot(x: unknown): Snapshot {
   if (!isRec(x)) throw new ProtocolError("snapshot must be an object");

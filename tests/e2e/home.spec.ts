@@ -17,7 +17,8 @@ async function waitForData(page: Page, points = 2) {
   await expect
     .poll(async () => ((await line.getAttribute("d")) ?? "").split("L").length, { timeout: 15_000 })
     .toBeGreaterThanOrEqual(points);
-  await expect(page.locator("section[data-kpi] [data-numeric]")).toHaveCount(4);
+  // Three snapshot numbers; the DNS tile says Off while the filter is off.
+  await expect(page.locator("section[data-kpi] [data-numeric]")).toHaveCount(3);
   await expect(page.getByRole("region", { name: "When apps are busy" }).locator("[data-step]").first()).toBeVisible();
 }
 
@@ -111,14 +112,16 @@ test.describe("home", () => {
     await page.screenshot({ path: "test-results/screens/home-mobile.png", fullPage: true });
   });
 
-  test("never says ads, trackers or blocked; KPI labels name connections, hosts or ports", async ({ page }) => {
+  test("with the DNS filter off, never says ads, trackers or blocked; tiles name apps, connections, hosts and the filter", async ({ page }) => {
     await openHome(page);
     await waitForData(page);
     const text = await page.locator("body").innerText();
     expect(text).not.toMatch(/\b(ads|trackers|blocked)\b/i);
-    for (const tile of await page.locator("section[data-kpi]").all()) {
-      expect(await tile.getAttribute("aria-label")).toMatch(/connections|hosts|ports/i);
+    for (const tile of await page.locator("section[data-kpi]:not([data-dns-derived])").all()) {
+      expect(await tile.getAttribute("aria-label")).toMatch(/apps|connections|hosts/i);
     }
+    await expect(page.locator('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Watched apps");
+    await expect(page.locator('section[data-kpi="blocked"]')).toHaveAttribute("aria-label", "DNS filter");
   });
 
   test("the pause pill pauses until the chosen time and resume restarts sampling", async ({ page }, info) => {
@@ -149,10 +152,10 @@ test.describe("home", () => {
         const b = (await loc.boundingBox())!;
         expect(b.y + b.height).toBeLessThanOrEqual(800);
       }
-      // No KPI number is clipped by its tile.
+      // No KPI value (a number, or the DNS tile's Off line) is clipped by its tile.
       for (const tile of await page.locator("section[data-kpi]").all()) {
         const t = (await tile.boundingBox())!;
-        const n = (await tile.locator("[data-numeric]").boundingBox())!;
+        const n = (await tile.locator("p").last().boundingBox())!;
         expect(n.y + n.height).toBeLessThanOrEqual(t.y + t.height);
       }
     }
@@ -180,7 +183,8 @@ test.describe("home", () => {
     await openHome(page, "/?source=mock&seed=1&scenario=error");
     const r = regions(page);
     await expect(r.chart.getByRole("alert")).toContainText("scenario error");
-    await expect(r.kpis.getByText("No data")).toHaveCount(4);
+    // The three snapshot tiles; the DNS tile does not depend on the snapshot source and says Off.
+    await expect(r.kpis.getByText("No data")).toHaveCount(3);
     expect(await r.kpis.innerText()).not.toMatch(/\d/);
     await expect(r.top.getByRole("alert")).toBeVisible();
     await expect(page.locator('path[data-part="area"]')).toHaveCount(0);

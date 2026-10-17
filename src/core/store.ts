@@ -1,10 +1,13 @@
 /**
- * The single Sieve store. One writer (the poller in src/data/poller.ts),
- * many readers (React through useSieve). Snapshots live in a ring buffer
- * whose size is derived from the longest window any consumer declared,
- * so nothing keeps more history than someone actually reads.
+ * The single Sieve store, many readers (React through useSieve). One writer
+ * per part: the poller (src/data/poller.ts) owns snapshots and sampling
+ * status; the DNS controller (src/data/dns-controller.ts) owns `dns` through
+ * setDns. Snapshots live in a ring buffer whose size is derived from the
+ * longest window any consumer declared, so nothing keeps more history than
+ * someone actually reads.
  */
 import type { Snapshot } from "@/data/protocol";
+import { EMPTY_DNS, type DnsSlice } from "./dns";
 
 export type SourceKind = "mock" | "tauri";
 
@@ -24,6 +27,8 @@ export interface SieveState {
   snapshots: readonly Snapshot[];
   capacity: number;
   status: SamplingStatus;
+  /** DNS filter state (writer: the DNS controller). */
+  dns: DnsSlice;
 }
 
 export type Phase = "starting" | "live" | "paused" | "off" | "error";
@@ -57,6 +62,8 @@ export interface SieveStore {
   push(snapshot: Snapshot): void;
   setStatus(patch: Partial<SamplingStatus>): void;
   clear(): void;
+  // Writer API of the DNS part: only the DNS controller calls this.
+  setDns(patch: Partial<DnsSlice>): void;
 }
 
 export const DEFAULT_INTERVAL_MS = 1000;
@@ -70,6 +77,7 @@ export function createStore(intervalMs = DEFAULT_INTERVAL_MS): SieveStore {
     snapshots: [],
     capacity: 1,
     status: { running: false, pausedUntil: null, error: null },
+    dns: EMPTY_DNS,
   };
   const listeners = new Set<() => void>();
 
@@ -117,6 +125,9 @@ export function createStore(intervalMs = DEFAULT_INTERVAL_MS): SieveStore {
     },
     clear() {
       emit({ ...state, snapshots: [] });
+    },
+    setDns(patch) {
+      emit({ ...state, dns: { ...state.dns, ...patch } });
     },
   };
 }

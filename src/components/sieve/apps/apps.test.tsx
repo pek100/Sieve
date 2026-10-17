@@ -1,6 +1,8 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DNS_SWITCH } from "@/core/dns";
+import { REGISTRY } from "@/core/settings/registry";
 import { createMockSource } from "@/data/mock-source";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "@/hooks/runtime";
@@ -55,14 +57,18 @@ describe("apps screen", () => {
     expect(within(row("quiet")).getByText("0")).toBeInTheDocument();
   });
 
-  it("sieve is disabled and says it needs DNS filtering while the data switch is off", async () => {
-    await setup();
+  it("sieve is disabled and says per-app filtering needs a driver Sieve does not have, even with DNS filtering on", async () => {
+    // DNS filtering on and proven does not unlock a per-app level: DNS cannot tell apps apart.
+    const { runtime } = await setup({ [DNS_SWITCH]: true });
+    await waitFor(() => expect(runtime.passedChecks.has(DNS_SWITCH)).toBe(true));
+    const reason = `Needs ${REGISTRY["filtering.perApp"].label}. ${REGISTRY["filtering.perApp"].unavailable}`;
     const group = within(row(CHROME)).getByRole("radiogroup", { name: "Level for Google Chrome" });
     const sieve = within(group).getByRole("radio", { name: "Sieve" });
     expect(sieve).toBeDisabled();
-    expect(sieve).toHaveAccessibleDescription("Needs DNS filtering, which is off");
+    expect(sieve).toHaveAccessibleDescription(reason);
     expect(within(group).getByRole("radio", { name: "Watch" })).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByTestId("sieve-locked")).toHaveTextContent("Needs DNS filtering, which is off");
+    expect(screen.getByTestId("sieve-locked")).toHaveTextContent(reason);
+    expect(document.body.textContent).not.toMatch(/Needs DNS filtering/);
   });
 
   it("setting an app to off stores it and drops it from the being-sieved count", async () => {

@@ -3,7 +3,6 @@ import { EMPTY_DOC, readValue, writeValue, type SettingsDoc } from "./document";
 import { SETTING_KEYS, settingDef } from "./registry";
 import { EXPORT_KIND, exportText, formatNumber, formatValue, numberChoices, planImport, resetPlan, searchSettings } from "./transfer";
 
-const unlocked = () => false;
 const changed: SettingsDoc = writeValue(writeValue(EMPTY_DOC, "appearance.theme", "light"), "apps.pinned", ["C:\\Tools\\a.exe"]);
 
 describe("settings export and import", () => {
@@ -12,13 +11,13 @@ describe("settings export and import", () => {
     const parsed = JSON.parse(text);
     expect(parsed.kind).toBe(EXPORT_KIND);
     expect(Object.keys(parsed.values).sort()).toEqual(["appearance.theme", "apps.pinned"]);
-    const plan = planImport(changed, text, unlocked);
+    const plan = planImport(changed, text);
     expect(plan.ok && plan.changes).toEqual([]);
   });
 
   it("import replaces: lists every key that changes, and keys missing from the file go back to default", () => {
     const file = JSON.stringify({ kind: EXPORT_KIND, schema: 1, values: { "sampling.intervalMs": 2000 } });
-    const plan = planImport(changed, file, unlocked);
+    const plan = planImport(changed, file);
     if (!plan.ok) throw new Error(plan.error);
     expect(plan.changes.map((c) => [c.key, c.from, c.to])).toEqual([
       ["appearance.theme", "light", "dark"],
@@ -29,28 +28,51 @@ describe("settings export and import", () => {
     expect(readValue(plan.next, "appearance.theme")).toBe("dark");
   });
 
-  it("refuses unknown keys, invalid values and turning on a locked data switch, keeping the current value", () => {
+  it("refuses unknown keys, invalid values and turning on any data switch, keeping the current value", () => {
     const file = JSON.stringify({
       kind: EXPORT_KIND,
       schema: 1,
-      values: { "appearance.theme": "neon", "nope.key": true, "filtering.dns": true, "apps.levels": { chrome: "loud" } },
+      values: {
+        "appearance.theme": "neon",
+        "nope.key": true,
+        "filtering.dns": true,
+        "filtering.systemDns": true,
+        "apps.levels": { chrome: "loud" },
+        "filtering.upstreams": ["dns.google"],
+      },
     });
-    const plan = planImport(changed, file, (k) => settingDef(k).kind === "dataSwitch");
+    const plan = planImport(changed, file);
     if (!plan.ok) throw new Error(plan.error);
-    expect(plan.refused.map((r) => r.key).sort()).toEqual(["appearance.theme", "apps.levels", "filtering.dns", "nope.key"]);
-    expect(plan.refused.find((r) => r.key === "filtering.dns")?.reason).toMatch(/live check/);
+    expect(plan.refused.map((r) => r.key).sort()).toEqual([
+      "appearance.theme",
+      "apps.levels",
+      "filtering.dns",
+      "filtering.systemDns",
+      "filtering.upstreams",
+      "nope.key",
+    ]);
+    expect(plan.refused.find((r) => r.key === "filtering.dns")?.reason).toMatch(/never turns this on/);
     expect(readValue(plan.next, "filtering.dns")).toBe(false);
+    expect(readValue(plan.next, "filtering.systemDns")).toBe(false);
     // A refused known key keeps its current value: the theme stays light.
     expect(readValue(plan.next, "appearance.theme")).toBe("light");
-    // Once the check has passed, the same file may turn the switch on.
-    const open = planImport(EMPTY_DOC, file, () => false);
-    expect(open.ok && readValue(open.next, "filtering.dns")).toBe(true);
+    // Every data switch, every time: no import path turns one on.
+    for (const key of SETTING_KEYS.filter((k) => settingDef(k).kind === "dataSwitch")) {
+      const one = planImport(EMPTY_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: 1, values: { [key]: true } }));
+      expect(one.ok && readValue(one.next, key), key).toBe(false);
+    }
+    // Turning one off is imported, and a switch already on stays on.
+    const on = writeValue(EMPTY_DOC, "filtering.dns", true);
+    const off = planImport(on, JSON.stringify({ kind: EXPORT_KIND, schema: 1, values: {} }));
+    expect(off.ok && readValue(off.next, "filtering.dns")).toBe(false);
+    const kept = planImport(on, JSON.stringify({ kind: EXPORT_KIND, schema: 1, values: { "filtering.dns": true } }));
+    expect(kept.ok && readValue(kept.next, "filtering.dns")).toBe(true);
   });
 
   it("says plainly when the text is not a settings file", () => {
-    expect(planImport(EMPTY_DOC, "{nope", unlocked)).toEqual({ ok: false, error: expect.stringMatching(/not valid JSON/) });
-    expect(planImport(EMPTY_DOC, JSON.stringify({ values: {} }), unlocked)).toEqual({ ok: false, error: expect.stringMatching(/not a Sieve settings file/) });
-    expect(planImport(EMPTY_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: 0, values: {} }), unlocked).ok).toBe(false);
+    expect(planImport(EMPTY_DOC, "{nope")).toEqual({ ok: false, error: expect.stringMatching(/not valid JSON/) });
+    expect(planImport(EMPTY_DOC, JSON.stringify({ values: {} }))).toEqual({ ok: false, error: expect.stringMatching(/not a Sieve settings file/) });
+    expect(planImport(EMPTY_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: 0, values: {} })).ok).toBe(false);
   });
 
   it("reset to defaults lists what changes and keeps keys a newer Sieve wrote", () => {
@@ -67,7 +89,8 @@ describe("settings search and words", () => {
     expect(searchSettings("")).toEqual(SETTING_KEYS);
     expect(searchSettings("theme")).toEqual(["appearance.theme"]);
     expect(searchSettings("LIGHT")).toEqual(["appearance.theme"]);
-    expect(searchSettings("dns")).toEqual(["filtering.dns"]);
+    expect(searchSettings("dns")).toEqual(["filtering.dns", "filtering.upstreams", "filtering.systemDns"]);
+    expect(searchSettings("per-app filtering")).toEqual(["filtering.perApp"]);
     expect(searchSettings("startup")).toEqual(["startup.launchAtLogin"]);
     expect(searchSettings("sample every")).toEqual(["sampling.intervalMs"]);
     expect(searchSettings("zzzz")).toEqual([]);
@@ -80,6 +103,7 @@ describe("settings search and words", () => {
     expect(formatValue("filtering.dns", false)).toBe("Off");
     expect(formatValue("apps.levels", { a: "off", b: "off" })).toBe("2 apps set");
     expect(formatValue("apps.pinned", [])).toBe("None");
+    expect(formatValue("filtering.upstreams", ["1.1.1.1", "9.9.9.9"])).toBe("1.1.1.1, 9.9.9.9");
     const choices = numberChoices("sampling.intervalMs");
     expect(choices[0]).toBe(500);
     expect(choices.at(-1)).toBe(10_000);

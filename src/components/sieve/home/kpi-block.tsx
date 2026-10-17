@@ -1,23 +1,28 @@
 "use client";
 
-import { AppWindow, ArrowDownRight, ArrowUpRight, Cable, Globe, Minus, RadioTower } from "lucide-react";
+import { AppWindow, ArrowDownRight, ArrowUpRight, Cable, Globe, Minus, ShieldCheck, ShieldOff } from "lucide-react";
+import Link from "next/link";
 import type { ReactNode } from "react";
 import { IconTile, type IconTileTone } from "@/components/sieve/primitives/icon-tile";
 import { CardBoundary } from "@/components/sieve/shell/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { isFiltering } from "@/core/dns";
 import type { DeltaDir, Kpi, KpiId } from "@/core/kpis";
+import { useDns } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
 import { useTicker } from "./use-home";
 
-/** Labels name connections, hosts or ports, never anything Sieve is not doing. */
+/** Snapshot tiles name apps, connections or hosts: what Sieve watches, never a claim of filtering. */
 export const KPI_COPY: Record<KpiId, { label: string; icon: ReactNode; tone: IconTileTone }> = {
   // The one accent container tile on Home.
-  // Counts apps sieved now (level watch or sieve, with an active connection), not every app online.
-  apps: { label: "Sieved apps with connections", icon: <AppWindow strokeWidth={1.75} />, tone: "mint" },
+  // Counts watched apps (level watch or sieve) with an active connection, not every app online.
+  apps: { label: "Watched apps", icon: <AppWindow strokeWidth={1.75} />, tone: "mint" },
   connections: { label: "Active connections", icon: <Cable strokeWidth={1.75} />, tone: "neutral" },
   hosts: { label: "Remote hosts", icon: <Globe strokeWidth={1.75} />, tone: "neutral" },
-  ports: { label: "Listening ports", icon: <RadioTower strokeWidth={1.75} />, tone: "neutral" },
 };
+
+/** Where the DNS filter is turned on. */
+export const FILTERING_HREF = "/settings/#section-filtering";
 
 const DELTA_ICON: Record<DeltaDir, typeof Minus> = { up: ArrowUpRight, down: ArrowDownRight, flat: Minus };
 
@@ -81,7 +86,53 @@ function Tile({ id, kpi, phase }: { id: KpiId; kpi: Kpi | null; phase: "loading"
   );
 }
 
-/** 2 x 2 KPI tiles. One error boundary for the block. */
+/**
+ * The DNS-derived tile: the filter's blocked lookups while it runs, "Off"
+ * with the way to turn it on otherwise. It is the only Home tile that may
+ * say "blocked", and only while the filter answers (law in home.test.tsx).
+ * Lookups are counted for the whole computer: DNS cannot tell apps apart.
+ */
+function BlockedTile() {
+  const dns = useDns();
+  const on = isFiltering(dns);
+  const blocked = dns.status?.counters.blocked ?? 0;
+  const lookups = dns.status?.counters.queries ?? 0;
+  const label = on ? "Blocked lookups" : "DNS filter";
+  return (
+    <section
+      aria-label={label}
+      data-kpi="blocked"
+      data-dns-derived=""
+      className="flex min-w-0 flex-col gap-3 rounded-lg bg-surface-1 p-5 text-on-surface shadow-l1"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <IconTile>{on ? <ShieldCheck strokeWidth={1.75} /> : <ShieldOff strokeWidth={1.75} />}</IconTile>
+        {on && (
+          <span className="inline-flex h-6 items-center rounded-full bg-surface-2 px-2 text-label text-on-surface-muted tabular">
+            of {lookups.toLocaleString()}
+          </span>
+        )}
+      </div>
+      <div className="flex min-w-0 flex-col gap-1">
+        <p className="text-label text-on-surface-muted">{label}</p>
+        {on ? (
+          <p className="text-kpi tabular" data-numeric="">
+            <Ticker value={blocked} />
+          </p>
+        ) : (
+          <p className="flex flex-wrap items-baseline gap-x-2 text-body">
+            <span className="text-title text-on-surface-muted">Off</span>
+            <Link href={FILTERING_HREF} className="text-label text-primary underline-offset-4 hover:underline">
+              Turn on in Settings
+            </Link>
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/** 2 x 2 KPI tiles: three from snapshots, one from the DNS filter. One error boundary for the block. */
 export function KpiBlock({ kpis, phase, className }: { kpis: Kpi[] | null; phase: "loading" | "error" | "ready"; className?: string }) {
   const byId = new Map((kpis ?? []).map((k) => [k.id, k]));
   return (
@@ -90,6 +141,7 @@ export function KpiBlock({ kpis, phase, className }: { kpis: Kpi[] | null; phase
         {(Object.keys(KPI_COPY) as KpiId[]).map((id) => (
           <Tile key={id} id={id} kpi={byId.get(id) ?? null} phase={phase} />
         ))}
+        <BlockedTile />
       </div>
     </CardBoundary>
   );

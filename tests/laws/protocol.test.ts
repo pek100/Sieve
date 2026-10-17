@@ -8,8 +8,21 @@ import { GRAINS } from "@/core/history";
 import { parseTrayAction } from "@/core/tray";
 import { TRAY_EVENT } from "@/data/desktop";
 import historyFixture from "@/data/fixtures/history-v1.json";
+import dnsFixture from "@/data/fixtures/dns-status-v2.json";
 import fixture from "@/data/fixtures/snapshot-v1.json";
-import { FLOW_STATES, PROTOCOL_VERSION, parseHistory, parseSnapshot, ProtocolError } from "@/data/protocol";
+import systemFixture from "@/data/fixtures/system-dns-v1.json";
+import {
+  DNS_STATUS_VERSION,
+  FLOW_STATES,
+  PROTOCOL_VERSION,
+  SYSTEM_DNS_VERSION,
+  parseDnsStatus,
+  parseHistory,
+  parseSelfCheck,
+  parseSnapshot,
+  parseSystemDns,
+  ProtocolError,
+} from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("src-tauri/src/protocol.rs");
@@ -57,9 +70,41 @@ describe("protocol law", () => {
     // What Rust emits for its Pause and Resume items (serde tag "kind", snake_case) is what the window accepts.
     expect(parseTrayAction({ kind: "pause", minutes })).toEqual({ kind: "pause", minutes });
     expect(parseTrayAction({ kind: "resume" })).toEqual({ kind: "resume" });
+    // Quit is sent to the window while Sieve's DNS backup exists, so the window can ask first.
+    expect(parseTrayAction({ kind: "quit" })).toEqual({ kind: "quit" });
     expect(ids.map((m) => m[1])).toEqual(["pause", "resume", "open", "quit"]);
     // The Pause item's label states the same minutes it sends.
     expect(ids[0][2]).toBe(`Pause ${minutes} min`);
+  });
+
+  it("dns_status: the v2 fixture parses losslessly and the version matches Rust", () => {
+    expect(parseDnsStatus(dnsFixture)).toEqual(dnsFixture);
+    const rust = read("src-tauri/src/dns/status.rs");
+    expect(Number(rust.match(/pub const DNS_STATUS_VERSION: u32 = (\d+);/)?.[1])).toBe(DNS_STATUS_VERSION);
+    // Rust serialises against the same file.
+    expect(rust).toContain('include_str!("../../../src/data/fixtures/dns-status-v2.json")');
+    expect(() => parseDnsStatus({ ...dnsFixture, v: 1 })).toThrow(/version 1 is not 2.*Restart Sieve/);
+    expect(() => parseDnsStatus({ ...dnsFixture, binds: "127.0.0.1:53" })).toThrow(/binds/);
+    expect(() => parseDnsStatus({ ...dnsFixture, counters: { ...dnsFixture.counters, blocked: -1 } })).toThrow(/counters\.blocked/);
+    expect(() => parseDnsStatus({ ...dnsFixture, top_blocked: [{ domain: 3, count: 1 }] })).toThrow(/top_blocked\[0\]\.domain/);
+  });
+
+  it("system_dns_state: the v1 fixture parses losslessly and the version matches Rust", () => {
+    expect(parseSystemDns(systemFixture)).toEqual(systemFixture);
+    const rust = read("src-tauri/src/sysdns/mod.rs");
+    expect(Number(rust.match(/pub const SYSTEM_DNS_VERSION: u32 = (\d+);/)?.[1])).toBe(SYSTEM_DNS_VERSION);
+    expect(rust).toContain('include_str!("../../../src/data/fixtures/system-dns-v1.json")');
+    expect(() => parseSystemDns({ ...systemFixture, v: 2 })).toThrow(ProtocolError);
+    expect(() => parseSystemDns({ ...systemFixture, interfaces: [{ ...systemFixture.interfaces[0], v4: null }] })).toThrow(/interfaces\[0\]\.v4/);
+  });
+
+  it("dns_self_check: the Rust Check fields are the ones parsed", () => {
+    const probe = read("src-tauri/src/dns/probe.rs");
+    const fields = [...(probe.match(/pub struct Check \{([\s\S]*?)\}/)?.[1] ?? "").matchAll(/pub (\w+):/g)].map((m) => m[1]);
+    const check = { server: "127.0.0.1:53", name: "doubleclick.net", expect: "x", got: "y", pass: true };
+    expect(fields).toEqual(Object.keys(check));
+    expect(parseSelfCheck({ pass: true, checks: [check] })).toEqual({ pass: true, checks: [check] });
+    expect(() => parseSelfCheck({ pass: "yes", checks: [] })).toThrow(/pass/);
   });
 
   it("rejects a snapshot from another version or with a broken flow", () => {

@@ -1,13 +1,15 @@
 /**
- * Home KPIs (pure). Four counts of what the machine is doing now, each with
- * its change since the start of the chart window. They count connections,
- * hosts and ports only: Sieve never claims filtering that is not happening.
+ * Home KPIs from snapshots (pure). Three counts of what the machine is doing
+ * now, each with its change since the start of the chart window: watched
+ * apps with connections, connections and remote hosts. They never claim
+ * filtering. The fourth Home tile (blocked lookups) is not derived from
+ * snapshots: it is the DNS filter's own counter (src/core/dns.ts).
  */
 import type { Snapshot } from "@/data/protocol";
 import { groupApps, isActiveFlow, isSieved } from "./apps";
 import type { Level } from "./policy";
 
-export const KPI_IDS = ["apps", "connections", "hosts", "ports"] as const;
+export const KPI_IDS = ["apps", "connections", "hosts"] as const;
 export type KpiId = (typeof KPI_IDS)[number];
 
 export type KpiValues = Record<KpiId, number>;
@@ -25,15 +27,10 @@ export interface Kpi {
 /** The counts for one snapshot. `levelOf` gives each app's effective level. */
 export function kpiValues(s: Snapshot, levelOf: (appKey: string) => Level): KpiValues {
   const active = s.flows.filter(isActiveFlow);
-  const listening = new Set<string>();
-  for (const f of s.flows) {
-    if (f.remote === null && (f.state === "listen" || f.proto === "udp")) listening.add(`${f.proto}:${f.local.port}`);
-  }
   return {
     apps: groupApps(s).filter((a) => isSieved(a, levelOf(a.key))).length,
     connections: active.length,
     hosts: new Set(active.map((f) => f.remote?.addr)).size,
-    ports: listening.size,
   };
 }
 

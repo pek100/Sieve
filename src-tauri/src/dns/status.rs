@@ -1,12 +1,17 @@
-//! `dns_status` wire shape, version 1. The TypeScript mirror is phase B;
-//! changing a key or its meaning bumps `DNS_STATUS_VERSION` and the
-//! fixture in the test below in the same commit.
+//! `dns_status` wire shape, version 2. The TypeScript mirror is
+//! `parseDnsStatus` in src/data/protocol.ts; both read the fixture
+//! src/data/fixtures/dns-status-v2.json. Changing a key or its meaning bumps
+//! `DNS_STATUS_VERSION`, the fixture and the mirror in the same commit.
+//!
+//! v2 (phase B): `bind` (one address or null) became `binds` (every listen
+//! address, empty when stopped), because the proxy listens on 127.0.0.1 and
+//! ::1 at once so Windows can point both address families at it.
 //!
 //! ```json
 //! {
-//!   "v": 1,
+//!   "v": 2,
 //!   "running": true,
-//!   "bind": "127.0.0.1:53",            // null when stopped
+//!   "binds": ["127.0.0.1:53", "[::1]:53"], // empty when stopped
 //!   "started_at": 1800000000000,       // ms since the Unix epoch, null when stopped
 //!   "upstreams": ["1.1.1.1:53", "9.9.9.9:53"],
 //!   "counters": {
@@ -33,7 +38,7 @@
 
 use serde::Serialize;
 
-pub const DNS_STATUS_VERSION: u32 = 1;
+pub const DNS_STATUS_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Counters {
@@ -65,7 +70,7 @@ pub struct DomainCount {
 pub struct DnsStatus {
     pub v: u32,
     pub running: bool,
-    pub bind: Option<String>,
+    pub binds: Vec<String>,
     pub started_at: Option<u64>,
     pub upstreams: Vec<String>,
     pub counters: Counters,
@@ -80,7 +85,7 @@ impl DnsStatus {
         DnsStatus {
             v: DNS_STATUS_VERSION,
             running: false,
-            bind: None,
+            binds: Vec::new(),
             started_at: None,
             upstreams: Vec::new(),
             counters: Counters::default(),
@@ -95,12 +100,14 @@ impl DnsStatus {
 mod tests {
     use super::*;
 
+    const FIXTURE: &str = include_str!("../../../src/data/fixtures/dns-status-v2.json");
+
     #[test]
-    fn running_status_serialises_to_the_documented_v1_shape() {
+    fn running_status_serialises_to_the_shared_v2_fixture() {
         let status = DnsStatus {
             v: DNS_STATUS_VERSION,
             running: true,
-            bind: Some("127.0.0.1:53".into()),
+            binds: vec!["127.0.0.1:53".into(), "[::1]:53".into()],
             started_at: Some(1_800_000_000_000),
             upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
             counters: Counters { queries: 120, blocked: 14, forwarded: 105, failed: 1, untracked: 0 },
@@ -116,34 +123,16 @@ mod tests {
             },
             top_blocked: vec![DomainCount { domain: "doubleclick.net".into(), count: 9 }],
         };
-        let expected = serde_json::json!({
-            "v": 1,
-            "running": true,
-            "bind": "127.0.0.1:53",
-            "started_at": 1_800_000_000_000_u64,
-            "upstreams": ["1.1.1.1:53", "9.9.9.9:53"],
-            "counters": { "queries": 120, "blocked": 14, "forwarded": 105, "failed": 1, "untracked": 0 },
-            "last_error": null,
-            "list": {
-                "url": "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt",
-                "fetched_at": 1_800_000_000_000_u64,
-                "rules": 51234,
-                "allow": 812,
-                "skipped": 97,
-                "user_rules": true,
-                "error": null
-            },
-            "top_blocked": [{ "domain": "doubleclick.net", "count": 9 }]
-        });
+        let expected: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture is JSON");
         assert_eq!(serde_json::to_value(&status).expect("serialises"), expected);
     }
 
     #[test]
-    fn stopped_status_has_nulls_not_zero_timestamps() {
+    fn stopped_status_has_nulls_and_no_binds_not_zero_timestamps() {
         let v = serde_json::to_value(DnsStatus::stopped()).expect("serialises");
-        assert_eq!(v["v"], 1);
+        assert_eq!(v["v"], 2);
         assert_eq!(v["running"], false);
-        assert!(v["bind"].is_null());
+        assert_eq!(v["binds"], serde_json::json!([]));
         assert!(v["started_at"].is_null());
         assert!(v["list"]["fetched_at"].is_null());
     }

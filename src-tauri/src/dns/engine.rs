@@ -36,7 +36,8 @@ pub fn system_clock() -> Clock {
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    pub bind: SocketAddr,
+    /// Listen addresses (default `proxy::DEFAULT_BINDS`: 127.0.0.1:53 and [::1]:53).
+    pub binds: Vec<SocketAddr>,
     pub upstreams: Vec<SocketAddr>,
     pub list_url: String,
     /// Where the list cache and `user-rules.txt` live.
@@ -57,7 +58,7 @@ impl Engine {
         let (rules, info) = load_rules(&config, started_at, &fetch).await;
         let proxy = Proxy::start(
             ProxyConfig {
-                bind: config.bind,
+                binds: config.binds.clone(),
                 upstreams: config.upstreams.clone(),
                 upstream_timeout: Duration::from_millis(UPSTREAM_TIMEOUT_MS),
             },
@@ -79,12 +80,16 @@ impl Engine {
         self.proxy.local_addr()
     }
 
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        self.proxy.local_addrs()
+    }
+
     pub fn status(&self) -> DnsStatus {
         let s = self.proxy.stats();
         DnsStatus {
             v: DNS_STATUS_VERSION,
             running: true,
-            bind: Some(self.proxy.local_addr().to_string()),
+            binds: self.proxy.local_addrs().iter().map(SocketAddr::to_string).collect(),
             started_at: Some(self.started_at),
             upstreams: self.config.upstreams.iter().map(SocketAddr::to_string).collect(),
             counters: Counters {
@@ -104,11 +109,12 @@ impl Engine {
         }
     }
 
-    /// Asks the running proxy for a name its loaded rules block and for
-    /// `KNOWN_GOOD_NAME`. These two queries show up in the counters.
+    /// Asks the running proxy, on every listen address, for a name its
+    /// loaded rules block, and on the first for `KNOWN_GOOD_NAME`. These
+    /// queries show up in the counters (one blocked per address, one forwarded).
     pub async fn self_check(&self) -> SelfCheck {
         let blocked = current(&self.proxy.rules()).sample_blocked();
-        probe::self_check(self.proxy.local_addr(), blocked, KNOWN_GOOD_NAME).await
+        probe::self_check(self.proxy.local_addrs(), blocked, KNOWN_GOOD_NAME).await
     }
 
     /// One refresh pass now (the refresher calls the same function).
@@ -200,7 +206,7 @@ mod tests {
 
     fn config(dir: &std::path::Path, upstreams: Vec<SocketAddr>) -> EngineConfig {
         EngineConfig {
-            bind: "127.0.0.1:0".parse().expect("addr"),
+            binds: vec!["127.0.0.1:0".parse().expect("addr")],
             upstreams,
             list_url: URL.to_owned(),
             data_dir: dir.to_path_buf(),
@@ -217,7 +223,7 @@ mod tests {
             .expect("start");
         let s = engine.status();
         assert!(s.running);
-        assert_eq!(s.bind, Some(engine.local_addr().to_string()));
+        assert_eq!(s.binds, vec![engine.local_addr().to_string()]);
         assert_eq!(s.started_at, Some(T0));
         assert_eq!(s.upstreams, vec![up.addr.to_string()]);
         assert_eq!(s.list.fetched_at, Some(T0));

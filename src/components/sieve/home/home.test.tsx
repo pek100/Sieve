@@ -1,7 +1,9 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import { DNS_SWITCH } from "@/core/dns";
 import { OTHER_KEY, SERIES_COUNT } from "@/core/series";
+import { createMockDns } from "@/data/dns-mock";
 import { createMockSource } from "@/data/mock-source";
 import type { Clock } from "@/data/poller";
 import { memoryBackend } from "@/data/settings-store";
@@ -176,23 +178,69 @@ describe("home chart", () => {
   });
 });
 
+/** Home's text with the DNS-derived tiles taken out. */
+function textOutsideDnsTiles(): string {
+  const copy = document.body.cloneNode(true) as HTMLElement;
+  for (const el of copy.querySelectorAll("[data-dns-derived]")) el.remove();
+  return copy.textContent ?? "";
+}
+
+const CLAIMS = /\b(ads|trackers|blocked)\b/i;
+
 describe("home copy and KPIs", () => {
-  it("never says ads, trackers or blocked; KPI labels name connections, hosts or ports", async () => {
-    await setup();
-    expect(document.body.textContent ?? "").not.toMatch(/\b(ads|trackers|blocked)\b/i);
-    const tiles = screen.getByRole("group", { name: "Right now" }).querySelectorAll("section[data-kpi]");
+  it("law, filter off: Home never says ads, trackers or blocked; the DNS tile says Off with the way to turn it on", async () => {
+    const { runtime } = await setup();
+    expect(runtime.store.getState().dns.status?.running).toBe(false);
+    expect(document.body.textContent ?? "").not.toMatch(CLAIMS);
+    const group = screen.getByRole("group", { name: "Right now" });
+    const tiles = group.querySelectorAll("section[data-kpi]");
     expect(tiles).toHaveLength(4);
-    for (const t of tiles) expect(t.getAttribute("aria-label")).toMatch(/connections|hosts|ports/i);
-    // The apps count is isSieved (level watch or sieve), and its label says so.
-    expect(screen.getByRole("group", { name: "Right now" }).querySelector('section[data-kpi="apps"]')).toHaveAttribute(
-      "aria-label",
-      expect.stringMatching(/^Sieved apps/),
-    );
+    // Snapshot tiles name apps, connections or hosts.
+    for (const t of group.querySelectorAll("section[data-kpi]:not([data-dns-derived])")) {
+      expect(t.getAttribute("aria-label")).toMatch(/apps|connections|hosts/i);
+    }
+    // The apps count is isSieved (level watch or sieve): watched apps, and its label says so.
+    expect(group.querySelector('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Watched apps");
+    const dns = group.querySelector<HTMLElement>('section[data-kpi="blocked"]')!;
+    expect(dns).toHaveAttribute("aria-label", "DNS filter");
+    expect(within(dns).getByText("Off")).toBeInTheDocument();
+    expect(within(dns).getByRole("link", { name: "Turn on in Settings" })).toHaveAttribute("href", expect.stringMatching(/^\/settings\/?#section-filtering$/));
     // Numbers are shown, with a delta chip each.
     expect(within(tiles[1] as HTMLElement).getByText(/^\d+$/)).toBeInTheDocument();
     expect(tiles[1].querySelector("[data-dir]")).not.toBeNull();
     // At most one accent container tile.
     expect([...tiles].filter((t) => t.className.includes("bg-mint-container"))).toHaveLength(1);
+  });
+
+  it("law, filter on: 'blocked' appears only in the DNS-derived tile, with the filter's own count; never ads or trackers", async () => {
+    const fc = fakeClock();
+    const runtime = createRuntime({
+      source: createMockSource({ seed: 1, now: fc.clock.now }),
+      settings: memoryBackend({ schema: 1, values: { [DNS_SWITCH]: true } }),
+      clock: fc.clock,
+      // Windows already points at Sieve, so lookups arrive and some are blocked.
+      dns: createMockDns({ seed: 1, scenario: "running", now: fc.clock.now }),
+    });
+    render(
+      <SieveProvider runtime={runtime}>
+        <HomeScreen />
+      </SieveProvider>,
+    );
+    await act(async () => {
+      await runtime.settings.ready;
+      await fc.flush();
+    });
+    await act(() => fc.advance(20_000));
+    const status = runtime.store.getState().dns.status!;
+    expect(status.running).toBe(true);
+    expect(status.counters.blocked).toBeGreaterThan(0);
+    const dns = screen.getByRole("group", { name: "Right now" }).querySelector<HTMLElement>('section[data-kpi="blocked"]')!;
+    expect(dns).toHaveAttribute("aria-label", "Blocked lookups");
+    await vi.waitFor(() => expect(dns.querySelector("[data-numeric]")).toHaveTextContent(status.counters.blocked.toLocaleString()));
+    expect(dns).toHaveTextContent(`of ${runtime.store.getState().dns.status!.counters.queries.toLocaleString()}`);
+    expect(document.body.textContent).toMatch(/blocked/i);
+    expect(textOutsideDnsTiles()).not.toMatch(CLAIMS);
+    expect(document.body.textContent).not.toMatch(/\b(ads|trackers)\b/i);
   });
 
   it("every icon-only button has an accessible name", async () => {
@@ -286,7 +334,8 @@ describe("home history periods", () => {
       const line = chart().querySelector('path[data-part="line"]')!.getAttribute("d")!;
       expect(line.split("L").length).toBeGreaterThan(80);
     }
-    expect(document.querySelectorAll("section[data-kpi] [data-numeric]")).toHaveLength(4);
+    // Three snapshot numbers; the DNS tile says Off while the filter is off.
+    expect(document.querySelectorAll("section[data-kpi] [data-numeric]")).toHaveLength(3);
   });
 
   it("an empty history says so instead of drawing nothing", async () => {
@@ -316,7 +365,8 @@ describe("home states", () => {
     expect(within(chart()).getByRole("alert")).toHaveTextContent(/scenario error/);
     const tiles = screen.getByRole("group", { name: "Right now" });
     expect(tiles.textContent).not.toMatch(/\d/);
-    expect(within(tiles).getAllByText("No data")).toHaveLength(4);
+    // The three snapshot tiles; the DNS tile does not depend on the snapshot source.
+    expect(within(tiles).getAllByText("No data")).toHaveLength(3);
     expect(within(screen.getByRole("region", { name: "Top apps" })).getByRole("alert")).toBeInTheDocument();
   });
 

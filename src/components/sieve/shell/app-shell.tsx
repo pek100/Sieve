@@ -6,6 +6,7 @@ import type { Runtime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { useThemeSync } from "@/hooks/use-theme";
 import { NoticeToaster } from "./notice-toaster";
+import { QuitDialog } from "./quit-dialog";
 import { TopBar } from "./top-bar";
 
 function ThemeSync() {
@@ -24,6 +25,7 @@ export function AppShell({ children, runtime }: { children: ReactNode; runtime?:
           {children}
         </div>
         <NoticeToaster />
+        <QuitDialog />
       </TooltipProvider>
     </SieveProvider>
   );

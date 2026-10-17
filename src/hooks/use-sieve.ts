@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useMemo, useSyncExternalStore } from "react";
+import type { DnsSlice } from "@/core/dns";
 import type { Notice } from "@/core/notices";
+import type { DnsController } from "@/data/dns-controller";
 import { ceiling, type Level } from "@/core/policy";
 import { readValue } from "@/core/settings/document";
 import { isSettingKey, type SettingKey, type SettingValue } from "@/core/settings/registry";
@@ -37,18 +39,33 @@ export function useSwitchOn(): (key: string) => boolean {
   return useCallback((k: string) => isSettingKey(k) && readValue(doc, k) === true, [doc]);
 }
 
+/** Whether a data switch's live check passed this session; rerenders when one passes or is forgotten. */
+export function useCheckPassed(): (key: string) => boolean {
+  const { passedChecks } = useRuntime();
+  const version = useSyncExternalStore(passedChecks.subscribe, passedChecks.version, passedChecks.version);
+  // `version` is the dependency that makes a new function on every change.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  return useCallback((k: string) => passedChecks.has(k), [passedChecks, version]);
+}
+
 /** The highest per-app level reachable now (from data switches and passed live checks). */
 export function useLevelCeiling(): Level {
-  const { settings, passedChecks } = useRuntime();
+  const { settings } = useRuntime();
   const doc = useSyncExternalStore(settings.subscribe, settings.doc, settings.doc);
-  return useMemo(
-    () =>
-      ceiling(
-        (k) => isSettingKey(k) && readValue(doc, k) === true,
-        (k) => passedChecks.has(k),
-      ),
-    [doc, passedChecks],
-  );
+  const passed = useCheckPassed();
+  return useMemo(() => ceiling((k) => isSettingKey(k) && readValue(doc, k) === true, passed), [doc, passed]);
+}
+
+const selectDns = (s: SieveState): DnsSlice => s.dns;
+
+/** The DNS filter's state (owner: the DNS controller). */
+export function useDns(): DnsSlice {
+  return useSieve(selectDns);
+}
+
+/** The DNS controller's actions (point, restore, quit answers). */
+export function useDnsActions(): DnsController {
+  return useRuntime().dnsController;
 }
 
 export function useNotices(): readonly Notice[] {

@@ -1,7 +1,7 @@
 //! Tauri commands for the DNS engine. Thin: parse the config at the
 //! boundary, hand the engine the real clock and fetcher, turn errors into
 //! strings. Starting the proxy changes nothing on the system; Windows keeps
-//! its own DNS servers until phase B points it here.
+//! its own DNS servers until the user points it here (`crate::sysdns`).
 //!
 //! - `dns_start(config?)` -> `DnsStatus` (fails when already running)
 //! - `dns_stop()` -> `DnsStatus` (stopped; a no-op when not running)
@@ -17,21 +17,28 @@ use tauri::{AppHandle, Manager, State};
 use super::engine::{Engine, EngineConfig, system_clock};
 use super::lists::{DEFAULT_LIST_URL, http_fetcher};
 use super::probe::SelfCheck;
-use super::proxy::{DEFAULT_BIND, DEFAULT_UPSTREAMS};
+use super::proxy::{DEFAULT_BINDS, DEFAULT_UPSTREAMS};
 use super::status::DnsStatus;
 
 /// The running engine, if any. Managed by Tauri (`.manage` in lib.rs).
 #[derive(Default)]
 pub struct DnsState(tokio::sync::Mutex<Option<Engine>>);
 
+impl DnsState {
+    /// The engine slot, for other commands that need the running filter (sysdns).
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, Option<Engine>> {
+        self.0.lock().await
+    }
+}
+
 /// `dns_start` argument. Every key is optional on the wire; a missing key
 /// takes the default below (the only place the defaults are spelled out).
-/// `{"bind": "127.0.0.1:53", "upstreams": ["1.1.1.1:53", "9.9.9.9"],
+/// `{"binds": ["127.0.0.1:53", "[::1]:53"], "upstreams": ["1.1.1.1:53", "9.9.9.9"],
 ///   "list_url": "https://..."}`; an upstream without a port means :53.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DnsConfig {
-    pub bind: String,
+    pub binds: Vec<String>,
     pub upstreams: Vec<String>,
     pub list_url: String,
 }
@@ -39,7 +46,7 @@ pub struct DnsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         DnsConfig {
-            bind: DEFAULT_BIND.to_owned(),
+            binds: DEFAULT_BINDS.iter().map(|s| (*s).to_owned()).collect(),
             upstreams: DEFAULT_UPSTREAMS.iter().map(|s| (*s).to_owned()).collect(),
             list_url: DEFAULT_LIST_URL.to_owned(),
         }
@@ -51,8 +58,14 @@ const DNS_PORT: u16 = 53;
 impl DnsConfig {
     /// The one normalizer for this boundary.
     pub fn resolve(self, data_dir: PathBuf) -> Result<EngineConfig, String> {
-        let bind: SocketAddr =
-            self.bind.parse().map_err(|_| format!("bind is not an ip:port: {}", self.bind))?;
+        let binds = self
+            .binds
+            .iter()
+            .map(|b| b.parse::<SocketAddr>().map_err(|_| format!("bind is not an ip:port: {b}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        if binds.is_empty() {
+            return Err("at least one listen address is needed".to_owned());
+        }
         let upstreams = self
             .upstreams
             .iter()
@@ -64,7 +77,7 @@ impl DnsConfig {
         if !self.list_url.starts_with("https://") {
             return Err(format!("list_url must be https: {}", self.list_url));
         }
-        Ok(EngineConfig { bind, upstreams, list_url: self.list_url, data_dir })
+        Ok(EngineConfig { binds, upstreams, list_url: self.list_url, data_dir })
     }
 }
 
@@ -133,7 +146,8 @@ mod tests {
         let c: DnsConfig = serde_json::from_str("{}").expect("parses");
         assert_eq!(c, DnsConfig::default());
         let e = c.resolve(PathBuf::from("x")).expect("resolves");
-        assert_eq!(e.bind, "127.0.0.1:53".parse::<SocketAddr>().expect("a"));
+        let want: Vec<SocketAddr> = ["127.0.0.1:53", "[::1]:53"].iter().map(|s| s.parse().expect("a")).collect();
+        assert_eq!(e.binds, want, "both loopback families, so Windows can point IPv4 and IPv6 here");
         assert_eq!(e.upstreams.len(), 2);
         assert_eq!(e.list_url, DEFAULT_LIST_URL);
     }
@@ -154,7 +168,8 @@ mod tests {
     #[test]
     fn bad_config_is_refused_at_the_boundary() {
         for json in [
-            r#"{"bind": "localhost:53"}"#,
+            r#"{"binds": ["localhost:53"]}"#,
+            r#"{"binds": []}"#,
             r#"{"upstreams": []}"#,
             r#"{"upstreams": ["dns.google"]}"#,
             r#"{"list_url": "http://plain.example/list.txt"}"#,
@@ -163,5 +178,6 @@ mod tests {
             assert!(c.resolve(PathBuf::from("x")).is_err(), "{json}");
         }
         assert!(serde_json::from_str::<DnsConfig>(r#"{"bnid": "x"}"#).is_err(), "typo keys are refused");
+        assert!(serde_json::from_str::<DnsConfig>(r#"{"bind": "127.0.0.1:53"}"#).is_err(), "the v1 key is refused, not ignored");
     }
 }

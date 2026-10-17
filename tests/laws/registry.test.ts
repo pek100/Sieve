@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { LEVEL_REQUIRES } from "@/core/policy";
 import { normalizeDoc, readValue } from "@/core/settings/document";
 import { REGISTRY, SECTIONS, SETTING_KEYS, isValidValue, settingDef, type SettingDef } from "@/core/settings/registry";
-import { hits, walk } from "./files";
+import { hits, read, walk } from "./files";
 
 const defs = SETTING_KEYS.map((k) => [k, settingDef(k)] as const);
 const isDataSwitch = (key: string) => (REGISTRY as Record<string, SettingDef>)[key]?.kind === "dataSwitch";
@@ -18,6 +18,20 @@ describe("registry law", () => {
       if (def.kind !== "dataSwitch") continue;
       expect(def.default, key).toBe(false);
       expect(def.liveCheck, key).toMatch(/^live_[a-z0-9_]+$/);
+    }
+  });
+
+  it("a working data switch's live check is an ignored Rust test of that name; an unavailable one says why", () => {
+    const rust = walk("src-tauri/src", [".rs"]).map(read).join("\n");
+    for (const [key, def] of defs) {
+      if (def.kind !== "dataSwitch") continue;
+      const declared = new RegExp(`#\\[ignore[^\\]]*\\]\\s*(?:#\\[[^\\]]*\\]\\s*)*async fn ${def.liveCheck}\\(|#\\[ignore[^\\]]*\\]\\s*fn ${def.liveCheck}\\(`);
+      if (def.unavailable) {
+        expect(def.unavailable.length, key).toBeGreaterThan(20);
+        expect(rust, key).not.toMatch(new RegExp(`fn ${def.liveCheck}\\(`));
+      } else {
+        expect(rust, key).toMatch(declared);
+      }
     }
   });
 
@@ -61,7 +75,7 @@ describe("registry law", () => {
     }
   });
 
-  it("UI code never names a data switch key: it reads the key from LEVEL_REQUIRES or `requires`", () => {
+  it("UI code never names a data switch key: it reads it from LEVEL_REQUIRES, `requires` or src/core/dns.ts", () => {
     const switches = defs.filter(([, d]) => d.kind === "dataSwitch").map(([k]) => k);
     const files = walk("src/components", [".ts", ".tsx"]).filter((f) => !f.endsWith(".test.ts") && !f.endsWith(".test.tsx"));
     const re = new RegExp(`["'\`](${switches.map((k) => k.replace(".", "\\.")).join("|")})["'\`]`);

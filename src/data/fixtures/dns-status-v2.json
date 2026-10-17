@@ -1,0 +1,19 @@
+{
+  "v": 2,
+  "running": true,
+  "binds": ["127.0.0.1:53", "[::1]:53"],
+  "started_at": 1800000000000,
+  "upstreams": ["1.1.1.1:53", "9.9.9.9:53"],
+  "counters": { "queries": 120, "blocked": 14, "forwarded": 105, "failed": 1, "untracked": 0 },
+  "last_error": null,
+  "list": {
+    "url": "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt",
+    "fetched_at": 1800000000000,
+    "rules": 51234,
+    "allow": 812,
+    "skipped": 97,
+    "user_rules": true,
+    "error": null
+  },
+  "top_blocked": [{ "domain": "doubleclick.net", "count": 9 }]
+}

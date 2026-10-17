@@ -1,6 +1,7 @@
 /**
  * The desktop seam: what only the Tauri shell can do for the window. The tray
- * (state out, Pause/Resume in) and launch at startup (tauri-plugin-autostart).
+ * (state out, Pause/Resume/Quit in), launch at startup (tauri-plugin-autostart),
+ * the window's close request and quitting the app.
  * The browser and tests have no desktop (null) or inject a fake.
  */
 import { invoke } from "@tauri-apps/api/core";
@@ -14,6 +15,13 @@ export interface Desktop {
     isEnabled(): Promise<boolean>;
     set(on: boolean): Promise<void>;
   };
+  /**
+   * Subscribe to the window's close (close button, Alt+F4). `hold` returning
+   * true keeps the window open. Resolves to the unsubscribe.
+   */
+  onCloseRequested(hold: () => boolean): Promise<() => void>;
+  /** End the app (Rust `app_quit`). */
+  quit(): Promise<void>;
 }
 
 /** Event name shared with src-tauri/src/tray.rs (TRAY_EVENT). */
@@ -37,5 +45,12 @@ export function tauriDesktop(): Desktop {
         await (on ? m.enable() : m.disable());
       },
     },
+    async onCloseRequested(hold) {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      return getCurrentWindow().onCloseRequested((e) => {
+        if (hold()) e.preventDefault();
+      });
+    },
+    quit: () => invoke("app_quit"),
   };
 }

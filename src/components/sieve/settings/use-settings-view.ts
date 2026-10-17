@@ -8,13 +8,14 @@ import { REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, settingDef, type Sectio
 import { planImport, resetPlan, searchSettings, type ImportPlan } from "@/core/settings/transfer";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useHydrated } from "@/hooks/use-hydrated";
-import { useSwitchOn } from "@/hooks/use-sieve";
+import { useCheckPassed, useSwitchOn } from "@/hooks/use-sieve";
 
 /** Why a setting cannot be changed here and now. */
 export type Lock =
-  | { kind: "liveCheck"; check: string; neededBy: string[] }
+  | { kind: "unavailable"; reason: string; check: string; neededBy: string[] }
   | { kind: "desktop" }
-  | { kind: "requires"; label: string };
+  /** `checking`: the switch it needs is on but its live check has not passed (yet). */
+  | { kind: "requires"; label: string; checking: boolean };
 
 export interface SettingsView {
   doc: SettingsDoc;
@@ -42,10 +43,11 @@ function neededBy(key: string): string[] {
  * toast with Undo (notice bus).
  */
 export function useSettingsView(query: string): SettingsView {
-  const { settings, notices, passedChecks, isTauri } = useRuntime();
+  const { settings, notices, isTauri } = useRuntime();
   const doc = useSyncExternalStore(settings.subscribe, settings.doc, settings.doc);
   const hydrated = useHydrated();
   const switchOn = useSwitchOn();
+  const passed = useCheckPassed();
 
   const sections = useMemo(() => {
     const hits = new Set(searchSettings(query));
@@ -60,14 +62,21 @@ export function useSettingsView(query: string): SettingsView {
   const lockOf = useCallback(
     (key: SettingKey): Lock | null => {
       const d = settingDef(key);
-      if (d.kind === "dataSwitch" && !passedChecks.has(key)) return { kind: "liveCheck", check: d.liveCheck, neededBy: neededBy(key) };
+      if (d.kind === "dataSwitch" && d.unavailable) {
+        return { kind: "unavailable", reason: d.unavailable, check: d.liveCheck, neededBy: neededBy(key) };
+      }
       if (d.desktopOnly && !(hydrated && isTauri)) return { kind: "desktop" };
-      if (d.requires && !switchOn(d.requires)) {
-        return { kind: "requires", label: isSettingKey(d.requires) ? REGISTRY[d.requires].label : d.requires };
+      if (d.requires) {
+        const label = isSettingKey(d.requires) ? REGISTRY[d.requires].label : d.requires;
+        if (!switchOn(d.requires)) return { kind: "requires", label, checking: false };
+        // A data switch is proven by its live check; what builds on it waits for that.
+        if (isSettingKey(d.requires) && settingDef(d.requires).kind === "dataSwitch" && !passed(d.requires)) {
+          return { kind: "requires", label, checking: true };
+        }
       }
       return null;
     },
-    [passedChecks, hydrated, isTauri, switchOn],
+    [passed, hydrated, isTauri, switchOn],
   );
 
   const apply = useCallback(
@@ -97,7 +106,7 @@ export function useSettingsView(query: string): SettingsView {
         action: { label: "Undo", run: () => void settings.set(key, before as never) },
       });
     },
-    planImport: (text) => planImport(settings.doc(), text, (k) => lockOf(k)?.kind === "liveCheck"),
+    planImport: (text) => planImport(settings.doc(), text),
     resetAll: () => resetPlan(settings.doc()),
     apply,
   };

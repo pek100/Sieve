@@ -9,9 +9,12 @@
 //! - `engine`: rules + proxy + refresher as one start/status/check/stop unit.
 //! - `commands`: the Tauri commands over the engine.
 //!
-//! Nothing here changes Windows DNS settings. Pointing the system at the
-//! proxy is phase B, behind the `filtering.dns` data switch. The live check
-//! for that switch is `engine::tests::live_dns_filter_resolves_blocked_domain`.
+//! Nothing here changes Windows DNS settings: pointing the system at the
+//! proxy is `crate::sysdns`, behind the `filtering.systemDns` data switch.
+//! The live check for `filtering.dns` is
+//! `engine::tests::live_dns_filter_resolves_blocked_domain`. The filter is
+//! system wide: every lookup arrives from the DNS Client service, so the
+//! proxy never knows which app asked.
 
 pub mod commands;
 pub mod engine;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sourceOptions } from "./source";
+import { createDnsSource, sourceOptions } from "./source";
 
 describe("source choice (seam law: Tauri when present, mock forced by ?source=mock)", () => {
   it("picks tauri inside Tauri and mock in a plain browser", () => {
@@ -12,7 +12,26 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
   });
 
   it("reads seed and scenario, falling back to seed 1 and steady", () => {
-    expect(sourceOptions({ search: "?seed=7&scenario=busy", isTauri: false })).toEqual({ kind: "mock", seed: 7, scenario: "busy" });
-    expect(sourceOptions({ search: "?seed=abc&scenario=nope", isTauri: false })).toEqual({ kind: "mock", seed: 1, scenario: "steady" });
+    expect(sourceOptions({ search: "?seed=7&scenario=busy", isTauri: false })).toEqual({
+      kind: "mock",
+      seed: 7,
+      scenario: "busy",
+      dns: "off",
+      adguard: false,
+    });
+    expect(sourceOptions({ search: "?seed=abc&scenario=nope", isTauri: false })).toEqual({
+      kind: "mock",
+      seed: 1,
+      scenario: "steady",
+      dns: "off",
+      adguard: false,
+    });
+  });
+
+  it("reads the mock DNS scenario and the AdGuard flag; the DNS seam follows the source kind", () => {
+    expect(sourceOptions({ search: "?dns=running&adguard=1", isTauri: false })).toMatchObject({ dns: "running", adguard: true });
+    expect(sourceOptions({ search: "?dns=nope", isTauri: false }).dns).toBe("off");
+    expect(createDnsSource(sourceOptions({ search: "", isTauri: true })).kind).toBe("tauri");
+    expect(createDnsSource(sourceOptions({ search: "?source=mock&dns=error", isTauri: true })).kind).toBe("mock");
   });
 });

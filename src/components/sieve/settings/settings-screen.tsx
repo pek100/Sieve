@@ -7,7 +7,13 @@ import { Card } from "@/components/sieve/shell/card";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { Page } from "@/components/sieve/shell/page";
 import { Button } from "@/components/ui/button";
+import { DNS_SWITCH } from "@/core/dns";
+import { settingDef } from "@/core/settings/registry";
+import { DnsCard } from "./dns-card";
 import { SettingRow } from "./setting-row";
+
+/** The section that owns the DNS switch shows the DNS filter card under its rows. */
+const DNS_SECTION = settingDef(DNS_SWITCH).section;
 import { TransferMenu } from "./transfer-menu";
 import { useSettingsView } from "./use-settings-view";
 
@@ -16,7 +22,8 @@ import { useSettingsView } from "./use-settings-view";
  * registry, so a new setting appears here with no UI change. A rail of
  * sections on the left (a wrapping row of chips under 960 px), one column of
  * about 720 px, search across label, help, key and options, and an overflow
- * menu with export, import and reset.
+ * menu with export, import and reset. The section that owns the DNS switch
+ * also carries the DNS filter card (status, counters, list, Windows DNS).
  */
 export function SettingsScreen() {
   const [query, setQuery] = useState("");
@@ -70,6 +77,11 @@ export function SettingsScreen() {
                     ))}
                   </div>
                 </Card>
+                {s.id === DNS_SECTION && (
+                  <div className="pt-4">
+                    <DnsCard lockOf={view.lockOf} />
+                  </div>
+                )}
               </div>
             ))
           )}
