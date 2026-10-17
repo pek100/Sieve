@@ -46,7 +46,7 @@ const DAY = 86_400_000;
 function clock(ms: number, seconds = false, spanMs = 0): string {
   const d = new Date(ms);
   const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: seconds && spanMs <= DAY ? "2-digit" : undefined });
-  return spanMs > DAY ? `${d.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}` : time;
+  return spanMs > DAY ? `${d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })}, ${time}` : time;
 }
 
 /** The plot group's transform: `end` at the right edge, the window stretched across the plot. */
