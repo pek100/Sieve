@@ -21,7 +21,9 @@ export interface SegmentItem<V extends string> {
   hint?: string;
 }
 
-const track = "relative inline-grid auto-cols-fr grid-flow-col rounded-full bg-inset p-1 shadow-inset";
+// Items sit 4 px apart (gap-1) so a hover state never touches its neighbour; the thumb accounts for it.
+const GAP_PX = 4;
+const track = "relative inline-grid auto-cols-fr grid-flow-col gap-1 rounded-full bg-inset p-1 shadow-inset";
 const itemBase =
   "relative z-10 inline-flex h-8 items-center justify-center gap-2 overflow-hidden rounded-full px-4 text-label max-[640px]:px-3 whitespace-nowrap transition-colors duration-(--motion-base) ease-standard [&_svg]:size-4";
 
@@ -31,7 +33,10 @@ function Thumb({ index, count }: { index: number; count: number }) {
     <span
       aria-hidden="true"
       className="absolute top-1 bottom-1 left-1 rounded-full bg-surface-3 shadow-l2 transition-transform duration-(--motion-base) ease-standard"
-      style={{ width: `calc((100% - 8px) / ${count})`, transform: `translateX(${index * 100}%)` }}
+      style={{
+        width: `calc((100% - 8px - ${GAP_PX * (count - 1)}px) / ${count})`,
+        transform: `translateX(calc(${index * 100}% + ${index * GAP_PX}px))`,
+      }}
     />
   );
 }
