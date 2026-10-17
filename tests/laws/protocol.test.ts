@@ -8,7 +8,7 @@ import { GRAINS } from "@/core/history";
 import { parseTrayAction } from "@/core/tray";
 import { TRAY_EVENT } from "@/data/desktop";
 import historyFixture from "@/data/fixtures/history-v1.json";
-import dnsFixture from "@/data/fixtures/dns-status-v2.json";
+import dnsFixture from "@/data/fixtures/dns-status-v3.json";
 import fixture from "@/data/fixtures/snapshot-v1.json";
 import systemFixture from "@/data/fixtures/system-dns-v1.json";
 import {
@@ -77,13 +77,15 @@ describe("protocol law", () => {
     expect(ids[0][2]).toBe(`Pause ${minutes} min`);
   });
 
-  it("dns_status: the v2 fixture parses losslessly and the version matches Rust", () => {
+  it("dns_status: the v3 fixture parses losslessly and the version matches Rust", () => {
     expect(parseDnsStatus(dnsFixture)).toEqual(dnsFixture);
     const rust = read("src-tauri/src/dns/status.rs");
     expect(Number(rust.match(/pub const DNS_STATUS_VERSION: u32 = (\d+);/)?.[1])).toBe(DNS_STATUS_VERSION);
     // Rust serialises against the same file.
-    expect(rust).toContain('include_str!("../../../src/data/fixtures/dns-status-v2.json")');
-    expect(() => parseDnsStatus({ ...dnsFixture, v: 1 })).toThrow(/version 1 is not 2.*Restart Sieve/);
+    expect(rust).toContain('include_str!("../../../src/data/fixtures/dns-status-v3.json")');
+    expect(() => parseDnsStatus({ ...dnsFixture, v: 2 })).toThrow(/version 2 is not 3.*Restart Sieve/);
+    expect(() => parseDnsStatus({ ...dnsFixture, v: 2 })).toThrow(ProtocolError);
+    expect(() => parseDnsStatus({ ...dnsFixture, pass_through: "no" })).toThrow(/pass_through/);
     expect(() => parseDnsStatus({ ...dnsFixture, binds: "127.0.0.1:53" })).toThrow(/binds/);
     expect(() => parseDnsStatus({ ...dnsFixture, counters: { ...dnsFixture.counters, blocked: -1 } })).toThrow(/counters\.blocked/);
     expect(() => parseDnsStatus({ ...dnsFixture, top_blocked: [{ domain: 3, count: 1 }] })).toThrow(/top_blocked\[0\]\.domain/);

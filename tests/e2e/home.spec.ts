@@ -120,29 +120,28 @@ test.describe("home", () => {
     for (const tile of await page.locator("section[data-kpi]:not([data-dns-derived])").all()) {
       expect(await tile.getAttribute("aria-label")).toMatch(/apps|connections|hosts/i);
     }
-    await expect(page.locator('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Watched apps");
+    await expect(page.locator('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Sieved apps");
     await expect(page.locator('section[data-kpi="blocked"]')).toHaveAttribute("aria-label", "DNS filter");
   });
 
   test("the pause pill pauses until the chosen time and resume restarts sampling", async ({ page }, info) => {
     await openHome(page);
     await waitForData(page, 4);
-    const status = page.getByRole("status");
+    const status = page.locator("[data-phase]");
     await expect(status).toHaveAttribute("data-phase", "live");
     await page.getByRole("main").getByRole("button", { name: "Pause" }).click();
     await page.getByRole("menuitem", { name: "For 5 minutes" }).click();
     await expect(status).toHaveAttribute("data-phase", "paused");
-    await expect(status).toContainText(/Paused until \d/);
+    await expect(page.getByRole("status")).toContainText(/Paused until \d/);
+    // One clear visible indicator: the banner says until when; Resume is the one control.
     await expect(page.getByRole("note")).toContainText("Sampling is paused until");
-    // Resume is one control, and the status shows once per window (top bar).
+    await expect(page.getByRole("note")).toBeVisible();
     await expect(page.getByRole("button", { name: /resume/i })).toHaveCount(1);
     await expect(page.locator("[data-phase]")).toHaveCount(1);
-    // The chip says the phase in words at every width, not only by its dot colour.
-    await expect(status.locator("span:visible", { hasText: /Paused/ }).first()).toBeVisible();
-    // ...and the wider chip does not slide under the nav.
-    const nav = (await page.getByRole("navigation", { name: "Main" }).boundingBox())!;
-    const chip = (await status.boundingBox())!;
-    expect(chip.x).toBeGreaterThanOrEqual(nav.x + nav.width);
+    // No status chip in the top bar repeats it.
+    expect(await page.getByRole("banner").evaluate((bar) =>
+      [...bar.querySelectorAll("*")].filter((e) => e.childElementCount === 0 && !e.closest(".sr-only") && /Paused/.test(e.textContent ?? "")).length,
+    )).toBe(0);
     await page.screenshot({ path: `test-results/screens/home-paused-${info.project.name}.png` });
     if (info.project.name === "desktop") {
       // The banner takes its height from the grid, not from the window: still no scroll at 1280x800.
@@ -168,6 +167,41 @@ test.describe("home", () => {
     await page.getByRole("main").getByRole("button", { name: "Resume", exact: true }).click();
     await expect(status).toHaveAttribute("data-phase", "live");
     await expect(page.getByRole("note")).toHaveCount(0);
+  });
+
+  test("the chart tooltip is outside the chart: in a portal, fixed, follows the cursor, flips at the edges", async ({ page }, info) => {
+    await openHome(page);
+    await waitForData(page, 6);
+    const plot = (await page.locator("svg[data-chart-plot]").boundingBox())!;
+    const tip = page.locator("[data-chart-tooltip]");
+    // Near the plot's right edge, which is near the viewport's right edge.
+    const x1 = plot.x + plot.width - 4;
+    const y1 = plot.y + 10;
+    await page.mouse.move(x1, y1);
+    await expect(tip).toBeVisible();
+    expect(await tip.evaluate((el) => el.parentElement === document.body && getComputedStyle(el).position === "fixed")).toBe(true);
+    const vp = page.viewportSize()!;
+    let b = (await tip.boundingBox())!;
+    expect(b.x).toBeGreaterThanOrEqual(0);
+    expect(b.x + b.width).toBeLessThanOrEqual(vp.width);
+    expect(b.y + b.height).toBeLessThanOrEqual(vp.height);
+    if (x1 + 12 + b.width <= vp.width - 8) {
+      // Room on the right (desktop): it sits right of the cursor and pokes out past the plot, unclipped.
+      expect(b.x).toBeGreaterThanOrEqual(x1);
+      expect(b.x + b.width).toBeGreaterThan(plot.x + plot.width);
+    } else {
+      // No room on the right (mobile): flipped to the left of the cursor.
+      expect(b.x + b.width).toBeLessThanOrEqual(x1);
+    }
+    await page.screenshot({ path: `test-results/screens/home-tooltip-${info.project.name}.png` });
+    // It follows the cursor.
+    const x2 = plot.x + plot.width / 2;
+    await page.mouse.move(x2, y1 + 20);
+    await expect.poll(async () => (await tip.boundingBox())!.y).toBeGreaterThan(b.y);
+    b = (await tip.boundingBox())!;
+    expect(b.x <= x2 + 13 && b.x + b.width >= x2 - 13 - b.width).toBe(true);
+    await page.mouse.move(0, 0);
+    await expect(tip).toHaveCount(0);
   });
 
   test("scenario empty shows one serif line and one action", async ({ page }, info) => {

@@ -32,6 +32,8 @@ function statusLine(phase: DnsPhase, d: DnsSlice): string {
       return "Stopping...";
     case "running":
       return `Running on ${(d.status?.binds ?? []).join(" and ")}.`;
+    case "paused":
+      return "Paused while Sieving is off: lookups pass through to the upstream servers, nothing is blocked.";
     case "error":
       return "Off: the last attempt failed.";
   }
@@ -54,10 +56,7 @@ function Note({ tone, children, label }: { tone: "warning" | "error" | "info"; c
     <div
       role={tone === "error" ? "alert" : "note"}
       aria-label={label}
-      className={cn(
-        "flex items-start gap-3 rounded-md border p-3 text-label",
-        tone === "error" ? "border-blocked" : tone === "warning" ? "border-warning" : "border-outline",
-      )}
+      className="flex items-start gap-3 text-label"
     >
       <AlertTriangle
         aria-hidden="true"
@@ -80,7 +79,7 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 
 function Stat({ label, value, id }: { label: string; value: string; id: string }) {
   return (
-    <div className="flex min-w-0 flex-col gap-1 rounded-md bg-surface-2 p-3" data-stat={id}>
+    <div className="flex min-w-0 flex-col gap-1" data-stat={id}>
       <dt className="text-label text-on-surface-muted">{label}</dt>
       <dd className="text-title tabular" data-numeric="">
         {value}
@@ -96,10 +95,10 @@ function familyText(f: FamilyDns): string {
 
 function AdapterRow({ it }: { it: InterfaceDns & { uses_sieve: boolean } }) {
   return (
-    <li className="flex min-w-0 flex-col gap-1 rounded-md bg-surface-2 p-3" data-adapter={it.alias}>
+    <li className="flex min-w-0 flex-col gap-1 border-b border-outline py-3 last:border-b-0" data-adapter={it.alias}>
       <p className="flex flex-wrap items-center gap-2 text-body-strong">
         {it.alias}
-        {it.uses_sieve && <span className="rounded-full bg-mint-container px-2 text-caption text-on-mint-container">Uses Sieve</span>}
+        {it.uses_sieve && <span className="text-caption text-primary">Uses Sieve</span>}
       </p>
       <p className="text-label text-on-surface-muted">
         IPv4 <span className="font-mono text-mono break-all text-on-surface">{familyText(it.v4)}</span>
@@ -137,7 +136,7 @@ function Upstreams({ inUse }: { inUse: string[] | null }) {
       </p>
       <ul aria-label="Upstream servers" className="flex flex-wrap gap-2">
         {list.map((u) => (
-          <li key={u} className="flex items-center gap-1 rounded-full bg-surface-2 pl-3">
+          <li key={u} className="flex items-center gap-1">
             <span className="font-mono text-mono">{u}</span>
             <IconButton label={`Remove ${u}`} disabled={list.length <= 1} onClick={() => void setList(list.filter((x) => x !== u))}>
               <X strokeWidth={1.75} />
@@ -248,7 +247,7 @@ export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH | typeof S
         )}
 
         {running && c && (
-          <dl aria-label="Since the filter started" className="grid grid-cols-3 gap-2">
+          <dl aria-label="Since the filter started" className="grid grid-cols-3 gap-4">
             <Stat id="queries" label="Lookups" value={count(c.queries)} />
             <Stat id="blocked" label="Blocked" value={count(c.blocked)} />
             <Stat id="rate" label="Block rate" value={rate === null ? "None yet" : `${(rate * 100).toFixed(1)}%`} />
@@ -296,7 +295,7 @@ export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH | typeof S
                 : "Windows uses its own DNS servers. Pointing it at Sieve saves a backup first; Windows asks for administrator rights."}
           </p>
           {system !== null && system.interfaces.length > 0 && (
-            <ul aria-label="Network adapters" className="flex flex-col gap-2">
+            <ul aria-label="Network adapters" className="flex flex-col">
               {system.interfaces.map((it) => (
                 <AdapterRow key={`${it.index}-${it.alias}`} it={it} />
               ))}

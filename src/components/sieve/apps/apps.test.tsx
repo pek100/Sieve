@@ -1,12 +1,12 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DNS_SWITCH } from "@/core/dns";
-import { REGISTRY } from "@/core/settings/registry";
+import { GLOBAL_SWITCH } from "@/core/policy";
 import { createMockSource } from "@/data/mock-source";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "@/hooks/runtime";
 import { AppShell } from "@/components/sieve/shell/app-shell";
+import { APP_OFF_MEANS } from "./app-toggle";
 import { AppsScreen } from "./apps-screen";
 
 vi.mock("next/navigation", () => ({ usePathname: () => "/apps/" }));
@@ -57,30 +57,47 @@ describe("apps screen", () => {
     expect(within(row("quiet")).getByText("0")).toBeInTheDocument();
   });
 
-  it("sieve is disabled and says per-app filtering needs a driver Sieve does not have, even with DNS filtering on", async () => {
-    // DNS filtering on and proven does not unlock a per-app level: DNS cannot tell apps apart.
-    const { runtime } = await setup({ [DNS_SWITCH]: true });
-    await waitFor(() => expect(runtime.passedChecks.has(DNS_SWITCH)).toBe(true));
-    const reason = `Needs ${REGISTRY["filtering.perApp"].label}. ${REGISTRY["filtering.perApp"].unavailable}`;
-    const group = within(row(CHROME)).getByRole("radiogroup", { name: "Level for Google Chrome" });
-    const sieve = within(group).getByRole("radio", { name: "Sieve" });
-    expect(sieve).toBeDisabled();
-    expect(sieve).toHaveAccessibleDescription(reason);
-    expect(within(group).getByRole("radio", { name: "Watch" })).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByTestId("sieve-locked")).toHaveTextContent(reason);
-    expect(document.body.textContent).not.toMatch(/Needs DNS filtering/);
+  it("every app is sieved by default; the toggle says once, plainly, that Off cannot exempt it from DNS blocking", async () => {
+    await setup();
+    const toggle = within(row(CHROME)).getByRole("switch", { name: "Sieve Google Chrome" });
+    expect(toggle).toBeChecked();
+    expect(toggle).toHaveAccessibleDescription(APP_OFF_MEANS);
+    expect(APP_OFF_MEANS).toMatch(/stops tracking and charting/);
+    expect(APP_OFF_MEANS).toMatch(/DNS blocking still covers it/);
+    // No Watch level and no locked per-app filtering anywhere.
+    expect(document.body.textContent).not.toMatch(/Watch|network driver|Per-app filtering/);
+    expect(screen.queryAllByRole("radio")).toHaveLength(0);
   });
 
-  it("setting an app to off stores it and drops it from the being-sieved count", async () => {
+  it("turning an app off stores it and drops it from the being-sieved count", async () => {
     const { runtime, user } = await setup();
     const count = () => Number(screen.getByTestId("sieved-count").textContent?.split(" ")[0]);
-    // Freeze sampling so the count only moves because of the level.
+    // Freeze sampling so the count only moves because of the toggle.
     act(() => runtime.poller.stop());
     const before = count();
-    await user.click(within(row(CHROME)).getByRole("radio", { name: "Off" }));
+    expect(screen.getByTestId("sieved-count")).toHaveTextContent(`${before} being sieved`);
+    await user.click(within(row(CHROME)).getByRole("switch", { name: "Sieve Google Chrome" }));
     expect(runtime.settings.get("apps.levels")).toEqual({ [CHROME]: "off" });
-    expect(within(row(CHROME)).getByRole("radio", { name: "Off" })).toHaveAttribute("aria-checked", "true");
+    expect(within(row(CHROME)).getByRole("switch", { name: "Sieve Google Chrome" })).not.toBeChecked();
+    expect(row(CHROME)).toHaveAttribute("data-off");
     expect(count()).toBe(before - 1);
+    // Back on: nothing stored.
+    await user.click(within(row(CHROME)).getByRole("switch", { name: "Sieve Google Chrome" }));
+    expect(runtime.settings.get("apps.levels")).toEqual({});
+  });
+
+  it("global Sieving off: nothing is being sieved and the screen says so", async () => {
+    const { runtime } = await setup();
+    await act(async () => {
+      await runtime.settings.set(GLOBAL_SWITCH, false);
+    });
+    expect(screen.getByTestId("sieved-count")).toHaveTextContent("0 being sieved");
+    expect(screen.getByTestId("sieving-off")).toHaveTextContent("Sieving is off for every app");
+  });
+
+  it("an old Watch level reads as on; an old off stays off (settings migration)", async () => {
+    await setup({ "apps.levels": { [CHROME]: "watch", discord: "off" } });
+    expect(within(row(CHROME)).getByRole("switch")).toBeChecked();
   });
 
   it("removing a pinned app shows an undo toast, and undo restores it", async () => {
@@ -135,13 +152,13 @@ describe("apps screen", () => {
     expect(new URLSearchParams(window.location.search).get("app")).toBe(CHROME);
   });
 
-  it("reset asks first, then empties apps.levels", async () => {
-    const { runtime, user } = await setup({ "apps.levels": { [CHROME]: "off" } });
+  it("bulk: turn every app off, then sieve every app again, each with undo", async () => {
+    const { runtime, user } = await setup();
     await user.click(screen.getByRole("button", { name: "More app actions" }));
-    await user.click(await screen.findByRole("menuitem", { name: "Reset levels" }));
-    const dialog = await screen.findByRole("dialog", { name: "Reset every app to watch?" });
-    expect(runtime.settings.get("apps.levels")).toEqual({ [CHROME]: "off" });
-    await user.click(within(dialog).getByRole("button", { name: "Reset levels" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Turn every app off" }));
+    expect(runtime.settings.get("apps.levels")[CHROME]).toBe("off");
+    await user.click(screen.getByRole("button", { name: "More app actions" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Sieve every app" }));
     expect(runtime.settings.get("apps.levels")).toEqual({});
   });
 

@@ -1,39 +1,25 @@
 "use client";
 
-import { useCallback, useMemo } from "react";
-import {
-  levelOf,
-  listApps,
-  pin,
-  resetLevels,
-  setLevel,
-  sievedCount,
-  stopAll,
-  unpin,
-  watchAll,
-  type AppEntry,
-} from "@/core/apps-actions";
+import { useMemo } from "react";
+import { listApps, offAll, pin, setAppState, sieveAll, sievedCount, unpin, type AppEntry } from "@/core/apps-actions";
 import { exeStem } from "@/core/apps";
-import { lockedReason as lockedReasonFor, type Level } from "@/core/policy";
-import { isSettingKey, settingDef, unavailableReason } from "@/core/settings/registry";
+import { isAppOn } from "@/core/policy";
 import { newest, phase, type Phase } from "@/core/store";
 import { useRuntime } from "@/hooks/sieve-provider";
-import { useLevelCeiling, useSetting, useSieve, useSwitchOn } from "@/hooks/use-sieve";
+import { useSetting, useSieve, useTracking } from "@/hooks/use-sieve";
 
 export interface AppsModel {
   apps: AppEntry[];
   phase: Phase;
   error: string | null;
-  /** Highest level reachable now. */
-  top: Level;
+  /** The global Sieving switch. */
+  globalOn: boolean;
   sievedNow: number;
-  levelOf: (key: string) => Level;
-  /** Why a level above the ceiling is not available, or null when it is. */
-  lockedReason: (level: Level) => string | null;
-  setLevel: (key: string, level: Level) => void;
-  watchAll: () => void;
-  stopAll: () => void;
-  resetLevels: () => void;
+  /** The user has not turned this app off (the global switch is shown on its own). */
+  isOn: (key: string) => boolean;
+  setOn: (key: string, on: boolean) => void;
+  sieveAll: () => void;
+  offAll: () => void;
   pin: (path: string) => void;
   unpin: (key: string) => void;
 }
@@ -49,54 +35,37 @@ export function useApps(): AppsModel {
   const snapshot = useSieve(newest);
   const p = useSieve(phase);
   const error = useSieve((s) => s.status.error);
-  const [levels, writeLevels] = useSetting("apps.levels");
+  const { globalOn, states } = useTracking();
+  const [, writeStates] = useSetting("apps.levels");
   const [pinned, writePinned] = useSetting("apps.pinned");
-  const switchOn = useSwitchOn();
-  const top = useLevelCeiling();
 
+  // The list is the whole snapshot (an app turned off must stay listed to be turned back on).
   const apps = useMemo(() => listApps(snapshot, pinned), [snapshot, pinned]);
-  const sievedNow = useMemo(() => sievedCount(snapshot, levels, top), [snapshot, levels, top]);
-
-  // The switch a level needs is whatever LEVEL_REQUIRES names; its label comes from the registry.
-  const lockedReason = useCallback(
-    (level: Level) =>
-      lockedReasonFor(level, top, switchOn, (k) => (isSettingKey(k) ? settingDef(k).label : k), unavailableReason),
-    [top, switchOn],
-  );
+  const sievedNow = useMemo(() => sievedCount(snapshot, states, globalOn), [snapshot, states, globalOn]);
 
   // Writers read the latest stored value at call time, so undo after other edits stays correct.
-  const levelsNow = useCallback(() => settings.get("apps.levels"), [settings]);
-  const pinnedNow = useCallback(() => settings.get("apps.pinned"), [settings]);
-
-  const undoLevels = useCallback(
-    (text: string, before: ReturnType<typeof levelsNow>) =>
-      notices.push({ kind: "info", text, action: { label: "Undo", run: () => void writeLevels(before) } }),
-    [notices, writeLevels],
-  );
+  const statesNow = () => settings.get("apps.levels");
+  const pinnedNow = () => settings.get("apps.pinned");
+  const undoStates = (text: string, before: ReturnType<typeof statesNow>) =>
+    notices.push({ kind: "info", text, action: { label: "Undo", run: () => void writeStates(before) } });
 
   return {
     apps,
     phase: p,
     error,
-    top,
+    globalOn,
     sievedNow,
-    levelOf: (key) => levelOf(levels, key, top),
-    lockedReason,
-    setLevel: (key, level) => void writeLevels(setLevel(levelsNow(), key, level, top)),
-    watchAll: () => {
-      const before = levelsNow();
-      void writeLevels(watchAll(before));
-      undoLevels("Every app is watched", before);
+    isOn: (key) => isAppOn(states, key),
+    setOn: (key, on) => void writeStates(setAppState(statesNow(), key, on ? "sieve" : "off")),
+    sieveAll: () => {
+      const before = statesNow();
+      void writeStates(sieveAll());
+      undoStates("Every app is sieved", before);
     },
-    stopAll: () => {
-      const before = levelsNow();
-      void writeLevels(stopAll(before, apps.map((a) => a.key)));
-      undoLevels("Stopped watching every app", before);
-    },
-    resetLevels: () => {
-      const before = levelsNow();
-      void writeLevels(resetLevels());
-      undoLevels("Levels reset to watch", before);
+    offAll: () => {
+      const before = statesNow();
+      void writeStates(offAll(before, apps.map((a) => a.key)));
+      undoStates("Every app is off", before);
     },
     pin: (path) => {
       const before = pinnedNow();

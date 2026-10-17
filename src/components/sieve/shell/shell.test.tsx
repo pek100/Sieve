@@ -39,7 +39,30 @@ describe("app shell (seam law: shell renders ROUTES and binds the master switch 
     await userEvent.click(screen.getByRole("switch", { name: "Sieving" }));
     expect(runtime.settings.get("sampling.enabled")).toBe(false);
     expect(runtime.store.getState().status.running).toBe(false);
-    expect(screen.getByRole("status")).toHaveAttribute("data-phase", "off");
+    // The phase lives on the master switch; there is no separate status chip.
+    expect(document.querySelectorAll("[data-phase]")).toHaveLength(1);
+    expect(document.querySelector("[data-phase]")).toHaveAttribute("data-phase", "off");
+    expect(screen.getByRole("status")).toHaveTextContent("Off");
+    expect(screen.queryByText("Live")).toBeNull();
+  });
+
+  it("no Live chip: while live the top bar shows the switch, and the phase is spoken only", async () => {
+    const { runtime } = setup();
+    await act(async () => {
+      await runtime.settings.ready;
+    });
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("Live");
+    expect(status.className).toContain("sr-only");
+  });
+
+  it("the logo is the Sieve mark: a ring with its mesh lines clipped inside, in the mint primary", () => {
+    setup();
+    const svg = screen.getByRole("banner").querySelector("svg.text-primary")!;
+    expect(svg.querySelectorAll("line")).toHaveLength(3);
+    const clip = svg.querySelector("clipPath")!.id;
+    expect(svg.querySelector("g")!.getAttribute("clip-path")).toBe(`url(#${clip})`);
+    expect(clip).toMatch(/^[a-zA-Z0-9_-]+$/);
   });
 
   it("gives every icon-only button an accessible name", () => {

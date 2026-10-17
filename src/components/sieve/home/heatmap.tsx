@@ -35,7 +35,6 @@ export function Heatmap({
     <Card
       title="When apps are busy"
       icon={<CalendarDays strokeWidth={1.75} />}
-      dense
       className={className}
       state={base}
       action={<span className="text-caption text-on-surface-muted">{caption}</span>}

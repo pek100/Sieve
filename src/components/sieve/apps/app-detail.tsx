@@ -1,6 +1,6 @@
 "use client";
 
-import { Check, Copy, Info, Trash2 } from "lucide-react";
+import { Check, Copy, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { Button } from "@/components/ui/button";
@@ -10,7 +10,7 @@ import { isActiveFlow } from "@/core/apps";
 import type { AppEntry } from "@/core/apps-actions";
 import type { Flow } from "@/data/protocol";
 import { CATEGORY_LABEL, type RowActions } from "./app-list";
-import { LevelControl } from "./level-control";
+import { AppToggle, APP_OFF_MEANS } from "./app-toggle";
 import { Monogram } from "./monogram";
 
 const MAX_ROWS = 40;
@@ -53,7 +53,7 @@ function CopyPath({ path }: { path: string }) {
         if (timer.current) clearTimeout(timer.current);
         timer.current = setTimeout(() => setCopied(false), 1500);
       }}
-      className="relative flex min-h-11 w-full items-center gap-3 overflow-hidden rounded-sm bg-inset px-3 py-2 text-left shadow-inset"
+      className="relative flex min-h-11 w-full items-center gap-3 overflow-hidden rounded-sm py-2 text-left"
     >
       <span className="min-w-0 flex-1 font-mono text-mono break-all text-on-surface">{path}</span>
       {copied ? (
@@ -80,11 +80,11 @@ function ConnectionsTable({ flows }: { flows: Flow[] }) {
   const shown = sorted.slice(0, MAX_ROWS);
   if (flows.length === 0) return <p className="text-body text-on-surface-faint">No sockets open right now.</p>;
   return (
-    <div className="overflow-hidden rounded-md bg-surface-2">
+    <div>
       <table className="w-full table-fixed text-body" aria-label="Connections">
         <thead>
           <tr className="h-9 text-left text-label text-on-surface-muted">
-            <th scope="col" className="px-3 font-medium">Host</th>
+            <th scope="col" className="pr-3 font-medium">Host</th>
             <th scope="col" className="w-16 px-2 font-medium">Proto</th>
             <th scope="col" className="w-24 px-3 font-medium">State</th>
           </tr>
@@ -92,7 +92,7 @@ function ConnectionsTable({ flows }: { flows: Flow[] }) {
         <tbody>
           {shown.map((f, i) => (
             <tr key={`${f.proto}-${f.local.port}-${host(f)}-${i}`} data-testid="connection-row" className="h-11 border-t border-outline">
-              <td className="truncate px-3 font-mono text-mono text-on-surface" data-testid="host">
+              <td className="truncate pr-3 font-mono text-mono text-on-surface" data-testid="host">
                 {host(f)}
               </td>
               <td className="px-2 text-label text-on-surface-muted uppercase">{f.proto}</td>
@@ -102,7 +102,7 @@ function ConnectionsTable({ flows }: { flows: Flow[] }) {
         </tbody>
       </table>
       {sorted.length > MAX_ROWS && (
-        <p className="border-t border-outline px-3 py-2 text-caption text-on-surface-faint">
+        <p className="border-t border-outline py-2 text-caption text-on-surface-faint">
           {sorted.length - MAX_ROWS} more not shown
         </p>
       )}
@@ -128,25 +128,18 @@ function RemoteHosts({ flows }: { flows: Flow[] }) {
 }
 
 function Detail({ app, actions }: { app: AppEntry; actions: RowActions }) {
-  const level = actions.levelOf(app.key);
-  const locked = actions.lockedReason("sieve");
+  const on = actions.isOn(app.key);
   const pids = app.pids.length;
   return (
     <div className="flex flex-col gap-6 overflow-y-auto px-5 pb-6">
-      <Section title="Level">
-        <LevelControl
-          appName={app.name}
-          value={level}
-          lockedReason={actions.lockedReason}
-          onChange={(l) => actions.setLevel(app.key, l)}
-          className="w-full"
-        />
-        {locked && (
-          <p className="flex items-center gap-2 text-label text-on-surface-muted" data-testid="sieve-locked">
-            <Info className="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" />
-            Sieve: {locked}.
-          </p>
-        )}
+      <Section title="Sieve">
+        <div className="flex items-center gap-3">
+          <AppToggle appName={app.name} on={on} onChange={(v) => actions.setOn(app.key, v)} />
+          <span className="text-body text-on-surface">{on ? "On" : "Off"}</span>
+        </div>
+        <p className="text-label text-on-surface-muted" data-testid="app-off-means">
+          {APP_OFF_MEANS}
+        </p>
       </Section>
 
       <Section title={app.exes.length === 1 ? "Path" : "Paths"}>

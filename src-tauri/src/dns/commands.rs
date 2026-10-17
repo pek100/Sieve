@@ -5,8 +5,10 @@
 //!
 //! - `dns_start(config?)` -> `DnsStatus` (fails when already running)
 //! - `dns_stop()` -> `DnsStatus` (stopped; a no-op when not running)
-//! - `dns_status()` -> `DnsStatus` (see `status.rs` for the v1 shape)
+//! - `dns_status()` -> `DnsStatus` (see `status.rs` for the shape)
 //! - `dns_self_check()` -> `SelfCheck` (fails when not running)
+//! - `dns_set_pass_through(on)` -> `DnsStatus` (forward everything, block
+//!   nothing, while the global Sieving switch is off; fails when not running)
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -135,6 +137,14 @@ pub async fn dns_self_check(state: State<'_, DnsState>) -> Result<SelfCheck, Str
     let slot = state.0.lock().await;
     let engine = slot.as_ref().ok_or("DNS filter is not running")?;
     Ok(engine.self_check().await)
+}
+
+#[tauri::command]
+pub async fn dns_set_pass_through(state: State<'_, DnsState>, on: bool) -> Result<DnsStatus, String> {
+    let slot = state.0.lock().await;
+    let engine = slot.as_ref().ok_or("DNS filter is not running")?;
+    engine.set_pass_through(on);
+    Ok(engine.status())
 }
 
 #[cfg(test)]

@@ -57,7 +57,7 @@ test.describe("history periods", () => {
     // Back to a live window: the ring, not history (few samples again), KPIs never left live.
     await pickWindow(page, info, "5 min");
     await expect.poll(() => vertices(page), { timeout: 5_000 }).toBeLessThan(60);
-    await expect(page.getByRole("status")).toHaveAttribute("data-phase", "live");
+    await expect(page.locator("[data-phase]")).toHaveAttribute("data-phase", "live");
     expect(errors).toEqual([]);
   });
 

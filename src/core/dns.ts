@@ -58,7 +58,7 @@ export function isUpstream(raw: string): boolean {
   return false;
 }
 
-export type DnsBusy = "start" | "check" | "stop" | "point" | "restore";
+export type DnsBusy = "start" | "check" | "stop" | "point" | "restore" | "pass";
 
 export interface DnsSlice {
   /** Newest dns_status answer; null before the first read. */
@@ -87,21 +87,22 @@ export const EMPTY_DNS: DnsSlice = {
   quitAsked: false,
 };
 
-export type DnsPhase = "off" | "starting" | "checking" | "running" | "stopping" | "error";
+/** `paused`: running in pass-through (the global Sieving switch is off): it answers, forwards everything, blocks nothing. */
+export type DnsPhase = "off" | "starting" | "checking" | "running" | "paused" | "stopping" | "error";
 
 /** What the DNS card says about the filter, derived, never stored. */
 export function dnsPhase(d: DnsSlice): DnsPhase {
   if (d.busy === "start") return "starting";
   if (d.busy === "check") return "checking";
   if (d.busy === "stop") return "stopping";
-  if (d.status?.running) return "running";
+  if (d.status?.running) return d.status.pass_through ? "paused" : "running";
   if (d.error !== null) return "error";
   return "off";
 }
 
-/** The filter answers lookups now. Only then may copy say "blocked". */
+/** The filter answers lookups and blocks now (running, not passing through). Only then may copy say "blocked". */
 export function isFiltering(d: Pick<DnsSlice, "status">): boolean {
-  return d.status?.running === true;
+  return d.status?.running === true && !d.status.pass_through;
 }
 
 /** Blocked share of all lookups, 0 to 1; null before the first lookup. */

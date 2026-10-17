@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createMockSource } from "@/data/mock-source";
 import type { History } from "@/data/protocol";
-import { GRAINS, grainFor, historySeries, hourActivity, periodQuery } from "./history";
+import { GRAINS, grainFor, historySeries, hourActivity, periodQuery, trackedHistory } from "./history";
 import { MAX_POINTS, OTHER_KEY, SERIES_COUNT } from "./series";
 
 const MIN = 60_000;
@@ -92,5 +92,16 @@ describe("history folds", () => {
       expect(m.points.length).toBeLessThanOrEqual(MAX_POINTS);
       expect(m.points.every((p, i) => i === 0 || p.t > m.points[i - 1].t)).toBe(true);
     }
+  });
+});
+
+describe("trackedHistory", () => {
+  it("leaves out apps turned off; samples stay, so the gap is not read as zero activity", () => {
+    const hist = h([[0, 2]], [[0, "a", 4], [0, "b", 2]]);
+    const out = trackedHistory(hist, new Set(["a"]));
+    expect(out.apps.map((x) => x.app)).toEqual(["b"]);
+    expect(out.samples).toEqual(hist.samples);
+    expect(historySeries(out, { periodMs: HOUR }).series.map((x) => x.key)).toEqual(["b"]);
+    expect(trackedHistory(hist, new Set())).toBe(hist);
   });
 });

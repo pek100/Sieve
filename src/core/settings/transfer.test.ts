@@ -31,7 +31,7 @@ describe("settings export and import", () => {
   it("refuses unknown keys, invalid values and turning on any data switch, keeping the current value", () => {
     const file = JSON.stringify({
       kind: EXPORT_KIND,
-      schema: 1,
+      schema: 2,
       values: {
         "appearance.theme": "neon",
         "nope.key": true,
@@ -89,8 +89,10 @@ describe("settings search and words", () => {
     expect(searchSettings("")).toEqual(SETTING_KEYS);
     expect(searchSettings("theme")).toEqual(["appearance.theme"]);
     expect(searchSettings("LIGHT")).toEqual(["appearance.theme"]);
-    expect(searchSettings("dns")).toEqual(["filtering.dns", "filtering.upstreams", "filtering.systemDns"]);
-    expect(searchSettings("per-app filtering")).toEqual(["filtering.perApp"]);
+    // The global switch's help says what it does to DNS filtering, so it is found too.
+    expect(searchSettings("dns")).toEqual(["sampling.enabled", "filtering.dns", "filtering.upstreams", "filtering.systemDns"]);
+    expect(searchSettings("per-app filtering")).toEqual([]);
+    expect(searchSettings("turned off")).toEqual(["apps.levels"]);
     expect(searchSettings("startup")).toEqual(["startup.launchAtLogin"]);
     expect(searchSettings("sample every")).toEqual(["sampling.intervalMs"]);
     expect(searchSettings("zzzz")).toEqual([]);
@@ -101,7 +103,8 @@ describe("settings search and words", () => {
     expect(formatNumber(500, "ms")).toBe("500 ms");
     expect(formatValue("appearance.theme", "dark")).toBe("Dark");
     expect(formatValue("filtering.dns", false)).toBe("Off");
-    expect(formatValue("apps.levels", { a: "off", b: "off" })).toBe("2 apps set");
+    expect(formatValue("apps.levels", { a: "off", b: "off" })).toBe("2 apps");
+    expect(formatValue("apps.levels", {})).toBe("None");
     expect(formatValue("apps.pinned", [])).toBe("None");
     expect(formatValue("filtering.upstreams", ["1.1.1.1", "9.9.9.9"])).toBe("1.1.1.1, 9.9.9.9");
     const choices = numberChoices("sampling.intervalMs");

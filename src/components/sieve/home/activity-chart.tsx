@@ -1,6 +1,7 @@
 "use client";
 
 import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import { niceCeiling, stackSeries, type SeriesModel } from "@/core/series";
 import { cn } from "@/lib/utils";
 import { seriesTone } from "./series-tone";
@@ -45,6 +46,26 @@ function clock(ms: number, seconds = false, spanMs = 0): string {
 export function plotTransform(lastT: number, origin: number, baseMs: number, viewMs: number): { tx: number; scale: number } {
   const scale = baseMs / viewMs;
   return { tx: W - (lastT - origin) * (W / baseMs) * scale, scale };
+}
+
+/** Gap between the cursor and the tooltip, and the least room kept to the viewport edge. */
+const TIP_GAP = 12;
+const TIP_EDGE = 8;
+
+/**
+ * Where a tooltip of size (w, h) goes for a pointer at (x, y) in a viewport
+ * of (vw, vh): right of and below the cursor, flipped to the left or above
+ * when it would leave the viewport, and never closer than TIP_EDGE to an edge.
+ */
+export function tooltipPosition(x: number, y: number, w: number, h: number, vw: number, vh: number): { left: number; top: number } {
+  let left = x + TIP_GAP;
+  if (left + w > vw - TIP_EDGE) left = x - TIP_GAP - w;
+  let top = y + TIP_GAP;
+  if (top + h > vh - TIP_EDGE) top = y - TIP_GAP - h;
+  return {
+    left: Math.max(TIP_EDGE, Math.min(left, vw - TIP_EDGE - w)),
+    top: Math.max(TIP_EDGE, Math.min(top, vh - TIP_EDGE - h)),
+  };
 }
 
 export function ActivityChart({
@@ -97,6 +118,17 @@ export function ActivityChart({
 
   // Crosshair: the pointer's fraction across the plot, mapped to the nearest bucket each render.
   const [hoverF, setHoverF] = useState<number | null>(null);
+  // The pointer in viewport coordinates: the tooltip follows it, in a portal with fixed
+  // positioning, so neither the plot nor any parent's overflow can clip it.
+  const pointer = useRef({ x: 0, y: 0 });
+  const tipRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const tip = tipRef.current;
+    if (!tip) return;
+    const { left, top } = tooltipPosition(pointer.current.x, pointer.current.y, tip.offsetWidth, tip.offsetHeight, window.innerWidth, window.innerHeight);
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
+  });
   const hover = useMemo(() => {
     if (hoverF === null || pts.length === 0) return null;
     const t = lastT - (1 - hoverF) * model.windowMs;
@@ -117,10 +149,18 @@ export function ActivityChart({
   return (
     <div className={cn("flex min-h-0 flex-col gap-2", className)}>
       <div
-        className="relative min-h-0 flex-1 overflow-hidden rounded-md bg-inset shadow-inset"
+        className="relative min-h-0 flex-1 overflow-hidden border-b border-outline"
         onPointerMove={(e) => {
           const r = e.currentTarget.getBoundingClientRect();
+          pointer.current = { x: e.clientX, y: e.clientY };
           if (r.width > 0) setHoverF(Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)));
+          // Same bucket, new spot: move the tooltip without a render.
+          const tip = tipRef.current;
+          if (tip) {
+            const p = tooltipPosition(e.clientX, e.clientY, tip.offsetWidth, tip.offsetHeight, window.innerWidth, window.innerHeight);
+            tip.style.left = `${p.left}px`;
+            tip.style.top = `${p.top}px`;
+          }
         }}
         onPointerLeave={() => setHoverF(null)}
       >
@@ -179,25 +219,29 @@ export function ActivityChart({
               className="pointer-events-none absolute inset-y-0 w-px bg-on-surface-muted"
               style={{ left: `${hover.f * 100}%` }}
             />
-            <div
-              role="tooltip"
-              className={cn(
-                "pointer-events-none absolute top-2 z-10 min-w-40 rounded-md bg-surface-3 p-3 text-label shadow-l3",
-                hover.f > 0.55 ? "-translate-x-[calc(100%+12px)]" : "translate-x-3",
-              )}
-              style={{ left: `${hover.f * 100}%` }}
-            >
-              <p className="pb-2 text-caption text-on-surface-muted tabular">{clock(pts[hover.index].t, model.bucketMs < 60_000, model.windowMs)}</p>
-              <ul className="flex flex-col gap-1">
-                {visible.map((s) => (
-                  <li key={s.key} className="flex items-center gap-2">
-                    <span aria-hidden="true" className={cn("size-2 shrink-0 rounded-full", seriesTone(s.slot).bg)} />
-                    <span className="min-w-0 flex-1 truncate text-on-surface-muted">{s.name}</span>
-                    <span className="text-on-surface tabular">{fmt1(pts[hover.index].values[s.key] ?? 0)}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
+            {/* Placed by the layout effect and the pointer handler (tooltipPosition), before paint. */}
+            {createPortal(
+              <div
+                ref={tipRef}
+                role="tooltip"
+                data-chart-tooltip=""
+                className="pointer-events-none fixed top-0 left-0 z-50 max-w-72 min-w-40 rounded-md bg-surface-3 p-3 text-label shadow-l3"
+              >
+                <p className="pb-2 text-caption text-on-surface-muted tabular">
+                  {clock(pts[hover.index].t, model.bucketMs < 60_000, model.windowMs)}
+                </p>
+                <ul className="flex flex-col gap-1">
+                  {visible.map((s) => (
+                    <li key={s.key} className="flex items-center gap-2">
+                      <span aria-hidden="true" className={cn("size-2 shrink-0 rounded-full", seriesTone(s.slot).bg)} />
+                      <span className="min-w-0 flex-1 truncate text-on-surface-muted">{s.name}</span>
+                      <span className="text-on-surface tabular">{fmt1(pts[hover.index].values[s.key] ?? 0)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>,
+              document.body,
+            )}
           </>
         )}
       </div>

@@ -2,7 +2,7 @@
 
 import { AlertCircle } from "lucide-react";
 import { Component, type ErrorInfo, type ReactNode } from "react";
-import { IconTile, type IconTileTone } from "@/components/sieve/primitives/icon-tile";
+import { SectionIcon, type SectionIconTone } from "@/components/sieve/primitives/section-icon";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { EmptyState } from "./empty-state";
@@ -14,9 +14,13 @@ export type CardState =
   | { kind: "error"; message: string };
 
 /**
- * Card (level 1): surface-1, radius 16, 20 px padding, 5% rim. Header row:
- * 40 px icon tile, title, optional action. Every card carries its own error
- * boundary, so one broken card never blanks the screen.
+ * A titled block of content, laid out flat on the page: no surface, border,
+ * elevation, radius or inner padding (the user's "no containers" rule).
+ * Header row: an optional plain icon, the title, an optional action. Every
+ * block carries its own error boundary, so one broken block never blanks the
+ * screen. It is as tall as its content; a caller that must fill a grid cell
+ * passes `className="h-full"` (Home does), never the block itself, so a
+ * block never stretches to a parent that also holds its siblings.
  */
 export function Card({
   title,
@@ -24,16 +28,14 @@ export function Card({
   tone = "neutral",
   action,
   state = { kind: "ready" },
-  dense = false,
   children,
   className,
 }: {
   title: string;
   icon?: ReactNode;
-  tone?: IconTileTone;
+  tone?: SectionIconTone;
   action?: ReactNode;
   state?: CardState;
-  dense?: boolean;
   children?: ReactNode;
   className?: string;
 }) {
@@ -41,14 +43,10 @@ export function Card({
     <section
       aria-label={title}
       aria-busy={state.kind === "loading" || undefined}
-      className={cn(
-        "flex h-full min-w-0 flex-col gap-4 rounded-lg bg-surface-1 text-on-surface shadow-l1",
-        dense ? "p-4" : "p-5",
-        className,
-      )}
+      className={cn("flex min-w-0 flex-col gap-3 text-on-surface", className)}
     >
-      <header className="flex min-h-10 flex-wrap items-center gap-3">
-        {icon && <IconTile tone={tone}>{icon}</IconTile>}
+      <header className="flex min-h-9 flex-wrap items-center gap-2">
+        {icon && <SectionIcon tone={tone}>{icon}</SectionIcon>}
         {/* flex-auto (basis = text width) so a header too narrow for title and action wraps the action to a second line */}
         <h2 className="min-w-0 flex-auto truncate text-title">{title}</h2>
         {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
@@ -62,7 +60,8 @@ export function Card({
   );
 }
 
-function CardBody({ state, children }: { state: CardState; children?: ReactNode }) {
+/** A block's body by state: skeleton, empty state, error, or the content. */
+export function CardBody({ state, children }: { state: CardState; children?: ReactNode }) {
   switch (state.kind) {
     case "loading":
       return (
@@ -82,17 +81,17 @@ function CardBody({ state, children }: { state: CardState; children?: ReactNode 
 
 export function CardError({ message }: { message: string }) {
   return (
-    <div role="alert" className="flex items-start gap-3 rounded-md border-[1.5px] border-blocked p-4 text-body">
+    <div role="alert" className="flex items-start gap-3 py-2 text-body">
       <AlertCircle className="size-5 shrink-0 text-blocked" strokeWidth={1.75} aria-hidden="true" />
       <div className="min-w-0">
-        <p className="text-body-strong text-on-surface">This card could not load</p>
+        <p className="text-body-strong text-on-surface">This could not load</p>
         <p className="break-words text-on-surface-muted">{message}</p>
       </div>
     </div>
   );
 }
 
-/** The per-card error boundary, for blocks that are not a single Card (the Home KPI tiles). */
+/** The per-block error boundary, for blocks that are not a single Card (the Home KPI tiles, the Apps list). */
 export class CardBoundary extends Component<{ title: string; children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null };
 

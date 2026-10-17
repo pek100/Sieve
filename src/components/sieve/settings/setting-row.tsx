@@ -24,13 +24,7 @@ function LockNote({ lock }: { lock: Lock }) {
     <p data-lock={lock.kind} className="flex items-start gap-2 pt-1 text-label text-on-surface-muted">
       <LockIcon aria-hidden="true" className="size-4 shrink-0 text-warning" strokeWidth={1.75} />
       <span className="min-w-0">
-        {lock.kind === "unavailable" ? (
-          <>
-            {lock.reason} Its live check <code className="font-mono text-mono break-all text-on-surface">{lock.check}</code> does not
-            exist yet.
-            {lock.neededBy.length > 0 && ` Needed by ${lock.neededBy.join(", ")}.`}
-          </>
-        ) : lock.kind === "desktop" ? (
+        {lock.kind === "desktop" ? (
           "Only the desktop app can change this."
         ) : lock.checking ? (
           `Needs ${lock.label} to pass its self check.`
@@ -84,11 +78,9 @@ export function SettingRow({
       break;
     case "boolean":
     case "dataSwitch": {
-      // A data switch this build cannot provide is off in force, whatever is stored.
-      const on = value === true && lock?.kind !== "unavailable";
       control = (
         <Switch
-          checked={on}
+          checked={value === true}
           disabled={disabled}
           onCheckedChange={(v) => onSet(k, v)}
           aria-labelledby={labelId}

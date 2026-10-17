@@ -17,6 +17,10 @@
 //! truncated one (it then retries over TCP itself). Sequential, not raced:
 //! a race would send every query to every upstream.
 //!
+//! Pass-through: while set (the global Sieving switch is off) every query
+//! is forwarded, blocked names too, and nothing is counted as blocked. The
+//! proxy keeps answering, so Windows DNS pointed here keeps working.
+//!
 //! Lifecycle: `Proxy::start` binds a UDP and a TCP socket on every listen
 //! address (a requested port 0 gets the same free port for UDP and TCP of
 //! that address), `stop` ends every server and every in-flight task, which
@@ -26,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -143,6 +147,8 @@ impl Stats {
 
 struct Shared {
     rules: SharedRules,
+    /// Forward everything, block nothing (see the module doc).
+    pass_through: AtomicBool,
     upstreams: Vec<SocketAddr>,
     timeout: Duration,
     stats: Stats,
@@ -182,6 +188,7 @@ impl Proxy {
         }
         let shared = Arc::new(Shared {
             rules: Arc::new(RwLock::new(Arc::new(rules))),
+            pass_through: AtomicBool::new(false),
             upstreams: config.upstreams,
             timeout: config.upstream_timeout,
             stats: Stats::default(),
@@ -216,6 +223,16 @@ impl Proxy {
 
     pub fn stats(&self) -> StatsSnapshot {
         self.shared.stats.snapshot()
+    }
+
+    /// Forward every query, blocked names too (true), or filter again (false).
+    /// Takes effect on the next query.
+    pub fn set_pass_through(&self, on: bool) {
+        self.shared.pass_through.store(on, Ordering::SeqCst);
+    }
+
+    pub fn pass_through(&self) -> bool {
+        self.shared.pass_through.load(Ordering::SeqCst)
     }
 
     /// Stops both servers and every in-flight query; the port is free when
@@ -361,7 +378,9 @@ impl Shared {
                 return formerr(query);
             }
         };
-        if let Some(name) = filterable_name(&msg) {
+        if !self.pass_through.load(Ordering::SeqCst)
+            && let Some(name) = filterable_name(&msg)
+        {
             let rules = self.rules.read().unwrap_or_else(PoisonError::into_inner).clone();
             if rules.verdict(&name) == Verdict::Block {
                 self.stats.note_blocked(&name);
@@ -845,6 +864,31 @@ pub(crate) mod tests {
         assert_eq!(s.top_blocked.len(), TOP_BLOCKED_N);
         assert_eq!(s.top_blocked[0], ("n0.example".to_owned(), 2));
         assert_eq!(lock(&stats.per_domain).len(), MAX_TRACKED_DOMAINS);
+    }
+
+    #[tokio::test]
+    async fn pass_through_forwards_a_blocked_name_and_counts_no_block() {
+        let up = FakeUpstream::start(false).await;
+        let proxy = start_with(vec![up.addr]).await;
+        let addr = proxy.local_addr();
+        warm_proxy(addr).await;
+        let before = proxy.stats();
+        let sent_before = up.udp_queries.load(Ordering::SeqCst);
+
+        proxy.set_pass_through(true);
+        assert!(proxy.pass_through());
+        let m = ask_udp(addr, "ads.sieve-test.invalid.", RecordType::A).await;
+        assert_eq!(ips(&m), vec![IpAddr::V4(FAKE_ANSWER)], "the upstream's answer, not the block answer");
+        assert_eq!(up.udp_queries.load(Ordering::SeqCst), sent_before + 1, "the blocked name reached the upstream");
+        let s = proxy.stats();
+        assert_eq!((s.blocked - before.blocked, s.forwarded - before.forwarded), (0, 1));
+
+        // Off again: the same name is blocked here, not forwarded.
+        proxy.set_pass_through(false);
+        let m = ask_udp(addr, "ads.sieve-test.invalid.", RecordType::A).await;
+        assert_eq!(ips(&m), vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)]);
+        assert_eq!(up.udp_queries.load(Ordering::SeqCst), sent_before + 1);
+        proxy.stop().await;
     }
 
     #[tokio::test]

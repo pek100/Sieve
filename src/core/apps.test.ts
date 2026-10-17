@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import fixture from "@/data/fixtures/snapshot-v1.json";
 import type { Snapshot } from "@/data/protocol";
-import { category, groupApps, isActiveFlow, isSieved } from "./apps";
+import { category, groupApps, isActiveFlow, isSieved, trackedSnapshot } from "./apps";
 
 const snapshot = fixture as Snapshot;
 
@@ -40,14 +40,31 @@ describe("isSieved", () => {
   const code = groupApps(snapshot).find((a) => a.key === "visual studio code")!;
   const system = groupApps(snapshot).find((a) => a.key === "system")!;
 
-  it("needs level watch or higher and at least one active flow", () => {
-    expect(isSieved(code, "watch")).toBe(true);
-    expect(isSieved(code, "sieve")).toBe(true);
-    expect(isSieved(code, "off")).toBe(false);
+  it("needs the app effectively on and at least one active flow", () => {
+    expect(isSieved(code, true)).toBe(true);
+    expect(isSieved(code, false)).toBe(false);
   });
 
   it("listening sockets alone do not count", () => {
     expect(system.flows.every((f) => !isActiveFlow(f))).toBe(true);
-    expect(isSieved(system, "watch")).toBe(false);
+    expect(isSieved(system, true)).toBe(false);
+  });
+});
+
+describe("trackedSnapshot (the one place per-app Off applies)", () => {
+  it("drops the processes and flows of apps turned off, by app key", () => {
+    const off = new Set(["google chrome"]);
+    const s = trackedSnapshot(snapshot, off);
+    expect(s.processes.some((p) => p.pid === 9120 || p.pid === 9188)).toBe(false);
+    expect(s.flows.some((f) => f.pid === 9120 || f.pid === 9188)).toBe(false);
+    expect(groupApps(s).map((a) => a.key)).not.toContain("google chrome");
+    // Everything else is untouched.
+    expect(s.flows.length).toBe(snapshot.flows.filter((f) => f.pid !== 9120 && f.pid !== 9188).length);
+  });
+
+  it("is the snapshot itself with nothing off, and the same object for the same off set", () => {
+    expect(trackedSnapshot(snapshot, new Set())).toBe(snapshot);
+    const off = new Set(["google chrome"]);
+    expect(trackedSnapshot(snapshot, off)).toBe(trackedSnapshot(snapshot, off));
   });
 });

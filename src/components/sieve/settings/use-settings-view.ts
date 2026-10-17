@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useMemo, useSyncExternalStore } from "react";
-import { LEVEL_REQUIRES, LEVELS } from "@/core/policy";
 import { ROUTES, type RouteDef } from "@/core/routes";
 import { readValue, type SettingsDoc } from "@/core/settings/document";
 import { REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, settingDef, type Section, type SettingKey } from "@/core/settings/registry";
@@ -12,7 +11,6 @@ import { useCheckPassed, useSwitchOn } from "@/hooks/use-sieve";
 
 /** Why a setting cannot be changed here and now. */
 export type Lock =
-  | { kind: "unavailable"; reason: string; check: string; neededBy: string[] }
   | { kind: "desktop" }
   /** `checking`: the switch it needs is on but its live check has not passed (yet). */
   | { kind: "requires"; label: string; checking: boolean };
@@ -27,13 +25,6 @@ export interface SettingsView {
   planImport: (text: string) => ImportPlan;
   resetAll: () => ReturnType<typeof resetPlan>;
   apply: (next: SettingsDoc, said: string) => void;
-}
-
-/** What needs a data switch, in words: levels (LEVEL_REQUIRES) and settings (`requires`). */
-function neededBy(key: string): string[] {
-  const levels = LEVELS.filter((l) => LEVEL_REQUIRES[l] === key).map((l) => `the ${l} level for apps`);
-  const settings = SETTING_KEYS.filter((k) => settingDef(k).requires === key).map((k) => settingDef(k).label);
-  return [...levels, ...settings];
 }
 
 /**
@@ -62,9 +53,6 @@ export function useSettingsView(query: string): SettingsView {
   const lockOf = useCallback(
     (key: SettingKey): Lock | null => {
       const d = settingDef(key);
-      if (d.kind === "dataSwitch" && d.unavailable) {
-        return { kind: "unavailable", reason: d.unavailable, check: d.liveCheck, neededBy: neededBy(key) };
-      }
       if (d.desktopOnly && !(hydrated && isTauri)) return { kind: "desktop" };
       if (d.requires) {
         const label = isSettingKey(d.requires) ? REGISTRY[d.requires].label : d.requires;

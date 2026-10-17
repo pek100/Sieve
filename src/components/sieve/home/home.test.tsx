@@ -199,8 +199,8 @@ describe("home copy and KPIs", () => {
     for (const t of group.querySelectorAll("section[data-kpi]:not([data-dns-derived])")) {
       expect(t.getAttribute("aria-label")).toMatch(/apps|connections|hosts/i);
     }
-    // The apps count is isSieved (level watch or sieve): watched apps, and its label says so.
-    expect(group.querySelector('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Watched apps");
+    // The apps count is isSieved (effectively on, with a connection): sieved apps, and its label says so.
+    expect(group.querySelector('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Sieved apps");
     const dns = group.querySelector<HTMLElement>('section[data-kpi="blocked"]')!;
     expect(dns).toHaveAttribute("aria-label", "DNS filter");
     expect(within(dns).getByText("Off")).toBeInTheDocument();
@@ -208,8 +208,10 @@ describe("home copy and KPIs", () => {
     // Numbers are shown, with a delta chip each.
     expect(within(tiles[1] as HTMLElement).getByText(/^\d+$/)).toBeInTheDocument();
     expect(tiles[1].querySelector("[data-dir]")).not.toBeNull();
-    // At most one accent container tile.
-    expect([...tiles].filter((t) => t.className.includes("bg-mint-container"))).toHaveLength(1);
+    // One accent tile, mint by its number only: no tile has a container (surface, border, elevation, radius).
+    expect([...tiles].filter((t) => t.hasAttribute("data-accent"))).toHaveLength(1);
+    expect(tiles[0].querySelector("[data-numeric]")!.className).toContain("text-primary");
+    for (const t of tiles) expect(t.className).not.toMatch(/\b(bg-|shadow-|rounded|border|p-\d)/);
   });
 
   it("law, filter on: 'blocked' appears only in the DNS-derived tile, with the filter's own count; never ads or trackers", async () => {
@@ -268,7 +270,7 @@ describe("home pause", () => {
     const st = runtime.store.getState().status;
     expect(st.pausedUntil).not.toBeNull();
     expect(screen.getByRole("note")).toHaveTextContent(/Sampling is paused until/);
-    // One control per job: Resume is the pill only, and the status chip lives in the top bar, not on Home.
+    // One control per job: Resume is the pill only; the phase lives on the top bar's master switch, not on Home.
     expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
     expect(document.querySelectorAll("[data-phase]")).toHaveLength(0);
 

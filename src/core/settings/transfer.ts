@@ -141,7 +141,7 @@ export function formatValue(key: SettingKey, value: unknown): string {
       return typeof value === "number" ? formatNumber(value, d.unit) : String(value);
     case "map": {
       const n = typeof value === "object" && value !== null ? Object.keys(value).length : 0;
-      return n === 0 ? "None set" : n === 1 ? "1 app set" : `${n} apps set`;
+      return n === 0 ? "None" : n === 1 ? "1 app" : `${n} apps`;
     }
     case "list": {
       const n = Array.isArray(value) ? value.length : 0;

@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { createPassedChecks } from "@/core/checks";
-import { DNS_POLL_MS, DNS_SWITCH, SYSTEM_DNS_SWITCH, UPSTREAMS_KEY } from "@/core/dns";
+import { DNS_POLL_MS, DNS_SWITCH, dnsPhase, isFiltering, SYSTEM_DNS_SWITCH, UPSTREAMS_KEY } from "@/core/dns";
 import { createNoticeBus } from "@/core/notices";
+import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
 import { createDnsController } from "./dns-controller";
 import { createMockDns, MOCK_PORT_BUSY, type DnsScenario } from "./dns-mock";
@@ -283,5 +284,43 @@ describe("DNS controller: AdGuard", () => {
     ctl.requestQuit();
     expect(store.getState().dns.quitAsked).toBe(false);
     undo();
+  });
+});
+
+describe("DNS controller: the global Sieving switch", () => {
+  it("off puts the running filter in pass-through instead of stopping it; on filters again", async () => {
+    const t = await setup("off", { [DNS_SWITCH]: true });
+    expect(t.dns().status?.running).toBe(true);
+    expect(dnsPhase(t.dns())).toBe("running");
+    await t.settings.set(GLOBAL_SWITCH, false);
+    await settle();
+    expect(t.count("setPassThrough")).toBe(1);
+    expect(t.count("stop")).toBe(0);
+    expect(t.dns().status).toMatchObject({ running: true, pass_through: true });
+    expect(dnsPhase(t.dns())).toBe("paused");
+    expect(isFiltering(t.dns())).toBe(false);
+    await t.settings.set(GLOBAL_SWITCH, true);
+    await settle();
+    expect(t.dns().status).toMatchObject({ running: true, pass_through: false });
+    expect(isFiltering(t.dns())).toBe(true);
+    t.undo();
+  });
+
+  it("a filter started while Sieving is off passes its self check first, then passes through", async () => {
+    const t = await setup("off", { [GLOBAL_SWITCH]: false });
+    await t.settings.set(DNS_SWITCH, true);
+    await settle();
+    expect(t.calls.filter((c) => ["start", "selfCheck", "setPassThrough"].includes(c))).toEqual(["start", "selfCheck", "setPassThrough"]);
+    expect(t.checks.has(DNS_SWITCH)).toBe(true);
+    expect(t.dns().status?.pass_through).toBe(true);
+    t.undo();
+  });
+
+  it("nothing is called while the filter is not running", async () => {
+    const t = await setup("off");
+    await t.settings.set(GLOBAL_SWITCH, false);
+    await settle();
+    expect(t.count("setPassThrough")).toBe(0);
+    t.undo();
   });
 });

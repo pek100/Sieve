@@ -53,18 +53,18 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1" };
 }
 
-export function createSource(o: SourceOptions): SieveSource {
-  return o.kind === "tauri" ? createTauriSource() : createMockSource({ seed: o.seed, scenario: o.scenario });
+/**
+ * @param untracked the app keys the user turned off, read at every sample;
+ *   the Tauri source does not save their counts. (The mock keeps no history
+ *   of its own: its history is computed, and the window filters what it shows.)
+ */
+export function createSource(o: SourceOptions, untracked: () => ReadonlySet<string>): SieveSource {
+  return o.kind === "tauri" ? createTauriSource(undefined, untracked) : createMockSource({ seed: o.seed, scenario: o.scenario });
 }
 
 /** The DNS seam follows the same choice: Tauri commands, or the mock. */
 export function createDnsSource(o: SourceOptions): DnsSource {
   return o.kind === "tauri" ? createTauriDns() : createMockDns({ seed: o.seed, scenario: o.dns, adguard: o.adguard });
-}
-
-/** Pick the source for this window. */
-export function resolveSource(env: { search: string; isTauri: boolean }): SieveSource {
-  return createSource(sourceOptions(env));
 }
 
 export function isTauriWindow(): boolean {

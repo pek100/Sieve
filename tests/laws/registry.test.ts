@@ -1,10 +1,9 @@
 /**
  * Law 4, settings registry: every data switch defaults to false and names a
  * live check; every `requires` points at a data switch; defaults are valid;
- * levels that need a switch need a data switch; settings are declared nowhere else.
+ * settings are declared nowhere else.
  */
 import { describe, expect, it } from "vitest";
-import { LEVEL_REQUIRES } from "@/core/policy";
 import { normalizeDoc, readValue } from "@/core/settings/document";
 import { REGISTRY, SECTIONS, SETTING_KEYS, isValidValue, settingDef, type SettingDef } from "@/core/settings/registry";
 import { hits, read, walk } from "./files";
@@ -21,23 +20,17 @@ describe("registry law", () => {
     }
   });
 
-  it("a working data switch's live check is an ignored Rust test of that name; an unavailable one says why", () => {
+  it("every data switch's live check is an ignored Rust test of that name", () => {
     const rust = walk("src-tauri/src", [".rs"]).map(read).join("\n");
     for (const [key, def] of defs) {
       if (def.kind !== "dataSwitch") continue;
       const declared = new RegExp(`#\\[ignore[^\\]]*\\]\\s*(?:#\\[[^\\]]*\\]\\s*)*async fn ${def.liveCheck}\\(|#\\[ignore[^\\]]*\\]\\s*fn ${def.liveCheck}\\(`);
-      if (def.unavailable) {
-        expect(def.unavailable.length, key).toBeGreaterThan(20);
-        expect(rust, key).not.toMatch(new RegExp(`fn ${def.liveCheck}\\(`));
-      } else {
-        expect(rust, key).toMatch(declared);
-      }
+      expect(rust, key).toMatch(declared);
     }
   });
 
   it("every requires points at an existing data switch", () => {
     for (const [key, def] of defs) if (def.requires) expect(isDataSwitch(def.requires), key).toBe(true);
-    for (const needs of Object.values(LEVEL_REQUIRES)) expect(isDataSwitch(needs!), needs).toBe(true);
   });
 
   it("every default is a valid value for its own entry", () => {
@@ -54,7 +47,7 @@ describe("registry law", () => {
     expect(isValidValue("apps.pinned", [{ path: "x" }])).toBe(false);
     expect(isValidValue("apps.pinned", [""])).toBe(false);
     // Through the stored document: the corrupt value is not used, the default is.
-    const doc = normalizeDoc({ schema: 1, values: { "apps.levels": { chrome: 42 }, "apps.pinned": [null] } });
+    const doc = normalizeDoc({ schema: 2, values: { "apps.levels": { chrome: 42 }, "apps.pinned": [null] } });
     expect(readValue(doc, "apps.levels")).toEqual({});
     expect(readValue(doc, "apps.pinned")).toEqual([]);
     // Every map and list declares the shape of its elements.
@@ -75,7 +68,7 @@ describe("registry law", () => {
     }
   });
 
-  it("UI code never names a data switch key: it reads it from LEVEL_REQUIRES, `requires` or src/core/dns.ts", () => {
+  it("UI code never names a data switch key: it reads it from `requires` or src/core/dns.ts", () => {
     const switches = defs.filter(([, d]) => d.kind === "dataSwitch").map(([k]) => k);
     const files = walk("src/components", [".ts", ".tsx"]).filter((f) => !f.endsWith(".test.ts") && !f.endsWith(".test.tsx"));
     const re = new RegExp(`["'\`](${switches.map((k) => k.replace(".", "\\.")).join("|")})["'\`]`);

@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 /**
- * Bento grid: 12 columns, 16 px gutter. Card widths are named by intent and
+ * Bento grid: 12 columns, 32 px gutter across and 24 px down (blocks are flat, so space separates them). Card widths are named by intent and
  * map to spans per breakpoint:
  *   >= 1280 (three): third 4, two-thirds 8, half 6, full 12
  *   960 to 1279 (two): third 6, two-thirds 12, half 6, full 12
@@ -18,7 +18,7 @@ const SPAN: Record<BentoSpan, string> = {
 };
 
 export function BentoGrid({ children, className }: { children: ReactNode; className?: string }) {
-  return <div className={cn("grid grid-cols-12 gap-4", className)}>{children}</div>;
+  return <div className={cn("grid grid-cols-12 gap-x-8 gap-y-6", className)}>{children}</div>;
 }
 
 export function BentoItem({

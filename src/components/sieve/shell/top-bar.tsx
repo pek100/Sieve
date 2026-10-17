@@ -5,7 +5,6 @@ import { usePathname } from "next/navigation";
 import { SegmentedNav } from "@/components/sieve/primitives/segmented";
 import { activeRoute, ROUTES, type RouteDef } from "@/core/routes";
 import { MasterSwitch } from "./master-switch";
-import { StatusChip } from "./status-chip";
 import { ThemeMenu } from "./theme-menu";
 import { WindowControls } from "./window-controls";
 import { Wordmark } from "./wordmark";
@@ -33,7 +32,7 @@ export function TopBar() {
     <header
       data-tauri-drag-region
       className={
-        // Under 480 the side columns stop being equal: the right cluster (status word, switch, theme)
+        // Under 480 the side columns stop being equal: the right cluster (switch, theme)
         // takes its own width and the nav centres in what is left, so nothing overlaps.
         "sticky top-0 z-40 grid h-14 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3 bg-bg px-6 max-[640px]:gap-2 max-[640px]:px-4 max-[480px]:grid-cols-[auto_minmax(0,1fr)_auto] max-[480px]:justify-items-center"
       }
@@ -43,7 +42,6 @@ export function TopBar() {
       </div>
       <SegmentedNav items={items} active={active?.href} label="Main" />
       <div data-tauri-drag-region className="flex min-w-0 items-center justify-end gap-2 max-[640px]:gap-1">
-        <StatusChip />
         <MasterSwitch />
         <ThemeMenu />
         <WindowControls />

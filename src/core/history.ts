@@ -52,6 +52,15 @@ export function periodQuery(periodMs: number, to: number): HistoryQuery {
 }
 
 /**
+ * History without the apps the user turned off (by app key), the saved-history
+ * side of apps.trackedSnapshot: counts saved before an app was turned off are
+ * left out of the chart and the heatmap too.
+ */
+export function trackedHistory(h: History, off: ReadonlySet<string>): History {
+  return off.size === 0 ? h : { ...h, apps: h.apps.filter((a) => !off.has(a.app)) };
+}
+
+/**
  * Mean active connections per hour bucket, for the heatmap: every app's flows
  * in the bucket over the bucket's samples. Buckets with no samples are left
  * out (Sieve was not sampling then), never read as zero.

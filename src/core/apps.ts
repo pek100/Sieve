@@ -5,7 +5,6 @@
  * the newest snapshot every time (S23).
  */
 import type { Flow, ProcessInfo, Snapshot } from "@/data/protocol";
-import { levelRank, type Level } from "./policy";
 
 export type Category = "mine" | "apps" | "system";
 
@@ -84,7 +83,29 @@ export function isActiveFlow(f: Flow): boolean {
   return f.remote !== null && f.state !== "listen";
 }
 
-/** "Being sieved": effective level at least watch and at least one active flow now. */
-export function isSieved(app: Pick<AppGroup, "flows">, effective: Level): boolean {
-  return levelRank(effective) >= levelRank("watch") && app.flows.some(isActiveFlow);
+/** "Being sieved": effectively on (policy.effectiveOn) and at least one active flow now. */
+export function isSieved(app: Pick<AppGroup, "flows">, on: boolean): boolean {
+  return on && app.flows.some(isActiveFlow);
+}
+
+// Snapshots are immutable once pushed; the tracked view is computed once per (snapshot, off set).
+const trackedCache = new WeakMap<Snapshot, { off: ReadonlySet<string>; out: Snapshot }>();
+
+/**
+ * What Sieve tracks of a snapshot: the snapshot without the processes (and
+ * their flows) of the apps the user turned off, by app key. The one place
+ * per-app Off is applied; the chart, the counts and the saved history all
+ * read through it. With nothing off it is the snapshot itself.
+ */
+export function trackedSnapshot(s: Snapshot, off: ReadonlySet<string>): Snapshot {
+  if (off.size === 0) return s;
+  const hit = trackedCache.get(s);
+  if (hit && hit.off === off) return hit.out;
+  const dropped = new Set(s.processes.filter((p) => off.has(appIdentity(p).key)).map((p) => p.pid));
+  const out: Snapshot =
+    dropped.size === 0
+      ? s
+      : { ...s, processes: s.processes.filter((p) => !dropped.has(p.pid)), flows: s.flows.filter((f) => !dropped.has(f.pid)) };
+  trackedCache.set(s, { off, out });
+  return out;
 }

@@ -44,16 +44,11 @@ describe("settings view (rendered from the registry)", () => {
     );
   });
 
-  it("per-app filtering is a locked switch that says why it cannot exist here, and the value in force is off", async () => {
+  it("there is no per-app filtering row: per-app DNS exemption would need a network driver", async () => {
     await setup({ schema: 1, values: { "filtering.perApp": true } });
-    const perApp = row("filtering.perApp");
-    const sw = within(perApp).getByRole("switch");
-    expect(sw).toBeDisabled();
-    expect(sw).not.toBeChecked();
-    const lock = perApp.querySelector("[data-lock=unavailable]");
-    expect(lock).toHaveTextContent(/network driver/);
-    expect(lock).toHaveTextContent(/live_per_app_filter_blocks_one_app/);
-    expect(perApp).toHaveTextContent(/Needed by the sieve level for apps/);
+    expect(document.querySelector('[data-setting="filtering.perApp"]')).toBeNull();
+    expect(document.querySelector("[data-lock=unavailable]")).toBeNull();
+    expect(row("apps.levels")).toHaveTextContent("Apps turned off");
   });
 
   it("DNS filtering is a live switch: on starts the filter and records its passed self check", async () => {
@@ -108,8 +103,6 @@ describe("settings view (rendered from the registry)", () => {
     expect(rt.settings.get("startup.launchAtLogin")).toBe(true);
     await vi.waitFor(() => expect(autostart).toEqual([true]));
     expect(within(row("startup.launchAtLogin")).getByRole("switch")).toBeChecked();
-    // An unavailable data switch stays locked in the desktop app too.
-    expect(within(row("filtering.perApp")).getByRole("switch")).toBeDisabled();
   });
 
   it("changing a control writes the setting", async () => {

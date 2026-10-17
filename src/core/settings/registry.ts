@@ -8,9 +8,10 @@
  * works on the real machine (a `live_*` test). The registry law enforces it.
  */
 import { isUpstream } from "../dns";
-import { LEVELS, type Level } from "../policy";
+import { APP_STATES, type AppState } from "../policy";
 
-export const SETTINGS_SCHEMA = 1;
+/** 2: apps.levels became on/off per app (see migrate.ts). */
+export const SETTINGS_SCHEMA = 2;
 
 /** Settings sections in the order the settings view shows them; a key's prefix is its section. */
 export const SECTIONS = [
@@ -77,8 +78,6 @@ export interface DataSwitchSetting extends Base<false | boolean> {
   kind: "dataSwitch";
   /** Name of the ignored Rust/Playwright test that proves the switch on the real machine. */
   liveCheck: string;
-  /** Why this build cannot turn the switch on, said to the user. Absent: the switch works. */
-  unavailable?: string;
 }
 
 export type SettingDef =
@@ -102,11 +101,13 @@ export const REGISTRY = {
     options: ["system", "light", "dark"],
     default: "dark",
   }),
+  // The global state (policy GLOBAL_SWITCH). Off pauses DNS blocking by
+  // passing every lookup through, so Windows DNS keeps working.
   "sampling.enabled": {
     kind: "boolean",
     section: "sampling",
     label: "Sieving",
-    help: "Read which apps have open connections, once per interval. Read only; nothing is blocked.",
+    help: "On: Sieve charts which apps talk to the network and, while DNS filtering runs, blocks listed domains. Off pauses both; lookups still go through.",
     default: true,
   } satisfies BooleanSetting,
   "sampling.intervalMs": {
@@ -131,14 +132,15 @@ export const REGISTRY = {
     default: false,
     desktopOnly: true,
   } satisfies BooleanSetting,
+  // Key name kept from schema 1 (per-app levels); only "off" entries are stored now.
   "apps.levels": {
     kind: "map",
     section: "apps",
-    label: "Per-app level",
-    help: "Off, watch or sieve, per app. Apps not listed use watch.",
-    default: {} as Readonly<Record<string, Level>>,
-    of: { type: "enum", options: LEVELS },
-  } satisfies MapSetting<Level>,
+    label: "Apps turned off",
+    help: "Apps Sieve leaves out of its charts, counts and history. Every other app is sieved.",
+    default: {} as Readonly<Record<string, AppState>>,
+    of: { type: "enum", options: APP_STATES },
+  } satisfies MapSetting<AppState>,
   "apps.pinned": {
     kind: "list",
     section: "apps",
@@ -176,16 +178,6 @@ export const REGISTRY = {
     liveCheck: "live_system_dns_points_at_sieve",
     requires: "filtering.dns",
   } satisfies DataSwitchSetting,
-  "filtering.perApp": {
-    kind: "dataSwitch",
-    section: "filtering",
-    label: "Per-app filtering",
-    help: "Filter some apps and not others: the sieve level on Apps.",
-    default: false,
-    liveCheck: "live_per_app_filter_blocks_one_app",
-    unavailable:
-      "Telling which app made a lookup needs a network driver, which Sieve does not have. DNS filtering applies to every app.",
-  } satisfies DataSwitchSetting,
 } as const;
 
 export type SettingKey = keyof typeof REGISTRY;
@@ -216,13 +208,6 @@ export function defaultValue<K extends SettingKey>(key: K): SettingValue<K> {
 
 export function isSettingKey(key: string): key is SettingKey {
   return Object.prototype.hasOwnProperty.call(REGISTRY, key);
-}
-
-/** Why this build cannot turn a data switch on (its `unavailable`), or null. */
-export function unavailableReason(key: string): string | null {
-  if (!isSettingKey(key)) return null;
-  const d = settingDef(key);
-  return d.kind === "dataSwitch" ? (d.unavailable ?? null) : null;
 }
 
 /** Does `value` have the shape the registry declares for `key`? */

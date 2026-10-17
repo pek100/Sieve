@@ -2,14 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { heatCaption, heatGrid, type HeatGrid } from "@/core/heat";
-import { historySeries, hourActivity, periodQuery, type HistoryQuery } from "@/core/history";
-import type { History } from "@/data/protocol";
+import { trackedSnapshot } from "@/core/apps";
+import { historySeries, hourActivity, periodQuery, trackedHistory, type HistoryQuery } from "@/core/history";
+import type { History, Snapshot } from "@/data/protocol";
 import { kpis, type Kpi } from "@/core/kpis";
-import { effectiveLevel, requestedLevel, type Level } from "@/core/policy";
 import { createSlotKeeper, windowSnapshots, type SeriesModel } from "@/core/series";
 import type { SieveState } from "@/core/store";
 import { useRuntime } from "@/hooks/sieve-provider";
-import { useLevelCeiling, useSetting, useSieve } from "@/hooks/use-sieve";
+import { useSieve, useTracking } from "@/hooks/use-sieve";
 
 /**
  * The chart's window choices. Live windows draw the store's snapshot ring
@@ -77,25 +77,25 @@ export function useDeclaredWindow(choice: WindowChoice) {
   useEffect(() => store.declareWindow(ms), [store, ms]);
 }
 
+/** The snapshot ring as Sieve tracks it: apps turned off left out (apps.trackedSnapshot). */
+export function useTrackedSnapshots(): readonly Snapshot[] {
+  const snapshots = useSieve(selectSnapshots);
+  const { off } = useTracking();
+  return useMemo(() => (off.size === 0 ? snapshots : snapshots.map((s) => trackedSnapshot(s, off))), [snapshots, off]);
+}
+
 /** The per-app series for the window; colours stay sticky across ticks. */
 export function useSeriesModel(ms: number): SeriesModel {
-  const snapshots = useSieve(selectSnapshots);
+  const snapshots = useTrackedSnapshots();
   const intervalMs = useSieve(selectInterval);
   const [keeper] = useState(createSlotKeeper);
   return useMemo(() => keeper.build(snapshots, { windowMs: ms, intervalMs }), [keeper, snapshots, ms, intervalMs]);
 }
 
-/** Effective level of an app, from apps.levels and the current ceiling. */
-export function useLevelOf(): (appKey: string) => Level {
-  const [levels] = useSetting("apps.levels");
-  const top = useLevelCeiling();
-  return useCallback((k: string) => effectiveLevel(requestedLevel(levels, k), top), [levels, top]);
-}
-
 export function useKpis(ms: number): Kpi[] | null {
-  const snapshots = useSieve(selectSnapshots);
-  const levelOf = useLevelOf();
-  return useMemo(() => kpis(windowSnapshots(snapshots, ms), levelOf), [snapshots, ms, levelOf]);
+  const snapshots = useTrackedSnapshots();
+  const { isOn } = useTracking();
+  return useMemo(() => kpis(windowSnapshots(snapshots, ms), isOn), [snapshots, ms, isOn]);
 }
 
 export type Loaded<T> = { kind: "loading" } | ({ kind: "ready" } & T) | { kind: "error"; message: string };
@@ -142,14 +142,17 @@ function useHistory<T>(query: ((to: number) => HistoryQuery) | null, fold: (h: H
 }
 
 const heatQuery = (to: number): HistoryQuery => ({ from: to - 28 * DAY, to, grain: "hour", step: HOUR });
-const heatFold = (h: History, q: HistoryQuery) => {
-  const grid = heatGrid(hourActivity(h));
-  return { grid, caption: heatCaption(grid, q) };
-};
-
-/** Up to four weeks of hourly activity from the source, refreshed every minute; the caption says how far back it goes. */
+/** Up to four weeks of hourly activity from the source (apps turned off left out), refreshed every minute; the caption says how far back it goes. */
 export function useHeat(): HistoryState {
-  return useHistory(heatQuery, heatFold);
+  const { off } = useTracking();
+  const fold = useCallback(
+    (h: History, q: HistoryQuery) => {
+      const grid = heatGrid(hourActivity(trackedHistory(h, off)));
+      return { grid, caption: heatCaption(grid, q) };
+    },
+    [off],
+  );
+  return useHistory(heatQuery, fold);
 }
 
 /** The chart model for a history period (24 h, 7 d, 14 d); colours stay sticky across refreshes. */
@@ -158,13 +161,14 @@ export function useHistoryModel(choice: WindowChoice): Loaded<{ model: SeriesMod
   const ms = windowMs(choice);
   const slots = useRef<Readonly<Record<string, number>>>({});
   const query = useMemo(() => (history ? (to: number) => periodQuery(ms, to) : null), [history, ms]);
+  const { off } = useTracking();
   const fold = useCallback(
     (h: History) => {
-      const model = historySeries(h, { periodMs: ms, previousSlots: slots.current });
+      const model = historySeries(trackedHistory(h, off), { periodMs: ms, previousSlots: slots.current });
       slots.current = model.slots;
       return { model };
     },
-    [ms],
+    [ms, off],
   );
   return useHistory(query, fold);
 }

@@ -8,6 +8,10 @@
  *   error. Off: dns_stop, and when Windows points at Sieve, restore first;
  *   if that restore does not happen the filter stays on (stopping it would
  *   leave Windows asking a server that is gone).
+ * - the global Sieving switch (GLOBAL_SWITCH). Off puts a running filter in
+ *   pass-through (dns_set_pass_through): it keeps answering and forwards
+ *   everything, so Windows DNS pointed here keeps working; on filters again.
+ *   The filter is never stopped for it.
  * - `filtering.systemDns` (SYSTEM_DNS_SWITCH). It mirrors Windows: on load
  *   the switch is set from what Windows does, never the other way (no UAC
  *   prompt at startup). Only a change the user makes points or restores.
@@ -33,6 +37,7 @@ import {
   type DnsSlice,
 } from "@/core/dns";
 import type { NoticeBus } from "@/core/notices";
+import { GLOBAL_SWITCH } from "@/core/policy";
 import type { SieveStore } from "@/core/store";
 import type { DnsSource } from "./dns-source";
 import type { Clock } from "./poller";
@@ -234,6 +239,20 @@ export function createDnsController(d: DnsControllerDeps): DnsController {
     return { started: false, error: why };
   };
 
+  /** Follow the global switch: pass everything through while it is off. */
+  const passThrough = async (on: boolean) => {
+    set({ busy: "pass" });
+    try {
+      set({ status: await dns.setPassThrough(on), busy: null });
+    } catch (e) {
+      set({ busy: null, error: `DNS filter could not ${on ? "pause" : "resume"} blocking: ${message(e)}` });
+      // Read back what the filter does, so the next round compares with the truth.
+      await readStatus();
+      return false;
+    }
+    return true;
+  };
+
   const restore = async (): Promise<boolean> => {
     set({ busy: "restore" });
     try {
@@ -308,11 +327,16 @@ export function createDnsController(d: DnsControllerDeps): DnsController {
       if (disposed || !loaded) return;
       const wantDns = settings.get(DNS_SWITCH);
       const wantSystem = settings.get(SYSTEM_DNS_SWITCH);
+      const wantPass = !settings.get(GLOBAL_SWITCH);
       const system = get().system;
       // Windows DNS never read: nothing to compare the system switch with.
       const pointed = system === null ? wantSystem : system.pointed;
       if (wantDns && !running()) await turnOn(false);
       else if (!wantDns && running()) await turnOff();
+      // Global Sieving off: running, but blocking nothing. A failed change stops here (no retry loop).
+      else if (running() && get().status?.pass_through !== wantPass) {
+        if (!(await passThrough(wantPass))) return;
+      }
       // Windows changed by itself: the switch follows, nothing is run.
       else if (wantSystem !== pointed && wantSystem === mirrored) await mirrorSystem(system);
       // The user flipped the switch: that is the order.

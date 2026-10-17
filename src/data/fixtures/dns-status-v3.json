@@ -1,6 +1,7 @@
 {
-  "v": 2,
+  "v": 3,
   "running": true,
+  "pass_through": false,
   "binds": ["127.0.0.1:53", "[::1]:53"],
   "started_at": 1800000000000,
   "upstreams": ["1.1.1.1:53", "9.9.9.9:53"],

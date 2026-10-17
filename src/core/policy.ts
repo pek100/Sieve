@@ -1,84 +1,47 @@
 /**
- * Per-app level (primitive B4): one ordered quantity off < watch < sieve.
- * Replaces AdGuard's three dependent switches (route, filter, HTTPS); the
- * "muted when the parent is off" rule falls out of the ordering.
+ * What Sieve does per app (primitive B4): every app is sieved unless the
+ * user turned it off, and nothing is sieved while the global Sieving switch
+ * is off. Effective = global on AND app not off.
  *
- * Effective level = min(requested, ceiling). The ceiling is derived from the
- * data switches: a level that needs a switch is reachable only when that
- * switch is on AND its live check has passed this session. A switch the
- * build cannot provide (registry `unavailable`) never passes, so the level
- * stays out of reach with the reason said.
+ * Honesty: per-app Off cannot exempt an app from DNS blocking. Windows sends
+ * every lookup through one service (the DNS Client), so a DNS filter never
+ * knows which app asked; exempting one app would need a network driver.
+ * Off means Sieve leaves the app out of its tracking: the chart, the counts
+ * and the saved history.
  */
+import type { SettingKey } from "./settings/registry";
 
-export const LEVELS = ["off", "watch", "sieve"] as const;
-export type Level = (typeof LEVELS)[number];
+export const APP_STATES = ["sieve", "off"] as const;
+export type AppState = (typeof APP_STATES)[number];
 
-/** What an app gets when the user never chose: watching is read-only and safe. */
-export const DEFAULT_LEVEL: Level = "watch";
+/** What an app gets when the user never chose. */
+export const DEFAULT_APP_STATE: AppState = "sieve";
 
 /**
- * Which data switch (settings key) each level needs. Levels absent here need nothing.
- * `sieve` filters one app and not another, so it needs per-app filtering. DNS
- * filtering cannot provide it: every Windows lookup reaches a DNS proxy
- * through the DNS Client service, so the proxy never knows which app asked.
+ * The global Sieving switch (top bar). Off pauses sampling and puts a running
+ * DNS filter into pass-through: it keeps answering, forwards everything and
+ * blocks nothing, so Windows DNS never breaks while it points at Sieve.
  */
-export const LEVEL_REQUIRES: Partial<Record<Level, string>> = {
-  sieve: "filtering.perApp",
-};
+export const GLOBAL_SWITCH = "sampling.enabled" satisfies SettingKey;
 
-export function levelRank(level: Level): number {
-  return LEVELS.indexOf(level);
+/** Stored per-app choices (settings `apps.levels`): only apps turned off are listed. */
+export type AppStates = Readonly<Record<string, AppState>>;
+
+export function appState(states: AppStates, appKey: string): AppState {
+  return states[appKey] ?? DEFAULT_APP_STATE;
 }
 
-export function minLevel(a: Level, b: Level): Level {
-  return levelRank(a) <= levelRank(b) ? a : b;
+/** The user has not turned this app off. */
+export function isAppOn(states: AppStates, appKey: string): boolean {
+  return appState(states, appKey) !== "off";
 }
 
-/**
- * The highest level currently reachable.
- * @param switchOn  whether a data switch (by settings key) is on
- * @param checkPassed whether that switch's live check passed this session
- */
-export function ceiling(
-  switchOn: (key: string) => boolean,
-  checkPassed: (key: string) => boolean,
-): Level {
-  let top: Level = LEVELS[0];
-  for (const level of LEVELS) {
-    const needs = LEVEL_REQUIRES[level];
-    if (needs !== undefined && !(switchOn(needs) && checkPassed(needs))) break;
-    top = level;
-  }
-  return top;
+/** Sieve tracks this app now: the global switch is on and the app is not off. */
+export function effectiveOn(globalOn: boolean, states: AppStates, appKey: string): boolean {
+  return globalOn && isAppOn(states, appKey);
 }
 
-/**
- * Why `level` is out of reach, or null when it is reachable. Reads the switch
- * LEVEL_REQUIRES names for that level (never a hardcoded key), so a new
- * level or a new switch gets the right words for free.
- * @param switchOn    whether a data switch (by settings key) is on
- * @param labelOf     a settings key's label
- * @param unavailable why a switch cannot be turned on in this build, or null
- */
-export function lockedReason(
-  level: Level,
-  top: Level,
-  switchOn: (key: string) => boolean,
-  labelOf: (key: string) => string,
-  unavailable: (key: string) => string | null,
-): string | null {
-  const needs = LEVEL_REQUIRES[level];
-  if (needs === undefined || levelRank(level) <= levelRank(top)) return null;
-  const label = labelOf(needs);
-  const why = unavailable(needs);
-  if (why !== null) return `Needs ${label}. ${why}`;
-  return switchOn(needs) ? `Needs ${label} to pass its live check` : `Needs ${label}, which is off`;
-}
-
-export function requestedLevel(levels: Readonly<Record<string, Level>>, appKey: string): Level {
-  return levels[appKey] ?? DEFAULT_LEVEL;
-}
-
-export function effectiveLevel(requested: Level, top: Level): Level {
-  return minLevel(requested, top);
+/** Keys of the apps the user turned off (left out of charts, counts and history). */
+export function offKeys(states: AppStates): ReadonlySet<string> {
+  return new Set(Object.entries(states).filter(([, s]) => s === "off").map(([k]) => k));
 }
