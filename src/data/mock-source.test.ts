@@ -85,6 +85,29 @@ describe("mock source (seam law: deterministic and protocol valid)", () => {
     expect((await src.history({ from: to - 86_400_000, to, grain: "hour", step: 90 * 60_000 })).samples).toEqual([]);
   });
 
+  it("history mixes apps differently over the week: work apps in office hours, leisure apps at night and weekends", async () => {
+    // Four weeks ending Monday 2026-10-12 00:00 local time.
+    const to = new Date(2026, 9, 12).getTime();
+    const h = await createMockSource({ seed: 1, now: () => to }).history({ from: to - 28 * 86_400_000, to, grain: "hour", step: 3_600_000 });
+    /** Each app's share of an hour, by app key. */
+    const mix = (day: number, hour: number) => {
+      const t = new Date(2026, 9, 12 - 7 + day, hour).getTime();
+      const rows = h.apps.filter((a) => a.t === t);
+      const total = rows.reduce((s, a) => s + a.flows, 0);
+      return new Map(rows.map((a) => [a.app, a.flows / total]));
+    };
+    const wed14 = mix(2, 14);
+    const wed21 = mix(2, 21);
+    const sat15 = mix(5, 15);
+    const wed3 = mix(2, 3);
+    expect(wed14.get("microsoft teams")!).toBeGreaterThan(4 * (wed21.get("microsoft teams") ?? 0));
+    expect(wed21.get("discord")!).toBeGreaterThan(4 * (wed14.get("discord") ?? 0));
+    expect(sat15.get("discord")!).toBeGreaterThan(4 * (sat15.get("slack") ?? 0));
+    // At night the background apps (Windows' own services, OneDrive) lead.
+    const top = [...wed3.entries()].sort((a, b) => b[1] - a[1])[0][0];
+    expect(["microsoft windows operating system", "microsoft onedrive", "google chrome"]).toContain(top);
+  });
+
   it("scenario empty has no history and error rejects", async () => {
     const q = { from: 0, to: fixedNow(), grain: "hour" as const, step: 3_600_000 };
     expect((await createMockSource({ seed: 1, scenario: "empty", now: fixedNow }).history(q)).samples).toEqual([]);
