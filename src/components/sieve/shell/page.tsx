@@ -9,6 +9,9 @@ import { cn } from "@/lib/utils";
  * optional right action; then the content, laid out on the 12 column
  * `LayoutGrid`.
  *
+ * The header row is sticky (top of the content area, 4rem tall): anything that
+ * sticks below it uses `top-[4rem]`, and in-page anchors use `scroll-mt-[4rem]`.
+ *
  * `notice`: a banner slot. At >= 1280 it sits inside the header row, between
  * the title and the action, so a banner costs no height; narrower, it wraps
  * to its own line under them. An empty slot takes no space.
@@ -46,7 +49,9 @@ export function Page({
         className,
       )}
     >
-      <div className="grid shrink-0 grid-cols-[minmax(0,1fr)_auto] grid-rows-[4rem] items-center gap-x-4 three:grid-cols-[auto_minmax(0,1fr)_auto]">
+      {/* The header row sticks to the top of the content area, so the title and actions never
+          scroll away and nothing below (a sticky rail, a long list) slides under the top bar. */}
+      <div className="sticky top-0 z-20 grid shrink-0 grid-cols-[minmax(0,1fr)_auto] grid-rows-[4rem] items-center gap-x-4 bg-bg three:grid-cols-[auto_minmax(0,1fr)_auto]">
         <div className="col-start-1 row-start-1 flex min-w-0 items-baseline gap-3">
           <h1 className="min-w-0 truncate text-title-lg text-on-surface">{title}</h1>
           {meta}
