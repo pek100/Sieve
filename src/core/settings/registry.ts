@@ -7,11 +7,20 @@
  * "dataSwitch", defaults to false and names the live check that proves it
  * works on the real machine (a `live_*` test). The registry law enforces it.
  */
-import type { Level } from "../policy";
+import { LEVELS, type Level } from "../policy";
 
 export const SETTINGS_SCHEMA = 1;
 
-export type Section = "appearance" | "sampling" | "apps" | "filtering";
+/** Settings sections in the order the settings view shows them; a key's prefix is its section. */
+export const SECTIONS = [
+  { id: "appearance", label: "Appearance" },
+  { id: "sampling", label: "Sampling" },
+  { id: "startup", label: "Startup" },
+  { id: "apps", label: "Apps" },
+  { id: "filtering", label: "Filtering" },
+] as const;
+
+export type Section = (typeof SECTIONS)[number]["id"];
 
 interface Base<T> {
   section: Section;
@@ -20,6 +29,16 @@ interface Base<T> {
   default: T;
   /** Settings key of a data switch that must be on for this one to apply. */
   requires?: string;
+  /** Only the desktop app can apply it (it talks to Windows through a Tauri plugin). */
+  desktopOnly?: boolean;
+}
+
+/** Shape of one element of a map or list setting. */
+export type ElementSpec = { type: "string" } | { type: "enum"; options: readonly string[] };
+
+export function isValidElement(spec: ElementSpec, v: unknown): boolean {
+  if (typeof v !== "string") return false;
+  return spec.type === "string" ? v.trim().length > 0 : spec.options.includes(v);
 }
 
 export interface EnumSetting<O extends string = string> extends Base<O> {
@@ -38,9 +57,13 @@ export interface NumberSetting extends Base<number> {
 }
 export interface MapSetting<V> extends Base<Readonly<Record<string, V>>> {
   kind: "map";
+  /** Shape of every value in the map. */
+  of: ElementSpec;
 }
 export interface ListSetting<V> extends Base<readonly V[]> {
   kind: "list";
+  /** Shape of every item in the list. */
+  of: ElementSpec;
 }
 export interface DataSwitchSetting extends Base<false | boolean> {
   kind: "dataSwitch";
@@ -87,12 +110,24 @@ export const REGISTRY = {
     step: 500,
     unit: "ms",
   } satisfies NumberSetting,
+  // Not a data switch: it changes no traffic, needs no admin and writes only
+  // the current user's Run entry, through tauri-plugin-autostart, when the
+  // user turns it on (declared exception, docs/conventions.md section 6).
+  "startup.launchAtLogin": {
+    kind: "boolean",
+    section: "startup",
+    label: "Launch at startup",
+    help: "Start Sieve when you sign in to Windows. Adds Sieve to your own startup apps; off removes it.",
+    default: false,
+    desktopOnly: true,
+  } satisfies BooleanSetting,
   "apps.levels": {
     kind: "map",
     section: "apps",
     label: "Per-app level",
     help: "Off, watch or sieve, per app. Apps not listed use watch.",
     default: {} as Readonly<Record<string, Level>>,
+    of: { type: "enum", options: LEVELS },
   } satisfies MapSetting<Level>,
   "apps.pinned": {
     kind: "list",
@@ -100,6 +135,7 @@ export const REGISTRY = {
     label: "My apps",
     help: "Executables you added by hand. They show under Mine even when not running.",
     default: [] as readonly string[],
+    of: { type: "string" },
   } satisfies ListSetting<string>,
   "filtering.dns": {
     kind: "dataSwitch",
@@ -153,8 +189,13 @@ export function isValidValue(key: SettingKey, value: unknown): boolean {
     case "number":
       return typeof value === "number" && Number.isFinite(value) && value >= def.min && value <= def.max;
     case "map":
-      return typeof value === "object" && value !== null && !Array.isArray(value);
+      return (
+        typeof value === "object" &&
+        value !== null &&
+        !Array.isArray(value) &&
+        Object.values(value).every((v) => isValidElement(def.of, v))
+      );
     case "list":
-      return Array.isArray(value);
+      return Array.isArray(value) && value.every((v) => isValidElement(def.of, v));
   }
 }

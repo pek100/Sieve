@@ -7,31 +7,24 @@
  */
 import type { SourceKind } from "@/core/store";
 import { createMockSource, MOCK_SCENARIOS, type MockScenario } from "./mock-source";
-import type { Snapshot } from "./protocol";
+import type { HistoryQuery } from "@/core/history";
+import type { History, Snapshot } from "./protocol";
 import { createTauriSource } from "./tauri-source";
 
 export type { SourceKind };
 
-export interface HistoryRange {
-  /** Epoch ms, inclusive. */
-  from: number;
-  /** Epoch ms, exclusive. */
-  to: number;
-}
-
-/** Activity in one clock hour: active (non-listening) flows summed over the hour's samples. */
-export interface HourBucket {
-  /** Start of the hour, epoch ms. */
-  t: number;
-  flows: number;
-}
+export type { HistoryQuery };
 
 export interface SieveSource {
   readonly kind: SourceKind;
   /** Take one sample of the machine now. Rejects on failure. */
   sample(): Promise<Snapshot>;
-  /** Hourly activity buckets in the range, oldest first. Hours with no data are omitted. */
-  history(range: HistoryRange): Promise<HourBucket[]>;
+  /**
+   * Per-app activity in [from, to) at one grain, summed into `step` buckets,
+   * oldest first. Tauri reads the persisted store; the mock computes the same
+   * shape. Rejects on failure.
+   */
+  history(query: HistoryQuery): Promise<History>;
 }
 
 export interface SourceOptions {

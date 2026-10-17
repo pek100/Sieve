@@ -7,10 +7,12 @@
  *
  * Query string: ?source=mock&seed=<n>&scenario=steady|busy|empty|error
  */
-import type { Flow, ProcessInfo, Snapshot } from "./protocol";
+import { appIdentity } from "@/core/apps";
+import { GRAINS, grainMs, type HistoryQuery } from "@/core/history";
+import type { Flow, History, ProcessInfo, Snapshot } from "./protocol";
 import { PROTOCOL_VERSION } from "./protocol";
 import { hash01, mulberry32 } from "./prng";
-import type { HistoryRange, HourBucket, SieveSource } from "./source";
+import type { SieveSource } from "./source";
 
 export const MOCK_SCENARIOS = ["steady", "busy", "empty", "error"] as const;
 export type MockScenario = (typeof MOCK_SCENARIOS)[number];
@@ -195,22 +197,59 @@ export function createMockSource({ seed, scenario = "steady", now = Date.now }: 
         flows: [...listeners, ...live.map((l) => l.flow)].map((f) => ({ ...f })),
       };
     },
-    async history(range: HistoryRange): Promise<HourBucket[]> {
+    async history(q: HistoryQuery): Promise<History> {
       if (scenario === "error") throw new Error("Mock source: scenario error (no data on purpose)");
-      if (scenario === "empty") return [];
-      const end = Math.min(range.to, now());
-      const start = Math.max(range.from, end - HISTORY_SPAN);
-      const out: HourBucket[] = [];
-      for (let t = Math.ceil(start / HOUR) * HOUR; t < end; t += HOUR) {
-        const d = new Date(t);
-        const hour = d.getHours();
-        const weekend = d.getDay() === 0 || d.getDay() === 6;
-        const day = hour >= 9 && hour < 18 ? 1 : hour >= 18 && hour < 23 ? 0.7 : hour >= 7 ? 0.4 : 0.08;
-        const base = (weekend ? 0.55 : 1) * day * 2400 * scale;
-        const noise = 0.75 + 0.5 * hash01(seed, Math.floor(t / HOUR));
-        out.push({ t, flows: Math.round(base * noise) });
-      }
-      return out;
+      return mockHistory(q, { seed, scale, now: now() });
     },
   };
+}
+
+/** Busyness of the machine at `t`, local time: office hours busiest, nights nearly idle. */
+function dayCurve(t: number): number {
+  const d = new Date(t);
+  const hour = d.getHours();
+  const weekend = d.getDay() === 0 || d.getDay() === 6;
+  const day = hour >= 9 && hour < 18 ? 1 : hour >= 18 && hour < 23 ? 0.7 : hour >= 7 ? 0.4 : 0.08;
+  return (weekend ? 0.55 : 1) * day;
+}
+
+/**
+ * The mock's persisted history, in the same shape and under the same rules
+ * as the Rust store: the grain is kept only for its retention (GRAINS), a
+ * bucket holds one sample per second, apps with no flows have no row, and
+ * buckets are summed into `step`. Four weeks deep at most; `empty` has none.
+ * Each app's mean active connections follow its live rate and lifetime,
+ * scaled by the time of day with per-hour noise.
+ */
+export function mockHistory(q: HistoryQuery, o: { seed: number; scale: number; now: number }): History {
+  const g = grainMs(q.grain);
+  const keep = GRAINS.find((x) => x.name === q.grain)?.keepMs ?? HISTORY_SPAN;
+  const out: History = { v: PROTOCOL_VERSION, grain: q.grain, step: q.step, samples: [], apps: [] };
+  if (o.scale === 0 || q.step <= 0 || q.step % g !== 0) return out;
+  const end = Math.min(q.to, o.now);
+  const start = Math.max(q.from, end - Math.min(HISTORY_SPAN, keep));
+  const ids = MOCK_APPS.map((a) => appIdentity({ pid: 0, exe: a.exe, name: a.name ?? "", product: a.product }));
+  const samples = new Map<number, number>();
+  const flows = new Map<string, { t: number; app: string; name: string; flows: number }>();
+  for (let t = Math.ceil(start / g) * g; t < end; t += g) {
+    const b = Math.floor(t / q.step) * q.step;
+    const n = g / 1000;
+    samples.set(b, (samples.get(b) ?? 0) + n);
+    const curve = dayCurve(t);
+    MOCK_APPS.forEach((app, i) => {
+      const meanLife = (app.life[0] + app.life[1]) / 2;
+      const noise = 0.75 + 0.5 * hash01(o.seed, i, Math.floor(t / HOUR));
+      const mean = app.rate * o.scale * meanLife * curve * noise;
+      const f = Math.round(mean * n);
+      if (f <= 0) return;
+      const id = ids[i];
+      const k = `${b}|${id.key}`;
+      const row = flows.get(k) ?? { t: b, app: id.key, name: id.name, flows: 0 };
+      row.flows += f;
+      flows.set(k, row);
+    });
+  }
+  out.samples = [...samples.entries()].sort(([a], [b]) => a - b).map(([t, n]) => ({ t, n }));
+  out.apps = [...flows.values()].sort((a, b) => a.t - b.t || a.app.localeCompare(b.app));
+  return out;
 }

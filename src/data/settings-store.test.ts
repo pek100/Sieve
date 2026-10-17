@@ -20,6 +20,19 @@ describe("settings store (seam law: only non-default values are stored, defaults
     expect(await backend.load()).toEqual({ schema: SETTINGS_SCHEMA, values: {} });
   });
 
+  it("replace swaps the whole document in one write, after the first load", async () => {
+    const backend = memoryBackend({ schema: SETTINGS_SCHEMA, values: { "appearance.theme": "light" } });
+    const s = createSettingsStore(backend);
+    let emits = 0;
+    s.subscribe(() => (emits += 1));
+    await s.replace({ schema: SETTINGS_SCHEMA, values: { "sampling.intervalMs": 2000 } });
+    expect(s.get("appearance.theme")).toBe("dark");
+    expect(s.get("sampling.intervalMs")).toBe(2000);
+    expect(await backend.load()).toEqual({ schema: SETTINGS_SCHEMA, values: { "sampling.intervalMs": 2000 } });
+    // One emit for the load, one for the replace.
+    expect(emits).toBe(2);
+  });
+
   it("keeps unknown keys and reads a wrong-shaped value as the default", async () => {
     const s = createSettingsStore(
       memoryBackend({ schema: SETTINGS_SCHEMA, values: { "future.key": 3, "sampling.intervalMs": "fast" } }),

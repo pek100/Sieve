@@ -12,7 +12,17 @@ import { HomeBanner } from "./home-banner";
 import { KpiBlock } from "./kpi-block";
 import { PausePill } from "./pause-pill";
 import { TopApps } from "./top-apps";
-import { useDeclaredWindow, useHeat, useKpis, useSeriesModel, useViewMs, type WindowChoice } from "./use-home";
+import {
+  isHistoryWindow,
+  liveWindow,
+  useDeclaredWindow,
+  useHeat,
+  useHistoryModel,
+  useKpis,
+  useSeriesModel,
+  useViewMs,
+  type WindowChoice,
+} from "./use-home";
 
 const selectHasData = (s: SieveState) => s.snapshots.length > 0;
 const selectError = (s: SieveState) => s.status.error;
@@ -28,11 +38,16 @@ const selectError = (s: SieveState) => s.status.error;
  */
 export function HomeScreen() {
   const [choice, setChoice] = useState<WindowChoice>("5m");
-  useDeclaredWindow(choice);
-  const view = useViewMs(choice);
-  const model = useSeriesModel(view);
+  // History periods draw persisted history; the KPIs and top apps stay on the live session.
+  const live = liveWindow(choice);
+  useDeclaredWindow(live);
+  const view = useViewMs(live);
+  const liveModel = useSeriesModel(view);
   const kpis = useKpis(view);
   const heat = useHeat();
+  const past = useHistoryModel(choice);
+  const historic = isHistoryWindow(choice);
+  const model = historic && past.kind === "ready" ? past.model : liveModel;
   const hasData = useSieve(selectHasData);
   const error = useSieve(selectError);
   // The setting, not the phase: before settings load the poller is not started yet, which is not "off".
@@ -44,8 +59,13 @@ export function HomeScreen() {
     : error !== null
       ? { kind: "error", message: `The data source failed: ${error}` }
       : { kind: "loading" };
-  const chartBase: CardState =
-    !hasData && !enabled
+  const chartBase: CardState = historic
+    ? past.kind === "ready"
+      ? { kind: "ready" }
+      : past.kind === "loading"
+        ? { kind: "loading" }
+        : { kind: "error", message: `History could not be read: ${past.message}` }
+    : !hasData && !enabled
       ? { kind: "empty", line: "Sieving is off", body: "Turn Sieving on in the top bar to see which apps are talking." }
       : base;
   const kpiPhase = hasData ? "ready" : base.kind === "loading" && enabled ? "loading" : "error";
@@ -62,7 +82,7 @@ export function HomeScreen() {
           <KpiBlock kpis={kpis} phase={kpiPhase} />
         </BentoItem>
         <BentoItem span="third" className="min-h-0">
-          <TopApps slots={model.slots} base={base} />
+          <TopApps slots={liveModel.slots} base={base} />
         </BentoItem>
         <BentoItem span="two-thirds" className="min-h-0">
           <Heatmap

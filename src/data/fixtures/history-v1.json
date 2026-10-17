@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "grain": "minute",
+  "step": 300000,
+  "samples": [
+    { "t": 1792224000000, "n": 300 },
+    { "t": 1792224300000, "n": 240 }
+  ],
+  "apps": [
+    { "t": 1792224000000, "app": "google chrome", "name": "Google Chrome", "flows": 4210 },
+    { "t": 1792224000000, "app": "pid 20012", "name": "pid 20012", "flows": 12 },
+    { "t": 1792224300000, "app": "google chrome", "name": "Google Chrome", "flows": 3980 }
+  ]
+}

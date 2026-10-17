@@ -14,5 +14,8 @@ export default defineConfig({
     exclude: ["tests/e2e/**", "node_modules/**"],
     css: false,
     restoreMocks: true,
+    // Component tests drive Radix and sonner through jsdom; on a shared, loaded machine the 5 s
+    // default timed out apps tests that pass alone in about 2 s each (wave 2, 2026-10-17).
+    testTimeout: 20_000,
   },
 });

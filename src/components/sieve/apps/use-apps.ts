@@ -14,11 +14,11 @@ import {
   type AppEntry,
 } from "@/core/apps-actions";
 import { exeStem } from "@/core/apps";
-import { LEVEL_REQUIRES, levelRank, type Level } from "@/core/policy";
-import { settingDef, type SettingKey } from "@/core/settings/registry";
+import { lockedReason as lockedReasonFor, type Level } from "@/core/policy";
+import { isSettingKey, settingDef } from "@/core/settings/registry";
 import { newest, phase, type Phase } from "@/core/store";
 import { useRuntime } from "@/hooks/sieve-provider";
-import { useLevelCeiling, useSetting, useSieve } from "@/hooks/use-sieve";
+import { useLevelCeiling, useSetting, useSieve, useSwitchOn } from "@/hooks/use-sieve";
 
 export interface AppsModel {
   apps: AppEntry[];
@@ -51,21 +51,16 @@ export function useApps(): AppsModel {
   const error = useSieve((s) => s.status.error);
   const [levels, writeLevels] = useSetting("apps.levels");
   const [pinned, writePinned] = useSetting("apps.pinned");
-  const [dnsOn] = useSetting("filtering.dns");
+  const switchOn = useSwitchOn();
   const top = useLevelCeiling();
 
   const apps = useMemo(() => listApps(snapshot, pinned), [snapshot, pinned]);
   const sievedNow = useMemo(() => sievedCount(snapshot, levels, top), [snapshot, levels, top]);
 
+  // The switch a level needs is whatever LEVEL_REQUIRES names; its label comes from the registry.
   const lockedReason = useCallback(
-    (level: Level) => {
-      const needs = LEVEL_REQUIRES[level];
-      if (!needs || levelRank(level) <= levelRank(top)) return null;
-      const label = settingDef(needs as SettingKey).label;
-      // Only one data switch exists today; its state is read for the copy.
-      return dnsOn ? `Needs ${label} to pass its live check` : `Needs ${label}, which is off`;
-    },
-    [top, dnsOn],
+    (level: Level) => lockedReasonFor(level, top, switchOn, (k) => (isSettingKey(k) ? settingDef(k).label : k)),
+    [top, switchOn],
   );
 
   // Writers read the latest stored value at call time, so undo after other edits stays correct.

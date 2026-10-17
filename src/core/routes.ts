@@ -12,6 +12,7 @@ export interface RouteDef {
 export const ROUTES: readonly RouteDef[] = [
   { href: "/", label: "Home", icon: "activity" },
   { href: "/apps", label: "Apps", icon: "app-window" },
+  { href: "/settings", label: "Settings", icon: "settings" },
 ];
 
 /** Which route a pathname belongs to (static export uses trailing slashes). */

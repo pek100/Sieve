@@ -22,6 +22,13 @@ if (!window.matchMedia) {
     }) as MediaQueryList;
 }
 
+// jsdom has no pointer capture; sonner's toast swipe calls it on pointerdown.
+if (!Element.prototype.setPointerCapture) {
+  Element.prototype.setPointerCapture = () => {};
+  Element.prototype.releasePointerCapture = () => {};
+  Element.prototype.hasPointerCapture = () => false;
+}
+
 if (!("ResizeObserver" in window)) {
   class RO {
     observe() {}

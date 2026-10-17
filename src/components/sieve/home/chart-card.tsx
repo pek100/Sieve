@@ -6,11 +6,12 @@ import { Segmented } from "@/components/sieve/primitives/segmented";
 import { StateLayer } from "@/components/sieve/primitives/state-layer";
 import { Card, type CardState } from "@/components/sieve/shell/card";
 import { Button } from "@/components/ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import type { SeriesDef, SeriesModel } from "@/core/series";
 import { cn } from "@/lib/utils";
 import { ActivityChart } from "./activity-chart";
 import { seriesTone } from "./series-tone";
-import { WINDOWS, windowMs, type WindowChoice } from "./use-home";
+import { isHistoryWindow, WINDOWS, windowMs, type WindowChoice } from "./use-home";
 
 /** Legend chips double as toggles: off shows a hollow swatch and a muted label. */
 export function ChartLegend({
@@ -80,18 +81,25 @@ export function ChartCard({
     base.kind !== "ready"
       ? base
       : model.series.length === 0
-        ? {
-            kind: "empty",
-            line: "Nothing is talking right now",
-            body: "No app holds an open connection in this window.",
-            action:
-              choice !== "session" ? (
-                <Button variant="secondary" onClick={() => onChoice("session")}>
-                  Show the whole session
-                </Button>
-              ) : undefined,
-          }
+        ? isHistoryWindow(choice)
+          ? {
+              kind: "empty",
+              line: "No history for this period yet",
+              body: "Sieve keeps per-app counts while it samples. They show here once some are saved.",
+            }
+          : {
+              kind: "empty",
+              line: "Nothing is talking right now",
+              body: "No app holds an open connection in this window.",
+              action:
+                choice !== "session" ? (
+                  <Button variant="secondary" onClick={() => onChoice("session")}>
+                    Show the whole session
+                  </Button>
+                ) : undefined,
+            }
         : { kind: "ready" };
+  const items = WINDOWS.map((w) => ({ value: w.value, label: w.label }));
 
   return (
     <Card
@@ -100,12 +108,22 @@ export function ChartCard({
       tone="neutral"
       className={className}
       action={
-        <Segmented
-          label="Chart window"
-          items={WINDOWS.map((w) => ({ value: w.value, label: w.label }))}
-          value={choice}
-          onChange={onChoice}
-        />
+        <>
+          {/* Six choices fit a segmented control from 640 up; narrower, the same choice is a select. */}
+          <Segmented label="Chart window" items={items} value={choice} onChange={onChoice} className="max-[640px]:hidden" />
+          <Select value={choice} onValueChange={(v) => onChoice(v as WindowChoice)}>
+            <SelectTrigger aria-label="Chart window" className="hidden h-9 w-28 rounded-full bg-inset px-3 text-label max-[640px]:flex">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {items.map((i) => (
+                <SelectItem key={i.value} value={i.value}>
+                  {i.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </>
       }
       state={state}
     >

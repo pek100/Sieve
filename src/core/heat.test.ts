@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { createMockSource } from "@/data/mock-source";
 import { HEAT_STEPS, heatCaption, heatGrid, heatStep } from "./heat";
+import { hourActivity } from "./history";
+
+const hours = (r: { from: number; to: number }) => ({ ...r, grain: "hour" as const, step: HOUR });
 
 const HOUR = 3_600_000;
 /** Monday 2026-10-12 00:00 local time. */
@@ -37,7 +40,7 @@ describe("heat grid", () => {
   it("mock history (4 weeks) is busier on weekday afternoons than at night", async () => {
     const now = MONDAY + 28 * 24 * HOUR;
     const src = createMockSource({ seed: 1, now: () => now });
-    const g = heatGrid(await src.history({ from: now - 28 * 24 * HOUR, to: now }));
+    const g = heatGrid(hourActivity(await src.history(hours({ from: now - 28 * 24 * HOUR, to: now }))));
     expect(g.hours).toBe(28 * 24);
     expect(g.cells[2 * 24 + 14].step).toBe(3);
     expect(g.cells[2 * 24 + 3].step).toBe(1);
@@ -51,15 +54,15 @@ describe("heat caption", () => {
   it("derives from the buckets returned, never from the source kind", async () => {
     // Mock, 4 weeks: the buckets reach back to the start of the range.
     const src = createMockSource({ seed: 1, now: () => to });
-    expect(heatCaption(heatGrid(await src.history(range)), range)).toBe("Last 4 weeks");
-    // A session-only source (Tauri until persisted history): the first bucket is today.
+    expect(heatCaption(heatGrid(hourActivity(await src.history(hours(range)))), range)).toBe("Last 4 weeks");
+    // A history that started today (a fresh install): the first bucket is today.
     const session = heatGrid([{ t: to - 2 * HOUR - 20 * 60_000, flows: 10 }]);
     expect(heatCaption(session, range)).toMatch(/^Since \d/);
     // A shorter history that started on an earlier day names the day.
     const days = heatGrid([{ t: to - 3 * 24 * HOUR, flows: 10 }]);
     expect(heatCaption(days, range)).toMatch(/^Since [A-Za-z]+\.? \d/);
     expect(heatCaption(heatGrid([]), range)).toBe("No history yet");
-    expect(heatCaption(heatGrid(await src.history({ from: to - 7 * 24 * HOUR, to })), { from: to - 7 * 24 * HOUR, to })).toBe(
+    expect(heatCaption(heatGrid(hourActivity(await src.history(hours({ from: to - 7 * 24 * HOUR, to })))), { from: to - 7 * 24 * HOUR, to })).toBe(
       "Last week",
     );
   });

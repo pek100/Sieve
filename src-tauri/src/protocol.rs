@@ -125,11 +125,125 @@ pub struct Snapshot {
     pub flows: Vec<Flow>,
 }
 
+// ---------------------------------------------------------------------------
+// Persisted history (plan row 77). Mirror of the History types in
+// `src/data/protocol.ts`; the grain table is mirrored by GRAINS in
+// `src/core/history.ts` (the protocol law compares the three arrays below).
+// Fixture: `src/data/fixtures/history-v1.json`.
+
+/// Wire names of the stored grains, finest first.
+pub const GRAIN_NAMES: [&str; 3] = ["minute", "hour", "day"];
+/// Width of one bucket of each grain, ms.
+pub const GRAIN_MS: [u64; 3] = [60_000, 3_600_000, 86_400_000];
+/// How long each grain is kept, ms: 2 days of minutes, 35 days of hours, 400 days of days.
+pub const GRAIN_KEEP_MS: [u64; 3] = [172_800_000, 3_024_000_000, 34_560_000_000];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Grain {
+    Minute,
+    Hour,
+    Day,
+}
+
+impl Grain {
+    /// Every grain in GRAIN_NAMES order.
+    pub const ALL: [Grain; 3] = [Grain::Minute, Grain::Hour, Grain::Day];
+
+    pub const fn index(self) -> usize {
+        match self {
+            Grain::Minute => 0,
+            Grain::Hour => 1,
+            Grain::Day => 2,
+        }
+    }
+
+    pub const fn ms(self) -> u64 {
+        GRAIN_MS[self.index()]
+    }
+
+    pub const fn keep_ms(self) -> u64 {
+        GRAIN_KEEP_MS[self.index()]
+    }
+}
+
+/// Active (non-listening) flows of one app in one sample. App identity is
+/// decided on the TypeScript side (`appIdentity` in src/core/apps.ts), once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppCount {
+    pub app: String,
+    pub name: String,
+    pub flows: u64,
+}
+
+/// One sample folded into history: its time and the apps that had active flows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRecord {
+    pub t: u64,
+    pub apps: Vec<AppCount>,
+}
+
+/// Ask for history in [from, to) at one grain, summed into buckets `step` wide
+/// (a whole multiple of the grain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryQuery {
+    pub from: u64,
+    pub to: u64,
+    pub grain: Grain,
+    pub step: u64,
+}
+
+/// How many samples a bucket holds. A bucket with no samples is absent: no data, not zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SampleBucket {
+    pub t: u64,
+    pub n: u64,
+}
+
+/// Active flows of one app summed over a bucket's samples. Absent in a sampled bucket means 0.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppBucket {
+    pub t: u64,
+    pub app: String,
+    pub name: String,
+    pub flows: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    pub v: u32,
+    pub grain: Grain,
+    pub step: u64,
+    /// Oldest first.
+    pub samples: Vec<SampleBucket>,
+    /// Oldest first, then by app key.
+    pub apps: Vec<AppBucket>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const FIXTURE: &str = include_str!("../../src/data/fixtures/snapshot-v1.json");
+    const HISTORY_FIXTURE: &str = include_str!("../../src/data/fixtures/history-v1.json");
+
+    #[test]
+    fn history_fixture_round_trips_through_rust() {
+        let h: History = serde_json::from_str(HISTORY_FIXTURE).expect("history fixture parses");
+        assert_eq!(h.v, PROTOCOL_VERSION);
+        let original: serde_json::Value = serde_json::from_str(HISTORY_FIXTURE).expect("fixture is json");
+        assert_eq!(original, serde_json::to_value(&h).expect("serialises"));
+    }
+
+    #[test]
+    fn grain_wire_names_match_the_shared_list() {
+        for (g, name) in Grain::ALL.iter().zip(GRAIN_NAMES) {
+            assert_eq!(serde_json::to_value(g).expect("serialises"), name);
+        }
+        for g in Grain::ALL {
+            assert!(g.keep_ms() > g.ms(), "{g:?} keeps at least one bucket");
+        }
+    }
 
     #[test]
     fn fixture_round_trips_through_rust() {

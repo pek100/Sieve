@@ -45,6 +45,25 @@ export function ceiling(
   return top;
 }
 
+/**
+ * Why `level` is out of reach, or null when it is reachable. Reads the switch
+ * LEVEL_REQUIRES names for that level (never a hardcoded key), so a new
+ * level or a new switch gets the right words for free.
+ * @param switchOn whether a data switch (by settings key) is on
+ * @param labelOf  a settings key's label
+ */
+export function lockedReason(
+  level: Level,
+  top: Level,
+  switchOn: (key: string) => boolean,
+  labelOf: (key: string) => string,
+): string | null {
+  const needs = LEVEL_REQUIRES[level];
+  if (needs === undefined || levelRank(level) <= levelRank(top)) return null;
+  const label = labelOf(needs);
+  return switchOn(needs) ? `Needs ${label} to pass its live check` : `Needs ${label}, which is off`;
+}
+
 export function requestedLevel(levels: Readonly<Record<string, Level>>, appKey: string): Level {
   return levels[appKey] ?? DEFAULT_LEVEL;
 }

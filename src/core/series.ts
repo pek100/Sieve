@@ -124,17 +124,16 @@ export interface SeriesOptions {
 
 const round2 = (x: number) => Math.round(x * 100) / 100;
 
-export function buildSeries(snapshots: readonly Snapshot[], o: SeriesOptions): SeriesModel {
-  const previous = o.previousSlots ?? {};
-  const bucketMs = bucketSize(o.windowMs, o.intervalMs);
-  const ticks = windowSnapshots(snapshots, o.windowMs).map(tickCounts);
-
-  const totals = new Map<string, number>();
-  const names = new Map<string, string>();
-  for (const tick of ticks) {
-    for (const [k, n] of tick.byApp) totals.set(k, (totals.get(k) ?? 0) + n);
-    for (const [k, name] of tick.names) names.set(k, name);
-  }
+/**
+ * Who gets named: rank apps by total, keep the top SERIES_COUNT with sticky
+ * slots, fold the rest into Other. Shared by the live chart (buildSeries) and
+ * the history periods (historySeries in ./history).
+ */
+export function rankSeries(
+  totals: ReadonlyMap<string, number>,
+  names: ReadonlyMap<string, string>,
+  previous: Readonly<Record<string, number>>,
+): { series: SeriesDef[]; slots: Record<string, number>; top: ReadonlySet<string> } {
   // Rank by window total; on a tie an app that already holds a slot stays ahead.
   const ranked = [...totals.entries()]
     .filter(([, n]) => n > 0)
@@ -152,8 +151,20 @@ export function buildSeries(snapshots: readonly Snapshot[], o: SeriesOptions): S
     .map((key) => ({ key, name: names.get(key) ?? key, slot: slots[key], total: totals.get(key) ?? 0 }))
     .sort((a, b) => a.slot - b.slot);
   if (otherTotal > 0) series.push({ key: OTHER_KEY, name: "Other", slot: 0, total: otherTotal });
+  return { series, slots, top: new Set(top) };
+}
 
-  const topSet = new Set(top);
+export function buildSeries(snapshots: readonly Snapshot[], o: SeriesOptions): SeriesModel {
+  const bucketMs = bucketSize(o.windowMs, o.intervalMs);
+  const ticks = windowSnapshots(snapshots, o.windowMs).map(tickCounts);
+
+  const totals = new Map<string, number>();
+  const names = new Map<string, string>();
+  for (const tick of ticks) {
+    for (const [k, n] of tick.byApp) totals.set(k, (totals.get(k) ?? 0) + n);
+    for (const [k, name] of tick.names) names.set(k, name);
+  }
+  const { series, slots, top: topSet } = rankSeries(totals, names, o.previousSlots ?? {});
   const points: SeriesPoint[] = [];
   let i = 0;
   while (i < ticks.length) {

@@ -1,7 +1,6 @@
 "use client";
 
 import { Pause, Play } from "lucide-react";
-import { useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { phase } from "@/core/store";
@@ -14,38 +13,15 @@ export const PAUSE_CHOICES = [
   { minutes: 60, label: "For 1 hour" },
 ] as const;
 
-function clock(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
 /**
  * Pause pill: pause sampling for 5, 15 or 60 minutes through the poller, or
- * resume. While paused, a Home banner (notice bus, B7) says until when; it is
- * dismissed when sampling resumes, by hand or when the time is up.
+ * resume. It only drives the poller; the paused banner on Home is derived
+ * from status.pausedUntil (home-banner.tsx), so it is right whoever paused
+ * (this pill, the tray) and after any navigation.
  */
 export function PausePill() {
-  const { poller, notices, store } = useRuntime();
+  const { poller } = useRuntime();
   const p = useSieve(phase);
-  const banner = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (p !== "paused" && banner.current !== null) {
-      notices.dismiss(banner.current);
-      banner.current = null;
-    }
-  }, [p, notices]);
-
-  const pause = (minutes: number) => {
-    poller.pauseFor(minutes);
-    if (banner.current !== null) notices.dismiss(banner.current);
-    const until = store.getState().status.pausedUntil;
-    banner.current = notices.push({
-      kind: "info",
-      surface: "banner",
-      // No action: Resume is the pill itself, one control for one job.
-      text: `Sampling is paused${until === null ? "" : ` until ${clock(until)}`}. The chart and counts hold their last values.`,
-    });
-  };
 
   if (p === "paused") {
     return (
@@ -66,7 +42,7 @@ export function PausePill() {
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="min-w-44 rounded-md bg-surface-3 p-1 shadow-l3">
         {PAUSE_CHOICES.map((c) => (
-          <DropdownMenuItem key={c.minutes} onSelect={() => pause(c.minutes)} className="h-9 rounded-sm px-3 text-body">
+          <DropdownMenuItem key={c.minutes} onSelect={() => poller.pauseFor(c.minutes)} className="h-9 rounded-sm px-3 text-body">
             {c.label}
           </DropdownMenuItem>
         ))}

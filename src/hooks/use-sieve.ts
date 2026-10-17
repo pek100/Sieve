@@ -30,6 +30,13 @@ export function useSetting<K extends SettingKey>(key: K): [SettingValue<K>, (v: 
   return [value, set];
 }
 
+/** Whether a setting (by key) is on, for data switches named by data (LEVEL_REQUIRES, `requires`). */
+export function useSwitchOn(): (key: string) => boolean {
+  const { settings } = useRuntime();
+  const doc = useSyncExternalStore(settings.subscribe, settings.doc, settings.doc);
+  return useCallback((k: string) => isSettingKey(k) && readValue(doc, k) === true, [doc]);
+}
+
 /** The highest per-app level reachable now (from data switches and passed live checks). */
 export function useLevelCeiling(): Level {
   const { settings, passedChecks } = useRuntime();

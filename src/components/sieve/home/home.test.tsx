@@ -82,8 +82,8 @@ describe("chart view span", () => {
     expect(viewMs("5m", 0, 5000)).toBe(300_000 / 2);
   });
 
-  it("past the floor the data fills at least half the plot, for every window", () => {
-    for (const w of WINDOWS) {
+  it("past the floor the data fills at least half the plot, for every live window", () => {
+    for (const w of WINDOWS.filter((x) => !x.history)) {
       for (let span = 0; span <= w.ms * 1.5; span += 7_919) {
         const v = viewMs(w.value, span);
         expect(v).toBeLessThanOrEqual(w.ms);
@@ -228,6 +228,77 @@ describe("home pause", () => {
     expect(runtime.store.getState().status.pausedUntil).toBeNull();
     expect(screen.queryByRole("note")).toBeNull();
     expect(screen.getByRole("button", { name: "Pause" })).toBeEnabled();
+  });
+});
+
+describe("home paused banner (derived from status.pausedUntil)", () => {
+  /** Home mounted or not, as when the user navigates to Apps and back. */
+  function Routed({ home }: { home: boolean }) {
+    return home ? <HomeScreen /> : <p>elsewhere</p>;
+  }
+
+  it("shows whoever paused, survives navigating away and back, and goes on a resume made elsewhere", async () => {
+    const fc = fakeClock();
+    const runtime = createRuntime({ source: createMockSource({ seed: 1, now: fc.clock.now }), settings: memoryBackend(), clock: fc.clock });
+    const ui = (home: boolean) => (
+      <SieveProvider runtime={runtime}>
+        <Routed home={home} />
+      </SieveProvider>
+    );
+    const { rerender } = render(ui(true));
+    await act(async () => {
+      await runtime.settings.ready;
+      await fc.flush();
+    });
+    await act(() => fc.advance(3000));
+    expect(screen.queryByRole("note")).toBeNull();
+
+    // Paused by something other than the pill (the tray calls the same poller action).
+    act(() => runtime.poller.pauseFor(5));
+    expect(screen.getByRole("note")).toHaveTextContent(/Sampling is paused until/);
+
+    // Navigate away and back while paused: the banner is still there.
+    rerender(ui(false));
+    rerender(ui(true));
+    expect(screen.getByRole("note")).toHaveTextContent(/Sampling is paused until/);
+
+    // Resume while Home is not mounted, then come back: no stale banner.
+    rerender(ui(false));
+    act(() => runtime.poller.resume());
+    rerender(ui(true));
+    expect(screen.queryByRole("note")).toBeNull();
+
+    // A pause that runs out by itself takes the banner with it.
+    act(() => runtime.poller.pauseFor(5));
+    expect(screen.getByRole("note")).toBeInTheDocument();
+    await act(() => fc.advance(5 * 60_000 + 1000));
+    expect(screen.queryByRole("note")).toBeNull();
+  });
+});
+
+describe("home history periods", () => {
+  it("24 h, 7 d and 14 d draw named series from the source's history; KPIs stay live", async () => {
+    await setup("steady", 10);
+    for (const label of ["24 h", "7 d", "14 d"]) {
+      await userEvent.click(within(chart()).getByRole("radio", { name: label }));
+      await vi.waitFor(() => expect(areas().length).toBeGreaterThan(1));
+      // Hundreds of history buckets, never the 10 live samples.
+      const line = chart().querySelector('path[data-part="line"]')!.getAttribute("d")!;
+      expect(line.split("L").length).toBeGreaterThan(80);
+    }
+    expect(document.querySelectorAll("section[data-kpi] [data-numeric]")).toHaveLength(4);
+  });
+
+  it("an empty history says so instead of drawing nothing", async () => {
+    await setup("empty", 3);
+    await userEvent.click(within(chart()).getByRole("radio", { name: "7 d" }));
+    expect(await within(chart()).findByText("No history for this period yet")).toBeInTheDocument();
+  });
+
+  it("a failing history read is an error card on the chart, not a crash", async () => {
+    await setup("error", 3);
+    await userEvent.click(within(chart()).getByRole("radio", { name: "24 h" }));
+    expect(await within(chart()).findByText(/History could not be read: .*scenario error/)).toBeInTheDocument();
   });
 });
 

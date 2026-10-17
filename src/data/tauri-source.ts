@@ -5,15 +5,17 @@
  * ProtocolError that the UI shows as an error state. A Rust error is passed
  * through as is. It never pretends with empty or mock data.
  *
- * History is session only until persisted stats exist (plan row 77): the
- * source folds every sample it takes into hourly buckets.
+ * History (plan row 77) is persisted by Rust: after each good sample the
+ * source sends its per-app counts (`history_record`; app identity is decided
+ * here, by core's tickCounts, once) and reads buckets back with
+ * `history_buckets`. A failed write does not fail the sample; the next
+ * history read reports it until a write succeeds again.
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { isActiveFlow } from "@/core/apps";
-import { PROTOCOL_VERSION, ProtocolError, parseSnapshot, type Snapshot } from "./protocol";
-import type { HistoryRange, HourBucket, SieveSource } from "./source";
-
-const HOUR = 3_600_000;
+import type { HistoryQuery } from "@/core/history";
+import { tickCounts } from "@/core/series";
+import { PROTOCOL_VERSION, ProtocolError, parseHistory, parseSnapshot, type History, type HistoryRecord, type Snapshot } from "./protocol";
+import type { SieveSource } from "./source";
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
 
@@ -27,23 +29,32 @@ function checkVersion(raw: unknown): void {
   }
 }
 
+/** One snapshot as a history record: active flows per app. */
+export function historyRecord(snap: Snapshot): HistoryRecord {
+  const c = tickCounts(snap);
+  return {
+    t: snap.t,
+    apps: [...c.byApp.entries()].map(([app, flows]) => ({ app, name: c.names.get(app) ?? app, flows })),
+  };
+}
+
 export function createTauriSource(invoke: Invoke = tauriInvoke): SieveSource {
-  const hours = new Map<number, number>();
+  let writeError: string | null = null;
   return {
     kind: "tauri",
     async sample(): Promise<Snapshot> {
       const raw = await invoke<unknown>("net_snapshot");
       checkVersion(raw);
       const snap = parseSnapshot(raw);
-      const hour = Math.floor(snap.t / HOUR) * HOUR;
-      hours.set(hour, (hours.get(hour) ?? 0) + snap.flows.filter(isActiveFlow).length);
+      invoke<void>("history_record", { record: historyRecord(snap) }).then(
+        () => (writeError = null),
+        (e: unknown) => (writeError = e instanceof Error ? e.message : String(e)),
+      );
       return snap;
     },
-    async history(range: HistoryRange): Promise<HourBucket[]> {
-      return [...hours.entries()]
-        .filter(([t]) => t >= range.from && t < range.to)
-        .sort(([a], [b]) => a - b)
-        .map(([t, flows]) => ({ t, flows }));
+    async history(query: HistoryQuery): Promise<History> {
+      if (writeError !== null) throw new Error(`History is not being saved: ${writeError}`);
+      return parseHistory(await invoke<unknown>("history_buckets", { query }));
     },
   };
 }
