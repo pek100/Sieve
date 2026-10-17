@@ -191,6 +191,26 @@
 }
 
 /*
+ * The layout grid, defined once (tokens in tokens.css, primitives in
+ * components/sieve/shell/layout-grid.tsx). `page-container` is the one box
+ * the top bar, the page header and the content share, so the logo, the page
+ * title and every region start on one line and the right controls, the
+ * header actions and every region end on another. `layout-grid` is the
+ * 12 column grid inside it. A max width only ever applies here.
+ */
+@utility page-container {
+  width: 100%;
+  max-width: var(--page-max);
+  margin-inline: auto;
+  padding-inline: var(--page-pad);
+}
+@utility layout-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: var(--gutter);
+}
+
+/*
  * State layer and ripple (Material). One implementation for every pressable:
  * put <StateLayer /> as a child of a positioned, overflow-hidden element.
  */

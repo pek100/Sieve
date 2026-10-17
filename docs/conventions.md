@@ -26,7 +26,7 @@ src/styles/tokens.css       every design value (the only file allowed colour lit
 src/components/ui/          shadcn primitives, owned by us, already restyled to tokens
 src/components/sieve/
   primitives/               state-layer, icon-button, section-icon, segmented
-  shell/                    app-shell, top-bar, page, bento-grid, card, empty-state,
+  shell/                    app-shell, top-bar, page, layout-grid, card, empty-state,
                             master-switch, theme-menu, window-controls, wordmark, notice-toaster
   <area>/                   one folder per screen area: home/ (S2), apps/ (S3), ...
 src/core/                   pure TS: store, policy, apps, routes, notices, settings/
@@ -95,7 +95,12 @@ Hooks: `useRuntime()`, `useSieve(selector)` (rerenders on every store change; de
 
 ## 5. UI placement and components
 
-- A screen is `src/app/<route>/page.tsx` that renders `<Page title action? notice? fill?>` with a `<BentoGrid>` of `<BentoItem span="third|two-thirds|half|full">`. Spans: at 1280+ third 4, two-thirds 8, half 6; at 960 to 1279 third and half 6, two-thirds 12; below 960 everything 12. Gutter 32 across, 24 down. Page header row is 64 px; outer padding 24 px (16 below 640). The Apps screen has no grid: search, count and groups sit on the page (max 880 px wide).
+- A screen is `src/app/<route>/page.tsx` that renders `<Page title meta? action? notice? fill?>` with its regions on a `<LayoutGrid>` of `<GridRegion span={3|4|6|8|9|12}>`.
+- **Layout grid (one for every page, defined once).** Tokens in `src/styles/tokens.css`: `--page-max` 1920, `--page-pad` 24, `--gutter` 24, both 16 under 640 px (`@media (width < 640px)` in tokens.css, the same breakpoint as `max-[640px]:`), `--page-header-h` 64. Utilities in `globals.css`: `page-container` (width 100%, at most `--page-max`, centred, `--page-pad` each side) and `layout-grid` (12 equal columns, `--gutter` between columns and rows). Primitives in `shell/layout-grid.tsx`: `LayoutGrid`, `GridRegion` (span from 960 up, 12 below). The top bar's inner row and `<Page>` (header row and content) are both a `page-container`, so:
+  - the top bar's logo, the page title and every region's left edge sit on one line; the top bar's right controls, the header actions and every region's right edge sit on another;
+  - regions start on a column start and end on a column end, spans side by side add up to 12, so a row ends on the container's right line;
+  - a max width only ever applies to the whole container, never to one list or column.
+  Never set side padding, a max width or a gutter on a screen; never nest a second 12 column grid. Law: `tests/e2e/alignment.spec.ts` (edges within 1 px of the grid lines, no overlap, at least the gutter between siblings, no sideways overflow in a region, the legend or the range control, headers in a row share a top), at 1280x800, 960x800 and 375x812.
 - A titled block of content is a `<Card title icon? tone? action? state?>`, flat (see section 4). `state` is `{kind:"ready"}` (default), `{kind:"loading"}` (skeleton), `{kind:"empty", line, body?, action?}`, or `{kind:"error", message}`. Each has its own error boundary (`CardBoundary` and `CardBody` are exported for blocks that are not one Card, such as the Home KPI tiles and the Apps list). A Card is as tall as its content; Home passes `className="h-full"` to fill a bento cell (a built-in `h-full` stretched the Settings Filtering card to the height of the wrapper it shares with the DNS filter card). When title and action do not fit on one line, the action wraps under the title.
 - No status chip (the user: the Live chip was redundant beside the Sieving switch). The master switch carries `data-phase` and a screen-reader-only live region that speaks the phase; a timed pause is shown once, on Home, as the paused banner (until when) with the Resume pill as its one control.
 - `<Page fill>` makes the page exactly window-tall at 1280+, so a `three:flex-1` grid takes the height left under the header. Do not subtract sibling heights in a calc.
