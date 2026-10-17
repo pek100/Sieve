@@ -47,7 +47,7 @@ export function SettingsScreen() {
             ))}
           </ul>
         </nav>
-        <div className="flex min-w-0 flex-col gap-4">
+        <div className="flex min-w-0 flex-col gap-8">
           <SearchField value={query} onChange={setQuery} label="Search settings" placeholder="Search settings" />
           {view.sections.length === 0 ? (
             <EmptyState
@@ -62,7 +62,7 @@ export function SettingsScreen() {
           ) : (
             view.sections.map((s) => (
               <div key={s.id} id={`section-${s.id}`} className="scroll-mt-20">
-                <Card title={s.label} dense>
+                <Card title={s.label}>
                   <div className="flex flex-col">
                     {s.keys.map((k) => (
                       <SettingRow
@@ -78,7 +78,7 @@ export function SettingsScreen() {
                   </div>
                 </Card>
                 {s.id === DNS_SECTION && (
-                  <div className="pt-4">
+                  <div className="pt-8">
                     <DnsCard lockOf={view.lockOf} />
                   </div>
                 )}

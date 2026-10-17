@@ -117,7 +117,7 @@ export function ActivityChart({
   return (
     <div className={cn("flex min-h-0 flex-col gap-2", className)}>
       <div
-        className="relative min-h-0 flex-1 overflow-hidden rounded-md bg-inset shadow-inset"
+        className="relative min-h-0 flex-1 overflow-hidden border-b border-outline"
         onPointerMove={(e) => {
           const r = e.currentTarget.getBoundingClientRect();
           if (r.width > 0) setHoverF(Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)));

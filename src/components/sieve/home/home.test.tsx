@@ -208,8 +208,10 @@ describe("home copy and KPIs", () => {
     // Numbers are shown, with a delta chip each.
     expect(within(tiles[1] as HTMLElement).getByText(/^\d+$/)).toBeInTheDocument();
     expect(tiles[1].querySelector("[data-dir]")).not.toBeNull();
-    // At most one accent container tile.
-    expect([...tiles].filter((t) => t.className.includes("bg-mint-container"))).toHaveLength(1);
+    // One accent tile, mint by its number only: no tile has a container (surface, border, elevation, radius).
+    expect([...tiles].filter((t) => t.hasAttribute("data-accent"))).toHaveLength(1);
+    expect(tiles[0].querySelector("[data-numeric]")!.className).toContain("text-primary");
+    for (const t of tiles) expect(t.className).not.toMatch(/\b(bg-|shadow-|rounded|border|p-\d)/);
   });
 
   it("law, filter on: 'blocked' appears only in the DNS-derived tile, with the filter's own count; never ads or trackers", async () => {

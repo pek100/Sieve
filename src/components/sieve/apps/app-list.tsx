@@ -30,7 +30,7 @@ export function AppRow({ app, actions }: { app: AppEntry; actions: RowActions })
   const n = app.activeCount;
   const on = actions.isOn(app.key);
   return (
-    <li data-testid="app-row" data-app={app.key} data-off={on ? undefined : ""} className="flex h-11 items-center gap-2">
+    <li data-testid="app-row" data-app={app.key} data-off={on ? undefined : ""} className="flex h-11 items-center gap-2 border-b border-outline last:border-b-0">
       <button
         type="button"
         onClick={() => actions.open(app.key)}

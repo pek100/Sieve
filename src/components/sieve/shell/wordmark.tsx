@@ -3,7 +3,7 @@ export function Wordmark() {
   const dots = [-1, 0, 1].flatMap((y) => [-1, 0, 1].map((x) => ({ x: 12 + x * 4.5, y: 12 + y * 4.5 })));
   return (
     <span className="inline-flex items-center gap-2 text-title text-on-surface select-none">
-      <span className="inline-flex size-8 items-center justify-center rounded-sm bg-mint-container text-on-mint-container">
+      <span className="inline-flex size-8 items-center justify-center text-primary">
         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
           <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" strokeWidth="1.75" />
           {dots.map((d) => (

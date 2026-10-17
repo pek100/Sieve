@@ -53,7 +53,7 @@ function CopyPath({ path }: { path: string }) {
         if (timer.current) clearTimeout(timer.current);
         timer.current = setTimeout(() => setCopied(false), 1500);
       }}
-      className="relative flex min-h-11 w-full items-center gap-3 overflow-hidden rounded-sm bg-inset px-3 py-2 text-left shadow-inset"
+      className="relative flex min-h-11 w-full items-center gap-3 overflow-hidden rounded-sm py-2 text-left"
     >
       <span className="min-w-0 flex-1 font-mono text-mono break-all text-on-surface">{path}</span>
       {copied ? (
@@ -80,11 +80,11 @@ function ConnectionsTable({ flows }: { flows: Flow[] }) {
   const shown = sorted.slice(0, MAX_ROWS);
   if (flows.length === 0) return <p className="text-body text-on-surface-faint">No sockets open right now.</p>;
   return (
-    <div className="overflow-hidden rounded-md bg-surface-2">
+    <div>
       <table className="w-full table-fixed text-body" aria-label="Connections">
         <thead>
           <tr className="h-9 text-left text-label text-on-surface-muted">
-            <th scope="col" className="px-3 font-medium">Host</th>
+            <th scope="col" className="pr-3 font-medium">Host</th>
             <th scope="col" className="w-16 px-2 font-medium">Proto</th>
             <th scope="col" className="w-24 px-3 font-medium">State</th>
           </tr>
@@ -92,7 +92,7 @@ function ConnectionsTable({ flows }: { flows: Flow[] }) {
         <tbody>
           {shown.map((f, i) => (
             <tr key={`${f.proto}-${f.local.port}-${host(f)}-${i}`} data-testid="connection-row" className="h-11 border-t border-outline">
-              <td className="truncate px-3 font-mono text-mono text-on-surface" data-testid="host">
+              <td className="truncate pr-3 font-mono text-mono text-on-surface" data-testid="host">
                 {host(f)}
               </td>
               <td className="px-2 text-label text-on-surface-muted uppercase">{f.proto}</td>
@@ -102,7 +102,7 @@ function ConnectionsTable({ flows }: { flows: Flow[] }) {
         </tbody>
       </table>
       {sorted.length > MAX_ROWS && (
-        <p className="border-t border-outline px-3 py-2 text-caption text-on-surface-faint">
+        <p className="border-t border-outline py-2 text-caption text-on-surface-faint">
           {sorted.length - MAX_ROWS} more not shown
         </p>
       )}

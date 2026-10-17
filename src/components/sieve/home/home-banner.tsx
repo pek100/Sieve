@@ -19,7 +19,7 @@ function Banner({ text, children }: { text: string; children?: ReactNode }) {
     <div
       role="note"
       data-banner=""
-      className="flex min-h-12 items-center gap-3 rounded-full bg-surface-2 py-1 pr-1 pl-4 text-body text-on-surface shadow-l1"
+      className="flex min-h-10 items-center gap-3 text-body text-on-surface"
     >
       <Info aria-hidden="true" className="size-5 shrink-0 text-warning" strokeWidth={1.75} />
       <p className="min-w-0 flex-1">{text}</p>

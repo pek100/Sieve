@@ -36,9 +36,11 @@ test.describe("shell", () => {
     await page.getByRole("menuitem", { name: "Light" }).click();
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
     await expect(page.getByRole("menu")).toHaveCount(0);
-    // Tokens reach the page: cards are radius 16 and the light page background is the light bg role.
+    // Tokens reach the page: blocks are flat (no radius, no fill of their own) on the light bg role.
     const card = page.getByRole("region", { name: "Top apps" });
-    await expect(card).toHaveCSS("border-top-left-radius", "16px");
+    await expect(card).toHaveCSS("border-top-left-radius", "0px");
+    await expect(card).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    await expect(card).toHaveCSS("box-shadow", "none");
     await expect(page.locator("body")).toHaveCSS("background-color", "rgb(246, 242, 251)");
     await page.screenshot({ path: `test-results/screens/shell-light-${info.project.name}.png`, fullPage: true });
 

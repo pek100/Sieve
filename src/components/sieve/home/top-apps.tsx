@@ -41,7 +41,7 @@ export function TopApps({ slots, base, className }: { slots: Readonly<Record<str
   const top = Math.max(1, ...apps.map((a) => a.count));
 
   return (
-    <Card title="Top apps" icon={<ListOrdered strokeWidth={1.75} />} dense className={className} state={base}>
+    <Card title="Top apps" icon={<ListOrdered strokeWidth={1.75} />} className={className} state={base}>
       {apps.length === 0 ? (
         <p className="py-4 text-body text-on-surface-muted">No app has an open connection right now.</p>
       ) : (

@@ -114,7 +114,7 @@ test.describe("dns filter", () => {
     const errors = await open(page, `${HOME}&dns=running`);
     const tile = page.locator('section[data-kpi="blocked"]');
     await expect(tile).toHaveAttribute("aria-label", "Blocked lookups");
-    await page.getByRole("switch", { name: "Sieving" }).click();
+    await page.getByRole("banner").getByRole("switch", { name: "Sieving" }).click();
     await expect(tile).toHaveAttribute("aria-label", "DNS filter");
     await expect(tile.locator("[data-dns-paused]")).toContainText("Paused");
     await page.getByRole("group", { name: "Right now" }).screenshot({ path: `test-results/screens/dns-home-paused-${info.project.name}.png` });
@@ -124,7 +124,7 @@ test.describe("dns filter", () => {
     await expect(card(page)).toContainText("Paused while Sieving is off");
     await expect(page.locator('[data-setting="filtering.dns"]').getByRole("switch")).toBeChecked();
     // On again: blocking resumes.
-    await page.getByRole("switch", { name: "Sieving" }).click();
+    await page.getByRole("banner").getByRole("switch", { name: "Sieving" }).click();
     await expect(phase(page)).toHaveAttribute("data-dns-phase", "running");
     await noHorizontalScroll(page);
     expect(errors).toEqual([]);
