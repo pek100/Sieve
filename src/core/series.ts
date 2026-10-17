@@ -170,6 +170,19 @@ export function rankSeries(
   return { series, slots, top: new Set(top) };
 }
 
+/**
+ * Whether two sets name the same series, in the same order, with the same
+ * names and colour slots (totals aside): a view that draws only who and in
+ * which colour, such as the heatmap, need not redraw when this holds.
+ */
+export function sameSeries(a: SeriesSet, b: SeriesSet): boolean {
+  return (
+    a === b ||
+    (a.series.length === b.series.length &&
+      a.series.every((s, i) => s.key === b.series[i].key && s.name === b.series[i].name && s.slot === b.series[i].slot))
+  );
+}
+
 /** The series set of a run of snapshots: every app's total over all of them. */
 export function seriesSet(snapshots: readonly Snapshot[], previous: Readonly<Record<string, number>> = {}): SeriesSet {
   const totals = new Map<string, number>();

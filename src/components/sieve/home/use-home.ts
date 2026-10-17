@@ -3,10 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { heatCaption, heatGrid, type HeatGrid } from "@/core/heat";
 import { trackedSnapshot } from "@/core/apps";
-import { historySeries, hourActivity, periodQuery, trackedHistory, type HistoryQuery } from "@/core/history";
+import { historySeries, periodQuery, trackedHistory, type HistoryQuery } from "@/core/history";
 import type { History, Snapshot } from "@/data/protocol";
 import { kpis, type Kpi } from "@/core/kpis";
-import { buildSeries, createSlotKeeper, windowSnapshots, type SeriesModel, type SeriesSet } from "@/core/series";
+import { buildSeries, createSlotKeeper, sameSeries, windowSnapshots, type SeriesModel, type SeriesSet } from "@/core/series";
 import type { SieveState } from "@/core/store";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useSieve, useTracking } from "@/hooks/use-sieve";
@@ -126,18 +126,27 @@ function useHistory<T>(query: ((to: number) => HistoryQuery) | null, fold: (h: H
   return query !== null && answer.for === query ? answer.state : { kind: "loading" };
 }
 
-const heatQuery = (to: number): HistoryQuery => ({ from: to - 28 * DAY, to, grain: "hour", step: HOUR });
-/** Up to four weeks of hourly activity from the source (apps turned off left out), refreshed every minute; the caption says how far back it goes. */
-export function useHeat(): HistoryState {
+const HEAT_MS = 28 * DAY;
+const heatQuery = (to: number): HistoryQuery => ({ from: to - HEAT_MS, to, grain: "hour", step: HOUR });
+/**
+ * Up to four weeks of hourly activity per app from the source (apps turned
+ * off left out), refreshed every minute, drawn with `set`, the chart's series
+ * set, so an app has one colour everywhere. Like useHistoryModel, the fold
+ * keeps the raw answer and the grid is made from it and the current set. The
+ * caption says how far back it goes.
+ */
+export function useHeat(set: SeriesSet): HistoryState {
   const { off } = useTracking();
-  const fold = useCallback(
-    (h: History, q: HistoryQuery) => {
-      const grid = heatGrid(hourActivity(trackedHistory(h, off)));
-      return { grid, caption: heatCaption(grid, q) };
-    },
-    [off],
-  );
-  return useHistory(heatQuery, fold);
+  const fold = useCallback((h: History, q: HistoryQuery) => ({ history: trackedHistory(h, off), q }), [off]);
+  const read = useHistory(heatQuery, fold);
+  // The set is a new object every live tick (its totals move); the map redraws only when who or which colour changes.
+  const [named, setNamed] = useState(set);
+  if (!sameSeries(named, set)) setNamed(set);
+  return useMemo<HistoryState>(() => {
+    if (read.kind !== "ready") return read;
+    const grid = heatGrid(historySeries(read.history, { periodMs: HEAT_MS, to: read.q.to }, named));
+    return { kind: "ready", grid, caption: heatCaption(grid, read.q) };
+  }, [read, named]);
 }
 
 /**

@@ -2,14 +2,13 @@
  * Persisted history (plan row 77), the pure side. The Rust store
  * (src-tauri/src/history) keeps per-app counts per minute, hour and day; the
  * mock source answers the same queries. This file owns the grain table the
- * readers choose from and the folds from history to the Home chart and the
- * heatmap.
+ * readers choose from and the fold from history to the Home chart's model,
+ * which the heatmap folds further (heat.heatGrid over hour buckets).
  *
  * GRAINS mirrors GRAIN_NAMES, GRAIN_MS and GRAIN_KEEP_MS in
  * src-tauri/src/protocol.rs (protocol law).
  */
 import type { History } from "@/data/protocol";
-import type { HourActivity } from "./heat";
 import { bucketSize, rankSeries, type SeriesModel, type SeriesPoint, type SeriesSet, OTHER_KEY } from "./series";
 
 const MINUTE = 60_000;
@@ -58,17 +57,6 @@ export function periodQuery(periodMs: number, to: number): HistoryQuery {
  */
 export function trackedHistory(h: History, off: ReadonlySet<string>): History {
   return off.size === 0 ? h : { ...h, apps: h.apps.filter((a) => !off.has(a.app)) };
-}
-
-/**
- * Mean active connections per hour bucket, for the heatmap: every app's flows
- * in the bucket over the bucket's samples. Buckets with no samples are left
- * out (Sieve was not sampling then), never read as zero.
- */
-export function hourActivity(h: History): HourActivity[] {
-  const flows = new Map<number, number>();
-  for (const a of h.apps) flows.set(a.t, (flows.get(a.t) ?? 0) + a.flows);
-  return h.samples.filter((s) => s.n > 0).map((s) => ({ t: s.t, flows: (flows.get(s.t) ?? 0) / s.n }));
 }
 
 const round2 = (x: number) => Math.round(x * 100) / 100;

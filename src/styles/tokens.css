@@ -197,20 +197,6 @@
 
 /* ---------- Derived roles (same formula in both themes) ---------- */
 :root {
-  /* Heatmap: 4 steps per hue = surface-2, 35%, 65%, 100% */
-  --heat-mint-0: var(--surface-2);
-  --heat-mint-1: color-mix(in oklab, var(--series-1) 35%, var(--surface-2));
-  --heat-mint-2: color-mix(in oklab, var(--series-1) 65%, var(--surface-2));
-  --heat-mint-3: var(--series-1);
-  --heat-lilac-0: var(--surface-2);
-  --heat-lilac-1: color-mix(in oklab, var(--series-2) 35%, var(--surface-2));
-  --heat-lilac-2: color-mix(in oklab, var(--series-2) 65%, var(--surface-2));
-  --heat-lilac-3: var(--series-2);
-  --heat-peach-0: var(--surface-2);
-  --heat-peach-1: color-mix(in oklab, var(--series-3) 35%, var(--surface-2));
-  --heat-peach-2: color-mix(in oklab, var(--series-3) 65%, var(--surface-2));
-  --heat-peach-3: var(--series-3);
-
   /* Selected = accent at 16% */
   --selected-container: color-mix(in oklab, var(--primary) 16%, transparent);
   /* Track for thin progress bars (D #404448 [M], lilac tinted) */

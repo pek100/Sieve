@@ -19,7 +19,7 @@ async function waitForData(page: Page, points = 2) {
     .toBeGreaterThanOrEqual(points);
   // Three snapshot numbers; the DNS tile says Off while the filter is off.
   await expect(page.locator("section[data-kpi] [data-numeric]")).toHaveCount(3);
-  await expect(page.getByRole("region", { name: "When apps are busy" }).locator("[data-step]").first()).toBeVisible();
+  await expect(page.getByRole("region", { name: "When apps are busy" }).locator("[data-cell]").first()).toBeVisible();
 }
 
 const regions = (page: Page) => ({

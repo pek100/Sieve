@@ -32,7 +32,16 @@ interface MockApp {
   udp?: number[];
   /** Fixed pid (System is always 4). */
   pid?: number;
+  /** When in the week the app is busy, for saved history (rhythmOf). Default: all day. */
+  rhythm?: Rhythm;
 }
+
+/**
+ * Weekly rhythms of the mock's saved history, so the heatmap's per-app mix
+ * changes over the week: work apps own office hours, leisure apps own
+ * evenings and weekends, background apps own the night.
+ */
+type Rhythm = "allDay" | "office" | "evening" | "background";
 
 const U = "C:\\Users\\<user>";
 const WIN_PRODUCT = "Microsoft Windows Operating System";
@@ -40,22 +49,22 @@ const WIN_PRODUCT = "Microsoft Windows Operating System";
 /** About 18 apps a Windows machine typically runs. Paths are scrubbed. */
 export const MOCK_APPS: readonly MockApp[] = [
   { product: "Google Chrome", exe: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", procs: 4, rate: 0.9, life: [6, 60] },
-  { product: "Firefox", exe: "C:\\Program Files\\Mozilla Firefox\\firefox.exe", procs: 3, rate: 0.45, life: [6, 50] },
-  { product: "Microsoft Edge", exe: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", procs: 2, rate: 0.25, life: [5, 40] },
-  { product: "Visual Studio Code", exe: `${U}\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe`, procs: 3, rate: 0.25, life: [10, 90], listen: [54012] },
-  { product: "Discord", exe: `${U}\\AppData\\Local\\Discord\\app-1.0.9200\\Discord.exe`, procs: 2, rate: 0.2, life: [20, 120], udp: [50001] },
+  { product: "Firefox", exe: "C:\\Program Files\\Mozilla Firefox\\firefox.exe", procs: 3, rate: 0.45, life: [6, 50], rhythm: "evening" },
+  { product: "Microsoft Edge", exe: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", procs: 2, rate: 0.25, life: [5, 40], rhythm: "office" },
+  { product: "Visual Studio Code", exe: `${U}\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe`, procs: 3, rate: 0.25, life: [10, 90], listen: [54012], rhythm: "office" },
+  { product: "Discord", exe: `${U}\\AppData\\Local\\Discord\\app-1.0.9200\\Discord.exe`, procs: 2, rate: 0.2, life: [20, 120], udp: [50001], rhythm: "evening" },
   { product: "Spotify", exe: `${U}\\AppData\\Roaming\\Spotify\\Spotify.exe`, procs: 2, rate: 0.22, life: [8, 70] },
-  { product: "Steam", exe: "C:\\Program Files (x86)\\Steam\\steam.exe", procs: 1, rate: 0.15, life: [10, 80], listen: [27036] },
-  { product: "Slack", exe: `${U}\\AppData\\Local\\slack\\app-4.41.0\\slack.exe`, procs: 2, rate: 0.15, life: [15, 100] },
-  { product: "Microsoft Teams", exe: `${U}\\AppData\\Local\\Microsoft\\WindowsApps\\ms-teams.exe`, procs: 2, rate: 0.18, life: [15, 100] },
-  { product: "Microsoft OneDrive", exe: "C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe", procs: 1, rate: 0.1, life: [5, 30] },
-  { product: "Microsoft Outlook", exe: "C:\\Program Files\\Microsoft Office\\root\\Office16\\OUTLOOK.EXE", procs: 1, rate: 0.08, life: [20, 120] },
-  { product: "Zoom", exe: `${U}\\AppData\\Roaming\\Zoom\\bin\\Zoom.exe`, procs: 1, rate: 0.04, life: [30, 200], udp: [8801] },
-  { product: "NVIDIA Container", exe: "C:\\Program Files\\NVIDIA Corporation\\NvContainer\\nvcontainer.exe", procs: 1, rate: 0.04, life: [5, 20] },
-  { product: "Git", exe: "C:\\Program Files\\Git\\mingw64\\bin\\git-remote-https.exe", procs: 1, rate: 0.03, life: [3, 12] },
-  { product: "Node.js", exe: "C:\\Program Files\\nodejs\\node.exe", procs: 1, rate: 0.05, life: [5, 40], listen: [3000] },
+  { product: "Steam", exe: "C:\\Program Files (x86)\\Steam\\steam.exe", procs: 1, rate: 0.15, life: [10, 80], listen: [27036], rhythm: "evening" },
+  { product: "Slack", exe: `${U}\\AppData\\Local\\slack\\app-4.41.0\\slack.exe`, procs: 2, rate: 0.15, life: [15, 100], rhythm: "office" },
+  { product: "Microsoft Teams", exe: `${U}\\AppData\\Local\\Microsoft\\WindowsApps\\ms-teams.exe`, procs: 2, rate: 0.18, life: [15, 100], rhythm: "office" },
+  { product: "Microsoft OneDrive", exe: "C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe", procs: 1, rate: 0.1, life: [5, 30], rhythm: "background" },
+  { product: "Microsoft Outlook", exe: "C:\\Program Files\\Microsoft Office\\root\\Office16\\OUTLOOK.EXE", procs: 1, rate: 0.08, life: [20, 120], rhythm: "office" },
+  { product: "Zoom", exe: `${U}\\AppData\\Roaming\\Zoom\\bin\\Zoom.exe`, procs: 1, rate: 0.04, life: [30, 200], udp: [8801], rhythm: "office" },
+  { product: "NVIDIA Container", exe: "C:\\Program Files\\NVIDIA Corporation\\NvContainer\\nvcontainer.exe", procs: 1, rate: 0.04, life: [5, 20], rhythm: "background" },
+  { product: "Git", exe: "C:\\Program Files\\Git\\mingw64\\bin\\git-remote-https.exe", procs: 1, rate: 0.03, life: [3, 12], rhythm: "office" },
+  { product: "Node.js", exe: "C:\\Program Files\\nodejs\\node.exe", procs: 1, rate: 0.05, life: [5, 40], listen: [3000], rhythm: "office" },
   { product: WIN_PRODUCT, exe: "C:\\Windows\\explorer.exe", procs: 1, rate: 0.05, life: [5, 30] },
-  { product: WIN_PRODUCT, exe: "C:\\Windows\\System32\\svchost.exe", procs: 3, rate: 0.12, life: [3, 25], udp: [5353, 5355] },
+  { product: WIN_PRODUCT, exe: "C:\\Windows\\System32\\svchost.exe", procs: 3, rate: 0.12, life: [3, 25], udp: [5353, 5355], rhythm: "background" },
   { product: WIN_PRODUCT, exe: "C:\\Windows\\SystemApps\\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\\SearchHost.exe", procs: 1, rate: 0.06, life: [3, 20] },
   { product: null, exe: null, name: "System", procs: 1, rate: 0, life: [1, 1], listen: [445, 139], pid: 4 },
 ];
@@ -210,13 +219,27 @@ export function createMockSource({ seed, scenario = "steady", now = Date.now, ic
   };
 }
 
-/** Busyness of the machine at `t`, local time: office hours busiest, nights nearly idle. */
-function dayCurve(t: number): number {
+/** How busy an app of `rhythm` is at `t`, local time (about 0 to 1.5). */
+function rhythmOf(rhythm: Rhythm, t: number): number {
   const d = new Date(t);
   const hour = d.getHours();
   const weekend = d.getDay() === 0 || d.getDay() === 6;
-  const day = hour >= 9 && hour < 18 ? 1 : hour >= 18 && hour < 23 ? 0.7 : hour >= 7 ? 0.4 : 0.08;
-  return (weekend ? 0.55 : 1) * day;
+  switch (rhythm) {
+    case "office":
+      if (weekend) return 0.05;
+      return hour >= 9 && hour < 17 ? 1.4 : hour === 8 || hour === 17 ? 0.6 : 0.04;
+    case "evening":
+      if (hour >= (weekend ? 10 : 18) && hour < 24) return weekend ? 1.2 : 1.5;
+      return hour < 1 ? 0.6 : !weekend && hour >= 12 && hour < 13 ? 0.5 : 0.06;
+    case "background":
+      // Updates and sync at night, a trickle the rest of the time.
+      return hour >= 2 && hour < 5 ? 1 : 0.35;
+    case "allDay": {
+      // Office hours busiest, evenings next, nights nearly idle.
+      const day = hour >= 9 && hour < 18 ? 1 : hour >= 18 && hour < 23 ? 0.7 : hour >= 7 ? 0.4 : 0.08;
+      return (weekend ? 0.55 : 1) * day;
+    }
+  }
 }
 
 /**
@@ -225,7 +248,8 @@ function dayCurve(t: number): number {
  * bucket holds one sample per second, apps with no flows have no row, and
  * buckets are summed into `step`. Four weeks deep at most; `empty` has none.
  * Each app's mean active connections follow its live rate and lifetime,
- * scaled by the time of day with per-hour noise.
+ * scaled by its weekly rhythm (rhythmOf) with per-hour noise, so the mix of
+ * apps changes over the day and the week.
  */
 export function mockHistory(q: HistoryQuery, o: { seed: number; scale: number; now: number }): History {
   const g = grainMs(q.grain);
@@ -241,11 +265,10 @@ export function mockHistory(q: HistoryQuery, o: { seed: number; scale: number; n
     const b = Math.floor(t / q.step) * q.step;
     const n = g / 1000;
     samples.set(b, (samples.get(b) ?? 0) + n);
-    const curve = dayCurve(t);
     MOCK_APPS.forEach((app, i) => {
       const meanLife = (app.life[0] + app.life[1]) / 2;
       const noise = 0.75 + 0.5 * hash01(o.seed, i, Math.floor(t / HOUR));
-      const mean = app.rate * o.scale * meanLife * curve * noise;
+      const mean = app.rate * o.scale * meanLife * rhythmOf(app.rhythm ?? "allDay", t) * noise;
       const f = Math.round(mean * n);
       if (f <= 0) return;
       const id = ids[i];

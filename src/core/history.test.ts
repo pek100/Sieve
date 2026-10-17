@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createMockSource } from "@/data/mock-source";
 import type { History } from "@/data/protocol";
-import { GRAINS, grainFor, historySeries, hourActivity, periodQuery, trackedHistory } from "./history";
+import { GRAINS, grainFor, historySeries, periodQuery, trackedHistory } from "./history";
 import { EMPTY_SET, MAX_POINTS, OTHER_KEY, rankSeries, SERIES_COUNT } from "./series";
 
 const MIN = 60_000;
@@ -41,8 +41,8 @@ describe("history grains", () => {
 });
 
 describe("history folds", () => {
-  it("hour activity is mean connections per sample; unsampled hours are absent, not zero", () => {
-    const a = hourActivity(
+  it("a period's points are mean connections per sample; unsampled hours are absent, not zero", () => {
+    const m = historySeries(
       h(
         [
           [0, 10],
@@ -53,13 +53,15 @@ describe("history folds", () => {
           [0, "slack", 10],
         ],
       ),
+      { periodMs: DAY, to: DAY },
+      EMPTY_SET,
     );
-    // Hour 0: (30 + 10) / 10 samples; hour 1 was sampled with no flows: a real 0.
-    expect(a).toEqual([
-      { t: 0, flows: 4 },
-      { t: HOUR, flows: 0 },
+    // Hour 0: 30 / 10 and 10 / 10 samples; hour 1 was sampled with no flows: a real 0.
+    expect(m.points).toEqual([
+      { t: 0, values: { chrome: 3, slack: 1, [OTHER_KEY]: 0 } },
+      { t: HOUR, values: { chrome: 0, slack: 0, [OTHER_KEY]: 0 } },
     ]);
-    expect(hourActivity(h([], [[0, "chrome", 5]]))).toEqual([]);
+    expect(historySeries(h([], [[0, "chrome", 5]]), { periodMs: DAY, to: DAY }, EMPTY_SET).points).toEqual([]);
   });
 
   it("the chart model averages per sample, names the top apps and folds the rest into Other", () => {
