@@ -56,6 +56,15 @@ describe("app shell (seam law: shell renders ROUTES and binds the master switch 
     expect(status.className).toContain("sr-only");
   });
 
+  it("the logo is the Sieve mark: a ring with its mesh lines clipped inside, in the mint primary", () => {
+    setup();
+    const svg = screen.getByRole("banner").querySelector("svg.text-primary")!;
+    expect(svg.querySelectorAll("line")).toHaveLength(3);
+    const clip = svg.querySelector("clipPath")!.id;
+    expect(svg.querySelector("g")!.getAttribute("clip-path")).toBe(`url(#${clip})`);
+    expect(clip).toMatch(/^[a-zA-Z0-9_-]+$/);
+  });
+
   it("gives every icon-only button an accessible name", () => {
     setup();
     for (const b of screen.getAllByRole("button")) expect(b).toHaveAccessibleName();
