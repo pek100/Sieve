@@ -143,7 +143,7 @@ async function openHome(page: Page, extra = "") {
   const line = page.getByRole("region", { name: "Connections per app" }).locator('path[data-part="line"]').first();
   await expect(line).toBeAttached();
   await expect.poll(async () => ((await line.getAttribute("d")) ?? "").split("L").length, { timeout: 15_000 }).toBeGreaterThanOrEqual(4);
-  await expect(page.getByRole("region", { name: "When apps are busy" }).locator("[data-step]").first()).toBeVisible();
+  await expect(page.getByRole("region", { name: "When apps are busy" }).locator("[data-cell]").first()).toBeVisible();
 }
 
 const homeRegions = (page: Page) => ({

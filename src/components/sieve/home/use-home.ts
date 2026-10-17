@@ -6,7 +6,7 @@ import { trackedSnapshot } from "@/core/apps";
 import { historySeries, periodQuery, trackedHistory, type HistoryQuery } from "@/core/history";
 import type { History, Snapshot } from "@/data/protocol";
 import { kpis, type Kpi } from "@/core/kpis";
-import { buildSeries, createSlotKeeper, windowSnapshots, type SeriesModel, type SeriesSet } from "@/core/series";
+import { buildSeries, createSlotKeeper, sameSeries, windowSnapshots, type SeriesModel, type SeriesSet } from "@/core/series";
 import type { SieveState } from "@/core/store";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useSieve, useTracking } from "@/hooks/use-sieve";
@@ -139,11 +139,14 @@ export function useHeat(set: SeriesSet): HistoryState {
   const { off } = useTracking();
   const fold = useCallback((h: History, q: HistoryQuery) => ({ history: trackedHistory(h, off), q }), [off]);
   const read = useHistory(heatQuery, fold);
+  // The set is a new object every live tick (its totals move); the map redraws only when who or which colour changes.
+  const [named, setNamed] = useState(set);
+  if (!sameSeries(named, set)) setNamed(set);
   return useMemo<HistoryState>(() => {
     if (read.kind !== "ready") return read;
-    const grid = heatGrid(historySeries(read.history, { periodMs: HEAT_MS, to: read.q.to }, set));
+    const grid = heatGrid(historySeries(read.history, { periodMs: HEAT_MS, to: read.q.to }, named));
     return { kind: "ready", grid, caption: heatCaption(grid, read.q) };
-  }, [read, set]);
+  }, [read, named]);
 }
 
 /**

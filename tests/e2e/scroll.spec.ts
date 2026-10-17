@@ -66,7 +66,7 @@ test.describe("scroll law", () => {
         await page.goto(p.url);
         await expect(page.getByRole("heading", { level: 1 })).toHaveText(p.name === "Home" ? "Sieving now" : p.name);
         if (p.name === "Home") {
-          await expect(page.getByRole("region", { name: "When apps are busy" }).locator("[data-step]").first()).toBeVisible();
+          await expect(page.getByRole("region", { name: "When apps are busy" }).locator("[data-cell]").first()).toBeVisible();
           await expect(page.locator('svg[data-chart-plot] path[data-part="line"]').first()).toBeAttached();
         } else {
           await expect(page.locator(p.name === "Apps" ? "[data-testid=app-row]" : "[data-setting]").first()).toBeVisible();

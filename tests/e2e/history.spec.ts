@@ -64,10 +64,10 @@ test.describe("history periods", () => {
   test("the heatmap reads four weeks of history and says so", async ({ page }) => {
     await openHome(page);
     const heat = page.getByRole("region", { name: "When apps are busy" });
-    await expect(heat.locator("[data-step]").first()).toBeVisible();
+    await expect(heat.locator("[data-cell]").first()).toBeVisible();
     await expect(heat).toContainText("Last 4 weeks");
     // 7 days x 24 hours.
-    await expect(heat.locator("[data-step]")).toHaveCount(168);
+    await expect(heat.locator("[data-cell]")).toHaveCount(168);
   });
 
   test("a period with no saved counts says so instead of drawing an empty plot", async ({ page }, info) => {

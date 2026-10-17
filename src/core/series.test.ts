@@ -10,6 +10,8 @@ import {
   MAX_POINTS,
   niceCeiling,
   OTHER_KEY,
+  rankSeries,
+  sameSeries,
   SERIES_COUNT,
   seriesSet,
   stackSeries,
@@ -151,5 +153,23 @@ describe("series derivation", () => {
 
   it("niceCeiling rounds up to 1, 2 or 5 times a power of ten", () => {
     expect([0, 0.4, 1, 3, 7, 12, 51, 260].map(niceCeiling)).toEqual([1, 0.5, 1, 5, 10, 20, 100, 500]);
+  });
+
+  it("sameSeries ignores totals but not keys, names, slots or order", () => {
+    const names = new Map([
+      ["a", "A"],
+      ["b", "B"],
+    ]);
+    const s1 = rankSeries(new Map([["a", 5], ["b", 3]]), names, {});
+    const s2 = rankSeries(new Map([["a", 9], ["b", 4]]), names, s1.slots);
+    expect(s2).not.toBe(s1);
+    expect(sameSeries(s1, s2)).toBe(true);
+    // b overtakes a but keeps its slot: same set.
+    expect(sameSeries(s1, rankSeries(new Map([["a", 1], ["b", 4]]), names, s1.slots))).toBe(true);
+    // New slots (no memory): b takes slot 1, a different colour for both.
+    expect(sameSeries(s1, rankSeries(new Map([["a", 1], ["b", 4]]), names, {}))).toBe(false);
+    expect(sameSeries(s1, rankSeries(new Map([["a", 5]]), names, s1.slots))).toBe(false);
+    expect(sameSeries(s1, rankSeries(new Map([["a", 5], ["b", 3]]), new Map([["a", "A2"], ["b", "B"]]), s1.slots))).toBe(false);
+    expect(sameSeries(EMPTY_SET, EMPTY_SET)).toBe(true);
   });
 });
