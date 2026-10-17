@@ -1,6 +1,8 @@
 //! The tray icon (plan row 74). It holds no sampling logic of its own:
 //! Pause and Resume are sent to the window as a `tray-action` event and the
-//! window runs the same poller actions its own pause pill uses. The window
+//! window runs the same poller actions its own pause pill uses. Quit is
+//! Rust's, except while Sieve's DNS backup exists: then the window asks
+//! first (restore DNS and quit, keep filtering, cancel). The window
 //! reports its phase back through `tray_set_state`, which sets the tooltip,
 //! which menu items are enabled, and a dimmed icon while not live.
 
@@ -76,14 +78,50 @@ fn show_main<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// Who handles Quit: Rust quits at once, unless Sieve's DNS backup exists
+/// (Windows may be pointed at Sieve, and quitting would leave it asking a
+/// server that is gone), in which case the window asks the user first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitRoute {
+    Now,
+    AskInWindow,
+}
+
+pub fn quit_route(dns_backup_exists: bool) -> QuitRoute {
+    if dns_backup_exists { QuitRoute::AskInWindow } else { QuitRoute::Now }
+}
+
+fn emit<R: Runtime>(app: &AppHandle<R>, action: TrayAction) -> bool {
+    match app.emit(TRAY_EVENT, action) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("tray: could not reach the window: {e}");
+            false
+        }
+    }
+}
+
 fn run<R: Runtime>(app: &AppHandle<R>, action: TrayAction) {
     match action {
         TrayAction::Open => show_main(app),
-        TrayAction::Quit => app.exit(0),
-        TrayAction::Pause { .. } | TrayAction::Resume => {
-            if let Err(e) = app.emit(TRAY_EVENT, action) {
-                eprintln!("tray: could not reach the window: {e}");
+        TrayAction::Quit => {
+            let backup = app
+                .path()
+                .app_data_dir()
+                .is_ok_and(|d| crate::sysdns::backup::exists(&crate::sysdns::backup::dir_in(&d)));
+            match quit_route(backup) {
+                QuitRoute::Now => app.exit(0),
+                QuitRoute::AskInWindow => {
+                    show_main(app);
+                    // No window to ask: quitting is still the user's order.
+                    if !emit(app, action) {
+                        app.exit(0);
+                    }
+                }
             }
+        }
+        TrayAction::Pause { .. } | TrayAction::Resume => {
+            emit(app, action);
         }
     }
 }
@@ -168,6 +206,13 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "tooltip": "Sieve: live", "canPause": true, "canResume": false, "dim": false }))
                 .expect("parses");
         assert!(s.can_pause && !s.can_resume && !s.dim);
+    }
+
+    #[test]
+    fn quit_asks_in_the_window_only_while_a_dns_backup_exists() {
+        assert_eq!(quit_route(false), QuitRoute::Now);
+        assert_eq!(quit_route(true), QuitRoute::AskInWindow);
+        assert_eq!(serde_json::to_value(TrayAction::Quit).expect("serialises"), serde_json::json!({ "kind": "quit" }));
     }
 
     #[test]
