@@ -12,9 +12,12 @@ const STEP_BG = ["bg-(--heat-mint-0)", "bg-(--heat-mint-1)", "bg-(--heat-mint-2)
 
 const hh = (h: number) => `${String(h).padStart(2, "0")}:00`;
 
+/** Intensity step 0..3 against the max: nothing, then thirds. */
+const stepOf = (v: number, max: number) => (v <= 0 || max <= 0 ? 0 : 1 + Math.min(2, Math.floor((3 * v) / max)));
+
 function describe(c: HeatCell): string {
   if (c.hours === 0) return `${WEEKDAYS[c.day]} ${hh(c.hour)}: no data yet`;
-  return `${WEEKDAYS[c.day]} ${hh(c.hour)} to ${hh((c.hour + 1) % 24)}: about ${Math.round(c.value).toLocaleString()} connection samples per hour`;
+  return `${WEEKDAYS[c.day]} ${hh(c.hour)} to ${hh((c.hour + 1) % 24)}: about ${Math.round(c.total).toLocaleString()} active connections`;
 }
 
 /** Hour x weekday activity. Caption says how far back the data goes. */
@@ -30,7 +33,7 @@ export function Heatmap({
   className?: string;
 }) {
   const [hover, setHover] = useState<{ cell: HeatCell; x: number; y: number } | null>(null);
-  const busiest = grid && grid.max > 0 ? grid.cells.reduce((a, b) => (b.value > a.value ? b : a)) : null;
+  const busiest = grid && grid.max > 0 ? grid.cells.reduce((a, b) => (b.total > a.total ? b : a)) : null;
 
   return (
     <Card
@@ -58,11 +61,11 @@ export function Heatmap({
                 {grid.cells.slice(day * 24, day * 24 + 24).map((c) => (
                   <span
                     key={c.hour}
-                    data-step={c.step}
+                    data-step={stepOf(c.total, grid.max)}
                     data-day={day}
                     data-hour={c.hour}
                     onPointerMove={(e) => setHover({ cell: c, x: e.clientX, y: e.clientY })}
-                    className={cn("min-h-2 rounded-xs", STEP_BG[c.step])}
+                    className={cn("min-h-2 rounded-xs", STEP_BG[stepOf(c.total, grid.max)])}
                   />
                 ))}
               </div>

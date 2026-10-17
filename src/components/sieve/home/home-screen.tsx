@@ -51,7 +51,7 @@ export function HomeScreen() {
   const set = useSeriesSet();
   const liveModel = useSeriesModel(windowMs(live), set);
   const kpis = useKpis(windowMs(live));
-  const heat = useHeat();
+  const heat = useHeat(set);
   const past = useHistoryModel(choice, set);
   const historic = isHistoryWindow(choice);
   // While a period loads, the chart keeps its series and takes the period's span with no points yet:
