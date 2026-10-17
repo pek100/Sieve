@@ -8,6 +8,7 @@ import { createMockSource } from "@/data/mock-source";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
+import { NoticeToaster } from "@/components/sieve/shell/notice-toaster";
 import { SettingsScreen } from "./settings-screen";
 
 vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
@@ -26,6 +27,7 @@ async function setup(
   render(
     <SieveProvider runtime={runtime}>
       <SettingsScreen />
+      <NoticeToaster />
     </SieveProvider>,
   );
   await act(async () => {
@@ -84,6 +86,59 @@ describe("DNS card", () => {
     expect(rt.settings.get(DNS_SWITCH)).toBe(false);
     expect(within(card()).getByRole("alert")).toHaveTextContent(MOCK_PORT_BUSY);
     expect(within(card()).getByRole("switch", { name: "DNS filtering" })).not.toBeChecked();
+  });
+
+  it("failed self check: a short toast, one plain line in the card, the technical replies folded away and said once", async () => {
+    // What the user hit: the same failure on both listeners, with a long technical reply.
+    const bad = "no answer: bad name -tototix.gif: Malformed label: -tototix";
+    const check = (kind: "canary" | "resolve", server: string, got: string, pass: boolean) => ({
+      kind,
+      server,
+      name: kind === "canary" ? "selfcheck.sieve.invalid" : "example.com",
+      expect: kind === "canary" ? "NOERROR 0.0.0.0 (blocked)" : "NOERROR with a real address",
+      got,
+      pass,
+    });
+    const rt = await setup("off", {
+      stored: { [DNS_SWITCH]: true },
+      over: {
+        selfCheck: async () => ({
+          pass: false,
+          checks: [
+            check("canary", "127.0.0.1:53", bad, false),
+            check("resolve", "127.0.0.1:53", "NOERROR 192.0.2.10", true),
+            check("canary", "[::1]:53", bad, false),
+            check("resolve", "[::1]:53", "NOERROR 192.0.2.10", true),
+          ],
+        }),
+      },
+    });
+    await vi.waitFor(() => expect(phase()).toBe("error"));
+    expect(rt.settings.get(DNS_SWITCH)).toBe(false);
+
+    const toastText =
+      "DNS filtering could not start: its self check failed on 127.0.0.1:53 and [::1]:53 (the test name got no answer). Details in Settings > Filtering.";
+    expect(await screen.findByText(toastText)).toBeInTheDocument();
+    expect(rt.notices.list().map((n) => n.text)).toEqual([toastText]);
+
+    // The card says it once, in plain words.
+    const line = "The self check failed on 127.0.0.1:53 and [::1]:53 (the test name got no answer).";
+    expect(within(card()).getAllByText(line)).toHaveLength(1);
+    expect(within(card()).getByRole("alert")).toHaveTextContent(line);
+    const technical = within(card()).getAllByText(/Malformed/);
+    expect(technical).toHaveLength(2);
+    for (const el of technical) expect(el).not.toBeVisible();
+
+    // The detail row folds out with each listener's reply once.
+    const details = card().querySelector("[data-dns-check-details]") as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+    await userEvent.click(within(details).getByText("Self check details"));
+    expect(details.open).toBe(true);
+    const items = within(details).getAllByRole("listitem").map((li) => li.textContent);
+    expect(items).toEqual([
+      `127.0.0.1:53: selfcheck.sieve.invalid expected NOERROR 0.0.0.0 (blocked), got ${bad}`,
+      `[::1]:53: selfcheck.sieve.invalid expected NOERROR 0.0.0.0 (blocked), got ${bad}`,
+    ]);
   });
 
   it("AdGuard running: a warning that its DNS protection must be paused for Sieve to decide", async () => {

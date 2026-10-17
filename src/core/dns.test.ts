@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SystemDnsState } from "@/data/protocol";
-import { blockRate, dnsPhase, EMPTY_DNS, failedChecks, isFiltering, isUpstream, mustAskBeforeQuit, needsProxyAtStart } from "./dns";
+import { blockRate, checkDetails, checkFailedLine, checkFailure, dnsPhase, EMPTY_DNS, isFiltering, isUpstream, mustAskBeforeQuit, needsProxyAtStart } from "./dns";
 import { createPassedChecks } from "./checks";
 
 const system = (pointed: boolean, backup: boolean): SystemDnsState => ({ v: 1, interfaces: [], pointed, backup, backup_dir: null });
@@ -48,16 +48,47 @@ describe("dns derivations", () => {
     expect(needsProxyAtStart(null)).toBe(false);
   });
 
-  it("failed checks are said in words", () => {
-    expect(
-      failedChecks({
-        pass: false,
-        checks: [
-          { kind: "canary", server: "127.0.0.1:53", name: "doubleclick.net", expect: "NOERROR 0.0.0.0 (blocked)", got: "no answer: timed out", pass: false },
-          { kind: "resolve", server: "127.0.0.1:53", name: "example.com", expect: "x", got: "x", pass: true },
-        ],
-      }),
-    ).toBe("doubleclick.net: expected NOERROR 0.0.0.0 (blocked), got no answer: timed out");
+  const V4 = "127.0.0.1:53";
+  const V6 = "[::1]:53";
+  const canary = (server: string, got: string, pass = false) =>
+    ({ kind: "canary", server, name: "selfcheck.sieve.invalid", expect: "NOERROR 0.0.0.0 (blocked)", got, pass }) as const;
+  const resolve = (server: string, got: string, pass = false) =>
+    ({ kind: "resolve", server, name: "example.com", expect: "NOERROR with a real address", got, pass }) as const;
+
+  it("a failed check is said once per reason, with the listeners named, and no technical reply", () => {
+    // The shape of the bug the user hit: the same failure on both listeners.
+    const bad = "no answer: bad name -tototix.gif: Malformed label: -tototix";
+    const both = { pass: false, checks: [canary(V4, bad), resolve(V4, "NOERROR 192.0.2.1", true), canary(V6, bad), resolve(V6, "NOERROR 192.0.2.1", true)] };
+    expect(checkFailure(both)).toBe(`on ${V4} and ${V6} (the test name got no answer)`);
+    expect(checkFailedLine(both)).toBe(`The self check failed on ${V4} and ${V6} (the test name got no answer).`);
+    expect(checkFailedLine(both)).not.toMatch(/Malformed|NOERROR|tototix/);
+    const one = { pass: false, checks: [canary(V4, "no answer: timed out"), canary(V6, "NOERROR 0.0.0.0", true)] };
+    expect(checkFailure(one)).toBe(`on ${V4} (the test name got no answer)`);
+    const mixed = {
+      pass: false,
+      checks: [
+        { kind: "rules", server: "", name: "", expect: "at least one block rule", got: "no block rule is loaded", pass: false } as const,
+        canary(V4, "NOERROR 192.0.2.7"),
+        resolve(V4, "SERVFAIL (no records)"),
+        resolve(V6, "no answer: timed out"),
+      ],
+    };
+    expect(checkFailure(mixed)).toBe(
+      `(no filter list is loaded); on ${V4} (the test name was not blocked); on ${V4} (a normal name did not resolve); on ${V6} (a normal name got no answer)`,
+    );
+    const call = { pass: false, checks: [{ kind: "call", server: "", name: "", expect: "an answer from the filter", got: "DNS filter is not running", pass: false } as const] };
+    expect(checkFailure(call)).toBe("(the check could not run)");
+    expect(checkFailure({ pass: false, checks: [] })).toBe("(no check ran)");
+  });
+
+  it("details keep every technical reply with its listener, identical lines once", () => {
+    const bad = "no answer: bad name -tototix.gif: Malformed label: -tototix";
+    const c = { pass: false, checks: [canary(V4, bad), canary(V6, bad), canary(V4, bad), resolve(V4, "NOERROR 192.0.2.1", true)] };
+    expect(checkDetails(c)).toEqual([
+      `${V4}: selfcheck.sieve.invalid expected NOERROR 0.0.0.0 (blocked), got ${bad}`,
+      `${V6}: selfcheck.sieve.invalid expected NOERROR 0.0.0.0 (blocked), got ${bad}`,
+    ]);
+    expect(checkDetails({ pass: true, checks: [resolve(V4, "NOERROR 192.0.2.1", true)] })).toEqual([]);
   });
 });
 

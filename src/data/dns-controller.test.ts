@@ -143,7 +143,11 @@ describe("DNS controller: the filtering.dns switch", () => {
     expect(t.dns().status?.running).toBe(false);
     expect(t.settings.get(DNS_SWITCH)).toBe(false);
     expect(t.checks.has(DNS_SWITCH)).toBe(false);
-    expect(t.texts().at(-1)).toMatch(/DNS filtering was turned off: its self check failed \(selfcheck\.sieve\.invalid: expected .* got no answer: timed out\)/);
+    expect(t.texts().at(-1)).toBe(
+      "DNS filtering could not start: its self check failed on 127.0.0.1:53 (the test name got no answer). Details in Settings > Filtering.",
+    );
+    expect(t.dns().error).toBe("The self check failed on 127.0.0.1:53 (the test name got no answer).");
+    expect(t.dns().check?.pass).toBe(false);
     t.undo();
   });
 
