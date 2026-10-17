@@ -243,9 +243,7 @@ mod os {
 
         keys.into_iter().find_map(|(lang, cp)| {
             let words = query(&block, &format!("\\StringFileInfo\\{lang:04x}{cp:04x}\\ProductName"))?;
-            let text = String::from_utf16_lossy(words);
-            let text = text.trim_end_matches('\0').trim();
-            (!text.is_empty()).then(|| text.to_string())
+            super::clean_resource_string(words)
         })
     }
 
@@ -273,6 +271,22 @@ mod os {
         // and is 2-byte aligned; the slice borrows `block`.
         Some(unsafe { std::slice::from_raw_parts(ptr.cast::<u16>(), words) })
     }
+}
+
+/// A version-resource string as a display name. The length VerQueryValueW
+/// reports can run past the string's terminating NUL into leftover bytes
+/// (seen live: "NVIDIA App" followed by junk and "Product"), so the text
+/// ends at the first NUL. Control characters, U+FFFD from unpaired
+/// surrogates and other invisible format characters are dropped, and runs
+/// of whitespace collapse to one space. Empty after that means no name.
+pub fn clean_resource_string(words: &[u16]) -> Option<String> {
+    let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());
+    let text: String = char::decode_utf16(words[..end].iter().copied())
+        .filter_map(Result::ok)
+        .filter(|c| !c.is_control() && !matches!(*c, '\u{FFFD}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{E000}'..='\u{F8FF}'))
+        .collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
 }
 
 /// Off Windows there is no process table to ask.
@@ -305,6 +319,33 @@ mod tests {
 
     fn no_service(_: u32) -> Option<String> {
         None
+    }
+
+    fn utf16(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn resource_strings_end_at_the_first_nul_and_lose_invisible_junk() {
+        // The live case: a name, its NUL, then leftover bytes and another word.
+        let mut words = utf16("NVIDIA App");
+        words.extend([0, 0x003C, 0x0001, 0xD800, 0x0002]);
+        words.extend(utf16("Product"));
+        assert_eq!(clean_resource_string(&words).as_deref(), Some("NVIDIA App"));
+
+        // Control characters, an unpaired surrogate, zero-width and private-use characters vanish.
+        let mut words = utf16("Fig");
+        words.extend([0x0007, 0xDC00, 0x200B, 0xE123]);
+        words.extend(utf16("ma"));
+        assert_eq!(clean_resource_string(&words).as_deref(), Some("Figma"));
+
+        // Whitespace runs collapse and the ends are trimmed.
+        assert_eq!(clean_resource_string(&utf16("  Google \t  Drive \r\n")).as_deref(), Some("Google Drive"));
+        // Real non-ASCII names survive.
+        assert_eq!(clean_resource_string(&utf16("Böhm Café 日本")).as_deref(), Some("Böhm Café 日本"));
+        // Nothing visible left means no name.
+        assert_eq!(clean_resource_string(&[0x0001, 0x200B, 0]), None);
+        assert_eq!(clean_resource_string(&[]), None);
     }
 
     #[test]
