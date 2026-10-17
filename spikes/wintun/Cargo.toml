@@ -25,6 +25,15 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 
+# Read-only Windows calls: owner-pid tables (IP Helper), process image path.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 proptest = "1"
 

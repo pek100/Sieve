@@ -10,6 +10,11 @@
 //! - [`stream`]: per-flow TCP payload reassembly with a size cap.
 //! - [`packet`]: IPv4/IPv6 + TCP/UDP header parsing of a raw IP packet.
 //! - [`rules`]: the DNS filter's rule syntax and suffix-set matcher (copied).
+//! - [`flows`]: flow -> pid from the IP Helper owner-pid tables, pid -> exe,
+//!   and the pure per-app verdict.
+//! - [`classify`]: one flow's first client bytes in, one decision out.
+pub mod classify;
+pub mod flows;
 pub mod http;
 pub mod packet;
 pub mod quic;
