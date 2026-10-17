@@ -5,7 +5,9 @@
  *
  * Effective level = min(requested, ceiling). The ceiling is derived from the
  * data switches: a level that needs a switch is reachable only when that
- * switch is on AND its live check has passed this session.
+ * switch is on AND its live check has passed this session. A switch the
+ * build cannot provide (registry `unavailable`) never passes, so the level
+ * stays out of reach with the reason said.
  */
 
 export const LEVELS = ["off", "watch", "sieve"] as const;
@@ -14,9 +16,14 @@ export type Level = (typeof LEVELS)[number];
 /** What an app gets when the user never chose: watching is read-only and safe. */
 export const DEFAULT_LEVEL: Level = "watch";
 
-/** Which data switch (settings key) each level needs. Levels absent here need nothing. */
+/**
+ * Which data switch (settings key) each level needs. Levels absent here need nothing.
+ * `sieve` filters one app and not another, so it needs per-app filtering. DNS
+ * filtering cannot provide it: every Windows lookup reaches a DNS proxy
+ * through the DNS Client service, so the proxy never knows which app asked.
+ */
 export const LEVEL_REQUIRES: Partial<Record<Level, string>> = {
-  sieve: "filtering.dns",
+  sieve: "filtering.perApp",
 };
 
 export function levelRank(level: Level): number {
@@ -49,18 +56,22 @@ export function ceiling(
  * Why `level` is out of reach, or null when it is reachable. Reads the switch
  * LEVEL_REQUIRES names for that level (never a hardcoded key), so a new
  * level or a new switch gets the right words for free.
- * @param switchOn whether a data switch (by settings key) is on
- * @param labelOf  a settings key's label
+ * @param switchOn    whether a data switch (by settings key) is on
+ * @param labelOf     a settings key's label
+ * @param unavailable why a switch cannot be turned on in this build, or null
  */
 export function lockedReason(
   level: Level,
   top: Level,
   switchOn: (key: string) => boolean,
   labelOf: (key: string) => string,
+  unavailable: (key: string) => string | null,
 ): string | null {
   const needs = LEVEL_REQUIRES[level];
   if (needs === undefined || levelRank(level) <= levelRank(top)) return null;
   const label = labelOf(needs);
+  const why = unavailable(needs);
+  if (why !== null) return `Needs ${label}. ${why}`;
   return switchOn(needs) ? `Needs ${label} to pass its live check` : `Needs ${label}, which is off`;
 }
 

@@ -9,8 +9,12 @@ import { trayState } from "@/core/tray";
 import { tauriDesktop, type Desktop } from "@/data/desktop";
 import { createPoller, realClock, type Clock, type Poller } from "@/data/poller";
 import { createSettingsStore, localBackend, memoryBackend, tauriBackend, type SettingsBackend, type SettingsStore } from "@/data/settings-store";
+import { createPassedChecks, type PassedChecks } from "@/core/checks";
+import { createDnsController, type DnsController } from "@/data/dns-controller";
+import { createMockDns } from "@/data/dns-mock";
+import type { DnsSource } from "@/data/dns-source";
 import { createMockSource } from "@/data/mock-source";
-import { isTauriWindow, resolveSource, type SieveSource } from "@/data/source";
+import { createDnsSource, createSource, isTauriWindow, sourceOptions, type SieveSource } from "@/data/source";
 
 export interface Runtime {
   readonly isTauri: boolean;
@@ -19,12 +23,16 @@ export interface Runtime {
   readonly poller: Poller;
   readonly settings: SettingsStore;
   readonly notices: NoticeBus;
-  /** Live checks (by settings key of their data switch) that passed this session. None yet. */
-  readonly passedChecks: ReadonlySet<string>;
+  /** Live checks (by settings key of their data switch) that passed this session. Written by the DNS controller. */
+  readonly passedChecks: PassedChecks;
   /** The window's clock (the poller's): "now" for history queries. Injected in tests. */
   readonly clock: Clock;
   /** Tray and launch at startup; null outside the desktop app. */
   readonly desktop: Desktop | null;
+  /** The DNS seam (Tauri commands or the mock). */
+  readonly dns: DnsSource;
+  /** The one owner of DNS state; components call its actions through hooks. */
+  readonly dnsController: DnsController;
 }
 
 export interface RuntimeOptions {
@@ -33,21 +41,38 @@ export interface RuntimeOptions {
   clock?: Clock;
   isTauri?: boolean;
   desktop?: Desktop | null;
+  /** Default: the mock DNS, scenario off. */
+  dns?: DnsSource;
 }
 
 export function createRuntime(o: RuntimeOptions): Runtime {
   const store = createStore();
   const clock = o.clock ?? realClock;
+  const settings = createSettingsStore(o.settings);
+  const notices = createNoticeBus();
+  const passedChecks = createPassedChecks();
+  const desktop = o.desktop ?? null;
+  const dns = o.dns ?? createMockDns({ seed: 1, now: clock.now });
   return {
     isTauri: o.isTauri ?? false,
     source: o.source,
     store,
     poller: createPoller({ source: o.source, store, clock }),
-    settings: createSettingsStore(o.settings),
-    notices: createNoticeBus(),
-    passedChecks: new Set<string>(),
+    settings,
+    notices,
+    passedChecks,
     clock,
-    desktop: o.desktop ?? null,
+    desktop,
+    dns,
+    dnsController: createDnsController({
+      dns,
+      store,
+      settings,
+      notices,
+      checks: passedChecks,
+      clock,
+      exit: desktop ? () => desktop.quit() : null,
+    }),
   };
 }
 
@@ -57,12 +82,19 @@ export function createBrowserRuntime(): Runtime {
     return createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend() });
   }
   const isTauri = isTauriWindow();
+  const options = sourceOptions({ search: window.location.search, isTauri });
   return createRuntime({
-    source: resolveSource({ search: window.location.search, isTauri }),
+    source: createSource(options),
+    dns: createDnsSource(options),
     settings: isTauri ? tauriBackend() : localBackend(),
     isTauri,
     desktop: isTauri ? tauriDesktop() : null,
   });
+}
+
+/** Run the DNS controller (load, safety rule, follow the switches, poll). Returns the undo. */
+export function bindDns(rt: Runtime): () => void {
+  return rt.dnsController.bind();
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -75,6 +107,8 @@ function clockTime(ms: number): string {
  * Keep the desktop shell in step with the window (no-op without one):
  * - the tray shows the phase (trayState) and its Pause and Resume call the
  *   same poller actions as the pause pill;
+ * - tray Quit and the window's close go to the DNS controller, which asks
+ *   first while Windows points at Sieve;
  * - launch at startup follows the setting `startup.launchAtLogin`, which is
  *   the source of truth: on load the OS entry is reconciled to it, and every
  *   change is applied. A failure is said in a toast.
@@ -101,10 +135,22 @@ export function bindDesktop(rt: Runtime, fmt: (ms: number) => string = clockTime
   void d
     .onTrayAction((a) => {
       if (a.kind === "pause") rt.poller.pauseFor(a.minutes);
-      else rt.poller.resume();
+      else if (a.kind === "resume") rt.poller.resume();
+      else rt.dnsController.requestQuit();
     })
     .then((un) => (cancelled ? un() : (unTray = un)))
     .catch((e: unknown) => console.warn(`Tray: ${message(e)}`));
+
+  // Closing the window ends the app: while Windows points at Sieve, ask first.
+  let unClose: (() => void) | null = null;
+  void d
+    .onCloseRequested(() => {
+      if (!rt.dnsController.holdClose()) return false;
+      rt.dnsController.requestQuit();
+      return true;
+    })
+    .then((un) => (cancelled ? un() : (unClose = un)))
+    .catch((e: unknown) => console.warn(`Close: ${message(e)}`));
 
   let applied: boolean | null = null;
   const syncAutostart = async () => {
@@ -126,6 +172,7 @@ export function bindDesktop(rt: Runtime, fmt: (ms: number) => string = clockTime
     unStore();
     unSettings();
     unTray?.();
+    unClose?.();
   };
 }
 

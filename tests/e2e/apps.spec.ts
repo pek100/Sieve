@@ -35,8 +35,9 @@ test.describe("apps", () => {
 
     const sieve = row(page, CHROME).getByRole("radio", { name: "Sieve" });
     await expect(sieve).toBeDisabled();
-    await expect(sieve).toHaveAttribute("title", "Needs DNS filtering, which is off");
-    await expect(page.getByTestId("sieve-locked")).toContainText("Needs DNS filtering, which is off");
+    // Per-app filtering is not something DNS can do: the reason says so, from the registry.
+    await expect(sieve).toHaveAttribute("title", /^Needs Per-app filtering\. .*network driver/);
+    await expect(page.getByTestId("sieve-locked")).toContainText("Needs Per-app filtering.");
 
     await noHorizontalScroll(page);
     await page.screenshot({ path: `test-results/screens/apps-${info.project.name}.png`, fullPage: true });

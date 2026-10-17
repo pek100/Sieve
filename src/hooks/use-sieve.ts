@@ -37,18 +37,21 @@ export function useSwitchOn(): (key: string) => boolean {
   return useCallback((k: string) => isSettingKey(k) && readValue(doc, k) === true, [doc]);
 }
 
+/** Whether a data switch's live check passed this session; rerenders when one passes or is forgotten. */
+export function useCheckPassed(): (key: string) => boolean {
+  const { passedChecks } = useRuntime();
+  const version = useSyncExternalStore(passedChecks.subscribe, passedChecks.version, passedChecks.version);
+  // `version` is the dependency that makes a new function on every change.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  return useCallback((k: string) => passedChecks.has(k), [passedChecks, version]);
+}
+
 /** The highest per-app level reachable now (from data switches and passed live checks). */
 export function useLevelCeiling(): Level {
-  const { settings, passedChecks } = useRuntime();
+  const { settings } = useRuntime();
   const doc = useSyncExternalStore(settings.subscribe, settings.doc, settings.doc);
-  return useMemo(
-    () =>
-      ceiling(
-        (k) => isSettingKey(k) && readValue(doc, k) === true,
-        (k) => passedChecks.has(k),
-      ),
-    [doc, passedChecks],
-  );
+  const passed = useCheckPassed();
+  return useMemo(() => ceiling((k) => isSettingKey(k) && readValue(doc, k) === true, passed), [doc, passed]);
 }
 
 export function useNotices(): readonly Notice[] {

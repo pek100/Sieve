@@ -13,8 +13,13 @@ export interface TrayState {
   dim: boolean;
 }
 
-/** What a tray menu item asks the window to do (Rust TrayAction, minus open and quit, which Rust does itself). */
-export type TrayAction = { kind: "pause"; minutes: number } | { kind: "resume" };
+/**
+ * What a tray menu item asks the window to do (Rust TrayAction, minus open,
+ * which Rust does itself). Quit reaches the window only while Sieve's DNS
+ * backup exists (Windows may point at Sieve), so the window can ask first;
+ * otherwise Rust quits by itself.
+ */
+export type TrayAction = { kind: "pause"; minutes: number } | { kind: "resume" } | { kind: "quit" };
 
 /**
  * @param fmt formats an epoch ms as a clock time (the caller owns the locale)
@@ -40,6 +45,7 @@ export function parseTrayAction(x: unknown): TrayAction | null {
   if (typeof x !== "object" || x === null) return null;
   const r = x as { kind?: unknown; minutes?: unknown };
   if (r.kind === "resume") return { kind: "resume" };
+  if (r.kind === "quit") return { kind: "quit" };
   if (r.kind === "pause" && typeof r.minutes === "number" && Number.isFinite(r.minutes) && r.minutes > 0) {
     return { kind: "pause", minutes: r.minutes };
   }

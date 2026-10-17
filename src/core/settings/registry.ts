@@ -7,6 +7,7 @@
  * "dataSwitch", defaults to false and names the live check that proves it
  * works on the real machine (a `live_*` test). The registry law enforces it.
  */
+import { isUpstream } from "../dns";
 import { LEVELS, type Level } from "../policy";
 
 export const SETTINGS_SCHEMA = 1;
@@ -33,12 +34,19 @@ interface Base<T> {
   desktopOnly?: boolean;
 }
 
-/** Shape of one element of a map or list setting. */
-export type ElementSpec = { type: "string" } | { type: "enum"; options: readonly string[] };
+/** Shape of one element of a map or list setting. `upstream`: a DNS server address (see isUpstream). */
+export type ElementSpec = { type: "string" } | { type: "upstream" } | { type: "enum"; options: readonly string[] };
 
 export function isValidElement(spec: ElementSpec, v: unknown): boolean {
   if (typeof v !== "string") return false;
-  return spec.type === "string" ? v.trim().length > 0 : spec.options.includes(v);
+  switch (spec.type) {
+    case "string":
+      return v.trim().length > 0;
+    case "upstream":
+      return isUpstream(v);
+    case "enum":
+      return spec.options.includes(v);
+  }
 }
 
 export interface EnumSetting<O extends string = string> extends Base<O> {
@@ -69,6 +77,8 @@ export interface DataSwitchSetting extends Base<false | boolean> {
   kind: "dataSwitch";
   /** Name of the ignored Rust/Playwright test that proves the switch on the real machine. */
   liveCheck: string;
+  /** Why this build cannot turn the switch on, said to the user. Absent: the switch works. */
+  unavailable?: string;
 }
 
 export type SettingDef =
@@ -137,13 +147,44 @@ export const REGISTRY = {
     default: [] as readonly string[],
     of: { type: "string" },
   } satisfies ListSetting<string>,
+  // DNS filtering is system wide: every Windows lookup reaches the proxy
+  // through the DNS Client service, so it cannot tell apps apart.
   "filtering.dns": {
     kind: "dataSwitch",
     section: "filtering",
     label: "DNS filtering",
-    help: "Answer DNS for sieved apps and drop blocked domains. Changes how this computer resolves names.",
+    help: "Blocks ad and tracker domains for every app on this computer, once Windows uses Sieve for DNS. Runs a DNS filter on this computer with the AdGuard DNS filter list.",
     default: false,
     liveCheck: "live_dns_filter_resolves_blocked_domain",
+  } satisfies DataSwitchSetting,
+  "filtering.upstreams": {
+    kind: "list",
+    section: "filtering",
+    label: "Upstream DNS servers",
+    help: "Where DNS filtering sends the lookups it does not block, tried in order. Applies the next time DNS filtering starts.",
+    default: ["1.1.1.1", "9.9.9.9"] as readonly string[],
+    of: { type: "upstream" },
+  } satisfies ListSetting<string>,
+  // The one place Sieve changes the system: a backup is written first and
+  // Windows asks for administrator rights (src-tauri/src/sysdns).
+  "filtering.systemDns": {
+    kind: "dataSwitch",
+    section: "filtering",
+    label: "Windows uses Sieve for DNS",
+    help: "Points every active network adapter at Sieve (127.0.0.1 and ::1) after saving a backup of its DNS servers. Windows asks for administrator rights. Off restores the backup.",
+    default: false,
+    liveCheck: "live_system_dns_points_at_sieve",
+    requires: "filtering.dns",
+  } satisfies DataSwitchSetting,
+  "filtering.perApp": {
+    kind: "dataSwitch",
+    section: "filtering",
+    label: "Per-app filtering",
+    help: "Filter some apps and not others: the sieve level on Apps.",
+    default: false,
+    liveCheck: "live_per_app_filter_blocks_one_app",
+    unavailable:
+      "Telling which app made a lookup needs a network driver, which Sieve does not have. DNS filtering applies to every app.",
   } satisfies DataSwitchSetting,
 } as const;
 
@@ -175,6 +216,13 @@ export function defaultValue<K extends SettingKey>(key: K): SettingValue<K> {
 
 export function isSettingKey(key: string): key is SettingKey {
   return Object.prototype.hasOwnProperty.call(REGISTRY, key);
+}
+
+/** Why this build cannot turn a data switch on (its `unavailable`), or null. */
+export function unavailableReason(key: string): string | null {
+  if (!isSettingKey(key)) return null;
+  const d = settingDef(key);
+  return d.kind === "dataSwitch" ? (d.unavailable ?? null) : null;
 }
 
 /** Does `value` have the shape the registry declares for `key`? */

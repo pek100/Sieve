@@ -5,8 +5,7 @@
  * Import replaces: the file is the whole truth, so a known key the file does
  * not carry goes back to its default. The preview lists every key that would
  * change and every entry that is refused, before anything is applied. A data
- * switch cannot be turned on by an import while it is locked (its live check
- * has not passed); that entry is refused with the reason.
+ * switch is never turned on by an import; that entry is refused with the reason.
  */
 import { SETTINGS_SCHEMA, SECTIONS, SETTING_KEYS, defaultValue, isSettingKey, isValidValue, settingDef, type SettingKey } from "./registry";
 import { knownValues, normalizeDoc, readValue, type SettingsDoc } from "./document";
@@ -58,10 +57,11 @@ function changesBetween(current: SettingsDoc, next: SettingsDoc): Change[] {
 }
 
 /**
- * What importing `text` would do to `current`.
- * @param locked whether a setting (a data switch) may not be turned on now
+ * What importing `text` would do to `current`. A data switch is never turned
+ * on by an import: it changes traffic or the system, so a person turns it on
+ * where its checks run (safety asymmetry). Turning one off is imported.
  */
-export function planImport(current: SettingsDoc, text: string, locked: (key: SettingKey) => boolean): ImportPlan {
+export function planImport(current: SettingsDoc, text: string): ImportPlan {
   let raw: unknown;
   try {
     raw = JSON.parse(text);
@@ -88,8 +88,8 @@ export function planImport(current: SettingsDoc, text: string, locked: (key: Set
       refused.push({ key, reason: "Not a valid value for this setting" });
       continue;
     }
-    if (settingDef(key).kind === "dataSwitch" && v === true && locked(key)) {
-      refused.push({ key, reason: "Stays off until its live check passes on this computer" });
+    if (settingDef(key).kind === "dataSwitch" && v === true && readValue(current, key) !== true) {
+      refused.push({ key, reason: "An import never turns this on; turn it on yourself in Settings" });
       continue;
     }
     values[key] = v;
@@ -145,6 +145,8 @@ export function formatValue(key: SettingKey, value: unknown): string {
     }
     case "list": {
       const n = Array.isArray(value) ? value.length : 0;
+      // Server addresses are short and are the point: say them.
+      if (d.of.type === "upstream" && Array.isArray(value)) return n === 0 ? "None" : value.join(", ");
       return n === 0 ? "None" : n === 1 ? "1 item" : `${n} items`;
     }
   }

@@ -18,11 +18,11 @@ import {
 import { ceiling, LEVEL_REQUIRES, LEVELS, levelRank, type Level } from "./policy";
 import { createStore, newest } from "./store";
 
-const DNS = LEVEL_REQUIRES.sieve!;
+const NEEDS = LEVEL_REQUIRES.sieve!;
 const top = (switchOn: boolean, checkPassed: boolean) =>
   ceiling(
-    (k) => k === DNS && switchOn,
-    (k) => k === DNS && checkPassed,
+    (k) => k === NEEDS && switchOn,
+    (k) => k === NEEDS && checkPassed,
   );
 
 async function mockSnapshot(ticks = 40) {
@@ -33,7 +33,7 @@ async function mockSnapshot(ticks = 40) {
 }
 
 describe("setLevel is clamped to the ceiling", () => {
-  it("sieve with DNS filtering off is stored and read as watch", () => {
+  it("sieve with its switch (per-app filtering) off is stored and read as watch", () => {
     const t = top(false, false);
     expect(t).toBe("watch");
     const levels = setLevel({}, "google chrome", "sieve", t);

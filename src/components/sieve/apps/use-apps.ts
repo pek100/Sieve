@@ -15,7 +15,7 @@ import {
 } from "@/core/apps-actions";
 import { exeStem } from "@/core/apps";
 import { lockedReason as lockedReasonFor, type Level } from "@/core/policy";
-import { isSettingKey, settingDef } from "@/core/settings/registry";
+import { isSettingKey, settingDef, unavailableReason } from "@/core/settings/registry";
 import { newest, phase, type Phase } from "@/core/store";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useLevelCeiling, useSetting, useSieve, useSwitchOn } from "@/hooks/use-sieve";
@@ -59,7 +59,8 @@ export function useApps(): AppsModel {
 
   // The switch a level needs is whatever LEVEL_REQUIRES names; its label comes from the registry.
   const lockedReason = useCallback(
-    (level: Level) => lockedReasonFor(level, top, switchOn, (k) => (isSettingKey(k) ? settingDef(k).label : k)),
+    (level: Level) =>
+      lockedReasonFor(level, top, switchOn, (k) => (isSettingKey(k) ? settingDef(k).label : k), unavailableReason),
     [top, switchOn],
   );
 

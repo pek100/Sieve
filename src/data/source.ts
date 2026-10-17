@@ -10,6 +10,8 @@ import { createMockSource, MOCK_SCENARIOS, type MockScenario } from "./mock-sour
 import type { HistoryQuery } from "@/core/history";
 import type { History, Snapshot } from "./protocol";
 import { createTauriSource } from "./tauri-source";
+import { createMockDns, DNS_SCENARIOS, type DnsScenario } from "./dns-mock";
+import { createTauriDns, type DnsSource } from "./dns-source";
 
 export type { SourceKind };
 
@@ -31,6 +33,10 @@ export interface SourceOptions {
   kind: SourceKind;
   seed: number;
   scenario: MockScenario;
+  /** Mock DNS scenario (?dns=off|running|error, default off). */
+  dns: DnsScenario;
+  /** Mock: report AdGuard as running (?adguard=1). */
+  adguard: boolean;
 }
 
 /** Read the source choice from the environment: query string and Tauri presence. */
@@ -42,11 +48,18 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   const seed = Number.isInteger(seedRaw) && seedRaw > 0 ? seedRaw : 1;
   const sc = q.get("scenario");
   const scenario = (MOCK_SCENARIOS as readonly string[]).includes(sc ?? "") ? (sc as MockScenario) : "steady";
-  return { kind, seed, scenario };
+  const d = q.get("dns");
+  const dns = (DNS_SCENARIOS as readonly string[]).includes(d ?? "") ? (d as DnsScenario) : "off";
+  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1" };
 }
 
 export function createSource(o: SourceOptions): SieveSource {
   return o.kind === "tauri" ? createTauriSource() : createMockSource({ seed: o.seed, scenario: o.scenario });
+}
+
+/** The DNS seam follows the same choice: Tauri commands, or the mock. */
+export function createDnsSource(o: SourceOptions): DnsSource {
+  return o.kind === "tauri" ? createTauriDns() : createMockDns({ seed: o.seed, scenario: o.dns, adguard: o.adguard });
 }
 
 /** Pick the source for this window. */

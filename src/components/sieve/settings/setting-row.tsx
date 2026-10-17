@@ -14,20 +14,26 @@ import type { Lock } from "./use-settings-view";
 
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+const emptyDefault = (k: SettingKey) => {
+  const d = defaultValue(k);
+  return Array.isArray(d) ? d.length === 0 : typeof d === "object" && d !== null && Object.keys(d).length === 0;
+};
 
 function LockNote({ lock }: { lock: Lock }) {
   return (
     <p data-lock={lock.kind} className="flex items-start gap-2 pt-1 text-label text-on-surface-muted">
       <LockIcon aria-hidden="true" className="size-4 shrink-0 text-warning" strokeWidth={1.75} />
       <span className="min-w-0">
-        {lock.kind === "liveCheck" ? (
+        {lock.kind === "unavailable" ? (
           <>
-            Stays off until its live check <code className="font-mono text-mono break-all text-on-surface">{lock.check}</code> passes on
-            this computer. Sieve does not filter yet.
+            {lock.reason} Its live check <code className="font-mono text-mono break-all text-on-surface">{lock.check}</code> does not
+            exist yet.
             {lock.neededBy.length > 0 && ` Needed by ${lock.neededBy.join(", ")}.`}
           </>
         ) : lock.kind === "desktop" ? (
           "Only the desktop app can change this."
+        ) : lock.checking ? (
+          `Needs ${lock.label} to pass its self check.`
         ) : (
           `Needs ${lock.label}, which is off.`
         )}
@@ -78,8 +84,8 @@ export function SettingRow({
       break;
     case "boolean":
     case "dataSwitch": {
-      // A data switch whose check has not passed is off in force, whatever is stored.
-      const on = value === true && !(d.kind === "dataSwitch" && lock?.kind === "liveCheck");
+      // A data switch this build cannot provide is off in force, whatever is stored.
+      const on = value === true && lock?.kind !== "unavailable";
       control = (
         <Switch
           checked={on}
@@ -113,8 +119,14 @@ export function SettingRow({
         <div className="flex items-center gap-2">
           <span className="text-label text-on-surface-muted tabular">{formatValue(k, value)}</span>
           {!same(value, defaultValue(k)) && (
-            <Button variant="ghost" size="sm" onClick={() => onReset(k)} aria-label={`Clear ${d.label}`}>
-              Clear
+            // Back to the default: "Clear" when the default is empty, "Reset" when it has entries.
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => onReset(k)}
+              aria-label={`${emptyDefault(k) ? "Clear" : "Reset"} ${d.label}`}
+            >
+              {emptyDefault(k) ? "Clear" : "Reset"}
             </Button>
           )}
           {route && (
