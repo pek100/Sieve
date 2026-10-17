@@ -25,17 +25,37 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 
-# Read-only Windows calls: owner-pid tables (IP Helper), process image path.
+# Probe only: async runtime, userspace TCP/IP stack, Wintun loader, report.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "sync"] }
+ipstack = "1.0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = "0.6"
+
+# Windows calls. Read only for the library (owner-pid tables, process image
+# path). The probe binary alone also creates the adapter, its address and
+# its test routes (elevated, run by the user, removed on exit).
 [target.'cfg(windows)'.dependencies]
+# Loads wintun.dll at run time (libloading); verify_binary_signature refuses
+# a DLL whose Authenticode signer is not "WireGuard LLC".
+wintun-bindings = { version = "0.7.40", features = ["verify_binary_signature"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_Security",
     "Win32_System_Threading",
 ] }
 
+[[bin]]
+name = "probe"
+path = "src/bin/probe/main.rs"
+
 [dev-dependencies]
 proptest = "1"
+# Benchmark only: craft packets for ipstack (same version ipstack uses).
+etherparse = "0.20"
 
 [profile.release]
 debug = 1

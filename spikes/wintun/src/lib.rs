@@ -17,6 +17,7 @@ pub mod classify;
 pub mod flows;
 pub mod http;
 pub mod packet;
+pub mod probe_support;
 pub mod quic;
 pub mod rules;
 pub mod sni;
