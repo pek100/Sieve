@@ -25,6 +25,15 @@ tauri-plugin-autostart = "2"
 tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
 
+# DNS filter engine (src/dns): message parsing, the proxy's sockets and
+# the runtime list download (OS TLS stack, no bundled crypto).
+hickory-proto = "0.26"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
+
+[dev-dependencies]
+tempfile = "3"
+
 # Read-only Windows calls for the connection source (slice S1): the IP Helper
 # owner-pid tables, process image names and file version info. No writes.
 [target.'cfg(windows)'.dependencies]

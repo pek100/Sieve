@@ -6,6 +6,7 @@
 //! `startup.launchAtLogin` setting on.
 
 pub mod commands;
+pub mod dns;
 pub mod history;
 pub mod netstat;
 pub mod protocol;
@@ -19,6 +20,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        .manage(dns::commands::DnsState::default())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             app.manage(history::HistoryState::open_at(&dir));
@@ -29,7 +31,11 @@ pub fn run() {
             commands::net_snapshot,
             commands::history_record,
             commands::history_buckets,
-            commands::tray_set_state
+            commands::tray_set_state,
+            dns::commands::dns_start,
+            dns::commands::dns_stop,
+            dns::commands::dns_status,
+            dns::commands::dns_self_check,
         ])
         .run(tauri::generate_context!());
     if let Err(e) = result {
