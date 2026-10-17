@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
-import { bindSampling, createBrowserRuntime, type Runtime } from "./runtime";
+import { bindDesktop, bindSampling, createBrowserRuntime, type Runtime } from "./runtime";
 
 const RuntimeContext = createContext<Runtime | null>(null);
 
@@ -9,6 +9,7 @@ const RuntimeContext = createContext<Runtime | null>(null);
 export function SieveProvider({ runtime, children }: { runtime?: Runtime; children: ReactNode }) {
   const [rt] = useState(() => runtime ?? createBrowserRuntime());
   useEffect(() => bindSampling(rt), [rt]);
+  useEffect(() => bindDesktop(rt), [rt]);
   return <RuntimeContext.Provider value={rt}>{children}</RuntimeContext.Provider>;
 }
 
