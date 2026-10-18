@@ -13,7 +13,11 @@ import { ActivityChart } from "./activity-chart";
 import { seriesTone } from "./series-tone";
 import { isHistoryWindow, WINDOWS, type WindowChoice } from "./use-home";
 
-/** Legend chips double as toggles: off shows a hollow swatch and a muted label. */
+/**
+ * Compact legend, the same look as the heatmap's (dot and caption text, no pill),
+ * so it fits one line at desktop widths. Entries double as toggles: off shows a
+ * hollow dot and a faint label.
+ */
 export function ChartLegend({
   series,
   hidden,
@@ -24,25 +28,25 @@ export function ChartLegend({
   onToggle: (key: string) => void;
 }) {
   return (
-    <ul aria-label="Series" className="flex flex-wrap gap-2">
+    <ul aria-label="Series" className="-mx-1 flex min-w-0 flex-wrap gap-x-2 gap-y-1">
       {series.map((s) => {
         const on = !hidden.has(s.key);
         const tone = seriesTone(s.slot);
         return (
-          <li key={s.key} className="max-w-full min-w-0">
+          <li key={s.key} className="max-w-48 min-w-0">
             <button
               type="button"
               aria-pressed={on}
               title={on ? `Hide ${s.name}` : `Show ${s.name}`}
               onClick={() => onToggle(s.key)}
               className={cn(
-                "relative inline-flex h-7 max-w-full items-center gap-2 overflow-hidden rounded-full bg-surface-2 px-3 text-label transition-colors duration-(--motion-fast) ease-standard",
-                on ? "text-on-surface" : "text-on-surface-faint",
+                "relative inline-flex h-6 max-w-full items-center gap-2 overflow-hidden rounded-sm px-1 text-caption transition-colors duration-(--motion-fast) ease-standard",
+                on ? "text-on-surface-muted hover:text-on-surface" : "text-on-surface-faint",
               )}
             >
               <span
                 aria-hidden="true"
-                className={cn("size-2.5 shrink-0 rounded-full border-2", tone.border, on ? tone.bg : "bg-transparent")}
+                className={cn("size-2 shrink-0 rounded-full border-2", tone.border, on ? tone.bg : "bg-transparent")}
               />
               <span className="truncate">{s.name}</span>
               <StateLayer />
@@ -113,7 +117,7 @@ export function ChartCard({
       action={
         <>
           {/* Six choices fit a segmented control from 640 up; narrower, the same choice is a select. */}
-          <Segmented label="Chart window" items={items} value={choice} onChange={onChoice} className="max-[640px]:hidden" />
+          <Segmented label="Chart window" size="sm" items={items} value={choice} onChange={onChoice} className="max-[640px]:hidden" />
           <Select value={choice} onValueChange={(v) => onChoice(v as WindowChoice)}>
             <SelectTrigger aria-label="Chart window" className="hidden h-9 w-28 rounded-full bg-inset px-3 text-label max-[640px]:flex">
               <SelectValue />
@@ -130,7 +134,7 @@ export function ChartCard({
       }
       state={state}
     >
-      <div className="flex min-h-0 flex-1 flex-col gap-3">
+      <div className="flex min-h-0 flex-1 flex-col gap-2">
         <ChartLegend series={model.series} hidden={hidden} onToggle={toggle} />
         {/* Never keyed: a window switch rescales the same paths, so only the time range changes. */}
         <ActivityChart

@@ -25,7 +25,13 @@ export interface SegmentItem<V extends string> {
 const GAP_PX = 4;
 const track = "relative inline-grid auto-cols-fr grid-flow-col gap-1 rounded-full bg-inset p-1 shadow-inset";
 const itemBase =
-  "relative z-10 inline-flex h-8 items-center justify-center gap-2 overflow-hidden rounded-full px-4 text-label max-[640px]:px-3 whitespace-nowrap transition-colors duration-(--motion-base) ease-standard [&_svg]:size-4";
+  "relative z-10 inline-flex items-center justify-center gap-2 overflow-hidden rounded-full whitespace-nowrap transition-colors duration-(--motion-base) ease-standard [&_svg]:size-4";
+/** md: navigation-sized; sm: a control that sits in a section header (the chart window). */
+const SIZES = {
+  md: "h-8 px-4 text-label max-[640px]:px-3",
+  sm: "h-7 px-3 text-caption",
+} as const;
+export type SegmentedSize = keyof typeof SIZES;
 
 function Thumb({ index, count }: { index: number; count: number }) {
   if (index < 0) return null;
@@ -46,6 +52,7 @@ export function Segmented<V extends string>({
   value,
   onChange,
   label,
+  size = "md",
   className,
 }: {
   items: readonly SegmentItem<V>[];
@@ -53,6 +60,7 @@ export function Segmented<V extends string>({
   onChange: (v: V) => void;
   /** Accessible name of the group. */
   label: string;
+  size?: SegmentedSize;
   className?: string;
 }) {
   const index = items.findIndex((i) => i.value === value);
@@ -72,6 +80,7 @@ export function Segmented<V extends string>({
             onClick={() => onChange(item.value)}
             className={cn(
               itemBase,
+              SIZES[size],
               selected ? "text-on-surface" : "text-on-surface-muted hover:text-on-surface",
               "disabled:cursor-not-allowed disabled:opacity-(--disabled-content)",
             )}
@@ -108,7 +117,7 @@ export function SegmentedNav({
             key={item.href}
             href={item.href}
             aria-current={selected ? "page" : undefined}
-            className={cn(itemBase, selected ? "text-on-surface" : "text-on-surface-muted hover:text-on-surface")}
+            className={cn(itemBase, SIZES.md, selected ? "text-on-surface" : "text-on-surface-muted hover:text-on-surface")}
           >
             {item.icon}
             {/* Narrow windows keep the icon and move the label to screen readers. */}
