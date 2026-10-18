@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 /// Most bytes kept per flow: the ClientHello cap plus record headers.
-pub const MAX_STREAM_BYTES: usize = crate::sni::MAX_HELLO_LEN + 4 + 5 * 4;
+pub const MAX_STREAM_BYTES: usize = crate::flow::sni::MAX_HELLO_LEN + 4 + 5 * 4;
 
 /// Most out-of-order segments held per flow.
 const MAX_PENDING: usize = 16;

@@ -4,7 +4,7 @@
 //! - [`parse_tls_stream`]: the first bytes a client sent on a TCP
 //!   connection (one or more TLS records, possibly cut anywhere). The
 //!   ClientHello may span several records and several TCP segments; the
-//!   caller keeps the stream bytes (see [`crate::stream`]) and calls again.
+//!   caller keeps the stream bytes (see [`crate::flow::stream`]) and calls again.
 //! - [`parse_handshake`]: a bare handshake message (type, u24 length,
 //!   body), as carried in QUIC CRYPTO frames (no record layer).
 //!
@@ -22,7 +22,7 @@
 //! hellos are 0.5 to 2 KB (post-quantum key shares included); the cap
 //! bounds what a flow may make us buffer.
 
-use crate::{Progress, Reader};
+use crate::flow::{Progress, Reader};
 
 /// Largest ClientHello (handshake body) we will wait for.
 pub const MAX_HELLO_LEN: usize = 16 * 1024;

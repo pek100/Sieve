@@ -8,7 +8,7 @@
 //! port and IPv6 brackets are stripped; an IP literal is reported as is
 //! (it is still what the flow targets, a rule may match it).
 
-use crate::Progress;
+use crate::flow::Progress;
 
 pub const MAX_HEAD: usize = 8 * 1024;
 
@@ -84,7 +84,7 @@ fn host_of(authority: &str) -> Option<String> {
         return Some(ip.to_string());
     }
     let host = a.rsplit_once(':').map_or(a, |(h, port)| if port.bytes().all(|b| b.is_ascii_digit()) { h } else { a });
-    crate::sni::host_name(host.as_bytes())
+    crate::flow::sni::host_name(host.as_bytes())
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {

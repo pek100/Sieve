@@ -1,6 +1,6 @@
 //! The TCP relay between an app-side stream (ipstack in the probe) and an
 //! upstream connection, generic over the stream types so it is tested
-//! offline with in-memory app streams and a real loopback upstream.
+//! offline with in-memory streams on both sides.
 //!
 //! One code path for every TCP flow (TLS, HTTP, anything else):
 //! 1. server -> app is relayed from the start (server-first protocols);
@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::classify::{Decoded, TcpClassifier};
-use crate::flows::Action;
+use crate::flow::classify::{Decoded, TcpClassifier};
+use crate::flow::flows::Action;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outcome {
@@ -111,34 +111,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classify::Kind;
-    use crate::sni::build;
+    use crate::flow::classify::Kind;
+    use crate::flow::sni::build;
     use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream};
-    use tokio::net::{TcpListener, TcpStream};
 
     const WAIT: Duration = Duration::from_secs(2);
+    const PIPE_BYTES: usize = 64 * 1024;
 
-    /// A loopback upstream running `serve` on the one accepted connection;
-    /// returns the client-side stream and the server task (yielding what the
-    /// server read in total).
-    async fn upstream<F, Fut>(serve: F) -> (TcpStream, tokio::task::JoinHandle<Vec<u8>>)
+    /// An upstream running `serve` on the server end of an in-memory pipe;
+    /// returns the relay's end and the server task (yielding what the server
+    /// read in total).
+    ///
+    /// In memory, not a loopback socket: the spike drove these tests over
+    /// 127.0.0.1, and on this machine (AdGuard for Windows running, which
+    /// filters localhost) plain loopback TCP lost the server's reply under
+    /// parallel load. Measured 2026-10-18 with std blocking sockets, no relay
+    /// involved: 200 parallel request/reply/close exchanges gave 61 empty
+    /// replies, 300 sequential ones none. The relay's logic does not depend
+    /// on the transport, so the test must not either.
+    async fn upstream<F, Fut>(serve: F) -> (DuplexStream, tokio::task::JoinHandle<Vec<u8>>)
     where
-        F: FnOnce(TcpStream) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Vec<u8>> + Send,
+        F: FnOnce(DuplexStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Vec<u8>> + Send + 'static,
     {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = l.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            let (s, _) = l.accept().await.unwrap();
-            serve(s).await
-        });
-        (TcpStream::connect(addr).await.unwrap(), task)
+        let (relay_end, server_end) = tokio::io::duplex(PIPE_BYTES);
+        (relay_end, tokio::spawn(serve(server_end)))
     }
 
     /// Reads an HTTP request head, answers it, keeps the connection open
     /// (keep-alive) until the client closes.
-    async fn http_server(s: TcpStream, close_after: bool) -> Vec<u8> {
-        let (r, mut w) = s.into_split();
+    async fn http_server(s: DuplexStream, close_after: bool) -> Vec<u8> {
+        let (r, mut w) = tokio::io::split(s);
         let mut r = BufReader::new(r);
         let mut seen = Vec::new();
         loop {
@@ -178,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn http_request_is_replayed_once_and_the_response_reaches_the_app() {
         let (up, server) = upstream(|s| http_server(s, false)).await;
-        let (mut app, mut relay_side) = tokio::io::duplex(64 * 1024);
+        let (mut app, mut relay_side) = tokio::io::duplex(PIPE_BYTES);
         let relay = tokio::spawn(async move {
             relay_tcp(&mut relay_side, up, WAIT, |d| {
                 assert_eq!(d.kind, Some(Kind::Http));
@@ -202,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn http_request_split_in_tiny_writes_still_arrives_whole() {
         let (up, server) = upstream(|s| http_server(s, false)).await;
-        let (mut app, mut relay_side) = tokio::io::duplex(64 * 1024);
+        let (mut app, mut relay_side) = tokio::io::duplex(PIPE_BYTES);
         let relay = tokio::spawn(async move { relay_tcp(&mut relay_side, up, WAIT, |_| Action::Pass).await });
         for chunk in REQUEST.chunks(7) {
             app.write_all(chunk).await.unwrap();
@@ -218,7 +221,7 @@ mod tests {
     #[tokio::test]
     async fn server_that_answers_and_closes_still_delivers_the_whole_reply() {
         let (up, _server) = upstream(|s| http_server(s, true)).await;
-        let (mut app, mut relay_side) = tokio::io::duplex(64 * 1024);
+        let (mut app, mut relay_side) = tokio::io::duplex(PIPE_BYTES);
         let relay = tokio::spawn(async move { relay_tcp(&mut relay_side, up, WAIT, |_| Action::Pass).await });
         app.write_all(REQUEST).await.unwrap();
         let mut all = Vec::new();
@@ -233,14 +236,14 @@ mod tests {
     async fn server_that_closes_without_reply_gives_the_app_eof_not_a_hang() {
         // quic.nginx.org on port 80 (2026-10-17): reads the request, closes.
         let (up, server) = upstream(|s| async move {
-            let (mut r, mut w) = s.into_split();
+            let (mut r, mut w) = tokio::io::split(s);
             let mut buf = vec![0u8; REQUEST.len()];
             r.read_exact(&mut buf).await.unwrap();
             w.shutdown().await.unwrap();
             buf
         })
         .await;
-        let (mut app, mut relay_side) = tokio::io::duplex(64 * 1024);
+        let (mut app, mut relay_side) = tokio::io::duplex(PIPE_BYTES);
         let relay = tokio::spawn(async move { relay_tcp(&mut relay_side, up, WAIT, |_| Action::Pass).await });
         app.write_all(REQUEST).await.unwrap();
         let mut all = Vec::new();
@@ -257,7 +260,7 @@ mod tests {
         let hello = build::typical("tls.example");
         let hello_len = hello.len();
         let (up, server) = upstream(move |s| async move {
-            let (mut r, mut w) = s.into_split();
+            let (mut r, mut w) = tokio::io::split(s);
             let mut got = vec![0u8; hello_len];
             r.read_exact(&mut got).await.unwrap();
             w.write_all(b"SERVER-FLIGHT").await.unwrap();
@@ -267,7 +270,7 @@ mod tests {
             got
         })
         .await;
-        let (mut app, mut relay_side) = tokio::io::duplex(64 * 1024);
+        let (mut app, mut relay_side) = tokio::io::duplex(PIPE_BYTES);
         let relay = tokio::spawn(async move {
             relay_tcp(&mut relay_side, up, WAIT, |d| {
                 assert_eq!((d.kind, d.domain.as_deref()), (Some(Kind::Tls), Some("tls.example")));
@@ -297,7 +300,7 @@ mod tests {
             all
         })
         .await;
-        let (mut app, mut relay_side) = tokio::io::duplex(64 * 1024);
+        let (mut app, mut relay_side) = tokio::io::duplex(PIPE_BYTES);
         let relay = tokio::spawn(async move { relay_tcp(&mut relay_side, up, WAIT, |_| Action::Drop).await });
         app.write_all(&build::typical("blocked.example")).await.unwrap();
         let out = relay.await.unwrap();
@@ -309,14 +312,14 @@ mod tests {
     #[tokio::test]
     async fn server_first_banner_reaches_the_app_before_any_client_byte() {
         let (up, server) = upstream(|s| async move {
-            let (mut r, mut w) = s.into_split();
+            let (mut r, mut w) = tokio::io::split(s);
             w.write_all(b"220 smtp.example ESMTP\r\n").await.unwrap();
             let mut all = Vec::new();
             let _ = r.read_to_end(&mut all).await;
             all
         })
         .await;
-        let (mut app, mut relay_side) = tokio::io::duplex(64 * 1024);
+        let (mut app, mut relay_side) = tokio::io::duplex(PIPE_BYTES);
         let relay = tokio::spawn(async move { relay_tcp(&mut relay_side, up, WAIT, |_| Action::Pass).await });
         assert_eq!(read_response(&mut app, 24).await, b"220 smtp.example ESMTP\r\n");
         app.write_all(b"EHLO me\r\n").await.unwrap();

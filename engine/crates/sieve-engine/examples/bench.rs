@@ -16,12 +16,12 @@ use std::time::Instant;
 
 use etherparse::{PacketBuilder, SlicedPacket, TransportSlice};
 use ipstack::{IpStack, IpStackConfig, IpStackStream};
-use spike::classify::{TcpClassifier, UdpClassifier};
-use spike::flows::{AppPolicy, FiveTuple, Level, OwnerRow, match_owner, verdict};
-use spike::packet::{self, Proto};
-use spike::quic::{self, VERSION_1};
-use spike::rules::RuleSet;
-use spike::sni::build;
+use sieve_engine::flow::classify::{TcpClassifier, UdpClassifier};
+use sieve_engine::flow::flows::{AppPolicy, FiveTuple, Level, OwnerRow, match_owner, verdict};
+use sieve_engine::flow::packet::{self, Proto};
+use sieve_engine::flow::quic::{self, VERSION_1};
+use sieve_filter::rules::{ListText, RuleEngine};
+use sieve_engine::flow::sni::build;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
@@ -149,7 +149,7 @@ fn main() {
         let mut c = TcpClassifier::new();
         c.push(http_req)
     });
-    let rfc = spike::hex_decode(include_str!("../testdata/rfc9001-a2-client-initial.hex")).unwrap();
+    let rfc = sieve_engine::flow::hex_decode(include_str!("../testdata/rfc9001-a2-client-initial.hex")).unwrap();
     time("QUIC v1 Initial (1200 B): keys + HP + AES-GCM + SNI", 50_000, || {
         let mut c = UdpClassifier::new();
         c.push(&rfc)
@@ -172,10 +172,8 @@ fn main() {
     };
     time("owner match, 500-row table, last row", 200_000, || match_owner(&flow, &rows));
 
-    let mut rules = RuleSet::new();
-    for i in 0..100_000 {
-        rules.add_line(&format!("||ads{i}.tracker{}.com^", i % 997));
-    }
+    let text: String = (0..100_000).map(|i| format!("||ads{i}.tracker{}.com^\n", i % 997)).collect();
+    let rules = RuleEngine::compile(&[ListText { id: "bench", text: &text, trusted: false }]);
     let policy = AppPolicy::new(Level::Sieve);
     time("verdict, 100k rules, 5-label miss", 1_000_000, || {
         verdict(Some("a.b.cdn.example.org"), Some(r"C:\x\chrome.exe"), &rules, &policy)

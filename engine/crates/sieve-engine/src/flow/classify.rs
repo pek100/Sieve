@@ -7,7 +7,7 @@
 //! decoded, or a cap is hit, then answers once ([`Decoded`]) and stops
 //! inspecting: later pushes return None without parsing.
 //!
-//! Caps: TCP keeps at most [`crate::stream::MAX_STREAM_BYTES`] and
+//! Caps: TCP keeps at most [`crate::flow::stream::MAX_STREAM_BYTES`] and
 //! [`MAX_TCP_CHUNKS`] reads; UDP looks at most at [`MAX_UDP_DATAGRAMS`].
 //! A cap, a parse failure or an unknown protocol all end in a `Decoded`
 //! with `domain: None` (the verdict then passes the flow, reason
@@ -17,9 +17,9 @@
 //! it connects upstream at once and relays server bytes; only client bytes
 //! wait (see the report, "forwarder").
 
-use crate::quic::{self, CryptoAssembler};
-use crate::stream::MAX_STREAM_BYTES;
-use crate::{Progress, http, sni};
+use crate::flow::quic::{self, CryptoAssembler};
+use crate::flow::stream::MAX_STREAM_BYTES;
+use crate::flow::{Progress, http, sni};
 
 pub const MAX_TCP_CHUNKS: u32 = 16;
 pub const MAX_UDP_DATAGRAMS: u32 = 8;
@@ -168,8 +168,8 @@ impl UdpClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quic::{VERSION_1, crypto_frame, seal_client_initial};
-    use crate::sni::build;
+    use crate::flow::quic::{VERSION_1, crypto_frame, seal_client_initial};
+    use crate::flow::sni::build;
     use proptest::prelude::*;
 
     #[test]

@@ -18,6 +18,7 @@
 //!    closes the adapter (Wintun removes an adapter when its creator closes
 //!    it; a killed process closes it too), then writes the reports.
 
+mod support;
 #[cfg(windows)]
 mod forward;
 #[cfg(windows)]
@@ -45,9 +46,9 @@ mod live {
     use std::time::{Duration, Instant};
 
     use ipstack::{IpStack, IpStackConfig, IpStackStream};
-    use spike::flows::{Attributor, ExeCache, os::IpHelper};
-    use spike::probe_support::{self, Args, FlowLog, MAX_ROUTES, Summary, USAGE};
-    use spike::tasks::FlowTasks;
+    use sieve_engine::flow::flows::{Attributor, ExeCache, os::IpHelper};
+    use crate::support::{self, Args, FlowLog, MAX_ROUTES, Summary, USAGE};
+    use sieve_engine::flow::tasks::FlowTasks;
 
     use crate::forward::{self, Shared};
     use crate::os;
@@ -64,7 +65,7 @@ mod live {
 
     pub fn run() -> i32 {
         let raw: Vec<String> = std::env::args().skip(1).collect();
-        let args = match probe_support::parse_args(raw.clone()) {
+        let args = match support::parse_args(raw.clone()) {
             Ok(a) => a,
             Err(e) => {
                 if !e.is_empty() {
@@ -78,7 +79,7 @@ mod live {
             let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "probe.exe".into());
             eprintln!("Not elevated. This probe creates a network adapter and a test route, which needs admin.");
             eprintln!("Nothing was changed. Open Terminal (Admin) and run exactly:\n");
-            eprintln!("    {}\n", probe_support::admin_command(&exe, &raw));
+            eprintln!("    {}\n", support::admin_command(&exe, &raw));
             return 3;
         }
         if !args.wintun_dll.is_file() {
@@ -189,7 +190,7 @@ mod live {
             return Err(format!("{} addresses; at most {MAX_ROUTES} test routes", ips.len()));
         }
         for ip in &ips {
-            probe_support::check_route_target(*ip)?;
+            support::check_route_target(*ip)?;
         }
         Ok(ips)
     }
@@ -247,13 +248,13 @@ mod live {
             }
         }
 
-        let (rules, policy) = probe_support::policy_for(&args, list_text.as_deref());
+        let (rules, policy) = support::policy_for(&args, list_text.as_deref());
         let counters = Arc::new(TunCounters::default());
         let shared = Arc::new(Shared {
             start: Instant::now(),
             own_pid: std::process::id(),
             attributor: Mutex::new(Attributor::new(IpHelper)),
-            exes: Mutex::new(ExeCache::new(spike::flows::os::exe_path as fn(u32) -> Option<String>)),
+            exes: Mutex::new(ExeCache::new(sieve_engine::flow::flows::os::exe_path as fn(u32) -> Option<String>)),
             rules,
             policy,
             enforce: args.enforce.is_some(),
@@ -368,7 +369,7 @@ mod live {
                     println!("In a second (normal) PowerShell, while this runs:");
                     println!("    curl.exe -s -m 10 -o NUL -w \"%{{http_code}} %{{time_total}}s`n\" https://{h}/");
                     println!("    curl.exe -s -m 10 -o NUL -w \"%{{http_code}} %{{time_total}}s`n\" http://{h}/");
-                    if h == probe_support::DEFAULT_ROUTE_HOST {
+                    if h == support::DEFAULT_ROUTE_HOST {
                         println!("  (quic.nginx.org has no plain HTTP: it reads the request and closes, so curl");
                         println!("   says 'empty reply' (exit 52) with or without the TUN; the log still shows kind=http)");
                     }
@@ -379,7 +380,7 @@ mod live {
         println!("running {} s; Ctrl+C stops early.\n", args.seconds);
     }
 
-    fn write_reports(args: &Args, ips: &[IpAddr], s: &Summary, records: &[spike::probe_support::FlowRecord], text: &str) {
+    fn write_reports(args: &Args, ips: &[IpAddr], s: &Summary, records: &[crate::support::FlowRecord], text: &str) {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let base = args.out_dir.join(format!("probe-report-{stamp}"));
         let json = serde_json::json!({

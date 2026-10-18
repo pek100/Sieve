@@ -64,9 +64,9 @@ impl FlowTasks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flows::Action;
-    use crate::relay::relay_tcp;
-    use crate::sni::build;
+    use crate::flow::flows::Action;
+    use crate::flow::relay::relay_tcp;
+    use crate::flow::sni::build;
     use std::time::Instant;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};

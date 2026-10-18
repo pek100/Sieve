@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 
-use spike::packet::{self, Proto, TCP_ACK, TCP_SYN};
-use spike::probe_support::{Refusal, admit_destination};
+use sieve_engine::flow::packet::{self, Proto, TCP_ACK, TCP_SYN};
+use crate::support::{Refusal, admit_destination};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use wintun_bindings::Session;

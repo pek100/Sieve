@@ -24,8 +24,8 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::packet::{Packet, Proto};
-use crate::rules::{RuleSet, Verdict};
+use crate::flow::packet::{Packet, Proto};
+use sieve_filter::rules::{HostVerdict, RuleEngine};
 
 /// A refresh of a table is never more frequent than this on misses.
 pub const REFRESH_MIN_MS: u64 = 15;
@@ -341,7 +341,7 @@ impl Decision {
 }
 
 /// The verdict for one flow.
-pub fn verdict(domain: Option<&str>, exe: Option<&str>, rules: &RuleSet, policy: &AppPolicy) -> Decision {
+pub fn verdict(domain: Option<&str>, exe: Option<&str>, rules: &RuleEngine, policy: &AppPolicy) -> Decision {
     let Some(domain) = domain else {
         return Decision::pass(Reason::UnknownDomain);
     };
@@ -349,10 +349,10 @@ pub fn verdict(domain: Option<&str>, exe: Option<&str>, rules: &RuleSet, policy:
     if level != Level::Sieve {
         return Decision::pass(Reason::AppNotFiltered(level));
     }
-    match rules.verdict(domain) {
-        Verdict::Block => Decision { action: Action::Drop, reason: Reason::Blocked },
-        Verdict::Allow => Decision::pass(Reason::Allowed),
-        Verdict::None => Decision::pass(Reason::NoRule),
+    match rules.check_host(domain) {
+        HostVerdict::Block => Decision { action: Action::Drop, reason: Reason::Blocked },
+        HostVerdict::Allow => Decision::pass(Reason::Allowed),
+        HostVerdict::None => Decision::pass(Reason::NoRule),
     }
 }
 
@@ -439,7 +439,7 @@ pub mod os {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::build;
+    use crate::flow::packet::build;
     use proptest::prelude::*;
 
     fn sa(s: &str) -> SocketAddr {
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn outbound_tuple_from_a_packet() {
         let p = build::ip(Proto::Udp, "10.0.0.2".parse().unwrap(), "1.1.1.1".parse().unwrap(), 5000, 443, 0, b"x");
-        let pkt = crate::packet::parse(&p).unwrap();
+        let pkt = crate::flow::packet::parse(&p).unwrap();
         assert_eq!(FiveTuple::outbound(&pkt), udp("10.0.0.2:5000", "1.1.1.1:443"));
     }
 
@@ -635,10 +635,10 @@ mod tests {
         assert_eq!(calls, 2);
     }
 
-    fn rules(text: &str) -> RuleSet {
-        let mut r = RuleSet::new();
-        r.add_text(text);
-        r
+    /// The spike matched with a copy of the DNS rule set; the engine asks
+    /// the one rule engine (plan 5.1). The rules below are the same text.
+    fn rules(text: &str) -> RuleEngine {
+        RuleEngine::compile(&[sieve_filter::rules::ListText { id: "test", text, trusted: false }])
     }
 
     const CURL: &str = r"C:\Windows\System32\curl.exe";

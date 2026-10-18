@@ -1,26 +1,24 @@
-//! Spike: can Sieve tell, per connection, which app opened it and which
-//! domain it targets, and drop it only for apps that are not exempt? The
-//! packets come from a Wintun TUN adapter (see the report).
-//!
-//! Pure, offline-tested pieces (no driver, no admin):
+//! Flow decoding, moved from the Wintun spike (`docs/research/2026-10-17-wintun-spike.md`)
+//! with its tests. Which app opened a connection, which domain it targets,
+//! and what to do with it. Pure, offline-tested pieces (no driver, no admin):
 //! - [`sni`]: TLS ClientHello (records over a TCP stream) to SNI, ALPN, ECH.
 //! - [`quic`]: QUIC v1 and v2 client Initial decryption and CRYPTO
 //!   reassembly, then the same ClientHello parser.
 //! - [`http`]: plaintext HTTP/1 request to Host.
 //! - [`stream`]: per-flow TCP payload reassembly with a size cap.
 //! - [`packet`]: IPv4/IPv6 + TCP/UDP header parsing of a raw IP packet.
-//! - [`rules`]: the DNS filter's rule syntax and suffix-set matcher (copied).
 //! - [`flows`]: flow -> pid from the IP Helper owner-pid tables, pid -> exe,
-//!   and the pure per-app verdict.
+//!   and the pure per-app verdict, which asks the one rule engine
+//!   (`sieve_filter::rules`; the spike's copied DNS rule matcher is retired).
 //! - [`classify`]: one flow's first client bytes in, one decision out.
+//! - [`relay`]: the TCP relay between the app side and the upstream.
+//! - [`tasks`]: flow tasks with a bounded shutdown.
 pub mod classify;
 pub mod flows;
 pub mod http;
 pub mod packet;
-pub mod probe_support;
 pub mod quic;
 pub mod relay;
-pub mod rules;
 pub mod sni;
 pub mod stream;
 pub mod tasks;

@@ -25,12 +25,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ipstack::{IpStackTcpStream, IpStackUdpStream};
-use spike::classify::{Decoded, UdpClassifier};
-use spike::relay::relay_tcp;
-use spike::flows::{Action, AppPolicy, Attributor, ExeCache, FiveTuple, Owner, os::IpHelper, verdict};
-use spike::packet::Proto;
-use spike::probe_support::{FlowLog, Summary, admit_owner, record};
-use spike::rules::RuleSet;
+use sieve_engine::flow::classify::{Decoded, UdpClassifier};
+use sieve_engine::flow::relay::relay_tcp;
+use sieve_engine::flow::flows::{Action, AppPolicy, Attributor, ExeCache, FiveTuple, Owner, os::IpHelper, verdict};
+use sieve_engine::flow::packet::Proto;
+use crate::support::{FlowLog, Summary, admit_owner, record};
+use sieve_filter::rules::RuleEngine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
@@ -54,7 +54,7 @@ pub struct Shared {
     pub own_pid: u32,
     pub attributor: Mutex<Attributor<IpHelper>>,
     pub exes: Mutex<ExeCache<ExeLookup>>,
-    pub rules: RuleSet,
+    pub rules: RuleEngine,
     pub policy: AppPolicy,
     pub enforce: bool,
     /// Egress per routed address. Only these destinations are forwarded.
@@ -88,7 +88,7 @@ impl Shared {
                 Owner::Unknown => return (None, retried),
                 Owner::Pending => {
                     retried = true;
-                    tokio::time::sleep(Duration::from_millis(spike::flows::REFRESH_MIN_MS)).await;
+                    tokio::time::sleep(Duration::from_millis(sieve_engine::flow::flows::REFRESH_MIN_MS)).await;
                 }
             }
         }
@@ -197,7 +197,7 @@ pub async fn handle_tcp(shared: Arc<Shared>, mut app: IpStackTcpStream) {
             return close_app(&mut app).await;
         }
     };
-    // The same relay the offline tests drive (spike::relay): TLS, HTTP and
+    // The same relay the offline tests drive (sieve_engine::flow::relay): TLS, HTTP and
     // everything else take this one path.
     let out = relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, |d| shared.decide("tcp", &flow, pid, retried, d)).await;
     if out.upstream_write_failed {

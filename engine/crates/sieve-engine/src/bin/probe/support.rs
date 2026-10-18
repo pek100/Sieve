@@ -9,9 +9,9 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::classify::{Decoded, Kind};
-use crate::flows::{Action, AppPolicy, Decision, Level, Reason};
-use crate::rules::RuleSet;
+use sieve_engine::flow::classify::{Decoded, Kind};
+use sieve_engine::flow::flows::{Action, AppPolicy, Decision, Level, Reason};
+use sieve_filter::rules::{ListText, RuleEngine};
 
 /// Default test host: nginx's own HTTP/3 test site. Its addresses are
 /// dedicated (AWS, IPv4 only today) rather than a shared CDN anycast front
@@ -137,9 +137,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, Strin
             // routed addresses ever reach the stack, so a drop cannot touch
             // anything else); `--route-ip` runs keep the reserved-TLD rule.
             let own_host = (a.route_ips.is_empty())
-                .then(|| crate::sni::host_name(a.route_host.as_bytes()))
+                .then(|| sieve_engine::flow::sni::host_name(a.route_host.as_bytes()))
                 .flatten()
-                .filter(|h| crate::sni::host_name(d.as_bytes()).as_deref() == Some(h.as_str()));
+                .filter(|h| sieve_engine::flow::sni::host_name(d.as_bytes()).as_deref() == Some(h.as_str()));
             let domain = match own_host {
                 Some(h) => h,
                 None => checked_test_domain(&d)?,
@@ -154,7 +154,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, Strin
 
 /// The enforce test's domain, lower case, if it is under a reserved TLD.
 pub fn checked_test_domain(raw: &str) -> Result<String, String> {
-    let d = crate::sni::host_name(raw.as_bytes()).ok_or_else(|| format!("not a host name: {raw}"))?;
+    let d = sieve_engine::flow::sni::host_name(raw.as_bytes()).ok_or_else(|| format!("not a host name: {raw}"))?;
     let tld = d.rsplit('.').next().unwrap_or_default();
     if d.contains('.') && RESERVED_TLDS.contains(&tld) {
         Ok(d)
@@ -273,19 +273,13 @@ impl FlowLog {
 }
 
 /// The rules and per-app policy the run decides with.
-pub fn policy_for(args: &Args, list_text: Option<&str>) -> (RuleSet, AppPolicy) {
-    let mut rules = RuleSet::new();
+pub fn policy_for(args: &Args, list_text: Option<&str>) -> (RuleEngine, AppPolicy) {
+    let compile = |text: &str| RuleEngine::compile(&[ListText { id: "probe", text, trusted: false }]);
     match &args.enforce {
-        Some(e) => {
-            rules.add_line(&format!("||{}^", e.domain));
-            (rules, AppPolicy::new(Level::Off).set(&e.exe, Level::Sieve))
-        }
+        Some(e) => (compile(&format!("||{}^", e.domain)), AppPolicy::new(Level::Off).set(&e.exe, Level::Sieve)),
         None => {
-            if let Some(text) = list_text {
-                rules.add_text(text);
-            }
             let policy = args.exempt.iter().fold(AppPolicy::new(Level::Sieve), |p, e| p.set(e, Level::Off));
-            (rules, policy)
+            (compile(list_text.unwrap_or_default()), policy)
         }
     }
 }
@@ -509,7 +503,7 @@ pub fn admin_command(exe: &str, args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flows::verdict;
+    use sieve_engine::flow::flows::verdict;
 
     fn args(s: &str) -> Result<Args, String> {
         parse_args(s.split_whitespace().map(String::from))

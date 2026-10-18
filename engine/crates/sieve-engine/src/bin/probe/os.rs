@@ -184,7 +184,7 @@ pub fn bind_to_interface(sock: &socket2::Socket, target: SocketAddr, index: u32)
         SocketAddr::V4(_) => (IPPROTO_IP.0, IP_UNICAST_IF),
         SocketAddr::V6(_) => (IPPROTO_IPV6.0, IPV6_UNICAST_IF),
     };
-    let value = spike::probe_support::unicast_if_value(index, target.is_ipv4());
+    let value = crate::support::unicast_if_value(index, target.is_ipv4());
     // SAFETY: `s` is a live socket; the option value is a 4-byte DWORD.
     let r = unsafe { setsockopt(s, level, name, Some(&value)) };
     if r == 0 { Ok(()) } else { Err(format!("setsockopt UNICAST_IF failed: {}", std::io::Error::last_os_error())) }

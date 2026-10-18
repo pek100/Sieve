@@ -6,7 +6,7 @@
 #   sieve-engine  the Windows service: flow decoding today, the TUN later
 [workspace]
 resolver = "3"
-members = ["crates/sieve-ipc", "crates/sieve-filter"]
+members = ["crates/sieve-ipc", "crates/sieve-filter", "crates/sieve-engine"]
 exclude = ["vendor/ipstack"]
 
 [workspace.package]

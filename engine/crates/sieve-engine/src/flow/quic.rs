@@ -24,7 +24,7 @@
 //! Handshake): each long-header packet's Length says where the next one
 //! starts; non-Initial packets are skipped, a short-header packet ends the
 //! datagram. [`CryptoAssembler`] puts the CRYPTO stream back together and
-//! hands the first handshake message to [`crate::sni::parse_handshake`].
+//! hands the first handshake message to [`crate::flow::sni::parse_handshake`].
 //!
 //! The packet number used for the nonce is the truncated one as sent. That
 //! is exact for a client's first Initials (numbers start at 0 and stay far
@@ -45,8 +45,8 @@ use aes_gcm::aead::{Aead, Payload};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-use crate::sni::{self, Hello, MAX_HELLO_LEN};
-use crate::{Progress, Reader};
+use crate::flow::sni::{self, Hello, MAX_HELLO_LEN};
+use crate::flow::{Progress, Reader};
 
 pub const VERSION_1: u32 = 0x0000_0001;
 pub const VERSION_2: u32 = 0x6b33_43cf;
@@ -426,8 +426,8 @@ pub fn crypto_frame(offset: u32, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hex_decode;
-    use crate::sni::build;
+    use crate::flow::hex_decode;
+    use crate::flow::sni::build;
     use proptest::prelude::*;
 
     const DCID: [u8; 8] = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
@@ -437,15 +437,15 @@ mod tests {
     }
 
     fn rfc9001_packet() -> Vec<u8> {
-        vector(include_str!("../testdata/rfc9001-a2-client-initial.hex"))
+        vector(include_str!("../../testdata/rfc9001-a2-client-initial.hex"))
     }
     fn rfc9369_packet() -> Vec<u8> {
-        vector(include_str!("../testdata/rfc9369-a2-client-initial.hex"))
+        vector(include_str!("../../testdata/rfc9369-a2-client-initial.hex"))
     }
     /// The CRYPTO frame both RFC samples carry (06 00 40f1 then the hello).
     fn rfc_crypto_frame() -> Vec<u8> {
-        let a = vector(include_str!("../testdata/rfc9001-a2-crypto-frame.hex"));
-        let b = vector(include_str!("../testdata/rfc9369-a2-crypto-frame.hex"));
+        let a = vector(include_str!("../../testdata/rfc9001-a2-crypto-frame.hex"));
+        let b = vector(include_str!("../../testdata/rfc9369-a2-crypto-frame.hex"));
         assert_eq!(a, b, "both RFCs use the same ClientHello");
         a
     }
