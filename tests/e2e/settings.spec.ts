@@ -22,10 +22,11 @@ test.describe("settings", () => {
     const rail = page.getByRole("navigation", { name: "Settings sections" });
     // Filtering stays: it carries the engine.
     await expect(rail.getByRole("link")).toHaveText(["Appearance", "Sampling", "Startup", "Apps", "Filtering"]);
-    // Six rows: theme, sieving, interval, launch at startup, apps turned off, my apps. DNS
-    // filtering and its upstream servers are unavailable until the engine replaces them
-    // (2026-10-18). There is no Windows DNS row: Sieve never changes Windows DNS.
-    await expect(page.locator("[data-setting]")).toHaveCount(6);
+    // Seven rows: theme, sieving, interval, launch at startup, apps turned off, my apps, and the
+    // engine's switch (slice 3). DNS filtering and its upstream servers are unavailable until the
+    // engine replaces them (2026-10-18). There is no Windows DNS row: Sieve never changes Windows DNS.
+    await expect(page.locator("[data-setting]")).toHaveCount(7);
+    await expect(row(page, "filtering.engine").getByRole("switch")).not.toBeChecked();
     await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(0);
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
 
@@ -71,9 +72,8 @@ test.describe("settings", () => {
         return { name: s.getAttribute("aria-label"), height: own.height, gap: own.bottom - content };
       }),
     );
-    // Four registry sections with rows, then the engine (Filtering has no available row: its
-    // DNS filter is hidden until the engine replaces it).
-    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Engine"]);
+    // Five registry sections with rows (Filtering's is the engine's switch, slice 3), then the engine.
+    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Engine"]);
     // Was 686 px of empty space under Filtering's rows: its card took the height of the
     // wrapper that also holds the DNS filter (Card h-full).
     // Allowed: a row's own bottom padding (16) and at most a section's padding.

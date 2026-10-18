@@ -83,6 +83,15 @@ export function useEngine(): EngineSlice {
   return useSieve(selectEngine);
 }
 
+/** The engine's user actions: the AdGuard pause offer and its undo (through the engine controller). */
+export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdguard: () => Promise<void> } {
+  const { engineController } = useRuntime();
+  return useMemo(
+    () => ({ stopAdguard: () => engineController.stopAdguard(), startAdguard: () => engineController.startAdguard() }),
+    [engineController],
+  );
+}
+
 export function useNotices(): readonly Notice[] {
   const { notices } = useRuntime();
   return useSyncExternalStore(notices.subscribe, notices.list, notices.list);

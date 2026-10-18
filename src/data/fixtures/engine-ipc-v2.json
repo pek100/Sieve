@@ -1,0 +1,125 @@
+{
+  "protocol": 2,
+  "supported": [2, 2],
+  "pipe": "\\\\.\\pipe\\sieve-engine",
+  "maxFrame": 1048576,
+  "flowsBatchMs": 250,
+  "flowsPerFrame": 500,
+  "client": [
+    { "type": "hello", "protocol": 2, "app_version": "0.1.0" },
+    { "type": "status" },
+    { "type": "set_policy", "revision": 3, "engine": true },
+    { "type": "subscribe" }
+  ],
+  "engine": [
+    { "type": "welcome", "protocol": 2, "engine_version": "0.1.0", "session_id": 1 },
+    { "type": "incompatible", "supported": [2, 2] },
+    {
+      "type": "status",
+      "filtering": true,
+      "routes_up": true,
+      "flows": 2,
+      "decrypting": false,
+      "last_error": null,
+      "policy": { "revision": 3, "engine": true },
+      "blocker": null,
+      "split_tunnels": ["Corp VPN"],
+      "counters": {
+        "flows": 120,
+        "attributed": 118,
+        "own_refused": 0,
+        "dns_answers": 40,
+        "packets_in": 9000,
+        "packets_out": 8800,
+        "not_unicast": 12
+      }
+    },
+    { "type": "error", "message": "send hello first" },
+    {
+      "type": "flows",
+      "flows": [
+        {
+          "id": 7,
+          "pid": 4242,
+          "exe": "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+          "session": 1,
+          "proto": "tcp",
+          "local": "198.18.0.1:50112",
+          "remote": "93.184.215.14:443",
+          "kind": "tls",
+          "host": "example.com",
+          "action": "relayed",
+          "bytes_up": 812,
+          "bytes_down": 4096,
+          "open": true
+        },
+        {
+          "id": 8,
+          "pid": 1880,
+          "exe": null,
+          "session": 0,
+          "proto": "udp",
+          "local": "198.18.0.1:53001",
+          "remote": "192.168.7.1:53",
+          "kind": "dns",
+          "host": "example.com",
+          "action": "relayed",
+          "bytes_up": 29,
+          "bytes_down": 45,
+          "open": false
+        },
+        {
+          "id": 9,
+          "pid": null,
+          "exe": null,
+          "session": null,
+          "proto": "udp",
+          "local": "[fd53:6965:7665:1::1]:61000",
+          "remote": "[2606:4700::6810:84e5]:443",
+          "kind": "quic",
+          "host": "example.com",
+          "action": "relayed",
+          "bytes_up": 1200,
+          "bytes_down": 0,
+          "open": true
+        },
+        {
+          "id": 10,
+          "pid": 4242,
+          "exe": "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+          "session": 1,
+          "proto": "tcp",
+          "local": "198.18.0.1:50113",
+          "remote": "198.51.100.9:8080",
+          "kind": "http",
+          "host": "plain.example",
+          "action": "failed",
+          "bytes_up": 0,
+          "bytes_down": 0,
+          "open": false
+        },
+        {
+          "id": 11,
+          "pid": 912,
+          "exe": "C:\\Tools\\mail.exe",
+          "session": 1,
+          "proto": "tcp",
+          "local": "198.18.0.1:50114",
+          "remote": "198.51.100.25:25",
+          "kind": "other",
+          "host": null,
+          "action": "relayed",
+          "bytes_up": 30,
+          "bytes_down": 60,
+          "open": true
+        }
+      ]
+    }
+  ],
+  "blockers": [
+    { "kind": "adguard", "service": "Adguard Service" },
+    { "kind": "vpn", "adapter": "AdGuard VPN" },
+    { "kind": "crash_loop", "starts": 3 },
+    { "kind": "setup", "message": "CreateIpForwardEntry2 failed: Win32 error 5" }
+  ]
+}

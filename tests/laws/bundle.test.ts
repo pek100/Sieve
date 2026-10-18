@@ -95,6 +95,32 @@ describe("bundle law", () => {
     expect(fn(".onVerifyInstDir")).toMatch(/SIEVE_REFUSE_FOREIGN\s+Abort/);
   });
 
+  it("bundles the pinned Wintun and its licence beside the engine, never from the repo", () => {
+    const tun = read("engine/crates/sieve-engine/src/tun/mod.rs");
+    const pin = tun.match(/pub const WINTUN_SHA256: &str = "([0-9a-f]{64})";/)?.[1];
+    expect(pin).toBe("e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce");
+    expect(read("scripts/wintun.mjs")).toContain("pub const WINTUN_SHA256");
+    expect(pkg.scripts["engine:build"]).toMatch(/&& node scripts\/wintun\.mjs$/);
+    expect(hooks).toContain(String.raw`engine\target\release\${SIEVE_WINTUN_DLL}`);
+    const licence = hooks.match(/!define SIEVE_WINTUN_LICENSE "([^"]+)"/)?.[1];
+    expect(tun).toContain(`pub const WINTUN_LICENSE: &str = "${licence}";`);
+    expect(read("engine/vendor/wintun/LICENSE.txt")).toMatch(/^Prebuilt Binaries License/);
+    const post = macro("NSIS_HOOK_POSTINSTALL");
+    // Copied before the install verb runs its folder check over every file beside the exe.
+    expect(post.indexOf('File "/oname=${SIEVE_WINTUN_DLL}"')).toBeGreaterThan(-1);
+    expect(post.indexOf('File "/oname=${SIEVE_WINTUN_DLL}"')).toBeLessThan(post.indexOf('" install\''));
+    expect(macro("NSIS_HOOK_POSTUNINSTALL")).toContain('Delete "$INSTDIR\\${SIEVE_WINTUN_DLL}"');
+    expect(read(".gitignore")).toContain("/engine/**/*.dll");
+  });
+
+  it("adds the emergency restore shortcut, elevated, and removes it on uninstall", () => {
+    const post = macro("NSIS_HOOK_POSTINSTALL");
+    expect(post).toContain(`CreateShortCut "\${SIEVE_RESTORE_LINK}" "$SYSDIR\\cmd.exe" '/k ""$SieveEngine" restore"'`);
+    expect(post).toMatch(/FileSeek \$1 0x15 SET[\s\S]*IntOp \$2 \$2 \| 0x20[\s\S]*FileWriteByte \$1 \$2/);
+    expect(hooks).toContain(String.raw`!define SIEVE_RESTORE_LINK "$SMPROGRAMS\Sieve - restore network.lnk"`);
+    expect(macro("NSIS_HOOK_POSTUNINSTALL")).toContain('Delete "${SIEVE_RESTORE_LINK}"');
+  });
+
   it("names the engine's marker and refusal exit code", () => {
     const marker = hooks.match(/!define SIEVE_MARKER "([^"]+)"/)?.[1];
     expect(engineImage).toContain(`pub const MARKER_FILE: &str = "${marker}";`);

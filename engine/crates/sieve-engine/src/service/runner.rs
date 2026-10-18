@@ -1,14 +1,24 @@
-//! The service process (started by the SCM only). It first checks who can
-//! change its files (`image`, the same check as `install`) and refuses to run
-//! when users can; then it reports Running, serves the pipe until Windows
-//! asks it to stop or shut down, and reports Stopped.
-//! In slice 2 it changes nothing about traffic: no adapter, no routes.
+//! The service process (started by the SCM only). In order:
+//! 1. DLLs load from System32 only (`SetDefaultDllDirectories`); wintun.dll
+//!    is later loaded by absolute path after its hash check (`tun`).
+//! 2. It checks who can change its files (`image`, the same check as
+//!    `install`) and refuses to run when users can.
+//! 3. Before anything else touches the network: every route on an interface
+//!    named "Sieve" and every journalled route is deleted (plan 1.6.3).
+//! 4. The run is recorded (`runs.json`); the third restart within an hour is
+//!    a crash loop and routes nothing (plan 1.6.4).
+//! 5. It reports Running, starts the watchdog thread, the routing loop and
+//!    the pipe, until Windows asks it to stop or shut down; then it takes the
+//!    routes down, records a clean stop and reports Stopped.
+//!
+//! A panic on any thread but a flow worker deletes Sieve's routes before the
+//! process dies (plan 1.6.6); a flow task's panic ends that flow only.
 
 use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::Duration;
 
-use sieve_ipc::EngineStatus;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
@@ -17,16 +27,25 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use super::acl::pipe_sddl;
 use super::image::check_this_exe;
-use super::{EXIT_UNSAFE_FOLDER, SERVICE_NAME, state};
+use super::{EXIT_UNSAFE_FOLDER, EXIT_WATCHDOG, SERVICE_NAME, state};
+use crate::control::{Engine, routing};
 use crate::ipc::server;
+use crate::policy::{self, crash_loop};
+use crate::route::apply::clear_stale;
+use crate::route::journal::Journal;
+use crate::watchdog::{self, Stall, Trip, monotonic_ms};
 
 /// Bound for the runtime's own shutdown after the pipe stops.
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(3);
+/// The routing loop gets this long to take the routes down at a stop.
+const TAKE_DOWN_BOUND: Duration = Duration::from_secs(10);
 /// Service-specific exit code when the engine could not run.
 const FAILED: u32 = 1;
 /// Service-specific exit code when it refused to run from a folder users can
 /// change (`sc query` shows it as SERVICE_EXIT_CODE).
 const UNSAFE_FOLDER: u32 = EXIT_UNSAFE_FOLDER as u32;
+/// Flow workers: a panic there is caught by its task (the flow ends).
+const FLOW_THREAD: &str = "sieve-flow";
 
 define_windows_service!(ffi_service_main, service_main);
 
@@ -36,12 +55,14 @@ pub fn run() -> Result<(), windows_service::Error> {
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
 }
 
-/// Slice 2: nothing filters, so every fact is false or zero.
-fn status() -> EngineStatus {
-    EngineStatus::default()
+fn system32_only() {
+    use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories};
+    // SAFETY: a process-wide setting with a valid flag.
+    let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
 }
 
 fn service_main(_args: Vec<OsString>) {
+    system32_only();
     let (stop_tx, stop_rx) = watch::channel(false);
     let handler = move |control| match control {
         ServiceControl::Stop | ServiceControl::Shutdown => {
@@ -93,14 +114,89 @@ fn record_failure(why: &str) {
 
 const LAST_ERROR_FILE: &str = "last-error.txt";
 
-/// The pipe, with the DACL for the recorded owner, until the stop signal.
-/// An error ends the process with a failure code, so the SCM's recovery
-/// restarts it.
+/// The watchdog's trip: routes first (named and journalled), the reason on
+/// disk, then the process ends with [`EXIT_WATCHDOG`] (the SCM restarts it).
+struct ServiceTrip {
+    journal: Journal,
+}
+
+impl Trip for ServiceTrip {
+    fn delete_routes(&self) -> String {
+        clear_stale(&self.journal)
+    }
+
+    fn exit(&self, stall: &Stall, routes: &str) {
+        record_failure(&format!("{}; {routes}", stall.reason()));
+        std::process::exit(EXIT_WATCHDOG);
+    }
+}
+
+/// Deletes Sieve's routes when anything but a flow worker panics, before the
+/// default hook prints the panic (the process then unwinds or aborts).
+fn install_panic_cleanup(journal_dir: std::path::PathBuf) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let flow = std::thread::current().name().is_some_and(|n| n == FLOW_THREAD);
+        if !flow {
+            let routes = clear_stale(&Journal::new(&journal_dir));
+            record_failure(&format!("panic: {info}; {routes}"));
+        }
+        default_hook(info);
+    }));
+}
+
+/// The engine until the stop signal. An error ends the process with a
+/// failure code, so the SCM's recovery restarts it.
 fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
-    let owner = state::read(&state::engine_dir(&state::program_data()?))?.owner_sid;
+    let dir = state::engine_dir(&state::program_data()?);
+    let journal = Journal::new(&dir);
+    let cleaned = clear_stale(&journal);
+    install_panic_cleanup(dir.clone());
+
+    let mut runs = policy::load_runs(&dir);
+    let crash = crash_loop(runs.start(policy::wall_ms()));
+    policy::save_runs(&dir, &runs)?;
+    let (policy, policy_error) = policy::load(&dir);
+
+    let owner = state::read(&dir)?.owner_sid;
     let sddl = pipe_sddl(owner.as_deref())?;
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())?;
-    let result = rt.block_on(server::serve(&sddl, status, stop));
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let engine = Arc::new(Engine::new(Some(dir.clone()), exe, policy, runs, crash));
+    engine.set_facts(|f| f.last_error = policy_error.or_else(|| cleaned.contains("FAILED").then(|| format!("start-up cleanup: {cleaned}"))));
+
+    // The watchdog: a plain thread, armed only while routes are up.
+    let (ping_tx, ping_rx) = mpsc::unbounded_channel();
+    {
+        let (arm, beats) = (engine.arm.clone(), engine.beats.clone());
+        let trip = ServiceTrip { journal: Journal::new(&dir) };
+        std::thread::Builder::new()
+            .name("sieve-watchdog".into())
+            .spawn(move || watchdog::run(&arm, &beats, &monotonic_ms, &|| {
+                let _ = ping_tx.send(());
+            }, &trip))
+            .map_err(|e| format!("watchdog thread: {e}"))?;
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name(FLOW_THREAD)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let result = rt.block_on(async {
+        tokio::spawn(routing::answer_pings(engine.clone(), ping_rx));
+        let (halt_tx, halt_rx) = watch::channel(false);
+        let routing = tokio::spawn(routing::run(engine.clone(), halt_rx));
+        let served = server::serve(&sddl, engine.clone(), stop).await;
+        // The pipe ended (a stop, or a pipe error): the routes go down either way.
+        let _ = halt_tx.send(true);
+        let _ = tokio::time::timeout(TAKE_DOWN_BOUND, routing).await;
+        served
+    });
     rt.shutdown_timeout(SHUTDOWN_BOUND);
+    // Whatever the loop managed, nothing of Sieve's stays routed.
+    clear_stale(&journal);
+    if result.is_ok() {
+        engine.stop_clean();
+    }
     result
 }

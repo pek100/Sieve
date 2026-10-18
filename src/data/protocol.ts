@@ -364,15 +364,41 @@ export function parseWindowsDns(raw: unknown): WindowsDns {
 
 /**
  * `engine_probe` (Rust `engine::EngineProbe`, fixture
- * `src/data/fixtures/engine-probe-v1.json`): the filtering engine from
+ * `src/data/fixtures/engine-probe-v2.json`): the filtering engine from
  * facts. `service` is the Windows service's state ("missing" when not
  * installed); `pipe` is the engine's own answer, asked only while the service
- * runs. `status` is the engine's `sieve-ipc` Status.
+ * runs. `status` is the engine's `sieve-ipc` Status (protocol 2, fixture
+ * `engine-ipc-v2.json`). v2: the status carries the policy, the blocker, the
+ * split tunnels and the engine's counters; the probe also reads AdGuard's
+ * service state (`adguard`), for the pause offer.
  */
-export const ENGINE_PROBE_VERSION = 1 as const;
+export const ENGINE_PROBE_VERSION = 2 as const;
 export const SERVICE_FACTS = ["missing", "stopped", "starting", "stopping", "running", "other"] as const;
 export type ServiceFact = (typeof SERVICE_FACTS)[number];
 export const PIPE_KINDS = ["welcome", "incompatible", "refused", "unreachable"] as const;
+/** `sieve-ipc` Blocker kinds, in declaration order. */
+export const BLOCKER_KINDS = ["adguard", "vpn", "crash_loop", "setup"] as const;
+
+export type EngineBlocker =
+  | { kind: "adguard"; service: string }
+  | { kind: "vpn"; adapter: string }
+  | { kind: "crash_loop"; starts: number }
+  | { kind: "setup"; message: string };
+
+export interface EnginePolicy {
+  revision: number;
+  engine: boolean;
+}
+
+export interface EngineCounters {
+  flows: number;
+  attributed: number;
+  own_refused: number;
+  dns_answers: number;
+  packets_in: number;
+  packets_out: number;
+  not_unicast: number;
+}
 
 export interface EngineStatus {
   filtering: boolean;
@@ -380,6 +406,46 @@ export interface EngineStatus {
   flows: number;
   decrypting: boolean;
   last_error: string | null;
+  policy: EnginePolicy;
+  blocker: EngineBlocker | null;
+  split_tunnels: string[];
+  counters: EngineCounters;
+}
+
+const COUNTER_KEYS = ["flows", "attributed", "own_refused", "dns_answers", "packets_in", "packets_out", "not_unicast"] as const;
+
+function blocker(raw: unknown): EngineBlocker {
+  const b = rec(raw, "status.blocker");
+  switch (b.kind) {
+    case "adguard":
+      return { kind: "adguard", service: str(b.service, "blocker.service") };
+    case "vpn":
+      return { kind: "vpn", adapter: str(b.adapter, "blocker.adapter") };
+    case "crash_loop":
+      return { kind: "crash_loop", starts: int(b.starts, "blocker.starts") };
+    case "setup":
+      return { kind: "setup", message: str(b.message, "blocker.message") };
+    default:
+      throw new ProtocolError(`blocker.kind must be one of ${BLOCKER_KINDS.join(", ")}`);
+  }
+}
+
+/** Validate an untrusted engine Status (sieve-ipc v2). Throws ProtocolError. */
+export function parseEngineStatus(raw: unknown): EngineStatus {
+  const s = rec(raw, "status");
+  const p = rec(s.policy, "status.policy");
+  const c = rec(s.counters, "status.counters");
+  return {
+    filtering: bool(s.filtering, "status.filtering"),
+    routes_up: bool(s.routes_up, "status.routes_up"),
+    flows: int(s.flows, "status.flows"),
+    decrypting: bool(s.decrypting, "status.decrypting"),
+    last_error: strOrNull(s.last_error, "status.last_error"),
+    policy: { revision: int(p.revision, "policy.revision"), engine: bool(p.engine, "policy.engine") },
+    blocker: s.blocker === null ? null : blocker(s.blocker),
+    split_tunnels: strings(s.split_tunnels, "status.split_tunnels"),
+    counters: Object.fromEntries(COUNTER_KEYS.map((k) => [k, int(c[k], `counters.${k}`)])) as unknown as EngineCounters,
+  };
 }
 
 export type PipeFact =
@@ -391,27 +457,21 @@ export type PipeFact =
 export interface EngineProbe {
   v: typeof ENGINE_PROBE_VERSION;
   service: ServiceFact;
+  /** AdGuard for Windows' service (`Adguard Service`), read the same way: the pause offer and its undo follow it. */
+  adguard: ServiceFact;
   pipe: PipeFact | null;
 }
 
 function pipeFact(raw: unknown): PipeFact {
   const p = rec(raw, "pipe");
   switch (p.kind) {
-    case "welcome": {
-      const s = rec(p.status, "pipe.status");
+    case "welcome":
       return {
         kind: "welcome",
         engine_version: str(p.engine_version, "pipe.engine_version"),
         session_id: int(p.session_id, "pipe.session_id"),
-        status: {
-          filtering: bool(s.filtering, "status.filtering"),
-          routes_up: bool(s.routes_up, "status.routes_up"),
-          flows: int(s.flows, "status.flows"),
-          decrypting: bool(s.decrypting, "status.decrypting"),
-          last_error: strOrNull(s.last_error, "status.last_error"),
-        },
+        status: parseEngineStatus(p.status),
       };
-    }
     case "incompatible": {
       const range = Array.isArray(p.supported) && p.supported.length === 2 ? p.supported : null;
       if (!range) throw new ProtocolError("pipe.supported must be [min, max]");
@@ -432,6 +492,7 @@ export function parseEngineProbe(raw: unknown): EngineProbe {
   return {
     v: ENGINE_PROBE_VERSION,
     service: oneOf(x.service, SERVICE_FACTS, "service"),
+    adguard: oneOf(x.adguard, SERVICE_FACTS, "adguard"),
     pipe: x.pipe === null ? null : pipeFact(x.pipe),
   };
 }

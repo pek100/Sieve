@@ -82,7 +82,7 @@ function EngineTile() {
   return (
     <section aria-label="Engine" data-kpi="engine" data-engine-phase={phase} className="flex min-w-0 flex-col text-on-surface">
       <p data-kpi-label="" className="flex h-(--section-header-h) items-center gap-2 text-label text-on-surface-muted">
-        <SectionIcon size={16} tone={phase === "filtering" ? "mint" : "neutral"}>
+        <SectionIcon size={16} tone={phase === "routing" ? "mint" : "neutral"}>
           <Cpu strokeWidth={1.75} />
         </SectionIcon>
         Engine

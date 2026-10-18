@@ -1,0 +1,21 @@
+{
+  "adapters": [
+    {
+      "index": 41, "luid": 1689399632855051, "alias": "Corp VPN", "description": "WireGuard Tunnel",
+      "if_type": 53, "up": true,
+      "addresses": [{ "ip": "10.8.0.5", "len": 16 }],
+      "dns": ["10.8.0.1"]
+    },
+    {
+      "index": 42, "luid": 1689399632855052, "alias": "Old TAP", "description": "TAP-Windows Adapter V9",
+      "if_type": 6, "up": false,
+      "addresses": [],
+      "dns": []
+    }
+  ],
+  "routes": [
+    { "dest": "10.8.0.0/16", "if_index": 41, "next_hop": null, "metric": 5 },
+    { "dest": "203.0.113.0/24", "if_index": 41, "next_hop": null, "metric": 5 },
+    { "dest": "0.0.0.0/0", "if_index": 42, "next_hop": "10.9.0.1", "metric": 5 }
+  ]
+}

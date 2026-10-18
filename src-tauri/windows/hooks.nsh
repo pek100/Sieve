@@ -16,6 +16,17 @@
 ; The engine's install verb refused a folder users can change
 ; (service::EXIT_UNSAFE_FOLDER; law 10).
 !define SIEVE_EXIT_UNSAFE_FOLDER 3
+; Wintun 0.14.1 and its licence, put beside the release engine by
+; `pnpm engine:build` (scripts/wintun.mjs checks the DLL's SHA-256 against the
+; engine's pin; the engine checks it again before loading it, tun::WINTUN_SHA256).
+!define SIEVE_WINTUN_DLL "wintun.dll"
+!define SIEVE_WINTUN_LICENSE "wintun-LICENSE.txt"
+!define SIEVE_WINTUN_SRC "${__FILEDIR__}\..\..\engine\target\release\${SIEVE_WINTUN_DLL}"
+!define SIEVE_WINTUN_LICENSE_SRC "${__FILEDIR__}\..\..\engine\target\release\${SIEVE_WINTUN_LICENSE}"
+; The emergency off (plan 1.5): runs `sieve-engine.exe restore` at an admin
+; prompt that stays open. Windows file names cannot hold ":", so the plan's
+; "Sieve: restore network" is spelled with a hyphen.
+!define SIEVE_RESTORE_LINK "$SMPROGRAMS\Sieve - restore network.lnk"
 
 ; The install folder (2026-10-18). The engine runs as SYSTEM from it, so
 ; whoever can write there owns SYSTEM: E:\Sieve inherited "Authenticated
@@ -154,13 +165,26 @@ FunctionEnd
   Call SieveLockInstallDir
 !macroend
 
-; Copy the engine beside the app (the folder is locked, so it inherits the
-; lock) and register its service. Installing changes no network state: the
-; engine runs and filters nothing until a later slice turns it on.
+; Copy the engine, Wintun and its licence beside the app (the folder is
+; locked, so they inherit the lock; the install verb then checks every file
+; beside the exe), add the restore shortcut, and register the service.
+; Installing changes no network state: the engine routes nothing until the
+; user turns "Route traffic through the engine" on.
 !macro NSIS_HOOK_POSTINSTALL
   SetOutPath "$INSTDIR"
   File "/oname=${SIEVE_ENGINE_EXE}" "${SIEVE_ENGINE_SRC}"
+  File "/oname=${SIEVE_WINTUN_DLL}" "${SIEVE_WINTUN_SRC}"
+  File "/oname=${SIEVE_WINTUN_LICENSE}" "${SIEVE_WINTUN_LICENSE_SRC}"
   StrCpy $SieveEngine "$INSTDIR\${SIEVE_ENGINE_EXE}"
+  CreateShortCut "${SIEVE_RESTORE_LINK}" "$SYSDIR\cmd.exe" '/k ""$SieveEngine" restore"' "$SieveEngine" 0
+  ; Run as administrator: the link's SLDF_RUNAS_USER flag (byte 0x15, bit 0x20).
+  FileOpen $1 "${SIEVE_RESTORE_LINK}" a
+  FileSeek $1 0x15 SET
+  FileReadByte $1 $2
+  IntOp $2 $2 | 0x20
+  FileSeek $1 0x15 SET
+  FileWriteByte $1 $2
+  FileClose $1
   DetailPrint "Installing Sieve's engine service"
   nsExec::ExecToLog '"$SieveEngine" install'
   Pop $0
@@ -195,6 +219,9 @@ FunctionEnd
   ${If} $UpdateMode <> 1
     Delete "$SieveEngine"
     Delete "$INSTDIR\${SIEVE_ENGINE_EXE}"
+    Delete "$INSTDIR\${SIEVE_WINTUN_DLL}"
+    Delete "$INSTDIR\${SIEVE_WINTUN_LICENSE}"
+    Delete "${SIEVE_RESTORE_LINK}"
     Delete "$INSTDIR\${SIEVE_MARKER}"
     RMDir "$INSTDIR"
   ${EndIf}

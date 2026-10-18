@@ -6,14 +6,16 @@
 
 use std::os::windows::io::AsRawHandle;
 
-use sieve_ipc::{EngineStatus, PIPE_NAME};
+use std::sync::Arc;
+
+use sieve_ipc::PIPE_NAME;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::watch;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 
-use super::{NOT_ALLOWED, client_allowed, refuse, serve_client};
+use super::{Backend, NOT_ALLOWED, client_allowed, refuse, serve_client};
 use crate::flow::flows::os::exe_path;
 use crate::service::acl::SecurityDescriptor;
 
@@ -42,9 +44,9 @@ fn client_of(pipe: &NamedPipeServer) -> Option<(u32, String, u32)> {
     Some((pid, image, session))
 }
 
-async fn handle(mut pipe: NamedPipeServer, engine_exe: String, status: fn() -> EngineStatus) {
+async fn handle<B: Backend>(mut pipe: NamedPipeServer, engine_exe: String, backend: Arc<B>) {
     let result = match client_of(&pipe) {
-        Some((_, image, session)) if client_allowed(&image, &engine_exe) => serve_client(&mut pipe, session, status).await,
+        Some((_, image, session)) if client_allowed(&image, &engine_exe) => serve_client(&mut pipe, session, backend.as_ref()).await,
         _ => refuse(&mut pipe, NOT_ALLOWED).await,
     };
     // A client that went away mid-frame is not the engine's error.
@@ -53,19 +55,14 @@ async fn handle(mut pipe: NamedPipeServer, engine_exe: String, status: fn() -> E
 }
 
 /// Serves [`PIPE_NAME`] until `stop` turns true.
-pub async fn serve(pipe_sddl: &str, status: fn() -> EngineStatus, stop: watch::Receiver<bool>) -> Result<(), String> {
-    serve_named(PIPE_NAME, pipe_sddl, status, stop).await
+pub async fn serve<B: Backend>(pipe_sddl: &str, backend: Arc<B>, stop: watch::Receiver<bool>) -> Result<(), String> {
+    serve_named(PIPE_NAME, pipe_sddl, backend, stop).await
 }
 
 /// Serves the pipe `name` until `stop` turns true. Fails when the first
 /// instance cannot be created (another process holds the name, or the DACL
 /// is bad).
-async fn serve_named(
-    name: &str,
-    pipe_sddl: &str,
-    status: fn() -> EngineStatus,
-    mut stop: watch::Receiver<bool>,
-) -> Result<(), String> {
+async fn serve_named<B: Backend>(name: &str, pipe_sddl: &str, backend: Arc<B>, mut stop: watch::Receiver<bool>) -> Result<(), String> {
     let sd = SecurityDescriptor::from_sddl(pipe_sddl)?;
     let engine_exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
     let mut server = create(name, &sd, true).map_err(|e| format!("cannot create {name}: {e}"))?;
@@ -80,7 +77,7 @@ async fn serve_named(
         }
         let next = create(name, &sd, false).map_err(|e| format!("cannot create the next pipe instance: {e}"))?;
         let client = std::mem::replace(&mut server, next);
-        tokio::spawn(handle(client, engine_exe.clone(), status));
+        tokio::spawn(handle(client, engine_exe.clone(), backend.clone()));
     }
 }
 
@@ -94,6 +91,11 @@ mod tests {
     use std::time::Duration;
     use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 
+    /// An engine that routes nothing.
+    fn idle() -> Arc<crate::control::Engine> {
+        Arc::new(crate::control::Engine::new(None, std::path::PathBuf::new(), sieve_ipc::Policy::default(), Default::default(), None))
+    }
+
     fn unique(tag: &str) -> String {
         format!(r"\\.\pipe\sieve-engine-test-{tag}-{}", std::process::id())
     }
@@ -101,7 +103,7 @@ mod tests {
     fn running(name: &str, sddl: String) -> (watch::Sender<bool>, tokio::task::JoinHandle<Result<(), String>>) {
         let (tx, rx) = watch::channel(false);
         let name = name.to_string();
-        (tx, tokio::spawn(async move { serve_named(&name, &sddl, EngineStatus::default, rx).await }))
+        (tx, tokio::spawn(async move { serve_named(&name, &sddl, idle(), rx).await }))
     }
 
     /// Opens `name`, waiting (up to a second) for the server to create it.
@@ -155,7 +157,7 @@ mod tests {
         let (stop, task) = running(&name, sddl.clone());
         let _client = open(&name).await.unwrap();
         let (_tx, rx) = watch::channel(false);
-        let second = serve_named(&name, &sddl, EngineStatus::default, rx).await;
+        let second = serve_named(&name, &sddl, idle(), rx).await;
         assert!(second.is_err(), "FILE_FLAG_FIRST_PIPE_INSTANCE refuses a squatter");
         stop.send(true).unwrap();
         task.await.unwrap().unwrap();

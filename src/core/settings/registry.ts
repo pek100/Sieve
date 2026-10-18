@@ -182,6 +182,20 @@ export const REGISTRY = {
     liveCheck: "live_dns_filter_resolves_blocked_domain",
     unavailableUntil: ENGINE_SLICE_4,
   } satisfies DataSwitchSetting,
+  // The engine's switch (docs/plans/2026-10-17-https-filtering.md, slice 3):
+  // on, the engine brings up its Wintun adapter and routes this computer's
+  // traffic through itself; it relays every flow and blocks nothing yet. The
+  // app sends it to the engine (the engine controller, `SetPolicy`); off, the
+  // engine has no adapter and no route. The live check is run by the user
+  // (docs/live/engine-slice-3.md) and read back by the ignored test of its name.
+  "filtering.engine": {
+    kind: "dataSwitch",
+    section: "filtering",
+    label: "Route traffic through the engine",
+    help: "Sends this computer's traffic through Sieve's engine, so Home and Apps show each app's connections as the engine sees them. Nothing is blocked yet. Off: the engine adds no adapter and no route, and your network is as it was.",
+    default: false,
+    liveCheck: "live_engine_full_route_relays_and_restores",
+  } satisfies DataSwitchSetting,
   // Edited only by the DNS filter's card, so unavailable with it.
   "filtering.upstreams": {
     kind: "list",

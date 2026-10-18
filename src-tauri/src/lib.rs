@@ -4,7 +4,10 @@
 //! (`dns`) that answers only lookups sent to it directly. No drivers. Launch
 //! at startup (autostart plugin) writes the current user's Run entry, only
 //! when the user turns the `startup.launchAtLogin` setting on. Asks the
-//! filtering engine's service and pipe what it is doing (`engine`, read only).
+//! filtering engine's service and pipe what it is doing, sends it the user's
+//! switch, and reads its flows while it routes (`engine`). Stops or starts
+//! AdGuard's service only when the user clicks the pause offer, through one
+//! command Windows asks the user to approve (`adguard`).
 //!
 //! Sieve off means a normal network: Sieve never writes persistent system
 //! network state (DNS servers, persistent routes, proxy settings, firewall
@@ -30,11 +33,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .manage(dns::commands::DnsState::default())
+        .manage(std::sync::Arc::new(engine::EngineFlows::default()))
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             app.manage(history::HistoryState::open_at(&dir));
             app.manage(icons::IconStore::open_at(&dir));
             tray::install(app)?;
+            #[cfg(windows)]
+            tauri::async_runtime::spawn(engine::follow_flows(app.state::<std::sync::Arc<engine::EngineFlows>>().inner().clone()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -49,7 +55,10 @@ pub fn run() {
             dns::commands::dns_self_check,
             dns::commands::dns_set_pass_through,
             adguard::adguard_running,
+            adguard::adguard_stop,
+            adguard::adguard_start,
             engine::engine_probe,
+            engine::engine_set_policy,
             windns::windows_dns,
         ])
         .run(tauri::generate_context!());
