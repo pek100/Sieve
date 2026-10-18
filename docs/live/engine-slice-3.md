@@ -1,6 +1,6 @@
 # Live check: engine slice 3 (full route, relay, DNS on the TUN, crash safety, coexistence)
 
-`live_engine_full_route_relays_and_restores`, the live check of the `filtering.engine` switch. For the user, with a verifier reading the evidence. Agents never run any of this (plan section 9: no installer, no service, no routes, no elevation).
+`live_engine_full_route_relays_and_restores`, the live check of the `filtering.engine` switch. For the user, with a verifier reading the evidence. Agents run only the unelevated dry-run and contract checks below, never the live path (plan section 9: no installer, no service, no routes, no elevation).
 
 Script: `scripts/live/engine-route.ps1`. Every step prints PASS or FAIL per check and appends to `C:\Users\Public\sieve-engine-live\results-route.txt`; the listings, the engine's `status.json` copies and the budget numbers sit beside it. Send that folder to the verifier. Afterwards, in the worktree, `cargo test --manifest-path engine\Cargo.toml -p sieve-engine -- --ignored live_engine_full_route_relays_and_restores` reads `results-route.txt` and passes only when every required check passed (the list is `control::LIVE_CHECKS`).
 
@@ -8,7 +8,44 @@ What slice 3 does when you turn routing on: the engine creates its Wintun adapte
 
 Not relayed in slice 3: ICMP (ping and traceroute to the internet fail while routing is on; local pings work). UNVERIFIED until this check: the four service privileges are enough to create the adapter (if not, the Engine block shows "Could not start" with the reason and the network is untouched; send `status.json`).
 
-## Before you start
+## Unattended run (existing install)
+
+Open Terminal (Admin), approve UAC, and change to this worktree. With the current normal engine already installed and its service running, run this command and leave the terminal open:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\live\run-slice-3-auto.ps1
+```
+
+There are no installer dialogs or questions in this runner. Starting it authorizes pausing `Adguard Service` for the test. It requests any `sieve.exe` window to close and refuses if the process remains after the close grace. Keep Sieve closed until the summary: `src/data/engine-controller.ts` sends the app's stored `filtering.engine` value whenever it differs from the engine policy. A tray window that hides instead of exiting must be quit before retrying. If Sieve reopens during the check, the runner aborts and cleans up; if it is still open at cleanup, the engine stays stopped with policy OFF so the UI cannot undo the cleanup.
+
+The order is before, AdGuard refusal and pause, on, soak, kill, stall, budget, AdGuard back, then cleanup. The default soak is the existing acceptance interval; override its duration with `-SoakMinutes <minutes>`. A short override is a diagnostic run, not the full soak acceptance. The countdown prints engine counters every minute while you use the PC. The runner checks sampled routing, process identity, status freshness and HTTPS; it cannot certify that a video call or game launcher worked throughout. Attribution uses the difference from the saved on-step counter baseline, and a process restart or counter reset invalidates the measurement.
+
+The runner uses the engine's existing admin-only file path. `service/runner.rs` loads `policy.json` at service startup, while the running engine receives changes through its authenticated pipe. The runner stops the service, writes exactly `{"revision":<successor>,"engine":<boolean>}` as atomic UTF-8 without BOM, then starts it and verifies the loaded revision in `status.json`. The successor exceeds both the persisted and last reported revisions. No new engine verb is needed. `runs.json` is read for evidence and never edited: file-based policy changes do not call `set_policy` and do not forgive a crash loop. A crash-loop blocker fails the run and requires the existing app off/on recovery separately, followed by closing the app before retrying.
+
+Prepare the optional Stall build unelevated in this worktree, separately from the normal installer:
+
+```powershell
+cargo build --release --manifest-path engine\Cargo.toml -p sieve-engine --bin sieve-engine --features stall --target-dir engine\target\stall
+```
+
+The runner looks only at `engine\target\stall\release\sieve-engine.exe`, recording SKIP with the path if absent. It keeps the normal executable backup beside the installed executable, restores and hashes it in `finally`, and retains the backup if restoration fails. The outer cleanup independently attempts routing OFF, normal binary restoration, and AdGuard RUNNING if it was running initially. AdGuard that was absent or stopped stays that way, with its coexistence checks marked SKIP. No service startup type or recovery configuration is changed. Cleanup failures are visible failed checks, not successful restoration claims; inspect the summary before reopening Sieve.
+
+The kill measurement launches direct lookup plus HTTPS attempts immediately after the kill, polls at the requested cadence, and records the first observed successful response from `https://www.cloudflare.com`. Each new curl resolves that hostname itself, bypasses HTTP proxies, verifies TLS and requires a successful HTTP status. Slow attempts overlap rather than delaying the next probe; all probe processes are reaped. The reported interval conservatively includes the kill call and completion polling, with the target and response metadata recorded. Idle CPU is always ADVISORY because unattended user activity and background traffic are uncontrolled; the relay CPU, completed download and memory checks remain checks of measured values.
+
+`C:\Users\Public\sieve-engine-live\results-route.txt` is appended under an AUTO run header. Detailed evidence goes into the run's unique `auto-...` directory. The final table distinguishes PASS, FAIL, SKIP and ADVISORY; the process exit code is the failed-check count. UI questions are SKIP with the applicable `tests/e2e` spec path, never live PASS. Those specs use fixtures and do not establish live UI behavior. The existing ignored Rust acceptance test still requires the manual UI, idle, normal-use and reboot checks; an AUTO summary alone is not a complete slice acceptance.
+
+The summary prints the separate reboot commands with this run's evidence directory. First turn routing on in the installed app and close it, because AUTO deliberately ends OFF. The existing reboot steps remain interactive and their crash-loop assertion depends on the preserved crash history (including whether the Stall step ran).
+
+Unelevated validation, with no machine-state access or changes:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\live\run-slice-3-auto.ps1 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\live\test-slice-3-auto.ps1
+```
+
+The local contract tests use temporary files inside the worktree and mocked service/network operations. See [the validation transcript](engine-slice-3-auto-validation.txt) for the commands and observed output. The real elevated workflow, including service recovery and timings, remains unverified until the user runs it.
+
+## Before you start (manual flow)
 
 - Build the installer from this branch: `pnpm tauri build` in the worktree (it needs Wintun 0.14.1 at `E:\ml-tools\wintun`, or `SIEVE_WINTUN_DLL` pointing at its `bin\amd64\wintun.dll`; the build refuses any other file). The installer is `src-tauri\target\release\bundle\nsis\Sieve_0.1.0_x64-setup.exe`.
 - Install it over the slice 2 install (`E:\Sieve` is fine; it holds Sieve's marker): `powershell -ExecutionPolicy Bypass -File scripts\live\engine-install.ps1 -Step install`, then `-Step verify`. The verify step now expects the engine's four privileges.
