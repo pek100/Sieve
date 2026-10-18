@@ -32,6 +32,9 @@ if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
 }
 
 $results = [ordered]@{}
+. (Join-Path $PSScriptRoot 'live-lease.ps1')
+$liveLease = Enter-SieveLiveLease
+try {
 
 function Pause-For([string]$what) {
   Write-Host ""
@@ -100,3 +103,4 @@ Write-Host "Reboot test (separate, at a restart that suits you):"
 Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\live\engine-route.ps1 -Step reboot-prep"
 Write-Host "  (reboot, then)"
 Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\live\engine-route.ps1 -Step after-reboot"
+} finally { Exit-SieveLiveLease $liveLease }

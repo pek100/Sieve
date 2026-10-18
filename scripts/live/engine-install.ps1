@@ -49,6 +49,12 @@ $ProgramDataSieve = Join-Path $env:ProgramData "Sieve"
 # SYSTEM, Administrators, TrustedInstaller: the only principals that may change the engine's files.
 $TrustedSids = @("S-1-5-18", "S-1-5-32-544", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
 $script:Failed = 0
+$liveLease = $null
+if ($Step -in @('install', 'kill', 'reboot-prep', 'uninstall')) {
+  . (Join-Path $PSScriptRoot 'live-lease.ps1')
+  $liveLease = Enter-SieveLiveLease
+}
+try {
 
 New-Item -ItemType Directory -Force $Out | Out-Null
 
@@ -374,3 +380,4 @@ switch ($Step) {
 Write-Host ""
 Write-Host ("{0} check(s) failed. Evidence in {1}" -f $script:Failed, $Out) -ForegroundColor $(if ($script:Failed -eq 0) { "Green" } else { "Red" })
 exit $script:Failed
+} finally { if ($liveLease) { Exit-SieveLiveLease $liveLease } }

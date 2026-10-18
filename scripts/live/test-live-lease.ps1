@@ -1,0 +1,65 @@
+# Process/file-only tests; no service, network, policy or elevation calls.
+$ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'live-lease.ps1')
+$scratch=Join-Path $PSScriptRoot ('lease-test-'+[guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($scratch)
+$path=Join-Path $scratch 'runner.lock'
+$helper=Join-Path $PSScriptRoot 'live-lease.ps1'
+$child=Join-Path $scratch 'child.ps1'
+@'
+param([string]$Helper,[string]$Path,[string]$Mode,[string]$Ready)
+$ErrorActionPreference='Stop'
+. $Helper
+if ($Mode -eq 'contend') {$env:SIEVE_LIVE_RUN_TOKEN=$null; $env:SIEVE_LIVE_RUN_OWNER=$null}
+try {
+  $lease=Enter-SieveLiveLease $Path
+  if ($Mode -eq 'inherit' -and -not $lease.Inherited) {throw 'Child did not inherit'}
+  if ($Mode -eq 'contend') {throw 'Competing root acquired the lock'}
+  if ($Mode -eq 'hold') {
+    [IO.File]::WriteAllText($Ready,'ready')
+    Start-Sleep -Seconds 30
+  }
+  Exit-SieveLiveLease $lease
+  exit 0
+} catch {
+  if ($Mode -eq 'contend' -and $_.Exception.Message -like 'Another Sieve live runner*') {exit 0}
+  Write-Error $_
+  exit 1
+}
+'@ | Set-Content -LiteralPath $child -Encoding UTF8
+function Run-Child([string]$mode) {
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $child -Helper $helper -Path $path -Mode $mode
+  if ($LASTEXITCODE -ne 0) {throw "Child test failed: $mode"}
+}
+$lease=$null; $holder=$null
+try {
+  $originalToken=$env:SIEVE_LIVE_RUN_TOKEN
+  $lease=Enter-SieveLiveLease $path
+  Run-Child 'contend'
+  Write-Host 'PASS: competing root refused while lease is active'
+  Run-Child 'inherit'
+  Write-Host 'PASS: real child inherits without releasing parent handle'
+  Run-Child 'contend'
+  Exit-SieveLiveLease $lease; $lease=$null
+  if ($env:SIEVE_LIVE_RUN_TOKEN -ne $originalToken) {throw 'Environment not restored'}
+  $lease=Enter-SieveLiveLease $path
+  Exit-SieveLiveLease $lease; $lease=$null
+  Write-Host 'PASS: normal release permits a new run and restores environment'
+  $ready=Join-Path $scratch 'ready.txt'
+  $args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$child+'"'),'-Helper',('"'+$helper+'"'),'-Path',('"'+$path+'"'),'-Mode','hold','-Ready',('"'+$ready+'"'))
+  $holder=Start-Process powershell.exe -WindowStyle Hidden -ArgumentList $args -PassThru
+  $clock=[Diagnostics.Stopwatch]::StartNew()
+  while (-not (Test-Path -LiteralPath $ready) -and $clock.Elapsed.TotalSeconds -lt 10) {Start-Sleep -Milliseconds 50}
+  if (-not (Test-Path -LiteralPath $ready)) {throw 'Holder did not become ready'}
+  Stop-Process -Id $holder.Id -Force
+  $holder.WaitForExit()
+  $lease=Enter-SieveLiveLease $path
+  Exit-SieveLiveLease $lease; $lease=$null
+  Write-Host 'PASS: killing the test holder releases the OS file lock'
+} finally {
+  if ($lease) {Exit-SieveLiveLease $lease}
+  if ($holder -and -not $holder.HasExited) {Stop-Process -Id $holder.Id -Force}
+  # Only known test files; no recursive delete or computed external paths.
+  foreach($file in @($child,$path,(Join-Path $scratch 'ready.txt'))) {if(Test-Path -LiteralPath $file){Remove-Item -LiteralPath $file}}
+  Remove-Item -LiteralPath $scratch
+}

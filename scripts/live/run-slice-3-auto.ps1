@@ -57,6 +57,7 @@ $script:EngineExe = $null
 $script:Revision = [decimal]0
 $script:Cleaning = $false
 $script:EvidenceDir = $null
+$script:LiveLease = $null
 
 function Log([string]$text) {
   Write-Host $text
@@ -411,6 +412,8 @@ function Run-Auto {
   Step "preflight" "Assert admin; request sieve.exe close, wait up to $CloseSeconds s, refuse if still open; require running sieve-engine; record AdGuard state, runs.json and service image. Append AUTO header to $Results; save evidence in a unique run directory." {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw "Run from Terminal (Admin), or use -DryRun unelevated." }
+    . (Join-Path $PSScriptRoot 'live-lease.ps1')
+    $script:LiveLease = Enter-SieveLiveLease
     foreach ($app in @(Get-Process -Name sieve -ErrorAction SilentlyContinue)) {
       Log "Requesting sieve.exe PID $($app.Id) to close. Keep Sieve closed until the summary."
       [void]$app.CloseMainWindow()
@@ -628,7 +631,16 @@ trap {
 try { Run-Auto }
 catch { Record "FAIL" "AUTO stopped" "line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)" }
 finally {
-  if (-not $DryRun) { Restore-State }
+  if (-not $DryRun) {
+    try { Restore-State }
+    finally {
+      if ($script:LiveLease -and -not $script:LiveLease.Inherited) {
+        $script:LiveLease.Stream.Dispose()
+        $env:SIEVE_LIVE_RUN_TOKEN=$script:LiveLease.PreviousToken
+        $env:SIEVE_LIVE_RUN_OWNER=$script:LiveLease.PreviousOwner
+      }
+    }
+  }
 }
 Summary
 exit $script:Failed

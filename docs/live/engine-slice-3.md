@@ -41,11 +41,14 @@ Unelevated validation, with no machine-state access or changes:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\live\run-slice-3-auto.ps1 -DryRun
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\live\test-slice-3-auto.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\live\test-live-lease.ps1
 ```
 
 The local contract tests use temporary files inside the worktree and mocked service/network operations. See [the validation transcript](engine-slice-3-auto-validation.txt) for the commands and observed output. The real elevated workflow, including service recovery and timings, remains unverified until the user runs it.
 
 ## Before you start (manual flow)
+
+The interactive wrapper, unattended runner, individual routing steps and mutating install-check steps share `C:\Users\Public\sieve-engine-live\runner.lock`. A second runner refuses before changing the app, policy or services. The wrapper holds the lock across its prompts; only its verified child processes inherit it. The OS releases the lock if its process exits or is killed, so a leftover file does not require manual deletion. Older script copies do not participate: close those runners before using this version.
 
 - Build the installer from this branch: `pnpm tauri build` in the worktree (it needs Wintun 0.14.1 at `E:\ml-tools\wintun`, or `SIEVE_WINTUN_DLL` pointing at its `bin\amd64\wintun.dll`; the build refuses any other file). The installer is `src-tauri\target\release\bundle\nsis\Sieve_0.1.0_x64-setup.exe`.
 - Install it over the slice 2 install (`E:\Sieve` is fine; it holds Sieve's marker): `powershell -ExecutionPolicy Bypass -File scripts\live\engine-install.ps1 -Step install`, then `-Step verify`. The verify step now expects the engine's four privileges.
