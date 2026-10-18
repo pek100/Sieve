@@ -57,13 +57,14 @@ describe("apps screen", () => {
     expect(within(row("quiet")).getByText("0")).toBeInTheDocument();
   });
 
-  it("every app is sieved by default; the toggle says once, plainly, that Off cannot exempt it from DNS blocking", async () => {
+  it("every app is sieved by default; the toggle says once, plainly, what Off does and claims no blocking", async () => {
     await setup();
     const toggle = within(row(CHROME)).getByRole("switch", { name: "Sieve Google Chrome" });
     expect(toggle).toBeChecked();
     expect(toggle).toHaveAccessibleDescription(APP_OFF_MEANS);
     expect(APP_OFF_MEANS).toMatch(/stops tracking and charting/);
-    expect(APP_OFF_MEANS).toMatch(/DNS blocking still covers it/);
+    // Nothing is blocked before the engine, so the copy must not claim blocking.
+    expect(APP_OFF_MEANS).not.toMatch(/block/i);
     // No Watch level and no locked per-app filtering anywhere.
     expect(document.body.textContent).not.toMatch(/Watch|network driver|Per-app filtering/);
     expect(screen.queryAllByRole("radio")).toHaveLength(0);

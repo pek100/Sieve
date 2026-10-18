@@ -124,7 +124,7 @@ export const REGISTRY = {
     kind: "boolean",
     section: "sampling",
     label: "Sieving",
-    help: "On: Sieve charts which apps talk to the network and, while DNS filtering runs, blocks listed domains. Off pauses both; lookups still go through.",
+    help: "On: Sieve charts which apps talk to the network. Off pauses it. Nothing is blocked yet; filtering arrives with the engine.",
     default: true,
   } satisfies BooleanSetting,
   "sampling.intervalMs": {

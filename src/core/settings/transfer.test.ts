@@ -105,9 +105,9 @@ describe("settings search and words", () => {
     expect(searchSettings("")).toEqual(SETTING_KEYS.filter(isAvailable));
     expect(searchSettings("theme")).toEqual(["appearance.theme"]);
     expect(searchSettings("LIGHT")).toEqual(["appearance.theme"]);
-    // The global switch's help says what it does to DNS filtering, so it is found; the DNS
-    // filter's own keys are unavailable until the engine replaces it, so they are not.
-    expect(searchSettings("dns")).toEqual(["sampling.enabled"]);
+    // The DNS filter's own keys are unavailable until the engine replaces it, and no visible
+    // help mentions DNS, so a search for it finds nothing.
+    expect(searchSettings("dns")).toEqual([]);
     expect(searchSettings("per-app filtering")).toEqual([]);
     expect(searchSettings("turned off")).toEqual(["apps.levels"]);
     expect(searchSettings("startup")).toEqual(["startup.launchAtLogin"]);

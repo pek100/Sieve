@@ -5,11 +5,11 @@ import { cn } from "@/lib/utils";
 
 /**
  * What per-app Off does, said once (the switch's tooltip and accessible
- * description). Honest about DNS: blocking is system wide, so Off cannot
- * exempt an app from it.
+ * description). Only what is true today: Sieve blocks nothing yet (the DNS
+ * filter is hidden until engine slice 4), so Off only stops tracking. With
+ * the engine, Off becomes a real per-app exemption (plan section 1.4).
  */
-export const APP_OFF_MEANS =
-  "Off: Sieve stops tracking and charting this app. DNS blocking still covers it, because Windows sends every app's lookups through one service.";
+export const APP_OFF_MEANS = "Off: Sieve stops tracking and charting this app.";
 
 /**
  * Per-app on/off: Sieve (on, the default) or Off. `on` is the user's choice

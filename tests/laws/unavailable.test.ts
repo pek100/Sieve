@@ -108,7 +108,8 @@ describe("unavailable settings law", () => {
 
   it("not searched, exported, imported or reset; an import cannot reach them", () => {
     for (const k of unavailable) expect(searchSettings(""), k).not.toContain(k);
-    expect(searchSettings("dns")).toEqual(["sampling.enabled"]);
+    // Nothing visible mentions DNS while the filter is unavailable, so the search finds nothing.
+    expect(searchSettings("dns")).toEqual([]);
     const stored = { schema: SETTINGS_SCHEMA, values: { [UPSTREAMS_KEY]: ["9.9.9.9"], "appearance.theme": "light" } };
     expect(knownValues(stored)).toEqual({ "appearance.theme": "light" });
     expect(JSON.parse(exportText(stored)).values).toEqual({ "appearance.theme": "light" });
