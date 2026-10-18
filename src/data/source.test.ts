@@ -18,6 +18,7 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
       scenario: "busy",
       dns: "off",
       adguard: false,
+      pointed: false,
       icons: false,
     });
     expect(sourceOptions({ search: "?seed=abc&scenario=nope", isTauri: false })).toEqual({
@@ -26,6 +27,7 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
       scenario: "steady",
       dns: "off",
       adguard: false,
+      pointed: false,
       icons: false,
     });
   });
@@ -43,9 +45,11 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
     expect(await createMockSource({ seed: 1 }).appIcon("C:\\Program Files\\App\\app.exe")).toBeNull();
   });
 
-  it("reads the mock DNS scenario and the AdGuard flag; the DNS seam follows the source kind", () => {
-    expect(sourceOptions({ search: "?dns=running&adguard=1", isTauri: false })).toMatchObject({ dns: "running", adguard: true });
-    expect(sourceOptions({ search: "?dns=nope", isTauri: false }).dns).toBe("off");
+  it("reads the mock DNS scenario, the AdGuard flag and a pointed adapter; the DNS seam follows the source kind", () => {
+    expect(sourceOptions({ search: "?dns=error&adguard=1&pointed=1", isTauri: false })).toMatchObject({ dns: "error", adguard: true, pointed: true });
+    expect(sourceOptions({ search: "?dns=nope", isTauri: false })).toMatchObject({ dns: "off", pointed: false });
+    // The retired scenario (Windows pointed by Sieve, with a backup) reads as off.
+    expect(sourceOptions({ search: "?dns=running", isTauri: false }).dns).toBe("off");
     expect(createDnsSource(sourceOptions({ search: "", isTauri: true })).kind).toBe("tauri");
     expect(createDnsSource(sourceOptions({ search: "?source=mock&dns=error", isTauri: true })).kind).toBe("mock");
   });

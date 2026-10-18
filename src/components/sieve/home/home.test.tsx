@@ -203,8 +203,8 @@ describe("home copy and KPIs", () => {
       source: createMockSource({ seed: 1, now: fc.clock.now }),
       settings: memoryBackend({ schema: 1, values: { [DNS_SWITCH]: true } }),
       clock: fc.clock,
-      // Windows already points at Sieve, so lookups arrive and some are blocked.
-      dns: createMockDns({ seed: 1, scenario: "running", now: fc.clock.now }),
+      // An adapter asks 127.0.0.1 and ::1 (Sieve never sets that), so lookups arrive and some are blocked.
+      dns: createMockDns({ seed: 1, pointed: true, now: fc.clock.now }),
     });
     render(
       <SieveProvider runtime={runtime}>

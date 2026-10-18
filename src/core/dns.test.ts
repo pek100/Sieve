@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { SystemDnsState } from "@/data/protocol";
-import { blockRate, checkDetails, checkFailedLine, checkFailure, dnsPhase, EMPTY_DNS, isFiltering, isUpstream, mustAskBeforeQuit, needsProxyAtStart } from "./dns";
+import type { DnsStatus, WindowsDns } from "@/data/protocol";
+import { blockRate, checkDetails, checkFailedLine, checkFailure, dnsPhase, EMPTY_DNS, isFiltering, isUpstream, strandedAdapters } from "./dns";
 import { createPassedChecks } from "./checks";
 
-const system = (pointed: boolean, backup: boolean): SystemDnsState => ({ v: 1, interfaces: [], pointed, backup, backup_dir: null });
+const windows = (...adapters: [string, string[]][]): WindowsDns => ({
+  v: 1,
+  adapters: adapters.map(([alias, servers], index) => ({ alias, index, servers })),
+});
+const listening = (binds: string[], extra: Partial<DnsStatus> = {}): DnsStatus => ({ running: true, pass_through: false, binds, ...extra }) as DnsStatus;
+const stopped = { running: false, binds: [] } as unknown as DnsStatus;
 
 describe("upstream addresses (what dns_start accepts)", () => {
   it("takes IPv4 and IPv6, with or without a port", () => {
@@ -36,17 +41,6 @@ describe("dns derivations", () => {
     expect(blockRate({ queries: 200, blocked: 30, forwarded: 170, failed: 0, untracked: 0 })).toBe(0.15);
   });
 
-  it("asks before quitting whenever Windows may point at Sieve; starts the proxy only when it does and Sieve did it", () => {
-    expect(mustAskBeforeQuit(null)).toBe(false);
-    expect(mustAskBeforeQuit(system(false, false))).toBe(false);
-    expect(mustAskBeforeQuit(system(true, false))).toBe(true);
-    expect(mustAskBeforeQuit(system(false, true))).toBe(true);
-    expect(needsProxyAtStart(system(true, true))).toBe(true);
-    // Someone else's loopback DNS (no Sieve backup) is not Sieve's to answer.
-    expect(needsProxyAtStart(system(true, false))).toBe(false);
-    expect(needsProxyAtStart(system(false, true))).toBe(false);
-    expect(needsProxyAtStart(null)).toBe(false);
-  });
 
   const V4 = "127.0.0.1:53";
   const V6 = "[::1]:53";
@@ -89,6 +83,46 @@ describe("dns derivations", () => {
       `${V6}: selfcheck.sieve.invalid expected NOERROR 0.0.0.0 (blocked), got ${bad}`,
     ]);
     expect(checkDetails({ pass: true, checks: [resolve(V4, "NOERROR 192.0.2.1", true)] })).toEqual([]);
+  });
+});
+
+describe("safety net: strandedAdapters (read only, Sieve never changes Windows DNS)", () => {
+  const own = windows(["Wi-Fi", ["192.0.2.53", "2001:db8::53"]], ["Ethernet 2", ["198.51.100.53"]]);
+  const pointed = windows(["Wi-Fi", ["127.0.0.1", "::1"]], ["Ethernet 2", ["198.51.100.53"]]);
+
+  it("an adapter asking 127.0.0.1 or ::1 with no Sieve listener is stranded", () => {
+    expect(strandedAdapters(pointed, null)).toEqual(["Wi-Fi"]);
+    expect(strandedAdapters(pointed, stopped)).toEqual(["Wi-Fi"]);
+    // Either family alone is enough: that family's lookups go nowhere.
+    expect(strandedAdapters(windows(["Wi-Fi", ["192.0.2.53", "::1"]]), stopped)).toEqual(["Wi-Fi"]);
+    expect(strandedAdapters(windows(["Wi-Fi", ["127.0.0.1"]]), stopped)).toEqual(["Wi-Fi"]);
+    // Every stranded adapter, in Windows' order.
+    expect(strandedAdapters(windows(["B", ["::1"]], ["A", ["192.0.2.1"]], ["C", ["127.0.0.1"]]), stopped)).toEqual(["B", "C"]);
+  });
+
+  it("Windows' own DNS is never stranded, running or not", () => {
+    expect(strandedAdapters(own, stopped)).toEqual([]);
+    expect(strandedAdapters(own, listening(["127.0.0.1:53", "[::1]:53"]))).toEqual([]);
+    expect(strandedAdapters(windows(), stopped)).toEqual([]);
+    // Other loopback addresses are not what Sieve listens on, so not Sieve's to warn about.
+    expect(strandedAdapters(windows(["Wi-Fi", ["127.0.0.53"]]), stopped)).toEqual([]);
+  });
+
+  it("a running listener on the address answers it, pass-through included", () => {
+    expect(strandedAdapters(pointed, listening(["127.0.0.1:53", "[::1]:53"]))).toEqual([]);
+    expect(strandedAdapters(pointed, listening(["127.0.0.1:53", "[::1]:53"], { pass_through: true }))).toEqual([]);
+    // Listening on one family only: the other family's lookups still go nowhere.
+    expect(strandedAdapters(pointed, listening(["127.0.0.1:53"]))).toEqual(["Wi-Fi"]);
+    expect(strandedAdapters(windows(["Wi-Fi", ["127.0.0.1"]]), listening(["127.0.0.1:53"]))).toEqual([]);
+    // A test port is not where Windows asks.
+    expect(strandedAdapters(pointed, listening(["127.0.0.1:5353", "[::1]:5353"]))).toEqual(["Wi-Fi"]);
+    // Binds of a status that says stopped do not answer anything.
+    expect(strandedAdapters(pointed, { ...listening(["127.0.0.1:53", "[::1]:53"]), running: false })).toEqual(["Wi-Fi"]);
+  });
+
+  it("unknown Windows DNS decides nothing (absent is not 'nothing pointed')", () => {
+    expect(strandedAdapters(null, stopped)).toEqual([]);
+    expect(strandedAdapters(null, null)).toEqual([]);
   });
 });
 

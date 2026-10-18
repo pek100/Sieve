@@ -6,20 +6,25 @@
  * through the DNS Client service, so the proxy cannot tell which app asked:
  * nothing here, and no copy built on it, may claim per-app blocking.
  *
+ * Sieve never points Windows DNS at the filter (docs/conventions.md, "Sieve
+ * off means a normal network"), so today it filters only lookups sent to
+ * 127.0.0.1:53 or [::1]:53 directly. `strandedAdapters` is the read-only
+ * safety net for machines that still point there.
+ *
  * The slice has one writer, the DNS controller (src/data/dns-controller.ts).
  */
-import type { DnsCheck, DnsCounters, DnsStatus, SelfCheck, SystemDnsState } from "@/data/protocol";
+import type { DnsCheck, DnsCounters, DnsStatus, SelfCheck, WindowsDns } from "@/data/protocol";
 import type { SettingKey } from "./settings/registry";
 
 /** The data switch that runs the filter. UI reads it from here, never spelled out. */
 export const DNS_SWITCH = "filtering.dns" satisfies SettingKey;
-/** The data switch that points Windows at the filter (the one system write). */
-export const SYSTEM_DNS_SWITCH = "filtering.systemDns" satisfies SettingKey;
 /** Upstream servers handed to dns_start. */
 export const UPSTREAMS_KEY = "filtering.upstreams" satisfies SettingKey;
 
 /** How often dns_status is read while the filter runs. */
 export const DNS_POLL_MS = 2000;
+/** How often Windows DNS is read (read only) for the safety net, from startup on. */
+export const WINDOWS_DNS_POLL_MS = 30_000;
 
 const V4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
 
@@ -58,33 +63,30 @@ export function isUpstream(raw: string): boolean {
   return false;
 }
 
-export type DnsBusy = "start" | "check" | "stop" | "point" | "restore" | "pass";
+export type DnsBusy = "start" | "check" | "stop" | "pass";
 
 export interface DnsSlice {
   /** Newest dns_status answer; null before the first read. */
   status: DnsStatus | null;
   /** Self check of the current run; null until one ran. */
   check: SelfCheck | null;
-  /** Windows DNS per active adapter; null before the first read or when it cannot be read. */
-  system: SystemDnsState | null;
+  /** Windows DNS servers per active adapter (read only); null before the first good read. */
+  windows: WindowsDns | null;
   /** An AdGuard process is running (it intercepts lookups itself). */
   adguard: boolean;
   /** The action in flight, if any. */
   busy: DnsBusy | null;
   /** Newest failed action or read, cleared by the next good one. */
   error: string | null;
-  /** Quit was asked while Windows points at Sieve: the window asks how to leave. */
-  quitAsked: boolean;
 }
 
 export const EMPTY_DNS: DnsSlice = {
   status: null,
   check: null,
-  system: null,
+  windows: null,
   adguard: false,
   busy: null,
   error: null,
-  quitAsked: false,
 };
 
 /** `paused`: running in pass-through (the global Sieving switch is off): it answers, forwards everything, blocks nothing. */
@@ -108,11 +110,6 @@ export function isFiltering(d: Pick<DnsSlice, "status">): boolean {
 /** Blocked share of all lookups, 0 to 1; null before the first lookup. */
 export function blockRate(c: DnsCounters): number | null {
   return c.queries === 0 ? null : c.blocked / c.queries;
-}
-
-/** Leaving Sieve must be asked about: Windows points at it (or a backup says Sieve pointed it). */
-export function mustAskBeforeQuit(system: SystemDnsState | null): boolean {
-  return system !== null && (system.pointed || system.backup);
 }
 
 /** Where the self check's full detail is shown (the DNS card in Settings). */
@@ -165,7 +162,39 @@ export function checkDetails(c: SelfCheck): string[] {
   return [...new Set(lines)];
 }
 
-/** Lookups go nowhere unless Sieve answers them: Windows points at loopback and Sieve made the backup. */
-export function needsProxyAtStart(system: SystemDnsState | null): boolean {
-  return system !== null && system.pointed && system.backup;
+/**
+ * The loopback DNS servers an old Sieve build pointed Windows at, each with
+ * the listen address Sieve's filter answers it on. Windows always asks port 53.
+ */
+export const LOOPBACK_DNS: ReadonlyMap<string, string> = new Map([
+  ["127.0.0.1", "127.0.0.1:53"],
+  ["::1", "[::1]:53"],
+]);
+
+/**
+ * The safety net's decision, pure: the active adapters whose DNS servers
+ * include 127.0.0.1 or ::1 while no Sieve DNS listener answers there. Each
+ * such adapter's lookups go nowhere, so sites may not load. Sieve never
+ * changes Windows DNS; it only says so.
+ *
+ * `windows` null (not read yet, or unreadable) is unknown, not "nothing
+ * pointed": it decides nothing. A filter that runs answers on its `binds`
+ * (pass-through included: it still answers). Names in Windows' order, once.
+ */
+export function strandedAdapters(windows: WindowsDns | null, status: DnsStatus | null): string[] {
+  if (windows === null) return [];
+  const answered = new Set(status?.running ? status.binds : []);
+  const out: string[] = [];
+  for (const a of windows.adapters) {
+    const stranded = a.servers.some((s) => {
+      const listen = LOOPBACK_DNS.get(s);
+      return listen !== undefined && !answered.has(listen);
+    });
+    if (stranded && !out.includes(a.alias)) out.push(a.alias);
+  }
+  return out;
 }
+
+/** The safety notice, word for word wherever it shows (Home banner, DNS card). */
+export const STRANDED_DNS_TEXT =
+  "Windows is set to use Sieve for DNS, but Sieve's DNS filter is not running, so sites may not load. Reset DNS in Windows network settings, or turn DNS filtering on.";

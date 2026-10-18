@@ -10,19 +10,19 @@ import { TRAY_EVENT } from "@/data/desktop";
 import historyFixture from "@/data/fixtures/history-v1.json";
 import dnsFixture from "@/data/fixtures/dns-status-v3.json";
 import fixture from "@/data/fixtures/snapshot-v1.json";
-import systemFixture from "@/data/fixtures/system-dns-v1.json";
+import windowsFixture from "@/data/fixtures/windows-dns-v1.json";
 import { MOCK_CANARY } from "@/data/dns-mock";
 import {
   CHECK_KINDS,
   DNS_STATUS_VERSION,
   FLOW_STATES,
   PROTOCOL_VERSION,
-  SYSTEM_DNS_VERSION,
+  WINDOWS_DNS_VERSION,
   parseDnsStatus,
   parseHistory,
   parseSelfCheck,
   parseSnapshot,
-  parseSystemDns,
+  parseWindowsDns,
   ProtocolError,
 } from "@/data/protocol";
 import { read } from "./files";
@@ -72,8 +72,8 @@ describe("protocol law", () => {
     // What Rust emits for its Pause and Resume items (serde tag "kind", snake_case) is what the window accepts.
     expect(parseTrayAction({ kind: "pause", minutes })).toEqual({ kind: "pause", minutes });
     expect(parseTrayAction({ kind: "resume" })).toEqual({ kind: "resume" });
-    // Quit is sent to the window while Sieve's DNS backup exists, so the window can ask first.
-    expect(parseTrayAction({ kind: "quit" })).toEqual({ kind: "quit" });
+    // Quit is Rust's alone (it just quits): the window never gets it.
+    expect(parseTrayAction({ kind: "quit" })).toBeNull();
     expect(ids.map((m) => m[1])).toEqual(["pause", "resume", "open", "quit"]);
     // The Pause item's label states the same minutes it sends.
     expect(ids[0][2]).toBe(`Pause ${minutes} min`);
@@ -93,13 +93,14 @@ describe("protocol law", () => {
     expect(() => parseDnsStatus({ ...dnsFixture, top_blocked: [{ domain: 3, count: 1 }] })).toThrow(/top_blocked\[0\]\.domain/);
   });
 
-  it("system_dns_state: the v1 fixture parses losslessly and the version matches Rust", () => {
-    expect(parseSystemDns(systemFixture)).toEqual(systemFixture);
-    const rust = read("src-tauri/src/sysdns/mod.rs");
-    expect(Number(rust.match(/pub const SYSTEM_DNS_VERSION: u32 = (\d+);/)?.[1])).toBe(SYSTEM_DNS_VERSION);
-    expect(rust).toContain('include_str!("../../../src/data/fixtures/system-dns-v1.json")');
-    expect(() => parseSystemDns({ ...systemFixture, v: 2 })).toThrow(ProtocolError);
-    expect(() => parseSystemDns({ ...systemFixture, interfaces: [{ ...systemFixture.interfaces[0], v4: null }] })).toThrow(/interfaces\[0\]\.v4/);
+  it("windows_dns: the v1 fixture parses losslessly and the version matches Rust", () => {
+    expect(parseWindowsDns(windowsFixture)).toEqual(windowsFixture);
+    const rust = read("src-tauri/src/windns.rs");
+    expect(Number(rust.match(/pub const WINDOWS_DNS_VERSION: u32 = (\d+);/)?.[1])).toBe(WINDOWS_DNS_VERSION);
+    expect(rust).toContain('include_str!("../../src/data/fixtures/windows-dns-v1.json")');
+    expect(() => parseWindowsDns({ ...windowsFixture, v: 2 })).toThrow(ProtocolError);
+    expect(() => parseWindowsDns({ ...windowsFixture, adapters: [{ ...windowsFixture.adapters[0], servers: null }] })).toThrow(/adapters\[0\]\.servers/);
+    expect(() => parseWindowsDns({ ...windowsFixture, adapters: [{ ...windowsFixture.adapters[0], alias: 7 }] })).toThrow(/adapters\[0\]\.alias/);
   });
 
   it("dns_self_check: the Rust Check fields are the ones parsed", () => {

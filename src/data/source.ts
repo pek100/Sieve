@@ -39,10 +39,12 @@ export interface SourceOptions {
   kind: SourceKind;
   seed: number;
   scenario: MockScenario;
-  /** Mock DNS scenario (?dns=off|running|error, default off). */
+  /** Mock DNS scenario (?dns=off|error, default off). */
   dns: DnsScenario;
   /** Mock: report AdGuard as running (?adguard=1). */
   adguard: boolean;
+  /** Mock: one Windows adapter asks 127.0.0.1 and ::1 for DNS (?pointed=1). */
+  pointed: boolean;
   /** Mock: generated app icons (?icons=1); without it the mock has none, as for unreadable exes. */
   icons: boolean;
 }
@@ -58,7 +60,7 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   const scenario = (MOCK_SCENARIOS as readonly string[]).includes(sc ?? "") ? (sc as MockScenario) : "steady";
   const d = q.get("dns");
   const dns = (DNS_SCENARIOS as readonly string[]).includes(d ?? "") ? (d as DnsScenario) : "off";
-  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1", icons: q.get("icons") === "1" };
+  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1", pointed: q.get("pointed") === "1", icons: q.get("icons") === "1" };
 }
 
 /**
@@ -72,7 +74,7 @@ export function createSource(o: SourceOptions, untracked: () => ReadonlySet<stri
 
 /** The DNS seam follows the same choice: Tauri commands, or the mock. */
 export function createDnsSource(o: SourceOptions): DnsSource {
-  return o.kind === "tauri" ? createTauriDns() : createMockDns({ seed: o.seed, scenario: o.dns, adguard: o.adguard });
+  return o.kind === "tauri" ? createTauriDns() : createMockDns({ seed: o.seed, scenario: o.dns, adguard: o.adguard, pointed: o.pointed });
 }
 
 export function isTauriWindow(): boolean {

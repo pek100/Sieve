@@ -3,7 +3,6 @@
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 import type { DnsSlice } from "@/core/dns";
 import type { Notice } from "@/core/notices";
-import type { DnsController } from "@/data/dns-controller";
 import { effectiveOn, GLOBAL_SWITCH, offKeys, type AppStates } from "@/core/policy";
 import { readValue } from "@/core/settings/document";
 import { isSettingKey, type SettingKey, type SettingValue } from "@/core/settings/registry";
@@ -74,11 +73,6 @@ const selectDns = (s: SieveState): DnsSlice => s.dns;
 /** The DNS filter's state (owner: the DNS controller). */
 export function useDns(): DnsSlice {
   return useSieve(selectDns);
-}
-
-/** The DNS controller's actions (point, restore, quit answers). */
-export function useDnsActions(): DnsController {
-  return useRuntime().dnsController;
 }
 
 export function useNotices(): readonly Notice[] {

@@ -24,9 +24,26 @@ export function levelsToOnOff(values: Values): Values {
   return next;
 }
 
+/** Keys a step removes for good: a stored value would mean something Sieve no longer does. */
+export const RETIRED_KEYS = ["filtering.systemDns"] as const;
+
+/**
+ * 2 -> 3: "Point Windows at Sieve" is gone (2026-10-18). It set every
+ * adapter's DNS to 127.0.0.1 and ::1, and a reboot with Sieve not running
+ * left the computer with no DNS. Sieve never writes Windows DNS now, so its
+ * switch `filtering.systemDns` is dropped, not kept as an unknown key: no
+ * build may ever read an old "on" back.
+ */
+export function dropSystemDns(values: Values): Values {
+  const next: Values = { ...values };
+  for (const k of RETIRED_KEYS) delete next[k];
+  return next;
+}
+
 /** STEPS[n] upgrades a schema-n document to schema n + 1. */
 const STEPS: Record<number, (values: Values) => Values> = {
   1: levelsToOnOff,
+  2: dropSystemDns,
 };
 
 export function migrate(doc: { schema: number; values: Values }): { schema: number; values: Values } {

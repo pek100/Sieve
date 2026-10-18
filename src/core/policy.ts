@@ -20,7 +20,7 @@ export const DEFAULT_APP_STATE: AppState = "sieve";
 /**
  * The global Sieving switch (top bar). Off pauses sampling and puts a running
  * DNS filter into pass-through: it keeps answering, forwards everything and
- * blocks nothing, so Windows DNS never breaks while it points at Sieve.
+ * blocks nothing, so whatever sends it lookups keeps resolving.
  */
 export const GLOBAL_SWITCH = "sampling.enabled" satisfies SettingKey;
 

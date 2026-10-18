@@ -15,8 +15,8 @@ describe("tray state (derived from the phase)", () => {
     expect(parseTrayAction({ kind: "pause", minutes: 5 })).toEqual({ kind: "pause", minutes: 5 });
     expect(parseTrayAction({ kind: "resume" })).toEqual({ kind: "resume" });
     expect(parseTrayAction({ kind: "pause", minutes: -1 })).toBeNull();
-    // Quit reaches the window when Rust wants it to ask first (Windows points at Sieve).
-    expect(parseTrayAction({ kind: "quit" })).toEqual({ kind: "quit" });
+    // Quit is Rust's alone: it just quits, the window never gets it.
+    expect(parseTrayAction({ kind: "quit" })).toBeNull();
     expect(parseTrayAction({ kind: "open" })).toBeNull();
     expect(parseTrayAction("pause")).toBeNull();
     expect(parseTrayAction(null)).toBeNull();

@@ -27,7 +27,7 @@ const DNS_SECTION = settingDef(DNS_SWITCH).section;
  * rows on its edges. Search covers label, help, key and options; the
  * overflow menu has export, import and reset. The section that owns the
  * DNS switch also carries the DNS filter card (status, counters, list,
- * upstreams, Windows DNS); a key that card edits itself (DNS_CARD_KEYS) has
+ * upstreams, the safety notice); a key that card edits itself (DNS_CARD_KEYS) has
  * no row of its own, so each setting has one owner on the screen.
  */
 export function SettingsScreen() {
