@@ -1,0 +1,130 @@
+Unelevated validation. Real elevated live run: UNVERIFIED.
+
+COMMAND: $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+False
+
+COMMAND: $tokens = $null; $errors = $null; foreach ($file in @("scripts/live/run-slice-3-auto.ps1", "scripts/live/test-slice-3-auto.ps1")) { [void][Management.Automation.Language.Parser]::ParseFile((Join-Path (Get-Location) $file), [ref]$tokens, [ref]$errors); "$file parser errors: $($errors.Count)"; if ($errors.Count) { throw ($errors | Out-String) } }
+scripts/live/run-slice-3-auto.ps1 parser errors: 0
+scripts/live/test-slice-3-auto.ps1 parser errors: 0
+
+COMMAND: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/live/run-slice-3-auto.ps1 -DryRun
+PLAN preflight: Assert admin; request sieve.exe close, wait up to 60 s, refuse if still open; require running sieve-engine; record AdGuard state, runs.json and service image. Append AUTO header to C:\Users\Public\sieve-engine-live\results-route.txt; save evidence in a unique run directory.
+PLAN before: Stop engine, atomically write the successor policy revision with engine=false, start and verify it; save routes/DNS/proxy/firewall, check no Sieve adapter/routes and lookup plus HTTPS (https://www.cloudflare.com).
+PLAN adguard: Set policy ON through stop/write/start; while AdGuard runs verify blocker=adguard and no routes, then sc.exe stop 'Adguard Service'; wait for routing. If initially stopped/absent, SKIP refusal and leave it stopped/absent.
+PLAN on: Verify routing/status and unchanged listings, no persistent Sieve routes or adapter DNS; check direct HTTPS and LAN HTTP; save THIS run's counter/PID baseline. UI checks: SKIP (UI, covered by e2e: tests/e2e/engine.spec.ts).
+PLAN soak: Countdown for 30 minutes of normal PC use; each minute log counters and check same PID/revision, fresh routing status and HTTPS; compute counter deltas from on. UI: SKIP (UI, covered by e2e: tests/e2e/home.spec.ts, tests/e2e/apps.spec.ts).
+PLAN kill: Kill only the service PID; start lookup+HTTPS probes immediately, every 250 ms, each timeout 3 s, target https://www.cloudflare.com. Record FIRST success against the existing 5 s bound; verify routes/adapter removed and SCM recovery.
+PLAN stall: If F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\engine\target\stall\release\sieve-engine.exe is missing, SKIP with reason. Otherwise stop engine, back up installed binary beside it, swap Stall build, start, verify routes then watchdog reason/route removal/network; always restore normal binary. Preserve runs.json and prior last-error.txt.
+PLAN budget: With normal engine routing: measure CPU for 60 s, report idle CPU as ADVISORY because unattended activity is uncontrolled; download 300000000 bytes to NUL within the same sample bound; check relay CPU per 100 Mbit/s and memory.
+PLAN adguard-back: If initially running, sc.exe start 'Adguard Service'; check blocker=adguard, no routes and lookup+HTTPS. Otherwise SKIP. Finally always restore policy OFF and normal binary, and restore AdGuard if initially running, even on failure.
+=== AUTO summary ===
+PLAN ONLY: no checks executed, no files written, no processes or services changed.
+Reboot test stays separate. AUTO restores routing OFF, so first enable routing in the installed app, then close it.
+The existing reboot workflow is interactive; crash-loop expectations depend on the retained runs.json history.
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\live\engine-route.ps1 -Step reboot-prep -Out "<AUTO evidence directory printed by the live run>"
+(reboot, then)
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\live\engine-route.ps1 -Step after-reboot -Out "<AUTO evidence directory printed by the live run>"
+Exit: 0
+
+COMMAND: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/live/test-slice-3-auto.ps1
+Expected injected FAIL lines below test failure handling, not live failures.
+PLAN preflight: Assert admin; request sieve.exe close, wait up to 60 s, refuse if still open; require running sieve-engine; record AdGuard state, runs.json and service image. Append AUTO header to C:\Users\Public\sieve-engine-live\results-route.txt; save evidence in a unique run directory.
+PLAN before: Stop engine, atomically write the successor policy revision with engine=false, start and verify it; save routes/DNS/proxy/firewall, check no Sieve adapter/routes and lookup plus HTTPS (https://www.cloudflare.com).
+PLAN adguard: Set policy ON through stop/write/start; while AdGuard runs verify blocker=adguard and no routes, then sc.exe stop 'Adguard Service'; wait for routing. If initially stopped/absent, SKIP refusal and leave it stopped/absent.
+PLAN on: Verify routing/status and unchanged listings, no persistent Sieve routes or adapter DNS; check direct HTTPS and LAN HTTP; save THIS run's counter/PID baseline. UI checks: SKIP (UI, covered by e2e: tests/e2e/engine.spec.ts).
+PLAN soak: Countdown for 30 minutes of normal PC use; each minute log counters and check same PID/revision, fresh routing status and HTTPS; compute counter deltas from on. UI: SKIP (UI, covered by e2e: tests/e2e/home.spec.ts, tests/e2e/apps.spec.ts).
+PLAN kill: Kill only the service PID; start lookup+HTTPS probes immediately, every 250 ms, each timeout 3 s, target https://www.cloudflare.com. Record FIRST success against the existing 5 s bound; verify routes/adapter removed and SCM recovery.
+PLAN stall: If F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\engine\target\stall\release\sieve-engine.exe is missing, SKIP with reason. Otherwise stop engine, back up installed binary beside it, swap Stall build, start, verify routes then watchdog reason/route removal/network; always restore normal binary. Preserve runs.json and prior last-error.txt.
+PLAN budget: With normal engine routing: measure CPU for 60 s, report idle CPU as ADVISORY because unattended activity is uncontrolled; download 300000000 bytes to NUL within the same sample bound; check relay CPU per 100 Mbit/s and memory.
+PLAN adguard-back: If initially running, sc.exe start 'Adguard Service'; check blocker=adguard, no routes and lookup+HTTPS. Otherwise SKIP. Finally always restore policy OFF and normal binary, and restore AdGuard if initially running, even on failure.
+PASS TEST: dry run bypasses machine access and never records PASS
+policy.json = {"revision":9007199254740996,"engine":true} (service stopped, atomic UTF-8 without BOM)
+PASS TEST: atomic policy uses exact successor of maximum disk/status revision
+PASS TEST: policy is UTF-8 without BOM
+policy.json = {"revision":9007199254740997,"engine":false} (service stopped, atomic UTF-8 without BOM)
+PASS TEST: OFF is boolean with an increasing revision
+PASS TEST: atomic write removes temporary files
+PASS TEST: u64 overflow refuses to write
+PASS TEST: overflow preserves existing policy
+PASS TEST: negative revision rejected
+PASS TEST: string boolean rejected
+PASS TEST: attribution subtracts THIS run baseline
+PASS TEST: counter reset rejected
+FAIL  routing OFF cleanup  (finally: injected disk failure)
+FAIL  normal binary cleanup  (finally: injected copy failure)
+PASS  AdGuard restored to RUNNING  (finally: was running at preflight)
+PASS TEST: cleanup counts independent policy and binary failures
+PASS TEST: AdGuard restoration survives policy AND binary failures
+PASS TEST: cleanup does not restart unsafe engine after failed OFF write
+PASS  routing OFF after cleanup  (finally: fresh status and route table)
+PASS TEST: cleanup order is stop, OFF, normal binary, start; initially stopped AdGuard stays stopped
+FAIL  engine cleanup verification  (finally: sieve.exe is running. Keep Sieve closed: its controller overwrites the test policy.)
+PASS TEST: reopened Sieve leaves engine stopped with policy OFF
+injected logging test
+FAIL  results logging stopped: Exception calling "AppendAllText" with "3" argument(s): "Could not find a part of the path 'F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\scripts\auto-test-92b7897a908740de870124b0a17e7258\nonexistent\results.txt'."
+PASS TEST: logging failure is visible and cannot abort recovery
+lookup + HTTPS attempt: exit 6, 000  0, 
+PASS TEST: kill probe begins before sleep, retries failed DNS, stops on first success, closes all probes
+PASS TEST: kill observation records target and completion time
+PASS: all unattended runner contract tests (no live services or network used)
+Exit: 0
+
+Later contract run, after adding stale-status and reopened-UI tests:
+COMMAND: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/live/test-slice-3-auto.ps1 | Select-Object -Last 30
+Observed excerpts:
+PASS TEST: policy restart handshake loads new revision only after stop/write/start
+PASS TEST: unchanged stale status cannot acknowledge a new policy revision
+PASS TEST: reopened Sieve leaves engine stopped with policy OFF
+PASS: all unattended runner contract tests (no live services or network used)
+Exit: 0
+
+COMMAND: $env:PATH = "C:\Program Files\cursor\resources\app\resources\helpers;" + $env:PATH; node node_modules/typescript/bin/tsc --noEmit
+Initial output: src/app/layout.tsx(15,50): error TS2304: Cannot find name 'LayoutProps'.
+Initial exit: 1
+COMMAND: $env:PATH = "C:\Program Files\cursor\resources\app\resources\helpers;" + $env:PATH; node node_modules/next/dist/bin/next typegen
+Output: Generating route types...; Types generated successfully
+Exit: 0
+COMMAND: $env:PATH = "C:\Program Files\cursor\resources\app\resources\helpers;" + $env:PATH; node node_modules/typescript/bin/tsc --noEmit
+Output: (none)
+Exit: 0
+COMMAND: $env:PATH = "C:\Program Files\cursor\resources\app\resources\helpers;" + $env:PATH; node node_modules/eslint/bin/eslint.js
+Output: (none)
+Exit: 0
+
+COMMAND: $env:PATH = "C:\Program Files\cursor\resources\app\resources\helpers;" + $env:PATH; node node_modules/vitest/vitest.mjs run --reporter=dot
+Observed error: EPERM opening node_modules\.vite-temp\vitest.config.mts.timestamp-1792342232612-83df545407d65.mjs
+Exit: 1
+COMMAND: $env:PATH = "C:\Program Files\cursor\resources\app\resources\helpers;" + $env:PATH; node node_modules/vitest/vitest.mjs run --reporter=dot --configLoader runner
+Observed error: ERR_REQUIRE_ESM, html-encoding-sniffer requires @exodus/bytes/encoding-lite.js.
+Observed summary: Test Files no tests; Tests no tests; Errors 49 errors.
+Exit: 1
+COMMAND: $env:PATH = "C:\Program Files\cursor\resources\app\resources\helpers;" + $env:PATH; node --experimental-require-module node_modules/vitest/vitest.mjs run --reporter=dot --configLoader runner --maxWorkers=2
+Observed: same worker ERR_REQUIRE_ESM; Test Files no tests; Tests no tests; Errors 49 errors.
+Exit: 1
+The application unit suite remains UNVERIFIED. No dependencies or Rust files were changed.
+
+COMMAND: Test-Path scripts/gate.mjs
+Output: False
+This Sieve checkout uses the direct typecheck/lint/unit commands instead of the preamble's absent build gate.
+
+COMMAND: Get-CimInstance Win32_Process -Filter 'ParentProcessId=63144' | Select-Object ProcessId, ParentProcessId, Name
+Output: Get-CimInstance : Access denied (0x80041003).
+All launched command sessions returned. Independent orphan-process inspection is UNVERIFIED because CIM access was denied; no unknown shared-machine process was killed.
+COMMAND: $tokens = $null; $errors = $null; foreach ($file in @("scripts/live/run-slice-3-auto.ps1", "scripts/live/test-slice-3-auto.ps1")) { $source = Get-Content -Raw -Encoding UTF8 $file; [void][Management.Automation.Language.Parser]::ParseInput(($source -replace '\r?\n', "`r`n"), [ref]$tokens, [ref]$errors); "$file CRLF parser errors: $($errors.Count)"; if ($errors.Count) { throw ($errors | Out-String) } }; "Read-Host matches: $(@(Select-String -Path scripts/live/run-slice-3-auto.ps1 -Pattern 'Read-Host').Count)"
+scripts/live/run-slice-3-auto.ps1 CRLF parser errors: 0
+scripts/live/test-slice-3-auto.ps1 CRLF parser errors: 0
+Read-Host matches: 0
+
+COMMAND: $t = $null; $e = $null; [void][Management.Automation.Language.Parser]::ParseFile((Join-Path (Get-Location) "scripts/live/run-slice-3-auto.ps1"), [ref]$t, [ref]$e); $e.Count
+0
+
+SOURCE INSPECTION (not live behavior):
+COMMAND: Select-String -Path engine/crates/sieve-engine/src/policy.rs,engine/crates/sieve-engine/src/service/runner.rs,engine/crates/sieve-engine/src/control/mod.rs,engine/crates/sieve-ipc/src/lib.rs -SimpleMatch -Pattern "pub revision: u64", "pub engine: bool", "let (policy, policy_error) = policy::load(&dir)", "asked.revision <= current.revision", "next.engine && !current.engine", "runs.forgive()", "STATUS_FILE_EVERY_MS"
+F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\engine\crates\sieve-engine\src\policy.rs:54: if asked.revision <= current.revision {
+F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\engine\crates\sieve-engine\src\policy.rs:185: runs.forgive();
+F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\engine\crates\sieve-engine\src\service\runner.rs:159: let (policy, policy_error) = policy::load(&dir);
+F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\engine\crates\sieve-engine\src\control\mod.rs:32: pub const STATUS_FILE_EVERY_MS: u64 = 30_000;
+F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\engine\crates\sieve-engine\src\control\mod.rs:173: if next.engine && !current.engine && lock(&self.crash_loop).take().is_some() {
+F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\engine\crates\sieve-engine\src\control\mod.rs:175: runs.forgive();
+F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\engine\crates\sieve-ipc\src\lib.rs:82: pub revision: u64,
+F:\Projects\Code\Sieve\.claude\worktrees\codex-sieve-unattended-live\engine\crates\sieve-ipc\src\lib.rs:85: pub engine: bool,
