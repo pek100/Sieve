@@ -3,15 +3,22 @@ import fixture from "@/data/fixtures/engine-probe-v2.json";
 import { parseEngineProbe } from "@/data/protocol";
 import {
   EMPTY_ENGINE,
+  ENGINE_LOCK_TEXT,
   ENGINE_PHASES,
   ENGINE_STATE_TEXT,
+  ENGINE_UNREACHED,
   attribution,
   engineDetail,
+  engineInForce,
+  engineLockReason,
   enginePhase,
   engineRoutes,
+  engineStatus,
+  engineTakesPolicy,
   engineVersion,
   splitTunnelText,
   type EngineSlice,
+  type EngineUnreached,
 } from "./engine";
 
 type Example = keyof typeof fixture.examples;
@@ -90,5 +97,50 @@ describe("engine phase", () => {
     expect(engineVersion(facts("idle"))).toBe("0.1.0");
     expect(engineVersion(facts("refused"))).toBeNull();
     expect(engineVersion(EMPTY_ENGINE)).toBeNull();
+  });
+});
+
+describe("engine lock (the switch the engine carries out)", () => {
+  // The fixture has no example of a switched-on engine still bringing its routes up: the idle one, told to route.
+  const starting = (): EngineSlice => {
+    const idle = facts("idle");
+    const pipe = idle.probe!.pipe!;
+    if (pipe.kind !== "welcome") throw new Error("idle is a welcome");
+    const status = { ...pipe.status, policy: { ...pipe.status.policy, engine: true } };
+    return { ...idle, probe: { ...idle.probe!, pipe: { ...pipe, status } } };
+  };
+  const slices = (): EngineSlice[] => [EMPTY_ENGINE, { probe: null, error: "denied" }, starting(), ...ALL.map(facts)];
+
+  it("law: the engine takes a policy exactly when it answered with its Status; every other phase locks with one line", () => {
+    const seen = new Set<string>();
+    for (const s of slices()) {
+      const phase = enginePhase(s);
+      seen.add(phase);
+      const answered = engineStatus(s) !== null;
+      expect(engineTakesPolicy(s), phase).toBe(answered);
+      expect((ENGINE_UNREACHED as readonly string[]).includes(phase), phase).toBe(!answered);
+      const reason = engineLockReason(s);
+      if (answered) expect(reason, phase).toBeNull();
+      else expect(reason, phase).toBe(ENGINE_LOCK_TEXT[phase as EngineUnreached]);
+      // The value in force is the engine's own, and unknown without a Status.
+      expect(engineInForce(s), phase).toBe(answered ? engineStatus(s)!.policy.engine : null);
+    }
+    // Every phase is reached by these facts, so a new phase must be classified here.
+    expect([...seen].sort()).toEqual([...ENGINE_PHASES].sort());
+  });
+
+  it("the refused copy says it is not the installed one and where to open Sieve", () => {
+    expect(engineLockReason(facts("refused"))).toBe(
+      "This copy of Sieve is not the installed one, so it cannot control the engine. Open Sieve from the Start menu.",
+    );
+  });
+
+  it("a retained Status supplies the known value but cannot override a failed read or stopped service", () => {
+    const e = facts("filtering");
+    for (const s of [{ ...e, error: "read failed" }, { ...e, probe: { ...e.probe!, service: "stopped" as const } }]) {
+      expect(engineTakesPolicy(s)).toBe(false);
+      expect(engineLockReason(s)).toBeTruthy();
+      expect(engineInForce(s)).toBe(true);
+    }
   });
 });

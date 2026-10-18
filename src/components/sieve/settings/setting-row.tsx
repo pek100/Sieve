@@ -26,6 +26,8 @@ function LockNote({ lock }: { lock: Lock }) {
       <span className="min-w-0">
         {lock.kind === "desktop" ? (
           "Only the desktop app can change this."
+        ) : lock.kind === "engine" ? (
+          lock.reason
         ) : lock.checking ? (
           `Needs ${lock.label} to pass its self check.`
         ) : (
@@ -41,7 +43,8 @@ function LockNote({ lock }: { lock: Lock }) {
  * boolean and data switch as a switch, number as a select of its steps, map
  * and list as a summary (they are edited on their own screen) with a reset.
  * A locked row shows its control disabled at the value in force, with the
- * reason under the help text.
+ * reason under the help text (an engine lock: the engine's own value, never
+ * the stored wish it could not send).
  */
 export function SettingRow({
   k,
@@ -59,7 +62,9 @@ export function SettingRow({
   onReset: (key: SettingKey) => void;
 }) {
   const d = settingDef(k);
-  const value = readValue(doc, k);
+  // The value in force: what the engine itself holds for a setting it carries
+  // out but cannot take now (off when it did not say), else the stored value.
+  const value = lock?.kind === "engine" ? lock.inForce === true : readValue(doc, k);
   const labelId = `setting-${k}-label`;
   const helpId = `setting-${k}-help`;
   const disabled = lock !== null;

@@ -18,6 +18,20 @@ const switchedOn = (page: Page) =>
   page.addInitScript(() => window.localStorage.setItem("sieve.settings", JSON.stringify({ schema: 4, values: { "filtering.engine": true } })));
 
 test.describe("engine", () => {
+  test("a refused copy locks the switch, explains where to open Sieve, and leaves its stored wish alone", async ({ page }) => {
+    await switchedOn(page);
+    const { block, errors } = await openEngine(page, "refused");
+    await expect(block.locator("[data-engine-phase]")).toHaveAttribute("data-engine-phase", "refused");
+    const row = page.getByRole("group", { name: "Route traffic through the engine", exact: true });
+    await expect(row.getByRole("switch")).toBeDisabled();
+    await expect(row.getByRole("switch")).not.toBeChecked();
+    await expect(row.locator("[data-lock=engine]")).toHaveText(
+      "This copy of Sieve is not the installed one, so it cannot control the engine. Open Sieve from the Start menu.",
+    );
+    expect(await page.evaluate(() => JSON.parse(window.localStorage.getItem("sieve.settings")!).values["filtering.engine"])).toBe(true);
+    expect(errors).toEqual([]);
+  });
+
   test("a browser has no engine: Not installed, said from the facts", async ({ page }, info) => {
     const { block, errors } = await openEngine(page);
     await expect(block.locator("[data-engine-phase]")).toHaveAttribute("data-engine-phase", "not_installed");
