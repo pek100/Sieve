@@ -42,6 +42,9 @@ struct Summary {
     tunnels: u64,
     cancelled_connections: u64,
     failed_connections: u64,
+    /// Connections answered 405. Their CPU is in the process total, so the
+    /// runner refuses to score a sample that has any.
+    rejected_connections: u64,
 }
 
 #[cfg(windows)]
@@ -63,12 +66,17 @@ mod proxy {
     // Explicit P0 resource bounds from the task, not performance thresholds.
     const MAX_TUNNELS: usize = 16;
     const MAX_SECONDS: u64 = 600;
+    // After stdin closes, open tunnels may finish normally: curl has left, and
+    // the origin's FIN follows ours within a round trip. Bounded well inside
+    // the runner's shutdown allowance (one workload deadline, at least 1 s).
+    const DRAIN: Duration = Duration::from_millis(900);
 
     #[derive(Default)]
     struct Counts {
         up: AtomicU64,
         down: AtomicU64,
         tunnels: AtomicU64,
+        rejected: AtomicU64,
     }
 
     // Count successful payload writes, including a tunnel cancelled at the deadline.
@@ -106,38 +114,39 @@ mod proxy {
         }
     }
 
-    async fn reject(stream: &mut TcpStream) -> io::Result<()> {
+    async fn reject(stream: &mut TcpStream, counts: &Counts) -> io::Result<()> {
+        counts.rejected.fetch_add(1, Ordering::Relaxed);
         stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nAllow: CONNECT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await
     }
 
     async fn tunnel(mut stream: TcpStream, peer: std::net::SocketAddr, counts: Arc<Counts>) -> io::Result<()> {
         if !peer.ip().is_loopback() {
-            return reject(&mut stream).await;
+            return reject(&mut stream, &counts).await;
         }
         let mut head = Vec::new();
         // Read only the CONNECT head, never consume a pipelined TLS byte.
         // This is setup work only, the payload uses relay_tcp's existing buffers.
         while !head.ends_with(b"\r\n\r\n") {
             if head.len() >= MAX_HEAD {
-                return reject(&mut stream).await;
+                return reject(&mut stream, &counts).await;
             }
             match stream.read_u8().await {
                 Ok(byte) => head.push(byte),
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return reject(&mut stream).await,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return reject(&mut stream, &counts).await,
                 Err(error) => return Err(error),
             }
             // Refuse other methods as soon as their complete request line arrives.
             if head.ends_with(b"\r\n") && !head[..head.len() - 2].contains(&b'\n') {
                 let line = std::str::from_utf8(&head[..head.len() - 2]).ok();
                 if line.and_then(|line| parse_connect(line, peer)).is_none() {
-                    return reject(&mut stream).await;
+                    return reject(&mut stream, &counts).await;
                 }
             }
         }
         let target = std::str::from_utf8(&head).ok()
             .and_then(|head| head.split("\r\n").next())
             .and_then(|line| parse_connect(line, peer));
-        let Some((host, port)) = target else { return reject(&mut stream).await };
+        let Some((host, port)) = target else { return reject(&mut stream, &counts).await };
         let upstream = match TcpStream::connect((host.as_str(), port)).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -221,6 +230,17 @@ mod proxy {
                     }
                 }
             }
+            // The listener is no longer polled, so no new connection starts.
+            // Let open tunnels close normally first, then cancel what is left.
+            let _ = tokio::time::timeout(DRAIN, async {
+                while let Some(result) = tasks.join_next().await {
+                    if !matches!(result, Ok(Ok(()))) {
+                        failed += 1;
+                        eprintln!("connection: {result:?}");
+                    }
+                }
+            })
+            .await;
             tasks.abort_all();
             let mut cancelled = 0;
             while let Some(result) = tasks.join_next().await {
@@ -242,6 +262,7 @@ mod proxy {
             bytes_down: counts.down.load(Ordering::Relaxed),
             tunnels: counts.tunnels.load(Ordering::Relaxed),
             cancelled_connections, failed_connections,
+            rejected_connections: counts.rejected.load(Ordering::Relaxed),
         };
         println!("{}", serde_json::to_string(&summary)?);
         Ok(())
@@ -273,13 +294,13 @@ mod tests {
 
     #[test]
     fn final_json_has_separate_cpu_times_and_payload_counters() {
-        let summary = Summary { user_cpu_seconds: 0.25, kernel_cpu_seconds: 0.5, bytes_up: 17, bytes_down: 31, tunnels: 1, cancelled_connections: 0, failed_connections: 0 };
+        let summary = Summary { user_cpu_seconds: 0.25, kernel_cpu_seconds: 0.5, bytes_up: 17, bytes_down: 31, tunnels: 1, cancelled_connections: 0, failed_connections: 0, rejected_connections: 0 };
         let line = serde_json::to_string(&summary).unwrap();
         assert!(!line.contains('\n'));
         assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), serde_json::json!({
             "user_cpu_seconds": 0.25, "kernel_cpu_seconds": 0.5,
             "bytes_up": 17, "bytes_down": 31, "tunnels": 1,
-            "cancelled_connections": 0, "failed_connections": 0
+            "cancelled_connections": 0, "failed_connections": 0, "rejected_connections": 0
         }));
     }
 }

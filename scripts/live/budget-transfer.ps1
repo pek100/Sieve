@@ -29,7 +29,9 @@ function Get-SieveBudgetArguments([int]$Seconds=60,[string]$Url='', [int]$Count=
   return '--silent --show-error --fail --fail-early '+$proxyArgs+' --http1.1 --max-time '+$Seconds+' --write-out "%{http_code} %{size_download} %{num_connects}\n"'+((' -o NUL "'+$Url+'"')*$Count)
 }
 
-function Invoke-SieveBudgetTransfer([int]$Seconds=60,[string]$Url='', [int]$Count=12,[long]$Size=25000000,[string]$Proxy='') {
+# WhileRunning, when given, runs every PollMs while curl runs, so a caller can
+# watch for state that would contaminate the sample (it must not block).
+function Invoke-SieveBudgetTransfer([int]$Seconds=60,[string]$Url='', [int]$Count=12,[long]$Size=25000000,[string]$Proxy='',[scriptblock]$WhileRunning=$null,[int]$PollMs=500) {
   $arguments=Get-SieveBudgetArguments -Seconds $Seconds -Url $Url -Count $Count -Size $Size -Proxy $Proxy
   $p=New-Object Diagnostics.Process
   $p.StartInfo=New-Object Diagnostics.ProcessStartInfo
@@ -43,8 +45,14 @@ function Invoke-SieveBudgetTransfer([int]$Seconds=60,[string]$Url='', [int]$Coun
   try {
     [void]$p.Start();$started=$true
     $output=$p.StandardOutput.ReadToEndAsync();$errorText=$p.StandardError.ReadToEndAsync()
-    $remaining=[Math]::Max(0,[int](1000*$Seconds-$clock.Elapsed.TotalMilliseconds))
-    $timedOut=-not $p.WaitForExit($remaining)
+    $timedOut=$false
+    while ($true) {
+      $remaining=[Math]::Max(0,[int](1000*$Seconds-$clock.Elapsed.TotalMilliseconds))
+      $slice=if($WhileRunning){[Math]::Min($remaining,$PollMs)}else{$remaining}
+      if ($p.WaitForExit($slice)) {break}
+      if ($slice -ge $remaining) {$timedOut=$true;break}
+      & $WhileRunning
+    }
     if ($timedOut) {$p.Kill()}
     $p.WaitForExit()
     $result=Read-SieveBudgetTransfer $output.Result $p.ExitCode $timedOut -Count $Count -Size $Size

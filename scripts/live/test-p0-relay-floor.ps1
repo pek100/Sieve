@@ -58,7 +58,7 @@ Assert (-not $comparison.Pass) 'CPU above the research limit fails'
 
 $script:trace=New-Object 'Collections.Generic.List[string]'
 $script:fixtures=New-Object 'Collections.Generic.Queue[object]'
-$script:routeUp=$false;$script:missingStatus=$false;$script:badRelay=$false;$script:curlThrows=$false
+$script:routeUp=$false;$script:missingStatus=$false;$script:badRelay=$false;$script:curlThrows=$false;$script:rejected=$false;$script:midRoute=$false
 $script:lastTransfer=$null;$script:saved=$null
 function Assert-P0Unelevated {$script:trace.Add('identity')}
 function Enter-SieveLiveLease {$script:trace.Add('lease');return 'mock-lease'}
@@ -78,15 +78,20 @@ function Stop-P0Relay {
   param($Relay,$Seconds)
   $script:trace.Add('stop-relay')
   # Deliberately larger socket bytes check that normalization uses body bytes.
-  $s=[pscustomobject]@{user_cpu_seconds=0.1;kernel_cpu_seconds=0.1;bytes_up=123;bytes_down=200000000;tunnels=1;cancelled_connections=0;failed_connections=0}
+  $s=[pscustomobject]@{user_cpu_seconds=0.1;kernel_cpu_seconds=0.1;bytes_up=123;bytes_down=200000000;tunnels=1;cancelled_connections=0;failed_connections=0;rejected_connections=0}
   if ($script:badRelay) {$s.cancelled_connections=1}
+  if ($script:rejected) {$s.rejected_connections=1}
   [pscustomobject]@{Summary=$s;ExitCode=0;TimedOut=$false;ParseError=$null;Error='';Raw=($s | ConvertTo-Json -Compress)}
 }
 function Start-Sleep {param($Seconds);$script:trace.Add("pause:$Seconds")}
 function Invoke-SieveBudgetTransfer {
-  param($Seconds,$Url,$Count,$Size,$Proxy)
+  param($Seconds,$Url,$Count,$Size,$Proxy,$WhileRunning)
   $script:trace.Add($(if($Proxy){'curl-proxy'}else{'curl-direct'}))
   if ($script:curlThrows) {throw 'mock curl launch failure'}
+  if (-not $WhileRunning) {throw 'transfer is not watched while it runs'}
+  # Routing that is up only mid-transfer, invisible to the before/after reads.
+  if ($script:midRoute) {$script:routeUp=$true;& $WhileRunning;$script:routeUp=$false}
+  else {& $WhileRunning}
   if ($Proxy -and $Proxy -ne 'http://127.0.0.1:4321') {throw 'Wrong proxy argument'}
   $fixture=$script:fixtures.Dequeue()
   $raw="200 $Size 1`r`n"+(("200 $Size 0`r`n")*($Count-1))
@@ -119,7 +124,13 @@ Assert (@($script:trace | Where-Object {$_ -eq 'stop-relay'}).Count -eq 1) 'rela
 $script:badRelay=$true;Add-Fixture 8
 $row=Invoke-P0Sample -Kind candidate -Iteration 1 -Exe mock -Workload @{Seconds=60;Count=2;Size=50000000;Url='https://example.test/file'}
 Assert (-not $row.Valid -and $null -eq $row.CpuCoresPer100Mbit) 'cancelled relay evidence is never scored even with a valid download'
-$script:badRelay=$false;$script:curlThrows=$true;$script:trace.Clear()
+$script:badRelay=$false;$script:rejected=$true;Add-Fixture 8
+$row=Invoke-P0Sample -Kind candidate -Iteration 1 -Exe mock -Workload @{Seconds=60;Count=2;Size=50000000;Url='https://example.test/file'}
+Assert (-not $row.Valid -and $null -eq $row.CpuCoresPer100Mbit) 'a relay that also answered rejected connections is never scored'
+$script:rejected=$false;$script:midRoute=$true;Add-Fixture 8
+$row=Invoke-P0Sample -Kind baseline -Iteration 1 -Exe mock -Workload @{Seconds=60;Count=2;Size=50000000;Url='https://example.test/file'}
+Assert (-not $row.Valid -and $row.Reason -like 'Routing changed during the transfer*') 'routing seen only mid-transfer invalidates the sample'
+$script:midRoute=$false;$script:curlThrows=$true;$script:trace.Clear()
 $row=Invoke-P0Sample -Kind candidate -Iteration 1 -Exe mock -Workload @{Seconds=60;Count=2;Size=50000000;Url='https://example.test/file'}
 Assert (-not $row.Valid -and $script:trace.Contains('stop-relay')) 'relay cleanup runs when curl throws'
 $script:curlThrows=$false;$script:routeUp=$true;$script:trace.Clear()

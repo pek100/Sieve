@@ -112,17 +112,17 @@ function Stop-P0Relay($Relay,[int]$Seconds) {
 function Assert-P0RelayEvidence($Relay,$Transfer) {
   if (-not $Relay -or $Relay.ExitCode -ne 0 -or $Relay.TimedOut -or $Relay.ParseError -or -not $Relay.Summary) {throw 'Relay exit or JSON evidence is invalid'}
   $s=$Relay.Summary
-  foreach($name in @('user_cpu_seconds','kernel_cpu_seconds','bytes_up','bytes_down','tunnels','cancelled_connections','failed_connections')) {
+  foreach($name in @('user_cpu_seconds','kernel_cpu_seconds','bytes_up','bytes_down','tunnels','cancelled_connections','failed_connections','rejected_connections')) {
     $value=$s.$name
     if ($null -eq $value -or $value -is [string] -or $value -is [bool] -or
         [double]::IsNaN([double]$value) -or [double]::IsInfinity([double]$value) -or [double]$value -lt 0) {throw "Invalid relay field: $name"}
   }
-  foreach($name in @('bytes_up','bytes_down','tunnels','cancelled_connections','failed_connections')) {
+  foreach($name in @('bytes_up','bytes_down','tunnels','cancelled_connections','failed_connections','rejected_connections')) {
     if ([decimal]::Truncate([decimal]$s.$name) -ne [decimal]$s.$name) {throw "Non-integral relay field: $name"}
   }
   # TLS and HTTP framing make socket bytes larger than validated body bytes.
   if ($s.tunnels -ne $Transfer.Connections -or $s.bytes_up -le 0 -or $s.bytes_down -lt $Transfer.Bytes -or
-      $s.cancelled_connections -ne 0 -or $s.failed_connections -ne 0) {throw 'Relay did not complete the validated single tunnel'}
+      $s.cancelled_connections -ne 0 -or $s.failed_connections -ne 0 -or $s.rejected_connections -ne 0) {throw 'Relay did not complete the validated single tunnel, or served other connections'}
 }
 
 function Get-P0Median([double[]]$Values) {
@@ -145,6 +145,13 @@ function Invoke-P0Sample([string]$Kind,[int]$Iteration,[string]$Exe,$Workload,[s
       $relay=Start-P0Relay -Exe $Exe -Seconds $Workload.Seconds
       $transfer.Proxy='http://127.0.0.1:'+$relay.Port
     }
+    # Before/after snapshots miss routing that turns on and off mid-transfer,
+    # so watch throughout and latch any sighting.
+    $watch=@{Seen=$null}
+    $transfer.WhileRunning={
+      try {Assert-P0RoutingOff (Get-P0RoutingState) -AssumeRoutingOff:$AssumeRoutingOff}
+      catch {if(-not $watch.Seen){$watch.Seen=$_.Exception.Message}}
+    }
     try {$row.Transfer=Invoke-SieveBudgetTransfer @transfer}
     finally {
       if ($relay) {
@@ -154,6 +161,7 @@ function Invoke-P0Sample([string]$Kind,[int]$Iteration,[string]$Exe,$Workload,[s
     }
     $row.After=Get-P0RoutingState
     Assert-P0RoutingOff $row.After -AssumeRoutingOff:$AssumeRoutingOff
+    if ($watch.Seen) {throw "Routing changed during the transfer: $($watch.Seen)"}
     if (-not $row.Transfer.Valid -or $row.Transfer.Seconds -le 0) {throw 'Invalid workload; no performance score'}
     if ($Kind -eq 'candidate') {Assert-P0RelayEvidence $row.Relay $row.Transfer}
     # Same application-byte normalization as run-slice-3-auto.ps1's budget:
