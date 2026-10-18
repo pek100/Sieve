@@ -26,6 +26,7 @@ Open Terminal (Admin) and `cd` to the worktree. Run each step with
    - `icacls C:\ProgramData\Sieve`: SYSTEM and Administrators only, inherited;
    - `state.json` records your SID; the pipe's DACL has exactly three entries (SYSTEM, Administrators, you);
    - every listing matches the before-listing; lookups and HTTPS work.
+   **`-Step verify`** (admin) runs the same checks against an existing install without running the installer again, for example when the install step stopped early.
 3. **`-Step app`** (any). Open Sieve from the Start menu, Settings > Filtering: the Engine block must say **Installed, not filtering** and **Engine version 0.1.0**. Optionally start `pnpm tauri dev` too: that copy is not in Program Files, so the engine refuses it and the block says **Installed** with "This copy of Sieve is not the installed one".
 4. **`-Step pipe-open`** as the second, standard user. From your admin terminal:
    `runas /user:<other user> "powershell -ExecutionPolicy Bypass -File <worktree>\scripts\live\engine-install.ps1 -Step pipe-open"`

@@ -19,7 +19,7 @@
 #>
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("before", "install", "app", "pipe-open", "kill", "reboot-prep", "after-reboot", "uninstall")]
+  [ValidateSet("before", "install", "verify", "app", "pipe-open", "kill", "reboot-prep", "after-reboot", "uninstall")]
   [string]$Step,
   [string]$Installer = "",
   [string]$Out = (Join-Path $env:PUBLIC "sieve-engine-live")
@@ -171,6 +171,52 @@ function Test-PipeOpen {
 Write-Host "Sieve engine live check, step '$Step'. Evidence: $Out"
 "==== $(Get-Date -Format s) step $Step as $(whoami)" | Out-File -Append -Encoding utf8 (Join-Path $Out "results.txt")
 
+# The install step's checks on what the installer left: used by `install` and by `verify`
+# (verify checks an existing install without running the installer again).
+function Test-Installed([string]$tag) {
+  $InstallDir = Get-InstallDir
+  $EngineExe = Join-Path $InstallDir "sieve-engine.exe"
+  $f = Get-ServiceFacts
+  foreach ($k in $f.Keys) { Write-Evidence "$tag-sc-$k.txt" $f[$k] }
+  Check "sc qc: runs as LocalSystem" ($f.qc -match "SERVICE_START_NAME\s*:\s*LocalSystem")
+  Check "sc qc: automatic start" ($f.qc -match "START_TYPE\s*:\s*2\s+AUTO_START")
+  Check "sc qc: binary is the engine in the chosen folder" ($f.qc -match [regex]::Escape($EngineExe)) $EngineExe
+  Check "sc queryex: running" ($f.queryex -match "STATE\s*:\s*4\s+RUNNING")
+  Check "sc queryex: did not refuse its folder (exit code 3)" (-not ($f.queryex -match "SERVICE_EXIT_CODE\s*:\s*3\b"))
+  # The install folder (2026-10-18 finding: E:\Sieve inherited Authenticated Users Modify).
+  $dirAcl = Get-Acl -LiteralPath $InstallDir
+  Write-Evidence "$tag-folder-acl.txt" (((icacls $InstallDir) -join "`n") + "`n`nSDDL: " + $dirAcl.Sddl)
+  Write-Evidence "$tag-engine-acl.txt" ((icacls $EngineExe) -join "`n")
+  $inherited = @($dirAcl.Access | Where-Object { $_.IsInherited })
+  Check "install folder DACL is protected (no inherited ACEs)" ($dirAcl.AreAccessRulesProtected -and $inherited.Count -eq 0) "$InstallDir, $($inherited.Count) inherited"
+  $writers = @(Get-NonAdminWriters $InstallDir)
+  Check "install folder grants write only to SYSTEM and Administrators" ($writers.Count -eq 0) ($writers -join "; ")
+  $fileWriters = @(Get-ChildItem -LiteralPath $InstallDir -Force | ForEach-Object {
+      $name = $_.Name
+      Get-NonAdminWriters $_.FullName | ForEach-Object { "${name}: $_" }
+    })
+  Check "binary folder grants no write to non-admins (every file in it, the engine included)" ($fileWriters.Count -eq 0) ($fileWriters -join "; ")
+  Check "the installer's marker is in the folder" (Test-Path -LiteralPath (Join-Path $InstallDir $Marker))
+  Check "no last-error.txt (the engine did not refuse to start)" (-not (Test-Path (Join-Path $ProgramDataSieve "engine\last-error.txt")))
+  Check "sc qfailure: restart twice, reset after 3600 s" (($f.qfailure -match "RESET_PERIOD \(in seconds\)\s*:\s*3600") -and (([regex]::Matches($f.qfailure, "RESTART -- Delay = 5000")).Count -eq 2))
+  Check "sc qprivs: only SeChangeNotifyPrivilege" (($f.qprivs -match "SeChangeNotifyPrivilege") -and -not ($f.qprivs -match "SeDebugPrivilege|SeTcbPrivilege|SeLoadDriverPrivilege"))
+  $acl = (icacls $ProgramDataSieve) -join "`n"
+  Write-Evidence "$tag-programdata-acl.txt" $acl
+  Check "ProgramData\Sieve: SYSTEM and Administrators only" (($acl -match "NT AUTHORITY\\SYSTEM:\(OI\)\(CI\)\(F\)") -and ($acl -match "BUILTIN\\Administrators:\(OI\)\(CI\)\(F\)") -and -not ($acl -match "Users:|Everyone:|Authenticated Users:|CREATOR OWNER:"))
+  $state = Get-Content -Raw (Join-Path $ProgramDataSieve "engine\state.json") | ConvertFrom-Json
+  $me = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+  Check "state.json records the installing user" ($state.owner_sid -eq $me) "recorded $($state.owner_sid), you are $me"
+  try {
+    $pipeAcl = (Get-Acl $Pipe).Access | ForEach-Object { "{0} {1} {2}" -f $_.IdentityReference, $_.AccessControlType, $_.FileSystemRights }
+    Write-Evidence "$tag-pipe-acl.txt" ($pipeAcl -join "`n")
+    Check "pipe DACL lists SYSTEM, Administrators and the installing user only" (@($pipeAcl).Count -eq 3) ($pipeAcl -join "; ")
+  } catch {
+    Check "pipe DACL readable" $false $_.Exception.Message
+  }
+  Compare-WithBefore $tag
+  Test-Network $tag
+}
+
 # Never stop silently (seen live 2026-10-18: steps ended with no PASS/FAIL lines). Any error that
 # ends a step is printed and recorded in results.txt as an ERROR line, and counts as a failure.
 trap {
@@ -202,47 +248,14 @@ switch ($Step) {
     while (-not (Get-Service $Service -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
     Check "the service appeared after the installer" ([bool](Get-Service $Service -ErrorAction SilentlyContinue))
     Start-Sleep -Seconds 3
-    $InstallDir = Get-InstallDir
-    $EngineExe = Join-Path $InstallDir "sieve-engine.exe"
-    $f = Get-ServiceFacts
-    foreach ($k in $f.Keys) { Write-Evidence "install-sc-$k.txt" $f[$k] }
-    Check "sc qc: runs as LocalSystem" ($f.qc -match "SERVICE_START_NAME\s*:\s*LocalSystem")
-    Check "sc qc: automatic start" ($f.qc -match "START_TYPE\s*:\s*2\s+AUTO_START")
-    Check "sc qc: binary is the engine in the chosen folder" ($f.qc -match [regex]::Escape($EngineExe)) $EngineExe
-    Check "sc queryex: running" ($f.queryex -match "STATE\s*:\s*4\s+RUNNING")
-    Check "sc queryex: did not refuse its folder (exit code 3)" (-not ($f.queryex -match "SERVICE_EXIT_CODE\s*:\s*3\b"))
-    # The install folder (2026-10-18 finding: E:\Sieve inherited Authenticated Users Modify).
-    $dirAcl = Get-Acl -LiteralPath $InstallDir
-    Write-Evidence "install-folder-acl.txt" (((icacls $InstallDir) -join "`n") + "`n`nSDDL: " + $dirAcl.Sddl)
-    Write-Evidence "install-engine-acl.txt" ((icacls $EngineExe) -join "`n")
-    $inherited = @($dirAcl.Access | Where-Object { $_.IsInherited })
-    Check "install folder DACL is protected (no inherited ACEs)" ($dirAcl.AreAccessRulesProtected -and $inherited.Count -eq 0) "$InstallDir, $($inherited.Count) inherited"
-    $writers = @(Get-NonAdminWriters $InstallDir)
-    Check "install folder grants write only to SYSTEM and Administrators" ($writers.Count -eq 0) ($writers -join "; ")
-    $fileWriters = @(Get-ChildItem -LiteralPath $InstallDir -Force | ForEach-Object {
-        $name = $_.Name
-        Get-NonAdminWriters $_.FullName | ForEach-Object { "${name}: $_" }
-      })
-    Check "binary folder grants no write to non-admins (every file in it, the engine included)" ($fileWriters.Count -eq 0) ($fileWriters -join "; ")
-    Check "the installer's marker is in the folder" (Test-Path -LiteralPath (Join-Path $InstallDir $Marker))
-    Check "no last-error.txt (the engine did not refuse to start)" (-not (Test-Path (Join-Path $ProgramDataSieve "engine\last-error.txt")))
-    Check "sc qfailure: restart twice, reset after 3600 s" (($f.qfailure -match "RESET_PERIOD \(in seconds\)\s*:\s*3600") -and (([regex]::Matches($f.qfailure, "RESTART -- Delay = 5000")).Count -eq 2))
-    Check "sc qprivs: only SeChangeNotifyPrivilege" (($f.qprivs -match "SeChangeNotifyPrivilege") -and -not ($f.qprivs -match "SeDebugPrivilege|SeTcbPrivilege|SeLoadDriverPrivilege"))
-    $acl = (icacls $ProgramDataSieve) -join "`n"
-    Write-Evidence "install-programdata-acl.txt" $acl
-    Check "ProgramData\Sieve: SYSTEM and Administrators only" (($acl -match "NT AUTHORITY\\SYSTEM:\(OI\)\(CI\)\(F\)") -and ($acl -match "BUILTIN\\Administrators:\(OI\)\(CI\)\(F\)") -and -not ($acl -match "Users:|Everyone:|Authenticated Users:|CREATOR OWNER:"))
-    $state = Get-Content -Raw (Join-Path $ProgramDataSieve "engine\state.json") | ConvertFrom-Json
-    $me = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
-    Check "state.json records the installing user" ($state.owner_sid -eq $me) "recorded $($state.owner_sid), you are $me"
-    try {
-      $pipeAcl = (Get-Acl $Pipe).Access | ForEach-Object { "{0} {1} {2}" -f $_.IdentityReference, $_.AccessControlType, $_.FileSystemRights }
-      Write-Evidence "install-pipe-acl.txt" ($pipeAcl -join "`n")
-      Check "pipe DACL lists SYSTEM, Administrators and the installing user only" (@($pipeAcl).Count -eq 3) ($pipeAcl -join "; ")
-    } catch {
-      Check "pipe DACL readable" $false $_.Exception.Message
-    }
-    Compare-WithBefore "install"
-    Test-Network "install"
+    Test-Installed "install"
+  }
+
+  "verify" {
+    # The install step's checks against an existing install, without running the installer.
+    Assert-Admin
+    Check "the service is installed" ([bool](Get-Service $Service -ErrorAction SilentlyContinue))
+    Test-Installed "verify"
   }
 
   "app" {
