@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev --port 3000",
-    "build": "next build && node scripts/flatten-segments.mjs",
+    "build": "next build && node scripts/flatten-segments.mjs && node scripts/check-release-label.mjs",
     "serve:out": "node scripts/serve-out.mjs",
     "typecheck": "next typegen && tsc --noEmit",
     "lint": "eslint",

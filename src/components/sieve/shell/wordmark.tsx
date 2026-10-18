@@ -39,6 +39,8 @@ export function Wordmark() {
     <span className="inline-flex items-center gap-2 text-title text-on-surface select-none">
       <SieveMark size={24} className="shrink-0 text-primary" />
       <span className="max-[480px]:sr-only">Sieve</span>
+      {/* Next replaces this build-time fact in the static export as well as the client bundle. */}
+      {process.env.NODE_ENV !== "production" && <span className="text-label text-on-surface-muted whitespace-nowrap">Dev build</span>}
     </span>
   );
 }

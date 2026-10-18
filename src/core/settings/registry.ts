@@ -92,6 +92,15 @@ export interface DataSwitchSetting extends Base<false | boolean> {
   kind: "dataSwitch";
   /** Name of the ignored Rust/Playwright test that proves the switch on the real machine. */
   liveCheck: string;
+  /**
+   * The filtering engine carries it out (the app sends it with SetPolicy).
+   * Then the row is locked whenever the engine cannot take a policy
+   * (core/engine `engineLockReason`: not installed, not running, refused,
+   * incompatible, unreadable, checking) and shows the engine's value in
+   * force, never an unsent wish; a stored value waits, untouched, until the
+   * engine can take it.
+   */
+  needsEngine?: true;
 }
 
 export type SettingDef =
@@ -195,6 +204,7 @@ export const REGISTRY = {
     help: "Sends this computer's traffic through Sieve's engine, so Home and Apps show each app's connections as the engine sees them. Nothing is blocked yet. Off: the engine adds no adapter and no route, and your network is as it was.",
     default: false,
     liveCheck: "live_engine_full_route_relays_and_restores",
+    needsEngine: true,
   } satisfies DataSwitchSetting,
   // Edited only by the DNS filter's card, so unavailable with it.
   "filtering.upstreams": {
@@ -246,6 +256,12 @@ export function isSettingKey(key: string): key is SettingKey {
  */
 export function isAvailable(key: SettingKey): boolean {
   return settingDef(key).unavailableUntil === undefined;
+}
+
+/** Does the filtering engine carry this setting out (a data switch declared `needsEngine`)? */
+export function needsEngine(key: SettingKey): boolean {
+  const def = settingDef(key);
+  return def.kind === "dataSwitch" && def.needsEngine === true;
 }
 
 /** Does `value` have the shape the registry declares for `key`? */

@@ -93,6 +93,43 @@ export function enginePhase(e: EngineSlice): EnginePhase {
   }
 }
 
+/**
+ * A policy needs a successful read, a running service and its accepted
+ * handshake with Status. A retained Status alone is not permission to send.
+ * Settings and the controller share this predicate.
+ */
+export function engineTakesPolicy(e: EngineSlice): boolean {
+  return e.error === null && e.probe?.service === "running" && engineStatus(e) !== null;
+}
+
+/**
+ * Why a setting the engine carries out (registry `needsEngine`) cannot be
+ * changed now, one line per phase that cannot take a policy.
+ */
+export const ENGINE_LOCK_TEXT = {
+  checking: "Sieve is still asking whether the engine is installed.",
+  unreadable: "Sieve could not read the engine's state, so it cannot control the engine.",
+  not_installed: "The engine is not installed, so there is nothing to control. The Sieve installer adds it.",
+  not_running: "The engine is not running, so it cannot take this change.",
+  refused: "This copy of Sieve is not the installed one, so it cannot control the engine. Open Sieve from the Start menu.",
+  incompatible: "This app and the engine speak different versions, so it cannot control the engine. Reinstall Sieve so both match.",
+} satisfies Partial<Record<EnginePhase, string>>;
+
+export type EngineUnreached = keyof typeof ENGINE_LOCK_TEXT;
+/** Derived from the phase explanations; engine.test.ts checks them against handshake facts. */
+export const ENGINE_UNREACHED = Object.keys(ENGINE_LOCK_TEXT) as EngineUnreached[];
+
+/** The lock reason for a `needsEngine` setting, or null while the engine can take a policy. */
+export function engineLockReason(e: EngineSlice): string | null {
+  const phase = enginePhase(e);
+  return engineTakesPolicy(e) ? null : ENGINE_LOCK_TEXT[phase as EngineUnreached];
+}
+
+/** The engine's own routing switch in force (its Status's policy), or null when it did not say. */
+export function engineInForce(e: EngineSlice): boolean | null {
+  return engineStatus(e)?.policy.engine ?? null;
+}
+
 /** The state in a few words (the Engine block's status line, Home's Engine tile). */
 export const ENGINE_STATE_TEXT: Record<EnginePhase, string> = {
   checking: "Checking",

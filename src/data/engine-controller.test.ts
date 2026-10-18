@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createPassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, enginePhase } from "@/core/engine";
+import { ENGINE_POLL_MS, ENGINE_SWITCH, engineLockReason, enginePhase } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
 import type { SettingKey } from "@/core/settings/registry";
 import { createStore } from "@/core/store";
@@ -172,6 +172,53 @@ describe("engine controller", () => {
     const s = setup("idle", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
     await s.fc.flush();
     expect(s.fake.policies).toEqual([{ revision: 1, engine: true }]);
+    s.undo();
+  });
+
+  it("refused (this copy is not the installed one): a flip sends nothing, and nothing claims routing", async () => {
+    const s = setup("refused");
+    await s.fc.flush();
+    expect(s.phase()).toBe("refused");
+    expect(engineLockReason(s.store.getState().engine)).not.toBeNull();
+    // The Settings row is locked; even a write that got past it (another window, an old file) is not sent.
+    await s.settings.set(SWITCH, true);
+    await s.fc.flush();
+    await s.fc.advance(ENGINE_POLL_MS * 3);
+    expect(s.fake.policies).toEqual([]);
+    expect(s.checks.has(ENGINE_SWITCH)).toBe(false);
+    expect(s.store.getState().engine.actionError ?? null).toBeNull();
+    s.undo();
+  });
+
+  it("law: no policy is sent in any phase that cannot take one, a stored on included; it waits untouched until the engine can", async () => {
+    for (const scenario of ["missing", "stopped", "starting", "unreachable", "refused", "incompatible", "error"] as const) {
+      const s = setup(scenario, memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+      await s.fc.flush();
+      await s.fc.advance(ENGINE_POLL_MS * 2);
+      expect(s.fake.policies, scenario).toEqual([]);
+      expect(s.settings.get(SWITCH), scenario).toBe(true);
+      s.undo();
+    }
+    const s = setup("refused", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+    await s.fc.flush();
+    expect(s.fake.policies).toEqual([]);
+    // The installed copy's turn: the engine answers, and the stored value goes once.
+    s.fake.set("idle");
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.fake.policies).toEqual([{ revision: 1, engine: true }]);
+    expect(s.phase()).toBe("routing");
+    s.undo();
+  });
+
+  it("a retained Status cannot send a saved change after a failed read", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    s.store.setEngine({ ...s.store.getState().engine, error: "read failed" });
+    await s.settings.set(SWITCH, true);
+    await s.fc.flush();
+    expect(s.phase()).toBe("unreadable");
+    expect(s.fake.policies).toEqual([]);
+    expect(s.settings.get(SWITCH)).toBe(true);
     s.undo();
   });
 

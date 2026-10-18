@@ -1,19 +1,26 @@
 "use client";
 
 import { useCallback, useMemo, useSyncExternalStore } from "react";
+import { engineInForce, engineLockReason } from "@/core/engine";
 import { ROUTES, type RouteDef } from "@/core/routes";
 import { readValue, type SettingsDoc } from "@/core/settings/document";
-import { REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, settingDef, type Section, type SettingKey } from "@/core/settings/registry";
+import { REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, needsEngine, settingDef, type Section, type SettingKey } from "@/core/settings/registry";
 import { planImport, resetPlan, searchSettings, type ImportPlan } from "@/core/settings/transfer";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useHydrated } from "@/hooks/use-hydrated";
-import { useCheckPassed, useSwitchOn } from "@/hooks/use-sieve";
+import { useCheckPassed, useEngine, useSwitchOn } from "@/hooks/use-sieve";
 
 /** Why a setting cannot be changed here and now. */
 export type Lock =
   | { kind: "desktop" }
   /** `checking`: the switch it needs is on but its live check has not passed (yet). */
-  | { kind: "requires"; label: string; checking: boolean };
+  | { kind: "requires"; label: string; checking: boolean }
+  /**
+   * The engine carries it out (registry `needsEngine`) and cannot take a
+   * policy now. `reason` is one line from the engine's phase; `inForce` is
+   * the engine's own value, null when it did not say (the row shows off).
+   */
+  | { kind: "engine"; reason: string; inForce: boolean | null };
 
 export interface SettingsView {
   doc: SettingsDoc;
@@ -43,6 +50,7 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
   const hydrated = useHydrated();
   const switchOn = useSwitchOn();
   const passed = useCheckPassed();
+  const engine = useEngine();
 
   const sections = useMemo(() => {
     const hits = new Set(searchSettings(query));
@@ -59,6 +67,10 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
     (key: SettingKey): Lock | null => {
       const d = settingDef(key);
       if (d.desktopOnly && !(hydrated && isTauri)) return { kind: "desktop" };
+      if (needsEngine(key)) {
+        const reason = engineLockReason(engine);
+        if (reason !== null) return { kind: "engine", reason, inForce: engineInForce(engine) };
+      }
       if (d.requires) {
         const label = isSettingKey(d.requires) ? REGISTRY[d.requires].label : d.requires;
         if (!switchOn(d.requires)) return { kind: "requires", label, checking: false };
@@ -69,7 +81,7 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
       }
       return null;
     },
-    [passed, hydrated, isTauri, switchOn],
+    [passed, hydrated, isTauri, switchOn, engine],
   );
 
   const apply = useCallback(

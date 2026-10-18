@@ -9,7 +9,9 @@
  * - the engine's policy follows the user's switch `filtering.engine`
  *   (ENGINE_SWITCH): whenever the engine answers with a different value, the
  *   switch is sent with the next revision (`setPolicy`). The switch defaults
- *   off, so the engine routes nothing until the user turns it on;
+ *   off, so the engine routes nothing until the user turns it on. Nothing is
+ *   sent while the engine cannot take a policy (`engineTakesPolicy`); the
+ *   stored value then waits untouched;
  * - AdGuard's service, stopped or started only when the user clicks the
  *   pause offer (`stopAdguard`, `startAdguard`; Windows asks the user first).
  *
@@ -18,7 +20,7 @@
  * banner, dismissed when it is over.
  */
 import type { PassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, engineStatus, enginePhase, type EngineSlice } from "@/core/engine";
+import { ENGINE_POLL_MS, ENGINE_SWITCH, engineStatus, enginePhase, engineTakesPolicy, type EngineSlice } from "@/core/engine";
 import type { NoticeBus } from "@/core/notices";
 import type { SettingKey } from "@/core/settings/registry";
 import type { SieveStore } from "@/core/store";
@@ -78,9 +80,14 @@ export function createEngineController({ engine, store, clock, settings, checks,
     void syncPolicy();
   };
 
+  // Sent only while the engine can take a policy (engineTakesPolicy, the same
+  // fact that locks the switch in Settings). Before that a stored value, an
+  // old file's included, is left as it is and nothing claims it is in force:
+  // the row shows the engine's own value.
   const syncPolicy = async () => {
-    const status = engineStatus(get());
-    if (disposed || !settingsReady || policyInFlight || status === null) return;
+    const e = get();
+    const status = engineStatus(e);
+    if (disposed || !settingsReady || policyInFlight || !engineTakesPolicy(e) || status === null) return;
     const want = Boolean(settings.get(SWITCH));
     if (status.policy.engine === want) return;
     policyInFlight = true;
