@@ -1,5 +1,7 @@
 # Spike: per-app filtering through a Wintun TUN (2026-10-17)
 
+> **Moved 2026-10-18 (engine slice 1).** `spikes/wintun/` no longer exists. Its decoders and their tests are in `engine/crates/sieve-engine/src/flow/`, the probe in `engine/crates/sieve-engine/src/bin/probe/` (`support.rs` was `probe_support.rs`), the bench in `engine/crates/sieve-engine/examples/`. `rules.rs` was retired: verdicts ask `sieve_filter::rules::RuleEngine`. Open issue 5 (ipstack's `build.rs`) is resolved by `engine/vendor/ipstack`. Paths below are the spike's as it was. Build the probe now with `cargo build --release --bin probe` in `engine/`; the exe is `engine\target\release\probe.exe`.
+
 Question: can Sieve drop a blocked domain for one app and not for another, which its DNS filter cannot do (the Windows DNS Client service makes every lookup, so DNS has no per-app identity)?
 
 Approach under test: Sieve creates a Wintun adapter (WireGuard's signed layer-3 TUN), routes traffic into it, reads IP packets in user mode, terminates them in a userspace TCP/IP stack, attributes each flow to its process, reads the domain from the flow's first bytes (TLS SNI, HTTP Host, QUIC Initial), decides pass or drop per (app, domain), and forwards passed flows to the real network through sockets pinned to the physical interface.
