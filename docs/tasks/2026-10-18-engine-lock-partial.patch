@@ -1,0 +1,479 @@
+diff --git a/src/components/sieve/settings/engine-lock.test.tsx b/src/components/sieve/settings/engine-lock.test.tsx
+new file mode 100644
+index 0000000..0137e7d
+--- /dev/null
++++ b/src/components/sieve/settings/engine-lock.test.tsx
+@@ -0,0 +1,116 @@
++import { act, cleanup, render, within } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import { describe, expect, it, vi } from "vitest";
++import { ENGINE_LOCK_TEXT, ENGINE_UNREACHED, enginePhase, type EngineUnreached } from "@/core/engine";
++import { SETTING_KEYS, isAvailable, needsEngine, type SettingKey } from "@/core/settings/registry";
++import { createMockEngine, ENGINE_SCENARIOS, type EngineScenario } from "@/data/engine-mock";
++import type { EngineSource } from "@/data/engine-source";
++import { createMockSource } from "@/data/mock-source";
++import type { EnginePolicy } from "@/data/protocol";
++import { memoryBackend } from "@/data/settings-store";
++import { createRuntime } from "@/hooks/runtime";
++import { SieveProvider } from "@/hooks/sieve-provider";
++import { SettingsScreen } from "./settings-screen";
++
++vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
++vi.setConfig({ testTimeout: 60_000 });
++
++/** Every setting the engine carries out, from the registry (never a key spelled here). */
++const ENGINE_KEYS: SettingKey[] = SETTING_KEYS.filter((k) => isAvailable(k) && needsEngine(k));
++
++/** The mock engine with every SetPolicy recorded; `checking` never answers. */
++function recorded(scenario: EngineScenario | "checking") {
++  const mock = createMockEngine(scenario === "checking" ? "idle" : scenario);
++  const policies: EnginePolicy[] = [];
++  const source: EngineSource = {
++    ...mock,
++    probe: scenario === "checking" ? () => new Promise(() => {}) : mock.probe,
++    setPolicy: (p) => {
++      policies.push(p);
++      return mock.setPolicy(p);
++    },
++  };
++  return { source, policies };
++}
++
++async function setup(scenario: EngineScenario | "checking", storedOn: boolean) {
++  const engine = recorded(scenario);
++  const values = Object.fromEntries(ENGINE_KEYS.map((k) => [k, storedOn]));
++  const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend({ schema: 4, values }), engine: engine.source });
++  render(
++    <SieveProvider runtime={runtime}>
++      <SettingsScreen />
++    </SieveProvider>,
++  );
++  await act(async () => {
++    await runtime.settings.ready;
++  });
++  if (scenario !== "checking") await vi.waitFor(() => expect(runtime.store.getState().engine.probe ?? runtime.store.getState().engine.error).not.toBeNull());
++  return { runtime, policies: engine.policies, phase: () => enginePhase(runtime.store.getState().engine) };
++}
++
++const row = (key: SettingKey) => document.querySelector<HTMLElement>(`[data-setting="${key}"]`)!;
++
++describe("a setting the engine carries out is locked while the engine cannot take it", () => {
++  it("the registry names at least one such setting (so the law below cannot pass empty)", () => {
++    expect(ENGINE_KEYS.length).toBeGreaterThan(0);
++  });
++
++  it("law: every needsEngine switch is locked in every phase that cannot take a policy, shows the value in force, and is free otherwise", async () => {
++    const seen = new Set<string>();
++    for (const scenario of ["checking", ...ENGINE_SCENARIOS] as const) {
++      // Stored on, as an old file or another window would leave it: the row must not show it as in force.
++      const s = await setup(scenario, true);
++      const phase = s.phase();
++      seen.add(phase);
++      const unreached = (ENGINE_UNREACHED as readonly string[]).includes(phase);
++      for (const key of ENGINE_KEYS) {
++        const r = row(key);
++        const sw = within(r).getByRole("switch");
++        const lock = r.querySelector("[data-lock=engine]");
++        if (unreached) {
++          expect(sw, `${scenario} ${key}`).toBeDisabled();
++          expect(sw, `${scenario} ${key}`).not.toBeChecked();
++          expect(lock, `${scenario} ${key}`).toHaveTextContent(ENGINE_LOCK_TEXT[phase as EngineUnreached]);
++          expect(s.runtime.settings.get(key), `${scenario} ${key}`).toBe(true);
++        } else {
++          expect(lock, `${scenario} ${key}`).toBeNull();
++          expect(sw, `${scenario} ${key}`).toBeEnabled();
++        }
++      }
++      if (unreached) expect(s.policies, scenario).toEqual([]);
++      cleanup();
++    }
++    // Every phase the engine can be in without a Status was walked.
++    for (const p of ENGINE_UNREACHED) expect(seen, p).toContain(p);
++  });
++
++  it("refused: the switch is disabled with the reason, a click changes nothing and sends nothing", async () => {
++    const s = await setup("refused", false);
++    expect(s.phase()).toBe("refused");
++    for (const key of ENGINE_KEYS) {
++      const r = row(key);
++      const sw = within(r).getByRole("switch");
++      expect(sw).toBeDisabled();
++      expect(r.querySelector("[data-lock=engine]")).toHaveTextContent(
++        "This copy of Sieve is not the installed one, so it cannot control the engine. Open Sieve from the Start menu.",
++      );
++      await userEvent.click(sw);
++      expect(s.runtime.settings.get(key)).toBe(false);
++      expect(sw).not.toBeChecked();
++    }
++    expect(s.policies).toEqual([]);
++  });
++
++  it("idle: unlocked, and a flip reaches the engine", async () => {
++    const s = await setup("idle", false);
++    for (const key of ENGINE_KEYS) {
++      const sw = within(row(key)).getByRole("switch");
++      expect(sw).toBeEnabled();
++      await userEvent.click(sw);
++      await vi.waitFor(() => expect(s.phase()).toBe("routing"));
++      expect(sw).toBeChecked();
++    }
++    expect(s.policies).toEqual([{ revision: 1, engine: true }]);
++  });
++});
+diff --git a/src/components/sieve/settings/setting-row.tsx b/src/components/sieve/settings/setting-row.tsx
+index 22f1738..35ff4a1 100644
+--- a/src/components/sieve/settings/setting-row.tsx
++++ b/src/components/sieve/settings/setting-row.tsx
+@@ -26,6 +26,8 @@ function LockNote({ lock }: { lock: Lock }) {
+       <span className="min-w-0">
+         {lock.kind === "desktop" ? (
+           "Only the desktop app can change this."
++        ) : lock.kind === "engine" ? (
++          lock.reason
+         ) : lock.checking ? (
+           `Needs ${lock.label} to pass its self check.`
+         ) : (
+@@ -41,7 +43,8 @@ function LockNote({ lock }: { lock: Lock }) {
+  * boolean and data switch as a switch, number as a select of its steps, map
+  * and list as a summary (they are edited on their own screen) with a reset.
+  * A locked row shows its control disabled at the value in force, with the
+- * reason under the help text.
++ * reason under the help text (an engine lock: the engine's own value, never
++ * the stored wish it could not send).
+  */
+ export function SettingRow({
+   k,
+@@ -59,7 +62,9 @@ export function SettingRow({
+   onReset: (key: SettingKey) => void;
+ }) {
+   const d = settingDef(k);
+-  const value = readValue(doc, k);
++  // The value in force: what the engine itself holds for a setting it carries
++  // out but cannot take now (off when it did not say), else the stored value.
++  const value = lock?.kind === "engine" ? lock.inForce === true : readValue(doc, k);
+   const labelId = `setting-${k}-label`;
+   const helpId = `setting-${k}-help`;
+   const disabled = lock !== null;
+diff --git a/src/components/sieve/settings/use-settings-view.ts b/src/components/sieve/settings/use-settings-view.ts
+index 7cdf5a5..3016a39 100644
+--- a/src/components/sieve/settings/use-settings-view.ts
++++ b/src/components/sieve/settings/use-settings-view.ts
+@@ -1,19 +1,26 @@
+ "use client";
+ 
+ import { useCallback, useMemo, useSyncExternalStore } from "react";
++import { engineInForce, engineLockReason } from "@/core/engine";
+ import { ROUTES, type RouteDef } from "@/core/routes";
+ import { readValue, type SettingsDoc } from "@/core/settings/document";
+-import { REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, settingDef, type Section, type SettingKey } from "@/core/settings/registry";
++import { REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, needsEngine, settingDef, type Section, type SettingKey } from "@/core/settings/registry";
+ import { planImport, resetPlan, searchSettings, type ImportPlan } from "@/core/settings/transfer";
+ import { useRuntime } from "@/hooks/sieve-provider";
+ import { useHydrated } from "@/hooks/use-hydrated";
+-import { useCheckPassed, useSwitchOn } from "@/hooks/use-sieve";
++import { useCheckPassed, useEngine, useSwitchOn } from "@/hooks/use-sieve";
+ 
+ /** Why a setting cannot be changed here and now. */
+ export type Lock =
+   | { kind: "desktop" }
+   /** `checking`: the switch it needs is on but its live check has not passed (yet). */
+-  | { kind: "requires"; label: string; checking: boolean };
++  | { kind: "requires"; label: string; checking: boolean }
++  /**
++   * The engine carries it out (registry `needsEngine`) and cannot take a
++   * policy now. `reason` is one line from the engine's phase; `inForce` is
++   * the engine's own value, null when it did not say (the row shows off).
++   */
++  | { kind: "engine"; reason: string; inForce: boolean | null };
+ 
+ export interface SettingsView {
+   doc: SettingsDoc;
+@@ -43,6 +50,7 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
+   const hydrated = useHydrated();
+   const switchOn = useSwitchOn();
+   const passed = useCheckPassed();
++  const engine = useEngine();
+ 
+   const sections = useMemo(() => {
+     const hits = new Set(searchSettings(query));
+@@ -59,6 +67,10 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
+     (key: SettingKey): Lock | null => {
+       const d = settingDef(key);
+       if (d.desktopOnly && !(hydrated && isTauri)) return { kind: "desktop" };
++      if (needsEngine(key)) {
++        const reason = engineLockReason(engine);
++        if (reason !== null) return { kind: "engine", reason, inForce: engineInForce(engine) };
++      }
+       if (d.requires) {
+         const label = isSettingKey(d.requires) ? REGISTRY[d.requires].label : d.requires;
+         if (!switchOn(d.requires)) return { kind: "requires", label, checking: false };
+@@ -69,7 +81,7 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
+       }
+       return null;
+     },
+-    [passed, hydrated, isTauri, switchOn],
++    [passed, hydrated, isTauri, switchOn, engine],
+   );
+ 
+   const apply = useCallback(
+diff --git a/src/core/engine.test.ts b/src/core/engine.test.ts
+index 668b284..f182240 100644
+--- a/src/core/engine.test.ts
++++ b/src/core/engine.test.ts
+@@ -3,15 +3,22 @@ import fixture from "@/data/fixtures/engine-probe-v2.json";
+ import { parseEngineProbe } from "@/data/protocol";
+ import {
+   EMPTY_ENGINE,
++  ENGINE_LOCK_TEXT,
+   ENGINE_PHASES,
+   ENGINE_STATE_TEXT,
++  ENGINE_UNREACHED,
+   attribution,
+   engineDetail,
++  engineInForce,
++  engineLockReason,
+   enginePhase,
+   engineRoutes,
++  engineStatus,
++  engineTakesPolicy,
+   engineVersion,
+   splitTunnelText,
+   type EngineSlice,
++  type EngineUnreached,
+ } from "./engine";
+ 
+ type Example = keyof typeof fixture.examples;
+@@ -92,3 +99,39 @@ describe("engine phase", () => {
+     expect(engineVersion(EMPTY_ENGINE)).toBeNull();
+   });
+ });
++
++describe("engine lock (the switch the engine carries out)", () => {
++  // The fixture has no example of a switched-on engine still bringing its routes up: the idle one, told to route.
++  const starting = (): EngineSlice => {
++    const idle = facts("idle");
++    const pipe = idle.probe!.pipe!;
++    if (pipe.kind !== "welcome") throw new Error("idle is a welcome");
++    const status = { ...pipe.status, policy: { ...pipe.status.policy, engine: true } };
++    return { ...idle, probe: { ...idle.probe!, pipe: { ...pipe, status } } };
++  };
++  const slices = (): EngineSlice[] => [EMPTY_ENGINE, { probe: null, error: "denied" }, starting(), ...ALL.map(facts)];
++
++  it("law: the engine takes a policy exactly when it answered with its Status; every other phase locks with one line", () => {
++    const seen = new Set<string>();
++    for (const s of slices()) {
++      const phase = enginePhase(s);
++      seen.add(phase);
++      const answered = engineStatus(s) !== null;
++      expect(engineTakesPolicy(s), phase).toBe(answered);
++      expect((ENGINE_UNREACHED as readonly string[]).includes(phase), phase).toBe(!answered);
++      const reason = engineLockReason(s);
++      if (answered) expect(reason, phase).toBeNull();
++      else expect(reason, phase).toBe(ENGINE_LOCK_TEXT[phase as EngineUnreached]);
++      // The value in force is the engine's own, and unknown without a Status.
++      expect(engineInForce(s), phase).toBe(answered ? engineStatus(s)!.policy.engine : null);
++    }
++    // Every phase is reached by these facts, so a new phase must be classified here.
++    expect([...seen].sort()).toEqual([...ENGINE_PHASES].sort());
++  });
++
++  it("the refused copy says it is not the installed one and where to open Sieve", () => {
++    expect(engineLockReason(facts("refused"))).toBe(
++      "This copy of Sieve is not the installed one, so it cannot control the engine. Open Sieve from the Start menu.",
++    );
++  });
++});
+diff --git a/src/core/engine.ts b/src/core/engine.ts
+index 80688e6..e6f20e3 100644
+--- a/src/core/engine.ts
++++ b/src/core/engine.ts
+@@ -93,6 +93,47 @@ export function enginePhase(e: EngineSlice): EnginePhase {
+   }
+ }
+ 
++/**
++ * Phases in which the engine cannot take a policy: it gave no Status on its
++ * pipe (not asked yet, unreadable, absent, stopped or silent, refused this
++ * copy of Sieve, or a protocol it does not speak). Every other phase is an
++ * answer from the engine itself. A law in engine.test.ts holds this list to
++ * exactly the phases with no Status.
++ */
++export const ENGINE_UNREACHED = ["checking", "unreadable", "not_installed", "not_running", "refused", "incompatible"] as const;
++export type EngineUnreached = (typeof ENGINE_UNREACHED)[number];
++
++const isUnreached = (phase: EnginePhase): phase is EngineUnreached => (ENGINE_UNREACHED as readonly EnginePhase[]).includes(phase);
++
++/** Can the engine take a policy now? The one answer the switch lock (Settings) and the controller's sending share. */
++export function engineTakesPolicy(e: EngineSlice): boolean {
++  return !isUnreached(enginePhase(e));
++}
++
++/**
++ * Why a setting the engine carries out (registry `needsEngine`) cannot be
++ * changed now, one line per phase that cannot take a policy.
++ */
++export const ENGINE_LOCK_TEXT: Record<EngineUnreached, string> = {
++  checking: "Sieve is still asking whether the engine is installed.",
++  unreadable: "Sieve could not read the engine's state, so it cannot control the engine.",
++  not_installed: "The engine is not installed, so there is nothing to control. The Sieve installer adds it.",
++  not_running: "The engine is not running, so it cannot take this change.",
++  refused: "This copy of Sieve is not the installed one, so it cannot control the engine. Open Sieve from the Start menu.",
++  incompatible: "This app and the engine speak different versions, so it cannot control the engine. Reinstall Sieve so both match.",
++};
++
++/** The lock reason for a `needsEngine` setting, or null while the engine can take a policy. */
++export function engineLockReason(e: EngineSlice): string | null {
++  const phase = enginePhase(e);
++  return isUnreached(phase) ? ENGINE_LOCK_TEXT[phase] : null;
++}
++
++/** The engine's own routing switch in force (its Status's policy), or null when it did not say. */
++export function engineInForce(e: EngineSlice): boolean | null {
++  return engineStatus(e)?.policy.engine ?? null;
++}
++
+ /** The state in a few words (the Engine block's status line, Home's Engine tile). */
+ export const ENGINE_STATE_TEXT: Record<EnginePhase, string> = {
+   checking: "Checking",
+diff --git a/src/core/settings/registry.ts b/src/core/settings/registry.ts
+index 25de142..1787b42 100644
+--- a/src/core/settings/registry.ts
++++ b/src/core/settings/registry.ts
+@@ -92,6 +92,15 @@ export interface DataSwitchSetting extends Base<false | boolean> {
+   kind: "dataSwitch";
+   /** Name of the ignored Rust/Playwright test that proves the switch on the real machine. */
+   liveCheck: string;
++  /**
++   * The filtering engine carries it out (the app sends it with SetPolicy).
++   * Then the row is locked whenever the engine cannot take a policy
++   * (core/engine `engineLockReason`: not installed, not running, refused,
++   * incompatible, unreadable, checking) and shows the engine's value in
++   * force, never an unsent wish; a stored value waits, untouched, until the
++   * engine can take it.
++   */
++  needsEngine?: true;
+ }
+ 
+ export type SettingDef =
+@@ -195,6 +204,7 @@ export const REGISTRY = {
+     help: "Sends this computer's traffic through Sieve's engine, so Home and Apps show each app's connections as the engine sees them. Nothing is blocked yet. Off: the engine adds no adapter and no route, and your network is as it was.",
+     default: false,
+     liveCheck: "live_engine_full_route_relays_and_restores",
++    needsEngine: true,
+   } satisfies DataSwitchSetting,
+   // Edited only by the DNS filter's card, so unavailable with it.
+   "filtering.upstreams": {
+@@ -248,6 +258,12 @@ export function isAvailable(key: SettingKey): boolean {
+   return settingDef(key).unavailableUntil === undefined;
+ }
+ 
++/** Does the filtering engine carry this setting out (a data switch declared `needsEngine`)? */
++export function needsEngine(key: SettingKey): boolean {
++  const def = settingDef(key);
++  return def.kind === "dataSwitch" && def.needsEngine === true;
++}
++
+ /** Does `value` have the shape the registry declares for `key`? */
+ export function isValidValue(key: SettingKey, value: unknown): boolean {
+   const def = settingDef(key);
+diff --git a/src/data/engine-controller.test.ts b/src/data/engine-controller.test.ts
+index d56826a..277085f 100644
+--- a/src/data/engine-controller.test.ts
++++ b/src/data/engine-controller.test.ts
+@@ -175,6 +175,40 @@ describe("engine controller", () => {
+     s.undo();
+   });
+ 
++  it("refused (this copy is not the installed one): a flip sends nothing, and nothing claims routing", async () => {
++    const s = setup("refused");
++    await s.fc.flush();
++    expect(s.phase()).toBe("refused");
++    // The Settings row is locked; even a write that got past it (another window, an old file) is not sent.
++    await s.settings.set(SWITCH, true);
++    await s.fc.flush();
++    await s.fc.advance(ENGINE_POLL_MS * 3);
++    expect(s.fake.policies).toEqual([]);
++    expect(s.checks.has(ENGINE_SWITCH)).toBe(false);
++    expect(s.store.getState().engine.actionError ?? null).toBeNull();
++    s.undo();
++  });
++
++  it("law: no policy is sent in any phase that cannot take one, a stored on included; it waits untouched until the engine can", async () => {
++    for (const scenario of ["missing", "stopped", "starting", "unreachable", "refused", "incompatible", "error"] as const) {
++      const s = setup(scenario, memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
++      await s.fc.flush();
++      await s.fc.advance(ENGINE_POLL_MS * 2);
++      expect(s.fake.policies, scenario).toEqual([]);
++      expect(s.settings.get(SWITCH), scenario).toBe(true);
++      s.undo();
++    }
++    const s = setup("refused", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
++    await s.fc.flush();
++    expect(s.fake.policies).toEqual([]);
++    // The installed copy's turn: the engine answers, and the stored value goes once.
++    s.fake.set("idle");
++    await s.fc.advance(ENGINE_POLL_MS);
++    expect(s.fake.policies).toEqual([{ revision: 1, engine: true }]);
++    expect(s.phase()).toBe("routing");
++    s.undo();
++  });
++
+   it("a crash loop shows one Home banner, gone when the user turns routing off and on", async () => {
+     const s = setup("crash_loop", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+     const banners = () => s.notices.list().filter((n) => n.surface === "banner").map((n) => n.text);
+diff --git a/src/data/engine-controller.ts b/src/data/engine-controller.ts
+index 04ed367..82ada7f 100644
+--- a/src/data/engine-controller.ts
++++ b/src/data/engine-controller.ts
+@@ -9,7 +9,9 @@
+  * - the engine's policy follows the user's switch `filtering.engine`
+  *   (ENGINE_SWITCH): whenever the engine answers with a different value, the
+  *   switch is sent with the next revision (`setPolicy`). The switch defaults
+- *   off, so the engine routes nothing until the user turns it on;
++ *   off, so the engine routes nothing until the user turns it on. Nothing is
++ *   sent while the engine cannot take a policy (`engineTakesPolicy`); the
++ *   stored value then waits untouched;
+  * - AdGuard's service, stopped or started only when the user clicks the
+  *   pause offer (`stopAdguard`, `startAdguard`; Windows asks the user first).
+  *
+@@ -18,7 +20,7 @@
+  * banner, dismissed when it is over.
+  */
+ import type { PassedChecks } from "@/core/checks";
+-import { ENGINE_POLL_MS, ENGINE_SWITCH, engineStatus, enginePhase, type EngineSlice } from "@/core/engine";
++import { ENGINE_POLL_MS, ENGINE_SWITCH, engineStatus, enginePhase, engineTakesPolicy, type EngineSlice } from "@/core/engine";
+ import type { NoticeBus } from "@/core/notices";
+ import type { SettingKey } from "@/core/settings/registry";
+ import type { SieveStore } from "@/core/store";
+@@ -78,9 +80,14 @@ export function createEngineController({ engine, store, clock, settings, checks,
+     void syncPolicy();
+   };
+ 
++  // Sent only while the engine can take a policy (engineTakesPolicy, the same
++  // fact that locks the switch in Settings). Before that a stored value, an
++  // old file's included, is left as it is and nothing claims it is in force:
++  // the row shows the engine's own value.
+   const syncPolicy = async () => {
+-    const status = engineStatus(get());
+-    if (disposed || !settingsReady || policyInFlight || status === null) return;
++    const e = get();
++    const status = engineStatus(e);
++    if (disposed || !settingsReady || policyInFlight || !engineTakesPolicy(e) || status === null) return;
+     const want = Boolean(settings.get(SWITCH));
+     if (status.policy.engine === want) return;
+     policyInFlight = true;
+diff --git a/tests/laws/registry.test.ts b/tests/laws/registry.test.ts
+index 63d25b4..08a871a 100644
+--- a/tests/laws/registry.test.ts
++++ b/tests/laws/registry.test.ts
+@@ -33,6 +33,10 @@ describe("registry law", () => {
+     for (const [key, def] of defs) if (def.requires) expect(isDataSwitch(def.requires), key).toBe(true);
+   });
+ 
++  it("the engine's switch is the one needsEngine setting: the controller sends exactly it (SetPolicy carries one switch)", () => {
++    expect(defs.filter(([k]) => needsEngine(k)).map(([k]) => k)).toEqual([ENGINE_SWITCH]);
++  });
++
+   it("every default is a valid value for its own entry", () => {
+     for (const [key, def] of defs) expect(isValidValue(key, def.default), key).toBe(true);
+   });
