@@ -47,6 +47,37 @@ Run-Auto
 Assert ($script:Rows.Count -eq 0 -and -not $script:Changed -and -not $script:Logging) "dry run bypasses machine access and never records PASS"
 $DryRun = $false
 
+function Dns-Fixture($v4, $v6) {
+  [pscustomobject]@{
+    Error = $null
+    Rows = @([pscustomobject]@{ AddressFamily = 2; ServerAddresses = $v4 }, [pscustomobject]@{ AddressFamily = 23; ServerAddresses = $v6 })
+    Registry = @([pscustomobject]@{ Family = 'Tcpip'; NameServer = $null; DhcpNameServer = '' }, [pscustomobject]@{ Family = 'Tcpip6'; NameServer = ''; DhcpNameServer = $null })
+  }
+}
+$fallbackDns = @('fec0:0:0:ffff::1', 'fec0:0:0:ffff::2', 'fec0:0:0:ffff::3')
+Assert (Adapter-DnsUnconfigured (Dns-Fixture @() @())) "empty DNS with readable registry evidence passes"
+Assert (Adapter-DnsUnconfigured (Dns-Fixture @() $fallbackDns)) "only Windows IPv6 fallback defaults with empty configuration pass"
+$evidence = Dns-Fixture @() $fallbackDns
+$evidence.Registry[1].NameServer = $fallbackDns -join ','
+Assert (-not (Adapter-DnsUnconfigured $evidence)) "explicitly configured fallback addresses still fail"
+$evidence = Dns-Fixture @() $fallbackDns
+$evidence.Registry[0].DhcpNameServer = '1.1.1.1'
+Assert (-not (Adapter-DnsUnconfigured $evidence)) "configured DHCP DNS fails even when only fallback addresses are reported"
+$evidence = Dns-Fixture @() $fallbackDns
+$evidence.Registry[1] | Add-Member NoteProperty Dhcpv6DNSServers ([byte[]]@(0, 1))
+Assert (-not (Adapter-DnsUnconfigured $evidence)) "binary DHCPv6 DNS configuration fails"
+Assert (-not (Adapter-DnsUnconfigured (Dns-Fixture @('1.1.1.1') @()))) "any IPv4 DNS fails"
+Assert (-not (Adapter-DnsUnconfigured (Dns-Fixture @() @('fe80::1')))) "other IPv6 DNS fails"
+$evidence = Dns-Fixture @() $fallbackDns
+$evidence.Error = 'Access denied'
+Assert (-not (Adapter-DnsUnconfigured $evidence)) "unreadable DNS evidence fails"
+$evidence = Dns-Fixture @() @()
+$evidence.Rows = @()
+Assert (-not (Adapter-DnsUnconfigured $evidence)) "missing adapter DNS rows fail"
+$evidence = Dns-Fixture @() $fallbackDns
+$evidence.Registry = @()
+Assert (-not (Adapter-DnsUnconfigured $evidence)) "missing registry evidence fails"
+
 $scratch = Join-Path (Split-Path -Parent $PSScriptRoot) ("auto-test-" + [guid]::NewGuid().ToString("N"))
 [void](New-Item -ItemType Directory -Path $scratch)
 $PolicyFile = Join-Path $scratch "policy.json"
