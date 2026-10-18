@@ -1,7 +1,8 @@
 //! Tauri commands for the DNS engine. Thin: parse the config at the
 //! boundary, hand the engine the real clock and fetcher, turn errors into
-//! strings. Starting the proxy changes nothing on the system; Windows keeps
-//! its own DNS servers until the user points it here (`crate::sysdns`).
+//! strings. Starting the proxy changes nothing on the system, and Sieve
+//! never points Windows DNS at it: it answers only lookups sent to its
+//! listen addresses directly.
 //!
 //! - `dns_start(config?)` -> `DnsStatus` (fails when already running)
 //! - `dns_stop()` -> `DnsStatus` (stopped; a no-op when not running)
@@ -26,13 +27,6 @@ use super::status::DnsStatus;
 /// The running engine, if any. Managed by Tauri (`.manage` in lib.rs).
 #[derive(Default)]
 pub struct DnsState(tokio::sync::Mutex<Option<Engine>>);
-
-impl DnsState {
-    /// The engine slot, for other commands that need the running filter (sysdns).
-    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, Option<Engine>> {
-        self.0.lock().await
-    }
-}
 
 /// `dns_start` argument. Every key is optional on the wire; a missing key
 /// takes the default below (the only place the defaults are spelled out).
@@ -158,7 +152,7 @@ mod tests {
         assert_eq!(c, DnsConfig::default());
         let e = c.resolve(PathBuf::from("x")).expect("resolves");
         let want: Vec<SocketAddr> = ["127.0.0.1:53", "[::1]:53"].iter().map(|s| s.parse().expect("a")).collect();
-        assert_eq!(e.binds, want, "both loopback families, so Windows can point IPv4 and IPv6 here");
+        assert_eq!(e.binds, want, "both loopback families, so IPv4 and IPv6 clients can ask");
         assert_eq!(e.upstreams.len(), 2);
         assert_eq!(e.list_url, DEFAULT_LIST_URL);
     }

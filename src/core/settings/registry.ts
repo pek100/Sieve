@@ -6,12 +6,14 @@
  * Data switches: anything that would change traffic or the system is kind
  * "dataSwitch", defaults to false and names the live check that proves it
  * works on the real machine (a `live_*` test). The registry law enforces it.
+ * No switch may write persistent system network state (DNS servers, routes,
+ * proxy settings, firewall rules): Sieve off means a normal network.
  */
 import { isUpstream } from "../dns";
 import { APP_STATES, type AppState } from "../policy";
 
-/** 2: apps.levels became on/off per app (see migrate.ts). */
-export const SETTINGS_SCHEMA = 2;
+/** 2: apps.levels became on/off per app. 3: filtering.systemDns is gone (see migrate.ts). */
+export const SETTINGS_SCHEMA = 3;
 
 /** Settings sections in the order the settings view shows them; a key's prefix is its section. */
 export const SECTIONS = [
@@ -102,7 +104,7 @@ export const REGISTRY = {
     default: "dark",
   }),
   // The global state (policy GLOBAL_SWITCH). Off pauses DNS blocking by
-  // passing every lookup through, so Windows DNS keeps working.
+  // passing every lookup through, so whatever asks the filter keeps working.
   "sampling.enabled": {
     kind: "boolean",
     section: "sampling",
@@ -149,13 +151,14 @@ export const REGISTRY = {
     default: [] as readonly string[],
     of: { type: "string" },
   } satisfies ListSetting<string>,
-  // DNS filtering is system wide: every Windows lookup reaches the proxy
-  // through the DNS Client service, so it cannot tell apps apart.
+  // A local DNS filter that answers only lookups sent to it directly: Sieve
+  // never points Windows DNS at it. The filtering engine replaces it
+  // (docs/plans/2026-10-17-https-filtering.md, slice 4).
   "filtering.dns": {
     kind: "dataSwitch",
     section: "filtering",
     label: "DNS filtering",
-    help: "Blocks ad and tracker domains for every app on this computer, once Windows uses Sieve for DNS. Runs a DNS filter on this computer with the AdGuard DNS filter list.",
+    help: "Runs a DNS filter on 127.0.0.1:53 with the AdGuard DNS filter list. It filters only lookups sent to it directly; Windows keeps its own DNS servers.",
     default: false,
     liveCheck: "live_dns_filter_resolves_blocked_domain",
   } satisfies DataSwitchSetting,
@@ -167,17 +170,6 @@ export const REGISTRY = {
     default: ["1.1.1.1", "9.9.9.9"] as readonly string[],
     of: { type: "upstream" },
   } satisfies ListSetting<string>,
-  // The one place Sieve changes the system: a backup is written first and
-  // Windows asks for administrator rights (src-tauri/src/sysdns).
-  "filtering.systemDns": {
-    kind: "dataSwitch",
-    section: "filtering",
-    label: "Windows uses Sieve for DNS",
-    help: "Points every active network adapter at Sieve (127.0.0.1 and ::1) after saving a backup of its DNS servers. Windows asks for administrator rights. Off restores the backup.",
-    default: false,
-    liveCheck: "live_system_dns_points_at_sieve",
-    requires: "filtering.dns",
-  } satisfies DataSwitchSetting,
 } as const;
 
 export type SettingKey = keyof typeof REGISTRY;

@@ -7,10 +7,22 @@ import { Card } from "@/components/sieve/shell/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { blockRate, checkDetails, checkFailedLine, dnsPhase, DNS_SWITCH, isUpstream, SYSTEM_DNS_SWITCH, UPSTREAMS_KEY, type DnsPhase, type DnsSlice } from "@/core/dns";
+import {
+  blockRate,
+  checkDetails,
+  checkFailedLine,
+  dnsPhase,
+  DNS_SWITCH,
+  isUpstream,
+  STRANDED_DNS_TEXT,
+  strandedAdapters,
+  UPSTREAMS_KEY,
+  type DnsPhase,
+  type DnsSlice,
+} from "@/core/dns";
 import type { SettingKey } from "@/core/settings/registry";
-import type { FamilyDns, InterfaceDns, SelfCheck } from "@/data/protocol";
-import { useCheckPassed, useDns, useDnsActions, useSetting } from "@/hooks/use-sieve";
+import type { SelfCheck } from "@/data/protocol";
+import { useDns, useSetting } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
 import type { Lock } from "./use-settings-view";
 
@@ -110,28 +122,6 @@ function Stat({ label, value, id }: { label: string; value: string; id: string }
   );
 }
 
-function familyText(f: FamilyDns): string {
-  if (f.servers.length === 0) return f.dhcp ? "none (DHCP)" : "none";
-  return `${f.servers.join(", ")} (${f.dhcp ? "DHCP" : "set by hand"})`;
-}
-
-function AdapterRow({ it }: { it: InterfaceDns & { uses_sieve: boolean } }) {
-  return (
-    <li className="flex min-w-0 flex-col gap-1" data-adapter={it.alias}>
-      <p className="flex flex-wrap items-center gap-2 text-body-strong">
-        {it.alias}
-        {it.uses_sieve && <span className="text-caption text-primary">Uses Sieve</span>}
-      </p>
-      <p className="text-label text-on-surface-muted">
-        IPv4 <span className="font-mono text-mono break-all text-on-surface">{familyText(it.v4)}</span>
-      </p>
-      <p className="text-label text-on-surface-muted">
-        IPv6 <span className="font-mono text-mono break-all text-on-surface">{familyText(it.v6)}</span>
-      </p>
-    </li>
-  );
-}
-
 /** Upstream servers, edited in place; the setting is the list handed to dns_start. */
 function Upstreams({ inUse }: { inUse: string[] | null }) {
   const [list, setList] = useSetting(UPSTREAMS_KEY);
@@ -202,27 +192,24 @@ function Upstreams({ inUse }: { inUse: string[] | null }) {
 
 /**
  * Settings > Filtering, the DNS filter: its switch, what it is doing, its
- * counters and list, the most blocked domains, upstreams, and Windows DNS
- * with the one system change Sieve makes (point and restore). Every value
- * comes from the store's `dns` part; actions go to the DNS controller.
- * Blocking is for the whole computer: the card never names an app.
+ * counters and list, the most blocked domains and the upstreams. Every
+ * value comes from the store's `dns` part; the switch is the setting the
+ * DNS controller follows. Sieve never points Windows DNS at the filter, so
+ * the card says plainly what it covers (lookups sent to 127.0.0.1:53), and
+ * the safety notice while an adapter still asks it and nothing answers.
+ * The card never names an app.
  */
-export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH | typeof SYSTEM_DNS_SWITCH) => Lock | null }) {
+export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH) => Lock | null }) {
   const d = useDns();
-  const actions = useDnsActions();
-  const passed = useCheckPassed();
   const [on, setOn] = useSetting(DNS_SWITCH);
   const phase = dnsPhase(d);
   const running = d.status?.running === true;
-  const system = d.system;
-  const pointed = system?.pointed === true;
+  const stranded = strandedAdapters(d.windows ?? null, d.status ?? null).length > 0;
   const c = d.status?.counters;
   const rate = c ? blockRate(c) : null;
   const list = d.status?.list;
   const top = (d.status?.top_blocked ?? []).slice(0, TOP_SHOWN);
   const busy = d.busy !== null;
-  const canPoint = running && passed(DNS_SWITCH) && system !== null && !pointed && !busy && lockOf(SYSTEM_DNS_SWITCH) === null;
-  const canRestore = (pointed || system?.backup === true) && !busy;
 
   return (
     <Card
@@ -243,11 +230,16 @@ export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH | typeof S
           <p className="text-body text-on-surface" data-dns-status="">
             {statusLine(phase, d)}
           </p>
-          <p className="text-label text-on-surface-muted">
-            Filters every app on this computer at once: Windows sends all lookups through one service, so a DNS filter cannot tell
-            apps apart.
+          <p className="text-label text-on-surface-muted" data-dns-scope="">
+            Only lookups sent straight to 127.0.0.1:53 are filtered for now; filtering for the whole computer comes later.
           </p>
         </div>
+
+        {stranded && !busy && (
+          <Note tone="error" label="Windows DNS">
+            <span data-dns-stranded="">{STRANDED_DNS_TEXT}</span>
+          </Note>
+        )}
 
         {d.adguard && (
           <Note tone="warning" label="AdGuard is running">
@@ -259,10 +251,6 @@ export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH | typeof S
         {/* A failed check's line is said once, by the check line below. */}
         {d.error && (phase === "error" || phase === "running") && d.error !== (d.check && checkLine(d.check)) && (
           <Note tone="error">{d.error}</Note>
-        )}
-
-        {running && system !== null && !pointed && (
-          <Note tone="info">Windows does not use Sieve for DNS yet, so nothing is blocked. Point Windows at Sieve below.</Note>
         )}
 
         {d.check && (
@@ -317,38 +305,6 @@ export function DnsCard({ lockOf }: { lockOf: (key: typeof DNS_SWITCH | typeof S
         )}
 
         <Upstreams inUse={running ? (d.status?.upstreams ?? null) : null} />
-
-        <Section title="Windows DNS">
-          <p className="text-label text-on-surface-muted" data-system-dns={system === null ? "unknown" : pointed ? "pointed" : "own"}>
-            {system === null
-              ? "Reading Windows DNS..."
-              : pointed
-                ? "Windows uses Sieve for DNS (127.0.0.1 and ::1)."
-                : "Windows uses its own DNS servers. Pointing it at Sieve saves a backup first; Windows asks for administrator rights."}
-          </p>
-          {system !== null && system.interfaces.length > 0 && (
-            <ul aria-label="Network adapters" className="flex flex-col gap-3">
-              {system.interfaces.map((it) => (
-                <AdapterRow key={`${it.index}-${it.alias}`} it={it} />
-              ))}
-            </ul>
-          )}
-          <div className="flex flex-wrap gap-2">
-            <Button disabled={!canPoint} onClick={() => void actions.point()}>
-              Point Windows at Sieve
-            </Button>
-            <Button variant="secondary" disabled={!canRestore} onClick={() => void actions.restore()}>
-              Restore my DNS
-            </Button>
-          </div>
-          {!running && !pointed && <p className="text-label text-on-surface-muted">Turn DNS filtering on first; its self check must pass.</p>}
-          {system?.backup && system.backup_dir && (
-            <p className="text-label text-on-surface-muted">
-              Backup and <span className="font-mono text-mono">restore-dns.ps1</span> (works without Sieve):{" "}
-              <span className="font-mono text-mono break-all text-on-surface">{system.backup_dir}</span>
-            </p>
-          )}
-        </Section>
       </div>
     </Card>
   );

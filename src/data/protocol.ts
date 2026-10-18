@@ -165,12 +165,12 @@ export function parseHistory(x: unknown): History {
 
 // ---------------------------------------------------------------------------
 // DNS filter (phase B). Mirrors of src-tauri/src/dns/status.rs (dns_status),
-// src-tauri/src/dns/probe.rs (dns_self_check) and src-tauri/src/sysdns
-// (system_dns_state). Wire names are Rust's snake_case. Fixtures:
-// src/data/fixtures/dns-status-v3.json, system-dns-v1.json (Rust reads them too).
+// src-tauri/src/dns/probe.rs (dns_self_check) and src-tauri/src/windns.rs
+// (windows_dns, read only). Wire names are Rust's snake_case. Fixtures:
+// src/data/fixtures/dns-status-v3.json, windows-dns-v1.json (Rust reads them too).
 
 export const DNS_STATUS_VERSION = 3 as const;
-export const SYSTEM_DNS_VERSION = 1 as const;
+export const WINDOWS_DNS_VERSION = 1 as const;
 
 export interface DnsCounters {
   /** Every query received. */
@@ -243,32 +243,20 @@ export interface SelfCheck {
   checks: DnsCheck[];
 }
 
-export interface FamilyDns {
-  /** Servers in force, in order. */
-  servers: string[];
-  /** True when the servers come from DHCP (or the adapter's defaults), false when set by hand. */
-  dhcp: boolean;
-}
-
-export interface InterfaceDns {
+/** One active adapter's DNS servers in force (Rust `windns::AdapterDns`). */
+export interface AdapterDns {
+  /** The adapter's name as Windows' network settings show it. */
   alias: string;
   index: number;
-  v4: FamilyDns;
-  v6: FamilyDns;
-  /** IPv4 DNS is exactly 127.0.0.1 and IPv6 DNS exactly ::1. */
-  uses_sieve: boolean;
+  /** IPv4 and IPv6 servers in Windows' order, as address text ("127.0.0.1", "::1"). */
+  servers: string[];
 }
 
-export interface SystemDnsState {
-  v: typeof SYSTEM_DNS_VERSION;
-  /** Active (up, not loopback) adapters. */
-  interfaces: InterfaceDns[];
-  /** Some active adapter sends lookups to a loopback address. */
-  pointed: boolean;
-  /** Sieve's backup of the DNS before it pointed Windows here exists. */
-  backup: boolean;
-  /** Folder of the backup and restore-dns.ps1. */
-  backup_dir: string | null;
+/** `windows_dns`: read only, what Windows asks for DNS. Sieve never changes it. */
+export interface WindowsDns {
+  v: typeof WINDOWS_DNS_VERSION;
+  /** Active adapters: up, not loopback, not a tunnel. */
+  adapters: AdapterDns[];
 }
 
 function bool(x: unknown, where: string): boolean {
@@ -359,32 +347,18 @@ export function parseSelfCheck(raw: unknown): SelfCheck {
   };
 }
 
-function family(x: unknown, where: string): FamilyDns {
-  const r = rec(x, where);
-  return { servers: strings(r.servers, `${where}.servers`), dhcp: bool(r.dhcp, `${where}.dhcp`) };
-}
-
-/** Validate an untrusted `system_dns_state` answer. Throws ProtocolError. */
-export function parseSystemDns(raw: unknown): SystemDnsState {
-  const x = rec(raw, "system dns");
-  version(x, SYSTEM_DNS_VERSION, "system dns");
-  if (!Array.isArray(x.interfaces)) throw new ProtocolError("interfaces must be an array");
+/** Validate an untrusted `windows_dns` answer. Throws ProtocolError. */
+export function parseWindowsDns(raw: unknown): WindowsDns {
+  const x = rec(raw, "windows dns");
+  version(x, WINDOWS_DNS_VERSION, "windows dns");
+  if (!Array.isArray(x.adapters)) throw new ProtocolError("adapters must be an array");
   return {
-    v: SYSTEM_DNS_VERSION,
-    interfaces: x.interfaces.map((it, i) => {
-      const r = rec(it, `interfaces[${i}]`);
-      const w = `interfaces[${i}]`;
-      return {
-        alias: str(r.alias, `${w}.alias`),
-        index: int(r.index, `${w}.index`),
-        v4: family(r.v4, `${w}.v4`),
-        v6: family(r.v6, `${w}.v6`),
-        uses_sieve: bool(r.uses_sieve, `${w}.uses_sieve`),
-      };
+    v: WINDOWS_DNS_VERSION,
+    adapters: x.adapters.map((it, i) => {
+      const w = `adapters[${i}]`;
+      const r = rec(it, w);
+      return { alias: str(r.alias, `${w}.alias`), index: int(r.index, `${w}.index`), servers: strings(r.servers, `${w}.servers`) };
     }),
-    pointed: bool(x.pointed, "pointed"),
-    backup: bool(x.backup, "backup"),
-    backup_dir: strOrNull(x.backup_dir, "backup_dir"),
   };
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createPassedChecks } from "@/core/checks";
-import { DNS_POLL_MS, DNS_SWITCH, dnsPhase, isFiltering, SYSTEM_DNS_SWITCH, UPSTREAMS_KEY } from "@/core/dns";
+import { DNS_POLL_MS, DNS_SWITCH, dnsPhase, isFiltering, STRANDED_DNS_TEXT, UPSTREAMS_KEY, WINDOWS_DNS_POLL_MS } from "@/core/dns";
 import { createNoticeBus } from "@/core/notices";
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
@@ -47,8 +47,8 @@ const settle = async () => {
 };
 
 /** The mock with every call counted, and any call replaceable. */
-function spied(scenario: DnsScenario, over: Partial<DnsSource> = {}) {
-  const base = createMockDns({ seed: 1, scenario });
+function spied(scenario: DnsScenario, over: Partial<DnsSource> = {}, pointed = false) {
+  const base = createMockDns({ seed: 1, scenario, pointed });
   const calls: string[] = [];
   const src = { ...base, ...over } as DnsSource;
   const wrapped = Object.fromEntries(
@@ -57,27 +57,24 @@ function spied(scenario: DnsScenario, over: Partial<DnsSource> = {}) {
   return { dns: wrapped, calls, count: (name: string) => calls.filter((c) => c === name).length };
 }
 
-async function setup(scenario: DnsScenario, stored: Record<string, unknown> = {}, over: Partial<DnsSource> = {}, exit = true) {
+async function setup(scenario: DnsScenario, stored: Record<string, unknown> = {}, over: Partial<DnsSource> = {}, pointed = false) {
   const fc = fakeClock();
-  const s = spied(scenario, over);
+  const s = spied(scenario, over, pointed);
   const store = createStore();
   const settings = createSettingsStore(memoryBackend({ schema: 1, values: stored }));
   const notices = createNoticeBus();
   const checks = createPassedChecks();
-  const exits: number[] = [];
-  const ctl = createDnsController({
-    dns: s.dns,
-    store,
-    settings,
-    notices,
-    checks,
-    clock: fc.clock,
-    exit: exit ? async () => void exits.push(1) : null,
+  // Every banner ever shown, so a test can say one never flashed.
+  const banners: string[] = [];
+  notices.subscribe(() => {
+    for (const n of notices.list()) if (n.surface === "banner" && !banners.includes(`${n.id}`)) banners.push(`${n.id}`);
   });
+  const ctl = createDnsController({ dns: s.dns, store, settings, notices, checks, clock: fc.clock });
   const undo = ctl.bind();
   await settle();
   const dns = () => store.getState().dns;
-  return { ...s, fc, store, settings, notices, checks, ctl, undo, dns, exits, texts: () => notices.list().map((n) => n.text) };
+  const banner = () => notices.list().find((n) => n.surface === "banner");
+  return { ...s, source: s.dns, fc, store, settings, notices, checks, ctl, undo, dns, banner, bannersShown: () => banners.length, texts: () => notices.list().map((n) => n.text) };
 }
 
 describe("DNS controller: the filtering.dns switch", () => {
@@ -107,7 +104,8 @@ describe("DNS controller: the filtering.dns switch", () => {
     await t.settings.set(DNS_SWITCH, false);
     await settle();
     expect(t.dns().status?.running).toBe(false);
-    expect(t.fc.pending()).toBe(0);
+    // Only the safety net's 30 s Windows DNS read is left.
+    expect(t.fc.pending()).toBe(1);
     const after = t.count("status");
     await t.fc.advance(DNS_POLL_MS * 5);
     expect(t.count("status")).toBe(after);
@@ -151,122 +149,134 @@ describe("DNS controller: the filtering.dns switch", () => {
     t.undo();
   });
 
-  it("off while Windows points at Sieve restores first, then stops", async () => {
-    const t = await setup("running");
+  it("off stops the filter; the source has no call that could change Windows DNS", async () => {
+    const t = await setup("off", { [DNS_SWITCH]: true });
     expect(t.dns().status?.running).toBe(true);
+    expect(t.texts()).toContain("DNS filtering is on for lookups sent to 127.0.0.1:53.");
     await t.settings.set(DNS_SWITCH, false);
     await settle();
-    expect(t.calls.filter((c) => c === "restoreSystem" || c === "stop")).toEqual(["restoreSystem", "stop"]);
-    expect(t.dns().system?.pointed).toBe(false);
-    expect(t.settings.get(SYSTEM_DNS_SWITCH)).toBe(false);
-    t.undo();
-  });
-
-  it("off while pointed, and the restore is declined: the filter stays on and the switch says so", async () => {
-    const t = await setup("running", {}, {
-      restoreSystem: async () => {
-        throw new Error("you declined the Windows prompt, so nothing was changed");
-      },
-    });
-    await t.settings.set(DNS_SWITCH, false);
-    await settle();
-    expect(t.count("stop")).toBe(0);
-    expect(t.dns().status?.running).toBe(true);
-    expect(t.settings.get(DNS_SWITCH)).toBe(true);
-    expect(t.texts()).toContain("DNS filtering stays on: Windows still uses Sieve for DNS until it is restored.");
+    expect(t.count("stop")).toBe(1);
+    expect(t.dns().status?.running).toBe(false);
+    // Reads and the filter's own start, stop and pass-through only (Sieve never writes Windows DNS).
+    expect(Object.keys(t.source).sort()).toEqual(["adguardRunning", "kind", "selfCheck", "setPassThrough", "start", "status", "stop", "windowsDns"]);
     t.undo();
   });
 });
 
-describe("DNS controller: safety on load", () => {
-  it("Windows pointed at Sieve with a backup: the filter starts whatever the switch says, with a notice", async () => {
-    const t = await setup("running", { [DNS_SWITCH]: false });
-    expect(t.count("start")).toBe(1);
-    expect(t.dns().status?.running).toBe(true);
+describe("DNS controller: the read-only safety net", () => {
+  it("an adapter asks 127.0.0.1 and ::1 while the filter is off: a banner says so, word for word", async () => {
+    const t = await setup("off", {}, {}, true);
+    expect(t.count("windowsDns")).toBe(1);
+    expect(t.dns().windows?.adapters[0].servers).toEqual(["127.0.0.1", "::1"]);
+    expect(t.banner()?.text).toBe(
+      "Windows is set to use Sieve for DNS, but Sieve's DNS filter is not running, so sites may not load. Reset DNS in Windows network settings, or turn DNS filtering on.",
+    );
+    expect(t.banner()?.kind).toBe("error");
+    // Nothing is started by itself (no startup recovery) and nothing is written.
+    expect(t.count("start")).toBe(0);
+    expect(t.settings.get(DNS_SWITCH)).toBe(false);
+    t.undo();
+  });
+
+  it("its action turns DNS filtering on, and the banner goes once the filter answers there", async () => {
+    const t = await setup("off", {}, {}, true);
+    expect(t.banner()?.action?.label).toBe("Turn DNS filtering on");
+    t.banner()?.action?.run();
+    await settle();
     expect(t.settings.get(DNS_SWITCH)).toBe(true);
-    expect(t.settings.get(SYSTEM_DNS_SWITCH)).toBe(true);
-    expect(t.texts()).toContain("Windows uses Sieve for DNS, so Sieve started its DNS filter.");
-    // Starting it again from the switch does not happen: it is running.
+    expect(t.dns().status?.running).toBe(true);
+    expect(t.banner()).toBeUndefined();
+    // Lookups now reach it, so some get blocked on the next polls.
+    await t.fc.advance(DNS_POLL_MS * 3);
+    expect(t.dns().status?.counters.queries).toBeGreaterThan(0);
+    // Off again: back.
+    await t.settings.set(DNS_SWITCH, false);
     await settle();
-    expect(t.count("start")).toBe(1);
+    expect(t.banner()?.text).toBe(STRANDED_DNS_TEXT);
     t.undo();
   });
 
-  it("pointed but the filter cannot start: a banner that stays, with Restore my DNS, which works", async () => {
-    const t = await setup("running", {}, {
-      start: async () => {
-        throw new Error(MOCK_PORT_BUSY);
-      },
-    });
-    const banner = t.notices.list().find((n) => n.surface === "banner");
-    expect(banner?.kind).toBe("error");
-    expect(banner?.text).toMatch(/could not start .*10048.*Nothing resolves until you restore your DNS/);
-    expect(banner?.action?.label).toBe("Restore my DNS");
-    banner?.action?.run();
-    await settle();
-    expect(t.count("restoreSystem")).toBe(1);
-    expect(t.dns().system?.pointed).toBe(false);
-    expect(t.notices.list().some((n) => n.surface === "banner")).toBe(false);
+  it("filtering already on at load: the filter starts and the banner never flashes", async () => {
+    const t = await setup("off", { [DNS_SWITCH]: true }, {}, true);
+    expect(t.dns().status?.running).toBe(true);
+    expect(t.bannersShown()).toBe(0);
     t.undo();
   });
 
-  it("the system switch mirrors Windows on load and never points it by itself", async () => {
-    // Stored on from an earlier session, but Windows was restored meanwhile.
-    const t = await setup("off", { [SYSTEM_DNS_SWITCH]: true, [DNS_SWITCH]: true });
-    await settle();
-    expect(t.count("pointSystem")).toBe(0);
-    expect(t.settings.get(SYSTEM_DNS_SWITCH)).toBe(false);
-    t.undo();
-  });
-});
-
-describe("DNS controller: pointing Windows", () => {
-  it("is refused until the filter runs and passed its check; then points and records its own check", async () => {
+  it("Windows' own DNS: no banner, and Windows DNS is read again every 30 s, read only", async () => {
     const t = await setup("off");
-    expect(await t.ctl.point()).toBe(false);
-    expect(t.count("pointSystem")).toBe(0);
-    await t.settings.set(DNS_SWITCH, true);
-    await settle();
-    await t.settings.set(SYSTEM_DNS_SWITCH, true);
-    await settle();
-    expect(t.count("pointSystem")).toBe(1);
-    expect(t.dns().system?.pointed).toBe(true);
-    expect(t.checks.has(SYSTEM_DNS_SWITCH)).toBe(true);
-    expect(t.texts().at(-1)).toMatch(/Windows now uses Sieve for DNS\. Ads and trackers are blocked for every app on this computer\./);
-    // Off restores.
-    await t.settings.set(SYSTEM_DNS_SWITCH, false);
-    await settle();
-    expect(t.count("restoreSystem")).toBe(1);
-    expect(t.dns().system?.pointed).toBe(false);
-    expect(t.checks.has(SYSTEM_DNS_SWITCH)).toBe(false);
+    expect(WINDOWS_DNS_POLL_MS).toBe(30_000);
+    expect(t.banner()).toBeUndefined();
+    await t.fc.advance(WINDOWS_DNS_POLL_MS * 3);
+    expect(t.count("windowsDns")).toBe(4);
+    expect(t.bannersShown()).toBe(0);
+    t.undo();
+    await t.fc.advance(WINDOWS_DNS_POLL_MS * 3);
+    expect(t.count("windowsDns")).toBe(4);
+  });
+
+  it("follows Windows: pointed later shows the banner at the next read, reset by hand clears it", async () => {
+    let pointed = false;
+    const own = createMockDns({ seed: 1 });
+    const set = createMockDns({ seed: 1, pointed: true });
+    const t = await setup("off", {}, { windowsDns: () => (pointed ? set : own).windowsDns() });
+    expect(t.banner()).toBeUndefined();
+    pointed = true;
+    await t.fc.advance(WINDOWS_DNS_POLL_MS);
+    expect(t.banner()?.text).toBe(STRANDED_DNS_TEXT);
+    pointed = false;
+    await t.fc.advance(WINDOWS_DNS_POLL_MS);
+    expect(t.banner()).toBeUndefined();
     t.undo();
   });
 
-  it("Windows restored by hand (restore-dns.ps1) while Sieve runs: the switch follows and nothing is run", async () => {
-    const before = createMockDns({ seed: 1, scenario: "running" });
-    const after = createMockDns({ seed: 1, scenario: "off" });
-    let byHand = false;
-    const t = await setup("running", {}, { systemState: () => (byHand ? after : before).systemState() });
-    expect(t.settings.get(SYSTEM_DNS_SWITCH)).toBe(true);
-    byHand = true;
-    await t.fc.advance(DNS_POLL_MS);
-    await settle();
-    expect(t.settings.get(SYSTEM_DNS_SWITCH)).toBe(false);
-    expect(t.count("pointSystem") + t.count("restoreSystem")).toBe(0);
-    t.undo();
-  });
-
-  it("a declined Windows prompt leaves the switch off with the reason", async () => {
+  it("the filter stopping by itself while Windows asks it brings the banner", async () => {
+    const mock = createMockDns({ seed: 1, pointed: true });
+    let dead = false;
     const t = await setup("off", { [DNS_SWITCH]: true }, {
-      pointSystem: async () => {
-        throw new Error("you declined the Windows prompt, so nothing was changed");
+      start: (c) => mock.start(c),
+      selfCheck: () => mock.selfCheck(),
+      // The proxy dies between two polls (say, it crashed).
+      status: async () => (dead ? { ...(await mock.status()), running: false, binds: [] } : mock.status()),
+    }, true);
+    expect(t.dns().status?.running).toBe(true);
+    expect(t.banner()).toBeUndefined();
+    dead = true;
+    await t.fc.advance(DNS_POLL_MS);
+    expect(t.dns().status?.running).toBe(false);
+    expect(t.banner()?.text).toBe(STRANDED_DNS_TEXT);
+    t.undo();
+  });
+
+  it("a dismissed banner stays dismissed while nothing changes, and comes back after it was fixed and broke again", async () => {
+    let pointed = true;
+    const own = createMockDns({ seed: 1 });
+    const set = createMockDns({ seed: 1, pointed: true });
+    const t = await setup("off", {}, { windowsDns: () => (pointed ? set : own).windowsDns() });
+    const first = t.banner();
+    expect(first).toBeDefined();
+    t.notices.dismiss(first!.id);
+    await t.fc.advance(WINDOWS_DNS_POLL_MS * 2);
+    expect(t.banner()).toBeUndefined();
+    pointed = false;
+    await t.fc.advance(WINDOWS_DNS_POLL_MS);
+    pointed = true;
+    await t.fc.advance(WINDOWS_DNS_POLL_MS);
+    expect(t.banner()?.text).toBe(STRANDED_DNS_TEXT);
+    t.undo();
+    // The undo takes its banner with it.
+    expect(t.banner()).toBeUndefined();
+  });
+
+  it("an unreadable Windows DNS decides nothing: no banner, no error", async () => {
+    const t = await setup("off", {}, {
+      windowsDns: async () => {
+        throw new Error("GetAdaptersAddresses: error 8");
       },
     });
-    await settle();
-    await t.settings.set(SYSTEM_DNS_SWITCH, true);
-    await settle();
-    expect(t.settings.get(SYSTEM_DNS_SWITCH)).toBe(false);
-    expect(t.texts().at(-1)).toBe("Windows was not pointed at Sieve: you declined the Windows prompt, so nothing was changed");
+    expect(t.dns().windows).toBeNull();
+    expect(t.dns().error).toBeNull();
+    expect(t.banner()).toBeUndefined();
     t.undo();
   });
 });
@@ -282,13 +292,9 @@ describe("DNS controller: AdGuard", () => {
       notices: createNoticeBus(),
       checks: createPassedChecks(),
       clock: fc.clock,
-      exit: null,
     });
     const undo = ctl.bind();
     await vi.waitFor(() => expect(store.getState().dns.adguard).toBe(true));
-    // No app to end in the browser: quit is a no-op.
-    ctl.requestQuit();
-    expect(store.getState().dns.quitAsked).toBe(false);
     undo();
   });
 });

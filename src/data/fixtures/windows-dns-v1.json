@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "adapters": [
+    { "alias": "Wi-Fi", "index": 12, "servers": ["192.0.2.53", "2001:db8::53"] },
+    { "alias": "Ethernet 2", "index": 7, "servers": ["127.0.0.1", "::1"] }
+  ]
+}

@@ -72,7 +72,6 @@ export function createRuntime(o: RuntimeOptions): Runtime {
       notices,
       checks: passedChecks,
       clock,
-      exit: desktop ? () => desktop.quit() : null,
     }),
   };
 }
@@ -97,7 +96,7 @@ export function createBrowserRuntime(): Runtime {
   return rt;
 }
 
-/** Run the DNS controller (load, safety rule, follow the switches, poll). Returns the undo. */
+/** Run the DNS controller (load, follow the switches, poll, the read-only safety net). Returns the undo. */
 export function bindDns(rt: Runtime): () => void {
   return rt.dnsController.bind();
 }
@@ -111,9 +110,7 @@ function clockTime(ms: number): string {
 /**
  * Keep the desktop shell in step with the window (no-op without one):
  * - the tray shows the phase (trayState) and its Pause and Resume call the
- *   same poller actions as the pause pill;
- * - tray Quit and the window's close go to the DNS controller, which asks
- *   first while Windows points at Sieve;
+ *   same poller actions as the pause pill (Quit is Rust's: it just quits);
  * - launch at startup follows the setting `startup.launchAtLogin`, which is
  *   the source of truth: on load the OS entry is reconciled to it, and every
  *   change is applied. A failure is said in a toast.
@@ -140,22 +137,10 @@ export function bindDesktop(rt: Runtime, fmt: (ms: number) => string = clockTime
   void d
     .onTrayAction((a) => {
       if (a.kind === "pause") rt.poller.pauseFor(a.minutes);
-      else if (a.kind === "resume") rt.poller.resume();
-      else rt.dnsController.requestQuit();
+      else rt.poller.resume();
     })
     .then((un) => (cancelled ? un() : (unTray = un)))
     .catch((e: unknown) => console.warn(`Tray: ${message(e)}`));
-
-  // Closing the window ends the app: while Windows points at Sieve, ask first.
-  let unClose: (() => void) | null = null;
-  void d
-    .onCloseRequested(() => {
-      if (!rt.dnsController.holdClose()) return false;
-      rt.dnsController.requestQuit();
-      return true;
-    })
-    .then((un) => (cancelled ? un() : (unClose = un)))
-    .catch((e: unknown) => console.warn(`Close: ${message(e)}`));
 
   let applied: boolean | null = null;
   const syncAutostart = async () => {
@@ -177,7 +162,6 @@ export function bindDesktop(rt: Runtime, fmt: (ms: number) => string = clockTime
     unStore();
     unSettings();
     unTray?.();
-    unClose?.();
   };
 }
 

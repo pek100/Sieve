@@ -1,7 +1,7 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { DNS_SWITCH } from "@/core/dns";
+import { DNS_SWITCH, STRANDED_DNS_TEXT } from "@/core/dns";
 import { createMockDns, MOCK_PORT_BUSY, type DnsScenario } from "@/data/dns-mock";
 import type { DnsSource } from "@/data/dns-source";
 import { createMockSource } from "@/data/mock-source";
@@ -16,9 +16,9 @@ vi.setConfig({ testTimeout: 20_000 });
 
 async function setup(
   scenario: DnsScenario,
-  opts: { stored?: Record<string, unknown>; adguard?: boolean; over?: Partial<DnsSource>; systemReadable?: boolean } = {},
+  opts: { stored?: Record<string, unknown>; adguard?: boolean; pointed?: boolean; over?: Partial<DnsSource>; windowsReadable?: boolean } = {},
 ) {
-  const dns = { ...createMockDns({ seed: 1, scenario, adguard: opts.adguard }), ...opts.over } as DnsSource;
+  const dns = { ...createMockDns({ seed: 1, scenario, adguard: opts.adguard, pointed: opts.pointed }), ...opts.over } as DnsSource;
   const runtime = createRuntime({
     source: createMockSource({ seed: 1 }),
     settings: memoryBackend({ schema: 1, values: opts.stored ?? {} }),
@@ -33,7 +33,7 @@ async function setup(
   await act(async () => {
     await runtime.settings.ready;
   });
-  if (opts.systemReadable !== false) await vi.waitFor(() => expect(runtime.store.getState().dns.system).not.toBeNull());
+  if (opts.windowsReadable !== false) await vi.waitFor(() => expect(runtime.store.getState().dns.windows).not.toBeNull());
   return runtime;
 }
 
@@ -41,43 +41,46 @@ const card = () => screen.getByRole("region", { name: "DNS filter" });
 const phase = () => card().querySelector("[data-dns-phase]")!.getAttribute("data-dns-phase");
 
 describe("DNS card", () => {
-  it("off: says so, shows Windows' own DNS per adapter, and Point is disabled until the filter runs", async () => {
+  it("off: says so in one honest line about what it covers, and there is no Windows DNS block", async () => {
     await setup("off");
     expect(phase()).toBe("off");
     expect(card()).toHaveTextContent("Off. Lookups go to Windows' own DNS servers.");
-    expect(card()).toHaveTextContent(/every app on this computer at once/);
-    const adapters = within(card()).getByRole("list", { name: "Network adapters" });
-    expect(within(adapters).getAllByRole("listitem")).toHaveLength(2);
-    expect(adapters).toHaveTextContent("192.0.2.53 (DHCP)");
-    expect(adapters).toHaveTextContent("198.51.100.53, 203.0.113.53 (set by hand)");
-    expect(within(card()).getByRole("button", { name: "Point Windows at Sieve" })).toBeDisabled();
-    expect(within(card()).getByRole("button", { name: "Restore my DNS" })).toBeDisabled();
+    expect(card().querySelector("[data-dns-scope]")).toHaveTextContent(
+      "Only lookups sent straight to 127.0.0.1:53 are filtered for now; filtering for the whole computer comes later.",
+    );
+    expect(card()).not.toHaveTextContent(/every app on this computer|once Windows uses Sieve/);
+    // Removed 2026-10-18: no adapter list, no Point or Restore, nothing that changes Windows DNS.
+    expect(within(card()).queryByRole("list", { name: "Network adapters" })).toBeNull();
+    expect(within(card()).queryByRole("button", { name: /Point Windows|Restore my DNS/ })).toBeNull();
+    expect(card().querySelector("[data-system-dns], [data-dns-stranded]")).toBeNull();
     expect(within(card()).queryByRole("list", { name: "Most blocked domains" })).toBeNull();
   });
 
-  it("on: running with counters, list info, the passed check, and Point becomes available; Point then Restore", async () => {
-    const rt = await setup("off");
+  it("an adapter still asks 127.0.0.1 and ::1 while the filter is off: the card says so until the filter answers", async () => {
+    const rt = await setup("off", { pointed: true });
+    await vi.waitFor(() => expect(card().querySelector("[data-dns-stranded]")).toHaveTextContent(STRANDED_DNS_TEXT));
+    expect(within(card()).getByRole("alert", { name: "Windows DNS" })).toBeInTheDocument();
+    await userEvent.click(within(card()).getByRole("switch", { name: "DNS filtering" }));
+    await vi.waitFor(() => expect(phase()).toBe("running"));
+    expect(card().querySelector("[data-dns-stranded]")).toBeNull();
+    expect(rt.notices.list().some((n) => n.surface === "banner")).toBe(false);
+  });
+
+  it("on: running with counters, list info and the passed check", async () => {
+    await setup("off");
     await userEvent.click(within(card()).getByRole("switch", { name: "DNS filtering" }));
     await vi.waitFor(() => expect(phase()).toBe("running"));
     expect(card()).toHaveTextContent("Running on 127.0.0.1:53 and [::1]:53.");
     expect(card().querySelector("[data-dns-check=pass]")).toHaveTextContent(
       /Self check passed: the test name is blocked on 127\.0\.0\.1:53 and \[::1\]:53, and a normal name resolves\./,
     );
-    expect(card()).toHaveTextContent("Windows does not use Sieve for DNS yet, so nothing is blocked.");
     // The self check's normal name once per listener; its canary is never counted.
     expect(card().querySelector("[data-stat=queries] [data-numeric]")).toHaveTextContent("2");
     expect(card().querySelector("[data-stat=blocked] [data-numeric]")).toHaveTextContent("0");
     expect(within(card()).queryByText("selfcheck.sieve.invalid")).toBeNull();
     expect(card().querySelector("[data-dns-list]")).toHaveTextContent(/51,234 block rules, 812 allow rules, 97 lines skipped\. Updated/);
-    const point = within(card()).getByRole("button", { name: "Point Windows at Sieve" });
-    await vi.waitFor(() => expect(point).toBeEnabled());
-    await userEvent.click(point);
-    await vi.waitFor(() => expect(rt.store.getState().dns.system?.pointed).toBe(true));
-    expect(card().querySelector("[data-system-dns]")).toHaveAttribute("data-system-dns", "pointed");
-    expect(within(card()).getAllByText("Uses Sieve")).toHaveLength(2);
-    expect(card()).toHaveTextContent(/restore-dns\.ps1/);
-    await userEvent.click(within(card()).getByRole("button", { name: "Restore my DNS" }));
-    await vi.waitFor(() => expect(rt.store.getState().dns.system?.pointed).toBe(false));
+    expect(card().querySelector("[data-dns-scope]")).toBeInTheDocument();
+    expect(card().querySelector("[data-dns-stranded]")).toBeNull();
   });
 
   it("error: a busy port 53 turns the switch back off and the card says why", async () => {
@@ -152,9 +155,9 @@ describe("DNS card", () => {
     const noList = { url: null, fetched_at: null, rules: 0, allow: 0, skipped: 0, user_rules: false, error: "offline" };
     await setup("off", {
       stored: { [DNS_SWITCH]: true },
-      systemReadable: false,
+      windowsReadable: false,
       over: {
-        systemState: async () => {
+        windowsDns: async () => {
           throw new Error("access denied");
         },
         status: async () => ({ ...(await base.status()), list: noList }),
@@ -163,13 +166,9 @@ describe("DNS card", () => {
       },
     });
     await vi.waitFor(() => expect(phase()).toBe("running"));
-    // Windows DNS was never read: the card says so, and Point stays off (no adapters to back up).
-    expect(card().querySelector("[data-system-dns]")).toHaveAttribute("data-system-dns", "unknown");
-    expect(within(card()).getByRole("button", { name: "Point Windows at Sieve" })).toBeDisabled();
-    // The next poll (2 s) reads Windows DNS again and says why it failed.
-    await vi.waitFor(() => expect(within(card()).getByRole("alert")).toHaveTextContent("Windows DNS could not be read: access denied"), {
-      timeout: 5000,
-    });
+    // Windows DNS was never read: unknown decides nothing, so no safety notice and no error.
+    expect(card().querySelector("[data-dns-stranded]")).toBeNull();
+    expect(within(card()).queryByRole("alert")).toBeNull();
     expect(card().querySelector("[data-dns-list]")).toHaveTextContent("No list is loaded, so nothing is blocked.");
     expect(card()).toHaveTextContent("The list could not be refreshed: offline");
   });

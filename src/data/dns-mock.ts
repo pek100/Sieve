@@ -1,26 +1,29 @@
 /**
- * Mock DNS source: a deterministic DNS filter and Windows DNS for the
+ * Mock DNS source: a deterministic DNS filter and Windows DNS reads for the
  * browser, tests and e2e. Counters grow with every status read while the
  * filter runs (content depends on the read count and seed, never on the
  * clock). Addresses come from the documentation ranges only.
  *
- * Query string: ?dns=off|running|error (default off), ?adguard=1.
- * - off: nothing runs, Windows uses its own DNS; starting works.
- * - running: Windows already points at Sieve and Sieve's backup exists, as
- *   after a restart while pointed; the window must start the filter itself.
+ * Query string: ?dns=off|error (default off), ?adguard=1, ?pointed=1.
+ * - off: nothing runs; starting works.
  * - error: starting fails because port 53 is taken.
+ * - pointed: Windows' Wi-Fi adapter asks 127.0.0.1 and ::1 (left by an old
+ *   Sieve build, or set by hand). Sieve never changes it; only then do
+ *   lookups reach the filter, as on a real machine.
  */
-import { DNS_STATUS_VERSION, SYSTEM_DNS_VERSION, type DnsStatus, type InterfaceDns, type SelfCheck, type SystemDnsState } from "./protocol";
+import { DNS_STATUS_VERSION, WINDOWS_DNS_VERSION, type AdapterDns, type DnsStatus, type SelfCheck, type WindowsDns } from "./protocol";
 import { hash01 } from "./prng";
 import type { DnsSource } from "./dns-source";
 
-export const DNS_SCENARIOS = ["off", "running", "error"] as const;
+export const DNS_SCENARIOS = ["off", "error"] as const;
 export type DnsScenario = (typeof DNS_SCENARIOS)[number];
 
 export interface MockDnsOptions {
   seed: number;
   scenario?: DnsScenario;
   adguard?: boolean;
+  /** One adapter asks 127.0.0.1 and ::1 for DNS. */
+  pointed?: boolean;
   /** Clock for started_at and fetched_at; content never depends on it. */
   now?: () => number;
 }
@@ -31,7 +34,6 @@ export const MOCK_PORT_BUSY =
 const BINDS = ["127.0.0.1:53", "[::1]:53"];
 /** Rust's `rules::CANARY_NAME`, the self check's test name. */
 export const MOCK_CANARY = "selfcheck.sieve.invalid";
-const MOCK_BACKUP_DIR = "C:\\Users\\<user>\\AppData\\Roaming\\app.sieve.desktop\\system-dns";
 
 /** Plausible ad and tracker domains, most blocked first (weights fall off). */
 const DOMAINS = [
@@ -51,26 +53,14 @@ const DOMAINS = [
   "outbrain.com",
 ];
 
-const own = (alias: string, index: number, v4: string[], v6: string[], dhcp: boolean): InterfaceDns => ({
-  alias,
-  index,
-  v4: { servers: v4, dhcp },
-  v6: { servers: v6, dhcp },
-  uses_sieve: false,
-});
-
-/** What Windows had before Sieve: one adapter on DHCP, one set by hand. */
-const ORIGINAL: readonly InterfaceDns[] = [
-  own("Wi-Fi", 12, ["192.0.2.53"], ["2001:db8::53"], true),
-  own("Ethernet 2", 7, ["198.51.100.53", "203.0.113.53"], [], false),
+/** Windows' own DNS: two active adapters. */
+const OWN: readonly AdapterDns[] = [
+  { alias: "Wi-Fi", index: 12, servers: ["192.0.2.53", "2001:db8::53"] },
+  { alias: "Ethernet 2", index: 7, servers: ["198.51.100.53", "203.0.113.53"] },
 ];
 
-const pointedAt = (it: InterfaceDns): InterfaceDns => ({
-  ...it,
-  v4: { servers: ["127.0.0.1"], dhcp: false },
-  v6: { servers: ["::1"], dhcp: false },
-  uses_sieve: true,
-});
+/** ?pointed=1: the Wi-Fi adapter asks the loopback addresses. */
+const POINTED: readonly AdapterDns[] = [{ ...OWN[0], servers: ["127.0.0.1", "::1"] }, OWN[1]];
 
 /** An upstream as Rust reports it (SocketAddr display): port 53 added when absent. */
 function socketAddr(raw: string): string {
@@ -89,17 +79,13 @@ export function createMockDns(o: MockDnsOptions): DnsSource {
   let startedAt: number | null = null;
   let upstreams: string[] = [];
   let reads = 0;
-  let pointed = scenario === "running";
-  let backup = scenario === "running";
+  const pointed = o.pointed === true;
   const perDomain = new Map<string, number>();
   const counters = { queries: 0, blocked: 0, forwarded: 0, failed: 0, untracked: 0 };
 
-  const system = (): SystemDnsState => ({
-    v: SYSTEM_DNS_VERSION,
-    interfaces: ORIGINAL.map((it) => (pointed ? pointedAt(it) : it)),
-    pointed,
-    backup,
-    backup_dir: backup ? MOCK_BACKUP_DIR : null,
+  const windows = (): WindowsDns => ({
+    v: WINDOWS_DNS_VERSION,
+    adapters: (pointed ? POINTED : OWN).map((a) => ({ ...a, servers: [...a.servers] })),
   });
 
   const status = (): DnsStatus => ({
@@ -120,7 +106,7 @@ export function createMockDns(o: MockDnsOptions): DnsSource {
       .slice(0, 20),
   });
 
-  /** One poll's worth of lookups: only while Windows uses the filter, and not passing through, does anything get blocked. */
+  /** One poll's worth of lookups: they arrive only while an adapter asks the filter; nothing is blocked while passing through. */
   const traffic = () => {
     reads += 1;
     const lookups = pointed ? 6 + Math.floor(hash01(o.seed, reads, 1) * 10) : 0;
@@ -179,21 +165,8 @@ export function createMockDns(o: MockDnsOptions): DnsSource {
       passThrough = on;
       return status();
     },
-    async systemState() {
-      return system();
-    },
-    async pointSystem() {
-      if (!running) throw new Error("Start DNS filtering before pointing Windows at it");
-      if (backup) throw new Error("A backup from an earlier change exists; restore it first");
-      backup = true;
-      pointed = true;
-      return system();
-    },
-    async restoreSystem() {
-      if (!backup) throw new Error("There is no backup to restore");
-      backup = false;
-      pointed = false;
-      return system();
+    async windowsDns() {
+      return windows();
     },
     async adguardRunning() {
       return o.adguard === true;

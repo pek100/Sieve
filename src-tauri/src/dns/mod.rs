@@ -9,8 +9,11 @@
 //! - `engine`: rules + proxy + refresher as one start/status/check/stop unit.
 //! - `commands`: the Tauri commands over the engine.
 //!
-//! Nothing here changes Windows DNS settings: pointing the system at the
-//! proxy is `crate::sysdns`, behind the `filtering.systemDns` data switch.
+//! Nothing here changes Windows DNS settings, and nothing in Sieve does
+//! (docs/conventions.md, "Sieve off means a normal network"): the proxy
+//! answers only lookups sent to 127.0.0.1:53 or [::1]:53 directly. The
+//! filtering engine replaces it (docs/plans/2026-10-17-https-filtering.md,
+//! slice 4). Read-only Windows DNS facts are `crate::windns`.
 //! The live check for `filtering.dns` is
 //! `engine::tests::live_dns_filter_resolves_blocked_domain`. The filter is
 //! system wide: every lookup arrives from the DNS Client service, so the

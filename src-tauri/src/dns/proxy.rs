@@ -19,7 +19,7 @@
 //!
 //! Pass-through: while set (the global Sieving switch is off) every query
 //! is forwarded, blocked names too, and nothing is counted as blocked. The
-//! proxy keeps answering, so Windows DNS pointed here keeps working.
+//! proxy keeps answering, so anything that sends its lookups here keeps working.
 //!
 //! The self check's canary (`rules::CANARY_NAME`, `.invalid`) always gets
 //! the block answer, pass-through or not, and is never counted: not in
@@ -29,8 +29,8 @@
 //! address (a requested port 0 gets the same free port for UDP and TCP of
 //! that address), `stop` ends every server and every in-flight task, which
 //! frees the ports. Dropping a `Proxy` also stops its servers (the shutdown
-//! channel closes), without waiting. Listening on both 127.0.0.1 and ::1 is
-//! what lets Windows point both its IPv4 and IPv6 DNS here.
+//! channel closes), without waiting. It listens on both 127.0.0.1 and ::1,
+//! so a client of either address family can ask it.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -50,7 +50,8 @@ use super::DnsError;
 use super::rules::{RuleSet, Verdict, normalize_query};
 
 /// Where the proxy listens by default: the IPv4 and IPv6 loopback, port 53.
-/// These are the two addresses `sysdns` points Windows at.
+/// Sieve never points Windows at them; `crate::windns` only reads whether
+/// something else did.
 pub const DEFAULT_BINDS: [&str; 2] = ["127.0.0.1:53", "[::1]:53"];
 pub const DEFAULT_UPSTREAMS: [&str; 2] = ["1.1.1.1:53", "9.9.9.9:53"];
 /// TTL of a block answer, seconds (AdGuard's default too).
@@ -1004,7 +1005,7 @@ pub(crate) mod tests {
         assert!(matches!(Proxy::start(config, RuleSet::new()).await, Err(DnsError::Config(_))));
     }
 
-    /// Windows' IPv6 DNS is pointed at ::1, so the proxy must answer there
+    /// A client may ask ::1 instead of 127.0.0.1, so the proxy must answer there
     /// too, over UDP and TCP, with the same rules and counters.
     #[tokio::test]
     async fn listens_on_ipv4_and_ipv6_loopback_at_once() {

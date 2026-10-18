@@ -47,13 +47,13 @@ describe("settings export and import", () => {
       "appearance.theme",
       "apps.levels",
       "filtering.dns",
-      "filtering.systemDns",
       "filtering.upstreams",
       "nope.key",
     ]);
+    // The retired Windows DNS switch is dropped by the migration before the plan even sees it.
+    expect(plan.next.values).not.toHaveProperty("filtering.systemDns");
     expect(plan.refused.find((r) => r.key === "filtering.dns")?.reason).toMatch(/never turns this on/);
     expect(readValue(plan.next, "filtering.dns")).toBe(false);
-    expect(readValue(plan.next, "filtering.systemDns")).toBe(false);
     // A refused known key keeps its current value: the theme stays light.
     expect(readValue(plan.next, "appearance.theme")).toBe("light");
     // Every data switch, every time: no import path turns one on.
@@ -90,7 +90,7 @@ describe("settings search and words", () => {
     expect(searchSettings("theme")).toEqual(["appearance.theme"]);
     expect(searchSettings("LIGHT")).toEqual(["appearance.theme"]);
     // The global switch's help says what it does to DNS filtering, so it is found too.
-    expect(searchSettings("dns")).toEqual(["sampling.enabled", "filtering.dns", "filtering.upstreams", "filtering.systemDns"]);
+    expect(searchSettings("dns")).toEqual(["sampling.enabled", "filtering.dns", "filtering.upstreams"]);
     expect(searchSettings("per-app filtering")).toEqual([]);
     expect(searchSettings("turned off")).toEqual(["apps.levels"]);
     expect(searchSettings("startup")).toEqual(["startup.launchAtLogin"]);

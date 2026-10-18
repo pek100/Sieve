@@ -27,8 +27,6 @@ describe("SieveProvider binds the runtime for as long as it is mounted", () => {
         return () => (tray.fire = null);
       },
       autostart: { isEnabled: async () => false, set: async () => {} },
-      onCloseRequested: async () => () => {},
-      quit: async () => {},
     };
     const rt = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(), clock: still, desktop });
 

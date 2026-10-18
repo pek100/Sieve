@@ -62,15 +62,13 @@ describe("settings view (rendered from the registry)", () => {
     const rt = await setup();
     const dns = row("filtering.dns");
     expect(dns.querySelector("[data-lock]")).toBeNull();
-    expect(dns).toHaveTextContent(/every app on this computer/);
-    // Pointing Windows waits for DNS filtering.
-    expect(within(row("filtering.systemDns")).getByRole("switch")).toBeDisabled();
-    expect(row("filtering.systemDns").querySelector("[data-lock=requires]")).toHaveTextContent("Needs DNS filtering, which is off.");
+    expect(dns).toHaveTextContent(/filters only lookups sent to it directly; Windows keeps its own DNS servers/);
+    // There is no switch that points Windows DNS anywhere (removed 2026-10-18).
+    expect(document.querySelector('[data-setting="filtering.systemDns"]')).toBeNull();
     await userEvent.click(within(dns).getByRole("switch"));
     await vi.waitFor(() => expect(rt.passedChecks.has("filtering.dns")).toBe(true));
     expect(rt.store.getState().dns.status?.running).toBe(true);
     expect(within(row("filtering.dns")).getByRole("switch")).toBeChecked();
-    await vi.waitFor(() => expect(within(row("filtering.systemDns")).getByRole("switch")).toBeEnabled());
   });
 
   it("launch at startup is a switch only the desktop app can change", async () => {
@@ -86,8 +84,6 @@ describe("settings view (rendered from the registry)", () => {
       setTray: async () => {},
       onTrayAction: async () => () => {},
       autostart: { isEnabled: async () => autostart.at(-1) ?? false, set: async (on) => void autostart.push(on) },
-      onCloseRequested: async () => () => {},
-      quit: async () => {},
     };
     const rt = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(), isTauri: true, desktop });
     render(

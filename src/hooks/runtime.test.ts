@@ -1,11 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { TrayAction, TrayState } from "@/core/tray";
 import type { Desktop } from "@/data/desktop";
-import { createMockDns } from "@/data/dns-mock";
 import { createMockSource } from "@/data/mock-source";
 import type { Clock } from "@/data/poller";
 import { memoryBackend } from "@/data/settings-store";
-import { bindDesktop, bindDns, bindSampling, createRuntime } from "./runtime";
+import { bindDesktop, bindSampling, createRuntime } from "./runtime";
 
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
 /** Timers never fire: only explicit poller calls change the status. */
@@ -16,9 +15,7 @@ function fakeDesktop(startEnabled = false) {
   const autostartCalls: boolean[] = [];
   let enabled = startEnabled;
   let fire: (a: TrayAction) => void = () => {};
-  let hold: () => boolean = () => false;
   let failNext = false;
-  let quits = 0;
   const desktop: Desktop = {
     setTray: async (s) => void trays.push(s),
     onTrayAction: async (cb) => {
@@ -36,20 +33,12 @@ function fakeDesktop(startEnabled = false) {
         enabled = on;
       },
     },
-    onCloseRequested: async (h) => {
-      hold = h;
-      return () => (hold = () => false);
-    },
-    quit: async () => void (quits += 1),
   };
   return {
     desktop,
     trays,
     autostartCalls,
     fire: (a: TrayAction) => fire(a),
-    /** The window's close button: true when the window stays open. */
-    close: () => hold(),
-    quits: () => quits,
     failOnce: () => (failNext = true),
     enabled: () => enabled,
   };
@@ -85,62 +74,6 @@ describe("desktop binding: tray", () => {
     undo();
     rt.poller.pauseFor(5);
     expect(d.trays.length).toBe(n);
-  });
-});
-
-describe("desktop binding: quit and close while Windows points at Sieve", () => {
-  async function bound(dnsScenario: "off" | "running") {
-    const d = fakeDesktop();
-    const rt = createRuntime({
-      source: createMockSource({ seed: 1 }),
-      settings: memoryBackend(),
-      clock: still,
-      desktop: d.desktop,
-      dns: createMockDns({ seed: 1, scenario: dnsScenario }),
-    });
-    const undo = bindDesktop(rt, () => "14:05");
-    const undoDns = bindDns(rt);
-    await rt.settings.ready;
-    await vi.waitFor(() => expect(rt.store.getState().dns.system).not.toBeNull());
-    await flush();
-    return { d, rt, undo: () => (undo(), undoDns()) };
-  }
-
-  it("not pointed: tray Quit quits and the close button closes", async () => {
-    const { d, rt, undo } = await bound("off");
-    expect(d.close()).toBe(false);
-    d.fire({ kind: "quit" });
-    expect(d.quits()).toBe(1);
-    expect(rt.store.getState().dns.quitAsked).toBe(false);
-    undo();
-  });
-
-  it("pointed: close and tray Quit ask first; Cancel stays, Keep quits, Restore restores then quits", async () => {
-    const { d, rt, undo } = await bound("running");
-    expect(rt.store.getState().dns.system?.pointed).toBe(true);
-    // The close button is held and the question is asked.
-    expect(d.close()).toBe(true);
-    expect(rt.store.getState().dns.quitAsked).toBe(true);
-    rt.dnsController.cancelQuit();
-    expect(rt.store.getState().dns.quitAsked).toBe(false);
-    expect(d.quits()).toBe(0);
-
-    d.fire({ kind: "quit" });
-    expect(rt.store.getState().dns.quitAsked).toBe(true);
-    await rt.dnsController.quit("restore");
-    expect(rt.store.getState().dns.system?.pointed).toBe(false);
-    expect(rt.store.getState().dns.system?.backup).toBe(false);
-    expect(d.quits()).toBe(1);
-    undo();
-  });
-
-  it("pointed: Keep filtering quits without touching Windows DNS", async () => {
-    const { d, rt, undo } = await bound("running");
-    d.fire({ kind: "quit" });
-    await rt.dnsController.quit("keep");
-    expect(d.quits()).toBe(1);
-    expect(rt.store.getState().dns.system?.pointed).toBe(true);
-    undo();
   });
 });
 
