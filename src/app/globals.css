@@ -1,4 +1,11 @@
-@import "tailwindcss";
+/*
+ * The class scan's root is src/ (source("../") from src/app): every class lives
+ * there. `@source not` alone was not enough (2026-10-18): the dev server still
+ * watched files under the project root and crashed on a locked cargo file
+ * in src-tauri/target (os error 33), and churn in agent worktrees kept new
+ * classes from compiling. Nothing outside src/ is scanned or watched now.
+ */
+@import "tailwindcss" source("../");
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/inter";
@@ -6,16 +13,6 @@
 @import "@fontsource/jetbrains-mono/500.css";
 @import "@fontsource/instrument-serif/400-italic.css";
 @import "../styles/tokens.css";
-
-/*
- * Tailwind's class scan must never walk agent worktrees or Rust build output.
- * It did (2026-10-18): a locked file in a worktree's cargo target crashed the
- * dev CSS build, and constant churn there kept new classes from compiling.
- */
-@source not "../../.claude";
-@source not "../../src-tauri/target";
-@source not "../../spikes";
-@source not "../../engine";
 
 /*
  * Tailwind theme = role tokens only. The default palette is removed so a raw
