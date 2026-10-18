@@ -90,17 +90,19 @@ impl Relay {
     /// The owner pid, retried while the owner table lags (bounded by the
     /// attributor's give-up time).
     async fn owner(&self, flow: FiveTuple) -> Option<u32> {
+        #[cfg(feature = "attribution-diagnostics")]
+        let started = monotonic_ms();
         loop {
             let answer = lock(&self.attributor).owner(&flow, monotonic_ms());
             match answer {
                 Owner::Pid(pid) => {
                     #[cfg(feature = "attribution-diagnostics")]
-                    lock(&self.meters.attribution).observe(flow, true, monotonic_ms(), None, None);
+                    lock(&self.meters.attribution).observe(flow, true, monotonic_ms(), None, None, monotonic_ms().saturating_sub(started));
                     return Some(pid);
                 }
                 Owner::Unknown => {
                     #[cfg(feature = "attribution-diagnostics")]
-                    self.unknown_diagnostics(flow);
+                    self.unknown_diagnostics(flow, monotonic_ms().saturating_sub(started));
                     return None;
                 }
                 Owner::Pending => tokio::time::sleep(Duration::from_millis(REFRESH_MIN_MS)).await,
@@ -109,13 +111,13 @@ impl Relay {
     }
 
     #[cfg(feature = "attribution-diagnostics")]
-    fn unknown_diagnostics(&self, flow: FiveTuple) {
+    fn unknown_diagnostics(&self, flow: FiveTuple, lookup_elapsed_ms: u64) {
         use crate::flow::flows::{OwnerSource, Table};
         let same_table = Table::of(&flow);
         let other_table = match same_table {Table::Tcp4 => Table::Tcp6, Table::Tcp6 => Table::Tcp4, Table::Udp4 => Table::Udp6, Table::Udp6 => Table::Udp4};
         let same = IpHelper.read(same_table);
         let other = IpHelper.read(other_table);
-        lock(&self.meters.attribution).observe(flow, false, monotonic_ms(), same.as_deref(), other.as_deref());
+        lock(&self.meters.attribution).observe(flow, false, monotonic_ms(), same.as_deref(), other.as_deref(), lookup_elapsed_ms);
     }
 
     /// Counts the flow and registers it in the book; None when it is the
