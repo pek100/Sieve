@@ -61,18 +61,22 @@ where
         let mut out = Outcome::default();
         let mut classifier = TcpClassifier::new();
         let mut buf = vec![0u8; 16 * 1024];
-        let decided = loop {
+        // The classifier holds at most its cap, so the read that decides can
+        // carry a tail it did not keep: `spill` is that tail, sent after the
+        // held bytes and before the rest of the stream.
+        let (decided, spill) = loop {
             match tokio::time::timeout(first_bytes_wait, app_read.read(&mut buf)).await {
                 Ok(Ok(0)) | Ok(Err(_)) => {
                     out.stop = true;
                     return out;
                 }
                 Ok(Ok(n)) => {
+                    let before = classifier.held().len();
                     if let Some(d) = classifier.push(&buf[..n]) {
-                        break d;
+                        break (d, classifier.held().len() - before..n);
                     }
                 }
-                Err(_) => break Decoded { failure: Some("no client bytes in time"), ..Decoded::default() },
+                Err(_) => break (Decoded { failure: Some("no client bytes in time"), ..Decoded::default() }, 0..0),
             }
         };
         let action = decide(&decided);
@@ -83,12 +87,13 @@ where
             return out;
         }
         let held = classifier.take_held();
-        if up_write.write_all(&held).await.is_err() {
+        let tail = &buf[spill];
+        if up_write.write_all(&held).await.is_err() || up_write.write_all(tail).await.is_err() {
             out.upstream_write_failed = true;
             out.stop = true;
             return out;
         }
-        out.bytes_up = held.len() as u64 + tokio::io::copy(&mut app_read, &mut up_write).await.unwrap_or(0);
+        out.bytes_up = (held.len() + tail.len()) as u64 + tokio::io::copy(&mut app_read, &mut up_write).await.unwrap_or(0);
         let _ = up_write.shutdown().await;
         out
     };
@@ -314,6 +319,38 @@ mod tests {
         assert_eq!(out.bytes_up, REQUEST.len() as u64);
         assert_eq!(out.bytes_down, RESPONSE_LEN as u64);
         assert_eq!(server.await.unwrap(), REQUEST, "upstream saw the request exactly once, in order");
+    }
+
+    #[tokio::test]
+    async fn a_deciding_read_larger_than_the_classifier_cap_loses_no_byte() {
+        // First read: an unfinished head (the classifier needs more). Second
+        // read: a full 16 KiB buffer, more than the classifier's remaining
+        // room, so the read that decides carries a tail it does not keep.
+        let mut first = b"POST /upload HTTP/1.1\r\nHost: big.example\r\nX-Pad: ".to_vec();
+        first.resize(1460, b'a');
+        let mut second = b"\r\nContent-Length: 20000\r\n\r\n".to_vec();
+        second.resize(16 * 1024, b'b');
+        let mut expected = first.clone();
+        expected.extend_from_slice(&second);
+        let (up, server) = upstream(|mut s| async move {
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).await.unwrap();
+            got
+        })
+        .await;
+        let (mut app, mut relay_side) = tokio::io::duplex(PIPE_BYTES);
+        let relay = tokio::spawn(async move { relay_tcp(&mut relay_side, up, WAIT, |_| Action::Pass).await });
+        app.write_all(&first).await.unwrap();
+        // Let the relay take the first read on its own before the second arrives.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        app.write_all(&second).await.unwrap();
+        app.shutdown().await.unwrap();
+        let out = tokio::time::timeout(WAIT, relay).await.expect("relay ended").unwrap();
+        assert!(!out.upstream_write_failed);
+        let got = server.await.unwrap();
+        assert_eq!(got.len(), expected.len(), "every client byte reached upstream");
+        assert_eq!(got, expected, "in order, none lost or repeated");
+        assert_eq!(out.bytes_up, expected.len() as u64);
     }
 
     #[tokio::test]
