@@ -569,23 +569,25 @@ function Run-Auto {
       Record "ADVISORY" "idle CPU under 1 percent of one core" "measured $idle cores; limit $IdleCpuMaximum; unattended input and background traffic are uncontrolled, so idle is not established"
       $cpuStart = $p.TotalProcessorTime.TotalSeconds
       $clock.Restart()
-      $meta = & curl.exe -s --noproxy '*' -o NUL -m $BudgetSeconds -w '%{http_code} %{size_download} %{speed_download}' "https://speed.cloudflare.com/__down?bytes=$DownloadBytes"
-      $code = $LASTEXITCODE
+      . (Join-Path $PSScriptRoot 'budget-transfer.ps1')
+      $transfer = Invoke-SieveBudgetTransfer $BudgetSeconds
       $wall = $clock.Elapsed.TotalSeconds
+      Save "route-budget-transfer.json" ($transfer | ConvertTo-Json)
       Assert-AppClosed
       $p.Refresh()
       Require "same engine process throughout budget" ((Engine-Pid) -eq $enginePid) "PID $enginePid"
       Require-Routing
-      $fields = "$meta" -split '\s+'
-      Require "budget download completed" ($code -eq 0 -and $fields.Count -eq 3 -and $fields[0] -eq "200" -and [double]::Parse($fields[1], [Globalization.CultureInfo]::InvariantCulture) -eq $DownloadBytes) "curl exit $code; $meta"
-      # Bytes/s * bits/byte / decimal megabit, the existing budget's unit conversion.
-      $mbps = [double]::Parse($fields[2], [Globalization.CultureInfo]::InvariantCulture) * 8 / 1e6
-      Require "budget transfer has nonzero duration and speed" ($wall -gt 0 -and $mbps -gt 0) "$wall s; $mbps Mbit/s"
-      $cpu = ($p.TotalProcessorTime.TotalSeconds - $cpuStart) / $wall
-      $per100 = $cpu / ($mbps / $ReferenceMbps)
-      Check "relay CPU at most 15 percent of one core per 100 Mbit/s" ($per100 -le $RelayCpuMaximum) "$per100 cores per $ReferenceMbps Mbit/s; $mbps Mbit/s; $wall s"
+      $valid = $transfer.Valid -and $transfer.Bytes -eq $DownloadBytes -and $wall -gt 0
+      Check "budget download completed on one connection" $valid "12 responses; 300 MB total; see route-budget-transfer.json"
+      $per100 = $null
+      if ($valid) {
+        $mbps = $transfer.Bytes * 8 / $wall / 1e6
+        $cpu = ($p.TotalProcessorTime.TotalSeconds - $cpuStart) / $wall
+        $per100 = $cpu / ($mbps / $ReferenceMbps)
+        Check "relay CPU at most 15 percent of one core per 100 Mbit/s" ($per100 -le $RelayCpuMaximum) "$per100 cores per $ReferenceMbps Mbit/s; $mbps Mbit/s; $wall s"
+      } else { Record "SKIP" "relay CPU budget" "download did not complete as the specified single-connection workload" }
       Check "engine memory at most 300 MB" ($p.WorkingSet64 -le $MemoryMaximum) "$($p.WorkingSet64) bytes working set"
-      Save "route-budget.txt" "idle=$idle cores (advisory); download=$meta; wall=$wall s; relay=$per100 cores per $ReferenceMbps Mbit/s; workingSet=$($p.WorkingSet64) bytes"
+      Save "route-budget.txt" "idle=$idle cores (advisory); validTransfer=$valid; wall=$wall s; relay=$per100 cores per $ReferenceMbps Mbit/s; workingSet=$($p.WorkingSet64) bytes"
     } finally { $p.Dispose() }
   }
   Step "adguard-back" "If initially running, sc.exe start 'Adguard Service'; check blocker=adguard, no routes and lookup+HTTPS. Otherwise SKIP. Finally always restore policy OFF and normal binary, and restore AdGuard if initially running, even on failure." {

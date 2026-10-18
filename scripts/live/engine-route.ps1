@@ -311,17 +311,22 @@ switch ($Step) {
     $c0 = $p.TotalProcessorTime.TotalSeconds; Start-Sleep -Seconds 60; $p.Refresh()
     $idle = ($p.TotalProcessorTime.TotalSeconds - $c0) / 60
     Check "idle CPU under 1 percent of one core" ($idle -lt 0.01) ("{0:P2}" -f $idle)
-    $file = Join-Path $env:TEMP "sieve-budget.bin"
+    . (Join-Path $PSScriptRoot 'budget-transfer.ps1')
     $c0 = $p.TotalProcessorTime.TotalSeconds; $t0 = Get-Date
-    $meta = (& curl.exe -s -o $file -w "%{size_download} %{speed_download}" "https://speed.cloudflare.com/__down?bytes=300000000") 2>$null
+    $transfer = Invoke-SieveBudgetTransfer 60
     $wall = ((Get-Date) - $t0).TotalSeconds; $p.Refresh()
-    Remove-Item $file -ErrorAction SilentlyContinue
+    Write-Evidence "route-budget-transfer.json" ($transfer | ConvertTo-Json)
+    $valid=$transfer.Valid -and $wall -gt 0 -and (Get-EnginePid) -eq $p.Id -and (Get-SieveRoutes).Count -gt 0
+    Check "budget download completed on one connection with same routing engine" $valid "12 responses, 300 MB total; see route-budget-transfer.json"
+    if ($valid) {
     $cpu = ($p.TotalProcessorTime.TotalSeconds - $c0) / $wall
-    $mbps = ([double]($meta.Split(" ")[1]) * 8) / 1e6
+    $mbps = $transfer.Bytes * 8 / $wall / 1e6
     $per100 = if ($mbps -gt 0) { $cpu / ($mbps / 100) } else { 1 }
-    Write-Evidence "route-budget.txt" ("download: {0}`nwall {1:N1} s, {2:N1} Mbit/s, engine CPU {3:P1} of one core, {4:P1} per 100 Mbit/s`nworking set {5:N0} MB, private {6:N0} MB" -f $meta, $wall, $mbps, $cpu, $per100, ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB))
+    Write-Evidence "route-budget.txt" ("download: 300 MB on one connection`nwall {0:N1} s, {1:N1} Mbit/s, engine CPU {2:P1} of one core, {3:P1} per 100 Mbit/s`nworking set {4:N0} MB, private {5:N0} MB" -f $wall, $mbps, $cpu, $per100, ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB))
     Check "relay CPU at most 15 percent of one core per 100 Mbit/s" ($per100 -le 0.15) ("{0:P1} at {1:N0} Mbit/s" -f $cpu, $mbps)
+    } else {Write-Host 'SKIP relay CPU: invalid workload; download failure recorded above.'}
     Check "engine memory at most 300 MB" ($p.WorkingSet64 -le 300MB) ("{0:N0} MB working set" -f ($p.WorkingSet64 / 1MB))
+    $p.Dispose()
   }
 
   "adguard-back" {
