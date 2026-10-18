@@ -17,9 +17,11 @@ use windows_service::service::{
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::acl::{PROGRAM_DATA_SDDL, set_dir_security, token_user_sid};
+use super::image::check_this_exe;
 use super::state::{self, State};
 use super::{
-    DESCRIPTION, DISPLAY_NAME, FAILURE_RESET, REQUIRED_PRIVILEGES, RESTART_DELAY, RESTARTS, SERVICE_NAME, STOP_WAIT, Step,
+    DESCRIPTION, DISPLAY_NAME, FAILURE_RESET, FOLDER_STEP, REQUIRED_PRIVILEGES, RESTART_DELAY, RESTARTS, SERVICE_NAME,
+    STOP_WAIT, Step, image_exe,
 };
 use crate::route::delete_sieve_routes;
 
@@ -85,17 +87,33 @@ fn recovery() -> ServiceFailureActions {
     }
 }
 
+/// The exe the installed service is registered with, from its ImagePath.
+fn registered_image(service: &Service) -> Result<std::path::PathBuf, String> {
+    let config = service.query_config().map_err(|e| format!("query config: {e}"))?;
+    Ok(image_exe(&config.executable_path.to_string_lossy()))
+}
+
+/// Before anything is registered: only SYSTEM, Administrators and
+/// TrustedInstaller can change this exe, what is beside it, and the folders
+/// above (`image`). Nothing is re-ACLed here: the installer's hook locked the
+/// folder; this proves it.
+fn own_folder() -> Result<String, String> {
+    check_this_exe().map_err(|why| format!("{why}. Nothing was installed"))
+}
+
 fn register() -> Result<String, String> {
-    let access = ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
+    let access = ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
     let info = info()?;
     let (service, done) = match open(access)? {
         Some(s) => {
+            let was = registered_image(&s)?;
             s.change_config(&info).map_err(|e| format!("change config: {e}"))?;
-            (s, "updated")
+            let done = if was == info.executable_path { "updated".to_string() } else { format!("updated (was {})", was.display()) };
+            (s, done)
         }
         None => {
             let m = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-            (m.create_service(&info, access).map_err(|e| format!("create: {e}"))?, "created")
+            (m.create_service(&info, access).map_err(|e| format!("create: {e}"))?, "created".to_string())
         }
     };
     service.set_description(DESCRIPTION).map_err(|e| format!("description: {e}"))?;
@@ -160,10 +178,16 @@ fn stop() -> Result<String, String> {
     Ok("stopped".into())
 }
 
+/// Deletes the service by name, wherever its image was registered (an older
+/// build may sit in another folder); the report names that image so the
+/// installer's hook and a person can remove it.
 fn delete() -> Result<String, String> {
-    let Some(service) = open(ServiceAccess::DELETE)? else { return Ok("not installed".into()) };
+    let Some(service) = open(ServiceAccess::DELETE | ServiceAccess::QUERY_CONFIG)? else {
+        return Ok("not installed".into());
+    };
+    let image = registered_image(&service)?;
     service.delete().map_err(|e| format!("delete: {e}"))?;
-    Ok("deleted".into())
+    Ok(format!("deleted (its image was {})", image.display()))
 }
 
 fn remove_program_data() -> Result<String, String> {
@@ -179,13 +203,27 @@ fn routes() -> Result<String, String> {
     delete_sieve_routes().map(|n| format!("{n} routes on \"Sieve\" deleted"))
 }
 
+/// The folder check first; when it refuses, nothing else runs: no service is
+/// registered for an exe that users can replace.
 pub fn install() -> Vec<Step> {
-    vec![
-        Step::run("service", register),
-        Step::run("program data", program_data),
-        Step::run("owner", record_owner),
-        Step::run("start", start),
-    ]
+    install_steps(own_folder, || {
+        vec![
+            Step::run("service", register),
+            Step::run("program data", program_data),
+            Step::run("owner", record_owner),
+            Step::run("start", start),
+        ]
+    })
+}
+
+fn install_steps(folder: impl FnOnce() -> Result<String, String>, rest: impl FnOnce() -> Vec<Step>) -> Vec<Step> {
+    let first = Step::run(FOLDER_STEP, folder);
+    if first.outcome.is_err() {
+        return vec![first];
+    }
+    let mut steps = vec![first];
+    steps.extend(rest());
+    steps
 }
 
 pub fn uninstall() -> Vec<Step> {
@@ -225,6 +263,29 @@ mod tests {
             ]
         );
         assert!(matches!(r.reset_period, ServiceFailureResetPeriod::After(d) if d == FAILURE_RESET));
+    }
+
+    #[test]
+    fn a_refused_folder_registers_nothing() {
+        let mut ran = false;
+        let steps = install_steps(|| Err("refused: E:\\Sieve".into()), || {
+            ran = true;
+            vec![]
+        });
+        assert!(!ran, "no service step may run after a refusal");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(super::super::report("install", &steps).1, super::super::EXIT_UNSAFE_FOLDER);
+        let steps = install_steps(|| Ok("fine".into()), || vec![Step::run("service", || Ok("created".into()))]);
+        assert_eq!(steps.iter().map(|s| s.name).collect::<Vec<_>>(), [FOLDER_STEP, "service"]);
+    }
+
+    /// Read only: this test binary sits in the user's own target folder, so
+    /// the real check refuses it (and the install verb would register
+    /// nothing).
+    #[test]
+    fn the_test_binary_folder_is_refused() {
+        let why = own_folder().unwrap_err();
+        assert!(why.starts_with("refused: ") && why.ends_with("Nothing was installed"), "{why}");
     }
 
     /// Read only: the service manager answers, and the engine's service is

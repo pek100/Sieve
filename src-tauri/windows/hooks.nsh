@@ -1,7 +1,7 @@
 ; Sieve's NSIS hooks (tauri.conf.json bundle > windows > nsis > installerHooks).
 ; The bundle is per machine, so the installer runs elevated and every
 ; command below runs as the admin who approved the UAC prompt. Plan:
-; docs/plans/2026-10-17-https-filtering.md, 1.5.
+; docs/plans/2026-10-17-https-filtering.md, 1.5 and 7.
 ;
 ; The engine binary is not a Tauri resource: `pnpm engine:build` (part of
 ; beforeBuildCommand) builds it, and `File` embeds it when makensis compiles
@@ -9,50 +9,193 @@
 ; __FILEDIR__ is read here, outside any macro, so it names this folder.
 !define SIEVE_ENGINE_EXE "sieve-engine.exe"
 !define SIEVE_ENGINE_SRC "${__FILEDIR__}\..\..\engine\target\release\${SIEVE_ENGINE_EXE}"
+; Left in a folder this installer created empty and locked (the engine's
+; service::image::MARKER_FILE; law 10 keeps the two equal).
+!define SIEVE_MARKER "sieve-install.marker"
+!define SIEVE_SERVICE_KEY "SYSTEM\CurrentControlSet\Services\sieve-engine"
+; The engine's install verb refused a folder users can change
+; (service::EXIT_UNSAFE_FOLDER; law 10).
+!define SIEVE_EXIT_UNSAFE_FOLDER 3
 
-; An update replaces a running engine: stop it first (`restore` removes
-; Sieve's routes and stops the service; certificates and data stay).
-!macro NSIS_HOOK_PREINSTALL
-  ${If} ${FileExists} "$INSTDIR\${SIEVE_ENGINE_EXE}"
-    DetailPrint "Stopping Sieve's engine"
-    nsExec::ExecToLog '"$INSTDIR\${SIEVE_ENGINE_EXE}" restore'
-    Pop $0
+; The install folder (2026-10-18). The engine runs as SYSTEM from it, so
+; whoever can write there owns SYSTEM: E:\Sieve inherited "Authenticated
+; Users: Modify" from E:\ in the live check. The user keeps choosing the
+; folder (Tauri's directory page stays); whatever it is, the hook locks it
+; to administrators before any file is copied in:
+; - a folder this installer prepared before (it holds SIEVE_MARKER) is
+;   locked again;
+; - a new or empty folder is locked, checked empty again (nothing slipped in
+;   while it was still open) and gets the marker;
+; - anything else is refused: locking someone else's files could break them.
+; The lock is acl::INSTALL_DIR_SDDL: owner Administrators, inheritance off,
+; SYSTEM and Administrators full control, Users read and execute, inherited
+; by everything inside (the engine test `the_hooks_icacls_lines_give_the_install_lock`
+; runs these exact lines). The engine's install verb then proves it held
+; (service::image) before it registers anything, and the service proves it
+; again at every start.
+
+Var SieveEngine
+Var SieveForeign
+
+; $SieveForeign: the first entry of $INSTDIR when the folder holds files and
+; no marker (a folder this installer did not prepare), else "".
+Function SieveForeignEntry
+  Push $R8
+  Push $R9
+  StrCpy $SieveForeign ""
+  ${IfNot} ${FileExists} "$INSTDIR\${SIEVE_MARKER}"
+    FindFirst $R8 $R9 "$INSTDIR\*"
+    ${DoWhile} $R9 != ""
+      ${If} $R9 != "."
+      ${AndIf} $R9 != ".."
+        StrCpy $SieveForeign $R9
+        ${ExitDo}
+      ${EndIf}
+      FindNext $R8 $R9
+    ${Loop}
+    FindClose $R8
+  ${EndIf}
+  Pop $R9
+  Pop $R8
+FunctionEnd
+
+!macro SIEVE_REFUSE_FOREIGN
+  MessageBox MB_ICONSTOP|MB_OK "$INSTDIR already holds files Sieve's installer did not put there ($SieveForeign).$\r$\n$\r$\nSieve's engine runs as SYSTEM, so Sieve locks its folder so that only administrators can change it. Doing that here could break those files. Choose an empty or new folder." /SD IDOK
+!macroend
+
+; Tauri's directory page (template: MUI_PAGE_DIRECTORY, no config switch for
+; it) checks the choice when the user clicks Next, so a foreign folder is
+; refused there, before anything is uninstalled or copied.
+!define MUI_DIRECTORYPAGE_VERIFYONLEAVE
+Function .onVerifyInstDir
+  Call SieveForeignEntry
+  ${If} $SieveForeign != ""
+    !insertmacro SIEVE_REFUSE_FOREIGN
+    Abort
+  ${EndIf}
+FunctionEnd
+
+; One icacls call on $INSTDIR; a failure stops the install.
+!macro SIEVE_ICACLS ARGS
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" ${ARGS}'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_ICONSTOP|MB_OK "Sieve could not lock $INSTDIR so that only administrators can change it (icacls ${ARGS}: exit code $0). Nothing of Sieve was installed there." /SD IDOK
+    Abort
   ${EndIf}
 !macroend
 
-; Copy the engine beside the app (Program Files: only admins can write it,
-; plan 1.5) and register its service. Installing changes no network state:
-; the engine runs and filters nothing until a later slice turns it on.
+; Runs in the install section after Tauri's SetOutPath created $INSTDIR and
+; before the first File. The order leaves no moment with a user-writable
+; file in the folder: owner first (a user who made the folder can no longer
+; rewrite its ACL), then the inherited ACEs go, then the known broad grants,
+; then ours.
+Function SieveLockInstallDir
+  Call SieveForeignEntry
+  ${If} $SieveForeign != ""
+    !insertmacro SIEVE_REFUSE_FOREIGN
+    Abort
+  ${EndIf}
+  DetailPrint "Locking $INSTDIR so that only administrators can change it"
+  !insertmacro SIEVE_ICACLS '/setowner *S-1-5-32-544'
+  !insertmacro SIEVE_ICACLS '/inheritance:r'
+  !insertmacro SIEVE_ICACLS '/remove:g *S-1-1-0 *S-1-5-11 *S-1-5-32-545 *S-1-5-4 *S-1-3-0'
+  !insertmacro SIEVE_ICACLS '/grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX'
+  ${IfNot} ${FileExists} "$INSTDIR\${SIEVE_MARKER}"
+    ; Still empty now that it is locked: nothing slipped in before.
+    Call SieveForeignEntry
+    ${If} $SieveForeign != ""
+      !insertmacro SIEVE_REFUSE_FOREIGN
+      Abort
+    ${EndIf}
+    FileOpen $0 "$INSTDIR\${SIEVE_MARKER}" w
+    FileWrite $0 "Sieve's installer created this folder and locked it so that only administrators can change it. Sieve's engine checks that lock at every start.$\r$\n"
+    FileClose $0
+  ${EndIf}
+FunctionEnd
+
+; $SieveEngine: the exe the sieve-engine service is registered with (its
+; ImagePath, quotes stripped as service::image_exe does), so an older build
+; in another folder is still stopped and removed; else $INSTDIR's.
+!macro SIEVE_REGISTERED_ENGINE
+  Push $R8
+  Push $R9
+  ReadRegStr $SieveEngine HKLM "${SIEVE_SERVICE_KEY}" "ImagePath"
+  ExpandEnvStrings $SieveEngine $SieveEngine
+  StrCpy $R9 $SieveEngine 1
+  ${If} $R9 == '"'
+    StrCpy $SieveEngine $SieveEngine "" 1
+    StrCpy $R8 0
+    ${Do}
+      StrCpy $R9 $SieveEngine 1 $R8
+      ${IfThen} $R9 == "" ${|} ${ExitDo} ${|}
+      ${IfThen} $R9 == '"' ${|} ${ExitDo} ${|}
+      IntOp $R8 $R8 + 1
+    ${Loop}
+    StrCpy $SieveEngine $SieveEngine $R8
+  ${EndIf}
+  ${If} $SieveEngine == ""
+    StrCpy $SieveEngine "$INSTDIR\${SIEVE_ENGINE_EXE}"
+  ${EndIf}
+  Pop $R9
+  Pop $R8
+!macroend
+
+; An update replaces a running engine: stop it first (`restore` removes
+; Sieve's routes and stops the service; certificates and data stay). Then
+; lock the folder, before Tauri copies the first file.
+!macro NSIS_HOOK_PREINSTALL
+  !insertmacro SIEVE_REGISTERED_ENGINE
+  ${If} ${FileExists} "$SieveEngine"
+    DetailPrint "Stopping Sieve's engine ($SieveEngine)"
+    nsExec::ExecToLog '"$SieveEngine" restore'
+    Pop $0
+  ${EndIf}
+  Call SieveLockInstallDir
+!macroend
+
+; Copy the engine beside the app (the folder is locked, so it inherits the
+; lock) and register its service. Installing changes no network state: the
+; engine runs and filters nothing until a later slice turns it on.
 !macro NSIS_HOOK_POSTINSTALL
   SetOutPath "$INSTDIR"
   File "/oname=${SIEVE_ENGINE_EXE}" "${SIEVE_ENGINE_SRC}"
+  StrCpy $SieveEngine "$INSTDIR\${SIEVE_ENGINE_EXE}"
   DetailPrint "Installing Sieve's engine service"
-  nsExec::ExecToLog '"$INSTDIR\${SIEVE_ENGINE_EXE}" install'
+  nsExec::ExecToLog '"$SieveEngine" install'
   Pop $0
-  ${If} $0 != 0
+  ${If} $0 = ${SIEVE_EXIT_UNSAFE_FOLDER}
+    MessageBox MB_ICONSTOP|MB_OK "Sieve's filtering engine was not set up: users who are not administrators can change files in $INSTDIR or a folder above it, and the engine runs as SYSTEM. Sieve still runs; the installer's details list what was found. Reinstall Sieve into an empty or new folder." /SD IDOK
+  ${ElseIf} $0 != 0
     MessageBox MB_ICONEXCLAMATION|MB_OK "Sieve's filtering engine could not be set up (exit code $0). Sieve still runs; the installer's details list the step that failed." /SD IDOK
   ${EndIf}
 !macroend
 
 ; Uninstall removes the service and ProgramData\Sieve (the verb is safe to
-; rerun). An uninstall that is part of an update only stops the engine.
+; rerun), using the engine the service is registered with. An uninstall that
+; is part of an update only stops the engine.
 !macro NSIS_HOOK_PREUNINSTALL
-  ${If} ${FileExists} "$INSTDIR\${SIEVE_ENGINE_EXE}"
+  !insertmacro SIEVE_REGISTERED_ENGINE
+  ${If} ${FileExists} "$SieveEngine"
     ${If} $UpdateMode = 1
       DetailPrint "Stopping Sieve's engine for the update"
-      nsExec::ExecToLog '"$INSTDIR\${SIEVE_ENGINE_EXE}" restore'
+      nsExec::ExecToLog '"$SieveEngine" restore'
     ${Else}
       DetailPrint "Removing Sieve's engine"
-      nsExec::ExecToLog '"$INSTDIR\${SIEVE_ENGINE_EXE}" uninstall'
+      nsExec::ExecToLog '"$SieveEngine" uninstall'
     ${EndIf}
     Pop $0
   ${EndIf}
 !macroend
 
-; Tauri's uninstaller deletes only the files it laid down; the engine is ours.
+; Tauri's uninstaller deletes only the files it laid down; the engine and
+; the marker are ours. $SieveEngine is the registered engine, which an older
+; build may have left in another folder.
 !macro NSIS_HOOK_POSTUNINSTALL
   ${If} $UpdateMode <> 1
+    Delete "$SieveEngine"
     Delete "$INSTDIR\${SIEVE_ENGINE_EXE}"
+    Delete "$INSTDIR\${SIEVE_MARKER}"
     RMDir "$INSTDIR"
   ${EndIf}
 !macroend

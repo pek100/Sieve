@@ -6,12 +6,24 @@
 //! - `ProgramData\Sieve`: owned by Administrators, SYSTEM and Administrators
 //!   only, inherited by every folder and file below (`OICI`), protected.
 //!
+//! - The install folder (whatever the user picked): owner Administrators,
+//!   SYSTEM and Administrators full control, Users read and execute,
+//!   inherited by everything inside, protected. The installer's hook sets it
+//!   with icacls before any file is copied (`src-tauri/windows/hooks.nsh`);
+//!   a test runs the hook's own icacls lines and compares the result with
+//!   this string. `service::image` checks it held.
+//!
 //! The strings are built here and tested; [`SecurityDescriptor`] turns one
 //! into the binary form Windows takes.
 
 /// Owner Administrators; protected DACL: SYSTEM and Administrators full
 /// control, inherited by subfolders and files.
 pub const PROGRAM_DATA_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+/// The install folder's lock: owner Administrators; protected DACL: SYSTEM
+/// and Administrators full control, Users read and execute (0x1200a9, what
+/// icacls calls RX), inherited by subfolders and files.
+pub const INSTALL_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 
 /// A string SID (`S-1-5-21-...`): `S-1-`, then dash-separated decimal parts.
 /// Anything else is refused, so a recorded value can never inject SDDL.
@@ -78,6 +90,11 @@ mod win {
             }
             .map_err(|e| format!("bad SDDL {sddl:?}: {e}"))?;
             Ok(Self(sd))
+        }
+
+        /// The descriptor itself; valid while `self` lives.
+        pub fn raw(&self) -> PSECURITY_DESCRIPTOR {
+            self.0
         }
 
         /// SECURITY_ATTRIBUTES pointing at this descriptor; valid while
@@ -176,10 +193,69 @@ mod tests {
         assert!(!PROGRAM_DATA_SDDL.contains(";;;BU)") && !PROGRAM_DATA_SDDL.contains(";;;WD)"));
     }
 
+    #[test]
+    fn the_install_lock_is_admin_owned_protected_and_users_read_only() {
+        assert_eq!(INSTALL_DIR_SDDL, "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)");
+        assert!(!INSTALL_DIR_SDDL.contains(";;;AU)") && !INSTALL_DIR_SDDL.contains(";;;WD)"));
+    }
+
+    /// The hook's icacls lines, in order, with `$INSTDIR` as `dir`. The
+    /// owner line is skipped: an unelevated test cannot give a folder to
+    /// Administrators (the verb's check covers the owner).
+    #[cfg(windows)]
+    fn hook_icacls_lines() -> Vec<String> {
+        let hooks = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../src-tauri/windows/hooks.nsh");
+        let text = std::fs::read_to_string(&hooks).unwrap();
+        let lines: Vec<String> = text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("!insertmacro SIEVE_ICACLS '"))
+            .filter_map(|l| l.strip_suffix('\''))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 4, "the hook locks with four icacls calls: {lines:?}");
+        assert_eq!(lines[0], "/setowner *S-1-5-32-544", "owner first");
+        lines
+    }
+
+    /// Runs the hook's own icacls lines on a folder this test creates under
+    /// %TEMP% (nothing else is touched) and reads back exactly the DACL of
+    /// INSTALL_DIR_SDDL: the NSIS side and the Rust constant cannot drift.
+    #[cfg(windows)]
+    #[test]
+    fn the_hooks_icacls_lines_give_the_install_lock() {
+        use super::super::image::read_descriptor;
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("Sieve");
+        std::fs::create_dir(&dir).unwrap();
+        let icacls = std::path::Path::new(&std::env::var_os("SystemRoot").unwrap()).join(r"System32\icacls.exe");
+        for line in hook_icacls_lines().iter().skip(1) {
+            let out = std::process::Command::new(&icacls).arg(&dir).args(line.split_whitespace()).output().unwrap();
+            assert!(out.status.success(), "icacls {line}: {}", String::from_utf8_lossy(&out.stdout));
+        }
+        // Same ACEs; icacls orders them its own way, which does not matter
+        // for a DACL of allow ACEs only.
+        let sorted = |d: super::super::image::Descriptor| {
+            let mut aces = d.dacl.expect("a DACL");
+            aces.sort_by(|a, b| a.sid.cmp(&b.sid));
+            aces
+        };
+        let got = sorted(read_descriptor(&dir).unwrap());
+        let want = sorted(super::super::image::tests_support::parse_sddl(INSTALL_DIR_SDDL));
+        assert!(want.iter().all(|a| a.kind == super::super::image::AceKind::Allow));
+        assert_eq!(got, want);
+        // The folder is empty and its parent is ours, so it can be removed.
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_accepts_every_sddl_we_build() {
-        for sddl in [PROGRAM_DATA_SDDL.to_string(), pipe_sddl(Some(USER)).unwrap(), pipe_sddl(None).unwrap()] {
+        for sddl in [
+            PROGRAM_DATA_SDDL.to_string(),
+            INSTALL_DIR_SDDL.to_string(),
+            pipe_sddl(Some(USER)).unwrap(),
+            pipe_sddl(None).unwrap(),
+        ] {
             let sd = SecurityDescriptor::from_sddl(&sddl).unwrap();
             assert!(!sd.attributes().lpSecurityDescriptor.is_null());
         }
