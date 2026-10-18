@@ -35,8 +35,9 @@ test.describe("apps", () => {
 
     const toggle = row(page, CHROME).getByRole("switch", { name: "Sieve Google Chrome" });
     await expect(toggle).toBeChecked();
-    // Off is honest about DNS: said once, as the toggle's description and tooltip.
-    await expect(toggle).toHaveAttribute("title", /DNS blocking still covers it/);
+    // Off is said once, as the toggle's description and tooltip, and claims no blocking
+    // (nothing is blocked until the engine).
+    await expect(toggle).toHaveAttribute("title", "Off: Sieve stops tracking and charting this app.");
     await expect(page.getByTestId("sieved-count")).toContainText(/^\d+ being sieved$/);
     await expect(page.getByRole("radio")).toHaveCount(0);
 
