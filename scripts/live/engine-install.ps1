@@ -171,6 +171,17 @@ function Test-PipeOpen {
 Write-Host "Sieve engine live check, step '$Step'. Evidence: $Out"
 "==== $(Get-Date -Format s) step $Step as $(whoami)" | Out-File -Append -Encoding utf8 (Join-Path $Out "results.txt")
 
+# Never stop silently (seen live 2026-10-18: steps ended with no PASS/FAIL lines). Any error that
+# ends a step is printed and recorded in results.txt as an ERROR line, and counts as a failure.
+trap {
+  $msg = "ERROR  step '$Step' stopped at line {0}: {1}" -f $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message
+  Write-Host $msg -ForegroundColor Red
+  $msg | Out-File -Append -Encoding utf8 (Join-Path $Out "results.txt")
+  $script:Failed++
+  Write-Host ("{0} check(s) failed. Evidence in {1}" -f $script:Failed, $Out) -ForegroundColor Red
+  exit $script:Failed
+}
+
 switch ($Step) {
   "before" {
     Assert-Admin
@@ -261,9 +272,11 @@ switch ($Step) {
     $killedAt = Get-Date
     Start-Sleep -Seconds 1
     Test-Network "kill +1s"
-    Compare-WithBefore "kill"
+    # Timed at the network check itself; the listing comparison below is slow (firewall dump)
+    # and is not part of "the network works within 5 s" (live 2026-10-18 measured 5.3 s with it).
     $elapsed = ((Get-Date) - $killedAt).TotalSeconds
     Check "network checked within 5 s of the kill" ($elapsed -le 5) ("{0:N1} s" -f $elapsed)
+    Compare-WithBefore "kill"
     Start-Sleep -Seconds 10
     $state = (Get-Service $Service).Status
     Check "the SCM restarted the engine after 5 s (recovery)" ($state -eq "Running") "$state"
