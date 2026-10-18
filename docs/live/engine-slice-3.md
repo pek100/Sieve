@@ -46,6 +46,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\live\test-live-lease
 
 The local contract tests use temporary files inside the worktree and mocked service/network operations. See [the validation transcript](engine-slice-3-auto-validation.txt) for the commands and observed output. The real elevated workflow, including service recovery and timings, remains unverified until the user runs it.
 
+The performance workload transfers 300 MB as twelve 25 MB HTTPS responses in one curl process, verifies that exactly one TCP connection was used, and enforces a single 60-second deadline. A single 300 MB request returned HTTP 403 even with Sieve OFF on 2026-10-18. A rejected, short, timed-out or multi-connection transfer fails workload validation and cannot produce a CPU-budget pass. Raw transfer evidence is saved in `route-budget-transfer.json`.
+
 ## Before you start (manual flow)
 
 The interactive wrapper, unattended runner, individual routing steps and mutating install-check steps share `C:\Users\Public\sieve-engine-live\runner.lock`. A second runner refuses before changing the app, policy or services. The wrapper holds the lock across its prompts; only its verified child processes inherit it. Each child retains a handle, so it continues to exclude a second runner if the wrapper exits. The OS releases the lease after the last participating process exits or is killed; leftover files need no manual deletion. Older script copies do not participate: close those runners before using this version.
