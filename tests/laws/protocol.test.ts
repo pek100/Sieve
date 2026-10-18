@@ -149,7 +149,7 @@ describe("protocol law", () => {
     expect(() => parseEngineProbe(withStatus({ ...status, blocker: { kind: "elevate" } }))).toThrow(/blocker\.kind/);
     expect(() => parseEngineProbe(withStatus({ ...status, policy: { revision: 1 } }))).toThrow(/policy\.engine/);
     expect(() => parseEngineProbe(withStatus({ ...status, counters: { ...status.counters, attributed: -1 } }))).toThrow(/counters\.attributed/);
-    const { counters: _dropped, ...v1 } = status;
+    const v1 = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "counters"));
     expect(() => parseEngineProbe(withStatus(v1))).toThrow(/counters/);
     expect(() => parseEngineProbe({ ...idle, service: "paused" })).toThrow(/service/);
     expect(() => parseEngineProbe({ ...idle, pipe: { kind: "sign" } })).toThrow(/pipe\.kind/);

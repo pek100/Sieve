@@ -35,7 +35,7 @@ describe("engine IPC law", () => {
 
   it("the app reads the engine's v2 status and every blocker kind the crate declares", () => {
     const status = fixture.engine.find((m) => m.type === "status")!;
-    const { type: _type, ...body } = status;
+    const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
     expect(parseEngineStatus(body)).toEqual(body);
     const crate = (RUST.match(/pub enum Blocker \{([\s\S]*?)\n\}/)?.[1] ?? "").match(/^\s{4}(\w+)\b/gm) ?? [];
     const snake = crate.map((v) => v.trim().replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()));

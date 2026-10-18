@@ -36,6 +36,16 @@ pub fn snapshot() -> Result<Snapshot, NetstatError> {
         let buf = tables::read_table(kind)?;
         flows.extend(decode::decode_table(kind, &buf)?);
     }
+    described(t, flows)
+}
+
+/// A snapshot of flows the engine reported (it routes, so the connection
+/// tables would list each flow twice), with the same process facts.
+pub fn snapshot_of(flows: Vec<Flow>) -> Result<Snapshot, NetstatError> {
+    described(now_ms()?, flows)
+}
+
+fn described(t: u64, flows: Vec<Flow>) -> Result<Snapshot, NetstatError> {
     // One service list per snapshot: a hidden exe is named by the services it hosts.
     let services = process::service_names();
     let service_of = process::service_lookup(&services);

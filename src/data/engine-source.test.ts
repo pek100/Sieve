@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import fixture from "./fixtures/engine-probe-v1.json";
+import fixture from "./fixtures/engine-probe-v2.json";
 import { createTauriEngine } from "./engine-source";
 import { ProtocolError } from "./protocol";
 
@@ -15,7 +15,7 @@ describe("Tauri engine source", () => {
   });
 
   it("a malformed answer and a failed command reject, never become a fake state", async () => {
-    const bad = async <T,>(): Promise<T> => ({ v: 1, service: "running", pipe: { kind: "welcome" } }) as T;
+    const bad = async <T,>(): Promise<T> => ({ v: 2, service: "running", pipe: { kind: "welcome" } }) as T;
     await expect(createTauriEngine(bad).probe()).rejects.toThrow(ProtocolError);
     const failed = async <T,>(): Promise<T> => {
       throw new Error("service manager: Access is denied.");

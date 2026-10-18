@@ -37,7 +37,7 @@ export interface Runtime {
   readonly dns: DnsSource;
   /** The one owner of DNS state; components call its actions through hooks. */
   readonly dnsController: DnsController;
-  /** The engine seam (the Tauri command or the mock); read only. */
+  /** The engine seam (the Tauri commands or the mock). */
   readonly engine: EngineSource;
   /** The one owner of the store's engine part. */
   readonly engineController: EngineController;
@@ -84,7 +84,7 @@ export function createRuntime(o: RuntimeOptions): Runtime {
       clock,
     }),
     engine,
-    engineController: createEngineController({ engine, store, clock }),
+    engineController: createEngineController({ engine, store, clock, settings, checks: passedChecks, notices }),
   };
 }
 
@@ -114,7 +114,7 @@ export function bindDns(rt: Runtime): () => void {
   return rt.dnsController.bind();
 }
 
-/** Run the engine controller (probe now and on its cadence, read only). Returns the undo. */
+/** Run the engine controller (probe now and on its cadence, follow the engine switch). Returns the undo. */
 export function bindEngine(rt: Runtime): () => void {
   return rt.engineController.bind();
 }

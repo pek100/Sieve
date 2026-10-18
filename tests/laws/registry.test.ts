@@ -20,8 +20,8 @@ describe("registry law", () => {
     }
   });
 
-  it("every data switch's live check is an ignored Rust test of that name", () => {
-    const rust = walk("src-tauri/src", [".rs"]).map(read).join("\n");
+  it("every data switch's live check is an ignored Rust test of that name (the app's or the engine's)", () => {
+    const rust = [...walk("src-tauri/src", [".rs"]), ...walk("engine/crates", [".rs"])].map(read).join("\n");
     for (const [key, def] of defs) {
       if (def.kind !== "dataSwitch") continue;
       const declared = new RegExp(`#\\[ignore[^\\]]*\\]\\s*(?:#\\[[^\\]]*\\]\\s*)*async fn ${def.liveCheck}\\(|#\\[ignore[^\\]]*\\]\\s*fn ${def.liveCheck}\\(`);

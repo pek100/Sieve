@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 import { normalizeDoc } from "@/core/settings/document";
 import { RETIRED_KEYS } from "@/core/settings/migrate";
 import { SETTINGS_SCHEMA, SETTING_KEYS } from "@/core/settings/registry";
-import { hits, walk } from "./files";
+import { hits, read, walk } from "./files";
 
 /**
  * Persistent network writes and elevation, by the names code would have to
@@ -57,11 +57,35 @@ const sources = () => [
   ...walk("src-tauri/src", [".rs"]),
 ];
 
+/**
+ * The app's one elevation (the user's decision, 2026-10-17: offer to pause
+ * AdGuard; it has no supported pause from outside): `sc.exe stop|start
+ * "Adguard Service"`, run through the Windows prompt only when the user
+ * clicks. It lives in this file and nowhere else.
+ */
+const ELEVATION_FILE = "src-tauri/src/adguard.rs";
+const ELEVATION = /ShellExecuteEx|"runas"/;
+
 describe("normal network law", () => {
   it("no code in src or src-tauri/src writes system network state or elevates", () => {
     const files = sources();
     expect(files.length).toBeGreaterThan(50);
-    expect(files.flatMap((f) => hits(f, WRITES))).toEqual([]);
+    expect(files.flatMap((f) => hits(f, WRITES)).filter((h) => !(h.startsWith(ELEVATION_FILE) && ELEVATION.test(h)))).toEqual([]);
+  });
+
+  it("the only elevation is sc.exe stopping or starting AdGuard's service, with fixed arguments", () => {
+    const elevating = sources().filter((f) => hits(f, ELEVATION).length > 0);
+    expect(elevating).toEqual([ELEVATION_FILE]);
+    const src = read(ELEVATION_FILE);
+    expect(src.match(/ShellExecuteExW\(/g)).toHaveLength(1);
+    expect(src.match(/"runas"/g)).toHaveLength(1);
+    expect(src).toContain(String.raw`format!(r"{root}\System32\sc.exe")`);
+    expect(src).toContain('pub const ADGUARD_SERVICE: &str = "Adguard Service";');
+    expect(src).toContain('format!("{verb} \\"{ADGUARD_SERVICE}\\"")');
+    expect([...src.matchAll(/ServiceAction::(\w+) => "(\w+)"/g)].map((m) => m[2])).toEqual(["stop", "start"]);
+    // The commands take no argument from the web side.
+    expect(src).toMatch(/pub async fn adguard_stop\(\) ->/);
+    expect(src).toMatch(/pub async fn adguard_start\(\) ->/);
   });
 
   it("the pattern catches what it is for", () => {

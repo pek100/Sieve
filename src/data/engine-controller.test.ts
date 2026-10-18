@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { ENGINE_POLL_MS, enginePhase } from "@/core/engine";
+import { createPassedChecks } from "@/core/checks";
+import { ENGINE_POLL_MS, ENGINE_SWITCH, enginePhase } from "@/core/engine";
+import { createNoticeBus } from "@/core/notices";
+import type { SettingKey } from "@/core/settings/registry";
 import { createStore } from "@/core/store";
-import { createEngineController } from "./engine-controller";
-import { createMockEngine, MOCK_ENGINE_ERROR, type EngineScenario } from "./engine-mock";
+import { CRASH_LOOP_BANNER, createEngineController } from "./engine-controller";
+import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_ENGINE_ERROR, type EngineScenario } from "./engine-mock";
 import type { EngineSource } from "./engine-source";
 import type { Clock } from "./poller";
-import type { EngineProbe } from "./protocol";
+import type { EnginePolicy, EngineProbe } from "./protocol";
+import { createSettingsStore, memoryBackend, type SettingsBackend } from "./settings-store";
+
+const SWITCH = ENGINE_SWITCH as SettingKey;
 
 function fakeClock() {
   let now = 0;
@@ -20,7 +26,9 @@ function fakeClock() {
     },
     clearTimeout: (h) => void timers.delete(h as number),
   };
-  const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+  const flush = async () => {
+    for (let i = 0; i < 5; i++) await new Promise<void>((r) => setTimeout(r, 0));
+  };
   return {
     clock,
     flush,
@@ -40,27 +48,38 @@ function fakeClock() {
   };
 }
 
-/** A fake source whose scenario the test changes between probes, counting calls. */
+/** The mock engine, with its scenario changeable between probes and every call recorded. */
 function fakeEngine(start: EngineScenario) {
-  let scenario = start;
-  let calls = 0;
+  let mock = createMockEngine(start);
+  const policies: EnginePolicy[] = [];
+  let probes = 0;
   const source: EngineSource = {
     kind: "mock",
     probe: () => {
-      calls++;
-      return createMockEngine(scenario).probe();
+      probes++;
+      return mock.probe();
     },
+    setPolicy: (p) => {
+      policies.push(p);
+      return mock.setPolicy(p);
+    },
+    stopAdguard: () => mock.stopAdguard(),
+    startAdguard: () => mock.startAdguard(),
   };
-  return { source, set: (s: EngineScenario) => void (scenario = s), calls: () => calls };
+  return { source, set: (s: EngineScenario) => void (mock = createMockEngine(s)), probes: () => probes, policies };
 }
 
-function setup(start: EngineScenario) {
+function setup(start: EngineScenario, backend: SettingsBackend = memoryBackend()) {
   const fc = fakeClock();
   const store = createStore();
   const fake = fakeEngine(start);
-  const undo = createEngineController({ engine: fake.source, store, clock: fc.clock }).bind();
+  const settings = createSettingsStore(backend);
+  const checks = createPassedChecks();
+  const notices = createNoticeBus();
+  const controller = createEngineController({ engine: fake.source, store, clock: fc.clock, settings, checks, notices });
+  const undo = controller.bind();
   const phase = () => enginePhase(store.getState().engine);
-  return { fc, store, fake, undo, phase };
+  return { fc, store, fake, settings, checks, notices, controller, undo, phase };
 }
 
 describe("engine controller", () => {
@@ -91,7 +110,7 @@ describe("engine controller", () => {
     s.fake.set("unreachable");
     await s.fc.advance(ENGINE_POLL_MS);
     expect(s.phase()).toBe("not_running");
-    expect(s.fake.calls()).toBe(5);
+    expect(s.fake.probes()).toBe(5);
     s.undo();
   });
 
@@ -100,7 +119,8 @@ describe("engine controller", () => {
     await s.fc.flush();
     s.fake.set("error");
     await s.fc.advance(ENGINE_POLL_MS);
-    expect(s.store.getState().engine).toEqual({ probe: null, error: MOCK_ENGINE_ERROR });
+    expect(s.store.getState().engine.probe).toBeNull();
+    expect(s.store.getState().engine.error).toBe(MOCK_ENGINE_ERROR);
     expect(s.phase()).toBe("unreadable");
     s.fake.set("idle");
     await s.fc.advance(ENGINE_POLL_MS);
@@ -109,24 +129,111 @@ describe("engine controller", () => {
     s.undo();
   });
 
+  it("the switch defaults off: an idle engine is never told to route", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    await s.fc.advance(ENGINE_POLL_MS * 3);
+    expect(s.fake.policies).toEqual([]);
+    expect(s.phase()).toBe("idle");
+    s.undo();
+  });
+
+  it("turning the switch on sends it once with the next revision, and the engine routes", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    await s.settings.set(SWITCH, true);
+    await s.fc.flush();
+    expect(s.fake.policies).toEqual([{ revision: 1, engine: true }]);
+    expect(s.phase()).toBe("routing");
+    expect(s.checks.has(ENGINE_SWITCH)).toBe(true);
+    await s.fc.advance(ENGINE_POLL_MS * 2);
+    expect(s.fake.policies).toHaveLength(1);
+    await s.settings.set(SWITCH, false);
+    await s.fc.flush();
+    expect(s.fake.policies[1]).toEqual({ revision: 3, engine: false });
+    expect(s.phase()).toBe("idle");
+    expect(s.checks.has(ENGINE_SWITCH)).toBe(false);
+    s.undo();
+  });
+
+  it("an engine that routes while the user's switch is off is told to stop, but only after the settings loaded", async () => {
+    let release: (doc: unknown) => void = () => {};
+    const slow: SettingsBackend = { kind: "memory", load: () => new Promise((r) => (release = r)), save: async () => {} };
+    const s = setup("filtering", slow);
+    await s.fc.flush();
+    expect(s.fake.policies).toEqual([]);
+    release({ schema: 4, values: {} });
+    await s.fc.flush();
+    expect(s.fake.policies).toEqual([{ revision: 3, engine: false }]);
+    s.undo();
+  });
+
+  it("a stored on reaches an idle engine after load", async () => {
+    const s = setup("idle", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+    await s.fc.flush();
+    expect(s.fake.policies).toEqual([{ revision: 1, engine: true }]);
+    s.undo();
+  });
+
+  it("a crash loop shows one Home banner, gone when the user turns routing off and on", async () => {
+    const s = setup("crash_loop", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+    const banners = () => s.notices.list().filter((n) => n.surface === "banner").map((n) => n.text);
+    await s.fc.flush();
+    expect(s.phase()).toBe("crash_loop");
+    expect(banners()).toEqual([CRASH_LOOP_BANNER]);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(banners()).toHaveLength(1);
+    await s.settings.set(SWITCH, false);
+    await s.fc.flush();
+    await s.settings.set(SWITCH, true);
+    await s.fc.flush();
+    expect(s.phase()).toBe("routing");
+    expect(banners()).toEqual([]);
+    s.undo();
+  });
+
+  it("pausing AdGuard runs only on request, then probes: the waiting engine routes; starting it again makes it wait", async () => {
+    const s = setup("adguard", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+    await s.fc.flush();
+    expect(s.phase()).toBe("adguard");
+    const probes = s.fake.probes();
+    await s.controller.stopAdguard();
+    expect(s.fake.probes()).toBe(probes + 1);
+    expect(s.phase()).toBe("routing");
+    expect(s.store.getState().engine.adguard).toBeNull();
+    await s.controller.startAdguard();
+    expect(s.phase()).toBe("adguard");
+    s.undo();
+  });
+
+  it("a refused AdGuard action is said, and the facts stay the engine's", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    await s.controller.stopAdguard();
+    expect(s.store.getState().engine.actionError).toBe(`AdGuard was not paused: ${MOCK_ADGUARD_ERROR}`);
+    expect(s.phase()).toBe("idle");
+    s.undo();
+  });
+
   it("never overlaps probes: the next is scheduled after the previous settled", async () => {
     const fc = fakeClock();
     const store = createStore();
     let resolve: ((p: EngineProbe) => void) | null = null;
     let calls = 0;
+    const mock = createMockEngine("idle");
     const slow: EngineSource = {
-      kind: "mock",
+      ...mock,
       probe: () => {
         calls++;
         return new Promise((r) => (resolve = r));
       },
     };
-    const undo = createEngineController({ engine: slow, store, clock: fc.clock }).bind();
+    const deps = { settings: createSettingsStore(memoryBackend()), checks: createPassedChecks(), notices: createNoticeBus() };
+    const undo = createEngineController({ engine: slow, store, clock: fc.clock, ...deps }).bind();
     await fc.advance(ENGINE_POLL_MS * 5);
     expect(calls).toBe(1);
     expect(fc.pending()).toBe(0);
-    const answer = await createMockEngine("idle").probe();
-    resolve!(answer);
+    resolve!(await mock.probe());
     await fc.flush();
     expect(enginePhase(store.getState().engine)).toBe("idle");
     expect(fc.pending()).toBe(1);
@@ -138,18 +245,20 @@ describe("engine controller", () => {
     await s.fc.flush();
     s.undo();
     expect(s.fc.pending()).toBe(0);
-    const before = s.fake.calls();
+    const before = s.fake.probes();
     await s.fc.advance(ENGINE_POLL_MS * 3);
-    expect(s.fake.calls()).toBe(before);
+    expect(s.fake.probes()).toBe(before);
 
     const fc = fakeClock();
     const store = createStore();
     let resolve: ((p: EngineProbe) => void) | null = null;
-    const undo = createEngineController({ engine: { kind: "mock", probe: () => new Promise((r) => (resolve = r)) }, store, clock: fc.clock }).bind();
+    const mock = createMockEngine("idle");
+    const deps = { settings: createSettingsStore(memoryBackend()), checks: createPassedChecks(), notices: createNoticeBus() };
+    const undo = createEngineController({ engine: { ...mock, probe: () => new Promise((r) => (resolve = r)) }, store, clock: fc.clock, ...deps }).bind();
     undo();
-    resolve!(await createMockEngine("idle").probe());
+    resolve!(await mock.probe());
     await fc.flush();
-    expect(store.getState().engine).toEqual({ probe: null, error: null });
+    expect(store.getState().engine.probe).toBeNull();
     expect(fc.pending()).toBe(0);
   });
 });
