@@ -250,10 +250,11 @@ switch ($Step) {
     Write-Evidence "route-stall-build.txt" ("{0}  {1}" -f (Get-FileHash $stall).Hash, $stall)
     Stop-Service $Service
     Copy-Item $exe "$exe.normal" -Force
-    Copy-Item $stall $exe -Force
+    . (Join-Path $PSScriptRoot 'engine-binary.ps1')
+    try {
+    Copy-SieveStoppedEngine $stall $exe
     Remove-Item (Join-Path $EngineDir "last-error.txt") -ErrorAction SilentlyContinue
     Start-Service $Service
-    try {
       $up = Wait-For { (Get-SieveRoutes).Count -gt 0 } 30
       Check "the Stall build routes first" $up
       $upAt = Get-Date
@@ -267,7 +268,8 @@ switch ($Step) {
       Test-Network "stall" | Out-Null
     } finally {
       Stop-Service $Service -ErrorAction SilentlyContinue
-      Copy-Item "$exe.normal" $exe -Force
+      Copy-SieveStoppedEngine "$exe.normal" $exe
+      if ((Get-FileHash "$exe.normal").Hash -ne (Get-FileHash $exe).Hash) {throw 'Normal engine restore hash mismatch; backup retained'}
       Remove-Item "$exe.normal"
       Start-Service $Service
       Write-Host "The normal engine is back."

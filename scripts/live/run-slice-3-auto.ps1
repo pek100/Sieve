@@ -360,7 +360,8 @@ function Counter-Delta($baseline, $current) {
 function Restore-Binary {
   if ($script:OriginalBackup) {
     Service-State $Service "Stopped" $StopSeconds
-    Copy-Item -LiteralPath $script:OriginalBackup -Destination $script:EngineExe -Force
+    . (Join-Path $PSScriptRoot 'engine-binary.ps1')
+    Copy-SieveStoppedEngine $script:OriginalBackup $script:EngineExe
     Require "normal engine binary restored" ((Get-FileHash $script:EngineExe).Hash -eq $script:OriginalHash) $script:EngineExe
     Remove-Item -LiteralPath $script:OriginalBackup
     $script:OriginalBackup = $null
@@ -535,7 +536,8 @@ function Run-Auto {
     $script:OriginalBackup = $backup
     try {
       Save "route-stall-build.txt" ("$((Get-FileHash $StallBuild).Hash) $StallBuild")
-      Copy-Item -LiteralPath $StallBuild -Destination $script:EngineExe -Force
+      . (Join-Path $PSScriptRoot 'engine-binary.ps1')
+      Copy-SieveStoppedEngine $StallBuild $script:EngineExe
       $errorFile = Join-Path $EngineDir "last-error.txt"
       $oldError = if (Test-Path $errorFile) { (Get-Item $errorFile).LastWriteTimeUtc } else { [datetime]::MinValue }
       Service-State $Service "Running" $StopSeconds
