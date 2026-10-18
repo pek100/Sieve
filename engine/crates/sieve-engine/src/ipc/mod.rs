@@ -13,9 +13,10 @@ use sieve_ipc::{ClientMessage, EngineMessage, EngineStatus, FrameError, answer_h
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// The app's executable as the installer lays it out (Tauri's main binary,
-/// named after `productName`).
-pub const APP_EXE: &str = "Sieve.exe";
+/// The app's executable as the installer lays it out: Tauri's main binary,
+/// named after the src-tauri package (`!define MAINBINARYNAME "sieve"` in
+/// the generated installer.nsi, read 2026-10-18). Compared case-insensitively.
+pub const APP_EXE: &str = "sieve.exe";
 /// A client that sends no Hello within this is dropped.
 pub const HELLO_WAIT: Duration = Duration::from_secs(5);
 
@@ -115,6 +116,15 @@ mod tests {
             assert!(!client_allowed(refused, ENGINE), "{refused}");
         }
         assert!(!client_allowed(r"C:\Program Files\Sieve\Sieve.exe", "sieve-engine.exe"), "engine path without a folder");
+    }
+
+    /// Tauri names the bundled app after the src-tauri package; a rename
+    /// there must reach the client check, or the installed app is refused.
+    #[test]
+    fn the_allowed_exe_is_the_src_tauri_package() {
+        let manifest = include_str!("../../../../../src-tauri/Cargo.toml");
+        let name = manifest.lines().find_map(|l| l.strip_prefix("name = \"")?.strip_suffix('"')).unwrap();
+        assert_eq!(APP_EXE, format!("{name}.exe"));
     }
 
     fn idle() -> EngineStatus {
