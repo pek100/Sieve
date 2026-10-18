@@ -206,6 +206,8 @@ pub const LIVE_CHECKS: &[&str] = &[
     "no route on an interface named Sieve after the kill",
     "the watchdog removed the routes",
     "no route on an interface named Sieve after the reboot",
+    "the crash-loop stop engaged after three unclean ends within the hour",
+    "turning routing off and on ends the crash-loop stop",
     "idle CPU under 1 percent of one core",
     "relay CPU at most 15 percent of one core per 100 Mbit/s",
     "engine memory at most 300 MB",
