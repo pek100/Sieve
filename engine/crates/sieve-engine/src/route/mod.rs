@@ -69,14 +69,16 @@ pub fn delete_sieve_routes() -> Result<journal::Replay, String> {
     if report.failed == 0 { Ok(report) } else { Err(report.summary()) }
 }
 
-/// One classification shared by table cleanup and journal replay. Only
-/// ERROR_NOT_FOUND is an already-deleted route; every other error survives.
+/// One classification shared by table cleanup and journal replay.
+/// ERROR_NOT_FOUND (no such route) and ERROR_FILE_NOT_FOUND (the route's
+/// adapter no longer exists, so the route went with it) are already-deleted
+/// routes; every other error survives with its code.
 #[cfg(windows)]
 pub fn classify_delete(code: u32) -> journal::Deleted {
-    use windows::Win32::Foundation::{ERROR_NOT_FOUND, NO_ERROR};
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, NO_ERROR};
     if code == NO_ERROR.0 {
         journal::Deleted::Yes
-    } else if code == ERROR_NOT_FOUND.0 {
+    } else if code == ERROR_NOT_FOUND.0 || code == ERROR_FILE_NOT_FOUND.0 {
         journal::Deleted::NotThere
     } else {
         journal::Deleted::Failed(code)
@@ -106,7 +108,7 @@ mod tests {
         assert_eq!(replay.failed_codes, std::collections::BTreeMap::from([(ERROR_ACCESS_DENIED.0, 2)]));
         assert!(replay.summary().contains(&format!("codes {{{}: 2}}", ERROR_ACCESS_DENIED.0)));
         assert_eq!(journal.read().unwrap().0.len(), codes.len(), "failed entries remain retryable");
-        assert_eq!(classify_delete(ERROR_FILE_NOT_FOUND.0), journal::Deleted::Failed(ERROR_FILE_NOT_FOUND.0));
+        assert_eq!(classify_delete(ERROR_FILE_NOT_FOUND.0), journal::Deleted::NotThere, "the adapter took its routes with it");
         let cleaned = journal.replay(|_| classify_delete(ERROR_NOT_FOUND.0)).unwrap();
         assert_eq!((cleaned.deleted, cleaned.already_gone, cleaned.failed), (0, codes.len(), 0));
         assert!(cleaned.failed_codes.is_empty());
