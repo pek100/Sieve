@@ -35,6 +35,10 @@ $Service = "sieve-engine"
 $Pipe = "\\.\pipe\sieve-engine"
 $PipeShort = "sieve-engine"
 $InstallDir = Join-Path $env:ProgramFiles "Sieve"
+# Where the service really points wins: the installer let the user pick another folder
+# (seen live 2026-10-18: E:\Sieve, which inherited a user-writable ACL).
+$imagePath = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\sieve-engine" -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
+if ($imagePath) { $InstallDir = Split-Path -Parent ($imagePath.Trim('"').Split('"')[0]) }
 $EngineExe = Join-Path $InstallDir "sieve-engine.exe"
 $ProgramDataSieve = Join-Path $env:ProgramData "Sieve"
 $ServiceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\sieve-engine"
@@ -151,6 +155,12 @@ switch ($Step) {
     Write-Host "Running $installer. Approve the UAC prompt and click through the installer."
     Write-Evidence "installer-hash.txt" ("{0}  {1}" -f (Get-FileHash $installer).Hash, $installer)
     Start-Process -FilePath $installer -Wait
+    # The NSIS installer relaunches itself elevated, so -Wait can return before anything is
+    # installed (seen live 2026-10-18). Wait for the service itself, up to 5 minutes.
+    $deadline = (Get-Date).AddMinutes(5)
+    while (-not (Get-Service $Service -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+    Check "the service appeared after the installer" ([bool](Get-Service $Service -ErrorAction SilentlyContinue))
+    Start-Sleep -Seconds 3
     $f = Get-ServiceFacts
     foreach ($k in $f.Keys) { Write-Evidence "install-sc-$k.txt" $f[$k] }
     Check "sc qc: runs as LocalSystem" ($f.qc -match "SERVICE_START_NAME\s*:\s*LocalSystem")
