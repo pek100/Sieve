@@ -3,20 +3,30 @@
 //! `sieve-engine.exe` with no argument is the service itself (started by the
 //! SCM). The verbs are run by the NSIS installer, elevated, or by a person at
 //! an admin prompt:
-//! - `install`: create or update the service (LocalSystem, automatic start,
+//! - `install`: first check that only SYSTEM, Administrators and
+//!   TrustedInstaller can change the exe, everything beside it and the
+//!   folders above it (`image`; the installer locked the folder and left its
+//!   marker). If not, nothing else runs and the exit code is
+//!   [`EXIT_UNSAFE_FOLDER`]. Then create or update the service (LocalSystem, automatic start,
 //!   restart after 5 s twice then stay stopped, required privileges trimmed),
 //!   create `ProgramData\Sieve\engine` with an admin-only DACL, record the
 //!   installing user's SID (the pipe's one non-admin user), start it;
-//! - `uninstall`: remove Sieve's routes, stop and delete the service, delete
-//!   `ProgramData\Sieve`. Every step runs even when one fails, and rerunning
-//!   it is safe;
+//! - `uninstall`: remove Sieve's routes, stop and delete the service (by
+//!   name, wherever its registered image is), delete `ProgramData\Sieve`.
+//!   Every step runs even when one fails, and rerunning it is safe;
 //! - `restore`: the emergency off. Delete every route on an interface named
 //!   "Sieve" and stop the service; nothing else.
+//!
+//! The service runs the same `image` check at every start and refuses to run
+//! (exit code [`EXIT_UNSAFE_FOLDER`], reason in `last-error.txt`) when it
+//! fails, so a later ACL change cannot leave a SYSTEM service that users can
+//! replace.
 //!
 //! In slice 2 the running service changes nothing about traffic: no adapter,
 //! no routes. It only answers the pipe.
 
 pub mod acl;
+pub mod image;
 pub mod state;
 
 #[cfg(windows)]
@@ -78,6 +88,19 @@ pub fn parse_verb<I: IntoIterator<Item = String>>(args: I) -> Result<Verb, Strin
     }
 }
 
+/// The exe of a service's registered command line (its ImagePath): the text
+/// between the first pair of quotes, or the whole line when it is not
+/// quoted (windows-service quotes a path only when it needs it, and Sieve's
+/// service has no arguments). The NSIS hooks parse it the same way.
+pub fn image_exe(command_line: &str) -> std::path::PathBuf {
+    let line = command_line.trim();
+    let exe = match line.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => line,
+    };
+    std::path::PathBuf::from(exe)
+}
+
 /// One step of a verb and what came of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -91,8 +114,17 @@ impl Step {
     }
 }
 
+/// The step that checks who can change the engine's files (`image`).
+pub const FOLDER_STEP: &str = "binary folder";
+
+/// Exit code of a verb whose [`FOLDER_STEP`] refused, and the service's own
+/// exit code when it refuses to start for the same reason. The installer's
+/// hook names it (law 10).
+pub const EXIT_UNSAFE_FOLDER: i32 = 3;
+
 /// The verb's report: one line per step, and the exit code (0 when every
-/// step succeeded, 1 otherwise). A failed step never hides the later ones.
+/// step succeeded, [`EXIT_UNSAFE_FOLDER`] when the folder check refused, 1
+/// otherwise). A failed step never hides the later ones.
 pub fn report(verb: &str, steps: &[Step]) -> (String, i32) {
     let mut text = String::new();
     for s in steps {
@@ -108,7 +140,9 @@ pub fn report(verb: &str, steps: &[Step]) -> (String, i32) {
     } else {
         format!("{verb}: {failed} of {} steps failed\n", steps.len())
     });
-    (text, i32::from(failed > 0))
+    let unsafe_folder = steps.iter().any(|s| s.name == FOLDER_STEP && s.outcome.is_err());
+    let code = if unsafe_folder { EXIT_UNSAFE_FOLDER } else { i32::from(failed > 0) };
+    (text, code)
 }
 
 #[cfg(test)]
@@ -144,6 +178,28 @@ mod tests {
              uninstall: program data: ok, not there\nuninstall: 1 of 3 steps failed\n"
         );
         assert_eq!(report("restore", &steps[..1]).1, 0);
+    }
+
+    #[test]
+    fn the_registered_exe_is_read_quoted_or_not() {
+        use std::path::Path;
+        assert_eq!(image_exe(r#""C:\Program Files\Sieve\sieve-engine.exe""#), Path::new(r"C:\Program Files\Sieve\sieve-engine.exe"));
+        assert_eq!(image_exe(r#""E:\Sieve\sieve-engine.exe" --flag"#), Path::new(r"E:\Sieve\sieve-engine.exe"));
+        assert_eq!(image_exe(r"E:\Sieve\sieve-engine.exe"), Path::new(r"E:\Sieve\sieve-engine.exe"));
+        assert_eq!(image_exe(" \"E:\\a b\\x.exe"), Path::new(r"E:\a b\x.exe"), "an unclosed quote takes the rest");
+    }
+
+    #[test]
+    fn a_refused_folder_has_its_own_exit_code() {
+        let steps = [Step::run(FOLDER_STEP, || Err("refused: E:\\Sieve: Authenticated Users may change it".into()))];
+        let (text, code) = report("install", &steps);
+        assert_eq!(code, EXIT_UNSAFE_FOLDER);
+        assert_eq!(
+            text,
+            "install: binary folder: FAILED, refused: E:\\Sieve: Authenticated Users may change it\ninstall: 1 of 1 steps failed\n"
+        );
+        assert_eq!(report("install", &[Step::run(FOLDER_STEP, || Ok("fine".into()))]).1, 0);
+        assert_ne!(EXIT_UNSAFE_FOLDER, 1, "distinct from an ordinary failed step");
     }
 
     #[test]

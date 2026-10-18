@@ -34,14 +34,20 @@ if (-not $Installer) {
 $Service = "sieve-engine"
 $Pipe = "\\.\pipe\sieve-engine"
 $PipeShort = "sieve-engine"
-$InstallDir = Join-Path $env:ProgramFiles "Sieve"
-# Where the service really points wins: the installer let the user pick another folder
-# (seen live 2026-10-18: E:\Sieve, which inherited a user-writable ACL).
-$imagePath = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\sieve-engine" -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
-if ($imagePath) { $InstallDir = Split-Path -Parent ($imagePath.Trim('"').Split('"')[0]) }
-$EngineExe = Join-Path $InstallDir "sieve-engine.exe"
-$ProgramDataSieve = Join-Path $env:ProgramData "Sieve"
 $ServiceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\sieve-engine"
+# The install folder is the user's choice (E:\Sieve in the 2026-10-18 run), so it is
+# read from where the service points, again after the installer ran.
+function Get-InstallDir {
+  $imagePath = (Get-ItemProperty $ServiceKey -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
+  if ($imagePath) { return Split-Path -Parent ($imagePath.Trim().Trim('"').Split('"')[0]) }
+  Join-Path $env:ProgramFiles "Sieve"
+}
+$InstallDir = Get-InstallDir
+$EngineExe = Join-Path $InstallDir "sieve-engine.exe"
+$Marker = "sieve-install.marker"
+$ProgramDataSieve = Join-Path $env:ProgramData "Sieve"
+# SYSTEM, Administrators, TrustedInstaller: the only principals that may change the engine's files.
+$TrustedSids = @("S-1-5-18", "S-1-5-32-544", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
 $script:Failed = 0
 
 New-Item -ItemType Directory -Force $Out | Out-Null
@@ -121,6 +127,30 @@ function Get-ServiceFacts {
   [ordered]@{ qc = $qc; queryex = $query; qfailure = $failure; qprivs = $privs }
 }
 
+# Who besides SYSTEM, Administrators and TrustedInstaller can change $path: its owner
+# when untrusted, and every allow rule that grants a write, delete or ACL right. By SID,
+# so the answer does not depend on the Windows display language.
+$WriteRights = [System.Security.AccessControl.FileSystemRights]"WriteData, AppendData, WriteExtendedAttributes, DeleteSubdirectoriesAndFiles, WriteAttributes, Delete, ChangePermissions, TakeOwnership"
+function Get-NonAdminWriters([string]$path) {
+  $acl = Get-Acl -LiteralPath $path
+  $sidOf = { param($id) try { $id.Translate([Security.Principal.SecurityIdentifier]).Value } catch { "$id" } }
+  $found = @()
+  $owner = & $sidOf (New-Object Security.Principal.NTAccount($acl.Owner))
+  if ($TrustedSids -notcontains $owner) { $found += "owner $($acl.Owner)" }
+  foreach ($r in $acl.Access) {
+    if ($r.AccessControlType -ne "Allow") { continue }
+    $sid = & $sidOf $r.IdentityReference
+    if ($TrustedSids -contains $sid) { continue }
+    $inheritOnly = ($r.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0
+    # CREATOR OWNER on children only becomes whoever creates a file, who needs write here first.
+    if ($inheritOnly -and $sid -eq "S-1-3-0") { continue }
+    if (($r.FileSystemRights -band $WriteRights) -ne 0 -or ([int]$r.FileSystemRights -band 0x50000000) -ne 0) {
+      $found += "{0} {1}{2}" -f $r.IdentityReference, $r.FileSystemRights, $(if ($inheritOnly) { " (inherit only)" } else { "" })
+    }
+  }
+  $found
+}
+
 function Test-PipeOpen {
   # Opens the engine's pipe as the current user and reports what Windows said.
   $client = New-Object System.IO.Pipes.NamedPipeClientStream(".", $PipeShort, [System.IO.Pipes.PipeDirection]::InOut)
@@ -161,12 +191,30 @@ switch ($Step) {
     while (-not (Get-Service $Service -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
     Check "the service appeared after the installer" ([bool](Get-Service $Service -ErrorAction SilentlyContinue))
     Start-Sleep -Seconds 3
+    $InstallDir = Get-InstallDir
+    $EngineExe = Join-Path $InstallDir "sieve-engine.exe"
     $f = Get-ServiceFacts
     foreach ($k in $f.Keys) { Write-Evidence "install-sc-$k.txt" $f[$k] }
     Check "sc qc: runs as LocalSystem" ($f.qc -match "SERVICE_START_NAME\s*:\s*LocalSystem")
     Check "sc qc: automatic start" ($f.qc -match "START_TYPE\s*:\s*2\s+AUTO_START")
-    Check "sc qc: binary is in Program Files\Sieve" ($f.qc -match [regex]::Escape($EngineExe))
+    Check "sc qc: binary is the engine in the chosen folder" ($f.qc -match [regex]::Escape($EngineExe)) $EngineExe
     Check "sc queryex: running" ($f.queryex -match "STATE\s*:\s*4\s+RUNNING")
+    Check "sc queryex: did not refuse its folder (exit code 3)" (-not ($f.queryex -match "SERVICE_EXIT_CODE\s*:\s*3\b"))
+    # The install folder (2026-10-18 finding: E:\Sieve inherited Authenticated Users Modify).
+    $dirAcl = Get-Acl -LiteralPath $InstallDir
+    Write-Evidence "install-folder-acl.txt" (((icacls $InstallDir) -join "`n") + "`n`nSDDL: " + $dirAcl.Sddl)
+    Write-Evidence "install-engine-acl.txt" ((icacls $EngineExe) -join "`n")
+    $inherited = @($dirAcl.Access | Where-Object { $_.IsInherited })
+    Check "install folder DACL is protected (no inherited ACEs)" ($dirAcl.AreAccessRulesProtected -and $inherited.Count -eq 0) "$InstallDir, $($inherited.Count) inherited"
+    $writers = @(Get-NonAdminWriters $InstallDir)
+    Check "install folder grants write only to SYSTEM and Administrators" ($writers.Count -eq 0) ($writers -join "; ")
+    $fileWriters = @(Get-ChildItem -LiteralPath $InstallDir -Force | ForEach-Object {
+        $name = $_.Name
+        Get-NonAdminWriters $_.FullName | ForEach-Object { "${name}: $_" }
+      })
+    Check "binary folder grants no write to non-admins (every file in it, the engine included)" ($fileWriters.Count -eq 0) ($fileWriters -join "; ")
+    Check "the installer's marker is in the folder" (Test-Path -LiteralPath (Join-Path $InstallDir $Marker))
+    Check "no last-error.txt (the engine did not refuse to start)" (-not (Test-Path (Join-Path $ProgramDataSieve "engine\last-error.txt")))
     Check "sc qfailure: restart twice, reset after 3600 s" (($f.qfailure -match "RESET_PERIOD \(in seconds\)\s*:\s*3600") -and (([regex]::Matches($f.qfailure, "RESTART -- Delay = 5000")).Count -eq 2))
     Check "sc qprivs: only SeChangeNotifyPrivilege" (($f.qprivs -match "SeChangeNotifyPrivilege") -and -not ($f.qprivs -match "SeDebugPrivilege|SeTcbPrivilege|SeLoadDriverPrivilege"))
     $acl = (icacls $ProgramDataSieve) -join "`n"
@@ -257,7 +305,8 @@ switch ($Step) {
     Check "no service left" ($sc -match "1060")
     Check "no ProgramData\Sieve left" (-not (Test-Path $ProgramDataSieve))
     Check "nothing under HKLM\SYSTEM\CurrentControlSet\Services\sieve-engine" (-not (Test-Path $ServiceKey))
-    Check "no sieve-engine.exe left in Program Files\Sieve" (-not (Test-Path $EngineExe))
+    Check "no sieve-engine.exe left in the install folder" (-not (Test-Path $EngineExe)) $EngineExe
+    Check "no install folder left" (-not (Test-Path -LiteralPath $InstallDir)) $InstallDir
     Compare-WithBefore "uninstall"
     Test-Network "uninstall"
   }

@@ -1,5 +1,7 @@
-//! The service process (started by the SCM only). It reports Running, serves
-//! the pipe until Windows asks it to stop or shut down, then reports Stopped.
+//! The service process (started by the SCM only). It first checks who can
+//! change its files (`image`, the same check as `install`) and refuses to run
+//! when users can; then it reports Running, serves the pipe until Windows
+//! asks it to stop or shut down, and reports Stopped.
 //! In slice 2 it changes nothing about traffic: no adapter, no routes.
 
 use std::ffi::OsString;
@@ -14,13 +16,17 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::{define_windows_service, service_dispatcher};
 
 use super::acl::pipe_sddl;
-use super::{SERVICE_NAME, state};
+use super::image::check_this_exe;
+use super::{EXIT_UNSAFE_FOLDER, SERVICE_NAME, state};
 use crate::ipc::server;
 
 /// Bound for the runtime's own shutdown after the pipe stops.
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(3);
 /// Service-specific exit code when the engine could not run.
 const FAILED: u32 = 1;
+/// Service-specific exit code when it refused to run from a folder users can
+/// change (`sc query` shows it as SERVICE_EXIT_CODE).
+const UNSAFE_FOLDER: u32 = EXIT_UNSAFE_FOLDER as u32;
 
 define_windows_service!(ffi_service_main, service_main);
 
@@ -57,6 +63,13 @@ fn service_main(_args: Vec<OsString>) {
             process_id: None,
         });
     };
+    // Every start, before anything runs: a LocalSystem service whose files
+    // users can change must not run (the ACL may have changed since install).
+    if let Err(why) = check_this_exe() {
+        record_failure(&why);
+        report(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::ServiceSpecific(UNSAFE_FOLDER));
+        return;
+    }
     report(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, ServiceExitCode::Win32(0));
     let code = match serve(stop_rx) {
         Ok(()) => ServiceExitCode::Win32(0),
