@@ -152,6 +152,8 @@ function Invoke-P0Sample([string]$Kind,[int]$Iteration,[string]$Exe,$Workload,[s
       try {Assert-P0RoutingOff (Get-P0RoutingState) -AssumeRoutingOff:$AssumeRoutingOff}
       catch {if(-not $watch.Seen){$watch.Seen=$_.Exception.Message}}
     }
+    # Polls every 100 ms; see docs/live/p0-relay-floor.md for the residual gap.
+    $transfer.PollMs=100
     try {$row.Transfer=Invoke-SieveBudgetTransfer @transfer}
     finally {
       if ($relay) {

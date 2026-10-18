@@ -17,6 +17,8 @@ The assumption never overrides an observed Sieve route, unreadable route table, 
 
 Each timestamped `C:\Users\Public\sieve-engine-live\p0-relay-floor-*\evidence.json` records the workload, raw curl results, routing observations and assumptions, AdGuard state at start/end, and relay JSON. The relay counts successful payload writes in both directions, excluding CONNECT setup, and obtains its own user/kernel CPU time with `GetProcessTimes`. Its CPU includes process startup and shutdown; the throughput clock is the curl workload wall time. Scoring uses validated HTTP body bytes, matching the slice budget, rather than the larger TLS/socket byte count. The normalization is `(CPU seconds / wall seconds) / (body bytes * 8 / wall seconds / 1e6 / 100)`. Invalid workloads, cancelled connections and missing or inconsistent relay records remain unscored. Medians use valid runs only; an incomplete requested set has no pass verdict. A complete set passes at CPU median at most `0.05` cores per `100 Mbit/s` and candidate throughput median within `10 percent` of direct, in either direction. Results with AdGuard running describe that environment, not an isolated redirect floor.
 
+Routing is checked before each download, every 100 ms during it, and after it, and any sighting invalidates the sample. Unelevated, the runner cannot read the engine's admin-only status, so routing switched on and off entirely between two checks would go unseen. Keep the Sieve app closed for the whole run: only the app or an elevated runner (which the lease excludes) can switch routing. A run that overruns its deadline is invalid even if curl finished during a slow check.
+
 Offline verification commands (the PowerShell tests use mocks, not live measurements):
 
 ```powershell

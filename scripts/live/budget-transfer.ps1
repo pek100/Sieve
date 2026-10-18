@@ -53,7 +53,10 @@ function Invoke-SieveBudgetTransfer([int]$Seconds=60,[string]$Url='', [int]$Coun
       if ($slice -ge $remaining) {$timedOut=$true;break}
       & $WhileRunning
     }
-    if ($timedOut) {$p.Kill()}
+    # A slow WhileRunning call can return after the deadline while curl has
+    # exited meanwhile: that run is still over time.
+    if ($clock.Elapsed.TotalMilliseconds -gt 1000*$Seconds) {$timedOut=$true}
+    if ($timedOut -and -not $p.HasExited) {$p.Kill()}
     $p.WaitForExit()
     $result=Read-SieveBudgetTransfer $output.Result $p.ExitCode $timedOut -Count $Count -Size $Size
     $result | Add-Member NoteProperty Seconds $clock.Elapsed.TotalSeconds

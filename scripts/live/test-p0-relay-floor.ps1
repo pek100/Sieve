@@ -85,7 +85,7 @@ function Stop-P0Relay {
 }
 function Start-Sleep {param($Seconds);$script:trace.Add("pause:$Seconds")}
 function Invoke-SieveBudgetTransfer {
-  param($Seconds,$Url,$Count,$Size,$Proxy,$WhileRunning)
+  param($Seconds,$Url,$Count,$Size,$Proxy,$WhileRunning,$PollMs)
   $script:trace.Add($(if($Proxy){'curl-proxy'}else{'curl-direct'}))
   if ($script:curlThrows) {throw 'mock curl launch failure'}
   if (-not $WhileRunning) {throw 'transfer is not watched while it runs'}
