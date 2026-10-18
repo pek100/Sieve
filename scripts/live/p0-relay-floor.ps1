@@ -139,12 +139,13 @@ function Invoke-P0Sample([string]$Kind,[int]$Iteration,[string]$Exe,$Workload,[s
   try {
     $row.Before=Get-P0RoutingState
     Assert-P0RoutingOff $row.Before -AssumeRoutingOff:$AssumeRoutingOff
-    $args=@{};foreach($key in $Workload.Keys){$args[$key]=$Workload[$key]}
+    # Not $args: that is PowerShell's automatic variable.
+    $transfer=@{};foreach($key in $Workload.Keys){$transfer[$key]=$Workload[$key]}
     if ($Kind -eq 'candidate') {
       $relay=Start-P0Relay -Exe $Exe -Seconds $Workload.Seconds
-      $args.Proxy='http://127.0.0.1:'+$relay.Port
+      $transfer.Proxy='http://127.0.0.1:'+$relay.Port
     }
-    try {$row.Transfer=Invoke-SieveBudgetTransfer @args}
+    try {$row.Transfer=Invoke-SieveBudgetTransfer @transfer}
     finally {
       if ($relay) {
         $stopping=$relay;$relay=$null
