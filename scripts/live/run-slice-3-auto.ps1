@@ -634,10 +634,12 @@ finally {
   if (-not $DryRun) {
     try { Restore-State }
     finally {
-      if ($script:LiveLease -and -not $script:LiveLease.Inherited) {
+      if ($script:LiveLease) {
         $script:LiveLease.Stream.Dispose()
-        $env:SIEVE_LIVE_RUN_TOKEN=$script:LiveLease.PreviousToken
-        $env:SIEVE_LIVE_RUN_OWNER=$script:LiveLease.PreviousOwner
+        if (-not $script:LiveLease.Inherited) {
+          $env:SIEVE_LIVE_RUN_TOKEN=$script:LiveLease.PreviousToken
+          $env:SIEVE_LIVE_RUN_OWNER=$script:LiveLease.PreviousOwner
+        }
       }
     }
   }

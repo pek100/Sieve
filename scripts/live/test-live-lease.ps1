@@ -13,9 +13,9 @@ $ErrorActionPreference='Stop'
 if ($Mode -eq 'contend') {$env:SIEVE_LIVE_RUN_TOKEN=$null; $env:SIEVE_LIVE_RUN_OWNER=$null}
 try {
   $lease=Enter-SieveLiveLease $Path
-  if ($Mode -eq 'inherit' -and -not $lease.Inherited) {throw 'Child did not inherit'}
+  if ($Mode -like 'inherit*' -and -not $lease.Inherited) {throw 'Child did not inherit'}
   if ($Mode -eq 'contend') {throw 'Competing root acquired the lock'}
-  if ($Mode -eq 'hold') {
+  if ($Mode -in @('hold','inherit-hold')) {
     [IO.File]::WriteAllText($Ready,'ready')
     Start-Sleep -Seconds 30
   }
@@ -40,7 +40,18 @@ try {
   Run-Child 'inherit'
   Write-Host 'PASS: real child inherits without releasing parent handle'
   Run-Child 'contend'
+  $ready=Join-Path $scratch 'ready.txt'
+  $args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$child+'"'),'-Helper',('"'+$helper+'"'),'-Path',('"'+$path+'"'),'-Mode','inherit-hold','-Ready',('"'+$ready+'"'))
+  $holder=Start-Process powershell.exe -WindowStyle Hidden -ArgumentList $args -PassThru
+  $clock=[Diagnostics.Stopwatch]::StartNew()
+  while (-not (Test-Path -LiteralPath $ready) -and $clock.Elapsed.TotalSeconds -lt 10) {Start-Sleep -Milliseconds 50}
+  if (-not (Test-Path -LiteralPath $ready)) {throw 'Inherited holder did not become ready'}
   Exit-SieveLiveLease $lease; $lease=$null
+  Run-Child 'contend'
+  Write-Host 'PASS: surviving child keeps the lease after parent releases its handle'
+  Stop-Process -Id $holder.Id -Force
+  $holder.WaitForExit()
+  Remove-Item -LiteralPath $ready
   if ($env:SIEVE_LIVE_RUN_TOKEN -ne $originalToken) {throw 'Environment not restored'}
   $lease=Enter-SieveLiveLease $path
   Exit-SieveLiveLease $lease; $lease=$null
@@ -60,6 +71,6 @@ try {
   if ($lease) {Exit-SieveLiveLease $lease}
   if ($holder -and -not $holder.HasExited) {Stop-Process -Id $holder.Id -Force}
   # Only known test files; no recursive delete or computed external paths.
-  foreach($file in @($child,$path,(Join-Path $scratch 'ready.txt'))) {if(Test-Path -LiteralPath $file){Remove-Item -LiteralPath $file}}
+  foreach($file in @($child,$path,($path+'.gate'),(Join-Path $scratch 'ready.txt'))) {if(Test-Path -LiteralPath $file){Remove-Item -LiteralPath $file}}
   Remove-Item -LiteralPath $scratch
 }
