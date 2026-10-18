@@ -296,8 +296,9 @@ test.describe("alignment law", () => {
       const b = (await row.boundingBox())!;
       if (Math.abs(b.x - col.x) > TOL || Math.abs(right(b) - right(col)) > TOL) failures.push(`row ${await row.getAttribute("data-setting")} is not column wide`);
     }
-    // One owner for the upstream servers: the DNS filter section.
-    if ((await page.getByText("Upstream DNS servers", { exact: true }).count()) !== 1) failures.push("Upstream DNS servers appears more than once");
+    // One owner for the upstream servers at most: the DNS filter's card, while it is available
+    // (hidden until the engine replaces it, so none today).
+    if ((await page.getByText("Upstream DNS servers", { exact: true }).count()) > 1) failures.push("Upstream DNS servers appears more than once");
     expect(failures, failures.join("\n")).toEqual([]);
     expect(await noSidewaysOverflow(page)).toBeLessThanOrEqual(0);
     expect(errors).toEqual([]);

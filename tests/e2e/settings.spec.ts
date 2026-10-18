@@ -20,12 +20,13 @@ test.describe("settings", () => {
     const errors = await openSettings(page);
     await expect(page.getByRole("link", { name: "Settings" })).toHaveAttribute("aria-current", "page");
     const rail = page.getByRole("navigation", { name: "Settings sections" });
+    // Filtering stays: it carries the engine.
     await expect(rail.getByRole("link")).toHaveText(["Appearance", "Sampling", "Startup", "Apps", "Filtering"]);
-    // Seven rows: theme, sieving, interval, launch at startup, apps turned off, my apps, DNS filtering.
-    // The upstream servers are edited in the DNS filter section only (one owner). There is no
-    // Windows DNS row: Sieve never changes Windows DNS (removed 2026-10-18).
-    await expect(page.locator("[data-setting]")).toHaveCount(7);
-    await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(1);
+    // Six rows: theme, sieving, interval, launch at startup, apps turned off, my apps. DNS
+    // filtering and its upstream servers are unavailable until the engine replaces them
+    // (2026-10-18). There is no Windows DNS row: Sieve never changes Windows DNS.
+    await expect(page.locator("[data-setting]")).toHaveCount(6);
+    await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(0);
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
 
     if (info.project.name === "desktop") {
@@ -44,12 +45,12 @@ test.describe("settings", () => {
     expect(errors).toEqual([]);
   });
 
-  test("there is no per-app filtering row and no Windows DNS row; DNS filtering is a live switch", async ({ page }, info) => {
+  test("there is no per-app filtering row, no Windows DNS row and no DNS filtering switch", async ({ page }, info) => {
     await openSettings(page);
     await expect(row(page, "filtering.perApp")).toHaveCount(0);
     await expect(row(page, "filtering.systemDns")).toHaveCount(0);
-    await expect(row(page, "filtering.dns").getByRole("switch")).toBeEnabled();
-    await expect(row(page, "filtering.dns")).toContainText("Windows keeps its own DNS servers.");
+    await expect(row(page, "filtering.dns")).toHaveCount(0);
+    await expect(page.getByRole("region", { name: "DNS filter" })).toHaveCount(0);
     // Launch at startup needs the desktop app; the browser shows why.
     const startup = row(page, "startup.launchAtLogin");
     await startup.scrollIntoViewIfNeeded();
@@ -59,10 +60,10 @@ test.describe("settings", () => {
     await startup.screenshot({ path: `test-results/screens/settings-locked-${info.project.name}.png` });
   });
 
-  test("every section ends at its content: the last one (Filtering, then the DNS filter) is not stretched", async ({ page }) => {
+  test("every section ends at its content: the last one (Filtering's engine) is not stretched", async ({ page }) => {
     await openSettings(page);
     const gaps = await page.evaluate(() =>
-      [...document.querySelectorAll<HTMLElement>("main [id^='section-'] > section, main [id^='section-'] > div > section")].map((s) => {
+      [...document.querySelectorAll<HTMLElement>("main [id^='section-'] section[aria-label]:not(section[aria-label] section)")].map((s) => {
         const own = s.getBoundingClientRect();
         let content = own.top;
         // Leaves only: a wrapper stretched with the section would hide the gap.
@@ -70,8 +71,9 @@ test.describe("settings", () => {
         return { name: s.getAttribute("aria-label"), height: own.height, gap: own.bottom - content };
       }),
     );
-    // Five registry sections plus the DNS filter and the engine.
-    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "DNS filter", "Engine"]);
+    // Four registry sections with rows, then the engine (Filtering has no available row: its
+    // DNS filter is hidden until the engine replaces it).
+    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Engine"]);
     // Was 686 px of empty space under Filtering's rows: its card took the height of the
     // wrapper that also holds the DNS filter (Card h-full).
     // Allowed: a row's own bottom padding (16) and at most a section's padding.
@@ -94,16 +96,17 @@ test.describe("settings", () => {
     await openSettings(page);
     await page.getByRole("button", { name: "Settings actions" }).click();
     await page.getByRole("menuitem", { name: "Import settings" }).click();
-    const file = JSON.stringify({ kind: "sieve.settings", schema: 1, values: { "sampling.intervalMs": 2000, "filtering.dns": true } });
+    const file = JSON.stringify({ kind: "sieve.settings", schema: 4, values: { "sampling.intervalMs": 2000, "filtering.dns": true } });
     await page.getByRole("textbox", { name: "Settings file to import" }).fill(file);
     await page.getByRole("button", { name: "Preview changes" }).click();
     await expect(page.getByRole("list", { name: "Changes" })).toContainText("Sample every");
     await expect(page.getByRole("list", { name: "Not imported" })).toContainText("filtering.dns");
+    await expect(page.getByRole("list", { name: "Not imported" })).toContainText("Not available in this version of Sieve");
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
     await page.screenshot({ path: `test-results/screens/settings-import-${info.project.name}.png` });
     await page.getByRole("button", { name: "Apply 1 change" }).click();
     await expect(row(page, "sampling.intervalMs")).toContainText("2 s");
-    await expect(row(page, "filtering.dns").getByRole("switch")).not.toBeChecked();
+    await expect(row(page, "filtering.dns")).toHaveCount(0);
 
     await page.getByRole("button", { name: "Settings actions" }).click();
     await page.getByRole("menuitem", { name: "Reset to defaults" }).click();
