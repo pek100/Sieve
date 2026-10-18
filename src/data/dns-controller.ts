@@ -15,8 +15,13 @@
  * WINDOWS_DNS_POLL_MS, `windows_dns` is read, and while `strandedAdapters`
  * finds an adapter asking 127.0.0.1 or ::1 with no Sieve listener there
  * (an old build pointed it, or someone did by hand), a Home banner says so
- * (STRANDED_DNS_TEXT). It goes when that stops being true; the DNS card
- * says the same for as long as it is true.
+ * (STRANDED_DNS_TEXT), with no action: it points to Windows network
+ * settings. It goes when that stops being true; the DNS card says the same
+ * for as long as it is true.
+ *
+ * While `filtering.dns` is unavailable (registry `unavailableUntil`) it reads
+ * off whatever is stored, so the filter is never started; the safety net runs
+ * all the same.
  *
  * dns_status is read every DNS_POLL_MS while the filter runs, with the
  * AdGuard read alongside. Time comes from the injected clock.
@@ -102,12 +107,8 @@ export function createDnsController(d: DnsControllerDeps): DnsController {
     if (disposed || !loaded || get().busy !== null) return;
     const stranded = strandedAdapters(get().windows, get().status).length > 0;
     if (stranded && safetyBanner === null) {
-      safetyBanner = notices.push({
-        kind: "error",
-        surface: "banner",
-        text: STRANDED_DNS_TEXT,
-        action: { label: "Turn DNS filtering on", run: () => void settings.set(DNS_SWITCH, true) },
-      });
+      // No action: the way out is Windows' own network settings, which the text names.
+      safetyBanner = notices.push({ kind: "error", surface: "banner", text: STRANDED_DNS_TEXT });
     } else if (!stranded && safetyBanner !== null) {
       notices.dismiss(safetyBanner);
       safetyBanner = null;

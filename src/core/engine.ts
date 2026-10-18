@@ -12,6 +12,10 @@ import type { EngineProbe } from "@/data/protocol";
 /** How often the engine is asked while Sieve is open (plan 1.6.5). */
 export const ENGINE_POLL_MS = 2000;
 
+/** The Engine block's anchor in Settings (Settings > Engine), and the link to it (Home's Engine tile). */
+export const ENGINE_ANCHOR = "engine";
+export const ENGINE_HREF = `/settings/#${ENGINE_ANCHOR}`;
+
 export interface EngineSlice {
   /** Newest probe; null before the first answer or after a failed read. */
   probe: EngineProbe | null;

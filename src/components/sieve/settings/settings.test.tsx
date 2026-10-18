@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { SECTIONS, SETTING_KEYS, settingDef } from "@/core/settings/registry";
+import { SECTIONS, SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef } from "@/core/settings/registry";
 import { EXPORT_KIND } from "@/core/settings/transfer";
 import type { Desktop } from "@/data/desktop";
 import { createMockSource } from "@/data/mock-source";
@@ -32,10 +32,16 @@ async function setup(stored?: unknown) {
 const row = (key: string) => document.querySelector<HTMLElement>(`[data-setting="${key}"]`)!;
 
 describe("settings view (rendered from the registry)", () => {
-  it("shows one row per registry key under its section (the DNS card's own keys only there), and the rail lists the sections in order", async () => {
+  it("shows one row per available registry key under its section, none for an unavailable one, and the rail lists the sections in order", async () => {
     await setup();
     for (const key of SETTING_KEYS) {
       const r = row(key);
+      if (!isAvailable(key)) {
+        // Unavailable (unavailableUntil): no row, and nothing else on screen edits it.
+        expect(r, key).toBeNull();
+        expect(screen.queryAllByText(settingDef(key).label), key).toHaveLength(0);
+        continue;
+      }
       if (DNS_CARD_KEYS.has(key)) {
         // One owner on screen: the DNS filter section edits it, no row repeats it.
         expect(r, key).toBeNull();
@@ -46,8 +52,9 @@ describe("settings view (rendered from the registry)", () => {
       expect(r).toHaveTextContent(settingDef(key).label);
     }
     const rail = screen.getByRole("navigation", { name: "Settings sections" });
+    // Every section with an available key, and Filtering, which carries the engine.
     expect(within(rail).getAllByRole("link").map((a) => a.textContent)).toEqual(
-      SECTIONS.filter((s) => SETTING_KEYS.some((k) => settingDef(k).section === s.id)).map((s) => s.label),
+      SECTIONS.filter((s) => s.id === "filtering" || SETTING_KEYS.some((k) => isAvailable(k) && settingDef(k).section === s.id)).map((s) => s.label),
     );
   });
 
@@ -58,17 +65,34 @@ describe("settings view (rendered from the registry)", () => {
     expect(row("apps.levels")).toHaveTextContent("Apps turned off");
   });
 
-  it("DNS filtering is a live switch: on starts the filter and records its passed self check", async () => {
-    const rt = await setup();
-    const dns = row("filtering.dns");
-    expect(dns.querySelector("[data-lock]")).toBeNull();
-    expect(dns).toHaveTextContent(/filters only lookups sent to it directly; Windows keeps its own DNS servers/);
+  it("the DNS filter is hidden until the engine replaces it: no switch, no card; Filtering shows the engine", async () => {
+    // Stored by an old build with DNS filtering on.
+    const rt = await setup({ schema: 3, values: { "filtering.dns": true } });
+    expect(row("filtering.dns")).toBeNull();
+    expect(screen.queryByRole("region", { name: "DNS filter" })).toBeNull();
+    expect(screen.queryByRole("switch", { name: /DNS filtering/ })).toBeNull();
+    expect(screen.queryByText("Upstream DNS servers")).toBeNull();
     // There is no switch that points Windows DNS anywhere (removed 2026-10-18).
     expect(document.querySelector('[data-setting="filtering.systemDns"]')).toBeNull();
-    await userEvent.click(within(dns).getByRole("switch"));
-    await vi.waitFor(() => expect(rt.passedChecks.has("filtering.dns")).toBe(true));
-    expect(rt.store.getState().dns.status?.running).toBe(true);
-    expect(within(row("filtering.dns")).getByRole("switch")).toBeChecked();
+    const filtering = document.getElementById("section-filtering")!;
+    expect(within(filtering).getByRole("region", { name: "Engine" })).toBeInTheDocument();
+    expect(filtering.querySelector("#engine")).not.toBeNull();
+    // The stored "on" reads off, and the filter is never started for it.
+    expect(rt.settings.get("filtering.dns")).toBe(false);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(rt.store.getState().dns.status?.running).toBe(false);
+    expect(rt.passedChecks.has("filtering.dns")).toBe(false);
+  });
+
+  it("a search hides the engine's section unless a Filtering key matches; clearing it brings it back", async () => {
+    await setup();
+    const search = screen.getByRole("searchbox", { name: "Search settings" });
+    fireEvent.change(search, { target: { value: "theme" } });
+    expect(screen.queryByRole("region", { name: "Engine" })).toBeNull();
+    fireEvent.change(search, { target: { value: "" } });
+    expect(screen.getByRole("region", { name: "Engine" })).toBeInTheDocument();
   });
 
   it("launch at startup is a switch only the desktop app can change", async () => {
@@ -128,21 +152,22 @@ describe("settings view (rendered from the registry)", () => {
     fireEvent.change(search, { target: { value: "zzz" } });
     expect(screen.getByText("No setting matches")).toBeInTheDocument();
     fireEvent.keyDown(search, { key: "Escape" });
-    expect(document.querySelectorAll("[data-setting]")).toHaveLength(SETTING_KEYS.length - DNS_CARD_KEYS.size);
+    expect(document.querySelectorAll("[data-setting]")).toHaveLength(SETTING_KEYS.filter((k) => isAvailable(k) && !DNS_CARD_KEYS.has(k)).length);
   });
 
-  it("import previews every change before applying, never turns a data switch on, and undo restores", async () => {
+  it("import previews every change before applying, never reaches the hidden DNS switch, and undo restores", async () => {
     const rt = await setup();
     await userEvent.click(screen.getByRole("button", { name: "Settings actions" }));
     await userEvent.click(await screen.findByRole("menuitem", { name: "Import settings" }));
-    const file = JSON.stringify({ kind: EXPORT_KIND, schema: 1, values: { "appearance.theme": "light", "filtering.dns": true } });
+    // A current file (an older one loses the DNS switch to the schema 4 migration before the preview).
+    const file = JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "appearance.theme": "light", "filtering.dns": true } });
     fireEvent.change(screen.getByRole("textbox", { name: "Settings file to import" }), { target: { value: file } });
     await userEvent.click(screen.getByRole("button", { name: "Preview changes" }));
 
     const changes = screen.getByRole("list", { name: "Changes" });
     expect(within(changes).getAllByRole("listitem")).toHaveLength(1);
     expect(changes).toHaveTextContent(/Theme\s*Dark.*Light/);
-    expect(screen.getByRole("list", { name: "Not imported" })).toHaveTextContent(/filtering\.dns.*never turns this on/);
+    expect(screen.getByRole("list", { name: "Not imported" })).toHaveTextContent(/filtering\.dns.*Not available in this version of Sieve/);
     // Nothing applied yet.
     expect(rt.settings.get("appearance.theme")).toBe("dark");
 

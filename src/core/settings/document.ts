@@ -8,8 +8,10 @@ import { migrate } from "./migrate";
 import {
   SETTINGS_SCHEMA,
   defaultValue,
+  isAvailable,
   isSettingKey,
   isValidValue,
+  settingDef,
   type SettingKey,
   type SettingValue,
 } from "./registry";
@@ -34,13 +36,23 @@ export function normalizeDoc(raw: unknown): SettingsDoc {
   return migrate({ schema, values: values as Record<string, unknown> });
 }
 
+/**
+ * The value in force. An unavailable setting reads as its default whatever is
+ * stored, so an unavailable data switch is never on; its stored value is kept
+ * (not read) for the build that makes it available again.
+ */
 export function readValue<K extends SettingKey>(doc: SettingsDoc, key: K): SettingValue<K> {
+  if (!isAvailable(key)) return defaultValue(key);
   const v = doc.values[key];
   return v !== undefined && isValidValue(key, v) ? (v as SettingValue<K>) : defaultValue(key);
 }
 
+/** Store a value. An unavailable setting takes only its default (which clears it). */
 export function writeValue<K extends SettingKey>(doc: SettingsDoc, key: K, value: SettingValue<K>): SettingsDoc {
   if (!isValidValue(key, value)) throw new Error(`Setting ${key}: invalid value ${JSON.stringify(value)}`);
+  if (!isAvailable(key) && !sameValue(value, defaultValue(key))) {
+    throw new Error(`Setting ${key} is not available in this version of Sieve (until ${settingDef(key).unavailableUntil})`);
+  }
   const values: Record<string, unknown> = { ...doc.values };
   if (sameValue(value, defaultValue(key))) delete values[key];
   else values[key] = value;
@@ -53,9 +65,9 @@ export function resetValue(doc: SettingsDoc, key: SettingKey): SettingsDoc {
   return { schema: doc.schema, values };
 }
 
-/** Only the known, non-default values: what export writes. */
+/** Only the known, available, non-default values: what export writes. */
 export function knownValues(doc: SettingsDoc): Partial<Record<SettingKey, unknown>> {
   const out: Partial<Record<SettingKey, unknown>> = {};
-  for (const [k, v] of Object.entries(doc.values)) if (isSettingKey(k)) out[k] = v;
+  for (const [k, v] of Object.entries(doc.values)) if (isSettingKey(k) && isAvailable(k)) out[k] = v;
   return out;
 }

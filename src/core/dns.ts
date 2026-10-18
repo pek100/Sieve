@@ -195,6 +195,10 @@ export function strandedAdapters(windows: WindowsDns | null, status: DnsStatus |
   return out;
 }
 
-/** The safety notice, word for word wherever it shows (Home banner, DNS card). */
+/**
+ * The safety notice, word for word wherever it shows (Home banner, DNS card).
+ * It points only to Windows' own network settings: the DNS filter is
+ * unavailable until the engine replaces it, so turning it on is no way out.
+ */
 export const STRANDED_DNS_TEXT =
-  "Windows is set to use Sieve for DNS, but Sieve's DNS filter is not running, so sites may not load. Reset DNS in Windows network settings, or turn DNS filtering on.";
+  "Windows is set to use Sieve for DNS, but nothing of Sieve's answers there, so sites may not load. Set DNS back to automatic in Windows network settings.";

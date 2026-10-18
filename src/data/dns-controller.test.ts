@@ -10,6 +10,14 @@ import type { DnsSource } from "./dns-source";
 import type { Clock } from "./poller";
 import { createSettingsStore, memoryBackend } from "./settings-store";
 
+// The DNS filter's settings are unavailable until the engine's slice 4 replaces it (law 11,
+// tests/laws/unavailable.test.ts, holds the real registry). Its code stays, so these tests
+// run it as a build where they are available would.
+vi.mock("@/core/settings/registry", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/core/settings/registry")>()),
+  isAvailable: () => true,
+}));
+
 /** Manual clock: timers fire only when the test advances time. */
 function fakeClock() {
   let now = 1_760_000_000_000;
@@ -169,19 +177,21 @@ describe("DNS controller: the read-only safety net", () => {
     expect(t.count("windowsDns")).toBe(1);
     expect(t.dns().windows?.adapters[0].servers).toEqual(["127.0.0.1", "::1"]);
     expect(t.banner()?.text).toBe(
-      "Windows is set to use Sieve for DNS, but Sieve's DNS filter is not running, so sites may not load. Reset DNS in Windows network settings, or turn DNS filtering on.",
+      "Windows is set to use Sieve for DNS, but nothing of Sieve's answers there, so sites may not load. Set DNS back to automatic in Windows network settings.",
     );
     expect(t.banner()?.kind).toBe("error");
+    // It points to Windows' own settings only: no action, nothing that turns the filter on.
+    expect(t.banner()?.action).toBeUndefined();
     // Nothing is started by itself (no startup recovery) and nothing is written.
     expect(t.count("start")).toBe(0);
     expect(t.settings.get(DNS_SWITCH)).toBe(false);
     t.undo();
   });
 
-  it("its action turns DNS filtering on, and the banner goes once the filter answers there", async () => {
+  it("the banner goes once the filter answers there, and comes back when it stops", async () => {
     const t = await setup("off", {}, {}, true);
-    expect(t.banner()?.action?.label).toBe("Turn DNS filtering on");
-    t.banner()?.action?.run();
+    expect(t.banner()?.text).toBe(STRANDED_DNS_TEXT);
+    await t.settings.set(DNS_SWITCH, true);
     await settle();
     expect(t.settings.get(DNS_SWITCH)).toBe(true);
     expect(t.dns().status?.running).toBe(true);

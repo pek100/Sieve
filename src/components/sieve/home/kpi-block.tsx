@@ -1,14 +1,14 @@
 "use client";
 
-import { AppWindow, ArrowDownRight, ArrowUpRight, Cable, Globe, Minus, ShieldCheck, ShieldOff } from "lucide-react";
+import { AppWindow, ArrowDownRight, ArrowUpRight, Cable, Cpu, Globe, Minus } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { SectionIcon, type SectionIconTone } from "@/components/sieve/primitives/section-icon";
 import { CardBoundary } from "@/components/sieve/shell/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { dnsPhase, isFiltering } from "@/core/dns";
+import { ENGINE_HREF, ENGINE_STATE_TEXT, enginePhase } from "@/core/engine";
 import type { DeltaDir, Kpi, KpiId } from "@/core/kpis";
-import { useDns } from "@/hooks/use-sieve";
+import { useEngine } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
 import { useTicker } from "./use-home";
 
@@ -20,9 +20,6 @@ export const KPI_COPY: Record<KpiId, { label: string; icon: ReactNode; tone: Sec
   connections: { label: "Active connections", icon: <Cable strokeWidth={1.75} />, tone: "neutral" },
   hosts: { label: "Remote hosts", icon: <Globe strokeWidth={1.75} />, tone: "neutral" },
 };
-
-/** Where the DNS filter is turned on. */
-export const FILTERING_HREF = "/settings/#section-filtering";
 
 const DELTA_ICON: Record<DeltaDir, typeof Minus> = { up: ArrowUpRight, down: ArrowDownRight, flat: Minus };
 
@@ -73,51 +70,36 @@ function Tile({ id, kpi, phase }: { id: KpiId; kpi: Kpi | null; phase: "loading"
 }
 
 /**
- * The DNS-derived tile: the filter's blocked lookups while it runs, "Paused"
- * while it passes everything through (global Sieving off), "Off" with the way
- * to turn it on otherwise. It is the only Home tile that may say "blocked",
- * and only while the filter blocks (law in home.test.tsx). Lookups are
- * counted for the whole computer: DNS cannot tell apps apart.
+ * The engine tile: what Sieve's filtering engine is, from facts only (the
+ * engine controller's probe: Not installed, Not running, Installed, not
+ * filtering, ...), with the way to Settings > Engine. It replaced the DNS
+ * filter's tile on 2026-10-18, when the app-hosted DNS filter became
+ * unavailable until the engine's slice 4. It says nothing about blocking:
+ * nothing Home shows is blocked until the engine filters.
  */
-function BlockedTile() {
-  const dns = useDns();
-  const on = isFiltering(dns);
-  // Running in pass-through (global Sieving off): answering, blocking nothing.
-  const paused = dnsPhase(dns) === "paused";
-  const blocked = dns.status?.counters.blocked ?? 0;
-  const lookups = dns.status?.counters.queries ?? 0;
-  const label = on ? "Blocked lookups" : "DNS filter";
+function EngineTile() {
+  const phase = enginePhase(useEngine());
   return (
-    <section aria-label={label} data-kpi="blocked" data-dns-derived="" className="flex min-w-0 flex-col text-on-surface">
+    <section aria-label="Engine" data-kpi="engine" data-engine-phase={phase} className="flex min-w-0 flex-col text-on-surface">
       <p data-kpi-label="" className="flex h-(--section-header-h) items-center gap-2 text-label text-on-surface-muted">
-        <SectionIcon size={16}>{on ? <ShieldCheck strokeWidth={1.75} /> : <ShieldOff strokeWidth={1.75} />}</SectionIcon>
-        {label}
+        <SectionIcon size={16} tone={phase === "filtering" ? "mint" : "neutral"}>
+          <Cpu strokeWidth={1.75} />
+        </SectionIcon>
+        Engine
       </p>
-      {on ? (
-        <p className="flex flex-wrap items-baseline gap-x-3">
-          <span className="text-kpi tabular" data-numeric="">
-            <Ticker value={blocked} />
-          </span>
-          <span className="text-label text-on-surface-muted tabular">of {lookups.toLocaleString()}</span>
-        </p>
-      ) : paused ? (
-        <p className="flex flex-wrap items-baseline gap-x-2 text-body" data-dns-paused="">
-          <span className="text-title text-on-surface-muted">Paused</span>
-          <span className="text-label text-on-surface-muted">Lookups pass through while Sieving is off</span>
-        </p>
-      ) : (
-        <p className="flex flex-wrap items-baseline gap-x-2 text-body">
-          <span className="text-title text-on-surface-muted">Off</span>
-          <Link href={FILTERING_HREF} className="text-label text-primary underline-offset-4 hover:underline">
-            Turn on in Settings
-          </Link>
-        </p>
-      )}
+      <p className="flex flex-wrap items-baseline gap-x-2 text-body">
+        <span className="text-title text-on-surface-muted" data-engine-state="">
+          {ENGINE_STATE_TEXT[phase]}
+        </span>
+        <Link href={ENGINE_HREF} className="text-label text-primary underline-offset-4 hover:underline">
+          Details in Settings
+        </Link>
+      </p>
     </section>
   );
 }
 
-/** 2 x 2 KPI tiles, flat: three from snapshots, one from the DNS filter. One error boundary for the block. */
+/** 2 x 2 KPI tiles, flat: three from snapshots, one from the engine. One error boundary for the block. */
 export function KpiBlock({ kpis, phase, className }: { kpis: Kpi[] | null; phase: "loading" | "error" | "ready"; className?: string }) {
   const byId = new Map((kpis ?? []).map((k) => [k.id, k]));
   return (
@@ -136,7 +118,7 @@ export function KpiBlock({ kpis, phase, className }: { kpis: Kpi[] | null; phase
         {(Object.keys(KPI_COPY) as KpiId[]).map((id) => (
           <Tile key={id} id={id} kpi={byId.get(id) ?? null} phase={phase} />
         ))}
-        <BlockedTile />
+        <EngineTile />
       </div>
     </CardBoundary>
   );

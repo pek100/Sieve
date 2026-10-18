@@ -29,11 +29,15 @@ export interface SettingsView {
 
 /**
  * Everything the Settings view reads and writes, derived from the registry:
- * which rows exist, how each is locked, search, import, reset. Writes go
- * through the settings store; whole-document changes say what they did in a
- * toast with Undo (notice bus).
+ * which rows exist (available keys only: searchSettings), how each is locked,
+ * search, import, reset. Writes go through the settings store; whole-document
+ * changes say what they did in a toast with Undo (notice bus).
+ *
+ * `blocks`: sections that carry blocks of their own under their rows (the
+ * Engine). With no search such a section is listed even when none of its
+ * keys is available; a search lists only sections with a matching key.
  */
-export function useSettingsView(query: string): SettingsView {
+export function useSettingsView(query: string, blocks: ReadonlySet<Section>): SettingsView {
   const { settings, notices, isTauri } = useRuntime();
   const doc = useSyncExternalStore(settings.subscribe, settings.doc, settings.doc);
   const hydrated = useHydrated();
@@ -42,13 +46,14 @@ export function useSettingsView(query: string): SettingsView {
 
   const sections = useMemo(() => {
     const hits = new Set(searchSettings(query));
+    const searching = query.trim() !== "";
     return SECTIONS.map((s) => ({
       id: s.id,
       label: s.label,
       keys: SETTING_KEYS.filter((k) => settingDef(k).section === s.id && hits.has(k)),
       route: ROUTES.find((r) => r.href === `/${s.id}`),
-    })).filter((s) => s.keys.length > 0);
-  }, [query]);
+    })).filter((s) => s.keys.length > 0 || (!searching && blocks.has(s.id)));
+  }, [query, blocks]);
 
   const lockOf = useCallback(
     (key: SettingKey): Lock | null => {

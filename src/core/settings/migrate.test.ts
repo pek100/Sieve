@@ -36,7 +36,8 @@ describe("settings migration law", () => {
   it("2 -> 3: the retired Windows DNS switch is dropped, on or off; everything else stays", () => {
     const v2 = { "filtering.systemDns": true, "filtering.dns": true, "appearance.theme": "light" };
     expect(dropSystemDns(v2)).toEqual({ "filtering.dns": true, "appearance.theme": "light" });
-    expect(migrate({ schema: 2, values: v2 })).toEqual({ schema: 3, values: { "filtering.dns": true, "appearance.theme": "light" } });
+    // Then 3 -> 4 drops the DNS switch too: it is unavailable until the engine replaces it (law 11).
+    expect(migrate({ schema: 2, values: v2 })).toEqual({ schema: SETTINGS_SCHEMA, values: { "appearance.theme": "light" } });
     expect(migrate({ schema: 2, values: { "filtering.systemDns": false } }).values).toEqual({});
     // A schema 1 file that had it goes through both steps.
     expect(migrate({ schema: 1, values: { "filtering.systemDns": true, "apps.levels": { a: "watch" } } }).values).toEqual({});

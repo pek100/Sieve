@@ -39,13 +39,37 @@ test.describe("engine", () => {
     expect(errors).toEqual([]);
   });
 
-  test("the engine's left edge sits on the column of the other Filtering blocks", async ({ page }, info) => {
+  test("the engine sits on the settings column, under the other sections", async ({ page }, info) => {
     test.skip(info.project.name !== "desktop", "one column on a phone");
     const { block } = await openEngine(page, "idle");
-    const dns = (await page.getByRole("region", { name: "DNS filter" }).boundingBox())!;
+    // The DNS filter that used to sit above it is hidden until the engine replaces it.
+    const apps = (await page.getByRole("region", { name: "Apps" }).boundingBox())!;
     const engine = (await block.boundingBox())!;
-    expect(Math.abs(engine.x - dns.x)).toBeLessThanOrEqual(1);
-    expect(Math.abs(engine.width - dns.width)).toBeLessThanOrEqual(1);
-    expect(engine.y).toBeGreaterThanOrEqual(dns.y + dns.height);
+    expect(Math.abs(engine.x - apps.x)).toBeLessThanOrEqual(1);
+    expect(Math.abs(engine.width - apps.width)).toBeLessThanOrEqual(1);
+    expect(engine.y).toBeGreaterThanOrEqual(apps.y + apps.height);
+  });
+
+  test("Home's Engine tile says the same state from the same facts, unclipped, and links to Settings > Engine", async ({ page }, info) => {
+    const errors: string[] = [];
+    page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
+    page.on("pageerror", (e) => errors.push(e.message));
+    for (const [scenario, state] of [
+      ["missing", "Not installed"],
+      ["stopped", "Not running"],
+      ["idle", "Installed, not filtering"],
+    ] as const) {
+      await page.goto(`/?source=mock&seed=1&engine=${scenario}`);
+      const tile = page.locator('section[data-kpi="engine"]');
+      await expect(tile.locator("[data-engine-state]")).toHaveText(state);
+      await expect(tile.getByRole("link", { name: "Details in Settings" })).toHaveAttribute("href", /\/settings\/#engine$/);
+      // The longest state still fits its tile (the alignment and clipping laws see the same box).
+      const t = (await tile.boundingBox())!;
+      const last = (await tile.locator("p").last().boundingBox())!;
+      expect(last.y + last.height, scenario).toBeLessThanOrEqual(t.y + t.height);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+      if (scenario === "idle") await page.getByRole("group", { name: "Right now" }).screenshot({ path: `test-results/screens/engine-home-idle-${info.project.name}.png` });
+    }
+    expect(errors).toEqual([]);
   });
 });

@@ -6,8 +6,20 @@
  * not carry goes back to its default. The preview lists every key that would
  * change and every entry that is refused, before anything is applied. A data
  * switch is never turned on by an import; that entry is refused with the reason.
+ * An unavailable setting (`unavailableUntil`) is not exported, searched,
+ * imported or reset: its stored value stays as it is.
  */
-import { SETTINGS_SCHEMA, SECTIONS, SETTING_KEYS, defaultValue, isSettingKey, isValidValue, settingDef, type SettingKey } from "./registry";
+import {
+  SETTINGS_SCHEMA,
+  SECTIONS,
+  SETTING_KEYS,
+  defaultValue,
+  isAvailable,
+  isSettingKey,
+  isValidValue,
+  settingDef,
+  type SettingKey,
+} from "./registry";
 import { knownValues, normalizeDoc, readValue, type SettingsDoc } from "./document";
 
 /** Marks a file as Sieve settings, so a random JSON file is not read as one. */
@@ -37,11 +49,18 @@ export function exportText(doc: SettingsDoc): string {
   return `${JSON.stringify({ kind: EXPORT_KIND, schema: doc.schema, values: knownValues(doc) }, null, 2)}\n`;
 }
 
-/** The document with every known key at `values` (defaults dropped) plus the current doc's unknown keys. */
+/** The keys import, reset and their previews work on: the available ones. */
+const shownKeys = () => SETTING_KEYS.filter(isAvailable);
+
+/**
+ * The document with every available key at `values` (defaults dropped) plus
+ * the current doc's unknown and unavailable keys, kept as stored: neither an
+ * import nor a reset can reach a setting the user cannot see.
+ */
 function docWith(current: SettingsDoc, values: Partial<Record<SettingKey, unknown>>): SettingsDoc {
   const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(current.values)) if (!isSettingKey(k)) out[k] = v;
-  for (const key of SETTING_KEYS) {
+  for (const [k, v] of Object.entries(current.values)) if (!isSettingKey(k) || !isAvailable(k)) out[k] = v;
+  for (const key of shownKeys()) {
     const v = values[key];
     if (v !== undefined && !same(v, defaultValue(key))) out[key] = v;
   }
@@ -49,7 +68,7 @@ function docWith(current: SettingsDoc, values: Partial<Record<SettingKey, unknow
 }
 
 function changesBetween(current: SettingsDoc, next: SettingsDoc): Change[] {
-  return SETTING_KEYS.flatMap((key) => {
+  return shownKeys().flatMap((key) => {
     const from = readValue(current, key);
     const to = readValue(next, key);
     return same(from, to) ? [] : [{ key, from, to }];
@@ -84,6 +103,10 @@ export function planImport(current: SettingsDoc, text: string): ImportPlan {
       refused.push({ key, reason: "Not a setting in this version of Sieve" });
       continue;
     }
+    if (!isAvailable(key)) {
+      refused.push({ key, reason: "Not available in this version of Sieve" });
+      continue;
+    }
     if (!isValidValue(key, v)) {
       refused.push({ key, reason: "Not a valid value for this setting" });
       continue;
@@ -94,7 +117,8 @@ export function planImport(current: SettingsDoc, text: string): ImportPlan {
     }
     values[key] = v;
   }
-  // A refused known key keeps its current value rather than dropping to the default.
+  // A refused known key keeps its current value rather than dropping to the default
+  // (an unavailable one is kept as stored by docWith).
   for (const r of refused) if (isSettingKey(r.key)) values[r.key] = readValue(current, r.key);
   const next = docWith(current, values);
   return { ok: true, changes: changesBetween(current, next), refused, next };
@@ -108,11 +132,11 @@ export function resetPlan(current: SettingsDoc): { changes: Change[]; next: Sett
 
 const sectionLabel = (id: string) => SECTIONS.find((s) => s.id === id)?.label ?? id;
 
-/** Keys whose key, label, help, section or option names contain every word of `query`, in registry order. */
+/** Available keys whose key, label, help, section or option names contain every word of `query`, in registry order. */
 export function searchSettings(query: string): SettingKey[] {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-  if (words.length === 0) return [...SETTING_KEYS];
-  return SETTING_KEYS.filter((key) => {
+  if (words.length === 0) return shownKeys();
+  return shownKeys().filter((key) => {
     const d = settingDef(key);
     const options = d.kind === "enum" ? d.options.join(" ") : "";
     const hay = `${key} ${d.label} ${d.help} ${sectionLabel(d.section)} ${options}`.toLowerCase();
