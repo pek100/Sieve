@@ -210,6 +210,18 @@ mod tests {
         assert_ne!(EXIT_UNSAFE_FOLDER, 1, "distinct from an ordinary failed step");
     }
 
+    /// The install live check compares `sc qprivs` with this exact list.
+    #[test]
+    fn the_install_live_check_expects_these_privileges() {
+        let script = include_str!("../../../../../scripts/live/engine-install.ps1");
+        let line = script.lines().find(|l| l.trim_start().starts_with("$want = @(")).expect("the $want line");
+        let mut want: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+        want.sort_unstable();
+        let mut ours = REQUIRED_PRIVILEGES.to_vec();
+        ours.sort_unstable();
+        assert_eq!(want, ours);
+    }
+
     #[test]
     fn recovery_is_two_restarts_then_stopped() {
         assert_eq!((RESTART_DELAY.as_secs(), RESTARTS, FAILURE_RESET.as_secs()), (5, 2, 3_600));

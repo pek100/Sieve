@@ -223,7 +223,10 @@ function Test-Installed([string]$tag) {
   Check "the installer's marker is in the folder" (Test-Path -LiteralPath (Join-Path $InstallDir $Marker))
   Check "no last-error.txt (the engine did not refuse to start)" (-not (Test-Path (Join-Path $ProgramDataSieve "engine\last-error.txt")))
   Check "sc qfailure: restart twice, reset after 3600 s" (($f.qfailure -match "RESET_PERIOD \(in seconds\)\s*:\s*3600") -and (([regex]::Matches($f.qfailure, "RESTART -- Delay = 5000")).Count -eq 2))
-  Check "sc qprivs: only SeChangeNotifyPrivilege" (($f.qprivs -match "SeChangeNotifyPrivilege") -and -not ($f.qprivs -match "SeDebugPrivilege|SeTcbPrivilege|SeLoadDriverPrivilege"))
+  # The engine's REQUIRED_PRIVILEGES (slice 3 added load driver, backup and restore for Wintun's driver).
+  $privs = @([regex]::Matches($f.qprivs, "Se\w+Privilege") | ForEach-Object Value | Sort-Object -Unique)
+  $want = @("SeBackupPrivilege", "SeChangeNotifyPrivilege", "SeLoadDriverPrivilege", "SeRestorePrivilege")
+  Check "sc qprivs: the engine's required privileges only" ((Compare-Object $privs $want).Count -eq 0) ($privs -join ", ")
   $acl = (icacls $ProgramDataSieve) -join "`n"
   Write-Evidence "$tag-programdata-acl.txt" $acl
   Check "ProgramData\Sieve: SYSTEM and Administrators only" (($acl -match "NT AUTHORITY\\SYSTEM:\(OI\)\(CI\)\(F\)") -and ($acl -match "BUILTIN\\Administrators:\(OI\)\(CI\)\(F\)") -and -not ($acl -match "Users:|Everyone:|Authenticated Users:|CREATOR OWNER:"))
