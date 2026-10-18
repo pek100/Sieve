@@ -109,4 +109,9 @@ Done: three valid runs at 0.15 cores per 100 Mbit/s or less, with throughput wit
 
    **Decided by Michael (2026-10-18): (b).** Forwarded flows stay in the denominator: the gate is 0.95 of ALL new flows. Every report also shows the host-only rate. So A1 and A3 cannot pass the gate by relabelling flows. Forwarded traffic must be attributed exactly (for example, named as its VM through an exact NAT match), or it counts as a miss.
 2. **Whether WSL and VM traffic should be filtered at all,** or passed like an Off app until a guest-aware design exists.
+
+   **Decided by Michael (2026-10-18): filter it, and make it visible.**
+   - **Filtered by default,** with the default app policy (Sieve).
+   - **Domain level only:** names from DNS, TLS SNI and QUIC, blocked or passed. It is never decrypted. A guest does not trust Sieve's root certificate and Sieve cannot install it there, so interception would break every HTTPS site inside the VM. Slice 6's interception skips forwarded flows by rule, with a test.
+   - **UI:** a "Virtual machines and WSL" group at the top of the Apps list, shown only once forwarded traffic has been seen. One row per VM named by an exact NAT match; unmatched forwarded flows go in one "Unidentified virtual machine traffic" row. Each row has the same Sieve/Off switch as an app, plus a note that its traffic is filtered by domain only. Flat, per `docs/conventions.md`: a group label and rows, no card or badge.
 3. **The capture fallback.** If the CPU budget is out of reach with ipstack, should a WFP-redirect design (closer to how AdGuard works) be explored? It needs a signed driver or an existing signed one, which is the question already settled once for WinDivert.
