@@ -171,6 +171,30 @@ function Test-PipeOpen {
 Write-Host "Sieve engine live check, step '$Step'. Evidence: $Out"
 "==== $(Get-Date -Format s) step $Step as $(whoami)" | Out-File -Append -Encoding utf8 (Join-Path $Out "results.txt")
 
+function Get-PipeSddl([string]$path) {
+  if (-not ("SieveLive.Sec" -as [type])) {
+    Add-Type -Namespace SieveLive -Name Sec -MemberDefinition @'
+[DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+public static extern uint GetNamedSecurityInfoW(string name, int type, uint info, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr sd);
+[DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+public static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr sd, uint rev, uint info, out IntPtr str, out uint len);
+[DllImport("kernel32.dll")] public static extern IntPtr LocalFree(IntPtr p);
+'@
+  }
+  $o = [IntPtr]::Zero; $g = [IntPtr]::Zero; $d = [IntPtr]::Zero; $s = [IntPtr]::Zero; $sd = [IntPtr]::Zero
+  # SE_KERNEL_OBJECT (1); OWNER (0x1) and DACL (0x4) information.
+  $rc = [SieveLive.Sec]::GetNamedSecurityInfoW($path, 1, 0x5, [ref]$o, [ref]$g, [ref]$d, [ref]$s, [ref]$sd)
+  if ($rc -ne 0) { throw "GetNamedSecurityInfo($path) failed with $rc" }
+  $str = [IntPtr]::Zero; $len = 0
+  try {
+    if (-not [SieveLive.Sec]::ConvertSecurityDescriptorToStringSecurityDescriptorW($sd, 1, 0x5, [ref]$str, [ref]$len)) { throw "SDDL conversion failed" }
+    [Runtime.InteropServices.Marshal]::PtrToStringUni($str)
+  } finally {
+    if ($str -ne [IntPtr]::Zero) { [void][SieveLive.Sec]::LocalFree($str) }
+    [void][SieveLive.Sec]::LocalFree($sd)
+  }
+}
+
 # The install step's checks on what the installer left: used by `install` and by `verify`
 # (verify checks an existing install without running the installer again).
 function Test-Installed([string]$tag) {
@@ -206,10 +230,16 @@ function Test-Installed([string]$tag) {
   $state = Get-Content -Raw (Join-Path $ProgramDataSieve "engine\state.json") | ConvertFrom-Json
   $me = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
   Check "state.json records the installing user" ($state.owner_sid -eq $me) "recorded $($state.owner_sid), you are $me"
+  # Get-Acl cannot read named pipes in Windows PowerShell 5.1 (it reports "does not exist"),
+  # so the pipe's descriptor comes from GetNamedSecurityInfo (live 2026-10-18).
   try {
-    $pipeAcl = (Get-Acl $Pipe).Access | ForEach-Object { "{0} {1} {2}" -f $_.IdentityReference, $_.AccessControlType, $_.FileSystemRights }
-    Write-Evidence "$tag-pipe-acl.txt" ($pipeAcl -join "`n")
-    Check "pipe DACL lists SYSTEM, Administrators and the installing user only" (@($pipeAcl).Count -eq 3) ($pipeAcl -join "; ")
+    $sddl = Get-PipeSddl $Pipe
+    $raw = New-Object System.Security.AccessControl.RawSecurityDescriptor($sddl)
+    $aces = @($raw.DiscretionaryAcl | ForEach-Object { "{0} {1} 0x{2:X}" -f $_.SecurityIdentifier.Value, $_.AceQualifier, $_.AccessMask })
+    Write-Evidence "$tag-pipe-acl.txt" ("SDDL: $sddl`n" + ($aces -join "`n"))
+    $sids = @($raw.DiscretionaryAcl | ForEach-Object { $_.SecurityIdentifier.Value })
+    $only = ($aces.Count -eq 3) -and ($sids -contains "S-1-5-18") -and ($sids -contains "S-1-5-32-544") -and ($sids -contains $state.owner_sid) -and ($sddl -match "D:P")
+    Check "pipe DACL lists SYSTEM, Administrators and the installing user only, protected" $only $sddl
   } catch {
     Check "pipe DACL readable" $false $_.Exception.Message
   }
