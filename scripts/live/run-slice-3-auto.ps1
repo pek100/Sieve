@@ -187,6 +187,54 @@ function Sieve-Routes { @(Get-NetRoute | Where-Object InterfaceAlias -eq "Sieve"
 function Sieve-Adapters { @(Get-NetAdapter -IncludeHidden | Where-Object Name -eq "Sieve") }
 function Engine-Pid { (Get-CimInstance Win32_Service -Filter "Name='sieve-engine'").ProcessId }
 
+# Windows can report its three IPv6 fallback addresses on an interface with
+# no configured resolver. Keep both the reported addresses and the read-only
+# registry evidence; never classify an unreadable snapshot as unconfigured.
+function Adapter-DnsEvidence {
+  $evidence = [ordered]@{ Rows = @(); Registry = @(); Error = $null }
+  try {
+    $adapter = @(Sieve-Adapters)
+    if ($adapter.Count -ne 1) { throw "Expected one Sieve adapter" }
+    $guid = ([guid]$adapter[0].InterfaceGuid).ToString('B')
+    $evidence.Rows = @(Get-DnsClientServerAddress -InterfaceIndex $adapter[0].ifIndex |
+      Select-Object InterfaceAlias, InterfaceIndex, AddressFamily, ServerAddresses)
+    $evidence.Registry = @(foreach ($family in 'Tcpip', 'Tcpip6') {
+      $path = "SYSTEM\CurrentControlSet\Services\$family\Parameters\Interfaces\$guid"
+      $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($path, $false)
+      try {
+        [pscustomobject]@{
+          Family = $family; Path = $path; KeyExists = ($null -ne $key)
+          NameServer = $(if ($key) { $key.GetValue('NameServer', $null) } else { $null })
+          DhcpNameServer = $(if ($key) { $key.GetValue('DhcpNameServer', $null) } else { $null })
+          Dhcpv6DNSServers = $(if ($key) { $key.GetValue('Dhcpv6DNSServers', $null) } else { $null })
+        }
+      } finally { if ($key) { $key.Dispose() } }
+    })
+  } catch { $evidence.Error = $_.Exception.Message }
+  [pscustomobject]$evidence
+}
+
+function Adapter-DnsUnconfigured($evidence) {
+  if ($evidence.Error -or @($evidence.Rows).Count -eq 0 -or @($evidence.Registry).Count -ne 2) { return $false }
+  if (@(Compare-Object @('Tcpip', 'Tcpip6') @($evidence.Registry | ForEach-Object Family)).Count) { return $false }
+  foreach ($entry in $evidence.Registry) {
+    foreach ($value in @($entry.NameServer) + @($entry.DhcpNameServer) + @($entry.Dhcpv6DNSServers)) {
+      if (-not [string]::IsNullOrWhiteSpace([string]$value)) { return $false }
+    }
+  }
+  $defaults = @('fec0:0:0:ffff::1', 'fec0:0:0:ffff::2', 'fec0:0:0:ffff::3')
+  foreach ($row in $evidence.Rows) {
+    if ($row.AddressFamily -notin @(2, 23)) { return $false }
+    $addresses = @($row.ServerAddresses | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if (-not $addresses.Count) { continue }
+    if ($row.AddressFamily -ne 23 -or $addresses.Count -ne 3) { return $false }
+    try { $canonical = @($addresses | ForEach-Object { ([Net.IPAddress]$_).ToString() }) }
+    catch { return $false }
+    if (@(Compare-Object $defaults $canonical).Count) { return $false }
+  }
+  return $true
+}
+
 function Require-Routing {
   Require "routes on the Sieve adapter" (Wait-For {
     $s = Read-Status
@@ -417,7 +465,9 @@ function Run-Auto {
     Save "route-on-status.json" ($s | ConvertTo-Json)
     Save "route-on-sieve-routes.txt" ((Sieve-Routes | Format-Table -AutoSize | Out-String).Trim())
     Check "no Sieve route in the persistent store" (@(Get-NetRoute -PolicyStore PersistentStore | Where-Object InterfaceAlias -eq "Sieve").Count -eq 0)
-    Check "no DNS server set on the Sieve adapter" (@(Get-DnsClientServerAddress | Where-Object { $_.InterfaceAlias -eq "Sieve" -and $_.ServerAddresses.Count }).Count -eq 0)
+    $adapterDns = Adapter-DnsEvidence
+    Save "route-on-sieve-dns.json" ($adapterDns | ConvertTo-Json -Depth 5)
+    Check "no DNS server set on the Sieve adapter" (Adapter-DnsUnconfigured $adapterDns) "addresses and explicit/DHCP registry values: route-on-sieve-dns.json; error: $($adapterDns.Error)"
     Compare-Listings "on"
     Check-Network "on"
     $gateway = Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Where-Object InterfaceAlias -ne "Sieve" | Sort-Object RouteMetric | Select-Object -First 1
