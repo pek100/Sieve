@@ -21,9 +21,10 @@ test.describe("settings", () => {
     await expect(page.getByRole("link", { name: "Settings" })).toHaveAttribute("aria-current", "page");
     const rail = page.getByRole("navigation", { name: "Settings sections" });
     await expect(rail.getByRole("link")).toHaveText(["Appearance", "Sampling", "Startup", "Apps", "Filtering"]);
-    // Eight rows: theme, sieving, interval, launch at startup, apps turned off, my apps, DNS filtering,
-    // Windows uses Sieve. The upstream servers are edited in the DNS filter section only (one owner).
-    await expect(page.locator("[data-setting]")).toHaveCount(8);
+    // Seven rows: theme, sieving, interval, launch at startup, apps turned off, my apps, DNS filtering.
+    // The upstream servers are edited in the DNS filter section only (one owner). There is no
+    // Windows DNS row: Sieve never changes Windows DNS (removed 2026-10-18).
+    await expect(page.locator("[data-setting]")).toHaveCount(7);
     await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(1);
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
 
@@ -43,19 +44,19 @@ test.describe("settings", () => {
     expect(errors).toEqual([]);
   });
 
-  test("there is no per-app filtering row; DNS filtering is a live switch", async ({ page }, info) => {
+  test("there is no per-app filtering row and no Windows DNS row; DNS filtering is a live switch", async ({ page }, info) => {
     await openSettings(page);
     await expect(row(page, "filtering.perApp")).toHaveCount(0);
-    const systemDns = row(page, "filtering.systemDns");
-    await systemDns.scrollIntoViewIfNeeded();
+    await expect(row(page, "filtering.systemDns")).toHaveCount(0);
     await expect(row(page, "filtering.dns").getByRole("switch")).toBeEnabled();
-    await expect(row(page, "filtering.systemDns").getByRole("switch")).toBeDisabled();
-    await expect(row(page, "filtering.systemDns")).toContainText("Needs DNS filtering, which is off.");
+    await expect(row(page, "filtering.dns")).toContainText("Windows keeps its own DNS servers.");
     // Launch at startup needs the desktop app; the browser shows why.
-    await expect(row(page, "startup.launchAtLogin").getByRole("switch")).toBeDisabled();
-    await expect(row(page, "startup.launchAtLogin")).toContainText("Only the desktop app");
+    const startup = row(page, "startup.launchAtLogin");
+    await startup.scrollIntoViewIfNeeded();
+    await expect(startup.getByRole("switch")).toBeDisabled();
+    await expect(startup).toContainText("Only the desktop app");
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
-    await systemDns.screenshot({ path: `test-results/screens/settings-locked-${info.project.name}.png` });
+    await startup.screenshot({ path: `test-results/screens/settings-locked-${info.project.name}.png` });
   });
 
   test("every section ends at its content: the last one (Filtering, then the DNS filter) is not stretched", async ({ page }) => {
