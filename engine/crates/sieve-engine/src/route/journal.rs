@@ -5,6 +5,7 @@
 //! run never carries stale routes into the next one. One JSON object per
 //! line; a line that does not parse (a torn write) is skipped and counted.
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -28,12 +29,13 @@ pub struct Journal {
 }
 
 /// What a replay did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Replay {
     pub deleted: usize,
     /// Already gone (the adapter took it, or a previous cleanup).
-    pub absent: usize,
+    pub already_gone: usize,
     pub failed: usize,
+    pub failed_codes: BTreeMap<u32, usize>,
     /// Lines that did not parse.
     pub skipped: usize,
 }
@@ -43,7 +45,24 @@ pub struct Replay {
 pub enum Deleted {
     Yes,
     NotThere,
-    Failed,
+    Failed(u32),
+}
+
+impl Replay {
+    pub fn observe(&mut self, deleted: Deleted) {
+        match deleted {
+            Deleted::Yes => self.deleted += 1,
+            Deleted::NotThere => self.already_gone += 1,
+            Deleted::Failed(code) => {
+                self.failed += 1;
+                *self.failed_codes.entry(code).or_default() += 1;
+            }
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        format!("{} deleted, {} already gone, {} failed, codes {:?}", self.deleted, self.already_gone, self.failed, self.failed_codes)
+    }
 }
 
 impl Journal {
@@ -88,11 +107,7 @@ impl Journal {
         let (entries, skipped) = self.read()?;
         let mut r = Replay { skipped, ..Replay::default() };
         for e in &entries {
-            match delete(e) {
-                Deleted::Yes => r.deleted += 1,
-                Deleted::NotThere => r.absent += 1,
-                Deleted::Failed => r.failed += 1,
-            }
+            r.observe(delete(e));
         }
         if r.failed == 0 {
             self.truncate()?;
@@ -138,7 +153,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(seen, added);
-        assert_eq!(r, Replay { deleted: 3, absent: 1, failed: 0, skipped: 0 });
+        assert_eq!(r, Replay { deleted: 3, already_gone: 1, ..Replay::default() });
         assert_eq!(j.read().unwrap(), (vec![], 0));
         assert_eq!(j.replay(|_| panic!("nothing left to delete")).unwrap(), Replay::default());
     }
@@ -148,7 +163,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::new(dir.path());
         j.append(&entry("0.0.0.0/5")).unwrap();
-        let r = j.replay(|_| Deleted::Failed).unwrap();
+        let r = j.replay(|_| Deleted::Failed(5)).unwrap();
         assert_eq!(r.failed, 1);
         assert_eq!(j.read().unwrap().0, vec![entry("0.0.0.0/5")]);
     }
@@ -168,9 +183,9 @@ mod tests {
     #[test]
     fn no_journal_is_an_empty_replay_even_without_its_folder() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(Journal::new(dir.path()).replay(|_| Deleted::Failed).unwrap(), Replay::default());
+        assert_eq!(Journal::new(dir.path()).replay(|_| Deleted::Failed(5)).unwrap(), Replay::default());
         let missing = dir.path().join("not-installed");
-        assert_eq!(Journal::new(&missing).replay(|_| Deleted::Failed).unwrap(), Replay::default());
+        assert_eq!(Journal::new(&missing).replay(|_| Deleted::Failed(5)).unwrap(), Replay::default());
         assert!(!missing.exists(), "nothing is created");
     }
 }

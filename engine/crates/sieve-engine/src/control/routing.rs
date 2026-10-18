@@ -32,7 +32,9 @@ use crate::route::table::{NetTables, read};
 use crate::route::watch::{RouteWatch, watch as watch_routes};
 use crate::stack::relay::{Relay, UDP_IDLE, handle_tcp, handle_udp};
 use crate::tun::device::{Tun, TunDevice};
-use crate::tun::{MTU, TUN_V4, TUN_V6};
+#[cfg(not(feature = "relay-experiments"))]
+use crate::tun::MTU;
+use crate::tun::{TUN_V4, TUN_V6};
 use crate::watchdog::monotonic_ms;
 
 /// While the switch is on, AdGuard's service is read this often (it has no
@@ -162,9 +164,15 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     }
     let journal = journal(engine).ok_or("the engine has no state folder for its route journal")?;
     let mut config = IpStackConfig::default();
+    #[cfg(feature = "relay-experiments")]
+    config.mtu(engine.experiments.settings.tun_mtu).map_err(|e| format!("stack MTU: {e}"))?;
+    #[cfg(not(feature = "relay-experiments"))]
     config.mtu(MTU).map_err(|e| format!("stack MTU: {e}"))?;
     config.udp_timeout(UDP_IDLE);
+    #[cfg(not(feature = "relay-experiments"))]
     let tun = crate::tun::device::open(&engine.exe)?;
+    #[cfg(feature = "relay-experiments")]
+    let tun = crate::tun::device::open(&engine.exe, engine.experiments.settings.tun_mtu)?;
     let luid = tun.luid;
     apply::add_address(luid, TUN_V4.into())?;
     if plan.routes.iter().any(|p| !p.is_ipv4()) {
@@ -182,7 +190,17 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
         added.push(*p);
     }
 
+    #[cfg(not(feature = "relay-experiments"))]
     let relay = Arc::new(Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone()));
+    #[cfg(feature = "relay-experiments")]
+    let relay = {
+        let mut relay = Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone());
+        relay.experiments = engine.experiments.settings.clone();
+        Arc::new(relay)
+    };
+    #[cfg(feature = "relay-experiments")]
+    let device = TunDevice::experimental(tun.session.clone(), engine.meters.clone(), engine.beats.clone(), &engine.experiments.settings);
+    #[cfg(not(feature = "relay-experiments"))]
     let device = TunDevice::new(tun.session.clone(), engine.meters.clone(), engine.beats.clone());
     let stack = IpStack::new(config, device);
     let (stop_accept, stopped) = oneshot::channel();

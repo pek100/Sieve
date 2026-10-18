@@ -14,6 +14,8 @@
 
 #[cfg(windows)]
 pub mod device;
+#[cfg(feature = "relay-experiments")]
+pub mod batch;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};

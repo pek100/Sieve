@@ -30,6 +30,8 @@ stall = []
 # Bounded, admin-only attribution evidence for a short diagnostic run.
 # Off in the production build; never changes an attribution decision.
 attribution-diagnostics = []
+# Restart-only relay CPU experiments, absent from production builds.
+relay-experiments = []
 
 [dependencies]
 sieve-filter = { path = "../sieve-filter" }

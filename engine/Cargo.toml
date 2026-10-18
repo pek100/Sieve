@@ -32,3 +32,10 @@ ipstack = { path = "vendor/ipstack" }
 
 [profile.release]
 debug = 1
+
+# E5 from the relay CPU experiment plan: compare this profile separately.
+[profile.release-lto]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+debug = 1

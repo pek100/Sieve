@@ -18,6 +18,8 @@ pub mod coexist;
 pub mod control;
 pub mod dns;
 pub mod domain;
+#[cfg(feature = "relay-experiments")]
+pub mod experiments;
 pub mod flow;
 pub mod ipc;
 pub mod policy;

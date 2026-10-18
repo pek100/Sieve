@@ -11,7 +11,7 @@
 
 use std::net::IpAddr;
 
-use windows::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR, WIN32_ERROR};
+use windows::Win32::Foundation::{ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR, WIN32_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DeleteIpForwardEntry2, InitializeIpForwardEntry,
     InitializeUnicastIpAddressEntry, MIB_IPFORWARD_ROW2, MIB_UNICASTIPADDRESS_ROW,
@@ -90,13 +90,7 @@ pub fn add_route(journal: &Journal, luid: SieveLuid, prefix: Prefix) -> Result<(
 pub fn delete_route(luid: u64, prefix: Prefix) -> Deleted {
     let row = route_row(SieveLuid(luid), prefix);
     // SAFETY: `row` is a valid, initialised row.
-    match unsafe { DeleteIpForwardEntry2(&row) } {
-        NO_ERROR => Deleted::Yes,
-        ERROR_NOT_FOUND => Deleted::NotThere,
-        // The adapter of that run no longer exists: the route went with it.
-        windows::Win32::Foundation::ERROR_FILE_NOT_FOUND => Deleted::NotThere,
-        _ => Deleted::Failed,
-    }
+    super::classify_delete(unsafe { DeleteIpForwardEntry2(&row) }.0)
 }
 
 /// The adapter's own host address (a /32 or /128), active store only.
@@ -119,11 +113,11 @@ pub fn clear_stale(journal: &Journal) -> String {
     format!(
         "routes on \"Sieve\": {}; journal: {}",
         match named {
-            Ok(n) => format!("{n} deleted"),
+            Ok(r) => r.summary(),
             Err(e) => format!("FAILED, {e}"),
         },
         match replay {
-            Ok(r) => format!("{} deleted, {} already gone, {} failed, {} unreadable lines", r.deleted, r.absent, r.failed, r.skipped),
+            Ok(r) => format!("{}{}, {} unreadable lines", if r.failed > 0 { "FAILED, " } else { "" }, r.summary(), r.skipped),
             Err(e) => format!("FAILED, {e}"),
         }
     )

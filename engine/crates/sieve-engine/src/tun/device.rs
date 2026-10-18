@@ -16,7 +16,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use wintun_bindings::{Adapter, Session, Wintun};
 
-use super::{ADAPTER_GUID, MTU, RING_BYTES, TUNNEL_TYPE, admit, dll_beside, verify_dll};
+#[cfg(not(feature = "relay-experiments"))]
+use super::MTU;
+use super::{ADAPTER_GUID, RING_BYTES, TUNNEL_TYPE, admit, dll_beside, verify_dll};
 use crate::flow::packet;
 use crate::route::ADAPTER_NAME;
 use crate::route::apply::SieveLuid;
@@ -37,7 +39,7 @@ pub struct Tun {
 }
 
 /// Loads the pinned `wintun.dll` beside `exe` and creates the adapter.
-pub fn open(exe: &Path) -> Result<Tun, String> {
+pub fn open(exe: &Path, #[cfg(feature = "relay-experiments")] mtu: u16) -> Result<Tun, String> {
     let dll = dll_beside(exe);
     verify_dll(&dll)?;
     // SAFETY: the DLL's hash is the pinned build and wintun-bindings checks
@@ -48,7 +50,10 @@ pub fn open(exe: &Path) -> Result<Tun, String> {
     // SAFETY: NET_LUID_LH is a union over one u64.
     let luid = SieveLuid::of_created_adapter(unsafe { adapter.get_luid().Value });
     let index = adapter.get_adapter_index().map_err(|e| format!("adapter index: {e}"))?;
+    #[cfg(not(feature = "relay-experiments"))]
     adapter.set_mtu(usize::from(MTU)).map_err(|e| format!("MTU: {e}"))?;
+    #[cfg(feature = "relay-experiments")]
+    adapter.set_mtu(usize::from(mtu)).map_err(|e| format!("MTU: {e}"))?;
     let session = adapter.start_session(RING_BYTES).map_err(|e| format!("session: {e}"))?;
     Ok(Tun { session, luid, index, _adapter: adapter, _wintun: wintun })
 }
@@ -57,6 +62,10 @@ pub struct TunDevice {
     session: Arc<Session>,
     rx: mpsc::Receiver<Vec<u8>>,
     meters: Arc<Meters>,
+    #[cfg(feature = "relay-experiments")]
+    batch: Option<super::batch::Receiver>,
+    #[cfg(feature = "relay-experiments")]
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TunDevice {
@@ -83,12 +92,62 @@ impl TunDevice {
         if let Err(e) = spawned {
             eprintln!("sieve-engine: TUN reader thread: {e}");
         }
-        Self { session, rx, meters }
+        Self {
+            session, rx, meters,
+            #[cfg(feature = "relay-experiments")]
+            batch: None,
+            #[cfg(feature = "relay-experiments")]
+            reader: None,
+        }
+    }
+
+    #[cfg(feature = "relay-experiments")]
+    pub fn experimental(session: Arc<Session>, meters: Arc<Meters>, beats: Arc<Beats>, settings: &crate::experiments::Settings) -> Self {
+        if settings.tun_batch == crate::experiments::BATCH_MIN {
+            return Self::new(session, meters, beats);
+        }
+        let (tx, batch) = super::batch::channel(QUEUE, settings.tun_mtu, settings.tun_batch);
+        let mut source = session.clone();
+        let m = meters.clone();
+        let reader = match std::thread::Builder::new().name("sieve-tun".into()).spawn(move || {
+            if let Err(e) = tx.run(&mut source, &m, &beats, monotonic_ms) {
+                eprintln!("sieve-engine: batched TUN reader: {e}");
+            }
+        }) {
+            Ok(reader) => Some(reader),
+            Err(e) => {
+                eprintln!("sieve-engine: TUN reader thread: {e}");
+                None
+            }
+        };
+        let (_, rx) = mpsc::channel(QUEUE);
+        Self { session, rx, meters, batch: Some(batch), reader }
+    }
+}
+
+#[cfg(feature = "relay-experiments")]
+impl Drop for TunDevice {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            // Unblock every possible wait before joining: channel, pool and
+            // Wintun receive. None of these needs the async runtime to run.
+            drop(self.batch.take());
+            if let Err(e) = self.session.shutdown() {
+                eprintln!("sieve-engine: batched TUN shutdown: {e}");
+            }
+            if reader.join().is_err() {
+                eprintln!("sieve-engine: batched TUN reader panicked");
+            }
+        }
     }
 }
 
 impl AsyncRead for TunDevice {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        #[cfg(feature = "relay-experiments")]
+        if let Some(batch) = &mut self.batch {
+            return batch.poll_read(cx, buf);
+        }
         loop {
             match ready!(self.rx.poll_recv(cx)) {
                 // Larger than ipstack's buffer: dropped rather than truncated.

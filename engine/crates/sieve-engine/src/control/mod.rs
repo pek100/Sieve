@@ -43,6 +43,10 @@ pub struct Facts {
 }
 
 pub struct Engine {
+    #[cfg(feature = "relay-experiments")]
+    pub experiments: crate::experiments::Loaded,
+    #[cfg(feature = "relay-experiments")]
+    pub runtime_workers: std::sync::atomic::AtomicUsize,
     /// `ProgramData\Sieve\engine` (policy, runs, journal); None in tests.
     pub dir: Option<PathBuf>,
     /// This exe (wintun.dll sits beside it).
@@ -70,6 +74,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl Engine {
     pub fn new(dir: Option<PathBuf>, exe: PathBuf, policy: Policy, runs: Runs, crash_loop: Option<u32>) -> Self {
         Self {
+            #[cfg(feature = "relay-experiments")]
+            experiments: dir.as_deref().map(crate::experiments::Loaded::load).unwrap_or_else(crate::experiments::Loaded::absent),
+            #[cfg(feature = "relay-experiments")]
+            runtime_workers: std::sync::atomic::AtomicUsize::new(0),
             dir,
             exe,
             policy: Mutex::new(policy),
@@ -129,12 +137,34 @@ impl Engine {
                 let _ = std::fs::rename(&tmp, dir.join("attribution-diagnostics.json"));
             }
         }
-        if let (Some(dir), Ok(json)) = (&self.dir, serde_json::to_vec_pretty(&self.status())) {
+        #[cfg(not(feature = "relay-experiments"))]
+        let json = serde_json::to_vec_pretty(&self.status());
+        #[cfg(feature = "relay-experiments")]
+        let json = self.experimental_status_json();
+        if let (Some(dir), Ok(json)) = (&self.dir, json) {
             let tmp = dir.join(STATUS_FILE).with_extension("tmp");
             if std::fs::write(&tmp, json).is_ok() {
                 let _ = std::fs::rename(&tmp, dir.join(STATUS_FILE));
             }
         }
+    }
+
+    #[cfg(feature = "relay-experiments")]
+    fn experimental_status_json(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut status = serde_json::to_value(self.status())?;
+        let mut experiments = serde_json::to_value(&self.experiments)?;
+        let copy = self.experiments.settings.copy_buffer_bytes.unwrap_or(crate::experiments::DEFAULT_COPY_BYTES);
+        experiments["copy_buffers"] = serde_json::json!({
+            "app_to_upstream_bytes": copy,
+            "upstream_to_app_bytes": copy,
+            // The fallback is relay_tcp's existing classifier read buffer.
+            "classifier_bytes": self.experiments.settings.copy_buffer_bytes.unwrap_or(16 * 1024),
+        });
+        let workers = self.runtime_workers.load(std::sync::atomic::Ordering::Relaxed);
+        // Before the runtime exists there is no effective worker count yet.
+        experiments["runtime_worker_threads"] = if workers == 0 { serde_json::Value::Null } else { workers.into() };
+        status["experiments"] = experiments;
+        serde_json::to_vec_pretty(&status)
     }
 
     /// The next batch of changed flows, sent to every subscriber.
@@ -236,6 +266,32 @@ pub fn live_failures(results: &str) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "relay-experiments")]
+    #[test]
+    fn status_records_effective_settings_read_result_and_runtime_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::experiments::FILE);
+        std::fs::write(&path, b"{\"tun_mtu\":9000,\"worker_threads\":2}").unwrap();
+        let engine = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        engine.runtime_workers.store(2, std::sync::atomic::Ordering::Relaxed);
+        // Later edits are deliberately ignored until the next engine start.
+        std::fs::write(&path, b"{\"tun_mtu\":1280}").unwrap();
+        engine.write_status_file();
+        let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(STATUS_FILE)).unwrap()).unwrap();
+        assert_eq!(status["experiments"]["tun_mtu"], 9000);
+        assert_eq!(status["experiments"]["tun_batch"], 1);
+        assert_eq!(status["experiments"]["runtime_worker_threads"], 2);
+        assert_eq!(status["experiments"]["file"]["result"], "ok");
+        assert!(status["experiments"]["copy_buffer_bytes"].is_null());
+        assert!(serde_json::to_value(engine.status()).unwrap().get("experiments").is_none(), "IPC protocol unchanged");
+        std::fs::write(&path, b"{").unwrap();
+        let engine = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        let status: serde_json::Value = serde_json::from_slice(&engine.experimental_status_json().unwrap()).unwrap();
+        assert_eq!(status["experiments"]["tun_mtu"], crate::tun::MTU);
+        assert_eq!(status["experiments"]["file"]["result"], "refused");
+        assert!(!status["experiments"]["file"]["reason"].as_str().unwrap().is_empty());
+    }
 
     /// The live check of `filtering.engine` (registry `liveCheck`), run by
     /// the user only: it reads the evidence `scripts/live/engine-route.ps1`

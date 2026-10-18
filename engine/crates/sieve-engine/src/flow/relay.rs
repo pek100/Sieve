@@ -108,6 +108,85 @@ where
     }
 }
 
+/// Diagnostic counterpart of relay_tcp. Keep classification, half-close and
+/// outcomes in sync; only the allocation and copy primitives differ.
+#[cfg(feature = "relay-experiments")]
+pub async fn relay_tcp_buffered<A, U>(
+    app: &mut A,
+    upstream: U,
+    first_bytes_wait: Duration,
+    decide: impl FnOnce(&Decoded) -> Action,
+    capacity: usize,
+) -> Outcome
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let (up_read, mut up_write) = tokio::io::split(upstream);
+    let (mut app_read, mut app_write) = tokio::io::split(app);
+
+    let mut up_read = tokio::io::BufReader::with_capacity(capacity, up_read);
+    let server_to_app = async {
+        let n = tokio::io::copy_buf(&mut up_read, &mut app_write).await.unwrap_or(0);
+        let _ = app_write.shutdown().await;
+        n
+    };
+    let client_to_server = async {
+        let mut out = Outcome::default();
+        let mut classifier = TcpClassifier::new();
+        let mut buf = vec![0u8; capacity];
+        let (decided, spill) = loop {
+            match tokio::time::timeout(first_bytes_wait, app_read.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => {
+                    out.stop = true;
+                    return out;
+                }
+                Ok(Ok(n)) => {
+                    let before = classifier.held().len();
+                    if let Some(d) = classifier.push(&buf[..n]) {
+                        // A large read can exceed the classifier's held-byte
+                        // cap. Replay the unretained tail before copying more.
+                        let retained = classifier.held().len() - before;
+                        break (d, retained..n);
+                    }
+                }
+                Err(_) => break (Decoded { failure: Some("no client bytes in time"), ..Decoded::default() }, 0..0),
+            }
+        };
+        let action = decide(&decided);
+        out.decided = Some(decided);
+        if action == Action::Drop {
+            out.dropped = true;
+            out.stop = true;
+            return out;
+        }
+        let held = classifier.take_held();
+        if up_write.write_all(&held).await.is_err() || up_write.write_all(&buf[spill.clone()]).await.is_err() {
+            out.upstream_write_failed = true;
+            out.stop = true;
+            return out;
+        }
+        let mut app_read = tokio::io::BufReader::with_capacity(capacity, &mut app_read);
+        out.bytes_up = (held.len() + spill.len()) as u64 + tokio::io::copy_buf(&mut app_read, &mut up_write).await.unwrap_or(0);
+        let _ = up_write.shutdown().await;
+        out
+    };
+    tokio::pin!(server_to_app, client_to_server);
+    tokio::select! {
+        mut out = &mut client_to_server => {
+            if !out.stop {
+                out.bytes_down = server_to_app.await;
+            }
+            out
+        }
+        down = &mut server_to_app => {
+            let mut out = client_to_server.await;
+            out.bytes_down = down;
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +196,41 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(2);
     const PIPE_BYTES: usize = 64 * 1024;
+
+    #[cfg(feature = "relay-experiments")]
+    #[tokio::test]
+    async fn experimental_copy_moves_payloads_intact_in_both_directions_at_both_bounds() {
+        use crate::experiments::{COPY_MIN, COPY_MAX};
+        for capacity in [COPY_MIN, COPY_MAX] {
+            // More than two of the largest buffers, with a partial last fill.
+            let mut payload = REQUEST.to_vec();
+            payload.extend((0..COPY_MAX * 3 + 1).map(|i| i as u8));
+            let expected = payload.clone();
+            let (mut app, mut relay_side) = tokio::io::duplex(capacity);
+            let (up, mut server) = tokio::io::duplex(PIPE_BYTES);
+            let relay = tokio::spawn(async move {
+                relay_tcp_buffered(&mut relay_side, up, WAIT, |_| Action::Pass, capacity).await
+            });
+            let echo = tokio::spawn(async move {
+                let mut got = Vec::new();
+                server.read_to_end(&mut got).await.unwrap();
+                server.write_all(&got).await.unwrap();
+                server.shutdown().await.unwrap();
+                got
+            });
+            tokio::time::timeout(WAIT, async {
+                app.write_all(&payload).await.unwrap();
+                app.shutdown().await.unwrap();
+                let mut got = Vec::new();
+                app.read_to_end(&mut got).await.unwrap();
+                assert_eq!(got, expected);
+                assert_eq!(echo.await.unwrap(), expected);
+                let out = relay.await.unwrap();
+                assert!(!out.stop && !out.upstream_write_failed);
+                assert_eq!((out.bytes_up, out.bytes_down), (expected.len() as u64, expected.len() as u64));
+            }).await.expect("buffered relay completed");
+        }
+    }
 
     /// An upstream running `serve` on the server end of an in-memory pipe;
     /// returns the relay's end and the server task (yielding what the server
