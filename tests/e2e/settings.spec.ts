@@ -70,8 +70,8 @@ test.describe("settings", () => {
         return { name: s.getAttribute("aria-label"), height: own.height, gap: own.bottom - content };
       }),
     );
-    // Five registry sections plus the DNS filter.
-    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "DNS filter"]);
+    // Five registry sections plus the DNS filter and the engine.
+    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "DNS filter", "Engine"]);
     // Was 686 px of empty space under Filtering's rows: its card took the height of the
     // wrapper that also holds the DNS filter (Card h-full).
     // Allowed: a row's own bottom padding (16) and at most a section's padding.

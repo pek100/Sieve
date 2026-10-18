@@ -2,12 +2,14 @@
  * The single Sieve store, many readers (React through useSieve). One writer
  * per part: the poller (src/data/poller.ts) owns snapshots and sampling
  * status; the DNS controller (src/data/dns-controller.ts) owns `dns` through
- * setDns. Snapshots live in a ring buffer whose size is derived from the
+ * setDns; the engine controller (src/data/engine-controller.ts) owns `engine`
+ * through setEngine. Snapshots live in a ring buffer whose size is derived from the
  * longest window any consumer declared, so nothing keeps more history than
  * someone actually reads.
  */
 import type { Snapshot } from "@/data/protocol";
 import { EMPTY_DNS, type DnsSlice } from "./dns";
+import { EMPTY_ENGINE, type EngineSlice } from "./engine";
 
 export type SourceKind = "mock" | "tauri";
 
@@ -29,6 +31,8 @@ export interface SieveState {
   status: SamplingStatus;
   /** DNS filter state (writer: the DNS controller). */
   dns: DnsSlice;
+  /** Filtering engine facts (writer: the engine controller). */
+  engine: EngineSlice;
 }
 
 export type Phase = "starting" | "live" | "paused" | "off" | "error";
@@ -64,6 +68,8 @@ export interface SieveStore {
   clear(): void;
   // Writer API of the DNS part: only the DNS controller calls this.
   setDns(patch: Partial<DnsSlice>): void;
+  // Writer API of the engine part: only the engine controller calls this.
+  setEngine(next: EngineSlice): void;
 }
 
 export const DEFAULT_INTERVAL_MS = 1000;
@@ -78,6 +84,7 @@ export function createStore(intervalMs = DEFAULT_INTERVAL_MS): SieveStore {
     capacity: 1,
     status: { running: false, pausedUntil: null, error: null },
     dns: EMPTY_DNS,
+    engine: EMPTY_ENGINE,
   };
   const listeners = new Set<() => void>();
 
@@ -128,6 +135,9 @@ export function createStore(intervalMs = DEFAULT_INTERVAL_MS): SieveStore {
     },
     setDns(patch) {
       emit({ ...state, dns: { ...state.dns, ...patch } });
+    },
+    setEngine(next) {
+      emit({ ...state, engine: next });
     },
   };
 }

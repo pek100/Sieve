@@ -11,11 +11,16 @@ import historyFixture from "@/data/fixtures/history-v1.json";
 import dnsFixture from "@/data/fixtures/dns-status-v3.json";
 import fixture from "@/data/fixtures/snapshot-v1.json";
 import windowsFixture from "@/data/fixtures/windows-dns-v1.json";
+import engineFixture from "@/data/fixtures/engine-probe-v1.json";
 import { MOCK_CANARY } from "@/data/dns-mock";
 import {
   CHECK_KINDS,
   DNS_STATUS_VERSION,
+  ENGINE_PROBE_VERSION,
   FLOW_STATES,
+  PIPE_KINDS,
+  SERVICE_FACTS,
+  parseEngineProbe,
   PROTOCOL_VERSION,
   WINDOWS_DNS_VERSION,
   parseDnsStatus,
@@ -130,5 +135,29 @@ describe("protocol law", () => {
     expect(() => parseSnapshot(broken)).toThrow(/flows\[0\]\.state/);
     const badPort = { ...fixture, flows: [{ ...fixture.flows[0], local: { addr: "x", port: 70000 } }] };
     expect(() => parseSnapshot(badPort)).toThrow(/port/);
+  });
+
+  it("engine_probe: every fixture example parses losslessly, and broken ones are refused", () => {
+    expect(engineFixture.v).toBe(ENGINE_PROBE_VERSION);
+    for (const example of Object.values(engineFixture.examples)) {
+      expect(parseEngineProbe(example)).toEqual(example);
+    }
+    const idle = engineFixture.examples.idle;
+    expect(() => parseEngineProbe({ ...idle, v: 2 })).toThrow(ProtocolError);
+    expect(() => parseEngineProbe({ ...idle, service: "paused" })).toThrow(/service/);
+    expect(() => parseEngineProbe({ ...idle, pipe: { kind: "sign" } })).toThrow(/pipe\.kind/);
+    expect(() => parseEngineProbe({ ...idle, pipe: { ...idle.pipe, status: { ...idle.pipe.status, flows: -1 } } })).toThrow(/status\.flows/);
+    expect(() => parseEngineProbe({ ...idle, pipe: { kind: "incompatible", supported: [1] } })).toThrow(/supported/);
+    expect(() => parseEngineProbe(null)).toThrow(ProtocolError);
+  });
+
+  it("engine_probe: version, service facts and pipe kinds agree with src-tauri/src/engine.rs", () => {
+    const engine = read("src-tauri/src/engine.rs");
+    expect(Number(engine.match(/pub const ENGINE_PROBE_VERSION: u32 = (\d+);/)?.[1])).toBe(ENGINE_PROBE_VERSION);
+    const variants = (name: string) =>
+      [...(engine.match(new RegExp(`pub enum ${name} \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? "").matchAll(/^\s{4}(\w+)\b/gm)]
+        .map((m) => m[1].replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()));
+    expect(variants("ServiceFact")).toEqual([...SERVICE_FACTS]);
+    expect(variants("PipeFact")).toEqual([...PIPE_KINDS]);
   });
 });
