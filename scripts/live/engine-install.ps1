@@ -21,11 +21,16 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidateSet("before", "install", "app", "pipe-open", "kill", "reboot-prep", "after-reboot", "uninstall")]
   [string]$Step,
-  [string]$Installer = (Join-Path $PSScriptRoot "..\..\src-tauri\target\release\bundle\nsis\Sieve_0.1.0_x64-setup.exe"),
+  [string]$Installer = "",
   [string]$Out = (Join-Path $env:PUBLIC "sieve-engine-live")
 )
 
 $ErrorActionPreference = "Stop"
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty while parameter defaults are
+# evaluated, so the default installer path is resolved here, in the body.
+if (-not $Installer) {
+  $Installer = Join-Path $PSScriptRoot "..\..\src-tauri\target\release\bundle\nsis\Sieve_0.1.0_x64-setup.exe"
+}
 $Service = "sieve-engine"
 $Pipe = "\\.\pipe\sieve-engine"
 $PipeShort = "sieve-engine"
