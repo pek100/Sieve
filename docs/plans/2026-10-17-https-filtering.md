@@ -24,6 +24,8 @@ Inputs: `docs/research/2026-10-17-parity/*` (the survey of AdGuard 8.0.5584 at `
 | Encrypted DNS upstream (2026-10-18) | When the engine answers DNS on its adapter (slice 4), every lookup it does not block goes to the resolver ENCRYPTED: DNS over HTTPS by default (Cloudflare and Quad9 templates); DNS over TLS and DNS over QUIC are optional upstream kinds the user picks in settings. Never plain DNS while the engine runs. Fail open still holds: when the engine stops, Windows' own DNS settings apply untouched (1.4). |
 | Post-quantum key exchange (2026-10-18) | The hybrid X25519MLKEM768 through rustls with aws-lc-rs, preferred first on ALL TLS: the client-facing side of interception, the upstream side, and the DoH, DoT and DoQ upstream. AdGuard does the same (E12), and "never weaker than the browser" requires it: Chrome already offers X25519MLKEM768, so interception must not strip it (2.7). |
 | Network safety (2026-10-18) | "remove the Point Windows at Sieve feature; the engine will replace it with something that can't break the network." Removed the same day. The rule below binds every slice. |
+| Install folder (2026-10-18) | The user KEEPS CHOOSING the install folder (they use `E:\Sieve`). The installer makes any chosen folder as safe as Program Files: it locks a new or empty folder to administrators before copying anything, keeps a marker in it, and refuses a non-empty folder it did not create. The engine refuses to install and to start when its files can be changed by non-admins (1.5, 7.4). |
+| Signed updates (2026-10-18) | EVERY UPDATE ARTEFACT IS SIGNED with Ed25519 in the minisign format Tauri's updater uses: app and engine releases, the scriptlet resource bundle, and Sieve-owned lists such as the sensitive never-decrypt list. The private key is generated and kept offline by the user, never in the repo or CI; the public key is compiled into the engine. The engine service downloads, verifies the signature and a version that must increase, and only then replaces files in the locked install folder; anything unsigned, tampered or older is refused and nothing is written. The unelevated app can only request an update. Design in 7.5, slice 13. |
 
 ## The rule: Sieve off means a normal network
 
@@ -112,10 +114,16 @@ Decision: one named pipe, `\\.\pipe\sieve-engine`, carrying length-prefixed JSON
 
 ### 1.5 Lifecycle
 
-- **Install.** The Tauri bundle switches to a per-machine NSIS install, so the engine lives in `C:\Program Files\Sieve\`, which only admins can write. A service binary in a user-writable folder would be a local privilege escalation. `wintun.dll` 0.14.1 (signed, hash pinned in code) and its licence text sit beside the engine. The NSIS post-install hook runs `sieve-engine.exe install`: create the service (`sieve-engine`, LocalSystem, automatic start, recovery: restart after 5 s twice, then stay stopped), set the required privileges to the measured minimum, and create `C:\ProgramData\Sieve\engine\` with a DACL of SYSTEM and Administrators only. Installing does not turn on filtering and does not install the root certificate.
+- **Install.** The Tauri bundle is a per-machine NSIS install. The user picks the folder (default `C:\Program Files\Sieve\`; the user's own is `E:\Sieve`). A service binary in a user-writable folder is a local privilege escalation, and the live check of 2026-10-18 found exactly that (7.4), so whatever folder is chosen is made as safe as Program Files:
+  - **The installer locks it.** Tauri's NSIS config has no switch for the folder page (only a full custom template could drop it), so the pre-install hook does the work, after Tauri creates the folder and before it copies the first file. It sets the owner to Administrators, turns inheritance off, removes broad grants and grants SYSTEM and Administrators full control and Users read and execute, inherited by everything inside (`acl::INSTALL_DIR_SDDL`). It writes `sieve-install.marker` into a folder it found empty and checked empty again after locking (nothing slipped in while it was open). A folder holding the marker is locked again on update. A folder that holds other files and no marker is refused, on the folder page's Next and again during the install, because locking it could break someone else's files.
+  - **The engine proves the lock held** (`service::image`, one pure rule over parsed DACLs). Before `install` registers anything, and again at every service start, it checks that only SYSTEM, Administrators and TrustedInstaller own or can change the exe, every file beside it (the marker must be one; a planted DLL loads from the exe's folder first), the folder (inheritable grants too) and every folder above it (rename, delete-child and ACL rights). A refusal registers nothing (`install` exits 3) or keeps the service stopped (service exit code 3, reason in `last-error.txt`). Nothing in the engine re-ACLs a folder.
+  - **Uninstall and update find the engine through the service's registered ImagePath**, so an older build in another folder is still stopped and removed.
+
+  `wintun.dll` 0.14.1 (signed, hash pinned in code) and its licence text sit beside the engine. The NSIS post-install hook runs `sieve-engine.exe install`: create the service (`sieve-engine`, LocalSystem, automatic start, recovery: restart after 5 s twice, then stay stopped), set the required privileges to the measured minimum, and create `C:\ProgramData\Sieve\engine\` with a DACL of SYSTEM and Administrators only. Installing does not turn on filtering and does not install the root certificate.
 - **Turning on.** The first run asks once, with one button "Filter all traffic". It explains in one paragraph that Sieve will decrypt HTTPS with its own certificate and what is never decrypted. That act turns on `filtering.engine`, `filtering.https` and `filtering.content`, each still gated by its passed live check (section 9). The registry law keeps every data switch default `false`, so the defaults stay off, and the first-run consent is the user's flip.
 - **Autostart.** The service starts at boot and filters as soon as its persisted policy says so, without the app. The app's "Launch at login" stays its own setting. Quitting the app never stops filtering. The tray gets "Stop filtering", which sends `SetPolicy` with the engine switch off.
 - **Uninstall.** The NSIS uninstall hook runs `sieve-engine.exe uninstall`. The steps are idempotent and safe to rerun: stop filtering (routes removed, adapter closed), remove every root Sieve installed (by recorded thumbprint, never by name), remove the Firefox policy value only if Sieve set it, delete the CNG key, delete the service, delete `ProgramData\Sieve`. A failed step is reported and the rest still run.
+- **Updates (design, slice 13; decision of 2026-10-18).** The engine service is the only updater. It downloads app and engine releases, the scriptlet resource bundle and Sieve's own lists, checks each one's Ed25519 (minisign) signature against the public key compiled into it and checks that the signed version is higher than the one installed, and only then replaces its files in the locked install folder (or in admin-only ProgramData for data). The old version stays until the new one starts. The app can only ask for an update over the pipe; it never writes into the install folder. Threats and acceptance tests: 7.5.
 - **Kill switch.** "Stop filtering" (tray and app) is the everyday off. The emergency off for a person at an admin prompt is `sieve-engine.exe restore`, also a Start menu shortcut "Sieve: restore network": it deletes every route on any interface named "Sieve", stops the service, and leaves certificates alone. Sieve always fails open (normal routing). It never fails closed.
 
 ### 1.6 Crash safety
@@ -384,6 +392,7 @@ The uBO lists are gated by measurement, not opinion. Slice 10 runs the YouTube a
 - **Scriptlets and redirect resources: uBlock Origin's resources** (`gorhill/uBlock`, GPL-3.0), at a release tag pinned in Sieve's code with the archive's SHA-256. The engine downloads that exact archive at first use, verifies the hash, and assembles the resources with adblock-rust's resource assembler. Why uBO's: the dialect and every uBO list name these scriptlets, AdGuard's uBO builds are converted to them, and adblock-rust is built to consume them. AdGuard Scriptlets would need a name-translation layer and a second resource format.
 - **Runtime fetch with a pinned hash** rather than a build-time dependency or "latest", for three reasons. The GPL-3.0 code stays out of Sieve's repo and installer (Sieve has no declared licence yet, Q3). A pinned hash means a compromised download host cannot change the JavaScript that runs in every page (7.1). Updating is a reviewed one-line change to the pin.
 - **Cost of pinning.** A list rule that names a scriptlet newer than the pin is skipped and counted. The log says "N rules need a newer resource library". Bump cadence: Q8.
+- **From slice 13 (decision of 2026-10-18):** the bundle becomes a signed update (7.5): Sieve republishes the verified archive signed with the user's offline key and a rising version, checked daily, so a bump no longer needs an app release. The pin in code retires then.
 - **Procedural applier:** Brave's content-side applier for adblock-rust's procedural JSON (brave-core `components/cosmetic_filters/resources/data/procedural_filters.ts`, MPL-2.0; the path is UNVERIFIED until slice 9 pins a commit). Vendored as one file with its MPL header at a pinned commit, compiled into Sieve's injected script at build time. MPL is file-level, so this is a clean build-time dependency. It consumes exactly the format adblock-rust emits, which AdGuard ExtendedCss (GPL-3.0, a different syntax) does not.
 
 ### 5.6 Injection into responses
@@ -466,9 +475,10 @@ Also measured, without budgets: the attribution success rate and lag (PROBE), EC
 | Root key theft by admin-level malware | Out of reach for any local MITM. Mitigated in impact: EKU limits misuse to TLS server certificates, and the root is trusted only on this machine. |
 | A malicious local user (another account) | The pipe DACL admits only the enabling user, SYSTEM and Administrators. The client image path is checked. Flow and log events are scoped to the caller's session (1.3). ProgramData is admin only. |
 | Same-user malware abusing IPC | No IPC operation signs, exports or mints. User rules cannot use `trusted-*` scriptlets, and there is no raw JS rule in the dialect. Policy changes appear in the app as notices. |
-| Service binary or DLL replacement | Per-machine install in Program Files. `wintun.dll` is loaded by absolute path with its hash and Authenticode signer ("WireGuard LLC") checked. `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)` is set before any load. |
+| Service binary or DLL replacement | The install folder, whichever the user picks, is locked to administrators by the installer before any file is copied, and the engine refuses to install or start while a non-admin can own or change its exe, a file beside it, its folder or a folder above (1.5, 7.4). `wintun.dll` is loaded by absolute path with its hash and Authenticode signer ("WireGuard LLC") checked. `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)` is set before any load. |
+| Update channel tampering: app and engine releases, Sieve's own lists | Ed25519 (minisign) signature from the user's offline key, checked by the engine against its compiled-in public key, plus a signed version that must increase; only the engine writes, and only into the locked folder or admin-only ProgramData (7.5). |
 | Update channel tampering: filter lists | Downloaded only over the engine's own validated TLS from the catalogue hosts. Lists cannot add raw JS. `trusted-*` scriptlets run only from catalogue-trusted hosts. Worst case: blocking, hiding, or library scriptlets with hostile arguments on non-excluded sites. |
-| Update channel tampering: the resource library | Pinned archive hash in code (5.5). A mismatch refuses the load and keeps the previous verified copy. |
+| Update channel tampering: the resource library | Pinned archive hash in code (5.5). A mismatch refuses the load and keeps the previous verified copy. From slice 13 the bundle is a signed update like the others (7.5), which retires the pin. |
 | Update channel tampering: the exclusion list | It can only add pass-through (4.1). A tampered list can at worst stop decryption. |
 | Hostile servers | Strict upstream validation, with pass-through on any failure, so the browser judges the real certificate itself (2.6). Memory-safe TLS and HTML parsing (rustls, lol_html). Decompression caps. Per-flow caps. |
 | Downgrade | Upstream TLS 1.2+ only. A client that offers only TLS 1.0/1.1 passes through. No early data upstream (2.10). |
@@ -497,6 +507,9 @@ Also measured, without budgets: the attribution success rate and lag (PROBE), EC
 - [ ] Changing one byte of the cached resource archive makes the engine refuse it and keep the last verified copy.
 - [ ] Nothing leaves the machine except requests the user's apps made, list and library downloads, OCSP/CRL/CT/CRLite fetches, and DNS forwarding (network log of the engine's own sockets over 30 min).
 - [ ] No site name appears in engine source (law test).
+- [ ] The install folder (whatever was chosen) has a protected DACL with no inherited ACEs, grants write only to SYSTEM and Administrators, and holds `sieve-install.marker`; no file in it is owned or writable by anyone else (`scripts/live/engine-install.ps1 -Step install`).
+- [ ] The engine refuses a folder users can change: unit tests `service::image::tests` (E: inheritance refused, an E: folder Sieve locked accepted, Program Files default accepted, a user-owned file beside the exe refused) and `the_hooks_icacls_lines_give_the_install_lock`; live, `sc queryex sieve-engine` never shows exit code 3 after a normal install.
+- [ ] Signed updates (slice 13): the acceptance tests of 7.5 pass.
 
 ### 7.3 Sieve must never
 
@@ -507,7 +520,47 @@ Also measured, without budgets: the attribution success rate and lag (PROBE), EC
 - send anything off the machine automatically (no telemetry; reports are user actions);
 - fail closed (cut the network because Sieve failed);
 - run JavaScript in pages other than the pinned resource library and Sieve's own injected script;
-- write YouTube or any other site-specific logic into the engine.
+- write YouTube or any other site-specific logic into the engine;
+- run as SYSTEM from files a non-admin can change, or install anything that is not signed by the user's key with a higher version than the one installed.
+
+### 7.4 Finding, 2026-10-18: a user-writable install folder (fixed)
+
+The slice 2 live check installed Sieve to `E:\Sieve`, a folder the installer let the user choose. It inherited the drive root's ACL: `NT AUTHORITY\Authenticated Users:(I)(M)` on `E:\Sieve` and on `E:\Sieve\sieve-engine.exe`. The `sieve-engine` service runs that exe as LocalSystem, so any signed-in user could replace it and run code as SYSTEM: a local privilege escalation. `C:\ProgramData\Sieve` was locked correctly (an unelevated read was denied). The design had assumed Program Files (1.5) without enforcing it.
+
+The fix (branch `worktree-agent-a6e97b25222738145`), each layer tested on its own:
+1. **Installer.** The user keeps the folder choice. The hook locks the chosen folder before copying anything, writes a marker into a folder it created or found empty, and refuses a non-empty folder without the marker (1.5). Law 10 pins the order; an engine test runs the hook's own icacls lines and reads back `INSTALL_DIR_SDDL`.
+2. **`install` verb.** Before registering the service: `service::image::check_install` over the exe, every file beside it, the folder and every folder above. A refusal registers nothing and exits 3. It never re-ACLs a folder.
+3. **Service start.** The same check at every start; a refusal stops the service with exit code 3 and writes the reason to `last-error.txt`, so a later ACL change cannot leave a SYSTEM service users can replace.
+4. **Uninstall and update.** The hooks find the engine through the service's registered ImagePath, so an older build in another folder (the 0.1.0 one in `E:\Sieve`) is still stopped and removed.
+5. **The rule** is one pure function over parsed owners and DACLs, with unit tests (the live E: case refused, Program Files' default accepted, an E: folder Sieve locked accepted, an explicit Users write ACE refused, a deny ACE is no grant, a TrustedInstaller owner accepted, a user-owned file beside the exe refused) and real reads (`C:\Program Files` accepted, a folder made under `%TEMP%` refused).
+6. **Live check.** `engine-install.ps1` checks that the folder's DACL is protected and grants write only to SYSTEM and Administrators, and that no file in it can be changed by anyone else.
+
+Still UNVERIFIED until the user reruns the live check: the hook on a real elevated install (icacls as the admin, owner set to Administrators), the folder page's refusal on Next, and the service start check as SYSTEM.
+
+### 7.5 Signed updates (design, slice 13)
+
+Every update artefact is signed: app and engine releases (one NSIS installer per release), the scriptlet resource bundle, and Sieve-owned lists (the sensitive never-decrypt list first). Third-party filter lists keep their own channel (5.4): they cannot add code and are fetched over validated TLS.
+
+| Step | What it does | Threat it addresses |
+|---|---|---|
+| Offline key | The user generates the Ed25519 key pair with minisign (`tauri signer generate` makes the same format) on their own machine and keeps the private key offline, never in the repo, CI or the release host. A law test greps the repo for minisign secret-key headers. | A compromised repo, CI runner or release host cannot sign. |
+| Public key in the engine | The public key is compiled into `sieve-engine.exe` (a constant, not a setting or a file). A key change ships inside a release signed by the old key. | A malicious local user or same-user malware cannot swap the trust anchor; the engine sits in the locked folder (7.4). |
+| Signed metadata | Each artefact has a `.minisig`. Its trusted comment (covered by the signature) states `sieve-update kind=<app\|engine\|resources\|list:<id>> version=<n>`. An index of current versions is signed the same way and carries an expiry date. | Mix and match (a signed list served as an engine); a freeze (a host serving an old index forever): a stale index is reported, not trusted. |
+| Download | The engine fetches over its own validated TLS from the catalogue host into a staging folder inside the locked install folder (data: inside admin-only ProgramData). | MITM and a compromised host get no further than serving bytes: the next step refuses them. Nothing user-writable is ever read back. |
+| Verify, before any write to a real file | The engine verifies the signature over the exact staged bytes with the compiled-in key, the kind it asked for, and that the version is higher than the installed one recorded in admin-only ProgramData. Unsigned, tampered, wrong-key, wrong-kind, equal or older: refused, the staging copy deleted, nothing else written, the reason logged and shown in the app. | Tampering, a compromised host, MITM, rollback to an older signed version with known bugs. |
+| Apply atomically | The engine renames the old files aside (`*.old`), renames the verified ones into place in the same folder (a rename on one volume is atomic), and restarts the service. The new engine's start runs the folder check (7.4) and reports healthy over the pipe; only then is the `.old` set deleted. A new version that fails to start is replaced by the `.old` set and the version record is not raised. App releases run the verified installer as SYSTEM with `/S /UPDATE` into the same folder. | A half-written or broken update never leaves the machine without a working engine; filtering fails open as always. |
+| The app only asks | The pipe gets one message, `RequestUpdate {}`, with no URL, path or data: the engine decides where to fetch from and what to verify. It is rate-limited. The app never writes into the install folder, and Tauri's updater plugin is not used in the unelevated app. | A malicious local user or same-user malware can at most trigger a check; they cannot supply content, a source or a version. |
+
+Acceptance tests for slice 13 (offline unit tests with a test key pair generated in the test, plus one live run by the user):
+- a valid artefact verifies; one changed byte, anywhere in the file, is refused;
+- an artefact signed by another key is refused; one with no signature is refused;
+- a signed artefact whose trusted comment names another kind is refused;
+- a version equal to or lower than the installed one is refused, even when correctly signed;
+- after each refusal the install folder and ProgramData listings (names, sizes, hashes) are identical to before;
+- a valid update applies atomically: during the swap either the whole old set or the whole new set is in place, the `.old` set exists until the new engine reports healthy, and a new engine that exits at start is rolled back to the old set with the version record unchanged;
+- the IPC law: `RequestUpdate` is the only update message and carries no fields; no IPC message writes a file;
+- the repo law: no minisign secret key anywhere in the tree;
+- **live:** the user signs a test release with their offline key, the app requests it, the engine applies it, `sc qc` and the version in the app show the new one, and a re-served older release is refused.
 
 ## 8. UI
 
@@ -610,7 +663,8 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
 - **Acceptance.**
   - unit tests for the DACL SDDL string, the client path rule and the version handshake (including `Incompatible`);
   - a TS controller test with a fake source;
-  - **live:** after the installer, `sc qc sieve-engine` shows LocalSystem and automatic start; the app shows Installed; a second Windows user's pipe open is denied; uninstall leaves no service, no ProgramData, nothing in `HKLM\SYSTEM\CurrentControlSet\Services\sieve-engine`.
+  - **live:** after the installer, `sc qc sieve-engine` shows LocalSystem and automatic start; the app shows Installed; a second Windows user's pipe open is denied; uninstall leaves no service, no ProgramData, nothing in `HKLM\SYSTEM\CurrentControlSet\Services\sieve-engine`;
+  - (added 2026-10-18, 7.4) the install folder, whichever was chosen, has a protected DACL that grants write only to SYSTEM and Administrators, no file in it is writable by anyone else, and the engine refuses to install or start otherwise (unit tests in `service::image`, the hook's icacls lines run by an engine test).
 - **Files:** `engine/crates/sieve-engine/src/{service,ipc}/**`, `src-tauri/tauri.conf.json` (bundle), `src-tauri/windows/hooks.nsh`, `src/data/engine-*.ts`, `src/components/sieve/settings/engine-card.tsx`. **Live:** yes, installer UAC. **Switch:** none (nothing changes traffic).
 
 ### Slice 3: full route, relay, DNS on the TUN, crash safety, coexistence
@@ -718,6 +772,12 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
   - component tests: the report contains the listed fields and no query string unless the user leaves it in; "Open issue page" picks the list's issue page; nothing is sent (the network mock records zero requests);
   - e2e at 1280x800 and 375x812 with the alignment and scroll laws.
 - **Files:** `src/components/sieve/log/**`, `src/core/report.ts`. **Live:** no (mock), then a look in `pnpm tauri dev`. **Switch:** none.
+
+### Slice 13: signed updates
+
+- **Spec.** 7.5: minisign verification with the compiled-in public key, signed kind and version in the trusted comment, a signed index with expiry, staging inside the locked folder, atomic swap with rollback, `RequestUpdate {}` over the pipe, the app's update notice. The user generates the key pair offline first; the public key is the only part that enters the repo.
+- **Acceptance.** The list in 7.5.
+- **Files:** `engine/crates/sieve-engine/src/update/**`, `engine/crates/sieve-ipc/src/lib.rs` (one message, fixture bumped), `tests/laws/` (no secret key, the IPC rule). **Live:** yes, the user signs and serves a test release. **Switch:** none (updating never changes traffic by itself).
 
 **UNKNOWN until the probe runs:**
 - attribution rate and lag from the TUN;
