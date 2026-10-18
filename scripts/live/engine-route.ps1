@@ -40,6 +40,9 @@ $EngineDir = Join-Path $env:ProgramData "Sieve\engine"
 $StatusFile = Join-Path $EngineDir "status.json"
 $Results = Join-Path $Out "results-route.txt"
 $script:Failed = 0
+. (Join-Path $PSScriptRoot 'live-lease.ps1')
+$liveLease = Enter-SieveLiveLease
+try {
 
 New-Item -ItemType Directory -Force $Out | Out-Null
 
@@ -335,3 +338,4 @@ switch ($Step) {
 Write-Host ""
 Write-Host ("{0} check(s) failed. Evidence in {1}" -f $script:Failed, $Out) -ForegroundColor $(if ($script:Failed -eq 0) { "Green" } else { "Red" })
 exit $script:Failed
+} finally { Exit-SieveLiveLease $liveLease }
