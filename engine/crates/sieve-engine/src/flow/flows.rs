@@ -7,9 +7,10 @@
 //! `GetExtendedUdpTable(UDP_TABLE_OWNER_PID)` for its address family.
 //!
 //! - TCP: a row whose local and remote ends both match wins; a row whose
-//!   local end matches (remote unknown yet) is accepted next.
+//!   local end matches and remote is unspecified:0 is accepted next.
 //! - UDP rows have no remote end: match local addr:port, then the wildcard
 //!   address (0.0.0.0 or ::) with the same port (unconnected sockets).
+//!   Both protocols require a unique nonzero PID at the chosen specificity.
 //! - The table can lag the first packet (a SYN is on the wire before the
 //!   row is visible to a reader). [`Attributor`] keeps one snapshot per
 //!   table, refreshes it on a miss at most every [`REFRESH_MIN_MS`], and
@@ -141,13 +142,24 @@ pub fn decode_table(table: Table, buf: &[u8]) -> Vec<OwnerRow> {
 
 /// The owner of `flow` among `rows`, best match first (see module docs).
 pub fn match_owner(flow: &FiveTuple, rows: &[OwnerRow]) -> Option<u32> {
-    let exact = rows.iter().find(|r| r.local == flow.local && r.remote == Some(flow.remote));
-    let local = || rows.iter().find(|r| r.local == flow.local);
-    let wildcard = || {
-        rows.iter()
-            .find(|r| r.local.port() == flow.local.port() && r.local.ip().is_unspecified() && r.remote.is_none())
-    };
-    exact.or_else(local).or_else(wildcard).map(|r| r.pid)
+    // Reused ports and shared UDP bindings must not borrow another app's
+    // exemption. At the first matching specificity, require one known PID.
+    fn unique<'a>(mut rows: impl Iterator<Item = &'a OwnerRow>) -> Option<Option<u32>> {
+        let first = rows.next()?.pid;
+        Some((first != 0 && rows.all(|r| r.pid == first)).then_some(first))
+    }
+    if flow.proto == Proto::Tcp {
+        if let Some(owner) = unique(rows.iter().filter(|r| r.local == flow.local && r.remote == Some(flow.remote))) {
+            return owner;
+        }
+        // A different known remote is never a "not connected yet" row.
+        return unique(rows.iter().filter(|r| r.local == flow.local && r.remote.is_some_and(|remote| remote.ip().is_unspecified() && remote.port() == 0))).flatten();
+    }
+    if let Some(owner) = unique(rows.iter().filter(|r| r.local == flow.local && r.remote.is_none())) {
+        return owner;
+    }
+    unique(rows.iter().filter(|r| r.local.port() == flow.local.port() && r.local.ip().is_unspecified()
+        && r.local.is_ipv4() == flow.local.is_ipv4() && r.remote.is_none())).flatten()
 }
 
 /// Where table bytes come from: the OS in the probe, a fake in tests.
@@ -529,9 +541,30 @@ mod tests {
             OwnerRow { local: sa("10.0.0.2:5000"), remote: Some(sa("1.1.1.1:443")), pid: 3 },
         ];
         assert_eq!(match_owner(&tcp("10.0.0.2:5000", "1.1.1.1:443"), &rows), Some(3));
-        assert_eq!(match_owner(&tcp("10.0.0.2:5000", "9.9.9.9:443"), &rows), Some(2));
+        assert_eq!(match_owner(&tcp("10.0.0.2:5000", "9.9.9.9:443"), &rows), None);
         assert_eq!(match_owner(&udp("10.0.0.7:5000", "9.9.9.9:443"), &rows), Some(1));
         assert_eq!(match_owner(&udp("10.0.0.7:6000", "9.9.9.9:443"), &rows), None);
+    }
+
+    #[test]
+    fn attribution_never_guesses_between_apps_or_counts_pid_zero() {
+        let flow = tcp("10.0.0.2:5000", "1.1.1.1:443");
+        let row = OwnerRow { local: flow.local, remote: Some(flow.remote), pid: 0 };
+        assert_eq!(match_owner(&flow, &[row]), None);
+        assert_eq!(match_owner(&flow, &[OwnerRow {pid: 1, ..row}, OwnerRow {pid: 2, ..row}]), None);
+        let flow = udp("10.0.0.2:5000", "1.1.1.1:443");
+        let rows = [OwnerRow {local: sa("0.0.0.0:5000"), remote: None, pid: 1}, OwnerRow {local: sa("0.0.0.0:5000"), remote: None, pid: 2}];
+        assert_eq!(match_owner(&flow, &rows), None);
+        assert_eq!(match_owner(&flow, &[rows[0], rows[0]]), Some(1));
+    }
+
+    #[test]
+    fn only_a_truly_unconnected_tcp_row_can_supply_a_local_fallback() {
+        let flow = tcp("10.0.0.2:5000", "1.1.1.1:443");
+        let row = OwnerRow {local: flow.local, remote: Some(sa("0.0.0.0:0")), pid: 42};
+        assert_eq!(match_owner(&flow, &[row]), Some(42));
+        let wrong_remote = OwnerRow {remote: Some(sa("2.2.2.2:443")), ..row};
+        assert_eq!(match_owner(&flow, &[wrong_remote]), None);
     }
 
     /// A fake table source: rows appear after `visible_after` reads.

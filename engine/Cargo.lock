@@ -930,6 +930,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "url",
  "windows",
  "windows-service",
  "wintun-bindings",

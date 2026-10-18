@@ -263,11 +263,13 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0);
     }
     let (mut bytes_up, mut bytes_down) = (0u64, 0u64);
+    let mut transactions = dns::Transactions::default();
     for d in &held {
         if up.send(d).await.is_err() {
             return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0);
         }
         bytes_up += d.len() as u64;
+        if dns { transactions.remember(d, monotonic_ms()); }
     }
     let mut down = vec![0u8; DATAGRAM];
     let idle = if dns { DNS_IDLE } else { UDP_IDLE };
@@ -277,12 +279,13 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
                 Ok(Ok(n)) if n > 0 => {
                     if up.send(&buf[..n]).await.is_err() { break; }
                     bytes_up += n as u64;
+                    if dns { transactions.remember(&buf[..n], monotonic_ms()); }
                 }
                 _ => break,
             },
             r = tokio::time::timeout(idle, up.recv(&mut down)) => match r {
                 Ok(Ok(n)) => {
-                    if dns && let Some(m) = dns::parse(&down[..n]) {
+                    if dns && let Some(m) = transactions.answer(&down[..n], monotonic_ms()) {
                         lock(&ctx.names).record_message(&m, monotonic_ms());
                         Meters::bump(&ctx.meters.dns_answers);
                     }
