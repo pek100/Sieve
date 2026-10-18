@@ -64,10 +64,18 @@ test.describe("history periods", () => {
   test("the heatmap reads four weeks of history and says so", async ({ page }) => {
     await openHome(page);
     const heat = page.getByRole("region", { name: "When apps are busy" });
+    // Readiness is the card's own signal, not a race with the default 5 s: it is aria-busy (its
+    // skeleton) until the four-week history read answers. Under a loaded machine that read once
+    // took longer than 5 s on mobile ("element not found" on the first cell, 18/18 alone), so the
+    // wait is for the answer, however long the read takes within the test's own timeout.
+    await expect(heat).toBeAttached();
+    await expect(heat).not.toHaveAttribute("aria-busy", "true", { timeout: 25_000 });
+    await expect(heat.getByRole("alert")).toHaveCount(0);
+    await expect(heat.locator("svg[data-heat-plot]")).toBeAttached();
+    // 7 days x 24 hours, then the caption.
+    await expect(heat.locator("[data-cell]")).toHaveCount(168);
     await expect(heat.locator("[data-cell]").first()).toBeVisible();
     await expect(heat).toContainText("Last 4 weeks");
-    // 7 days x 24 hours.
-    await expect(heat.locator("[data-cell]")).toHaveCount(168);
   });
 
   test("a period with no saved counts says so instead of drawing an empty plot", async ({ page }, info) => {
