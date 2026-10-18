@@ -28,7 +28,7 @@ export function ChartLegend({
   onToggle: (key: string) => void;
 }) {
   return (
-    <ul aria-label="Series" className="-mx-1 flex min-w-0 flex-wrap gap-x-2 gap-y-1">
+    <ul aria-label="Series" className="flex min-w-0 flex-wrap gap-x-3 gap-y-1">
       {series.map((s) => {
         const on = !hidden.has(s.key);
         const tone = seriesTone(s.slot);
@@ -40,7 +40,7 @@ export function ChartLegend({
               title={on ? `Hide ${s.name}` : `Show ${s.name}`}
               onClick={() => onToggle(s.key)}
               className={cn(
-                "relative inline-flex h-6 max-w-full items-center gap-2 overflow-hidden rounded-sm px-1 text-caption transition-colors duration-(--motion-fast) ease-standard",
+                "relative inline-flex h-6 max-w-full items-center gap-2 overflow-hidden rounded-sm pr-1 text-caption transition-colors duration-(--motion-fast) ease-standard",
                 on ? "text-on-surface-muted hover:text-on-surface" : "text-on-surface-faint",
               )}
             >
