@@ -7,7 +7,8 @@
  * Changing a message shape bumps PROTOCOL and the fixture in one commit.
  */
 import { describe, expect, it } from "vitest";
-import fixture from "@/data/fixtures/engine-ipc-v1.json";
+import fixture from "@/data/fixtures/engine-ipc-v2.json";
+import { BLOCKER_KINDS, parseEngineStatus } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -28,6 +29,19 @@ describe("engine IPC law", () => {
     expect(fixture.supported).toEqual(JSON.parse(rustConst("SUPPORTED")));
     expect(fixture.maxFrame).toBe(1 << Number(rustConst("MAX_FRAME").replace("1 << ", "")));
     expect(fixture.pipe).toBe(rustConst("PIPE_NAME").replace(/^r"|"$/g, ""));
+    expect(fixture.flowsBatchMs).toBe(Number(rustConst("FLOWS_BATCH_MS")));
+    expect(fixture.flowsPerFrame).toBe(Number(rustConst("FLOWS_PER_FRAME")));
+  });
+
+  it("the app reads the engine's v2 status and every blocker kind the crate declares", () => {
+    const status = fixture.engine.find((m) => m.type === "status")!;
+    const { type: _type, ...body } = status;
+    expect(parseEngineStatus(body)).toEqual(body);
+    const crate = (RUST.match(/pub enum Blocker \{([\s\S]*?)\n\}/)?.[1] ?? "").match(/^\s{4}(\w+)\b/gm) ?? [];
+    const snake = crate.map((v) => v.trim().replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()));
+    expect(snake).toEqual([...BLOCKER_KINDS]);
+    expect(fixture.blockers.map((b) => b.kind)).toEqual([...BLOCKER_KINDS]);
+    for (const b of fixture.blockers) expect(parseEngineStatus({ ...body, blocker: b }).blocker).toEqual(b);
   });
 
   it("fixture names every message type of the crate, in order", () => {

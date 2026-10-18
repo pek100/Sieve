@@ -11,7 +11,7 @@ import historyFixture from "@/data/fixtures/history-v1.json";
 import dnsFixture from "@/data/fixtures/dns-status-v3.json";
 import fixture from "@/data/fixtures/snapshot-v1.json";
 import windowsFixture from "@/data/fixtures/windows-dns-v1.json";
-import engineFixture from "@/data/fixtures/engine-probe-v1.json";
+import engineFixture from "@/data/fixtures/engine-probe-v2.json";
 import { MOCK_CANARY } from "@/data/dns-mock";
 import {
   CHECK_KINDS,
@@ -143,7 +143,14 @@ describe("protocol law", () => {
       expect(parseEngineProbe(example)).toEqual(example);
     }
     const idle = engineFixture.examples.idle;
-    expect(() => parseEngineProbe({ ...idle, v: 2 })).toThrow(ProtocolError);
+    expect(() => parseEngineProbe({ ...idle, v: 1 })).toThrow(ProtocolError);
+    const status = idle.pipe.status;
+    const withStatus = (s: Record<string, unknown>) => ({ ...idle, pipe: { ...idle.pipe, status: s } });
+    expect(() => parseEngineProbe(withStatus({ ...status, blocker: { kind: "elevate" } }))).toThrow(/blocker\.kind/);
+    expect(() => parseEngineProbe(withStatus({ ...status, policy: { revision: 1 } }))).toThrow(/policy\.engine/);
+    expect(() => parseEngineProbe(withStatus({ ...status, counters: { ...status.counters, attributed: -1 } }))).toThrow(/counters\.attributed/);
+    const { counters: _dropped, ...v1 } = status;
+    expect(() => parseEngineProbe(withStatus(v1))).toThrow(/counters/);
     expect(() => parseEngineProbe({ ...idle, service: "paused" })).toThrow(/service/);
     expect(() => parseEngineProbe({ ...idle, pipe: { kind: "sign" } })).toThrow(/pipe\.kind/);
     expect(() => parseEngineProbe({ ...idle, pipe: { ...idle.pipe, status: { ...idle.pipe.status, flows: -1 } } })).toThrow(/status\.flows/);
