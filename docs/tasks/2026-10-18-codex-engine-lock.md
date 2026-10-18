@@ -66,3 +66,15 @@ once.
 No em dash U+2014 anywhere. Do not run pnpm tauri dev/build, open windows, install anything, elevate,
 touch E:\Sieve, its service, network settings or AdGuard. Never commit `features = []` churn in
 src-tauri/Cargo.toml.
+
+## Sieve, not another project: read this before the standards above
+
+The preamble was written for another project. In THIS repo:
+- Ignore the WebGPU, FrameGraph, two-clocks, `?flag`, metres-per-wu and Vite-port rules. Standards 1, 6 and 8 apply in full.
+- There is no `tooling\procs` here. You start no GPU process, no browser and no dev server.
+- There is no npm or pnpm for you. Run the checks directly with the node the preamble names:
+  - typecheck: `node node_modules/typescript/bin/tsc --noEmit`
+  - lint: `node node_modules/eslint/bin/eslint.js`
+  - unit tests: `node node_modules/vitest/vitest.mjs run`
+  If `tsc` reports `LayoutProps` not found, run `node node_modules/next/dist/bin/next typegen` once.
+- cargo lives under `%USERPROFILE%`, which your sandbox cannot read, so do not try. Any Rust or engine change goes under UNVERIFIED with the exact cargo commands for the verifier.
