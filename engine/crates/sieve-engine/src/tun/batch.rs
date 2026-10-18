@@ -1,6 +1,9 @@
 //! Diagnostic TUN batching. Slabs are recycled after the stack reads them.
-//! The packet budget is inherited from the original channel, not multiplied
-//! by the batch limit. Storage is allocated lazily up to that bounded budget.
+//! The original channel's packet budget is a CEILING here, not an equal
+//! queue: the channel holds budget / limit batches, so under sparse traffic
+//! (one packet per wake) far fewer packets queue before the reader waits and
+//! arrivals stay in the Wintun ring. Read tun_batch results with that in mind.
+//! Storage is allocated lazily up to that bounded budget.
 
 use std::io;
 use std::sync::mpsc as sync;

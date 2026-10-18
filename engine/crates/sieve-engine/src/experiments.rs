@@ -62,7 +62,17 @@ fn bounded(name: &str, field: Field, min: usize, max: usize) -> Result<Option<us
     Ok(field.0)
 }
 
+/// Four integer fields fit in well under 200 bytes; this leaves room for any
+/// formatting while keeping the read bounded.
+pub const FILE_MAX: u64 = 4 * 1024;
+
 pub fn parse(bytes: &[u8]) -> Result<Settings, String> {
+    // Windows PowerShell writes UTF-8 with a BOM, and UTF-16 with `>`. A BOM
+    // is not content; UTF-16 is refused by name so the cause is visible.
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return Err("experiments.json is UTF-16; save it as UTF-8".into());
+    }
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     // Serde structs can also deserialize sequences. The file contract is an
     // object, so reject arrays before applying field defaults.
     if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
@@ -94,7 +104,13 @@ pub struct Loaded {
 
 impl Loaded {
     pub fn load(dir: &Path) -> Self {
-        match std::fs::read(dir.join(FILE)) {
+        use std::io::Read;
+        let read = std::fs::File::open(dir.join(FILE)).and_then(|f| {
+            let mut bytes = Vec::new();
+            f.take(FILE_MAX + 1).read_to_end(&mut bytes).map(|_| bytes)
+        });
+        match read {
+            Ok(bytes) if bytes.len() as u64 > FILE_MAX => Self::refused(format!("{FILE} is larger than {FILE_MAX} bytes")),
             Ok(bytes) => Self::from_bytes(&bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::absent(),
             Err(e) => Self::refused(format!("{}: {e}", dir.join(FILE).display())),
@@ -191,6 +207,21 @@ mod tests {
         }
         assert!(parse(b"{\"unknown\":1}").unwrap_err().contains("unknown field"));
         assert!(parse(b"{").unwrap_err().contains("EOF"));
+    }
+
+    #[test]
+    fn a_utf8_bom_is_accepted_utf16_and_oversized_files_are_refused_by_name() {
+        assert_eq!(parse(b"\xEF\xBB\xBF{\"tun_mtu\":9000}").unwrap().tun_mtu, 9000);
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain("{}".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        assert!(parse(&utf16).unwrap_err().contains("UTF-16"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut big = b"{\"tun_mtu\":9000}".to_vec();
+        big.resize(FILE_MAX as usize + 1, b' ');
+        std::fs::write(dir.path().join(FILE), &big).unwrap();
+        assert!(matches!(Loaded::load(dir.path()).file, ReadResult::Refused { reason } if reason.contains("larger")));
+        big.truncate(FILE_MAX as usize);
+        std::fs::write(dir.path().join(FILE), &big).unwrap();
+        assert_eq!(Loaded::load(dir.path()).settings.tun_mtu, 9000, "exactly the cap is read");
     }
 
     #[test]

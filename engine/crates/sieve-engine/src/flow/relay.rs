@@ -39,6 +39,11 @@ pub struct Outcome {
     pub upstream_write_failed: bool,
 }
 
+/// The read buffer the classifier phase uses. It only has to cover the
+/// classifier's cap (MAX_STREAM_BYTES) in about one read; both relays share it
+/// so the diagnostic one differs from production only in its copy phase.
+pub const CLASSIFIER_READ: usize = 16 * 1024;
+
 pub async fn relay_tcp<A, U>(
     app: &mut A,
     upstream: U,
@@ -60,7 +65,7 @@ where
     let client_to_server = async {
         let mut out = Outcome::default();
         let mut classifier = TcpClassifier::new();
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut buf = vec![0u8; CLASSIFIER_READ];
         // The classifier holds at most its cap, so the read that decides can
         // carry a tail it did not keep: `spill` is that tail, sent after the
         // held bytes and before the rest of the stream.
@@ -114,7 +119,7 @@ where
 }
 
 /// Diagnostic counterpart of relay_tcp. Keep classification, half-close and
-/// outcomes in sync; only the allocation and copy primitives differ.
+/// outcomes in sync; only the copy phase's buffers differ (`capacity`).
 #[cfg(feature = "relay-experiments")]
 pub async fn relay_tcp_buffered<A, U>(
     app: &mut A,
@@ -139,7 +144,9 @@ where
     let client_to_server = async {
         let mut out = Outcome::default();
         let mut classifier = TcpClassifier::new();
-        let mut buf = vec![0u8; capacity];
+        // Same classifier read as production; dropped before the copy phase
+        // so a flow holds only its two copy buffers.
+        let mut buf = vec![0u8; CLASSIFIER_READ];
         let (decided, spill) = loop {
             match tokio::time::timeout(first_bytes_wait, app_read.read(&mut buf)).await {
                 Ok(Ok(0)) | Ok(Err(_)) => {
@@ -171,6 +178,7 @@ where
             out.stop = true;
             return out;
         }
+        drop(buf);
         let mut app_read = tokio::io::BufReader::with_capacity(capacity, &mut app_read);
         out.bytes_up = (held.len() + spill.len()) as u64 + tokio::io::copy_buf(&mut app_read, &mut up_write).await.unwrap_or(0);
         let _ = up_write.shutdown().await;

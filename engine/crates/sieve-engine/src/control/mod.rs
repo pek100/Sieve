@@ -158,7 +158,7 @@ impl Engine {
             "app_to_upstream_bytes": copy,
             "upstream_to_app_bytes": copy,
             // The fallback is relay_tcp's existing classifier read buffer.
-            "classifier_bytes": self.experiments.settings.copy_buffer_bytes.unwrap_or(16 * 1024),
+            "classifier_bytes": crate::flow::relay::CLASSIFIER_READ,
         });
         let workers = self.runtime_workers.load(std::sync::atomic::Ordering::Relaxed);
         // Before the runtime exists there is no effective worker count yet.
