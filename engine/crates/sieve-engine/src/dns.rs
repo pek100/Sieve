@@ -246,9 +246,10 @@ impl NameMap {
         }
         let entry = self.entries.entry(ip).or_default();
         entry.live.retain(|(_, exp)| *exp > now_ms);
-        // A new answer can shorten a TTL as well as extend it.
+        // The map is shared by every app and resolver: a shorter answer seen
+        // by one client never cuts short an answer another client still caches.
         if let Some(e) = entry.live.iter_mut().find(|(n, _)| *n == name) {
-            e.1 = expires;
+            e.1 = e.1.max(expires);
         } else if ttl_s != 0 {
             if entry.live.len() < NAMES_PER_IP_CAP {
                 entry.live.push((name, expires));
@@ -578,16 +579,23 @@ mod tests {
     }
 
     #[test]
-    fn new_answers_can_shorten_ttl_and_zero_ttl_removes_evidence() {
+    fn a_shorter_answer_never_cuts_short_another_clients_cached_answer() {
         let mut map = NameMap::default();
         let address = ip("192.0.2.1");
+        // Two clients share the address; one later sees a TTL 0 answer for
+        // news.example. The other may use its 300 s answer until it expires,
+        // so news.example must stay (else ads.example alone would block it).
+        map.record("news.example", address, 300, 0);
         map.record("ads.example", address, 300, 0);
-        map.record("ads.example", address, 1, 1_000);
-        assert_eq!(map.names(address, 1_999), vec!["ads.example"]);
-        assert!(map.names(address, 2_000).is_empty());
-        map.record("ads.example", address, 300, 3_000);
-        map.record("ads.example", address, 0, 4_000);
-        assert!(map.names(address, 4_000).is_empty());
+        map.record("news.example", address, 0, 1_000);
+        map.record("news.example", address, 1, 1_000);
+        assert_eq!(map.names(address, 2_000), vec!["news.example", "ads.example"]);
+        map.record("news.example", address, 600, 100_000);
+        assert_eq!(map.names(address, 400_000), vec!["news.example"]);
+        assert!(map.names(address, 700_000).is_empty());
+        // A TTL 0 answer for an unseen address records nothing.
+        map.record("zero.example", ip("192.0.2.2"), 0, 0);
+        assert!(map.names(ip("192.0.2.2"), 0).is_empty());
     }
 
     #[test]
