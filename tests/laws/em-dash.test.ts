@@ -11,6 +11,7 @@ describe("em dash law", () => {
     const files = [
       ...walk("src", EXTS),
       ...walk("src-tauri/src", EXTS),
+      ...walk("engine/crates", EXTS),
       ...walk("docs", EXTS),
       ...walk("tests", EXTS),
       ...walk("scripts", EXTS),

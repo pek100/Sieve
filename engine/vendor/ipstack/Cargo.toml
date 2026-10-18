@@ -1,0 +1,38 @@
+# Vendored copy of ipstack 1.0.1 (Apache-2.0, github.com/narrowlink/ipstack,
+# LICENSE beside this file). `src/` is byte for byte the crates.io release.
+#
+# Changed by Sieve (2026-10-18), the only change: this manifest. The upstream
+# `build.rs` is not copied and `build` is not set. Upstream, on every Windows
+# build (also as a dependency) it ran `cargo metadata` and copied the
+# `wintun.dll` bundled in its dev-dependency into `target/<profile>/examples/`.
+# Sieve loads Wintun only from its install folder with the signer checked, so
+# no build may put a DLL anywhere (law: sieve-engine `vendored_ipstack_has_no_build_script`).
+# Examples, dev-dependencies and build-dependencies are dropped with it.
+[package]
+edition = "2024"
+name = "ipstack"
+version = "1.0.1"
+authors = ["Narrowlink <opensource@narrowlink.com>"]
+description = "Asynchronous lightweight userspace implementation of TCP/IP stack for Tun device"
+license = "Apache-2.0"
+repository = "https://github.com/narrowlink/ipstack"
+publish = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "ipstack"
+path = "src/lib.rs"
+
+[dependencies]
+ahash = { version = "0.8", default-features = false, features = ["std"] }
+etherparse = { version = "0.20", default-features = false, features = ["std"] }
+log = { version = "0.4", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
+thiserror = { version = "2.0", default-features = false }
+tokio = { version = "1.52", default-features = false, features = ["sync", "rt", "time", "io-util", "macros", "rt-multi-thread"] }
+
+[lints.rust]
+# Upstream code, not held to Sieve's lint set.
+warnings = "allow"
