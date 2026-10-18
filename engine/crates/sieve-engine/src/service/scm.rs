@@ -23,7 +23,8 @@ use super::{
     DESCRIPTION, DISPLAY_NAME, FAILURE_RESET, FOLDER_STEP, REQUIRED_PRIVILEGES, RESTART_DELAY, RESTARTS, SERVICE_NAME,
     STOP_WAIT, Step, image_exe,
 };
-use crate::route::delete_sieve_routes;
+use crate::route::apply::clear_stale;
+use crate::route::journal::Journal;
 
 const POLL: Duration = Duration::from_millis(250);
 
@@ -199,8 +200,12 @@ fn remove_program_data() -> Result<String, String> {
     }
 }
 
+/// Every route on an interface named "Sieve" and every journalled one (a
+/// journal that is not there is fine: nothing was routed).
 fn routes() -> Result<String, String> {
-    delete_sieve_routes().map(|n| format!("{n} routes on \"Sieve\" deleted"))
+    let dir = state::engine_dir(&state::program_data()?);
+    let done = clear_stale(&Journal::new(&dir));
+    if done.contains("FAILED") { Err(done) } else { Ok(done) }
 }
 
 /// The folder check first; when it refuses, nothing else runs: no service is

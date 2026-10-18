@@ -1,16 +1,20 @@
 //! The engine's side of the pipe (plan 1.3). [`serve_client`] runs one
-//! connection over any stream, so the handshake and the requests are tested
-//! in memory; `server` (Windows) owns the real pipe, its DACL and the client
-//! check ([`client_allowed`]).
+//! connection over any stream against a [`Backend`], so the handshake, the
+//! requests and the flow stream are tested in memory; `server` (Windows)
+//! owns the real pipe, its DACL and the client check ([`client_allowed`]).
 
 #[cfg(windows)]
 pub mod server;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use sieve_ipc::nonblocking::{read_frame, write_frame};
-use sieve_ipc::{ClientMessage, EngineMessage, EngineStatus, FrameError, answer_hello};
+use sieve_ipc::{ClientMessage, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, Policy, answer_hello};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::broadcast;
+
+use crate::stack::book::visible_to;
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The app's executable as the installer lays it out: Tauri's main binary,
@@ -23,6 +27,24 @@ pub const HELLO_WAIT: Duration = Duration::from_secs(5);
 pub const NOT_ALLOWED: &str = "only the installed Sieve app may connect to the engine";
 pub const HELLO_FIRST: &str = "send hello first";
 pub const HELLO_ONCE: &str = "hello was already sent";
+
+/// What the pipe asks of the engine (the running engine is
+/// `control::Engine`; tests use a fake).
+pub trait Backend: Send + Sync + 'static {
+    fn status(&self) -> EngineStatus;
+    /// Applies a newer policy and answers the Status after it.
+    fn set_policy(&self, policy: Policy) -> Result<EngineStatus, String>;
+    /// The open flows now, every batch from now on, and whether routes are
+    /// up (a subscription ends when they go down: the app then reads the
+    /// connection tables again).
+    fn subscribe(&self) -> Subscription;
+}
+
+pub struct Subscription {
+    pub open: Vec<FlowEvent>,
+    pub batches: broadcast::Receiver<Arc<Vec<FlowEvent>>>,
+    pub routes_up: tokio::sync::watch::Receiver<bool>,
+}
 
 /// Normalises a Windows path for comparison: `/` to `\`, no `\\?\` prefix,
 /// lower case. None when it has a `.` or `..` component, which a real image
@@ -48,12 +70,14 @@ pub fn client_allowed(client_image: &str, engine_exe: &str) -> bool {
 
 /// Runs one client connection to its end: Hello first (within
 /// [`HELLO_WAIT`]), then requests. An Incompatible answer, a request before
-/// Hello and a malformed frame end the connection after one reply.
+/// Hello and a malformed frame end the connection after one reply. After
+/// `subscribe` the connection carries `flows` batches of the client's
+/// session (and the services', session 0) until either side closes.
 /// `session_id` is the client process's Windows session.
-pub async fn serve_client<S, F>(stream: &mut S, session_id: u32, status: F) -> Result<(), FrameError>
+pub async fn serve_client<S, B>(stream: &mut S, session_id: u32, backend: &B) -> Result<(), FrameError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    F: Fn() -> EngineStatus,
+    B: Backend + ?Sized,
 {
     let first = match tokio::time::timeout(HELLO_WAIT, read_frame::<_, ClientMessage>(stream)).await {
         Err(_) => return Ok(()),
@@ -74,12 +98,61 @@ where
     }
     loop {
         let reply = match read_frame::<_, ClientMessage>(stream).await {
-            Ok(ClientMessage::Status) => EngineMessage::Status(status()),
+            Ok(ClientMessage::Status) => EngineMessage::Status(backend.status()),
+            Ok(ClientMessage::SetPolicy(p)) => match backend.set_policy(p) {
+                Ok(status) => EngineMessage::Status(status),
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::Subscribe) => return stream_flows(stream, session_id, backend).await,
             Ok(ClientMessage::Hello { .. }) => return refuse(stream, HELLO_ONCE).await,
             Err(FrameError::Closed) => return Ok(()),
             Err(e) => return refuse(stream, &e.to_string()).await,
         };
         write_frame(stream, &reply).await?;
+    }
+}
+
+/// Sends `events` the client may see, in frames of at most FLOWS_PER_FRAME.
+async fn send_flows<S: AsyncWrite + Unpin>(stream: &mut S, session_id: u32, events: &[FlowEvent]) -> Result<(), FrameError> {
+    let mine: Vec<FlowEvent> = events.iter().filter(|e| visible_to(e, session_id)).cloned().collect();
+    for chunk in mine.chunks(FLOWS_PER_FRAME) {
+        write_frame(stream, &EngineMessage::Flows { flows: chunk.to_vec() }).await?;
+    }
+    Ok(())
+}
+
+/// The subscribed connection: the open flows first, then each batch. A
+/// client that falls behind by more than the backlog is disconnected (it
+/// reconnects and starts from the open flows again); a client that closes
+/// or sends anything ends the stream.
+async fn stream_flows<S, B>(stream: &mut S, session_id: u32, backend: &B) -> Result<(), FrameError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    B: Backend + ?Sized,
+{
+    let Subscription { open, mut batches, mut routes_up } = backend.subscribe();
+    send_flows(stream, session_id, &open).await?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut probe = [0u8; 1];
+    loop {
+        tokio::select! {
+            batch = batches.recv() => match batch {
+                Ok(b) => send_flows(&mut writer, session_id, &b).await?,
+                Err(_) => return Ok(()),
+            },
+            _ = routes_down(&mut routes_up) => return Ok(()),
+            _ = tokio::io::AsyncReadExt::read(&mut reader, &mut probe) => return Ok(()),
+        }
+    }
+}
+
+/// Resolves once the routes are down (or the engine dropped the sender).
+async fn routes_down(routes_up: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        let up = *routes_up.borrow_and_update();
+        if !up || routes_up.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -91,7 +164,9 @@ pub async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, message: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stack::book::tests_event;
     use sieve_ipc::{PROTOCOL, SUPPORTED};
+    use std::sync::Mutex;
     use tokio::io::{AsyncWriteExt, DuplexStream};
 
     const ENGINE: &str = r"C:\Program Files\Sieve\sieve-engine.exe";
@@ -127,8 +202,33 @@ mod tests {
         assert_eq!(APP_EXE, format!("{name}.exe"));
     }
 
-    fn idle() -> EngineStatus {
-        EngineStatus::default()
+    /// A stand-in engine: a policy, and a flow channel the test drives.
+    struct Fake {
+        policy: Mutex<Policy>,
+        open: Vec<FlowEvent>,
+        flows: broadcast::Sender<Arc<Vec<FlowEvent>>>,
+        routes: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl Fake {
+        fn new(open: Vec<FlowEvent>) -> Arc<Self> {
+            let routes = tokio::sync::watch::channel(true).0;
+            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, routes })
+        }
+    }
+
+    impl Backend for Fake {
+        fn status(&self) -> EngineStatus {
+            EngineStatus { policy: *self.policy.lock().unwrap(), ..EngineStatus::default() }
+        }
+        fn set_policy(&self, p: Policy) -> Result<EngineStatus, String> {
+            let next = crate::policy::accept(*self.policy.lock().unwrap(), p)?;
+            *self.policy.lock().unwrap() = next;
+            Ok(self.status())
+        }
+        fn subscribe(&self) -> Subscription {
+            Subscription { open: self.open.clone(), batches: self.flows.subscribe(), routes_up: self.routes.subscribe() }
+        }
     }
 
     async fn send(s: &mut DuplexStream, m: &ClientMessage) {
@@ -139,9 +239,13 @@ mod tests {
         read_frame(s).await.unwrap()
     }
 
+    fn start_with(session: u32, fake: Arc<Fake>) -> (DuplexStream, tokio::task::JoinHandle<Result<(), FrameError>>) {
+        let (client, mut engine) = tokio::io::duplex(1 << 20);
+        (client, tokio::spawn(async move { serve_client(&mut engine, session, fake.as_ref()).await }))
+    }
+
     fn start(session: u32) -> (DuplexStream, tokio::task::JoinHandle<Result<(), FrameError>>) {
-        let (client, mut engine) = tokio::io::duplex(64 * 1024);
-        (client, tokio::spawn(async move { serve_client(&mut engine, session, idle).await }))
+        start_with(session, Fake::new(vec![]))
     }
 
     fn hello(protocol: u32) -> ClientMessage {
@@ -158,8 +262,85 @@ mod tests {
         );
         for _ in 0..2 {
             send(&mut c, &ClientMessage::Status).await;
-            assert_eq!(recv(&mut c).await, EngineMessage::Status(idle()));
+            assert_eq!(recv(&mut c).await, EngineMessage::Status(EngineStatus::default()));
         }
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_policy_answers_the_new_status_and_a_stale_one_is_an_error() {
+        let (mut c, task) = start(1);
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        let on = Policy { revision: 1, engine: true };
+        send(&mut c, &ClientMessage::SetPolicy(on)).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.policy == on));
+        send(&mut c, &ClientMessage::SetPolicy(Policy { revision: 1, engine: false })).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Error { message } if message.contains("stale")));
+        send(&mut c, &ClientMessage::Status).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.policy == on), "the connection stays usable");
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_gets_its_sessions_open_flows_then_batches_and_never_another_users() {
+        let mut mine = tests_event(Some(1));
+        mine.id = 1;
+        let mut service = tests_event(Some(0));
+        service.id = 2;
+        let mut other_user = tests_event(Some(2));
+        other_user.id = 3;
+        let fake = Fake::new(vec![mine.clone(), other_user.clone()]);
+        let (mut c, task) = start_with(1, fake.clone());
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::Subscribe).await;
+        assert_eq!(recv(&mut c).await, EngineMessage::Flows { flows: vec![mine.clone()] });
+        fake.flows.send(Arc::new(vec![other_user, service.clone()])).unwrap();
+        assert_eq!(recv(&mut c).await, EngineMessage::Flows { flows: vec![service] });
+        // A batch with nothing for this session sends no frame.
+        fake.flows.send(Arc::new(vec![tests_event(Some(5))])).unwrap();
+        let mut closing = mine;
+        closing.open = false;
+        fake.flows.send(Arc::new(vec![closing.clone()])).unwrap();
+        assert_eq!(recv(&mut c).await, EngineMessage::Flows { flows: vec![closing] });
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_stream_ends_when_the_routes_go_down() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = start_with(1, fake.clone());
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::Subscribe).await;
+        tokio::task::yield_now().await;
+        fake.routes.send(false).unwrap();
+        task.await.unwrap().unwrap();
+        assert!(matches!(read_frame::<_, EngineMessage>(&mut c).await, Err(FrameError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn a_big_batch_is_split_into_frames() {
+        let events: Vec<FlowEvent> = (0..(FLOWS_PER_FRAME as u64 + 3))
+            .map(|i| {
+                let mut e = tests_event(Some(1));
+                e.id = i;
+                e
+            })
+            .collect();
+        let (mut c, task) = start_with(1, Fake::new(events));
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::Subscribe).await;
+        let sizes = [recv(&mut c).await, recv(&mut c).await].map(|m| match m {
+            EngineMessage::Flows { flows } => flows.len(),
+            other => panic!("{other:?}"),
+        });
+        assert_eq!(sizes, [FLOWS_PER_FRAME, 3]);
         drop(c);
         task.await.unwrap().unwrap();
     }

@@ -1,0 +1,17 @@
+{
+  "adapters": [
+    {
+      "index": 40, "luid": 1689399632855050, "alias": "AdGuard VPN", "description": "AdGuard VPN Tunnel",
+      "if_type": 53, "up": true,
+      "addresses": [{ "ip": "172.16.219.2", "len": 32 }, { "ip": "fd00:6a::2", "len": 128 }],
+      "dns": ["172.16.219.1"]
+    }
+  ],
+  "routes": [
+    { "dest": "0.0.0.0/1", "if_index": 40, "next_hop": null, "metric": 5 },
+    { "dest": "128.0.0.0/1", "if_index": 40, "next_hop": null, "metric": 5 },
+    { "dest": "::/1", "if_index": 40, "next_hop": null, "metric": 5 },
+    { "dest": "8000::/1", "if_index": 40, "next_hop": null, "metric": 5 },
+    { "dest": "198.51.100.7/32", "if_index": 6, "next_hop": "192.168.7.1", "metric": 50 }
+  ]
+}

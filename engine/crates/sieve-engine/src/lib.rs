@@ -2,14 +2,29 @@
 //! - [`flow`]: the flow decoders moved from the Wintun spike (slice 1);
 //! - [`service`]: the Windows service and its install, uninstall and
 //!   restore verbs (slice 2);
-//! - [`ipc`]: the pipe server and the per-connection protocol (slice 2);
-//! - [`route`]: removal of Sieve's routes for the off paths.
+//! - [`ipc`]: the pipe server and the per-connection protocol (slice 2, 3);
+//! - [`route`]: the route plan, pinning, the journal, and the only writes
+//!   of routing state (on the engine's own adapter, slice 3);
+//! - [`tun`]: the pinned wintun.dll and the adapter (slice 3);
+//! - [`stack`]: the relay of every flow, with attribution (slice 3);
+//! - [`dns`]: DNS answers read into the IP-to-names map (slice 3);
+//! - [`coexist`]: AdGuard and VPN detection, read only (slice 3);
+//! - [`watchdog`], [`policy`]: hang and crash-loop safety (slice 3);
+//! - [`control`]: the running engine's facts and its routing loop.
 //!
-//! Nothing here changes traffic yet: no adapter and no route is ever added.
+//! Slice 3 routes and relays; it filters nothing. Traffic goes through the
+//! engine only while the user's `filtering.engine` switch is on.
+pub mod coexist;
+pub mod control;
+pub mod dns;
 pub mod flow;
 pub mod ipc;
+pub mod policy;
 pub mod route;
 pub mod service;
+pub mod stack;
+pub mod tun;
+pub mod watchdog;
 
 #[cfg(test)]
 mod tests {

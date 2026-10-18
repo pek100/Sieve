@@ -1,8 +1,26 @@
-//! Sieve's routes, for removal only (plan 1.5 `restore`, 1.6). Every route
-//! the engine will ever add sits on its Wintun interface, named
-//! [`ADAPTER_NAME`]; removing them is how any off path gives the machine its
-//! normal routing back. Slice 2 adds no route: this is the cleanup that
-//! `restore` and `uninstall` run so they are complete before slice 3.
+//! Sieve's routes (plan 1.4, 1.6). Every route the engine adds sits on its
+//! Wintun interface, named [`ADAPTER_NAME`], in the active store only
+//! (`apply`, the one place that writes a route), so all of them go with the
+//! adapter when the engine's handle closes and none survives a reboot.
+//! Removing them is how every off path gives the machine its normal routing
+//! back (`restore`, `uninstall`, the watchdog, the start-up cleanup).
+//! - [`prefix`]: prefixes and the complement the plan cuts holes with;
+//! - [`table`]: the adapter and forwarding tables as data (fixtures in tests);
+//! - [`plan`]: which prefixes to route, derived from those tables;
+//! - [`pin`]: the egress interface and source address of an upstream socket;
+//! - [`journal`]: routes recorded on disk before they are added;
+//! - `apply` and `watch` (Windows): the writes and `NotifyRouteChange2`.
+
+pub mod journal;
+pub mod pin;
+pub mod plan;
+pub mod prefix;
+pub mod table;
+
+#[cfg(windows)]
+pub mod apply;
+#[cfg(windows)]
+pub mod watch;
 
 /// The engine's adapter (plan 1.4).
 pub const ADAPTER_NAME: &str = "Sieve";

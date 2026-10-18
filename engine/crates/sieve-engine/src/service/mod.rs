@@ -22,8 +22,8 @@
 //! fails, so a later ACL change cannot leave a SYSTEM service that users can
 //! replace.
 //!
-//! In slice 2 the running service changes nothing about traffic: no adapter,
-//! no routes. It only answers the pipe.
+//! The running service routes nothing until the user turns `filtering.engine`
+//! on (`SetPolicy`); `runner` has its start-up order (slice 3).
 
 pub mod acl;
 pub mod image;
@@ -48,10 +48,14 @@ pub const RESTARTS: usize = 2;
 pub const FAILURE_RESET: Duration = Duration::from_secs(3_600);
 
 /// The privileges the service keeps; Windows strips every other one from its
-/// LocalSystem token. Slice 2 creates a pipe and reads process images and
-/// session ids, which need none beyond traverse checking. Slice 3 (the Wintun
-/// adapter and routes) must measure and add its own; UNVERIFIED until then.
-pub const REQUIRED_PRIVILEGES: &[&str] = &["SeChangeNotifyPrivilege"];
+/// LocalSystem token. Slice 2's pipe and process reads need none beyond
+/// traverse checking. Slice 3 creates a Wintun adapter, which installs and
+/// loads Wintun's driver on first use (SetupAPI and the driver store: load
+/// driver, backup and restore). UNVERIFIED until the live check: an adapter
+/// that cannot be created is a Setup blocker (the network stays as it was)
+/// and its reason shows in the Engine block.
+pub const REQUIRED_PRIVILEGES: &[&str] =
+    &["SeChangeNotifyPrivilege", "SeLoadDriverPrivilege", "SeBackupPrivilege", "SeRestorePrivilege"];
 
 /// How long `uninstall` and `restore` wait for the service to stop.
 pub const STOP_WAIT: Duration = Duration::from_secs(20);
@@ -121,6 +125,10 @@ pub const FOLDER_STEP: &str = "binary folder";
 /// exit code when it refuses to start for the same reason. The installer's
 /// hook names it (law 10).
 pub const EXIT_UNSAFE_FOLDER: i32 = 3;
+
+/// Process exit code after the watchdog deleted the routes of a hung engine
+/// (plan 1.6.2); the service manager restarts it.
+pub const EXIT_WATCHDOG: i32 = 5;
 
 /// The verb's report: one line per step, and the exit code (0 when every
 /// step succeeded, [`EXIT_UNSAFE_FOLDER`] when the folder check refused, 1
@@ -205,6 +213,10 @@ mod tests {
     #[test]
     fn recovery_is_two_restarts_then_stopped() {
         assert_eq!((RESTART_DELAY.as_secs(), RESTARTS, FAILURE_RESET.as_secs()), (5, 2, 3_600));
-        assert_eq!(REQUIRED_PRIVILEGES, ["SeChangeNotifyPrivilege"]);
+        assert_eq!(REQUIRED_PRIVILEGES[0], "SeChangeNotifyPrivilege");
+        for banned in ["SeDebugPrivilege", "SeTcbPrivilege", "SeImpersonatePrivilege", "SeAssignPrimaryTokenPrivilege"] {
+            assert!(!REQUIRED_PRIVILEGES.contains(&banned), "{banned}");
+        }
+        assert_ne!(EXIT_WATCHDOG, EXIT_UNSAFE_FOLDER);
     }
 }

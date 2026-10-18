@@ -1,0 +1,55 @@
+{
+  "adapters": [
+    {
+      "index": 6, "luid": 1689399632855040, "alias": "Wi-Fi", "description": "Intel(R) Wi-Fi 6E AX211 160MHz",
+      "if_type": 71, "up": true,
+      "addresses": [
+        { "ip": "192.168.7.20", "len": 24 },
+        { "ip": "2001:db8:7:1::20", "len": 64 },
+        { "ip": "fe80::20", "len": 64 }
+      ],
+      "dns": ["192.168.7.1", "2001:db8:7:1::1"]
+    },
+    {
+      "index": 24, "luid": 1689399632855041, "alias": "vEthernet (Default Switch)", "description": "Hyper-V Virtual Ethernet Adapter",
+      "if_type": 6, "up": true,
+      "addresses": [{ "ip": "172.27.16.1", "len": 20 }, { "ip": "fe80::24", "len": 64 }],
+      "dns": []
+    },
+    {
+      "index": 8, "luid": 1689399632855042, "alias": "Ethernet 2", "description": "VirtualBox Host-Only Ethernet Adapter",
+      "if_type": 6, "up": true,
+      "addresses": [{ "ip": "192.168.56.1", "len": 24 }, { "ip": "fe80::8", "len": 64 }],
+      "dns": []
+    },
+    {
+      "index": 11, "luid": 1689399632855043, "alias": "Ethernet", "description": "Realtek Gaming 2.5GbE Family Controller",
+      "if_type": 6, "up": false,
+      "addresses": [{ "ip": "169.254.11.11", "len": 16 }],
+      "dns": []
+    },
+    {
+      "index": 1, "luid": 1689399632855044, "alias": "Loopback Pseudo-Interface 1", "description": "Software Loopback Interface 1",
+      "if_type": 24, "up": true,
+      "addresses": [{ "ip": "127.0.0.1", "len": 8 }, { "ip": "::1", "len": 128 }],
+      "dns": []
+    }
+  ],
+  "routes": [
+    { "dest": "0.0.0.0/0", "if_index": 6, "next_hop": "192.168.7.1", "metric": 50 },
+    { "dest": "::/0", "if_index": 6, "next_hop": "fe80::1", "metric": 306 },
+    { "dest": "192.168.7.0/24", "if_index": 6, "next_hop": null, "metric": 306 },
+    { "dest": "192.168.7.20/32", "if_index": 6, "next_hop": null, "metric": 306 },
+    { "dest": "192.168.7.255/32", "if_index": 6, "next_hop": null, "metric": 306 },
+    { "dest": "172.27.16.0/20", "if_index": 24, "next_hop": null, "metric": 271 },
+    { "dest": "192.168.56.0/24", "if_index": 8, "next_hop": null, "metric": 281 },
+    { "dest": "127.0.0.0/8", "if_index": 1, "next_hop": null, "metric": 331 },
+    { "dest": "224.0.0.0/4", "if_index": 6, "next_hop": null, "metric": 306 },
+    { "dest": "224.0.0.0/4", "if_index": 24, "next_hop": null, "metric": 271 },
+    { "dest": "255.255.255.255/32", "if_index": 6, "next_hop": null, "metric": 306 },
+    { "dest": "2001:db8:7:1::/64", "if_index": 6, "next_hop": null, "metric": 306 },
+    { "dest": "fe80::/64", "if_index": 6, "next_hop": null, "metric": 306 },
+    { "dest": "ff00::/8", "if_index": 6, "next_hop": null, "metric": 306 },
+    { "dest": "::1/128", "if_index": 1, "next_hop": null, "metric": 331 }
+  ]
+}

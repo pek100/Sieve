@@ -1,0 +1,19 @@
+{
+  "adapters": [
+    {
+      "index": 45, "luid": 1689399632855060, "alias": "Sieve", "description": "Sieve Tunnel",
+      "if_type": 53, "up": true,
+      "addresses": [{ "ip": "198.18.0.1", "len": 32 }, { "ip": "fd53:6965:7665:1::1", "len": 128 }],
+      "dns": []
+    }
+  ],
+  "routes": [
+    { "dest": "0.0.0.0/5", "if_index": 45, "next_hop": null, "metric": 5 },
+    { "dest": "8.0.0.0/7", "if_index": 45, "next_hop": null, "metric": 5 },
+    { "dest": "64.0.0.0/2", "if_index": 45, "next_hop": null, "metric": 5 },
+    { "dest": "128.0.0.0/2", "if_index": 45, "next_hop": null, "metric": 5 },
+    { "dest": "192.168.7.1/32", "if_index": 45, "next_hop": null, "metric": 5 },
+    { "dest": "2000::/4", "if_index": 45, "next_hop": null, "metric": 5 },
+    { "dest": "2001:db8:7:1::1/128", "if_index": 45, "next_hop": null, "metric": 5 }
+  ]
+}
