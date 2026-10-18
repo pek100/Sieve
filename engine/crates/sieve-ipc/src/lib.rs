@@ -53,19 +53,24 @@ pub enum EngineMessage {
     /// engine closes the pipe after this frame.
     Incompatible { supported: [u32; 2] },
     /// Facts about filtering, never assumptions (plan 1.6, 5).
-    Status {
-        /// Filtering is on and every one of its parts is up.
-        filtering: bool,
-        /// Sieve's routes are installed.
-        routes_up: bool,
-        /// Flows the engine holds right now.
-        flows: u32,
-        /// HTTPS is being decrypted.
-        decrypting: bool,
-        last_error: Option<String>,
-    },
+    Status(EngineStatus),
     /// A request the engine refused (before Hello, malformed, unknown).
     Error { message: String },
+}
+
+/// What the engine is doing, from facts it holds (the `status` message).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineStatus {
+    /// Filtering is on and every one of its parts is up.
+    pub filtering: bool,
+    /// Sieve's routes are installed.
+    pub routes_up: bool,
+    /// Flows the engine holds right now.
+    pub flows: u32,
+    /// HTTPS is being decrypted.
+    pub decrypting: bool,
+    pub last_error: Option<String>,
 }
 
 /// The engine's answer to a client's Hello.
@@ -91,16 +96,30 @@ pub enum FrameError {
     Io(#[from] std::io::Error),
 }
 
-/// Writes one frame. A message that serializes over [`MAX_FRAME`] is refused
-/// before anything is written.
-pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
+/// One whole frame (length prefix and body). A message that serializes over
+/// [`MAX_FRAME`] is refused.
+pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
     let body = serde_json::to_vec(msg)?;
-    if body.len() > MAX_FRAME {
-        return Err(FrameError::TooLarge(body.len()));
-    }
-    let len = u32::try_from(body.len()).map_err(|_| FrameError::TooLarge(body.len()))?;
-    w.write_all(&len.to_le_bytes())?;
-    w.write_all(&body)?;
+    let len = u32::try_from(body.len()).ok().filter(|_| body.len() <= MAX_FRAME).ok_or(FrameError::TooLarge(body.len()))?;
+    let mut frame = Vec::with_capacity(body.len() + 4);
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+/// The body length a frame header announces, refused over [`MAX_FRAME`].
+pub fn body_len(header: [u8; 4]) -> Result<usize, FrameError> {
+    let len = u32::from_le_bytes(header) as usize;
+    if len > MAX_FRAME { Err(FrameError::TooLarge(len)) } else { Ok(len) }
+}
+
+fn header_error(e: std::io::Error) -> FrameError {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof { FrameError::Closed } else { e.into() }
+}
+
+/// Writes one frame; nothing is written for a refused one.
+pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
+    w.write_all(&encode(msg)?)?;
     w.flush()?;
     Ok(())
 }
@@ -108,17 +127,36 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Fra
 /// Reads one frame. A length over [`MAX_FRAME`] is refused without reading
 /// the body; EOF before the length is [`FrameError::Closed`].
 pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
-    let mut len = [0u8; 4];
-    if let Err(e) = r.read_exact(&mut len) {
-        return Err(if e.kind() == std::io::ErrorKind::UnexpectedEof { FrameError::Closed } else { e.into() });
-    }
-    let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_FRAME {
-        return Err(FrameError::TooLarge(len));
-    }
-    let mut body = vec![0u8; len];
+    let mut header = [0u8; 4];
+    r.read_exact(&mut header).map_err(header_error)?;
+    let mut body = vec![0u8; body_len(header)?];
     r.read_exact(&mut body)?;
     Ok(serde_json::from_slice(&body)?)
+}
+
+/// The same framing over tokio streams (the engine's pipe server and the
+/// app's client), built on the same [`encode`] and [`body_len`].
+#[cfg(feature = "tokio")]
+pub mod nonblocking {
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    use super::{FrameError, body_len, encode, header_error};
+
+    pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
+        w.write_all(&encode(msg)?).await?;
+        w.flush().await?;
+        Ok(())
+    }
+
+    pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
+        let mut header = [0u8; 4];
+        r.read_exact(&mut header).await.map_err(header_error)?;
+        let mut body = vec![0u8; body_len(header)?];
+        r.read_exact(&mut body).await?;
+        Ok(serde_json::from_slice(&body)?)
+    }
 }
 
 #[cfg(test)]
@@ -171,7 +209,7 @@ mod tests {
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
             EngineMessage::Incompatible { .. } => "incompatible",
-            EngineMessage::Status { .. } => "status",
+            EngineMessage::Status(_) => "status",
             EngineMessage::Error { .. } => "error",
         };
         let f = fixture();
@@ -225,6 +263,26 @@ mod tests {
         let mut frame = (unknown.len() as u32).to_le_bytes().to_vec();
         frame.extend_from_slice(unknown);
         assert!(matches!(read_frame::<_, ClientMessage>(&mut frame.as_slice()), Err(FrameError::Json(_))));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn async_frames_match_the_blocking_ones_byte_for_byte() {
+        let msg = EngineMessage::Status(EngineStatus { last_error: Some("x".into()), ..EngineStatus::default() });
+        let mut blocking = Vec::new();
+        write_frame(&mut blocking, &msg).unwrap();
+        let mut async_wire = Vec::new();
+        nonblocking::write_frame(&mut async_wire, &msg).await.unwrap();
+        assert_eq!(blocking, async_wire);
+        let mut r = async_wire.as_slice();
+        assert_eq!(nonblocking::read_frame::<_, EngineMessage>(&mut r).await.unwrap(), msg);
+        assert!(matches!(nonblocking::read_frame::<_, EngineMessage>(&mut r).await, Err(FrameError::Closed)));
+    }
+
+    #[test]
+    fn status_rejects_unknown_fields() {
+        let extra = r#"{"type":"status","filtering":false,"routes_up":false,"flows":0,"decrypting":false,"last_error":null,"x":1}"#;
+        assert!(serde_json::from_str::<EngineMessage>(extra).is_err());
     }
 
     #[test]

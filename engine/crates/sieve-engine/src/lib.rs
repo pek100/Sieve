@@ -1,7 +1,15 @@
 //! Sieve's filtering engine (docs/plans/2026-10-17-https-filtering.md).
-//! Slice 1: the flow decoders moved from the Wintun spike. Nothing here
-//! changes traffic yet.
+//! - [`flow`]: the flow decoders moved from the Wintun spike (slice 1);
+//! - [`service`]: the Windows service and its install, uninstall and
+//!   restore verbs (slice 2);
+//! - [`ipc`]: the pipe server and the per-connection protocol (slice 2);
+//! - [`route`]: removal of Sieve's routes for the off paths.
+//!
+//! Nothing here changes traffic yet: no adapter and no route is ever added.
 pub mod flow;
+pub mod ipc;
+pub mod route;
+pub mod service;
 
 #[cfg(test)]
 mod tests {
