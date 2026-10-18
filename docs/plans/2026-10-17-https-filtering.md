@@ -6,7 +6,7 @@ The user's decision, verbatim: "not chosen sites, everything. our filtering shou
 
 So Sieve filters all traffic by default, the way AdGuard for Windows does: HTTPS decryption with a local root certificate, full-URL network rules, cosmetic CSS and scriptlet injection (this is what removes YouTube video ads), QUIC covered. It also carries everything that makes AdGuard safe to run that way: automatic exclusions, self-healing exclusion, strict upstream validation, and the per-app Sieve/Off switch as a real exemption.
 
-Inputs: `docs/research/2026-10-17-parity/*` (the survey of AdGuard 8.0.5584 at `E:\AdGuard`), `docs/plans/2026-10-17-parity.md`, `docs/conventions.md`, the Wintun spike (branch `worktree-agent-a025d1b361c8851d3`: `spikes/wintun/`, `docs/research/2026-10-17-wintun-spike.md`), and `src-tauri/src/dns/` and `sysdns/` on main at f5775c6. New read-only facts from `E:\AdGuard` are in section 0, paraphrased in my own words.
+Inputs: `docs/research/2026-10-17-parity/*` (the survey of AdGuard 8.0.5584 at `E:\AdGuard`), `docs/plans/2026-10-17-parity.md`, `docs/conventions.md`, the Wintun spike (branch `worktree-agent-a025d1b361c8851d3`: `spikes/wintun/`, `docs/research/2026-10-17-wintun-spike.md`), and `src-tauri/src/dns/` and `sysdns/` on main at f5775c6 (`sysdns` was removed on 2026-10-18, see the rule below). New read-only facts from `E:\AdGuard` are in section 0, paraphrased in my own words.
 
 ## Decisions by the user (2026-10-17), these override anything below
 
@@ -21,6 +21,24 @@ Inputs: `docs/research/2026-10-17-parity/*` (the survey of AdGuard 8.0.5584 at `
 | Root certificate | 1-year lifetime, SILENT ROTATION a month before expiry; the old root is removed after the switch; status in Settings > Filtering. |
 | Scriptlet resources | SEPARATE SIGNED UPDATE checked daily and verified against a published hash, independent of app releases. |
 | Health sites | Covered by our own list's health category. |
+| Network safety (2026-10-18) | "remove the Point Windows at Sieve feature; the engine will replace it with something that can't break the network." Removed the same day. The rule below binds every slice. |
+
+## The rule: Sieve off means a normal network
+
+Sieve off means a normal network. Sieve never writes persistent system network state (DNS servers, persistent routes, proxy settings, firewall rules that outlive the process). Everything Sieve changes disappears by itself when Sieve stops, crashes, is uninstalled or the PC reboots.
+
+Why: "Point Windows at Sieve" set every adapter's DNS to 127.0.0.1 and ::1. After a reboot with Sieve not running, nothing answered DNS and the PC could not connect until the user reset DNS by hand. A recovery that runs when Sieve starts cannot help when Sieve does not start.
+
+What it means for this design:
+- The engine's routes and addresses live on the Wintun adapter and in the active store only (`CreateIpForwardEntry2` and `CreateUnicastIpAddressEntry` without a persistent store), so they go with the adapter when the engine's handle closes, and are not there after a reboot (1.6).
+- DNS is caught on the TUN (1.4). Windows adapter DNS settings are never written, by the engine or the app.
+- No system proxy, no WinHTTP proxy, no firewall or WFP rule that outlives the engine process.
+- Trust state is not network state, but it is held to the same exits: the root certificate and the Firefox policy (2.3) change nothing while the engine is stopped, and they go when HTTPS filtering turns off and on uninstall (2.4). The service registration (1.5) starts the engine; it changes no network state by itself.
+
+Acceptance checks every slice that changes traffic must pass (slices 3 to 11), run by the user with a verifier reading the evidence; each records the before and after listings of `route print`, `Get-DnsClientServerAddress`, `netsh winhttp show proxy` and the firewall rules:
+- **Kill test.** With the slice's feature on and working, `taskkill /F` the engine. Within 5 s, `Resolve-DnsName example.com` answers and `curl -I https://example.com` succeeds, and every listing matches the before-listing.
+- **Reboot test.** With the feature on, set the engine not to start (service start type manual) and reboot. After sign-in, lookups and HTTPS work and every listing matches the before-listing.
+- **Uninstall test.** With the feature on, uninstall Sieve. Lookups and HTTPS work, every listing matches the before-listing, and no Sieve route, adapter, DNS server, proxy or firewall rule is left.
 
 Live probe results (slice 0, done): runs 3 and 4 with AdGuard paused proved per-flow app attribution, live QUIC SNI decoding, per-app blocking (one domain dropped for curl.exe, passed for a copy) and clean teardown. The spike's fixes (multicast filter, source-address pinning, bounded shutdown) are on branch `worktree-agent-a025d1b361c8851d3`.
 
@@ -84,7 +102,7 @@ Decision: one named pipe, `\\.\pipe\sieve-engine`, carrying length-prefixed JSON
   - It forwards each query to its original destination server through the pinned interface. This is AdGuard's "System DNS" default, and it keeps split-horizon names (router.lan, corporate zones) working. `filtering.upstreams` stays as an optional override.
   - **It does not block in DNS.** It resolves, logs, and records every answer in an IP-to-names map with TTL. Blocking happens per flow (section 5), because DNS lookups come from the DNS Client service and carry no app identity. Blocking in DNS would make the per-app Off switch a lie. A flow with no name of its own (no SNI, no Host, not QUIC) is decided by the names its destination IP was resolved for: it is blocked for a sieved app only when every live name for that IP is blocked.
   - It strips the `ech` parameter from HTTPS and SVCB answers for names that would be intercepted (2.9), and answers the Firefox canary `use-application-dns.net` with NXDOMAIN so Firefox does not switch itself to DoH.
-- **What retires.** The app-hosted DNS proxy on 127.0.0.1:53 and `sysdns` (pointing Windows DNS at loopback, backup, restore) are no longer needed once slice 4 passes, because DNS is caught on the TUN without touching adapter settings. Retire both in slice 4 (S52). Before the engine starts for the first time, the app restores Windows DNS if `sysdns` had pointed it, through the existing restore flow.
+- **What retires.** `sysdns` (pointing Windows DNS at loopback, backup, restore) was already removed on 2026-10-18 (the rule above); the app only reads adapter DNS now, for a safety notice. The app-hosted DNS proxy on 127.0.0.1:53 is no longer needed once slice 4 passes, because DNS is caught on the TUN without touching adapter settings. Retire it in slice 4 (S52).
 - **Loop prevention.** Every upstream socket (TCP, UDP, DNS, list downloads) gets `IP_UNICAST_IF` or `IPV6_UNICAST_IF` set to the interface Windows would choose for that destination with Sieve's routes ignored. That interface is computed from the forwarding table, skipping Sieve's own. A lookup that resolves to Sieve's interface is refused ("would loop"), as in the spike.
 
 ### 1.5 Lifecycle
@@ -540,7 +558,8 @@ Buttons: "Copy report", and "Open issue page", which opens the matching list's p
 Rules for every slice:
 - Each slice is independently verifiable and lands in its own worktree.
 - Every traffic-changing feature is a `dataSwitch` (default off) whose `liveCheck` names an ignored `live_*` test. It stays locked until that check passed in the app (`passedChecks`).
-- Agents never run elevation, route changes, certificate installs or the service installer. Only the user does, as the conventions already say for sysdns. The live checks below are run by the user, with a verifier reading the evidence.
+- Agents never run elevation, route changes, certificate installs or the service installer. Only the user does. The live checks below are run by the user, with a verifier reading the evidence.
+- Every slice that changes traffic passes the kill, reboot and uninstall tests of the rule above, in addition to its own acceptance.
 - Commands run in PowerShell. Processes started are killed by tree. Browser checks run under the GPU lease.
 
 New data switches (registry, append only):
@@ -551,7 +570,7 @@ New data switches (registry, append only):
 | `filtering.https` | `filtering.engine` | `live_https_intercepts_public_and_passes_floor` |
 | `filtering.content` | `filtering.https` | `live_content_injects_into_test_page` |
 
-They retire `filtering.dns`, `filtering.systemDns` and the never-available `filtering.perApp` gate (in slice 4, with a settings migration).
+They retire `filtering.dns` and the never-available `filtering.perApp` gate (in slice 4, with a settings migration). `filtering.systemDns` is already gone (settings schema 3, 2026-10-18).
 
 ### Slice 0: read the Wintun probe results (gate)
 
@@ -612,7 +631,7 @@ They retire `filtering.dns`, `filtering.systemDns` and the never-available `filt
   - Default lists downloaded and compiled in `sieve-filter`. Host decisions for SNI, Host, QUIC SNI and IP-map flows via the synthetic request (5.1). The per-app Off exemption.
   - DNS resolves and never blocks. ECH stripping and the Firefox canary.
   - The log route `/log/` v1 (host level). B6 user rules for the engine.
-  - The settings migration retiring `filtering.dns`, `filtering.systemDns` and `filtering.perApp`; deletion of `src-tauri/src/dns/` and `src-tauri/src/sysdns/` once the migration restores any pointed DNS.
+  - The settings migration retiring `filtering.dns` and `filtering.perApp`; deletion of `src-tauri/src/dns/`. `sysdns` already removed 2026-10-18 (nothing to restore: Sieve never pointed DNS since). The read-only safety net (`windns`, `strandedAdapters`) stays until no supported build can have pointed a machine.
   - The matcher benchmark (5.3).
 - **Acceptance.**
   - zero skipped exception rules in the default lists (or each listed);
@@ -620,7 +639,7 @@ They retire `filtering.dns`, `filtering.systemDns` and the never-available `filt
   - matcher p99 under 20 us on the scrubbed corpus;
   - unit tests: an Off app's flow to a blocked host is relayed; a sieved app's is closed; a no-name flow to an IP whose every name is blocked is closed, and one with a mixed set is relayed;
   - **live:** `doubleclick.net` blocked in Edge while an Off copy of curl reaches it; Windows adapter DNS settings unchanged throughout.
-- **Files:** `engine/crates/sieve-filter/**`, `engine/crates/sieve-engine/src/{policy,dns}/**`, `src/app/log/**`, `src/components/sieve/log/**`, `src/core/routes.ts` (one entry), `src/core/settings/{registry,migrate}.ts`, removal of `src-tauri/src/{dns,sysdns}/**` and their TS seams. **Live:** yes. **Switch:** none new (part of `filtering.engine`).
+- **Files:** `engine/crates/sieve-filter/**`, `engine/crates/sieve-engine/src/{policy,dns}/**`, `src/app/log/**`, `src/components/sieve/log/**`, `src/core/routes.ts` (one entry), `src/core/settings/{registry,migrate}.ts`, removal of `src-tauri/src/dns/**` and its TS seams. **Live:** yes. **Switch:** none new (part of `filtering.engine`).
 
 ### Slice 5: root CA, install, Firefox, removal, certificate status
 
