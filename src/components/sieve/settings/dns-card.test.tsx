@@ -1,32 +1,81 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { DNS_SWITCH, STRANDED_DNS_TEXT } from "@/core/dns";
+import { DNS_POLL_MS, DNS_SWITCH, STRANDED_DNS_TEXT } from "@/core/dns";
 import { createMockDns, MOCK_PORT_BUSY, type DnsScenario } from "@/data/dns-mock";
 import type { DnsSource } from "@/data/dns-source";
 import { createMockSource } from "@/data/mock-source";
+import type { Clock } from "@/data/poller";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { NoticeToaster } from "@/components/sieve/shell/notice-toaster";
-import { SettingsScreen } from "./settings-screen";
+import { DnsCard } from "./dns-card";
 
 vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
 vi.setConfig({ testTimeout: 20_000 });
+// The DNS filter's settings are unavailable until the engine's slice 4 replaces it, so the
+// Settings screen does not show this card (settings.test.tsx, settings.spec.ts and law 11
+// hold that with the real registry). Its code stays: these tests render the card itself,
+// as a build where its settings are available would.
+vi.mock("@/core/settings/registry", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/core/settings/registry")>()),
+  isAvailable: () => true,
+}));
+
+/** Manual clock: the controller's polls fire only when the test advances time. */
+function fakeClock() {
+  let now = 1_760_000_000_000;
+  let seq = 0;
+  const timers = new Map<number, { at: number; fn: () => void }>();
+  const clock: Clock = {
+    now: () => now,
+    setTimeout: (fn, ms) => {
+      timers.set(++seq, { at: now + ms, fn });
+      return seq;
+    },
+    clearTimeout: (h) => void timers.delete(h as number),
+  };
+  const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+  return {
+    clock,
+    async advance(ms: number) {
+      const target = now + ms;
+      for (;;) {
+        const due = [...timers.entries()].filter(([, t]) => t.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) break;
+        timers.delete(due[0]);
+        now = due[1].at;
+        due[1].fn();
+        for (let i = 0; i < 10; i++) await flush();
+      }
+      now = target;
+      await flush();
+    },
+  };
+}
 
 async function setup(
   scenario: DnsScenario,
-  opts: { stored?: Record<string, unknown>; adguard?: boolean; pointed?: boolean; over?: Partial<DnsSource>; windowsReadable?: boolean } = {},
+  opts: {
+    stored?: Record<string, unknown>;
+    adguard?: boolean;
+    pointed?: boolean;
+    over?: Partial<DnsSource>;
+    windowsReadable?: boolean;
+    clock?: Clock;
+  } = {},
 ) {
-  const dns = { ...createMockDns({ seed: 1, scenario, adguard: opts.adguard, pointed: opts.pointed }), ...opts.over } as DnsSource;
+  const dns = { ...createMockDns({ seed: 1, scenario, adguard: opts.adguard, pointed: opts.pointed, now: opts.clock?.now }), ...opts.over } as DnsSource;
   const runtime = createRuntime({
-    source: createMockSource({ seed: 1 }),
+    source: createMockSource({ seed: 1, now: opts.clock?.now }),
     settings: memoryBackend({ schema: 1, values: opts.stored ?? {} }),
     dns,
+    clock: opts.clock,
   });
   render(
     <SieveProvider runtime={runtime}>
-      <SettingsScreen />
+      <DnsCard lockOf={() => null} />
       <NoticeToaster />
     </SieveProvider>,
   );
@@ -83,12 +132,39 @@ describe("DNS card", () => {
     expect(card().querySelector("[data-dns-stranded]")).toBeNull();
   });
 
+  // Moved from tests/e2e/dns.spec.ts when the card left the Settings screen (2026-10-18).
+  it("lookups that reach a running filter fill the counters and the most blocked domains, in the mono font", async () => {
+    const fc = fakeClock();
+    await setup("off", { pointed: true, stored: { [DNS_SWITCH]: true }, clock: fc.clock });
+    await vi.waitFor(() => expect(phase()).toBe("running"));
+    expect(card().querySelector("[data-dns-stranded]")).toBeNull();
+    await act(() => fc.advance(DNS_POLL_MS * 6));
+    const top = within(card()).getByRole("list", { name: "Most blocked domains" });
+    expect(within(top).getAllByRole("listitem").length).toBeGreaterThan(1);
+    expect(top.querySelector(".font-mono")).not.toBeNull();
+    expect(Number(card().querySelector("[data-stat=blocked] [data-numeric]")!.textContent!.replace(/\D/g, ""))).toBeGreaterThan(0);
+    // The card never names an app, and its stranded note offers no way to change Windows DNS.
+    expect(within(card()).queryByRole("button", { name: /Point Windows|Restore my DNS|Turn DNS filtering on/ })).toBeNull();
+  });
+
   it("error: a busy port 53 turns the switch back off and the card says why", async () => {
     const rt = await setup("error", { stored: { [DNS_SWITCH]: true } });
     await vi.waitFor(() => expect(phase()).toBe("error"));
     expect(rt.settings.get(DNS_SWITCH)).toBe(false);
     expect(within(card()).getByRole("alert")).toHaveTextContent(MOCK_PORT_BUSY);
     expect(within(card()).getByRole("switch", { name: "DNS filtering" })).not.toBeChecked();
+    expect(await screen.findByText(/DNS filtering could not start/)).toBeInTheDocument();
+  });
+
+  it("global Sieving off: a running filter passes everything through and says Paused, never stops", async () => {
+    const rt = await setup("off", { stored: { [DNS_SWITCH]: true } });
+    await vi.waitFor(() => expect(phase()).toBe("running"));
+    await act(() => rt.settings.set("sampling.enabled", false));
+    await vi.waitFor(() => expect(phase()).toBe("paused"));
+    expect(card()).toHaveTextContent("Paused while Sieving is off");
+    expect(within(card()).getByRole("switch", { name: "DNS filtering" })).toBeChecked();
+    await act(() => rt.settings.set("sampling.enabled", true));
+    await vi.waitFor(() => expect(phase()).toBe("running"));
   });
 
   it("failed self check: a short toast, one plain line in the card, the technical replies folded away and said once", async () => {

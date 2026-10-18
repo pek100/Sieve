@@ -12,8 +12,12 @@
 import { isUpstream } from "../dns";
 import { APP_STATES, type AppState } from "../policy";
 
-/** 2: apps.levels became on/off per app. 3: filtering.systemDns is gone (see migrate.ts). */
-export const SETTINGS_SCHEMA = 3;
+/**
+ * 2: apps.levels became on/off per app. 3: filtering.systemDns is gone. 4: a
+ * stored unavailable data switch (filtering.dns) is dropped, so it is off
+ * (see migrate.ts).
+ */
+export const SETTINGS_SCHEMA = 4;
 
 /** Settings sections in the order the settings view shows them; a key's prefix is its section. */
 export const SECTIONS = [
@@ -35,6 +39,14 @@ interface Base<T> {
   requires?: string;
   /** Only the desktop app can apply it (it talks to Windows through a Tauri plugin). */
   desktopOnly?: boolean;
+  /**
+   * Present: the setting is unavailable until what this names replaces it or
+   * brings it back (a plan step, with the plan's path). It then has no row,
+   * search, export or import, the UI that edits it is not shown, and it reads
+   * as its default, so an unavailable data switch is never on. Absent:
+   * available. Its code stays (see isAvailable).
+   */
+  unavailableUntil?: string;
 }
 
 /** Shape of one element of a map or list setting. `upstream`: a DNS server address (see isUpstream). */
@@ -89,6 +101,9 @@ export type SettingDef =
   | MapSetting<unknown>
   | ListSetting<unknown>
   | DataSwitchSetting;
+
+/** The plan step that replaces the app-hosted DNS filter (law: the plan names every key unavailable until it). */
+const ENGINE_SLICE_4 = "engine slice 4 (docs/plans/2026-10-17-https-filtering.md)";
 
 const enumSetting = <const O extends string>(d: Omit<EnumSetting<O>, "kind">): EnumSetting<O> => ({
   kind: "enum",
@@ -153,7 +168,11 @@ export const REGISTRY = {
   } satisfies ListSetting<string>,
   // A local DNS filter that answers only lookups sent to it directly: Sieve
   // never points Windows DNS at it. The filtering engine replaces it
-  // (docs/plans/2026-10-17-https-filtering.md, slice 4).
+  // (docs/plans/2026-10-17-https-filtering.md, slice 4). Unavailable since
+  // 2026-10-18 (the user: "Hide the DNS filter switch and its card until the
+  // engine's slice 4 replaces it; keep the code for now"): with "Point
+  // Windows at Sieve" gone nothing sends it lookups, so it filtered nothing,
+  // and its self check kept failing on [::1]:53.
   "filtering.dns": {
     kind: "dataSwitch",
     section: "filtering",
@@ -161,7 +180,9 @@ export const REGISTRY = {
     help: "Runs a DNS filter on 127.0.0.1:53 with the AdGuard DNS filter list. It filters only lookups sent to it directly; Windows keeps its own DNS servers.",
     default: false,
     liveCheck: "live_dns_filter_resolves_blocked_domain",
+    unavailableUntil: ENGINE_SLICE_4,
   } satisfies DataSwitchSetting,
+  // Edited only by the DNS filter's card, so unavailable with it.
   "filtering.upstreams": {
     kind: "list",
     section: "filtering",
@@ -169,6 +190,7 @@ export const REGISTRY = {
     help: "Where DNS filtering sends the lookups it does not block, tried in order. Applies the next time DNS filtering starts.",
     default: ["1.1.1.1", "9.9.9.9"] as readonly string[],
     of: { type: "upstream" },
+    unavailableUntil: ENGINE_SLICE_4,
   } satisfies ListSetting<string>,
 } as const;
 
@@ -200,6 +222,16 @@ export function defaultValue<K extends SettingKey>(key: K): SettingValue<K> {
 
 export function isSettingKey(key: string): key is SettingKey {
   return Object.prototype.hasOwnProperty.call(REGISTRY, key);
+}
+
+/**
+ * Can the user see and change this setting in this build? The one place the
+ * answer comes from: the settings document, export, import, search, the
+ * Settings view and the DNS card all ask it. Tests of code that stays while
+ * its setting is unavailable (the DNS filter's) mock this to true.
+ */
+export function isAvailable(key: SettingKey): boolean {
+  return settingDef(key).unavailableUntil === undefined;
 }
 
 /** Does `value` have the shape the registry declares for `key`? */
