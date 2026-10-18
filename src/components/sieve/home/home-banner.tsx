@@ -19,10 +19,11 @@ function Banner({ text, children }: { text: string; children?: ReactNode }) {
     <div
       role="note"
       data-banner=""
-      className="flex min-h-10 items-center gap-3 text-body text-on-surface"
+      className="flex min-h-10 flex-wrap items-center gap-3 text-body text-on-surface"
     >
       <Info aria-hidden="true" className="size-5 shrink-0 text-warning" strokeWidth={1.75} />
-      <p className="min-w-0 flex-1">{text}</p>
+      {/* A long notice keeps its width on a phone: the actions wrap under it instead of squeezing it. */}
+      <p className="min-w-0 flex-1 basis-60">{text}</p>
       {children}
     </div>
   );
