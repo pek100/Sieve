@@ -161,6 +161,9 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
         return Err("this computer has no default route, so there is nothing to route".into());
     }
     let journal = journal(engine).ok_or("the engine has no state folder for its route journal")?;
+    let mut config = IpStackConfig::default();
+    config.mtu(MTU).map_err(|e| format!("stack MTU: {e}"))?;
+    config.udp_timeout(UDP_IDLE);
     let tun = crate::tun::device::open(&engine.exe)?;
     let luid = tun.luid;
     apply::add_address(luid, TUN_V4.into())?;
@@ -180,9 +183,6 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     }
 
     let relay = Arc::new(Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone()));
-    let mut config = IpStackConfig::default();
-    config.mtu(MTU).map_err(|e| format!("stack MTU: {e}"))?;
-    config.udp_timeout(UDP_IDLE);
     let device = TunDevice::new(tun.session.clone(), engine.meters.clone(), engine.beats.clone());
     let stack = IpStack::new(config, device);
     let (stop_accept, stopped) = oneshot::channel();
@@ -206,6 +206,9 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
         f.blocker = None;
         f.up_since = Some(monotonic_ms());
     });
+    // A ping left pending by an earlier run must not trip this one.
+    engine.beats.relay.end();
+    engine.beats.tun.end();
     engine.arm.set(true);
     Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches })
 }
@@ -244,6 +247,8 @@ async fn take_down(engine: &Engine, up: Up) {
         let _ = j.truncate();
     }
     drop(up.tun);
+    // Flows whose tasks were cancelled end here, so no client keeps them open.
+    engine.book.lock().unwrap_or_else(|p| p.into_inner()).close_all();
     engine.publish_batch();
     engine.set_facts(|f| {
         f.routes_up = false;

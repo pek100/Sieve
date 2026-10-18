@@ -220,7 +220,7 @@ pub fn live_failures(results: &str) -> Vec<&'static str> {
         .iter()
         .copied()
         .filter(|name| {
-            let last = results.lines().filter(|l| l.get(6..).is_some_and(|rest| rest.starts_with(name))).next_back();
+            let last = results.lines().rfind(|l| l.get(6..).is_some_and(|rest| rest.starts_with(name)));
             !last.is_some_and(|l| l.starts_with("PASS  "))
         })
         .collect()

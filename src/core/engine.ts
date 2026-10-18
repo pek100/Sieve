@@ -112,7 +112,7 @@ export const ENGINE_STATE_TEXT: Record<EnginePhase, string> = {
 
 /** The exact words of the pause offer (the user's decision: the UI says exactly what happens). */
 export const ADGUARD_PAUSE_TEXT =
-  "Pausing AdGuard stops its Windows service (Adguard Service). Windows asks you to approve it. AdGuard stops protecting this computer until you start it again, here or by opening AdGuard.";
+  "Pausing AdGuard stops its Windows service (Adguard Service). Windows asks you to approve it. AdGuard stops protecting this computer until you start it again here.";
 
 /** Phases whose detail is a problem the user should read. */
 export const ENGINE_PROBLEMS: ReadonlySet<EnginePhase> = new Set<EnginePhase>([

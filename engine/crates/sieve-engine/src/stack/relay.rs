@@ -40,6 +40,10 @@ pub const FIRST_BYTES_WAIT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A UDP flow idle this long ends (ipstack's own UDP timeout is the same).
 pub const UDP_IDLE: Duration = Duration::from_secs(30);
+/// A DNS flow is one query and its answer: it ends this long after the last
+/// datagram, so the DNS Client's one-port-per-query traffic holds no socket
+/// for half a minute.
+pub const DNS_IDLE: Duration = Duration::from_secs(5);
 const DATAGRAM: usize = 65_535;
 
 type ExeLookup = fn(u32) -> Option<String>;
@@ -246,16 +250,17 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         bytes_up += d.len() as u64;
     }
     let mut down = vec![0u8; DATAGRAM];
+    let idle = if dns { DNS_IDLE } else { UDP_IDLE };
     loop {
         tokio::select! {
-            r = tokio::time::timeout(UDP_IDLE, app.read(&mut buf)) => match r {
+            r = tokio::time::timeout(idle, app.read(&mut buf)) => match r {
                 Ok(Ok(n)) if n > 0 => {
                     if up.send(&buf[..n]).await.is_err() { break; }
                     bytes_up += n as u64;
                 }
                 _ => break,
             },
-            r = tokio::time::timeout(UDP_IDLE, up.recv(&mut down)) => match r {
+            r = tokio::time::timeout(idle, up.recv(&mut down)) => match r {
                 Ok(Ok(n)) => {
                     if dns && let Some(m) = dns::parse(&down[..n]) {
                         lock(&ctx.names).record_message(&m, monotonic_ms());

@@ -64,6 +64,14 @@ impl FlowBook {
         }
     }
 
+    /// Ends every open flow (the routes went down; their tasks are gone).
+    pub fn close_all(&mut self) {
+        let ids: Vec<u64> = self.open.keys().copied().collect();
+        for id in ids {
+            self.close(id, FlowAction::Relayed, 0, 0);
+        }
+    }
+
     pub fn live(&self) -> usize {
         self.open.len()
     }
@@ -142,6 +150,16 @@ mod tests {
         let batch = b.take_batch();
         assert_eq!(batch.len(), 1);
         assert!(!batch[0].open && batch[0].action == FlowAction::Failed);
+    }
+
+    #[test]
+    fn closing_all_ends_every_open_flow_in_the_next_batch() {
+        let mut b = FlowBook::default();
+        let ids = [b.open(event(Some(1))).unwrap(), b.open(event(Some(0))).unwrap()];
+        b.take_batch();
+        b.close_all();
+        assert_eq!(b.live(), 0);
+        assert_eq!(b.take_batch().iter().map(|e| (e.id, e.open)).collect::<Vec<_>>(), [(ids[0], false), (ids[1], false)]);
     }
 
     #[test]
