@@ -32,6 +32,8 @@ Open Terminal (Admin) and `cd` to the worktree. Run each step with
 7. **`-Step after-reboot`** (admin), after signing in. Lookups and HTTPS work, the listings match, the engine did not start. The step then sets automatic start again and starts it.
 8. **`-Step uninstall`** (admin). Runs `sieve-engine.exe uninstall` twice (both must succeed: the verb is idempotent), then the Sieve uninstaller (approve UAC; its hook runs the verb a third time). Expected: no `sieve-engine` service (`sc query` says 1060), no `C:\ProgramData\Sieve`, nothing at `HKLM\SYSTEM\CurrentControlSet\Services\sieve-engine`, no `sieve-engine.exe` left, the listings match the before-listing, lookups and HTTPS work.
 
+If the engine stops by itself, why is in `C:\ProgramData\Sieve\engine\last-error.txt` (readable from an admin prompt).
+
 The emergency off, at any time from an admin prompt: `"C:\Program Files\Sieve\sieve-engine.exe" restore` deletes every route on an interface named "Sieve" (none exist in slice 2) and stops the service.
 
 ## What the verifier reads

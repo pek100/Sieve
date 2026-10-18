@@ -69,7 +69,6 @@ mod tests {
     use crate::flow::sni::build;
     use std::time::Instant;
     use tokio::io::AsyncWriteExt;
-    use tokio::net::{TcpListener, TcpStream};
 
     /// A stand-in for ipstack's TCP stream: its Drop blocks the worker on a
     /// task of the runtime, exactly the pattern that hung run 2's exit.
@@ -88,22 +87,17 @@ mod tests {
     #[test]
     fn stuck_relays_and_connects_are_cancelled_within_a_bound() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        let started = Instant::now();
-        let report = rt.block_on(async {
-            // An upstream that accepts and then never reads nor answers.
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let held = tokio::spawn(async move {
-                let mut keep = Vec::new();
-                while let Ok((s, _)) = listener.accept().await {
-                    keep.push(s);
-                }
-            });
+        let (report, started) = rt.block_on(async {
             let mut tasks = FlowTasks::new();
             let mut apps = Vec::new();
+            // Upstreams that never read nor answer: the far ends are held, in
+            // memory (not 127.0.0.1, which AdGuard filters on this machine and
+            // made the setup itself take seconds under load).
+            let mut held = Vec::new();
             for i in 0..40 {
                 // A relay that decided pass and now waits forever on both sides.
-                let up = TcpStream::connect(addr).await.unwrap();
+                let (up, far) = tokio::io::duplex(64 * 1024);
+                held.push(far);
                 let (mut app, mut relay_side) = tokio::io::duplex(64 * 1024);
                 app.write_all(&build::typical(&format!("stuck{i}.example"))).await.unwrap();
                 apps.push(app);
@@ -119,10 +113,12 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(tasks.live(), 80, "the flows really are stuck before shutdown");
+            // The bound is about shutting down, so it is timed from here.
+            let started = Instant::now();
             let report = tasks.shutdown(Duration::from_secs(3)).await;
-            held.abort();
+            drop(held);
             drop(apps);
-            report
+            (report, started)
         });
         rt.shutdown_timeout(Duration::from_secs(1));
         let took = started.elapsed();

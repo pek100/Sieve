@@ -60,10 +60,25 @@ fn service_main(_args: Vec<OsString>) {
     report(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, ServiceExitCode::Win32(0));
     let code = match serve(stop_rx) {
         Ok(()) => ServiceExitCode::Win32(0),
-        Err(_) => ServiceExitCode::ServiceSpecific(FAILED),
+        Err(why) => {
+            record_failure(&why);
+            ServiceExitCode::ServiceSpecific(FAILED)
+        }
     };
     report(ServiceState::Stopped, ServiceControlAccept::empty(), code);
 }
+
+/// A service has no console: why it stopped goes to
+/// `ProgramData\Sieve\engine\last-error.txt` (admin-only, like the folder),
+/// for the live check and for a person reading it after a failure. Writing
+/// it is best effort: the exit code already tells the SCM it failed.
+fn record_failure(why: &str) {
+    if let Ok(pd) = state::program_data() {
+        let _ = std::fs::write(state::engine_dir(&pd).join(LAST_ERROR_FILE), why);
+    }
+}
+
+const LAST_ERROR_FILE: &str = "last-error.txt";
 
 /// The pipe, with the DACL for the recorded owner, until the stop signal.
 /// An error ends the process with a failure code, so the SCM's recovery
