@@ -43,6 +43,9 @@ $StallSeconds = 30
 $WatchdogSeconds = 5
 $WatchdogPollSeconds = 1
 $Target = "https://www.cloudflare.com"
+# What to do by hand when AdGuard's service hangs between states (live 2026-10-18 19:55:
+# it sat in StopPending for over 10 minutes). The runner never kills AdGuard's process itself.
+$AdguardRecovery = "AdGuard's service is stuck; this is AdGuard, not Sieve. In Terminal (Admin): taskkill /F /IM AdguardSvc.exe ; Start-Service 'Adguard Service' (or reboot)."
 $script:Failed = 0
 $script:Rows = New-Object 'System.Collections.Generic.List[object]'
 $script:Step = "preflight"
@@ -104,15 +107,24 @@ function Wait-For([scriptblock]$condition, [double]$seconds) {
 }
 
 function Service-State([string]$name, [string]$state, [double]$seconds) {
-  $svc = Get-Service -Name $name
-  if ($svc.Status.ToString() -eq $state) { return }
+  $hint = if ($name -eq $Adguard) { " $AdguardRecovery" } else { "" }
+  # A service between states rejects controls (1061) or answers misleadingly: a start sent
+  # to a StopPending service returned 1056 "already running" at 19:55 and cleanup gave up.
+  # Let any Pending state settle first.
+  if (-not (Wait-For { (Get-Service -Name $name).Status.ToString() -notlike '*Pending' } $seconds)) {
+    throw "'$name' is stuck in $((Get-Service -Name $name).Status) (not settled within $seconds s).$hint"
+  }
+  if ((Get-Service -Name $name).Status.ToString() -eq $state) { return }
   $verb = if ($state -eq "Running") { "start" } else { "stop" }
   $output = & sc.exe $verb $name
   $code = $LASTEXITCODE
   Log ("sc.exe {0} '{1}': exit {2}; {3}" -f $verb, $name, $code, ($output -join " "))
-  if ($code -ne 0) { throw "sc.exe $verb '$name' failed: $code" }
+  # 1056 ERROR_SERVICE_ALREADY_RUNNING on start and 1062 ERROR_SERVICE_NOT_ACTIVE on stop
+  # mean the service reached the wanted state by itself between the read and the control.
+  $already = ($verb -eq "start" -and $code -eq 1056) -or ($verb -eq "stop" -and $code -eq 1062)
+  if ($code -ne 0 -and -not $already) { throw "sc.exe $verb '$name' failed: $code.$hint" }
   if (-not (Wait-For { (Get-Service -Name $name).Status.ToString() -eq $state } $seconds)) {
-    throw "'$name' did not become $state within $seconds seconds"
+    throw "'$name' did not become $state within $seconds seconds (now $((Get-Service -Name $name).Status)).$hint"
   }
 }
 

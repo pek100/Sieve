@@ -140,6 +140,56 @@ try {
   $n = Network-Until ([Diagnostics.Stopwatch]::StartNew()) $KillSeconds
   Assert ($n.Ok -and $script:Attempts -eq 2 -and $script:Closed -eq 2) "kill probe begins before sleep, retries failed DNS, stops on first success, closes all probes"
   Assert ($n.Detail.Contains($Target) -and $null -ne $n.Seconds) "kill observation records target and completion time"
+
+  # Service-State against a scripted service (live 2026-10-18 19:55: AdGuard hung in StopPending,
+  # then cleanup's start got 1056 and gave up). The real helpers, a fake service manager.
+  Load-Function "Service-State"
+  Load-Function "Wait-For"
+  $script:Cleaning = $true
+  function Start-Sleep { }
+  function Get-Process { @() }
+  function Log { }
+  $script:Statuses = New-Object 'System.Collections.Generic.Queue[string]'
+  $script:Last = "Running"
+  function Get-Service([string]$Name) {
+    if ($script:Statuses.Count) { $script:Last = $script:Statuses.Dequeue() }
+    [pscustomobject]@{ Status = $script:Last }
+  }
+  $script:Sc = New-Object 'System.Collections.Generic.List[string]'
+  $script:ScCode = 0
+  function sc.exe { $script:Sc.Add(($args -join ' ')); $global:LASTEXITCODE = $script:ScCode; "fake sc" }
+
+  # Cleanup's case: AdGuard still StopPending, then it finishes stopping, then start works.
+  foreach ($s in "StopPending", "StopPending", "Stopped", "Stopped", "Running") { $script:Statuses.Enqueue($s) }
+  $script:Sc.Clear(); $script:ScCode = 0
+  Service-State $Adguard "Running" 5
+  Assert (($script:Sc -join '|') -eq "start $Adguard") "a Pending service settles before the control is sent, then start succeeds"
+
+  # A start answered 1056 (already running) is success, not a failure.
+  $script:Statuses.Clear(); foreach ($s in "Stopped", "Stopped", "Running") { $script:Statuses.Enqueue($s) }
+  $script:Sc.Clear(); $script:ScCode = 1056
+  Service-State $Adguard "Running" 5
+  Assert ($script:Sc.Count -eq 1) "start answered 1056 already-running counts as reaching Running"
+
+  # A stop answered 1062 (not active) is success.
+  $script:Statuses.Clear(); foreach ($s in "Running", "Running", "Stopped") { $script:Statuses.Enqueue($s) }
+  $script:Sc.Clear(); $script:ScCode = 1062
+  Service-State $Service "Stopped" 5
+  Assert ($script:Sc.Count -eq 1) "stop answered 1062 not-active counts as reaching Stopped"
+
+  # The 19:55 case: stuck in StopPending for good. No control is sent, and the error names the recovery.
+  $script:Statuses.Clear(); $script:Last = "StopPending"
+  $script:Sc.Clear(); $script:ScCode = 0
+  $msg = ""
+  try { Service-State $Adguard "Running" 0.01 } catch { $msg = $_.Exception.Message }
+  Assert ($script:Sc.Count -eq 0 -and $msg -like "*stuck in StopPending*" -and $msg -like "*taskkill /F /IM AdguardSvc.exe*") "a service stuck Pending sends no control and names AdGuard's manual recovery"
+
+  # Any other sc.exe failure still fails, with the hint for AdGuard.
+  $script:Statuses.Clear(); $script:Last = "Stopped"
+  $script:Sc.Clear(); $script:ScCode = 5
+  $msg = ""
+  try { Service-State $Adguard "Running" 1 } catch { $msg = $_.Exception.Message }
+  Assert ($msg -like "*failed: 5*" -and $msg -like "*AdguardSvc.exe*") "other sc.exe errors still fail loudly"
 } finally {
   # Only files in the directory this test created; no recursive delete or junction traversal.
   Get-ChildItem -LiteralPath $scratch -File | ForEach-Object { Remove-Item -LiteralPath $_.FullName }
