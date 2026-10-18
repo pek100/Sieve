@@ -8,6 +8,15 @@
 @import "../styles/tokens.css";
 
 /*
+ * Tailwind's class scan must never walk agent worktrees or Rust build output.
+ * It did (2026-10-18): a locked file in a worktree's cargo target crashed the
+ * dev CSS build, and constant churn there kept new classes from compiling.
+ */
+@source not "../../.claude";
+@source not "../../src-tauri/target";
+@source not "../../spikes";
+
+/*
  * Tailwind theme = role tokens only. The default palette is removed so a raw
  * colour class (bg-red-500, text-white) does not compile to anything.
  */
