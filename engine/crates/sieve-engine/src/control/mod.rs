@@ -157,7 +157,7 @@ impl Engine {
         experiments["copy_buffers"] = serde_json::json!({
             "app_to_upstream_bytes": copy,
             "upstream_to_app_bytes": copy,
-            // The fallback is relay_tcp's existing classifier read buffer.
+            // Fixed: both relays share production's classifier read.
             "classifier_bytes": crate::flow::relay::CLASSIFIER_READ,
         });
         let workers = self.runtime_workers.load(std::sync::atomic::Ordering::Relaxed);
