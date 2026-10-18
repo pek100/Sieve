@@ -1,7 +1,8 @@
 # Vendored copy of ipstack 1.0.1 (Apache-2.0, github.com/narrowlink/ipstack,
-# LICENSE beside this file). `src/` is byte for byte the crates.io release.
+# LICENSE beside this file). Source changes: TCP diagnostic formatting is
+# evaluated only when its log level is enabled (no packet/flow changes).
 #
-# Changed by Sieve (2026-10-18), the only change: this manifest. The upstream
+# Changed by Sieve (2026-10-18): manifest and lazy TCP logging. The upstream
 # `build.rs` is not copied and `build` is not set. Upstream, on every Windows
 # build (also as a dependency) it ran `cargo metadata` and copied the
 # `wintun.dll` bundled in its dev-dependency into `target/<profile>/examples/`.
