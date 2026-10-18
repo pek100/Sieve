@@ -6,8 +6,14 @@ function Enter-SieveLiveLease([string]$Path = (Join-Path $env:PUBLIC 'sieve-engi
   $previousOwner=$env:SIEVE_LIVE_RUN_OWNER
   $busy='Another Sieve live runner holds the test lock. Let that run finish before starting another.'
   [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
-  try {$gate=[IO.File]::Open($Path+'.gate',[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}
-  catch [IO.IOException] {throw $busy}
+  $gate=$null;$gateClock=[Diagnostics.Stopwatch]::StartNew()
+  while (-not $gate) {
+    try {$gate=[IO.File]::Open($Path+'.gate',[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}
+    catch [IO.IOException] {
+      if ($gateClock.Elapsed.TotalSeconds -ge 2) {throw $busy}
+      Start-Sleep -Milliseconds 50
+    }
+  }
   try {
     if ($previousToken -and $previousOwner -match '^\d+$') {
       try {
