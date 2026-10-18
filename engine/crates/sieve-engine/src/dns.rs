@@ -13,6 +13,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::flow::Reader;
 
+pub mod upstream;
+
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 const TYPE_CNAME: u16 = 5;
@@ -28,6 +30,7 @@ pub struct Message {
     pub id: u16,
     pub response: bool,
     pub question: Option<String>,
+    pub question_type: u16,
     /// (address, TTL in seconds).
     pub answers: Vec<(IpAddr, u32)>,
 }
@@ -89,7 +92,7 @@ pub fn parse(msg: &[u8]) -> Option<Message> {
     }
     let (question, next) = name_at(msg, 12)?;
     let mut q = Reader::new(msg.get(next..)?);
-    let (_qtype, qclass) = (q.u16()?, q.u16()?);
+    let (qtype, qclass) = (q.u16()?, q.u16()?);
     if question.is_empty() || qclass != CLASS_IN {
         return None;
     }
@@ -158,8 +161,56 @@ pub fn parse(msg: &[u8]) -> Option<Message> {
         id,
         response,
         question: Some(question),
+        question_type: qtype,
         answers,
     })
+}
+
+/// Per connected DNS flow, remember only a bounded set of requests. The
+/// connected socket establishes the server; ID, name and type establish
+/// which outstanding request an answer belongs to. Unmatched replies may
+/// still be relayed, but must never become host-blocking evidence.
+#[derive(Default)]
+pub struct Transactions {
+    pending: HashMap<u16, (String, u16, u64)>,
+}
+
+const TRANSACTION_CAP: usize = 256;
+const TRANSACTION_LIFETIME_MS: u64 = 5_000;
+
+impl Transactions {
+    pub fn remember(&mut self, bytes: &[u8], now_ms: u64) {
+        self.pending.retain(|_, (_, _, expires)| *expires > now_ms);
+        // Even a malformed replacement must invalidate the old ID.
+        if let Some(id) = bytes.get(..2) {
+            self.pending.remove(&u16::from_be_bytes([id[0], id[1]]));
+        }
+        let Some(m) = parse(bytes).filter(|m| !m.response) else {
+            return;
+        };
+        let Some(name) = m.question else { return };
+        if self.pending.len() < TRANSACTION_CAP {
+            self.pending.insert(
+                m.id,
+                (
+                    name,
+                    m.question_type,
+                    now_ms.saturating_add(TRANSACTION_LIFETIME_MS),
+                ),
+            );
+        }
+    }
+
+    pub fn answer(&mut self, bytes: &[u8], now_ms: u64) -> Option<Message> {
+        self.pending.retain(|_, (_, _, expires)| *expires > now_ms);
+        let m = parse(bytes).filter(|m| m.response)?;
+        let (name, ty, _) = self.pending.get(&m.id)?;
+        if m.question.as_ref() != Some(name) || m.question_type != *ty {
+            return None;
+        }
+        self.pending.remove(&m.id);
+        Some(m)
+    }
 }
 
 /// At most this many addresses are remembered; past it the soonest to
@@ -343,6 +394,72 @@ mod tests {
         assert_eq!(m.question.as_deref(), Some("router.lan"));
         let mut map = NameMap::default();
         assert_eq!(map.record_message(&m, 0), 0, "a query records nothing");
+    }
+
+    fn query(id: u16, name: &str) -> Vec<u8> {
+        let mut q = build::response(id, name, &[]);
+        q[2] = 0x01;
+        q
+    }
+
+    #[test]
+    fn only_an_outstanding_matching_answer_is_evidence_once() {
+        let mut tx = Transactions::default();
+        let answer = build::response(7, "ads.example", &[(ip("192.0.2.1"), 30)]);
+        assert!(tx.answer(&answer, 0).is_none());
+        tx.remember(&query(7, "ads.example"), 0);
+        assert!(
+            tx.answer(&build::response(8, "ads.example", &[]), 1)
+                .is_none()
+        );
+        assert!(
+            tx.answer(&build::response(7, "other.example", &[]), 1)
+                .is_none()
+        );
+        let mut wrong_type = build::response(7, "ads.example", &[]);
+        let end = wrong_type.len();
+        wrong_type[end - 4..end - 2].copy_from_slice(&TYPE_AAAA.to_be_bytes());
+        assert!(tx.answer(&wrong_type, 1).is_none());
+        assert_eq!(
+            tx.answer(&answer, 2).unwrap().answers,
+            vec![(ip("192.0.2.1"), 30)]
+        );
+        assert!(
+            tx.answer(&answer, 3).is_none(),
+            "a replay is not fresh evidence"
+        );
+    }
+
+    #[test]
+    fn replaced_expired_and_malformed_queries_cannot_validate_old_answers() {
+        let mut tx = Transactions::default();
+        let answer = build::response(7, "ads.example", &[]);
+        tx.remember(&query(7, "ads.example"), 0);
+        tx.remember(&query(7, "other.example"), 1);
+        assert!(tx.answer(&answer, 2).is_none());
+        tx.remember(&query(7, "ads.example"), 0);
+        assert!(tx.answer(&answer, TRANSACTION_LIFETIME_MS).is_none());
+        tx.remember(&query(7, "ads.example"), 0);
+        tx.remember(&[0, 7], 1);
+        assert!(tx.answer(&answer, 2).is_none());
+    }
+
+    #[test]
+    fn outstanding_queries_are_bounded_and_expire() {
+        let mut tx = Transactions::default();
+        for id in 0..=TRANSACTION_CAP {
+            tx.remember(&query(id as u16, "ads.example"), 0);
+        }
+        assert_eq!(tx.pending.len(), TRANSACTION_CAP);
+        assert!(
+            tx.answer(
+                &build::response(TRANSACTION_CAP as u16, "ads.example", &[]),
+                1
+            )
+            .is_none()
+        );
+        tx.remember(&query(500, "news.example"), TRANSACTION_LIFETIME_MS);
+        assert_eq!(tx.pending.len(), 1);
     }
 
     #[test]

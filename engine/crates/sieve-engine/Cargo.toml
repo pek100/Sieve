@@ -35,6 +35,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+url = "2.5"
 
 # QUIC Initial protection (RFC 9001 section 5): HKDF-SHA256 for the initial
 # secrets, AES-128-GCM for the payload, AES-128-ECB for header protection.
