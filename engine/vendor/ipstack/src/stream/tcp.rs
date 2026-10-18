@@ -230,8 +230,7 @@ impl IpStackTcpStream {
 
         let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
         let (seq, ack, state) = { (tcb.get_seq().0, tcb.get_ack().0, tcb.get_state()) };
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-        log::debug!("{tuple} {state:?}: {l_info} session begins, total TCP sessions: {sessions}");
+        log::debug!("{tuple} {state:?}: local {{ seq: {seq}, ack: {ack} }} session begins, total TCP sessions: {sessions}");
 
         stream.spawn_tasks()?;
         Ok(stream)
@@ -305,13 +304,12 @@ impl AsyncRead for IpStackTcpStream {
             {
                 let mut tcb = self.tcb.lock().unwrap();
                 let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
-                let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-                log::warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session timeout reached, closing forcefully...");
+                log::warn!("{network_tuple} {state:?}: [poll_read] local {{ seq: {seq}, ack: {ack} }}, session timeout reached, closing forcefully...");
                 let sender = &self.up_packet_sender;
                 write_packet_to_device(sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
                 tcb.change_state(TcpState::Closed);
                 let state = tcb.get_state();
-                log::warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session notified to close");
+                log::warn!("{network_tuple} {state:?}: [poll_read] local {{ seq: {seq}, ack: {ack} }}, session notified to close");
             }
             self.shutdown.lock().unwrap().ready();
 
@@ -359,8 +357,7 @@ impl AsyncWrite for IpStackTcpStream {
 
         if send_window == 0 || is_full {
             self.write_notify.lock().unwrap().replace(cx.waker().clone());
-            let info = format!("current send window: {send_window}, send buffer full: {is_full}");
-            log::trace!("{nt} {state:?}: [poll_write] {info}, waiting for the other side to send ACK...");
+            log::trace!("{nt} {state:?}: [poll_write] current send window: {send_window}, send buffer full: {is_full}, waiting for the other side to send ACK...");
             return Poll::Pending;
         }
 
@@ -369,8 +366,7 @@ impl AsyncWrite for IpStackTcpStream {
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
 
         let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-        log::trace!("{nt} {state:?}: [poll_write] {l_info} upstream data written to device, len = {payload_len}");
+        log::trace!("{nt} {state:?}: [poll_write] local {{ seq: {seq}, ack: {ack} }} upstream data written to device, len = {payload_len}");
 
         Poll::Ready(Ok(payload_len))
     }
@@ -519,8 +515,7 @@ async fn tcp_main_logic_loop(
 
         tcb.increase_ack();
         let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-        log::trace!("{network_tuple} {state:?}: {l_info} session begins");
+        log::trace!("{network_tuple} {state:?}: local {{ seq: {seq}, ack: {ack} }} session begins");
         write_packet_to_device(
             &up_packet_sender,
             network_tuple,
@@ -687,9 +682,8 @@ async fn tcp_main_logic_loop(
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
 
         let (state, seq, ack) = { (tcb.get_state(), tcb.get_seq(), tcb.get_ack()) };
-        let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-        log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
+        let len = payload.len();
+        log::trace!("{network_tuple} {state:?}: local {{ seq: {seq}, ack: {ack} }} {}, {pkt_type:?}, len = {len}", tcp_header_fmt(tcp_header));
         if pkt_type == PacketType::Invalid {
             continue;
         }
@@ -715,7 +709,7 @@ async fn tcp_main_logic_loop(
                             if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
                                 let (s, p) = (packet.seq, packet.payload.clone());
                                 log::debug!(
-                                    "{network_tuple} {state:?}: {l_info}, {pkt_type:?}, retransmission request, seq = {s}, len = {}",
+                                    "{network_tuple} {state:?}: local {{ seq: {seq}, ack: {ack} }}, {pkt_type:?}, retransmission request, seq = {s}, len = {}",
                                     p.len()
                                 );
                                 write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | PSH, Some(s), Some(p))?;
@@ -742,7 +736,7 @@ async fn tcp_main_logic_loop(
                     let len = tcb.get_inflight_packets_total_len();
                     if len == 0 {
                         // All upstream data sent, proceed to LastAck
-                        log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, closed by the other side, no upstream data");
+                        log::trace!("{network_tuple} {s:?}: local {{ seq: {seq}, ack: {ack} }}, {pkt_type:?}, closed by the other side, no upstream data");
 
                         // Here we don't wait, just send FIN to the other side and change state to LastAck directly,
                         write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, None, None)?;
@@ -750,7 +744,7 @@ async fn tcp_main_logic_loop(
                         tcb.change_state(TcpState::LastAck);
 
                         let s = tcb.get_state();
-                        log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, wait the last ack from the other side");
+                        log::trace!("{network_tuple} {s:?}: local {{ seq: {seq}, ack: {ack} }}, {pkt_type:?}, wait the last ack from the other side");
 
                         // Here we set a timer to wait for the last ACK from the other side.
                         // If the timer expires, we send an ACK|FIN packet to the other side again and wait anthoer timeout
@@ -789,7 +783,7 @@ async fn tcp_main_logic_loop(
                     }
                 } else {
                     // unnormal case, we do nothing here
-                    log::trace!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, unnormal case, we do nothing here");
+                    log::trace!("{network_tuple} {state:?}: local {{ seq: {seq}, ack: {ack} }}, {pkt_type:?}, unnormal case, we do nothing here");
                 }
             }
             TcpState::CloseWait => {
@@ -907,15 +901,14 @@ fn extract_data_n_write_upstream(
     read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
 ) -> std::io::Result<()> {
     let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
-    let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
     if state == TcpState::Closed {
-        log::debug!("{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"...");
+        log::debug!("{network_tuple} {state:?}: local {{ seq: {seq}, ack: {ack} }} session closed, exiting \"data extraction task\"...");
         return Ok(());
     }
 
     if let Some(data) = tcb.consume_unordered_packets(8192) {
         let hint = if state == TcpState::Established { "normally" } else { "still" };
-        log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
+        log::trace!("{network_tuple} {state:?}: local {{ seq: {seq}, ack: {ack} }} {hint} receiving data, len = {}", data.len());
         data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
