@@ -10,6 +10,8 @@
 //! - `relay` (Windows): the per-flow tasks.
 
 pub mod book;
+#[cfg(feature = "attribution-diagnostics")]
+pub mod diagnostics;
 #[cfg(windows)]
 pub mod relay;
 
@@ -22,6 +24,8 @@ use crate::flow::classify::{Decoded, Kind};
 /// Counters since the engine started.
 #[derive(Debug, Default)]
 pub struct Meters {
+    #[cfg(feature = "attribution-diagnostics")]
+    pub attribution: std::sync::Mutex<diagnostics::Report>,
     pub flows: AtomicU64,
     pub attributed: AtomicU64,
     pub own_refused: AtomicU64,

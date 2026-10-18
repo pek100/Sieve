@@ -93,11 +93,29 @@ impl Relay {
         loop {
             let answer = lock(&self.attributor).owner(&flow, monotonic_ms());
             match answer {
-                Owner::Pid(pid) => return Some(pid),
-                Owner::Unknown => return None,
+                Owner::Pid(pid) => {
+                    #[cfg(feature = "attribution-diagnostics")]
+                    lock(&self.meters.attribution).observe(flow, true, monotonic_ms(), None, None);
+                    return Some(pid);
+                }
+                Owner::Unknown => {
+                    #[cfg(feature = "attribution-diagnostics")]
+                    self.unknown_diagnostics(flow);
+                    return None;
+                }
                 Owner::Pending => tokio::time::sleep(Duration::from_millis(REFRESH_MIN_MS)).await,
             }
         }
+    }
+
+    #[cfg(feature = "attribution-diagnostics")]
+    fn unknown_diagnostics(&self, flow: FiveTuple) {
+        use crate::flow::flows::{OwnerSource, Table};
+        let same_table = Table::of(&flow);
+        let other_table = match same_table {Table::Tcp4 => Table::Tcp6, Table::Tcp6 => Table::Tcp4, Table::Udp4 => Table::Udp6, Table::Udp6 => Table::Udp4};
+        let same = IpHelper.read(same_table);
+        let other = IpHelper.read(other_table);
+        lock(&self.meters.attribution).observe(flow, false, monotonic_ms(), same.as_deref(), other.as_deref());
     }
 
     /// Counts the flow and registers it in the book; None when it is the

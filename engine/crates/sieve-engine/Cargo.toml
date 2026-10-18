@@ -27,6 +27,9 @@ path = "src/bin/probe/main.rs"
 # deletes the routes and exits. Never bundled: `pnpm engine:build` builds
 # without it.
 stall = []
+# Bounded, admin-only attribution evidence for a short diagnostic run.
+# Off in the production build; never changes an attribution decision.
+attribution-diagnostics = []
 
 [dependencies]
 sieve-filter = { path = "../sieve-filter" }
