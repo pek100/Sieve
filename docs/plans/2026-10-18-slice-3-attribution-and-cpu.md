@@ -60,7 +60,7 @@ This is offline work, with unit tests over recorded event fixtures. Live proof c
 
 ### A3. Report forwarded traffic as its own category
 
-If A1 confirms forwarded flows, the engine reports them as "Virtual machines and WSL" (a counter plus a Flows-view label). They get the default app policy. They never inherit a host app's exemption. Whether they count toward the 0.95 gate is Michael's decision (below). Until he decides, every report shows the rate both ways.
+If A1 confirms forwarded flows, the engine reports them as "Virtual machines and WSL" (a counter plus a Flows-view label). They get the default app policy. They never inherit a host app's exemption. They stay in the 0.95 gate's denominator (Michael's decision, section 6). A forwarded flow counts as attributed only when an exact NAT match names its VM. Every report shows the all-flows rate (the gate) and the host-only rate.
 
 ## 3. CPU work
 
@@ -106,5 +106,7 @@ Done: three valid runs at 0.15 cores per 100 Mbit/s or less, with throughput wit
    - (b) forwarded flows stay in the denominator, so 0.95 holds only on a machine where VMs are quiet.
 
    Either way, both rates are reported.
+
+   **Decided by Michael (2026-10-18): (b).** Forwarded flows stay in the denominator: the gate is 0.95 of ALL new flows. Every report also shows the host-only rate. So A1 and A3 cannot pass the gate by relabelling flows. Forwarded traffic must be attributed exactly (for example, named as its VM through an exact NAT match), or it counts as a miss.
 2. **Whether WSL and VM traffic should be filtered at all,** or passed like an Off app until a guest-aware design exists.
 3. **The capture fallback.** If the CPU budget is out of reach with ipstack, should a WFP-redirect design (closer to how AdGuard works) be explored? It needs a signed driver or an existing signed one, which is the question already settled once for WinDivert.
