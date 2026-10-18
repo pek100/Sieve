@@ -17,6 +17,11 @@
 /src-tauri/target/
 /src-tauri/gen/schemas
 
+# engine workspace (its own target dir); Wintun binaries are never committed
+/engine/target/
+/engine/**/*.dll
+/engine/**/*.sys
+
 # misc
 .DS_Store
 *.pem

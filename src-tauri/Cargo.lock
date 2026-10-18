@@ -3253,6 +3253,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sieve-ipc",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -3262,6 +3263,16 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "windows",
+]
+
+[[package]]
+name = "sieve-ipc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

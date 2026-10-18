@@ -14,8 +14,11 @@ import { createPassedChecks, type PassedChecks } from "@/core/checks";
 import { createDnsController, type DnsController } from "@/data/dns-controller";
 import { createMockDns } from "@/data/dns-mock";
 import type { DnsSource } from "@/data/dns-source";
+import { createEngineController, type EngineController } from "@/data/engine-controller";
+import { createMockEngine } from "@/data/engine-mock";
+import type { EngineSource } from "@/data/engine-source";
 import { createMockSource } from "@/data/mock-source";
-import { createDnsSource, createSource, isTauriWindow, sourceOptions, type SieveSource } from "@/data/source";
+import { createDnsSource, createEngineSource, createSource, isTauriWindow, sourceOptions, type SieveSource } from "@/data/source";
 
 export interface Runtime {
   readonly isTauri: boolean;
@@ -34,6 +37,10 @@ export interface Runtime {
   readonly dns: DnsSource;
   /** The one owner of DNS state; components call its actions through hooks. */
   readonly dnsController: DnsController;
+  /** The engine seam (the Tauri command or the mock); read only. */
+  readonly engine: EngineSource;
+  /** The one owner of the store's engine part. */
+  readonly engineController: EngineController;
 }
 
 export interface RuntimeOptions {
@@ -44,6 +51,8 @@ export interface RuntimeOptions {
   desktop?: Desktop | null;
   /** Default: the mock DNS, scenario off. */
   dns?: DnsSource;
+  /** Default: the mock engine, not installed. */
+  engine?: EngineSource;
 }
 
 export function createRuntime(o: RuntimeOptions): Runtime {
@@ -54,6 +63,7 @@ export function createRuntime(o: RuntimeOptions): Runtime {
   const passedChecks = createPassedChecks();
   const desktop = o.desktop ?? null;
   const dns = o.dns ?? createMockDns({ seed: 1, now: clock.now });
+  const engine = o.engine ?? createMockEngine();
   return {
     isTauri: o.isTauri ?? false,
     source: o.source,
@@ -73,6 +83,8 @@ export function createRuntime(o: RuntimeOptions): Runtime {
       checks: passedChecks,
       clock,
     }),
+    engine,
+    engineController: createEngineController({ engine, store, clock }),
   };
 }
 
@@ -88,6 +100,7 @@ export function createBrowserRuntime(): Runtime {
   const rt = createRuntime({
     source: createSource(options, () => offKeys(settings?.get("apps.levels") ?? {})),
     dns: createDnsSource(options),
+    engine: createEngineSource(options),
     settings: isTauri ? tauriBackend() : localBackend(),
     isTauri,
     desktop: isTauri ? tauriDesktop() : null,
@@ -99,6 +112,11 @@ export function createBrowserRuntime(): Runtime {
 /** Run the DNS controller (load, follow the switches, poll, the read-only safety net). Returns the undo. */
 export function bindDns(rt: Runtime): () => void {
   return rt.dnsController.bind();
+}
+
+/** Run the engine controller (probe now and on its cadence, read only). Returns the undo. */
+export function bindEngine(rt: Runtime): () => void {
+  return rt.engineController.bind();
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));

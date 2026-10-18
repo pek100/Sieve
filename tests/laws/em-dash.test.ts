@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { hits, walk } from "./files";
 
-const EXTS = [".ts", ".tsx", ".css", ".rs", ".md", ".json", ".mjs", ".toml"];
+const EXTS = [".ts", ".tsx", ".css", ".rs", ".md", ".json", ".mjs", ".toml", ".ps1", ".nsh"];
 // Built from the code point so this file never contains the character itself.
 const EM_DASH = new RegExp(String.fromCharCode(0x2014));
 
@@ -11,6 +11,8 @@ describe("em dash law", () => {
     const files = [
       ...walk("src", EXTS),
       ...walk("src-tauri/src", EXTS),
+      ...walk("engine/crates", EXTS),
+      ...walk("src-tauri/windows", EXTS),
       ...walk("docs", EXTS),
       ...walk("tests", EXTS),
       ...walk("scripts", EXTS),

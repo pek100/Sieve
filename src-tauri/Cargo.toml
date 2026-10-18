@@ -31,6 +31,9 @@ hickory-proto = "0.26"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
+# The engine's pipe protocol (src/engine.rs), shared with the engine workspace.
+sieve-ipc = { path = "../engine/crates/sieve-ipc", features = ["tokio"] }
+
 # App icons (src/icons): the shell's icon of an exe, encoded as PNG for the UI.
 png = "0.18"
 

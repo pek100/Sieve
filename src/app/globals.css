@@ -15,6 +15,7 @@
 @source not "../../.claude";
 @source not "../../src-tauri/target";
 @source not "../../spikes";
+@source not "../../engine";
 
 /*
  * Tailwind theme = role tokens only. The default palette is removed so a raw

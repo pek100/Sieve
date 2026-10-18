@@ -12,6 +12,8 @@ import type { AppIcon, History, Snapshot } from "./protocol";
 import { createTauriSource } from "./tauri-source";
 import { createMockDns, DNS_SCENARIOS, type DnsScenario } from "./dns-mock";
 import { createTauriDns, type DnsSource } from "./dns-source";
+import { createMockEngine, ENGINE_SCENARIOS, type EngineScenario } from "./engine-mock";
+import { createTauriEngine, type EngineSource } from "./engine-source";
 
 export type { SourceKind };
 
@@ -47,6 +49,8 @@ export interface SourceOptions {
   pointed: boolean;
   /** Mock: generated app icons (?icons=1); without it the mock has none, as for unreadable exes. */
   icons: boolean;
+  /** Mock engine scenario (?engine=missing|stopped|idle|..., default missing). */
+  engine: EngineScenario;
 }
 
 /** Read the source choice from the environment: query string and Tauri presence. */
@@ -60,7 +64,9 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   const scenario = (MOCK_SCENARIOS as readonly string[]).includes(sc ?? "") ? (sc as MockScenario) : "steady";
   const d = q.get("dns");
   const dns = (DNS_SCENARIOS as readonly string[]).includes(d ?? "") ? (d as DnsScenario) : "off";
-  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1", pointed: q.get("pointed") === "1", icons: q.get("icons") === "1" };
+  const e = q.get("engine");
+  const engine = (ENGINE_SCENARIOS as readonly string[]).includes(e ?? "") ? (e as EngineScenario) : "missing";
+  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1", pointed: q.get("pointed") === "1", icons: q.get("icons") === "1", engine };
 }
 
 /**
@@ -75,6 +81,11 @@ export function createSource(o: SourceOptions, untracked: () => ReadonlySet<stri
 /** The DNS seam follows the same choice: Tauri commands, or the mock. */
 export function createDnsSource(o: SourceOptions): DnsSource {
   return o.kind === "tauri" ? createTauriDns() : createMockDns({ seed: o.seed, scenario: o.dns, adguard: o.adguard, pointed: o.pointed });
+}
+
+/** The engine seam follows the same choice: the Tauri command, or the mock. */
+export function createEngineSource(o: SourceOptions): EngineSource {
+  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine);
 }
 
 export function isTauriWindow(): boolean {

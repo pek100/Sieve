@@ -3,7 +3,8 @@
 //! in a history file in the app's own data dir; runs a local DNS filter
 //! (`dns`) that answers only lookups sent to it directly. No drivers. Launch
 //! at startup (autostart plugin) writes the current user's Run entry, only
-//! when the user turns the `startup.launchAtLogin` setting on.
+//! when the user turns the `startup.launchAtLogin` setting on. Asks the
+//! filtering engine's service and pipe what it is doing (`engine`, read only).
 //!
 //! Sieve off means a normal network: Sieve never writes persistent system
 //! network state (DNS servers, persistent routes, proxy settings, firewall
@@ -12,6 +13,7 @@
 pub mod adguard;
 pub mod commands;
 pub mod dns;
+pub mod engine;
 pub mod history;
 pub mod icons;
 pub mod netstat;
@@ -47,6 +49,7 @@ pub fn run() {
             dns::commands::dns_self_check,
             dns::commands::dns_set_pass_through,
             adguard::adguard_running,
+            engine::engine_probe,
             windns::windows_dns,
         ])
         .run(tauri::generate_context!());

@@ -1,0 +1,20 @@
+[package]
+name = "sieve-filter"
+description = "Sieve's filter lists, rule engine, HTTPS exclusions and resource pin (pure, no Windows calls)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# brave/adblock-rust (MPL-2.0), the one rule engine (plan 5.1). Without the
+# default `single-thread` feature, so a compiled engine is Send + Sync and can
+# sit behind an ArcSwap shared by the flow tasks.
+adblock = { version = "0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+sha2.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

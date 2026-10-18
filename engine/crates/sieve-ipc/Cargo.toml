@@ -1,0 +1,23 @@
+[package]
+name = "sieve-ipc"
+description = "The engine pipe protocol: messages, version, framing (no Windows calls)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Async framing over tokio streams (`nonblocking`), for the engine's pipe
+# server and the app's client. Off by default so the protocol stays runtime
+# free.
+tokio = ["dep:tokio"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = ["io-util"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }

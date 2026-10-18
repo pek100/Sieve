@@ -363,6 +363,80 @@ export function parseWindowsDns(raw: unknown): WindowsDns {
 }
 
 /**
+ * `engine_probe` (Rust `engine::EngineProbe`, fixture
+ * `src/data/fixtures/engine-probe-v1.json`): the filtering engine from
+ * facts. `service` is the Windows service's state ("missing" when not
+ * installed); `pipe` is the engine's own answer, asked only while the service
+ * runs. `status` is the engine's `sieve-ipc` Status.
+ */
+export const ENGINE_PROBE_VERSION = 1 as const;
+export const SERVICE_FACTS = ["missing", "stopped", "starting", "stopping", "running", "other"] as const;
+export type ServiceFact = (typeof SERVICE_FACTS)[number];
+export const PIPE_KINDS = ["welcome", "incompatible", "refused", "unreachable"] as const;
+
+export interface EngineStatus {
+  filtering: boolean;
+  routes_up: boolean;
+  flows: number;
+  decrypting: boolean;
+  last_error: string | null;
+}
+
+export type PipeFact =
+  | { kind: "welcome"; engine_version: string; session_id: number; status: EngineStatus }
+  | { kind: "incompatible"; supported: [number, number] }
+  | { kind: "refused"; message: string }
+  | { kind: "unreachable"; message: string };
+
+export interface EngineProbe {
+  v: typeof ENGINE_PROBE_VERSION;
+  service: ServiceFact;
+  pipe: PipeFact | null;
+}
+
+function pipeFact(raw: unknown): PipeFact {
+  const p = rec(raw, "pipe");
+  switch (p.kind) {
+    case "welcome": {
+      const s = rec(p.status, "pipe.status");
+      return {
+        kind: "welcome",
+        engine_version: str(p.engine_version, "pipe.engine_version"),
+        session_id: int(p.session_id, "pipe.session_id"),
+        status: {
+          filtering: bool(s.filtering, "status.filtering"),
+          routes_up: bool(s.routes_up, "status.routes_up"),
+          flows: int(s.flows, "status.flows"),
+          decrypting: bool(s.decrypting, "status.decrypting"),
+          last_error: strOrNull(s.last_error, "status.last_error"),
+        },
+      };
+    }
+    case "incompatible": {
+      const range = Array.isArray(p.supported) && p.supported.length === 2 ? p.supported : null;
+      if (!range) throw new ProtocolError("pipe.supported must be [min, max]");
+      return { kind: "incompatible", supported: [int(range[0], "pipe.supported[0]"), int(range[1], "pipe.supported[1]")] };
+    }
+    case "refused":
+    case "unreachable":
+      return { kind: p.kind, message: str(p.message, "pipe.message") };
+    default:
+      throw new ProtocolError(`pipe.kind must be one of ${PIPE_KINDS.join(", ")}`);
+  }
+}
+
+/** Validate an untrusted `engine_probe` answer. Throws ProtocolError. */
+export function parseEngineProbe(raw: unknown): EngineProbe {
+  const x = rec(raw, "engine probe");
+  version(x, ENGINE_PROBE_VERSION, "engine probe");
+  return {
+    v: ENGINE_PROBE_VERSION,
+    service: oneOf(x.service, SERVICE_FACTS, "service"),
+    pipe: x.pipe === null ? null : pipeFact(x.pipe),
+  };
+}
+
+/**
  * An app's icon (Rust `icons::AppIcon`, command `app_icon`): PNG bytes,
  * base64, at 32 px (x1) and 64 px (x2, HiDPI). Fetched per app, never part
  * of a snapshot.

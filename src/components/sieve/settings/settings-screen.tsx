@@ -10,12 +10,14 @@ import { Page } from "@/components/sieve/shell/page";
 import { Button } from "@/components/ui/button";
 import { DNS_SWITCH } from "@/core/dns";
 import { settingDef } from "@/core/settings/registry";
+import { cn } from "@/lib/utils";
 import { DNS_CARD_KEYS, DnsCard } from "./dns-card";
+import { EngineCard } from "./engine-card";
 import { SettingRow } from "./setting-row";
 import { TransferMenu } from "./transfer-menu";
 import { useSettingsView } from "./use-settings-view";
 
-/** The section that owns the DNS switch shows the DNS filter card under its rows. */
+/** The section that owns the DNS switch shows the DNS filter and the engine under its rows. */
 const DNS_SECTION = settingDef(DNS_SWITCH).section;
 
 /**
@@ -27,7 +29,8 @@ const DNS_SECTION = settingDef(DNS_SWITCH).section;
  * rows on its edges. Search covers label, help, key and options; the
  * overflow menu has export, import and reset. The section that owns the
  * DNS switch also carries the DNS filter card (status, counters, list,
- * upstreams, the safety notice); a key that card edits itself (DNS_CARD_KEYS) has
+ * upstreams, the safety notice) and the engine (EngineCard, read only); a key
+ * the DNS card edits itself (DNS_CARD_KEYS) has
  * no row of its own, so each setting has one owner on the screen.
  */
 export function SettingsScreen() {
@@ -90,8 +93,9 @@ export function SettingsScreen() {
                     </Card>
                   )}
                   {dns && (
-                    <div className={keys.length > 0 ? "pt-8" : undefined}>
+                    <div className={cn("flex flex-col gap-8", keys.length > 0 && "pt-8")}>
                       <DnsCard lockOf={view.lockOf} />
+                      <EngineCard />
                     </div>
                   )}
                 </div>

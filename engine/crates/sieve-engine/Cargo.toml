@@ -1,0 +1,73 @@
+[package]
+name = "sieve-engine"
+description = "Sieve's filtering engine, a Windows service (plan 1.1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "sieve_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sieve-engine"
+path = "src/main.rs"
+
+# The spike's live probe (one test host routed into a Wintun adapter, run by
+# the user elevated). Kept as a developer tool for slice 3; never bundled.
+[[bin]]
+name = "probe"
+path = "src/bin/probe/main.rs"
+
+[dependencies]
+sieve-filter = { path = "../sieve-filter" }
+sieve-ipc = { path = "../sieve-ipc", features = ["tokio"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+# QUIC Initial protection (RFC 9001 section 5): HKDF-SHA256 for the initial
+# secrets, AES-128-GCM for the payload, AES-128-ECB for header protection.
+aes = "0.8"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2.workspace = true
+
+# Userspace TCP/IP stack (vendored, see engine/vendor/ipstack/Cargo.toml).
+ipstack = "1.0.1"
+socket2 = "0.6"
+
+# Windows calls. The library reads the owner-pid tables, process images and
+# session ids, serves the pipe (Pipes, Security_Authorization for its DACL),
+# and for the verbs run elevated by the installer or a person: the service
+# registration (Services, through windows-service for the rest), the
+# ProgramData ACL, and the deletion of routes on the "Sieve" interface. The
+# probe binary alone also creates an adapter, its address and its test
+# routes (elevated, run by the user, removed on exit).
+[target.'cfg(windows)'.dependencies]
+# Loads wintun.dll at run time (libloading); verify_binary_signature refuses
+# a DLL whose Authenticode signer is not "WireGuard LLC".
+wintun-bindings = { version = "0.7.40", features = ["verify_binary_signature"] }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
+# The SCM dispatcher and service configuration (MIT or Apache-2.0).
+windows-service = "0.8.1"
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+# Benchmark only: craft packets for ipstack (same version ipstack uses).
+etherparse = "0.20"

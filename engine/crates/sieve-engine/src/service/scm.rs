@@ -1,0 +1,236 @@
+//! The verbs' Windows side: the service registration, the ProgramData
+//! folder, the routes. Each verb is a list of [`Step`]s that all run; see
+//! the module doc of `service` for what each verb does.
+
+use std::ffi::OsString;
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+use windows::Win32::System::Services::{
+    ChangeServiceConfig2W, SC_HANDLE, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, SERVICE_REQUIRED_PRIVILEGES_INFOW,
+};
+use windows::core::PWSTR;
+use windows_service::service::{
+    Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
+    ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceType,
+};
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+use super::acl::{PROGRAM_DATA_SDDL, set_dir_security, token_user_sid};
+use super::state::{self, State};
+use super::{
+    DESCRIPTION, DISPLAY_NAME, FAILURE_RESET, REQUIRED_PRIVILEGES, RESTART_DELAY, RESTARTS, SERVICE_NAME, STOP_WAIT, Step,
+};
+use crate::route::delete_sieve_routes;
+
+const POLL: Duration = Duration::from_millis(250);
+
+fn manager(access: ServiceManagerAccess) -> Result<ServiceManager, String> {
+    ServiceManager::local_computer(None::<&str>, access).map_err(|e| format!("service manager: {e}"))
+}
+
+fn is_missing(e: &windows_service::Error) -> bool {
+    matches!(e, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST.0 as i32))
+}
+
+/// The service, or None when it is not installed.
+fn open(access: ServiceAccess) -> Result<Option<Service>, String> {
+    match manager(ServiceManagerAccess::CONNECT)?.open_service(SERVICE_NAME, access) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if is_missing(&e) => Ok(None),
+        Err(e) => Err(format!("open {SERVICE_NAME}: {e}")),
+    }
+}
+
+fn info() -> Result<ServiceInfo, String> {
+    Ok(ServiceInfo {
+        name: OsString::from(SERVICE_NAME),
+        display_name: OsString::from(DISPLAY_NAME),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: std::env::current_exe().map_err(|e| e.to_string())?,
+        launch_arguments: vec![],
+        dependencies: vec![],
+        // None is LocalSystem.
+        account_name: None,
+        account_password: None,
+    })
+}
+
+/// A REG_MULTI_SZ: each name NUL-terminated, then one more NUL.
+fn multi_sz(names: &[&str]) -> Vec<u16> {
+    names.iter().flat_map(|n| n.encode_utf16().chain(std::iter::once(0))).chain(std::iter::once(0)).collect()
+}
+
+fn set_required_privileges(service: &Service) -> Result<(), String> {
+    let mut list = multi_sz(REQUIRED_PRIVILEGES);
+    let info = SERVICE_REQUIRED_PRIVILEGES_INFOW { pmszRequiredPrivileges: PWSTR(list.as_mut_ptr()) };
+    let handle = SC_HANDLE(service.raw_handle() as *mut _);
+    // SAFETY: `handle` is the open service; `info` points at `list`, which
+    // outlives the call.
+    unsafe { ChangeServiceConfig2W(handle, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, Some((&raw const info).cast())) }
+        .map_err(|e| format!("required privileges: {e}"))
+}
+
+fn recovery() -> ServiceFailureActions {
+    let restart = ServiceAction { action_type: ServiceActionType::Restart, delay: RESTART_DELAY };
+    let mut actions = vec![restart; RESTARTS];
+    actions.push(ServiceAction { action_type: ServiceActionType::None, delay: Duration::ZERO });
+    ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(FAILURE_RESET),
+        reboot_msg: None,
+        command: None,
+        actions: Some(actions),
+    }
+}
+
+fn register() -> Result<String, String> {
+    let access = ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
+    let info = info()?;
+    let (service, done) = match open(access)? {
+        Some(s) => {
+            s.change_config(&info).map_err(|e| format!("change config: {e}"))?;
+            (s, "updated")
+        }
+        None => {
+            let m = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+            (m.create_service(&info, access).map_err(|e| format!("create: {e}"))?, "created")
+        }
+    };
+    service.set_description(DESCRIPTION).map_err(|e| format!("description: {e}"))?;
+    service.update_failure_actions(recovery()).map_err(|e| format!("recovery: {e}"))?;
+    service.set_failure_actions_on_non_crash_failures(true).map_err(|e| format!("recovery flag: {e}"))?;
+    set_required_privileges(&service)?;
+    Ok(format!("{done}: LocalSystem, automatic start, restart after 5 s twice, privileges {REQUIRED_PRIVILEGES:?}"))
+}
+
+fn program_data() -> Result<String, String> {
+    let pd = state::program_data()?;
+    let sieve = state::sieve_dir(&pd);
+    std::fs::create_dir_all(&sieve).map_err(|e| format!("{}: {e}", sieve.display()))?;
+    // Owner and DACL are set before anything is written inside, and again on
+    // every install (a folder someone else created first is taken over).
+    set_dir_security(&sieve, PROGRAM_DATA_SDDL)?;
+    let engine = state::engine_dir(&pd);
+    std::fs::create_dir_all(&engine).map_err(|e| format!("{}: {e}", engine.display()))?;
+    Ok(format!("{} (SYSTEM and Administrators only)", engine.display()))
+}
+
+fn record_owner() -> Result<String, String> {
+    let sid = token_user_sid()?;
+    let engine = state::engine_dir(&state::program_data()?);
+    state::write(&engine, &State { owner_sid: Some(sid.clone()) })?;
+    Ok(format!("pipe user {sid}"))
+}
+
+fn wait_for(service: &Service, want: ServiceState) -> Result<(), String> {
+    let deadline = Instant::now() + STOP_WAIT;
+    loop {
+        let now = service.query_status().map_err(|e| format!("status: {e}"))?.current_state;
+        if now == want {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("still {now:?} after {} s", STOP_WAIT.as_secs()));
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+fn start() -> Result<String, String> {
+    let service = open(ServiceAccess::QUERY_STATUS | ServiceAccess::START)?.ok_or("not installed")?;
+    if service.query_status().map_err(|e| e.to_string())?.current_state == ServiceState::Running {
+        return Ok("already running".into());
+    }
+    service.start::<&str>(&[]).map_err(|e| format!("start: {e}"))?;
+    wait_for(&service, ServiceState::Running)?;
+    Ok("running".into())
+}
+
+fn stop() -> Result<String, String> {
+    let Some(service) = open(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)? else {
+        return Ok("not installed".into());
+    };
+    if service.query_status().map_err(|e| e.to_string())?.current_state == ServiceState::Stopped {
+        return Ok("already stopped".into());
+    }
+    service.stop().map_err(|e| format!("stop: {e}"))?;
+    wait_for(&service, ServiceState::Stopped)?;
+    Ok("stopped".into())
+}
+
+fn delete() -> Result<String, String> {
+    let Some(service) = open(ServiceAccess::DELETE)? else { return Ok("not installed".into()) };
+    service.delete().map_err(|e| format!("delete: {e}"))?;
+    Ok("deleted".into())
+}
+
+fn remove_program_data() -> Result<String, String> {
+    let sieve = state::sieve_dir(&state::program_data()?);
+    match std::fs::remove_dir_all(&sieve) {
+        Ok(()) => Ok(format!("{} deleted", sieve.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(format!("{} not there", sieve.display())),
+        Err(e) => Err(format!("{}: {e}", sieve.display())),
+    }
+}
+
+fn routes() -> Result<String, String> {
+    delete_sieve_routes().map(|n| format!("{n} routes on \"Sieve\" deleted"))
+}
+
+pub fn install() -> Vec<Step> {
+    vec![
+        Step::run("service", register),
+        Step::run("program data", program_data),
+        Step::run("owner", record_owner),
+        Step::run("start", start),
+    ]
+}
+
+pub fn uninstall() -> Vec<Step> {
+    vec![
+        Step::run("routes", routes),
+        Step::run("stop", stop),
+        Step::run("delete service", delete),
+        Step::run("program data", remove_program_data),
+    ]
+}
+
+pub fn restore() -> Vec<Step> {
+    vec![Step::run("routes", routes), Step::run("stop", stop)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn privileges_are_a_double_nul_terminated_list() {
+        let w = multi_sz(&["SeA", "SeB"]);
+        assert_eq!(String::from_utf16_lossy(&w), "SeA\0SeB\0\0");
+        assert_eq!(multi_sz(&[]), [0]);
+    }
+
+    #[test]
+    fn recovery_restarts_twice_then_does_nothing() {
+        let r = recovery();
+        let kinds: Vec<_> = r.actions.unwrap().iter().map(|a| (a.action_type, a.delay)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (ServiceActionType::Restart, RESTART_DELAY),
+                (ServiceActionType::Restart, RESTART_DELAY),
+                (ServiceActionType::None, Duration::ZERO)
+            ]
+        );
+        assert!(matches!(r.reset_period, ServiceFailureResetPeriod::After(d) if d == FAILURE_RESET));
+    }
+
+    /// Read only: the service manager answers, and the engine's service is
+    /// either absent or installed (nothing is changed).
+    #[test]
+    fn opening_the_service_read_only_works_without_admin() {
+        assert!(open(ServiceAccess::QUERY_STATUS).is_ok());
+    }
+}
