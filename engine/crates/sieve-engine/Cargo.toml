@@ -21,6 +21,11 @@ path = "src/main.rs"
 name = "probe"
 path = "src/bin/probe/main.rs"
 
+# Include the offline CONNECT parser/JSON tests in cargo test --workspace.
+[[example]]
+name = "connect_relay"
+test = true
+
 [features]
 # The Stall test build (plan 7.2, slice 3 live check): 30 s after its routes
 # come up, the relay stops answering the watchdog's pings, so the watchdog
