@@ -3,7 +3,7 @@
  * Renaming or retyping a key does: bump SETTINGS_SCHEMA and add a step here
  * that maps documents of schema N to N + 1.
  */
-import { SETTINGS_SCHEMA } from "./registry";
+import { SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef } from "./registry";
 
 type Values = Record<string, unknown>;
 
@@ -40,10 +40,27 @@ export function dropSystemDns(values: Values): Values {
   return next;
 }
 
+/**
+ * 3 -> 4: the app-hosted DNS filter became unavailable until the engine
+ * replaces it (2026-10-18; registry `unavailableUntil`). A stored value of
+ * any data switch that is unavailable is dropped, so a stored "on" is off
+ * (off is the default, never stored) and stays off when the switch comes
+ * back: the user turns it on again where its checks run. Derived from the
+ * registry rather than a key list, so the step and the attribute cannot
+ * disagree. Other unavailable keys (the upstream list) are kept: they hold
+ * no traffic change and read as their default while unavailable.
+ */
+export function offUnavailableSwitches(values: Values): Values {
+  const next: Values = { ...values };
+  for (const k of SETTING_KEYS) if (settingDef(k).kind === "dataSwitch" && !isAvailable(k)) delete next[k];
+  return next;
+}
+
 /** STEPS[n] upgrades a schema-n document to schema n + 1. */
 const STEPS: Record<number, (values: Values) => Values> = {
   1: levelsToOnOff,
   2: dropSystemDns,
+  3: offUnavailableSwitches,
 };
 
 export function migrate(doc: { schema: number; values: Values }): { schema: number; values: Values } {
