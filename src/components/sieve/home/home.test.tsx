@@ -1,7 +1,7 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { DNS_SWITCH } from "@/core/dns";
+import { DNS_SWITCH, STRANDED_DNS_TEXT } from "@/core/dns";
 import { OTHER_KEY, SERIES_COUNT } from "@/core/series";
 import { createMockDns } from "@/data/dns-mock";
 import { createMockSource } from "@/data/mock-source";
@@ -161,17 +161,10 @@ describe("home chart", () => {
     expect(parseFloat(start.style.width)).toBeGreaterThan(95);
   });
 });
-/** Home's text with the DNS-derived tiles taken out. */
-function textOutsideDnsTiles(): string {
-  const copy = document.body.cloneNode(true) as HTMLElement;
-  for (const el of copy.querySelectorAll("[data-dns-derived]")) el.remove();
-  return copy.textContent ?? "";
-}
-
 const CLAIMS = /\b(ads|trackers|blocked)\b/i;
 
 describe("home copy and KPIs", () => {
-  it("law, filter off: Home never says ads, trackers or blocked; the DNS tile says Off with the way to turn it on", async () => {
+  it("law: Home never says ads, trackers or blocked; the fourth tile is the engine, from facts, linking to Settings > Engine", async () => {
     const { runtime } = await setup();
     expect(runtime.store.getState().dns.status?.running).toBe(false);
     expect(document.body.textContent ?? "").not.toMatch(CLAIMS);
@@ -179,15 +172,20 @@ describe("home copy and KPIs", () => {
     const tiles = group.querySelectorAll("section[data-kpi]");
     expect(tiles).toHaveLength(4);
     // Snapshot tiles name apps, connections or hosts.
-    for (const t of group.querySelectorAll("section[data-kpi]:not([data-dns-derived])")) {
+    for (const t of group.querySelectorAll("section[data-kpi]:not([data-kpi=engine])")) {
       expect(t.getAttribute("aria-label")).toMatch(/apps|connections|hosts/i);
     }
     // The apps count is isSieved (effectively on, with a connection): sieved apps, and its label says so.
     expect(group.querySelector('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Sieved apps");
-    const dns = group.querySelector<HTMLElement>('section[data-kpi="blocked"]')!;
-    expect(dns).toHaveAttribute("aria-label", "DNS filter");
-    expect(within(dns).getByText("Off")).toBeInTheDocument();
-    expect(within(dns).getByRole("link", { name: "Turn on in Settings" })).toHaveAttribute("href", expect.stringMatching(/^\/settings\/?#section-filtering$/));
+    // No DNS filter tile: the DNS filter is unavailable until the engine replaces it.
+    expect(group.querySelector('[data-kpi="blocked"], [data-dns-derived]')).toBeNull();
+    expect(screen.queryByText(/DNS filter/)).toBeNull();
+    const engine = group.querySelector<HTMLElement>('section[data-kpi="engine"]')!;
+    expect(engine).toHaveAttribute("aria-label", "Engine");
+    // The mock engine is not installed (a browser has none).
+    await vi.waitFor(() => expect(engine).toHaveAttribute("data-engine-phase", "not_installed"));
+    expect(within(engine).getByText("Not installed")).toBeInTheDocument();
+    expect(within(engine).getByRole("link", { name: "Details in Settings" })).toHaveAttribute("href", expect.stringMatching(/^\/settings\/?#engine$/));
     // Numbers are shown, with a delta chip each.
     expect(within(tiles[1] as HTMLElement).getByText(/^\d+$/)).toBeInTheDocument();
     expect(tiles[1].querySelector("[data-dir]")).not.toBeNull();
@@ -197,13 +195,13 @@ describe("home copy and KPIs", () => {
     for (const t of tiles) expect(t.className).not.toMatch(/\b(bg-|shadow-|rounded|border|p-\d)/);
   });
 
-  it("law, filter on: 'blocked' appears only in the DNS-derived tile, with the filter's own count; never ads or trackers", async () => {
+  it("law, settings from an old build with DNS filtering on: the filter never starts, Home never says blocked, the safety banner points to Windows only", async () => {
     const fc = fakeClock();
     const runtime = createRuntime({
       source: createMockSource({ seed: 1, now: fc.clock.now }),
-      settings: memoryBackend({ schema: 1, values: { [DNS_SWITCH]: true } }),
+      settings: memoryBackend({ schema: 3, values: { [DNS_SWITCH]: true } }),
       clock: fc.clock,
-      // An adapter asks 127.0.0.1 and ::1 (Sieve never sets that), so lookups arrive and some are blocked.
+      // An adapter asks 127.0.0.1 and ::1 (left by an old build), so a running filter would get lookups.
       dns: createMockDns({ seed: 1, pointed: true, now: fc.clock.now }),
     });
     render(
@@ -216,16 +214,13 @@ describe("home copy and KPIs", () => {
       await fc.flush();
     });
     await act(() => fc.advance(20_000));
-    const status = runtime.store.getState().dns.status!;
-    expect(status.running).toBe(true);
-    expect(status.counters.blocked).toBeGreaterThan(0);
-    const dns = screen.getByRole("group", { name: "Right now" }).querySelector<HTMLElement>('section[data-kpi="blocked"]')!;
-    expect(dns).toHaveAttribute("aria-label", "Blocked lookups");
-    await vi.waitFor(() => expect(dns.querySelector("[data-numeric]")).toHaveTextContent(status.counters.blocked.toLocaleString()));
-    expect(dns).toHaveTextContent(`of ${runtime.store.getState().dns.status!.counters.queries.toLocaleString()}`);
-    expect(document.body.textContent).toMatch(/blocked/i);
-    expect(textOutsideDnsTiles()).not.toMatch(CLAIMS);
-    expect(document.body.textContent).not.toMatch(/\b(ads|trackers)\b/i);
+    expect(runtime.settings.get(DNS_SWITCH)).toBe(false);
+    expect(runtime.store.getState().dns.status?.running).toBe(false);
+    const banner = runtime.notices.list().find((n) => n.surface === "banner");
+    expect(banner?.text).toBe(STRANDED_DNS_TEXT);
+    expect(banner?.action).toBeUndefined();
+    expect(screen.getByRole("group", { name: "Right now" }).querySelector('section[data-kpi="engine"]')).not.toBeNull();
+    expect(document.body.textContent ?? "").not.toMatch(CLAIMS);
   });
 
   it("every icon-only button has an accessible name", async () => {
