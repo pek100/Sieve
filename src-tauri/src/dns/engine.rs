@@ -112,7 +112,7 @@ impl Engine {
 
     /// Forward every lookup and block nothing (true), or filter again
     /// (false). The global Sieving switch off sets it; the proxy keeps
-    /// answering, so Windows DNS pointed here keeps working.
+    /// answering, so anything that sends its lookups here keeps working.
     pub fn set_pass_through(&self, on: bool) {
         self.proxy.set_pass_through(on);
     }

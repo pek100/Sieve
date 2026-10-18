@@ -37,14 +37,14 @@ png = "0.18"
 [dev-dependencies]
 tempfile = "3"
 
-# Windows calls. Read only: the IP Helper owner-pid tables, process image
-# names and file version info (slice S1); the service list, for the
-# service names of a process whose exe Windows hides (EnumServicesStatusExW
-# with SC_MANAGER_ENUMERATE_SERVICE, no admin); adapter DNS servers
-# (GetAdaptersAddresses), the Tcpip NameServer registry values and the process
-# list (sysdns); app icons (icons: SHCreateItemFromParsingName and
-# IShellItemImageFactory under COM, the bitmap read with GetDIBits). The one write: sysdns runs one PowerShell script elevated
-# (ShellExecuteExW "runas", the user approves the UAC prompt).
+# Windows calls, all read only (Sieve never writes system network state):
+# the IP Helper owner-pid tables, process image names and file version info
+# (slice S1); the service list, for the service names of a process whose exe
+# Windows hides (EnumServicesStatusExW with SC_MANAGER_ENUMERATE_SERVICE, no
+# admin); the process list (adguard); adapter DNS servers
+# (GetAdaptersAddresses, windns); app icons (icons:
+# SHCreateItemFromParsingName and IShellItemImageFactory under COM, the
+# bitmap read with GetDIBits).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -55,7 +55,6 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",

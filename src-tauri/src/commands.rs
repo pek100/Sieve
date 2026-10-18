@@ -38,11 +38,3 @@ pub async fn history_buckets(app: AppHandle, query: HistoryQuery) -> Result<Hist
 pub async fn tray_set_state(app: AppHandle, state: TrayState) -> Result<(), String> {
     tray::apply(&app, &state)
 }
-
-/// End the app. The window calls it after asking the user, when Windows
-/// points at Sieve (see src/data/dns-controller.ts quit).
-#[tauri::command]
-pub async fn app_quit(app: AppHandle) -> Result<(), String> {
-    app.exit(0);
-    Ok(())
-}
