@@ -122,6 +122,13 @@ impl Engine {
     /// the live check reads the engine's own facts and counters from an
     /// admin prompt (the pipe admits only the installed app). Best effort.
     pub fn write_status_file(&self) {
+        #[cfg(feature = "attribution-diagnostics")]
+        if let (Some(dir), Ok(json)) = (&self.dir, serde_json::to_vec_pretty(&*lock(&self.meters.attribution))) {
+            let tmp = dir.join("attribution-diagnostics.tmp");
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, dir.join("attribution-diagnostics.json"));
+            }
+        }
         if let (Some(dir), Ok(json)) = (&self.dir, serde_json::to_vec_pretty(&self.status())) {
             let tmp = dir.join(STATUS_FILE).with_extension("tmp");
             if std::fs::write(&tmp, json).is_ok() {
