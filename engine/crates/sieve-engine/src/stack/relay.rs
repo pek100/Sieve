@@ -50,6 +50,8 @@ type ExeLookup = fn(u32) -> Option<String>;
 
 /// What every flow task shares.
 pub struct Relay {
+    #[cfg(feature = "relay-experiments")]
+    pub experiments: crate::experiments::Settings,
     pub own_pid: u32,
     pub tun_index: u32,
     pub attributor: Mutex<Attributor<IpHelper>>,
@@ -76,6 +78,8 @@ pub fn session_of(pid: u32) -> Option<u32> {
 impl Relay {
     pub fn new(tun_index: u32, tables: NetTables, book: Arc<Mutex<FlowBook>>, names: Arc<Mutex<NameMap>>, meters: Arc<Meters>) -> Self {
         Self {
+            #[cfg(feature = "relay-experiments")]
+            experiments: crate::experiments::Settings::default(),
             own_pid: std::process::id(),
             tun_index,
             attributor: Mutex::new(Attributor::new(IpHelper)),
@@ -214,6 +218,19 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
             return close_app(&mut app).await;
         }
     };
+    #[cfg(feature = "relay-experiments")]
+    let out = if let Some(capacity) = ctx.experiments.copy_buffer_bytes {
+        crate::flow::relay::relay_tcp_buffered(&mut app, upstream, FIRST_BYTES_WAIT, |d| {
+            ctx.decided(id, d, dns);
+            Action::Pass
+        }, capacity).await
+    } else {
+        relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, |d| {
+            ctx.decided(id, d, dns);
+            Action::Pass
+        }).await
+    };
+    #[cfg(not(feature = "relay-experiments"))]
     let out = relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, |d| {
         ctx.decided(id, d, dns);
         Action::Pass

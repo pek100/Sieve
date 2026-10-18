@@ -32,10 +32,10 @@ pub fn is_sieve_interface(alias: &str) -> bool {
 }
 
 /// Deletes every route (IPv4 and IPv6) on an interface named "Sieve" and
-/// returns how many went. A route that cannot be deleted is an error naming
-/// how many could.
+/// reports deletions and races with an earlier cleanup separately. Failures
+/// retain their Win32 codes in the report.
 #[cfg(windows)]
-pub fn delete_sieve_routes() -> Result<usize, String> {
+pub fn delete_sieve_routes() -> Result<journal::Replay, String> {
     use windows::Win32::Foundation::NO_ERROR;
     use windows::Win32::NetworkManagement::IpHelper::{
         ConvertInterfaceLuidToAlias, DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
@@ -49,7 +49,7 @@ pub fn delete_sieve_routes() -> Result<usize, String> {
     if code != NO_ERROR || table.is_null() {
         return Err(format!("GetIpForwardTable2: {code:?}"));
     }
-    let (mut deleted, mut failed) = (0usize, 0usize);
+    let mut report = journal::Replay::default();
     // SAFETY: `table` is valid until FreeMibTable; NumEntries rows follow.
     unsafe {
         let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
@@ -62,16 +62,58 @@ pub fn delete_sieve_routes() -> Result<usize, String> {
             if !is_sieve_interface(&String::from_utf16_lossy(&alias[..len])) {
                 continue;
             }
-            if DeleteIpForwardEntry2(row) == NO_ERROR { deleted += 1 } else { failed += 1 }
+            report.observe(classify_delete(DeleteIpForwardEntry2(row).0));
         }
         FreeMibTable(table.cast());
     }
-    if failed == 0 { Ok(deleted) } else { Err(format!("{failed} routes could not be deleted ({deleted} were)")) }
+    if report.failed == 0 { Ok(report) } else { Err(report.summary()) }
+}
+
+/// One classification shared by table cleanup and journal replay.
+/// ERROR_NOT_FOUND (no such route) and ERROR_FILE_NOT_FOUND (the route's
+/// adapter no longer exists, so the route went with it) are already-deleted
+/// routes; every other error survives with its code.
+#[cfg(windows)]
+pub fn classify_delete(code: u32) -> journal::Deleted {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, NO_ERROR};
+    if code == NO_ERROR.0 {
+        journal::Deleted::Yes
+    } else if code == ERROR_NOT_FOUND.0 || code == ERROR_FILE_NOT_FOUND.0 {
+        journal::Deleted::NotThere
+    } else {
+        journal::Deleted::Failed(code)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn fake_delete_codes_agree_for_named_cleanup_and_journal_replay() {
+        use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, NO_ERROR};
+        use journal::{Entry, Journal, Replay};
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::new(dir.path());
+        let codes = [NO_ERROR.0, ERROR_NOT_FOUND.0, ERROR_ACCESS_DENIED.0, ERROR_ACCESS_DENIED.0];
+        let mut named = Replay::default();
+        for code in codes {
+            journal.append(&Entry { prefix: "192.0.2.1/32".parse().unwrap(), luid: u64::from(code) }).unwrap();
+            named.observe(classify_delete(code));
+        }
+        let replay = journal.replay(|entry| classify_delete(entry.luid as u32)).unwrap();
+        assert_eq!(named, replay);
+        assert_eq!((replay.deleted, replay.already_gone, replay.failed), (1, 1, 2));
+        assert_eq!(replay.failed_codes, std::collections::BTreeMap::from([(ERROR_ACCESS_DENIED.0, 2)]));
+        assert!(replay.summary().contains(&format!("codes {{{}: 2}}", ERROR_ACCESS_DENIED.0)));
+        assert_eq!(journal.read().unwrap().0.len(), codes.len(), "failed entries remain retryable");
+        assert_eq!(classify_delete(ERROR_FILE_NOT_FOUND.0), journal::Deleted::NotThere, "the adapter took its routes with it");
+        let cleaned = journal.replay(|_| classify_delete(ERROR_NOT_FOUND.0)).unwrap();
+        assert_eq!((cleaned.deleted, cleaned.already_gone, cleaned.failed), (0, codes.len(), 0));
+        assert!(cleaned.failed_codes.is_empty());
+        assert!(journal.read().unwrap().0.is_empty());
+    }
 
     #[test]
     fn only_the_interface_named_sieve_is_sieves() {

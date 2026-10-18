@@ -177,11 +177,25 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
             .map_err(|e| format!("watchdog thread: {e}"))?;
     }
 
+    #[cfg(feature = "relay-experiments")]
+    let rt = {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        if let Some(workers) = engine.experiments.settings.worker_threads {
+            builder.worker_threads(workers);
+        }
+        builder.enable_all().thread_name(FLOW_THREAD).build().map_err(|e| e.to_string())?
+    };
+    #[cfg(not(feature = "relay-experiments"))]
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name(FLOW_THREAD)
         .build()
         .map_err(|e| e.to_string())?;
+    #[cfg(feature = "relay-experiments")]
+    {
+        engine.runtime_workers.store(rt.metrics().num_workers(), std::sync::atomic::Ordering::Relaxed);
+        engine.write_status_file();
+    }
     let result = rt.block_on(async {
         tokio::spawn(routing::answer_pings(engine.clone(), ping_rx));
         let (halt_tx, halt_rx) = watch::channel(false);
