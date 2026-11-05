@@ -7,7 +7,7 @@ import { createMockEngine, MOCK_LOG_ERROR, type EngineScenario } from "@/data/en
 import type { EngineSource } from "@/data/engine-source";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
 import { createMockSource } from "@/data/mock-source";
-import { LOG_TAIL_VERSION, type LogEntry, type LogRow } from "@/data/protocol";
+import { LOG_TAIL_VERSION, type LogEntry, type LogOutcome, type LogRow } from "@/data/protocol";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
@@ -44,8 +44,8 @@ async function setup(engine: EngineSource | EngineScenario = "hosts", stored?: u
 }
 
 /** Waits for the mock's first read: the ring holds every fixture row. */
-async function withRows(engine: EngineSource | EngineScenario = "hosts") {
-  const rt = await setup(engine);
+async function withRows(engine: EngineSource | EngineScenario = "hosts", stored?: unknown) {
+  const rt = await setup(engine, stored);
   await vi.waitFor(() => expect(screen.getAllByTestId("log-row").length).toBeGreaterThan(0), { timeout: LOG_POLL_MS * 4 });
   // Reads go on; the tests need a still list.
   act(() => rt.logController.pause());
@@ -54,6 +54,8 @@ async function withRows(engine: EngineSource | EngineScenario = "hosts") {
 
 const rows = () => screen.queryAllByTestId("log-row");
 const rowOf = (host: string) => rows().find((r) => r.querySelector("[data-log-host]")?.textContent === host)!;
+/** A TLS flow with no name: the row knows it only by its address. */
+const ipRow = (host: string, outcome: LogOutcome): LogEntry => ({ seq: 1, row: { ...(FIXTURE_ROWS[0].row as LogRow), kind: "tls", url: null, rule: null, list: null, host, outcome } });
 
 describe("the Log screen", () => {
   it("says each outcome in words, the blocked colour only on Blocked", async () => {
@@ -270,14 +272,56 @@ describe("row actions", () => {
     await vi.waitFor(() => expect(rt.settings.get("filtering.userRules")).toEqual(["@@||ads.example.com^"]));
     expect(await screen.findByText("Added @@||ads.example.com^ to your rules.")).toBeInTheDocument();
 
-    // Twice is once.
-    await pick("ads.example.com", "Unblock");
-    await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add it" }));
-    await vi.waitFor(() => expect(screen.getAllByText("Added @@||ads.example.com^ to your rules.").length).toBe(2));
-    expect(rt.settings.get("filtering.userRules")).toEqual(["@@||ads.example.com^"]);
-
     undoLast(rt);
     await vi.waitFor(() => expect(rt.settings.get("filtering.userRules")).toEqual([]));
+  });
+
+  it.each([
+    ["Unblock", "ads.example.com", "filtering.userRules", "@@||ads.example.com^", "@@||ads.example.com^ is already in your rules."],
+    ["Do not decrypt this site", "shop.example.net", "filtering.exclusions", "shop.example.net", "shop.example.net is already in the sites not decrypted."],
+  ] as const)("%s of a line already there says so and offers no Undo: the line stays", async (item, host, key, line, said) => {
+    const rt = await withRows("hosts", { schema: 5, values: { "filtering.engine": true, [key]: [line] } });
+    const pushed = vi.spyOn(rt.notices, "push");
+    await pick(host, item);
+    await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add it" }));
+    await vi.waitFor(() => expect(pushed.mock.calls.map(([n]) => n.text)).toContain(said));
+    expect(pushed.mock.calls.filter(([n]) => n.action)).toEqual([]);
+    expect(rt.settings.get(key)).toEqual([line]);
+  });
+
+  it("the same action twice: the second adds nothing and no second Undo", async () => {
+    const rt = await withRows();
+    // Spied, not read from the bus: a toast leaves it when it expires.
+    const pushed = vi.spyOn(rt.notices, "push");
+    for (let i = 0; i < 2; i++) {
+      await pick("ads.example.com", "Unblock");
+      await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add it" }));
+      await vi.waitFor(() => expect(pushed).toHaveBeenCalledTimes(i + 1));
+    }
+    expect(pushed.mock.calls[1][0].text).toBe("@@||ads.example.com^ is already in your rules.");
+    expect(rt.settings.get("filtering.userRules")).toEqual(["@@||ads.example.com^"]);
+    expect(pushed.mock.calls.filter(([n]) => n.action)).toHaveLength(1);
+  });
+
+  it("an IPv6 row: Block previews the bracketed rule, Copy URL copies a valid URL", async () => {
+    const rt = await setup("missing");
+    act(() => rt.store.setLog({ ...EMPTY_LOG, rows: [ipRow("2001:db8::1", { kind: "passed", reason: "no_rule" })] }));
+    await pick("2001:db8::1", "Block");
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.querySelector("[data-rule-preview]")).toHaveTextContent("||[2001:db8::1]^");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await pick("2001:db8::1", "Copy URL");
+    await vi.waitFor(() => expect(clipboard).toHaveBeenCalledWith("https://[2001:db8::1]/"));
+  });
+
+  it.each(["203.0.113.9", "2001:db8::1"])("Report from a row known only by the address %s: the URL starts empty, the report holds no address", async (host) => {
+    const rt = await setup("missing");
+    act(() => rt.store.setLog({ ...EMPTY_LOG, rows: [ipRow(host, { kind: "blocked" })] }));
+    await pick(host, "Report a broken site");
+    expect(await screen.findByRole<HTMLInputElement>("textbox", { name: "Page URL" })).toHaveValue("");
+    const report = screen.getByRole<HTMLTextAreaElement>("textbox", { name: "The report" }).value;
+    expect(report).toContain("Page URL: not known");
+    expect(report).not.toContain(host);
   });
 
   it("Block the same way", async () => {
@@ -315,5 +359,13 @@ describe("row actions", () => {
     clipboard.mockRejectedValueOnce(new Error("denied"));
     await pick("ads.example.com", "Copy URL");
     expect(await screen.findByText(/Could not copy/)).toBeInTheDocument();
+  });
+
+  it("Copy URL with no clipboard at all says so, not that it copied", async () => {
+    const rt = await withRows();
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+    await pick("ads.example.com", "Copy URL");
+    await vi.waitFor(() => expect(rt.notices.list().map((n) => n.kind)).toContain("error"));
+    expect(rt.notices.list().map((n) => n.text)).not.toContain("URL copied");
   });
 });

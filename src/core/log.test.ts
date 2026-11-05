@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
 import { LOG_OUTCOMES, ProtocolError, parseLogTail, type LogEntry, type LogOutcome } from "@/data/protocol";
-import { LOG_RING, LOG_SHOWN, appendRows, exeName, listName, matchesFilter, matchesSearch, outcomeWords, reasonWords, rowPath, rowUrl, visibleRows } from "./log";
+import { LOG_RING, LOG_SHOWN, appendRows, exeName, listName, matchesFilter, matchesSearch, outcomeWords, reasonWords, rowPath, rowUrl, urlFormHost, visibleRows } from "./log";
 
 const rows = parseLogTail(logFixture).rows;
 const NO_TITLES = new Map<string, string>();
@@ -86,6 +86,14 @@ describe("what a row stands for", () => {
     expect(rowUrl({ url: null, kind: "http", host: "a.example" })).toBe("http://a.example/");
     expect(rowUrl({ url: null, kind: "dns", host: "a.example" })).toBeNull();
     expect(rowUrl({ url: null, kind: "other", host: "198.51.100.25" })).toBeNull();
+  });
+
+  it("an IPv6 host takes brackets in its URL; a name and an IPv4 address do not", () => {
+    expect(rowUrl({ url: null, kind: "tls", host: "2001:db8::1" })).toBe("https://[2001:db8::1]/");
+    expect(rowUrl({ url: null, kind: "http", host: "2001:db8::1" })).toBe("http://[2001:db8::1]/");
+    expect(rowUrl({ url: null, kind: "quic", host: "198.51.100.25" })).toBe("https://198.51.100.25/");
+    expect(urlFormHost("2001:db8::1")).toBe("[2001:db8::1]");
+    expect(urlFormHost("a.example")).toBe("a.example");
   });
 
   it("the path column, the exe's name, the list's name", () => {

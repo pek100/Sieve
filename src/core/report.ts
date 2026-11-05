@@ -6,8 +6,8 @@
  * another row's host. Query strings are out by default: they carry tokens.
  * Nothing here sends anything, and nothing in Sieve ever does.
  */
-import type { ListFact, LogEntry } from "@/data/protocol";
-import { exeName, listName } from "./log";
+import type { ListFact, LogEntry, LogRow } from "@/data/protocol";
+import { exeName, listName, rowUrl, urlFormHost } from "./log";
 
 const QUERY_START = /[?#]/;
 
@@ -27,6 +27,20 @@ export function urlHost(url: string): string | null {
   return m && m[1] !== "" ? m[1].toLowerCase() : null;
 }
 
+/** An IPv6 literal, or what a URL parser reads as IPv4: a host whose last label is a number. */
+const IP_HOST = /:|(?:^|\.)(?:\d+|0x[0-9a-f]+)\.?$/i;
+
+/**
+ * The URL a report starts from: the row's, unless its host is an address. The
+ * report holds no IP, so that field starts empty and the user may type one.
+ */
+export function reportUrl(row: Pick<LogRow, "url" | "kind" | "host">): string | null {
+  const url = rowUrl(row);
+  if (url === null) return null;
+  const host = urlHost(url);
+  return host !== null && IP_HOST.test(host) ? null : url;
+}
+
 export interface ReportRule {
   rule: string;
   /** A catalogue id, "user", or null. */
@@ -43,7 +57,7 @@ export function rulesForPage(rows: readonly LogEntry[], url: string, exe: string
   const out = new Map<string, ReportRule>();
   for (const e of rows) {
     const r = e?.row;
-    if (!r?.rule || r.host?.toLowerCase() !== host || (exe !== null && r.exe !== exe) || out.has(r.rule)) continue;
+    if (!r?.rule || urlFormHost(r.host?.toLowerCase() ?? "") !== host || (exe !== null && r.exe !== exe) || out.has(r.rule)) continue;
     out.set(r.rule, { rule: r.rule, list: r.list ?? null });
   }
   return [...out.values()];

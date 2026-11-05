@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
 import { parseLogTail, type ListFact } from "@/data/protocol";
-import { buildReport, hasQuery, issuePage, reportList, rulesForPage, stripQuery, urlHost } from "./report";
+import { buildReport, hasQuery, issuePage, reportList, reportUrl, rulesForPage, stripQuery, urlHost } from "./report";
 
 const ADGUARD: ListFact = { id: "adguard-base", title: "AdGuard Base filter", homepage: "https://github.com/AdguardTeam/AdguardFilters", version: "2.3.72", applied: 9, skipped: 1 };
 const UBO: ListFact = { id: "ubo-filters", title: "uBlock filters", homepage: "https://github.com/uBlockOrigin/uAssets", version: null, applied: 5, skipped: 0 };
@@ -43,6 +43,34 @@ describe("rulesForPage", () => {
     expect(rulesForPage(rows, "https://ads.example.com/", "C:\\other.exe")).toEqual([]);
     expect(rulesForPage(rows, "", null)).toEqual([]);
     expect(rulesForPage([{ seq: 1 } as never, null as never], "https://a.example/", null)).toEqual([]);
+  });
+
+  it("finds an IPv6 row's rules from the URL's bracketed host", () => {
+    const v6 = { seq: 1, row: { ...rows[0].row, host: "2001:db8::1", rule: "||[2001:db8::1]^", list: "user" } };
+    expect(rulesForPage([v6], "https://[2001:db8::1]/", null)).toEqual([{ rule: "||[2001:db8::1]^", list: "user" }]);
+  });
+});
+
+describe("reportUrl: the URL a report starts from", () => {
+  it("is the row's own URL, else the host's root", () => {
+    expect(reportUrl({ url: "https://a.example/x?y=1", kind: "tls", host: "a.example" })).toBe("https://a.example/x?y=1");
+    expect(reportUrl({ url: null, kind: "tls", host: "a.example" })).toBe("https://a.example/");
+    expect(reportUrl({ url: null, kind: "dns", host: "a.example" })).toBeNull();
+  });
+
+  it.each([
+    ["an IPv4 host-level row", { url: null, kind: "tls", host: "198.51.100.25" }],
+    ["an IPv6 host-level row", { url: null, kind: "quic", host: "2001:db8::1" }],
+    ["an HTTP row by IP", { url: null, kind: "http", host: "198.51.100.25" }],
+    ["a request to an IPv4 URL", { url: "http://198.51.100.25:8080/admin", kind: "http", host: "198.51.100.25" }],
+    ["a request to an IPv6 URL", { url: "https://[2001:db8::1]/a", kind: "tls", host: "2001:db8::1" }],
+    ["a request to a numeric IPv4 URL", { url: "http://3325256729/", kind: "http", host: "3325256729" }],
+  ])("holds no address for %s: the field starts empty", (_, row) => {
+    expect(reportUrl(row)).toBeNull();
+  });
+
+  it("keeps a name that only looks numeric in part", () => {
+    expect(reportUrl({ url: null, kind: "tls", host: "1.2.3.example" })).toBe("https://1.2.3.example/");
   });
 });
 

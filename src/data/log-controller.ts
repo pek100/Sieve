@@ -47,11 +47,13 @@ export function createLogController({ engine, store, clock }: LogControllerDeps)
       const tail = await engine.logTail(get().cursor);
       if (disposed) return;
       const log = get();
-      const changed = tail.rows.length > 0 || tail.skipped > 0 || tail.dropped > 0 || tail.next !== log.cursor || log.error !== null;
+      // Seqs only rise, so the cursor does too: a rewind would read the whole ring again as duplicates.
+      const cursor = Math.max(log.cursor, tail.next);
+      const changed = tail.rows.length > 0 || tail.skipped > 0 || tail.dropped > 0 || cursor !== log.cursor || log.error !== null;
       if (changed) {
         set({
           rows: tail.rows.length > 0 ? appendRows(log.rows, tail.rows) : log.rows,
-          cursor: tail.next,
+          cursor,
           dropped: log.dropped + tail.dropped,
           skipped: log.skipped + tail.skipped,
           error: null,

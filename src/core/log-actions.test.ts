@@ -41,6 +41,13 @@ describe("the rules and the lines", () => {
     expect(blockRule("a.example")).toBe("||a.example^");
   });
 
+  it("an IPv6 host goes in a rule in brackets, and bare in the exclusions: each the form its parser reads", () => {
+    expect(unblockRule("2001:db8::1")).toBe("@@||[2001:db8::1]^");
+    expect(blockRule("2001:db8::1")).toBe("||[2001:db8::1]^");
+    expect(blockRule("198.51.100.25")).toBe("||198.51.100.25^");
+    expect(previewOf("do_not_decrypt", "2001:db8::1").line).toBe("2001:db8::1");
+  });
+
   it("addLine dedupes and keeps order; removeLine takes it out", () => {
     expect(addLine(["a"], "b")).toEqual(["a", "b"]);
     expect(addLine(["a", "b"], "a")).toEqual(["a", "b"]);
@@ -51,6 +58,9 @@ describe("the rules and the lines", () => {
     expect(previewOf("unblock", "a.example")).toMatchObject({ key: "filtering.userRules", line: "@@||a.example^" });
     expect(previewOf("block", "a.example")).toMatchObject({ key: "filtering.userRules", line: "||a.example^" });
     expect(previewOf("do_not_decrypt", "a.example")).toMatchObject({ key: "filtering.exclusions", line: "a.example" });
-    for (const a of ["unblock", "block", "do_not_decrypt"] as const) expect(previewOf(a, "a.example").added).toMatch(/^Added /);
+    for (const a of ["unblock", "block", "do_not_decrypt"] as const) {
+      expect(previewOf(a, "a.example").added).toMatch(/^Added /);
+      expect(previewOf(a, "a.example").already).toMatch(/ is already in /);
+    }
   });
 });

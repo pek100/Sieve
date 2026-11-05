@@ -1,9 +1,10 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import { engineDetail, engineLists, engineRoutes, engineStatus } from "@/core/engine";
+import { engineDetail, engineLists, engineRoutes } from "@/core/engine";
 import { addLine, previewOf, removeLine, type LogAction, type LinePreview, type PreviewAction } from "@/core/log-actions";
 import { rowUrl, visibleRows, type LogFilter } from "@/core/log";
+import { reportUrl } from "@/core/report";
 import type { LogEntry, LogRow } from "@/data/protocol";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useEngine, useLog, useLogActions } from "@/hooks/use-sieve";
@@ -35,7 +36,6 @@ export function useLogView() {
     matched,
     routes: engineRoutes(e),
     engineDetail: engineDetail(e),
-    answered: engineStatus(e) !== null,
     clearFilters: () => {
       setFilter("all");
       setQuery("");
@@ -60,14 +60,15 @@ export function useRowActions() {
         case "copy_url": {
           const url = rowUrl(row);
           if (url === null) return;
-          void Promise.resolve(navigator.clipboard?.writeText(url)).then(
+          // In an async function, a missing clipboard is a refusal like any other.
+          void (async () => navigator.clipboard.writeText(url))().then(
             () => notices.push({ kind: "success", text: "URL copied" }),
             () => notices.push({ kind: "error", text: "Could not copy. Select the URL in the details and copy it by hand." }),
           );
           return;
         }
         case "report":
-          setReport({ url: row.url ?? rowUrl(row), exe: row.exe });
+          setReport({ url: reportUrl(row), exe: row.exe });
           return;
         default:
           setPreview(previewOf(action as PreviewAction, row.host));
@@ -76,12 +77,21 @@ export function useRowActions() {
     [notices],
   );
 
-  /** Writes what the preview showed, then says so with an Undo. */
+  /**
+   * Writes what the preview showed, then says so with an Undo. A line already
+   * there is not this action's to undo, so that says so and offers none.
+   */
   const confirm = useCallback(async () => {
     if (!preview) return;
-    const { key, line, added } = preview;
+    const { key, line, added, already } = preview;
     setPreview(null);
-    await settings.set(key, addLine(settings.get(key), line));
+    const before = settings.get(key);
+    const after = addLine(before, line);
+    if (after === before) {
+      notices.push({ kind: "info", text: already });
+      return;
+    }
+    await settings.set(key, after);
     notices.push({
       kind: "success",
       text: added,

@@ -4,7 +4,7 @@ import { createStore } from "@/core/store";
 import fixture from "./fixtures/engine-probe-v2.json";
 import { createLogController } from "./log-controller";
 import type { Clock } from "./poller";
-import { LOG_TAIL_VERSION, parseEngineProbe, type LogEntry, type LogTail } from "./protocol";
+import { LOG_TAIL_VERSION, parseEngineProbe, parseLogTail, type LogEntry, type LogTail } from "./protocol";
 import logFixture from "./fixtures/engine-log-v1.json";
 
 const settle = async () => {
@@ -133,6 +133,18 @@ describe("the log controller", () => {
     expect(t.log()).toMatchObject({ rows: [], cursor: 3, dropped: 0, skipped: 0 });
     await t.fc.advance(LOG_POLL_MS);
     expect(t.asked).toEqual([0, 3]);
+    t.undo();
+  });
+
+  it("a malformed answer cannot rewind the cursor, so the ring is not read again", async () => {
+    const t = setup();
+    t.queue.push(t.tail(1, 3), parseLogTail({ v: LOG_TAIL_VERSION, rows: [] }), parseLogTail({ v: LOG_TAIL_VERSION, next: 1, rows: [] }));
+    await t.fc.advance(LOG_POLL_MS);
+    const before = t.emits();
+    await t.fc.advance(LOG_POLL_MS * 3);
+    expect(t.asked).toEqual([0, 3, 3, 3]);
+    expect(t.log().cursor).toBe(3);
+    expect(t.emits()).toBe(before);
     t.undo();
   });
 

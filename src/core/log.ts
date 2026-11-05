@@ -114,6 +114,9 @@ export function outcomeWords(outcome: LogOutcome | null | undefined): string {
   }
 }
 
+/** A row's host as a URL or a filter rule writes it: an IPv6 address (`LogRow.host` has it bare) takes brackets. */
+export const urlFormHost = (host: string) => (host.includes(":") ? `[${host}]` : host);
+
 /**
  * The URL a row stands for: its own, else the host's root by what the flow
  * spoke. Null when the flow is not a web request (DNS, or a protocol not
@@ -122,8 +125,8 @@ export function outcomeWords(outcome: LogOutcome | null | undefined): string {
 export function rowUrl(row: Pick<LogRow, "url" | "kind" | "host">): string | null {
   if (row.url) return row.url;
   if (!row.host) return null;
-  if (row.kind === "tls" || row.kind === "quic") return `https://${row.host}/`;
-  return row.kind === "http" ? `http://${row.host}/` : null;
+  if (row.kind === "tls" || row.kind === "quic") return `https://${urlFormHost(row.host)}/`;
+  return row.kind === "http" ? `http://${urlFormHost(row.host)}/` : null;
 }
 
 /** The path and query of a request-level row, for its column; null on a host-level row. */

@@ -4,7 +4,7 @@
  * engine has it in force is the engine's to say, so nothing here claims it.
  */
 import type { LogRow } from "@/data/protocol";
-import { rowUrl } from "./log";
+import { rowUrl, urlFormHost } from "./log";
 import type { SettingKey } from "./settings/registry";
 
 export const LOG_ACTIONS = ["copy_url", "unblock", "block", "do_not_decrypt", "report"] as const;
@@ -32,9 +32,9 @@ export function rowActions(row: Pick<LogRow, "url" | "kind" | "host" | "outcome"
 }
 
 /** A user rule that lets this host through. */
-export const unblockRule = (host: string) => `@@||${host}^`;
+export const unblockRule = (host: string) => `@@||${urlFormHost(host)}^`;
 /** A user rule that blocks this host. */
-export const blockRule = (host: string) => `||${host}^`;
+export const blockRule = (host: string) => `||${urlFormHost(host)}^`;
 
 /** The list with `line` at its end, once. */
 export function addLine(list: readonly string[], line: string): readonly string[] {
@@ -57,7 +57,11 @@ export interface LinePreview {
   body: string;
   /** Said after it is written: that it was added, not that it is in force. */
   added: string;
+  /** Said instead when the line was there before: nothing is written. */
+  already: string;
 }
+
+const inRules = (line: string) => ({ added: `Added ${line} to your rules.`, already: `${line} is already in your rules.` });
 
 /** What an action would write for a host, before anything is written. */
 export function previewOf(action: PreviewAction, host: string): LinePreview {
@@ -70,7 +74,7 @@ export function previewOf(action: PreviewAction, host: string): LinePreview {
         line,
         title: `Unblock ${host}`,
         body: "This exception rule goes in your rules. It lets this host and its subdomains through.",
-        added: `Added ${line} to your rules.`,
+        ...inRules(line),
       };
     }
     case "block": {
@@ -81,7 +85,7 @@ export function previewOf(action: PreviewAction, host: string): LinePreview {
         line,
         title: `Block ${host}`,
         body: "This rule goes in your rules. It blocks this host and its subdomains.",
-        added: `Added ${line} to your rules.`,
+        ...inRules(line),
       };
     }
     case "do_not_decrypt":
@@ -92,6 +96,7 @@ export function previewOf(action: PreviewAction, host: string): LinePreview {
         title: `Do not decrypt ${host}`,
         body: "This goes in the sites Sieve leaves encrypted, with its subdomains.",
         added: `Added ${host} to the sites not decrypted.`,
+        already: `${host} is already in the sites not decrypted.`,
       };
   }
 }
