@@ -58,6 +58,18 @@ sha2.workspace = true
 ipstack = "1.0.1"
 socket2 = "0.6"
 
+# Encrypted DNS upstreams (plan 1.4) and the one TLS owner (plan 2.7, `tls`):
+# rustls on aws-lc-rs, X25519MLKEM768 preferred. hyper speaks DoH over HTTP/2,
+# quinn speaks DoQ. webpki-roots is the resolver trust store (never the Windows
+# verifier, whose network fetches would wait on this engine's own DNS).
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "prefer-post-quantum"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+webpki-roots = "1"
+
 # Windows calls. The library reads the owner-pid tables, process images and
 # session ids, the adapter and forwarding tables and AdGuard's service state,
 # serves the pipe (Pipes, Security_Authorization for its DACL), watches route
@@ -92,5 +104,8 @@ windows-service = "0.8.1"
 proptest.workspace = true
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+# Loopback resolvers for the encrypted DNS tests (`dns::testing`).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+hyper = { version = "1", features = ["server"] }
 # Benchmark only: craft packets for ipstack (same version ipstack uses).
 etherparse = "0.20"
