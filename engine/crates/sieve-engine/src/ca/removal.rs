@@ -10,6 +10,7 @@ use std::path::Path;
 use super::key::KeyStore;
 use super::state::{self, CaState, Retiring};
 use super::trust::{FIREFOX_POLICY_ON, FirefoxPolicy, RootStore};
+use crate::service::state::LAST_ERROR_FILE;
 
 /// The service start argument: delete the recorded keys and stop.
 pub const PURGE_ARG: &str = "purge-ca-keys";
@@ -91,13 +92,24 @@ pub fn remaining(dir: &Path) -> Option<String> {
 }
 
 /// `ca keys`: asks the service to purge when anything is recorded, then reads
-/// the outcome from `ca.json`.
+/// the outcome from `ca.json` and, when something remains, the service's reason
+/// from `last-error.txt`. This step is the reason's last reader: `program data`
+/// deletes the file. It is cleared first, so what it says after is this purge's.
 pub fn purge_through_service(dir: &Path, purge: impl FnOnce() -> Result<(), String>) -> Result<String, String> {
     if remaining(dir).is_none() {
         return Ok("no key recorded".into());
     }
+    let reason = dir.join(LAST_ERROR_FILE);
+    match std::fs::remove_file(&reason) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("{}: {e}", reason.display())),
+        _ => {}
+    }
     purge()?;
-    remaining(dir).map_or_else(|| Ok("keys deleted".into()), Err)
+    let Some(left) = remaining(dir) else { return Ok("keys deleted".into()) };
+    Err(match std::fs::read_to_string(&reason) {
+        Ok(why) => format!("{left}: {why}"),
+        Err(_) => left,
+    })
 }
 
 /// `delete service`: runs `delete` once [`remaining`] is clear. Until then the
@@ -297,8 +309,8 @@ mod tests {
     }
 
     /// The machine as uninstall's steps see it. The service purges as the real
-    /// one does: a failed purge still stops cleanly and leaves its outcome in
-    /// `ca.json` alone.
+    /// one does: a failed purge still stops cleanly, its outcome in `ca.json`
+    /// and its reason in `last-error.txt`.
     struct Machine {
         root: tempfile::TempDir,
         store: FakeRootStore,
@@ -347,7 +359,9 @@ mod tests {
                     return Err("the service is not installed".into());
                 }
                 self.service_start.borrow().clone()?;
-                let _ = purge_keys(&engine, &self.keys);
+                if let Err(why) = purge_keys(&engine, &self.keys) {
+                    std::fs::write(engine.join(LAST_ERROR_FILE), why).unwrap();
+                }
                 Ok(())
             });
             let delete = delete_service_once_clear(
@@ -396,6 +410,54 @@ mod tests {
         machine.keys.faults.clear();
         assert!(machine.uninstall().iter().all(Result::is_ok));
         machine.assert_finished();
+    }
+
+    /// `program data` deletes `last-error.txt` later in the same run, so the
+    /// `ca keys` step has to carry the reason, on the rerun as well.
+    #[test]
+    fn a_failed_key_delete_reports_why_on_every_run() {
+        let machine = Machine::new();
+        machine.keys.faults.fail_named.lock().unwrap().insert("key delete");
+        for _ in 0..2 {
+            let [_, keys, _, data] = machine.uninstall();
+            let why = keys.unwrap_err();
+            assert!(why.contains("not removed") && why.contains("key delete: refused"), "{why}");
+            assert!(data.is_err());
+            assert!(!machine.engine().join(LAST_ERROR_FILE).exists(), "only ca.json stays");
+        }
+    }
+
+    /// The folder check stops the service before any purge; the file is all
+    /// that says why.
+    #[test]
+    fn a_purge_the_service_refused_reports_why() {
+        let dir = tempfile::tempdir().unwrap();
+        recorded(dir.path());
+        let why = purge_through_service(dir.path(), || {
+            std::fs::write(dir.path().join(LAST_ERROR_FILE), "users can change the folder").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(why.contains("not removed") && why.contains("users can change the folder"), "{why}");
+    }
+
+    /// A reason left by an earlier stop must not pass as this purge's.
+    #[test]
+    fn a_reason_from_before_the_purge_is_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        recorded(dir.path());
+        std::fs::write(dir.path().join(LAST_ERROR_FILE), "the watchdog stopped the engine").unwrap();
+        let why = purge_through_service(dir.path(), || Ok(())).unwrap_err();
+        assert!(why.contains("not removed") && !why.contains("watchdog"), "{why}");
+    }
+
+    #[test]
+    fn a_reason_that_cannot_be_cleared_stops_the_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        recorded(dir.path());
+        std::fs::create_dir(dir.path().join(LAST_ERROR_FILE)).unwrap();
+        let why = purge_through_service(dir.path(), || panic!("must not purge")).unwrap_err();
+        assert!(why.contains(LAST_ERROR_FILE), "{why}");
     }
 
     #[test]

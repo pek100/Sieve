@@ -76,8 +76,8 @@ fn real_ca(dir: &std::path::Path) -> Result<Arc<Ca>, crate::ca::CaError> {
     Ca::new(dir.to_path_buf(), machine, seams).map(Arc::new)
 }
 
-/// `uninstall`'s key step. Its outcome is in `ca.json`, which the verb reads
-/// back, and a failure's reason in `last-error.txt`.
+/// `uninstall`'s key step. The verb reads back its outcome from `ca.json` and a
+/// failure's reason from `last-error.txt`.
 fn purge_ca_keys() {
     let purged = state::program_data().and_then(|pd| purge_keys(&state::engine_dir(&pd), &CngKeyStore));
     if let Err(why) = purged {
@@ -140,11 +140,9 @@ fn service_main(args: Vec<OsString>) {
 /// it is best effort: the exit code already tells the SCM it failed.
 fn record_failure(why: &str) {
     if let Ok(pd) = state::program_data() {
-        let _ = std::fs::write(state::engine_dir(&pd).join(LAST_ERROR_FILE), why);
+        let _ = std::fs::write(state::engine_dir(&pd).join(state::LAST_ERROR_FILE), why);
     }
 }
-
-const LAST_ERROR_FILE: &str = "last-error.txt";
 
 /// The watchdog's trip: routes first (named and journalled), the reason on
 /// disk, then the process ends with [`EXIT_WATCHDOG`] (the SCM restarts it).

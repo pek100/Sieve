@@ -208,7 +208,8 @@ fn trust() -> Result<String, String> {
 }
 
 /// The keys: their DACL is SYSTEM only, so the service deletes them, started
-/// once with [`removal::PURGE_ARG`]. It writes the outcome to `ca.json`.
+/// once with [`removal::PURGE_ARG`]. It writes the outcome to `ca.json` and a
+/// failure's reason to `last-error.txt`.
 fn ca_keys() -> Result<String, String> {
     let dir = state::engine_dir(&state::program_data()?);
     removal::purge_through_service(&dir, || {
