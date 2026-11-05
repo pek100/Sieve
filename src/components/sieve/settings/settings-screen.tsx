@@ -9,9 +9,10 @@ import { GridRegion, LayoutGrid } from "@/components/sieve/shell/layout-grid";
 import { Page } from "@/components/sieve/shell/page";
 import { Button } from "@/components/ui/button";
 import { DNS_SWITCH } from "@/core/dns";
-import { ENGINE_ANCHOR } from "@/core/engine";
+import { CERTIFICATE_ANCHOR, ENGINE_ANCHOR } from "@/core/engine";
 import { isAvailable, settingDef, type Section } from "@/core/settings/registry";
 import { cn } from "@/lib/utils";
+import { CertificateGroup } from "./certificate-group";
 import { DNS_CARD_KEYS, DnsCard } from "./dns-card";
 import { EngineCard } from "./engine-card";
 import { SettingRow } from "./setting-row";
@@ -34,7 +35,8 @@ const BLOCK_SECTIONS: ReadonlySet<Section> = new Set([FILTERING_SECTION]);
  * export, import and reset. The section that owns the DNS switch also
  * carries the DNS filter card (status, counters, list, upstreams, the safety
  * notice) while that switch is available, and the engine (EngineCard, read
- * only, anchor ENGINE_ANCHOR); a key the DNS card edits itself
+ * only, anchor ENGINE_ANCHOR) with the root certificate under it
+ * (CertificateGroup, anchor CERTIFICATE_ANCHOR); a key the DNS card edits itself
  * (DNS_CARD_KEYS) has no row of its own, so each setting has one owner on
  * the screen.
  */
@@ -103,6 +105,9 @@ export function SettingsScreen() {
                       {dnsCard && <DnsCard lockOf={view.lockOf} />}
                       <div id={ENGINE_ANCHOR} className="scroll-mt-[4rem]">
                         <EngineCard />
+                      </div>
+                      <div id={CERTIFICATE_ANCHOR} className="scroll-mt-[4rem]">
+                        <CertificateGroup />
                       </div>
                     </div>
                   )}

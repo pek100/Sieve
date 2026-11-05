@@ -12,7 +12,7 @@ import type { AppIcon, History, Snapshot } from "./protocol";
 import { createTauriSource } from "./tauri-source";
 import { createMockDns, DNS_SCENARIOS, type DnsScenario } from "./dns-mock";
 import { createTauriDns, type DnsSource } from "./dns-source";
-import { createMockEngine, ENGINE_SCENARIOS, type EngineScenario } from "./engine-mock";
+import { CERT_SCENARIOS, createMockEngine, ENGINE_SCENARIOS, type CertScenario, type EngineScenario } from "./engine-mock";
 import { createTauriEngine, type EngineSource } from "./engine-source";
 
 export type { SourceKind };
@@ -51,6 +51,8 @@ export interface SourceOptions {
   icons: boolean;
   /** Mock engine scenario (?engine=missing|stopped|idle|..., default missing). */
   engine: EngineScenario;
+  /** Mock certificate scenario (?cert=installed|expires_soon|not_installed|policy_off|error, default not_installed). */
+  cert: CertScenario;
 }
 
 /** Read the source choice from the environment: query string and Tauri presence. */
@@ -66,7 +68,9 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   const dns = (DNS_SCENARIOS as readonly string[]).includes(d ?? "") ? (d as DnsScenario) : "off";
   const e = q.get("engine");
   const engine = (ENGINE_SCENARIOS as readonly string[]).includes(e ?? "") ? (e as EngineScenario) : "missing";
-  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1", pointed: q.get("pointed") === "1", icons: q.get("icons") === "1", engine };
+  const c = q.get("cert");
+  const cert = (CERT_SCENARIOS as readonly string[]).includes(c ?? "") ? (c as CertScenario) : "not_installed";
+  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1", pointed: q.get("pointed") === "1", icons: q.get("icons") === "1", engine, cert };
 }
 
 /**
@@ -85,7 +89,7 @@ export function createDnsSource(o: SourceOptions): DnsSource {
 
 /** The engine seam follows the same choice: the Tauri command, or the mock. */
 export function createEngineSource(o: SourceOptions): EngineSource {
-  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine);
+  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine, o.cert);
 }
 
 export function isTauriWindow(): boolean {

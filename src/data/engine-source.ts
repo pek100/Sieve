@@ -11,7 +11,7 @@
  * AdGuard's service through one command Windows asks the user to approve.
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { parseEngineProbe, parseEngineStatus, type EnginePolicy, type EngineProbe, type EngineStatus } from "./protocol";
+import { parseCertStatus, parseEngineProbe, parseEngineStatus, type CertStatus, type EnginePolicy, type EngineProbe, type EngineStatus } from "./protocol";
 
 export interface EngineSource {
   readonly kind: "mock" | "tauri";
@@ -23,6 +23,10 @@ export interface EngineSource {
   stopAdguard(): Promise<void>;
   /** Starts AdGuard's service again (Windows asks the user first). */
   startAdguard(): Promise<void>;
+  /** The root certificate's facts. Rejects when the engine did not answer. */
+  certStatus(): Promise<CertStatus>;
+  /** The user's Reinstall: a new root and key. Rejects while `https` is off in the engine. */
+  installRoot(): Promise<CertStatus>;
 }
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -34,5 +38,7 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     setPolicy: async (policy) => parseEngineStatus(await invoke<unknown>("engine_set_policy", { policy })),
     stopAdguard: async () => void (await invoke<unknown>("adguard_stop")),
     startAdguard: async () => void (await invoke<unknown>("adguard_start")),
+    certStatus: async () => parseCertStatus(await invoke<unknown>("engine_cert_status")),
+    installRoot: async () => parseCertStatus(await invoke<unknown>("engine_install_root")),
   };
 }

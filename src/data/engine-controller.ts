@@ -6,12 +6,16 @@
  * or assumed state. Time comes from the injected clock.
  *
  * What it changes, and only these:
- * - the engine's policy follows the user's switch `filtering.engine`
- *   (ENGINE_SWITCH): whenever the engine answers with a different value, the
- *   switch is sent with the next revision (`setPolicy`). The switch defaults
- *   off, so the engine routes nothing until the user turns it on. Nothing is
- *   sent while the engine cannot take a policy (`engineTakesPolicy`); the
- *   stored value then waits untouched;
+ * - the engine's policy follows the user's switches `filtering.engine`
+ *   (ENGINE_SWITCH) and `filtering.https` (HTTPS_SWITCH): whenever the engine
+ *   answers with a different value, both are sent with the next revision
+ *   (`setPolicy`). The switches default off, so the engine routes nothing and
+ *   holds no certificate until the user turns them on. Nothing is sent while
+ *   the engine cannot take a policy (`engineTakesPolicy`); the stored value
+ *   then waits untouched;
+ * - the root certificate, only when the user asks (`installRoot`). Its facts
+ *   are read after each probe while the engine can answer, and cleared when
+ *   it cannot;
  * - AdGuard's service, stopped or started only when the user clicks the
  *   pause offer (`stopAdguard`, `startAdguard`; Windows asks the user first).
  *
@@ -20,7 +24,7 @@
  * banner, dismissed when it is over.
  */
 import type { PassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, engineStatus, enginePhase, engineTakesPolicy, type EngineSlice } from "@/core/engine";
+import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineStatus, enginePhase, engineTakesPolicy, type EngineSlice } from "@/core/engine";
 import type { NoticeBus } from "@/core/notices";
 import type { SettingKey } from "@/core/settings/registry";
 import type { SieveStore } from "@/core/store";
@@ -35,6 +39,8 @@ export interface EngineController {
   stopAdguard(): Promise<void>;
   /** Start AdGuard's service again (Windows asks the user), then probe. */
   startAdguard(): Promise<void>;
+  /** The user's Reinstall: a new root and key, then probe. */
+  installRoot(): Promise<void>;
 }
 
 export interface EngineControllerDeps {
@@ -51,6 +57,7 @@ export const CRASH_LOOP_BANNER =
   "Sieve's engine stopped routing after repeated failures. Your network works as usual. Details in Settings > Filtering.";
 
 const SWITCH = ENGINE_SWITCH as SettingKey;
+const HTTPS = HTTPS_SWITCH as SettingKey;
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 export function createEngineController({ engine, store, clock, settings, checks, notices }: EngineControllerDeps): EngineController {
@@ -89,10 +96,11 @@ export function createEngineController({ engine, store, clock, settings, checks,
     const status = engineStatus(e);
     if (disposed || !settingsReady || policyInFlight || !engineTakesPolicy(e) || status === null) return;
     const want = Boolean(settings.get(SWITCH));
-    if (status.policy.engine === want) return;
+    const wantHttps = Boolean(settings.get(HTTPS));
+    if (status.policy.engine === want && status.policy.https === wantHttps) return;
     policyInFlight = true;
     try {
-      const next = await engine.setPolicy({ revision: status.policy.revision + 1, engine: want });
+      const next = await engine.setPolicy({ revision: status.policy.revision + 1, engine: want, https: wantHttps });
       const probe = get().probe;
       if (probe?.pipe?.kind === "welcome") set({ probe: { ...probe, pipe: { ...probe.pipe, status: next } }, actionError: null });
     } catch (e) {
@@ -116,6 +124,30 @@ export function createEngineController({ engine, store, clock, settings, checks,
     await probeNow();
   };
 
+  // One read per probe, only while the engine can answer (the same fact as a
+  // policy). A failed read clears the facts: nothing shows from a stale state.
+  const readCert = async () => {
+    if (!engineTakesPolicy(get())) {
+      if (get().cert || get().certError) set({ cert: null, certError: null });
+      return;
+    }
+    try {
+      set({ cert: await engine.certStatus(), certError: null });
+    } catch (e) {
+      set({ cert: null, certError: message(e) });
+    }
+  };
+
+  const installRoot = async () => {
+    set({ certActionError: null });
+    try {
+      set({ cert: await engine.installRoot() });
+    } catch (e) {
+      set({ certActionError: `The certificate was not reinstalled: ${message(e)}` });
+    }
+    await probeNow();
+  };
+
   return {
     bind() {
       disposed = false;
@@ -128,7 +160,9 @@ export function createEngineController({ engine, store, clock, settings, checks,
         } catch (e) {
           set({ probe: null, error: message(e) });
         }
-        if (!disposed) follow();
+        if (disposed) return;
+        follow();
+        await readCert();
       };
       probeNow = probe;
 
@@ -160,5 +194,6 @@ export function createEngineController({ engine, store, clock, settings, checks,
     },
     stopAdguard: () => adguard("stopping", () => engine.stopAdguard()),
     startAdguard: () => adguard("starting", () => engine.startAdguard()),
+    installRoot,
   };
 }

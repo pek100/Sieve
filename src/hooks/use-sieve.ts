@@ -83,11 +83,15 @@ export function useEngine(): EngineSlice {
   return useSieve(selectEngine);
 }
 
-/** The engine's user actions: the AdGuard pause offer and its undo (through the engine controller). */
-export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdguard: () => Promise<void> } {
+/** The engine's user actions: the AdGuard pause offer and its undo, the certificate's Reinstall (through the engine controller). */
+export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdguard: () => Promise<void>; installRoot: () => Promise<void> } {
   const { engineController } = useRuntime();
   return useMemo(
-    () => ({ stopAdguard: () => engineController.stopAdguard(), startAdguard: () => engineController.startAdguard() }),
+    () => ({
+      stopAdguard: () => engineController.stopAdguard(),
+      startAdguard: () => engineController.startAdguard(),
+      installRoot: () => engineController.installRoot(),
+    }),
     [engineController],
   );
 }

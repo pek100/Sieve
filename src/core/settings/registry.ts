@@ -113,6 +113,8 @@ export type SettingDef =
 
 /** The plan step that replaces the app-hosted DNS filter (law: the plan names every key unavailable until it). */
 const ENGINE_SLICE_4 = "engine slice 4 (docs/plans/2026-10-17-https-filtering.md)";
+/** The plan step that brings interception, without which the HTTPS switch means nothing. */
+const ENGINE_SLICE_6 = "engine slice 6 (docs/plans/2026-10-17-https-filtering.md)";
 
 const enumSetting = <const O extends string>(d: Omit<EnumSetting<O>, "kind">): EnumSetting<O> => ({
   kind: "enum",
@@ -205,6 +207,21 @@ export const REGISTRY = {
     default: false,
     liveCheck: "live_engine_full_route_relays_and_restores",
     needsEngine: true,
+  } satisfies DataSwitchSetting,
+  // The root certificate (docs/plans/2026-10-17-https-filtering.md, slice 5).
+  // Hidden until interception exists: it "cannot be on without slice 6". The
+  // app therefore sends off, and the live check drives it with the app closed
+  // (docs/live/engine-slice-5.md). Settings' Certificate group turns it off.
+  "filtering.https": {
+    kind: "dataSwitch",
+    section: "filtering",
+    label: "Decrypt HTTPS traffic",
+    help: "Installs Sieve's own certificate on this computer so the engine can filter inside HTTPS. Off: the certificate is removed from Windows and Firefox.",
+    default: false,
+    liveCheck: "live_https_intercepts_public_and_passes_floor",
+    requires: "filtering.engine",
+    needsEngine: true,
+    unavailableUntil: ENGINE_SLICE_6,
   } satisfies DataSwitchSetting,
   // Edited only by the DNS filter's card, so unavailable with it.
   "filtering.upstreams": {

@@ -367,12 +367,13 @@ export function parseWindowsDns(raw: unknown): WindowsDns {
  * `src/data/fixtures/engine-probe-v2.json`): the filtering engine from
  * facts. `service` is the Windows service's state ("missing" when not
  * installed); `pipe` is the engine's own answer, asked only while the service
- * runs. `status` is the engine's `sieve-ipc` Status (protocol 2, fixture
+ * runs. `status` is the engine's `sieve-ipc` Status (protocol 3, fixture
  * `engine-ipc-v2.json`). v2: the status carries the policy, the blocker, the
  * split tunnels and the engine's counters; the probe also reads AdGuard's
- * service state (`adguard`), for the pause offer.
+ * service state (`adguard`), for the pause offer. v3: the policy carries
+ * `https` (the status is otherwise unchanged).
  */
-export const ENGINE_PROBE_VERSION = 2 as const;
+export const ENGINE_PROBE_VERSION = 3 as const;
 export const SERVICE_FACTS = ["missing", "stopped", "starting", "stopping", "running", "other"] as const;
 export type ServiceFact = (typeof SERVICE_FACTS)[number];
 export const PIPE_KINDS = ["welcome", "incompatible", "refused", "unreachable"] as const;
@@ -388,6 +389,37 @@ export type EngineBlocker =
 export interface EnginePolicy {
   revision: number;
   engine: boolean;
+  /** `filtering.https`: hold a root certificate. Off removes it. */
+  https: boolean;
+}
+
+/** `sieve-ipc` CertState and FirefoxTrust wire names, in declaration order. */
+export const CERT_STATES = ["not_installed", "installed", "expires_soon"] as const;
+export type CertState = (typeof CERT_STATES)[number];
+export const FIREFOX_TRUST = ["not_installed", "uses_windows", "not_using_windows"] as const;
+export type FirefoxTrust = (typeof FIREFOX_TRUST)[number];
+
+/** The `cert_status` message (`sieve-ipc` CertStatus, plan 8.1): facts the engine holds; `null` is a fact it does not have. */
+export interface CertStatus {
+  state: CertState;
+  valid_until_ms: number | null;
+  thumbprint: string | null;
+  firefox: FirefoxTrust;
+  last_rotation_ms: number | null;
+  last_error: string | null;
+}
+
+/** Validate an untrusted `cert_status` answer, the one normalizer of this shape. Throws ProtocolError. */
+export function parseCertStatus(raw: unknown): CertStatus {
+  const c = rec(raw, "cert status");
+  return {
+    state: oneOf(c.state, CERT_STATES, "cert.state"),
+    valid_until_ms: intOrNull(c.valid_until_ms, "cert.valid_until_ms"),
+    thumbprint: strOrNull(c.thumbprint, "cert.thumbprint"),
+    firefox: oneOf(c.firefox, FIREFOX_TRUST, "cert.firefox"),
+    last_rotation_ms: intOrNull(c.last_rotation_ms, "cert.last_rotation_ms"),
+    last_error: strOrNull(c.last_error, "cert.last_error"),
+  };
 }
 
 export interface EngineCounters {
@@ -430,7 +462,7 @@ function blocker(raw: unknown): EngineBlocker {
   }
 }
 
-/** Validate an untrusted engine Status (sieve-ipc v2). Throws ProtocolError. */
+/** Validate an untrusted engine Status (sieve-ipc v3). Throws ProtocolError. */
 export function parseEngineStatus(raw: unknown): EngineStatus {
   const s = rec(raw, "status");
   const p = rec(s.policy, "status.policy");
@@ -441,7 +473,7 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
     flows: int(s.flows, "status.flows"),
     decrypting: bool(s.decrypting, "status.decrypting"),
     last_error: strOrNull(s.last_error, "status.last_error"),
-    policy: { revision: int(p.revision, "policy.revision"), engine: bool(p.engine, "policy.engine") },
+    policy: { revision: int(p.revision, "policy.revision"), engine: bool(p.engine, "policy.engine"), https: bool(p.https, "policy.https") },
     blocker: s.blocker === null ? null : blocker(s.blocker),
     split_tunnels: strings(s.split_tunnels, "status.split_tunnels"),
     counters: Object.fromEntries(COUNTER_KEYS.map((k) => [k, int(c[k], `counters.${k}`)])) as unknown as EngineCounters,

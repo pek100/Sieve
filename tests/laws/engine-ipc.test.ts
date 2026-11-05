@@ -1,14 +1,14 @@
 /**
  * Law 9, engine IPC: the app and the engine speak one pipe protocol, owned by
  * the Rust crate `engine/crates/sieve-ipc`. Its fixture
- * `src/data/fixtures/engine-ipc-v1.json` is read by the Rust tests
+ * `src/data/fixtures/engine-ipc-v2.json` is read by the Rust tests
  * (`cargo test -p sieve-ipc`: every message round trips) and here: the
  * version, the limits and every message type name agree with the crate.
  * Changing a message shape bumps PROTOCOL and the fixture in one commit.
  */
 import { describe, expect, it } from "vitest";
 import fixture from "@/data/fixtures/engine-ipc-v2.json";
-import { BLOCKER_KINDS, parseEngineStatus } from "@/data/protocol";
+import { BLOCKER_KINDS, CERT_STATES, FIREFOX_TRUST, parseCertStatus, parseEngineStatus } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -33,7 +33,7 @@ describe("engine IPC law", () => {
     expect(fixture.flowsPerFrame).toBe(Number(rustConst("FLOWS_PER_FRAME")));
   });
 
-  it("the app reads the engine's v2 status and every blocker kind the crate declares", () => {
+  it("the app reads the engine's v3 status and every blocker kind the crate declares", () => {
     const status = fixture.engine.find((m) => m.type === "status")!;
     const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
     expect(parseEngineStatus(body)).toEqual(body);
@@ -42,6 +42,19 @@ describe("engine IPC law", () => {
     expect(snake).toEqual([...BLOCKER_KINDS]);
     expect(fixture.blockers.map((b) => b.kind)).toEqual([...BLOCKER_KINDS]);
     for (const b of fixture.blockers) expect(parseEngineStatus({ ...body, blocker: b }).blocker).toEqual(b);
+  });
+
+  it("the app reads every certificate status, and its enums are the crate's", () => {
+    const message = fixture.engine.find((m) => m.type === "cert_status")!;
+    const body = Object.fromEntries(Object.entries(message).filter(([k]) => k !== "type"));
+    expect(parseCertStatus(body)).toEqual(body);
+    for (const example of Object.values(fixture.certStatuses)) expect(parseCertStatus(example)).toEqual(example);
+    const variants = (name: string) =>
+      ((RUST.match(new RegExp(`pub enum ${name} \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? "").match(/^\s{4}([A-Z]\w+),/gm) ?? []).map((v) =>
+        v.trim().replace(",", "").replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()),
+      );
+    expect(variants("CertState")).toEqual([...CERT_STATES]);
+    expect(variants("FirefoxTrust")).toEqual([...FIREFOX_TRUST]);
   });
 
   it("fixture names every message type of the crate, in order", () => {

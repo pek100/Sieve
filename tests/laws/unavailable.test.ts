@@ -11,6 +11,7 @@
 import { describe, expect, it } from "vitest";
 import { createPassedChecks } from "@/core/checks";
 import { DNS_SWITCH, UPSTREAMS_KEY } from "@/core/dns";
+import { HTTPS_SWITCH } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
 import { EMPTY_DOC, knownValues, normalizeDoc, readValue, writeValue } from "@/core/settings/document";
 import { migrate, offUnavailableSwitches } from "@/core/settings/migrate";
@@ -38,8 +39,8 @@ const settle = async () => {
 const still: Clock = { now: () => 1_760_000_000_000, setTimeout: () => 0, clearTimeout: () => {} };
 
 describe("unavailable settings law", () => {
-  it("the DNS filter's switch and the keys only its card edits are unavailable, together", () => {
-    expect(unavailable).toEqual([DNS_SWITCH, UPSTREAMS_KEY]);
+  it("the DNS filter's switch and the keys only its card edits are unavailable, together; and the HTTPS switch until interception exists", () => {
+    expect(unavailable).toEqual([DNS_SWITCH, HTTPS_SWITCH, UPSTREAMS_KEY]);
   });
 
   it("every unavailable key names a plan step whose plan exists and names the key", () => {

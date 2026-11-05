@@ -4,7 +4,7 @@
  * settings are declared nowhere else.
  */
 import { describe, expect, it } from "vitest";
-import { ENGINE_SWITCH } from "@/core/engine";
+import { ENGINE_SWITCH, HTTPS_SWITCH } from "@/core/engine";
 import { normalizeDoc, readValue } from "@/core/settings/document";
 import { REGISTRY, SECTIONS, SETTING_KEYS, isValidValue, needsEngine, settingDef, type SettingDef } from "@/core/settings/registry";
 import { hits, read, walk } from "./files";
@@ -34,8 +34,8 @@ describe("registry law", () => {
     for (const [key, def] of defs) if (def.requires) expect(isDataSwitch(def.requires), key).toBe(true);
   });
 
-  it("the engine's switch is the one needsEngine setting: the controller sends exactly it (SetPolicy carries one switch)", () => {
-    expect(defs.filter(([k]) => needsEngine(k)).map(([k]) => k)).toEqual([ENGINE_SWITCH]);
+  it("the needsEngine settings are the two switches SetPolicy carries: the controller sends exactly them", () => {
+    expect(defs.filter(([k]) => needsEngine(k)).map(([k]) => k)).toEqual([ENGINE_SWITCH, HTTPS_SWITCH]);
   });
 
   it("every default is a valid value for its own entry", () => {

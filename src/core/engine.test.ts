@@ -84,7 +84,7 @@ describe("engine phase", () => {
   });
 
   it("a running service with no pipe answer is not running, and an error wins over old facts", () => {
-    const running: EngineSlice = { probe: { v: 2, service: "running", adguard: "missing", pipe: null }, error: null };
+    const running: EngineSlice = { probe: { v: 3, service: "running", adguard: "missing", pipe: null }, error: null };
     expect(enginePhase(running)).toBe("not_running");
     expect(enginePhase({ ...facts("idle"), error: "x" })).toBe("unreadable");
   });
