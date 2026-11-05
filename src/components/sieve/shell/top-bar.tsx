@@ -1,7 +1,8 @@
 "use client";
 
-import { Activity, AppWindow, List, Settings } from "lucide-react";
+import { Activity, AppWindow, Filter, List, Settings } from "lucide-react";
 import { usePathname } from "next/navigation";
+import { LockButton } from "@/components/sieve/lock/lock-button";
 import { SegmentedNav } from "@/components/sieve/primitives/segmented";
 import { activeRoute, ROUTES, type RouteDef } from "@/core/routes";
 import { MasterSwitch } from "./master-switch";
@@ -14,6 +15,7 @@ const ICONS: Record<RouteDef["icon"], typeof Activity> = {
   "app-window": AppWindow,
   list: List,
   settings: Settings,
+  filter: Filter,
 };
 
 /**
@@ -46,6 +48,7 @@ export function TopBar() {
         <SegmentedNav items={items} active={active?.href} label="Main" />
         <div data-tauri-drag-region className="flex min-w-0 items-center justify-end gap-2 max-[640px]:gap-1">
           <MasterSwitch />
+          <LockButton />
           <ThemeMenu />
           <WindowControls />
         </div>

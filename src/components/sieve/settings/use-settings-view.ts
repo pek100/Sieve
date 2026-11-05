@@ -2,16 +2,20 @@
 
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { engineInForce, engineLockReason } from "@/core/engine";
+import { isShut, type LockPhase } from "@/core/lock";
 import { ROUTES, type RouteDef } from "@/core/routes";
 import { readValue, type SettingsDoc } from "@/core/settings/document";
 import { REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, needsEngine, settingDef, type Section, type SettingKey } from "@/core/settings/registry";
 import { planImport, resetPlan, searchSettings, type ImportPlan } from "@/core/settings/transfer";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useHydrated } from "@/hooks/use-hydrated";
+import { useLock } from "@/hooks/use-lock";
 import { useCheckPassed, useEngine, useSwitchOn } from "@/hooks/use-sieve";
 
 /** Why a setting cannot be changed here and now. */
 export type Lock =
+  /** The settings password holds (`locked`, or `unreadable`: then nothing opens it). Checked first. */
+  | { kind: "password"; phase: LockPhase }
   | { kind: "desktop" }
   /** `checking`: the switch it needs is on but its live check has not passed (yet). */
   | { kind: "requires"; label: string; checking: boolean }
@@ -37,8 +41,9 @@ export interface SettingsView {
 /**
  * Everything the Settings view reads and writes, derived from the registry:
  * which rows exist (available keys only: searchSettings), how each is locked,
- * search, import, reset. Writes go through the settings store; whole-document
- * changes say what they did in a toast with Undo (notice bus).
+ * search, import, reset. Every write goes through the lock's write gate
+ * (`guard`) and then the settings store; whole-document changes say what they
+ * did in a toast with Undo (notice bus).
  *
  * `blocks`: sections that carry blocks of their own under their rows (the
  * Engine). With no search such a section is listed even when none of its
@@ -51,6 +56,9 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
   const switchOn = useSwitchOn();
   const passed = useCheckPassed();
   const engine = useEngine();
+  const { state: lockState, lock } = useLock();
+  const { guard } = lock;
+  const lockPhase = lockState.phase;
 
   const sections = useMemo(() => {
     const hits = new Set(searchSettings(query));
@@ -66,6 +74,7 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
   const lockOf = useCallback(
     (key: SettingKey): Lock | null => {
       const d = settingDef(key);
+      if (isShut(lockPhase)) return { kind: "password", phase: lockPhase };
       if (d.desktopOnly && !(hydrated && isTauri)) return { kind: "desktop" };
       if (needsEngine(key)) {
         const reason = engineLockReason(engine);
@@ -81,16 +90,18 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
       }
       return null;
     },
-    [passed, hydrated, isTauri, switchOn, engine],
+    [passed, hydrated, isTauri, switchOn, engine, lockPhase],
   );
 
   const apply = useCallback(
     (next: SettingsDoc, said: string) => {
-      const before = settings.doc();
-      void settings.replace(next);
-      notices.push({ kind: "success", text: said, action: { label: "Undo", run: () => void settings.replace(before) } });
+      void guard(() => {
+        const before = settings.doc();
+        void settings.replace(next);
+        notices.push({ kind: "success", text: said, action: { label: "Undo", run: () => void guard(() => settings.replace(before)) } });
+      });
     },
-    [settings, notices],
+    [settings, notices, guard],
   );
 
   return {
@@ -98,17 +109,21 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
     sections,
     lockOf,
     set: (key, value) => {
-      // The control offered only valid values; a locked row offers none.
-      if (lockOf(key) !== null) return;
-      void settings.set(key, value as never);
+      // The control offered only valid values; a locked row offers none. A
+      // password is the gate's to ask for, so the write waits for it.
+      const held = lockOf(key);
+      if (held !== null && held.kind !== "password") return;
+      void guard(() => settings.set(key, value as never));
     },
     reset: (key) => {
-      const before = readValue(settings.doc(), key);
-      void settings.reset(key);
-      notices.push({
-        kind: "info",
-        text: `${settingDef(key).label} is back to its default`,
-        action: { label: "Undo", run: () => void settings.set(key, before as never) },
+      void guard(() => {
+        const before = readValue(settings.doc(), key);
+        void settings.reset(key);
+        notices.push({
+          kind: "info",
+          text: `${settingDef(key).label} is back to its default`,
+          action: { label: "Undo", run: () => void guard(() => settings.set(key, before as never)) },
+        });
       });
     },
     planImport: (text) => planImport(settings.doc(), text),

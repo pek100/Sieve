@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { PasswordBlock } from "@/components/sieve/lock/password-block";
 import { SearchField } from "@/components/sieve/primitives/search-field";
 import { StateLayer } from "@/components/sieve/primitives/state-layer";
 import { Card } from "@/components/sieve/shell/card";
@@ -22,6 +23,8 @@ import { useSettingsView } from "./use-settings-view";
 const FILTERING_SECTION = settingDef(DNS_SWITCH).section;
 /** Sections with blocks of their own, listed even when none of their keys is available. */
 const BLOCK_SECTIONS: ReadonlySet<Section> = new Set([FILTERING_SECTION]);
+/** The section whose rows the password block sits under. */
+const PASSWORD_SECTION = settingDef("password.idleMinutes").section;
 
 /**
  * Settings (plan rows 68 to 70 and 6): every row is rendered from the
@@ -95,6 +98,7 @@ export function SettingsScreen() {
                             onReset={view.reset}
                           />
                         ))}
+                        {s.id === PASSWORD_SECTION && <PasswordBlock />}
                       </div>
                     </Card>
                   )}

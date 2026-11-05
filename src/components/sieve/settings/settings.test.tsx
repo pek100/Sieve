@@ -108,6 +108,7 @@ describe("settings view (rendered from the registry)", () => {
       setTray: async () => {},
       onTrayAction: async () => () => {},
       autostart: { isEnabled: async () => autostart.at(-1) ?? false, set: async (on) => void autostart.push(on) },
+      notifications: null,
     };
     const rt = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(), isTauri: true, desktop });
     render(

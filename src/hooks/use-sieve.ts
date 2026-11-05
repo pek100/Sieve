@@ -25,10 +25,11 @@ export function useSieve<T>(selector: (s: SieveState) => T): T {
 
 /** One setting's value and its setter. */
 export function useSetting<K extends SettingKey>(key: K): [SettingValue<K>, (v: SettingValue<K>) => Promise<void>] {
-  const { settings } = useRuntime();
+  const { settings, lockController } = useRuntime();
   const get = useCallback(() => settings.get(key), [settings, key]);
   const value = useSyncExternalStore(settings.subscribe, get, get);
-  const set = useCallback((v: SettingValue<K>) => settings.set(key, v), [settings, key]);
+  // The write gate: while a password holds, the write waits for it or is dropped.
+  const set = useCallback((v: SettingValue<K>) => lockController.guard(() => settings.set(key, v)), [settings, lockController, key]);
   return [value, set];
 }
 
@@ -85,10 +86,13 @@ export function useEngine(): EngineSlice {
 
 /** The engine's user actions: the AdGuard pause offer and its undo (through the engine controller). */
 export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdguard: () => Promise<void> } {
-  const { engineController } = useRuntime();
+  const { engineController, lockController } = useRuntime();
   return useMemo(
-    () => ({ stopAdguard: () => engineController.stopAdguard(), startAdguard: () => engineController.startAdguard() }),
-    [engineController],
+    () => ({
+      stopAdguard: () => lockController.guard(() => engineController.stopAdguard()),
+      startAdguard: () => lockController.guard(() => engineController.startAdguard()),
+    }),
+    [engineController, lockController],
   );
 }
 
