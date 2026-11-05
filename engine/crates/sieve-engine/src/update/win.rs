@@ -2,6 +2,7 @@
 //! worker thread. Compiled, never run by a test: their proof is the user's
 //! (docs/live/updates.md). This is the only product code that starts a process.
 
+use std::cell::Cell;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -130,6 +131,7 @@ pub fn start_worker(control: &Arc<UpdateControl>, engine_dir: &Path, exe: &Path)
         engine_dir: engine_dir.to_path_buf(),
         install_dir,
         own: OWN_RELEASE,
+        supervisor_wait_from_ms: Cell::default(),
     };
     control.set_status(updater.initial_status());
     let (tx, rx) = mpsc::channel();

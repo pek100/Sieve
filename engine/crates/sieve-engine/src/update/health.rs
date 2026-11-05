@@ -59,7 +59,7 @@ mod tests {
     use tokio::sync::watch;
 
     fn pending() -> Pending {
-        Pending { kind: "engine".into(), from_version: 1, to_version: 2, staged: "s".into(), aside: vec![] }
+        Pending { kind: "engine".into(), from_version: 1, to_version: 2, staged: "s".into(), aside: vec![], rolling_back: false }
     }
 
     /// Live, on a real pipe with the engine's own DACL shape: the test binary is

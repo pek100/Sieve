@@ -9,6 +9,7 @@
 //! Every refusal leaves both trees as they were: staged files go, and nothing is
 //! recorded, the accepted index version included, until a cycle had no refusal.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -17,12 +18,14 @@ use std::time::Duration;
 use sieve_ipc::UpdateStatus;
 
 use super::fetch::{FetchError, Fetcher};
+use super::finish::HEALTH_DEADLINE_MS;
 use super::index::{Entry, INDEX_FILE, Index, MAX_INDEX_BYTES, SIGNATURE_SUFFIX, parse_index, require_listed};
 use super::state::{self, Log, Pending, Record, installed};
 use super::swap::{self, DATA_DIR, DATA_STAGING_DIR, RealFs, STAGING_DIR};
 use super::trust::{TrustAnchor, display_version};
 use super::verify::{MAX_SIGNATURE_BYTES, require_newer, verify_artefact};
 use super::{Kind, Refusal};
+use crate::service::STOP_WAIT;
 
 /// At most one asked-for check in this long; over that the answer is an error.
 pub const REQUEST_COOLDOWN_MS: u64 = 5 * 60 * 1_000;
@@ -33,10 +36,14 @@ pub const CHECK_EVERY_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const FAILED_RETRY_MS: u64 = 60 * 60 * 1_000;
 /// How often an `applying` state is compared with the pending file.
 const SETTLE_POLL_MS: u64 = 30_000;
+/// A supervisor stops this service and watches the new engine within this long.
+/// An engine still running with the release unresolved after it has no supervisor.
+const SUPERVISOR_WAIT_MS: u64 = STOP_WAIT.as_secs() * 1_000 + HEALTH_DEADLINE_MS;
 
 pub const COOLDOWN_MESSAGE: &str = "an update check ran moments ago; try again in a few minutes";
 pub const NOT_RUNNING_MESSAGE: &str = "the updater is not running";
 pub const UNFINISHED_MESSAGE: &str = "the update did not finish; the current version keeps running";
+pub const ROLLBACK_UNFINISHED_MESSAGE: &str = "the update failed and the previous version could not be restored yet; Sieve keeps trying";
 
 /// A worker's job; the pipe only ever queues one of these.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +189,8 @@ pub struct Updater {
     pub engine_dir: PathBuf,
     pub install_dir: PathBuf,
     pub own: u64,
+    /// When `settle` started this wait for a supervisor (monotonic).
+    pub supervisor_wait_from_ms: Cell<Option<u64>>,
 }
 
 impl Updater {
@@ -210,6 +219,7 @@ impl Updater {
     fn cycle(&self, job: Job, now_unix: u64) -> UpdateStatus {
         let Some(anchor) = &self.anchor else { return UpdateStatus::NotConfigured };
         match state::load_pending(&self.engine_dir) {
+            Ok(Some(p)) if p.rolling_back => return UpdateStatus::Failed { message: ROLLBACK_UNFINISHED_MESSAGE.to_string() },
             Ok(Some(p)) => return UpdateStatus::Applying { version: display_version(p.to_version) },
             Ok(None) => self.clear_leftovers(),
             Err(message) => return UpdateStatus::Failed { message },
@@ -225,12 +235,82 @@ impl Updater {
         })
     }
 
-    /// An `applying` state whose pending file is gone, with this process still
-    /// the service: the supervisor gave up before it stopped anything.
-    pub fn settle(&self) {
+    /// Compares what the status says with the release actually in flight. An
+    /// `applying` state ends here when the supervisor gave up (the pending file is
+    /// gone) or never took over; an unfinished rollback is carried on.
+    pub fn settle(&self, now_ms: u64) {
         let waiting = matches!(self.control.status(), UpdateStatus::Applying { .. });
-        if waiting && matches!(state::load_pending(&self.engine_dir), Ok(None)) {
-            self.control.set_status(UpdateStatus::Failed { message: UNFINISHED_MESSAGE.to_string() });
+        match state::load_pending(&self.engine_dir) {
+            Ok(None) => {
+                self.supervisor_wait_from_ms.set(None);
+                if waiting {
+                    self.control.set_status(UpdateStatus::Failed { message: UNFINISHED_MESSAGE.to_string() });
+                }
+            }
+            Ok(Some(p)) if p.rolling_back => self.carry_on_rollback(&p, now_ms),
+            Ok(Some(p)) if waiting && self.supervisor_wait_over(now_ms) => self.supervisor_never_finished(p),
+            Ok(Some(_)) => {}
+            Err(message) if waiting => self.control.set_status(UpdateStatus::Failed { message }),
+            Err(_) => {}
+        }
+    }
+
+    /// True once per [`SUPERVISOR_WAIT_MS`] of the same release in flight.
+    fn supervisor_wait_over(&self, now_ms: u64) -> bool {
+        let from = self.supervisor_wait_from_ms.get().unwrap_or(now_ms);
+        let over = now_ms.saturating_sub(from) >= SUPERVISOR_WAIT_MS;
+        self.supervisor_wait_from_ms.set(Some(if over { now_ms } else { from }));
+        over
+    }
+
+    /// The old build still runs, so nothing was stopped and no file changed: the
+    /// release ends here. The new build runs unwatched and unproven, which is a
+    /// health timeout with no one to act on it: it becomes a rollback.
+    fn supervisor_never_finished(&self, pending: Pending) {
+        self.log.line(&format!("{} {}: no supervisor took over", pending.kind, pending.to_version));
+        if self.own != pending.from_version {
+            if let Err(why) = state::save_pending(&self.engine_dir, &Pending { rolling_back: true, ..pending }) {
+                self.log.line(&why);
+            }
+            return;
+        }
+        self.supervisor_wait_from_ms.set(None);
+        let message = state::clear_pending(&self.engine_dir).err().unwrap_or_else(|| UNFINISHED_MESSAGE.to_string());
+        self.control.set_status(UpdateStatus::Failed { message });
+    }
+
+    /// The old build restores the rest in place. Any other build needs to be
+    /// replaced while stopped, which takes a supervisor, one per wait.
+    fn carry_on_rollback(&self, pending: &Pending, now_ms: u64) {
+        if self.own != pending.from_version {
+            self.rollback_unfinished("a failed release is still the running one");
+            if self.supervisor_wait_over(now_ms)
+                && let Err(why) = self.starter.start(&self.install_dir)
+            {
+                self.log.line(&why);
+            }
+            return;
+        }
+        let restored = Kind::parse(&pending.kind)
+            .ok_or_else(|| format!("not a release: {}", pending.kind))
+            .and_then(|kind| swap::rollback(&RealFs, &self.install_dir, &kind, &pending.aside));
+        if let Err(why) = restored {
+            return self.rollback_unfinished(&why);
+        }
+        self.supervisor_wait_from_ms.set(None);
+        let status = match state::record_rollback(&self.engine_dir, pending) {
+            Ok(()) => UpdateStatus::RolledBack { version: display_version(pending.to_version) },
+            Err(message) => UpdateStatus::Failed { message },
+        };
+        self.control.set_status(status);
+    }
+
+    /// Said once, not on every poll.
+    fn rollback_unfinished(&self, why: &str) {
+        let status = UpdateStatus::Failed { message: ROLLBACK_UNFINISHED_MESSAGE.to_string() };
+        if self.control.status() != status {
+            self.log.line(&format!("rollback unfinished: {why}"));
+            self.control.set_status(status);
         }
     }
 
@@ -340,6 +420,7 @@ impl Updater {
             to_version: entry.version,
             staged: entry.file.clone(),
             aside: swap::release_set(&RealFs, &self.install_dir, &kind)?,
+            rolling_back: false,
         };
         state::save_pending(&self.engine_dir, &pending)?;
         if let Err(why) = self.starter.start(&self.install_dir) {
@@ -382,7 +463,7 @@ pub fn run_worker(updater: &Updater, jobs: &mpsc::Receiver<Job>, monotonic_ms: &
             let failed = updater.run(job, unix_now());
             last = Some((monotonic_ms(), failed));
         }
-        updater.settle();
+        updater.settle(monotonic_ms());
     }
 }
 
@@ -445,6 +526,7 @@ mod tests {
                 engine_dir: engine,
                 install_dir: install,
                 own: OWN,
+                supervisor_wait_from_ms: Cell::default(),
             };
             Self { _dir: dir, key, host, log, starter, updater }
         }
@@ -509,6 +591,14 @@ mod tests {
     /// Applying what a check of the usual catalogue showed.
     fn apply_next() -> Job {
         Job::Apply { shown: "0.2.0".into() }
+    }
+
+    fn engine_release() -> Pending {
+        Pending { kind: "engine".into(), from_version: OWN, to_version: NEXT, staged: "new.exe".into(), aside: vec![ENGINE_EXE.into()], rolling_back: false }
+    }
+
+    fn unfinished_rollback() -> UpdateStatus {
+        UpdateStatus::Failed { message: ROLLBACK_UNFINISHED_MESSAGE.to_string() }
     }
 
     /// Every way the host can serve bad bytes, each from a world holding a
@@ -764,7 +854,7 @@ mod tests {
     #[test]
     fn a_commit_that_lost_to_a_rollback_is_still_shown_as_rolled_back() {
         let w = World::new();
-        let p = Pending { kind: "engine".into(), from_version: OWN, to_version: NEXT, staged: "new.exe".into(), aside: vec![ENGINE_EXE.into()] };
+        let p = engine_release();
         state::save_pending(w.engine_dir(), &p).unwrap();
         state::commit_healthy(w.engine_dir(), &p).unwrap();
         state::save_pending(w.engine_dir(), &p).unwrap();
@@ -865,11 +955,99 @@ mod tests {
         let calls = w.host.call_count();
         assert_eq!(w.run(Job::Check), UpdateStatus::Applying { version: "0.2.0".into() });
         assert_eq!(w.host.call_count(), calls);
-        w.updater.settle();
+        w.updater.settle(0);
         assert_eq!(w.updater.control.status(), UpdateStatus::Applying { version: "0.2.0".into() });
         state::clear_pending(w.engine_dir()).unwrap();
-        w.updater.settle();
+        w.updater.settle(1);
         assert_eq!(w.updater.control.status(), UpdateStatus::Failed { message: UNFINISHED_MESSAGE.to_string() });
+    }
+
+    /// The supervisor died before it stopped this service: the pending file stays
+    /// and this process runs on. The wait ends, and updates work again.
+    #[test]
+    fn a_supervisor_that_never_takes_over_ends_the_wait() {
+        const START: u64 = 5_000;
+        let w = World::new();
+        w.publish(7, &[(Kind::Engine, NEXT, "new.exe", NEW_BYTES)]);
+        w.run(apply_next());
+        w.updater.settle(START);
+        w.updater.settle(START + SUPERVISOR_WAIT_MS - 1);
+        assert_eq!(w.updater.control.status(), UpdateStatus::Applying { version: "0.2.0".into() }, "a slow stop still has time");
+        assert!(state::load_pending(w.engine_dir()).unwrap().is_some());
+
+        w.updater.settle(START + SUPERVISOR_WAIT_MS);
+        assert_eq!(w.updater.control.status(), UpdateStatus::Failed { message: UNFINISHED_MESSAGE.to_string() });
+        assert_eq!(state::load_pending(w.engine_dir()).unwrap(), None);
+
+        let (tx, rx) = mpsc::channel();
+        w.updater.control.attach(tx);
+        w.updater.control.request(0).unwrap();
+        assert_eq!(rx.try_recv(), Ok(Job::Check), "a request queues work again");
+        assert_eq!(w.run(Job::Check), UpdateStatus::Available { version: "0.2.0".into() });
+        assert!(!w.install_dir().join(STAGING_DIR).exists());
+    }
+
+    /// The new build is running with nobody watching: past the wait the release is
+    /// not dropped, which would keep it unproven, but rolled back.
+    #[test]
+    fn a_new_build_left_unwatched_turns_the_release_into_a_rollback() {
+        let mut w = World::new();
+        w.updater.own = NEXT;
+        state::save_pending(w.engine_dir(), &engine_release()).unwrap();
+        w.updater.control.set_status(UpdateStatus::Applying { version: "0.2.0".into() });
+        w.updater.settle(0);
+        w.updater.settle(SUPERVISOR_WAIT_MS);
+        assert_eq!(state::load_pending(w.engine_dir()).unwrap(), Some(Pending { rolling_back: true, ..engine_release() }));
+        assert_eq!(w.starter.calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// The old engine is back but a later file of an app release was locked. The
+    /// next check must not take its `.old` for a leftover.
+    #[test]
+    fn the_old_build_finishes_a_rollback_in_place_and_only_then_the_old_files_go() {
+        let w = World::new();
+        let aside = vec![ENGINE_EXE.to_string(), "sieve.exe".to_string()];
+        state::save_pending(w.engine_dir(), &Pending { kind: "app".into(), aside, rolling_back: true, ..engine_release() }).unwrap();
+        std::fs::write(w.install_dir().join("sieve.exe"), b"new app").unwrap();
+        std::fs::write(w.install_dir().join("sieve.exe.old"), b"old app").unwrap();
+        w.publish(7, &[]);
+
+        let calls = w.host.call_count();
+        assert_eq!(w.run(Job::Check), unfinished_rollback());
+        assert_eq!(w.host.call_count(), calls, "nothing is fetched");
+        assert_eq!(std::fs::read(w.install_dir().join("sieve.exe.old")).unwrap(), b"old app");
+
+        w.updater.settle(0);
+        assert_eq!(w.updater.control.status(), UpdateStatus::RolledBack { version: "0.2.0".into() });
+        assert_eq!(std::fs::read(w.install_dir().join("sieve.exe")).unwrap(), b"old app");
+        assert_eq!(std::fs::read(w.install_dir().join(ENGINE_EXE)).unwrap(), b"engine", "already restored, left alone");
+        assert_eq!(state::load_pending(w.engine_dir()).unwrap(), None);
+        assert_eq!(w.record().rolled_back["app"], NEXT);
+        assert_eq!(w.starter.calls.load(Ordering::Relaxed), 0, "no restart");
+
+        assert_eq!(w.run(Job::Check), UpdateStatus::RolledBack { version: "0.2.0".into() });
+        assert!(!w.install_dir().join("sieve.exe.failed").exists(), "now they are leftovers");
+    }
+
+    /// The failed build itself is running: a supervisor replaces it, spaced out.
+    #[test]
+    fn a_running_failed_build_hands_the_rollback_to_a_supervisor_one_per_wait() {
+        let mut w = World::new();
+        w.updater.own = NEXT;
+        let marked = Pending { rolling_back: true, ..engine_release() };
+        state::save_pending(w.engine_dir(), &marked).unwrap();
+        std::fs::write(w.install_dir().join("sieve-engine.exe.old"), b"old").unwrap();
+        for at in [0, 1, SUPERVISOR_WAIT_MS - 1] {
+            w.updater.settle(at);
+            assert_eq!(w.starter.calls.load(Ordering::Relaxed), 0, "{at}");
+        }
+        assert_eq!(w.updater.control.status(), unfinished_rollback());
+        w.updater.settle(SUPERVISOR_WAIT_MS);
+        w.updater.settle(SUPERVISOR_WAIT_MS + 1);
+        assert_eq!(w.starter.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(state::load_pending(w.engine_dir()).unwrap(), Some(marked), "the supervisor ends it, not this");
+        assert_eq!(std::fs::read(w.install_dir().join("sieve-engine.exe.old")).unwrap(), b"old");
+        assert_eq!(w.log.0.lock().unwrap().iter().filter(|l| l.contains("rollback unfinished")).count(), 1);
     }
 
     #[test]

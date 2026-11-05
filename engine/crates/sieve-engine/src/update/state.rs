@@ -44,6 +44,10 @@ pub struct Pending {
     pub staged: String,
     /// The install folder's files this release replaces, as listed before it.
     pub aside: Vec<String>,
+    /// The supervisor gave its verdict: this release failed. Set before any file
+    /// moves back, so `.old` stays and the set is restored whoever runs next.
+    #[serde(default)]
+    pub rolling_back: bool,
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, String> {
@@ -101,10 +105,15 @@ pub enum Recovery {
     NotSwapped,
     /// This build is neither: a mislabelled release. Never raised.
     Mislabelled,
+    /// A rollback did not finish: whichever build this is, the release stays in
+    /// flight and the updater's `settle` carries it on.
+    FinishRollback,
 }
 
 pub fn recover(pending: &Pending, own: u64) -> Recovery {
-    if own == pending.to_version {
+    if pending.rolling_back {
+        Recovery::FinishRollback
+    } else if own == pending.to_version {
         Recovery::Probe
     } else if own == pending.from_version {
         Recovery::NotSwapped
@@ -130,6 +139,9 @@ pub fn on_service_start(dir: &Path, own: u64, log: &dyn Log) -> Option<Pending> 
         return Some(pending);
     }
     log.line(&format!("{} {} in flight, this build is {own}: {recovery:?}", pending.kind, pending.to_version));
+    if recovery == Recovery::FinishRollback {
+        return None;
+    }
     if let Err(why) = clear_pending(dir) {
         log.line(&why);
     }
@@ -138,7 +150,8 @@ pub fn on_service_start(dir: &Path, own: u64, log: &dyn Log) -> Option<Pending> 
 
 /// The new engine answered its own pipe: the record rises, then the pending
 /// file goes. The supervisor reads both, in that order. With the release no
-/// longer in flight the supervisor has already decided, and nothing rises.
+/// longer in flight, or marked as rolling back, the supervisor has already
+/// decided, and nothing rises.
 pub fn commit_healthy(dir: &Path, pending: &Pending) -> Result<(), String> {
     if load_pending(dir)?.as_ref() != Some(pending) {
         return Ok(());
@@ -231,7 +244,48 @@ pub(crate) mod tests {
     }
 
     fn pending(from: u64, to: u64) -> Pending {
-        Pending { kind: "engine".into(), from_version: from, to_version: to, staged: "s.exe".into(), aside: vec!["sieve-engine.exe".into()] }
+        Pending {
+            kind: "engine".into(),
+            from_version: from,
+            to_version: to,
+            staged: "s.exe".into(),
+            aside: vec!["sieve-engine.exe".into()],
+            rolling_back: false,
+        }
+    }
+
+    /// Whichever build starts, an unfinished rollback stays in flight, so the
+    /// next check cannot delete the `.old` files it still needs.
+    #[test]
+    fn a_start_during_an_unfinished_rollback_keeps_it_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = MemLog::default();
+        let p = Pending { rolling_back: true, ..pending(1, 2) };
+        save_pending(dir.path(), &p).unwrap();
+        for own in [1, 2, 3] {
+            assert_eq!(recover(&p, own), Recovery::FinishRollback, "{own}");
+            assert_eq!(on_service_start(dir.path(), own, &log), None, "{own}: no probe");
+            assert_eq!(load_pending(dir.path()).unwrap().as_ref(), Some(&p), "{own}");
+        }
+    }
+
+    /// The new engine holds the record as it was read at its start.
+    #[test]
+    fn a_report_after_the_verdict_raises_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let read_at_start = pending(1, 2);
+        save_pending(dir.path(), &Pending { rolling_back: true, ..read_at_start.clone() }).unwrap();
+        commit_healthy(dir.path(), &read_at_start).unwrap();
+        assert!(!is_committed(dir.path(), &read_at_start).unwrap());
+        assert!(load_pending(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pending_record_from_before_the_rolling_back_field_reads_as_not_rolling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{"kind":"engine","from_version":1,"to_version":2,"staged":"s.exe","aside":["sieve-engine.exe"]}"#;
+        std::fs::write(dir.path().join(PENDING_FILE), old).unwrap();
+        assert_eq!(load_pending(dir.path()).unwrap(), Some(pending(1, 2)));
     }
 
     #[test]

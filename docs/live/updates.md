@@ -82,5 +82,6 @@ Sign a test release with your offline key, request it from the app, watch it app
 ## Known limits, stated plainly
 
 - Power loss during a swap with a broken new engine: after that boot no supervisor exists, so nothing rolls back. The service manager restarts twice and stops, the network stays normal, and you reinstall.
+- A rollback blocked by a locked file (usually an antivirus scan) keeps every `.old` file and retries, and the app says the previous version could not be restored yet. If the new engine cannot start and the file is still locked after an hour, retries stop until an engine runs: the network stays normal, and you reinstall.
 - A health report followed by a crash seconds later is not rolled back. The existing crash-loop stop handles it, fail open.
 - `.old` files left by a reboot in the middle go at the next update check, about ten minutes after the service starts.

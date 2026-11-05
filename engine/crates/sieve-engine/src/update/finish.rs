@@ -8,6 +8,8 @@
 //! crash loop), sets the current files aside, swaps or runs the installer,
 //! starts the service, and waits for the new engine's report ([`super::health`]).
 //! Healthy: `.old` goes. Anything else: rollback, version record unchanged.
+//! A rollback that cannot finish keeps every `.old` and the release in flight,
+//! marked, so the next process to run carries it on (`Updater::settle`).
 //! Filtering fails open throughout: the routes go with the stopped service.
 
 use std::path::{Path, PathBuf};
@@ -22,6 +24,10 @@ const HEALTH_POLL_MS: u64 = 500;
 /// A rollback that hits a locked file gets this many tries, this far apart.
 const ROLLBACK_TRIES: u32 = 3;
 const ROLLBACK_RETRY_MS: u64 = 2_000;
+/// With no engine that starts, this process is the only one left to finish the
+/// rollback: it keeps at it this long, this far apart, then leaves it marked.
+const ROLLBACK_PATIENCE_MS: u64 = 60 * 60 * 1_000;
+const ROLLBACK_PATIENCE_POLL_MS: u64 = 30_000;
 
 pub trait ServiceControl {
     fn stop(&self) -> Result<(), String>;
@@ -80,6 +86,9 @@ impl Supervisor<'_> {
             return Ok(Outcome::NothingPending);
         };
         let kind = Kind::parse(&pending.kind).filter(Kind::is_release).ok_or_else(|| format!("not a release: {}", pending.kind))?;
+        if pending.rolling_back {
+            return self.roll_back(&kind, &pending, "an earlier rollback did not finish");
+        }
         if let Err(why) = self.service.stop() {
             return self.give_up(format!("the service would not stop: {why}"));
         }
@@ -154,11 +163,33 @@ impl Supervisor<'_> {
         Ok(Some(if raised { Health::Healthy } else { Health::Refused }))
     }
 
+    /// The verdict is written first: from there on the `.old` files are the only
+    /// copy of the set that works, and no process may treat them as leftovers. The
+    /// pending file may already be gone when the new engine reported in time.
     fn roll_back(&self, kind: &Kind, pending: &Pending, why: &str) -> Result<Outcome, String> {
         self.log.line(&format!("rolling back {} {}: {why}", pending.kind, pending.to_version));
+        let verdict = Pending { rolling_back: true, ..pending.clone() };
+        if let Err(e) = state::save_pending(&self.engine_dir, &verdict) {
+            self.log.line(&format!("recording the rollback: {e}"));
+        }
         if let Err(e) = self.service.stop() {
             self.log.line(&format!("stopping the failed version: {e}"));
         }
+        let deadline = self.clock.now_ms() + ROLLBACK_PATIENCE_MS;
+        loop {
+            let Err(locked) = self.restore(kind, &verdict) else {
+                return self.finish_rollback(&verdict);
+            };
+            self.log.line(&format!("the old version is not back yet: {locked}"));
+            // A running engine carries the rollback on; with none, only this process can.
+            if self.service.start().is_ok() || self.clock.now_ms() >= deadline {
+                return Err(format!("the rollback did not finish, the old files stay: {locked}"));
+            }
+            self.clock.sleep_ms(ROLLBACK_PATIENCE_POLL_MS);
+        }
+    }
+
+    fn restore(&self, kind: &Kind, pending: &Pending) -> Result<(), String> {
         let mut restored = swap::rollback(self.fs, &self.install_dir, kind, &pending.aside);
         for _ in 1..ROLLBACK_TRIES {
             if restored.is_ok() {
@@ -167,13 +198,18 @@ impl Supervisor<'_> {
             self.clock.sleep_ms(ROLLBACK_RETRY_MS);
             restored = swap::rollback(self.fs, &self.install_dir, kind, &pending.aside);
         }
+        restored
+    }
+
+    /// The old set is whole again: only now do the leftovers go and the record say so.
+    fn finish_rollback(&self, pending: &Pending) -> Result<Outcome, String> {
         let recorded = state::record_rollback(&self.engine_dir, pending);
         // A file still in use stays until the next check; this is not a failure.
         let _ = swap::clear_leftovers(self.fs, &self.install_dir);
         if let Err(e) = self.service.start() {
             self.log.line(&format!("starting the restored version: {e}"));
         }
-        restored.and(recorded)?;
+        recorded?;
         Ok(Outcome::RolledBack)
     }
 }
@@ -191,7 +227,7 @@ mod tests {
     use super::super::state::tests::MemLog;
     use super::super::state::{Record, Recovery, installed, load_record, recover};
     use super::super::swap::tests::{FailingFs, NEW_ENGINE, OLD_ENGINE};
-    use super::super::swap::{OLD_SUFFIX, RealFs};
+    use super::super::swap::{FAILED_SUFFIX, OLD_SUFFIX, RealFs};
     use super::super::testing::listing;
     use super::super::trust::release_number;
     use super::*;
@@ -279,6 +315,7 @@ mod tests {
                 match recover(&p, own) {
                     Recovery::Probe => state::commit_healthy(self.engine_dir, &p).unwrap(),
                     Recovery::NotSwapped | Recovery::Mislabelled => state::clear_pending(self.engine_dir).unwrap(),
+                    Recovery::FinishRollback => {}
                 }
             }
             Ok(())
@@ -361,6 +398,7 @@ mod tests {
                 to_version: TO,
                 staged: STAGED.into(),
                 aside: aside.iter().map(ToString::to_string).collect(),
+                rolling_back: false,
             };
             state::save_pending(&engine, &pending).unwrap();
             Self { _dir: dir, engine, install, pending }
@@ -603,6 +641,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Real files, except that this many renames to `.failed` fail first: a file
+    /// held open without delete sharing, as an antivirus scan of a new exe does.
+    struct LockedFs {
+        locked_tries: Cell<u32>,
+    }
+
+    impl LockedFs {
+        const FOREVER: u32 = u32::MAX;
+
+        fn new(locked_tries: u32) -> Self {
+            Self { locked_tries: Cell::new(locked_tries) }
+        }
+    }
+
+    impl Fs for LockedFs {
+        fn copy(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            RealFs.copy(from, to)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            let held = self.locked_tries.get();
+            if held > 0 && to.to_string_lossy().ends_with(FAILED_SUFFIX) {
+                self.locked_tries.set(held - 1);
+                return Err(std::io::Error::other("sharing violation"));
+            }
+            RealFs.rename(from, to)
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            RealFs.remove_file(path)
+        }
+
+        fn exists(&self, path: &Path) -> bool {
+            RealFs.exists(path)
+        }
+
+        fn files(&self, dir: &Path) -> std::io::Result<Vec<String>> {
+            RealFs.files(dir)
+        }
+    }
+
+    /// The only copy of the old set stays, and nothing says it is back.
+    #[test]
+    fn a_rollback_that_stays_locked_keeps_the_old_set_and_the_flight() {
+        let w = World::engine_only();
+        let service = FakeService::new(&w, Engine::ExitsAtStart);
+        let (out, _) = w.run_with(&LockedFs::new(LockedFs::FOREVER), &service, &FakeInstaller::default());
+        assert!(out.as_ref().is_err_and(|why| why.contains("sharing violation")), "{out:?}");
+        assert_eq!(std::fs::read(w.install.join(format!("{ENGINE_EXE}{OLD_SUFFIX}"))).unwrap(), OLD_ENGINE);
+        assert!(state::load_pending(&w.engine).unwrap().is_some_and(|p| p.rolling_back), "still in flight, marked");
+        assert_eq!(w.record().rolled_back.get("engine"), None, "not rolled back yet");
+        assert!(service.starts.get() > 2, "with no engine running it kept trying");
+    }
+
+    /// No engine runs, so the supervisor outlasts a scan far longer than its quick tries.
+    #[test]
+    fn with_no_engine_running_the_supervisor_outlasts_the_lock() {
+        let w = World::engine_only();
+        let service = FakeService::new(&w, Engine::ExitsAtStart);
+        let (out, _) = w.run_with(&LockedFs::new(4 * ROLLBACK_TRIES), &service, &FakeInstaller::default());
+        assert_eq!(out, Ok(Outcome::RolledBack));
+        w.assert_rolled_back();
+    }
+
+    /// An engine that starts ends this supervisor; a later one finishes the job.
+    #[test]
+    fn a_later_supervisor_finishes_a_rollback_left_marked() {
+        let w = World::engine_only();
+        let service = FakeService::new(&w, Engine::Silent);
+        let (out, _) = w.run_with(&LockedFs::new(LockedFs::FOREVER), &service, &FakeInstaller::default());
+        assert!(out.is_err(), "{out:?}");
+        assert_eq!(w.exe(), NEW_ENGINE);
+
+        let starts = service.starts.get();
+        assert_eq!(w.run(&service), Ok(Outcome::RolledBack));
+        w.assert_rolled_back();
+        assert_eq!(service.starts.get(), starts + 1, "it went straight to the rollback");
+    }
+
+    /// The report the verdict beat cannot keep a release the supervisor refused.
+    #[test]
+    fn a_mislabelled_release_that_stays_locked_is_back_in_flight() {
+        let w = World::engine_only();
+        let service = FakeService::new(&w, Engine::Report(WRONG));
+        let (out, _) = w.run_with(&LockedFs::new(LockedFs::FOREVER), &service, &FakeInstaller::default());
+        assert!(out.is_err(), "{out:?}");
+        assert!(state::load_pending(&w.engine).unwrap().is_some_and(|p| p.rolling_back), "the start had cleared it");
+        assert_eq!(std::fs::read(w.install.join(format!("{ENGINE_EXE}{OLD_SUFFIX}"))).unwrap(), OLD_ENGINE);
     }
 
     #[test]
