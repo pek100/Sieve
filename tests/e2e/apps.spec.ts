@@ -36,8 +36,8 @@ test.describe("apps", () => {
     const toggle = row(page, CHROME).getByRole("switch", { name: "Sieve Google Chrome" });
     await expect(toggle).toBeChecked();
     // Off is said once, as the toggle's description and tooltip, and claims no blocking
-    // (nothing is blocked until the engine).
-    await expect(toggle).toHaveAttribute("title", "Off: Sieve stops tracking and charting this app.");
+    // (whether anything is blocked is the engine's fact).
+    await expect(toggle).toHaveAttribute("title", "Off: Sieve stops tracking and charting this app, and its traffic is left alone.");
     await expect(page.getByTestId("sieved-count")).toContainText(/^\d+ being sieved$/);
     await expect(page.getByRole("radio")).toHaveCount(0);
 

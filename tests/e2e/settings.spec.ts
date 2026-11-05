@@ -22,10 +22,11 @@ test.describe("settings", () => {
     const rail = page.getByRole("navigation", { name: "Settings sections" });
     // Filtering stays: it carries the engine.
     await expect(rail.getByRole("link")).toHaveText(["Appearance", "Sampling", "Startup", "Apps", "Filtering"]);
-    // Seven rows: theme, sieving, interval, launch at startup, apps turned off, my apps, and the
-    // engine's switch (slice 3). DNS filtering and its upstream servers are unavailable until the
-    // engine replaces them (2026-10-18). There is no Windows DNS row: Sieve never changes Windows DNS.
-    await expect(page.locator("[data-setting]")).toHaveCount(7);
+    // Nine rows: theme, sieving, interval, launch at startup, apps turned off, my apps, the
+    // engine's switch (slice 3), and the blocked and allowed domains (slice 4). DNS filtering and its
+    // upstream servers are unavailable until the engine replaces them (2026-10-18). There is no
+    // Windows DNS row: Sieve never changes Windows DNS.
+    await expect(page.locator("[data-setting]")).toHaveCount(9);
     await expect(row(page, "filtering.engine").getByRole("switch")).not.toBeChecked();
     await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(0);
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
