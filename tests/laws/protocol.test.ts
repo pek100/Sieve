@@ -162,7 +162,7 @@ describe("protocol law", () => {
   it("engine status: a broken guest list degrades to the good rows; a missing counter is refused", () => {
     const status = engineFixture.examples.filtering.pipe.status;
     const named = { key: "vm:devbox", vm: "DevBox", seen: 4, open: 1 };
-    const { guests: _dropped, ...withoutGuests } = status;
+    const withoutGuests = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "guests"));
     expect(parseEngineStatus(withoutGuests).guests).toEqual([]);
     for (const notAList of [null, "x", 7, {}]) expect(parseEngineStatus({ ...status, guests: notAList }).guests).toEqual([]);
     const broken = [null, 7, {}, { ...named, key: 7 }, { ...named, key: "devbox" }, { ...named, vm: 7 }, { ...named, seen: -1 }, { ...named, open: "1" }, { key: "vm:x", vm: null, seen: 1 }];
