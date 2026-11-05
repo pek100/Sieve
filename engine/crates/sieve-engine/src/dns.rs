@@ -1,28 +1,242 @@
-//! DNS on the TUN (plan 1.4, slice 3): every lookup that enters the adapter
-//! is forwarded to the server it was sent to (encryption comes in slice 4),
-//! and every answer is read for the IP-to-names map with TTL, which later
-//! decides flows that carry no name of their own. The engine never blocks in
-//! DNS and never writes a DNS setting.
+//! DNS on the TUN (plan 1.4): every lookup that enters the adapter is answered
+//! through an encrypted upstream, or by the adapter's own LAN server for a name
+//! under its own suffixes, and every answer is read for the IP-to-names map
+//! with TTL, which later decides flows that carry no name of their own. The
+//! engine never blocks in DNS, never writes a DNS setting and never sends plain
+//! DNS beyond a private server excluded from routing.
+//!
+//! - [`service`]: one query to one answer, and the two flow loops;
+//! - [`upstream`]: the resolver list, failover and the split-horizon rules;
+//! - [`pool`]: one kept-open session per upstream, over [`doh`], [`dot`], [`doq`];
+//! - [`lan`]: the one plain exchange, to a LAN server;
+//! - [`config`]: the list as `dns.json` holds it.
+//!
+//! [`Connector`] is the only way this code opens a socket, so the production
+//! connector's pinning and the tests' recording cover every socket.
 //!
 //! The parser reads only what the map needs: the question name, and A and
 //! AAAA answers with their TTL (compressed names, RFC 1035 4.1.4). Anything
 //! malformed is None, never a guess.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+
+use tokio::net::TcpStream;
 
 use crate::flow::Reader;
 
+pub mod config;
+pub mod doh;
+pub mod doq;
+pub mod dot;
+pub mod lan;
+pub mod pool;
+pub mod service;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod upstream;
 
-const TYPE_A: u16 = 1;
-const TYPE_AAAA: u16 = 28;
+pub(crate) const TYPE_A: u16 = 1;
+pub(crate) const TYPE_AAAA: u16 = 28;
 const TYPE_CNAME: u16 = 5;
+/// EDNS's pseudo-record (RFC 6891).
+const TYPE_OPT: u16 = 41;
 const CLASS_IN: u16 = 1;
 /// Pointer hops allowed in one name (a loop guard).
 const MAX_POINTERS: usize = 16;
 /// The longest name (RFC 1035 3.1).
 const MAX_NAME: usize = 255;
+/// The fixed header of every message.
+const HEADER: usize = 12;
+/// The longest message any DNS transport carries (2-byte framing).
+pub const MAX_MESSAGE: usize = 65_535;
+/// What a UDP client without EDNS accepts (RFC 1035 4.2.1).
+const UDP_DEFAULT: usize = 512;
+/// IPv6 and UDP headers, the larger family, between the MTU and a reply.
+const UDP_OVERHEAD: usize = 48;
+const FLAG_QR: u16 = 0x8000;
+const FLAG_OPCODE: u16 = 0x7800;
+const FLAG_TC: u16 = 0x0200;
+const FLAG_RD: u16 = 0x0100;
+const FLAG_RA: u16 = 0x0080;
+const RCODE_SERVFAIL: u16 = 2;
+const RCODE_NOTIMP: u16 = 4;
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The only way DNS code opens a socket. Production is `stack::egress::Egress`,
+/// which binds and pins each socket to the interface Windows would use without
+/// Sieve; tests use a loopback connector that records every target.
+pub trait Connector: Send + Sync + 'static {
+    fn tcp(&self, target: SocketAddr) -> BoxFuture<'_, Result<TcpStream, String>>;
+    /// A bound, non-blocking UDP socket for traffic to `target`, not connected.
+    fn udp(&self, target: SocketAddr) -> Result<socket2::Socket, String>;
+    /// Where a socket for `target` sends. Only a test connector remaps it.
+    fn address(&self, target: SocketAddr) -> SocketAddr {
+        target
+    }
+}
+
+/// A spawned task that ends with its owner, so nothing outlives the engine.
+pub(crate) struct Owned(tokio::task::AbortHandle);
+
+impl Owned {
+    pub(crate) fn spawn(task: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self(tokio::spawn(task).abort_handle())
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// `msg` with its ID replaced.
+pub(crate) fn with_id(msg: &[u8], id: u16) -> Vec<u8> {
+    let mut out = msg.to_vec();
+    if let Some(head) = out.get_mut(..2) {
+        head.copy_from_slice(&id.to_be_bytes());
+    }
+    out
+}
+
+pub(crate) fn id_of(msg: &[u8]) -> Option<u16> {
+    Some(u16::from_be_bytes([*msg.first()?, *msg.get(1)?]))
+}
+
+/// A message's flags, for one at least as long as its header.
+pub(crate) fn flags_of(msg: &[u8]) -> Option<u16> {
+    (msg.len() >= HEADER).then(|| u16::from_be_bytes([msg[2], msg[3]]))
+}
+
+/// A recursive query for `name`, ID 0. None for a name that cannot be sent.
+pub(crate) fn query_for(name: &str, ty: u16) -> Option<Vec<u8>> {
+    let mut q = Vec::with_capacity(HEADER + name.len() + 6);
+    q.extend_from_slice(&[0, 0]);
+    q.extend_from_slice(&FLAG_RD.to_be_bytes());
+    q.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+    for label in name.split('.') {
+        q.push(u8::try_from(label.len()).ok().filter(|l| (1..64).contains(l))?);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&ty.to_be_bytes());
+    q.extend_from_slice(&CLASS_IN.to_be_bytes());
+    Some(q)
+}
+
+/// The position after a name, walked without reading it (any octets).
+fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = usize::from(*msg.get(pos)?);
+        match len & 0xc0 {
+            0 if len == 0 => return Some(pos + 1),
+            0 => pos += 1 + len,
+            0xc0 => return Some(pos + 2),
+            _ => return None,
+        }
+    }
+}
+
+/// The end of the question section, whatever its labels hold.
+fn question_end(msg: &[u8]) -> Option<usize> {
+    let count = u16::from_be_bytes([*msg.get(4)?, *msg.get(5)?]);
+    let mut pos = HEADER;
+    for _ in 0..count {
+        pos = skip_name(msg, pos)? + 4;
+    }
+    (pos <= msg.len()).then_some(pos)
+}
+
+/// The same header flags and question with no records; the opcode and RD of
+/// the query are kept, per RFC 1035 4.1.1.
+fn answer_without_records(msg: &[u8], flags: u16) -> Option<Vec<u8>> {
+    let id = msg.get(..2)?;
+    let (question, count) = match question_end(msg) {
+        Some(end) => (&msg[HEADER..end], [msg[4], msg[5]]),
+        None => (&[][..], [0, 0]),
+    };
+    let mut out = Vec::with_capacity(HEADER + question.len());
+    out.extend_from_slice(id);
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&count);
+    out.extend_from_slice(&[0; 6]);
+    out.extend_from_slice(question);
+    Some(out)
+}
+
+fn error_reply(query: &[u8], rcode: u16) -> Option<Vec<u8>> {
+    let kept = flags_of(query)? & (FLAG_OPCODE | FLAG_RD);
+    answer_without_records(query, FLAG_QR | FLAG_RA | kept | rcode)
+}
+
+/// SERVFAIL with the client's ID and question: nothing could answer.
+pub fn servfail(query: &[u8]) -> Option<Vec<u8>> {
+    error_reply(query, RCODE_SERVFAIL)
+}
+
+/// NOTIMP with the client's ID and question: the engine answers this itself.
+pub fn notimp(query: &[u8]) -> Option<Vec<u8>> {
+    error_reply(query, RCODE_NOTIMP)
+}
+
+/// `reply` as header and question with TC set: the client retries over TCP.
+pub fn truncated(reply: &[u8]) -> Option<Vec<u8>> {
+    answer_without_records(reply, flags_of(reply)? | FLAG_TC)
+}
+
+pub fn is_truncated(reply: &[u8]) -> bool {
+    flags_of(reply).is_some_and(|f| f & FLAG_TC != 0)
+}
+
+/// The payload size a query's EDNS record announces.
+fn edns_payload(msg: &[u8]) -> Option<usize> {
+    let count = |at: usize| Some(usize::from(u16::from_be_bytes([*msg.get(at)?, *msg.get(at + 1)?])));
+    let before = count(6)? + count(8)?;
+    let total = before + count(10)?;
+    let mut pos = question_end(msg)?;
+    for index in 0..total {
+        let start = skip_name(msg, pos)?;
+        let mut r = Reader::new(msg.get(start..)?);
+        let (ty, class, _ttl, len) = (r.u16()?, r.u16()?, r.u32()?, usize::from(r.u16()?));
+        if ty == TYPE_OPT && index >= before {
+            return Some(usize::from(class));
+        }
+        pos = start + 10 + len;
+    }
+    None
+}
+
+/// The largest UDP reply this query's client accepts: its EDNS payload size or
+/// 512, and never more than one packet of the adapter can carry.
+pub fn udp_limit(query: &[u8], mtu: usize) -> usize {
+    edns_payload(query).map_or(UDP_DEFAULT, |p| p.max(UDP_DEFAULT)).min(mtu.saturating_sub(UDP_OVERHEAD))
+}
+
+/// True when `reply` can stand as the answer to `query`: a response with its
+/// ID, at most [`MAX_MESSAGE`], and the same question and type when the query
+/// could be read. An opaque query has only the ID to compare.
+pub fn reply_fits(query: &[u8], reply: &[u8]) -> bool {
+    let response = flags_of(reply).is_some_and(|f| f & FLAG_QR != 0);
+    if !response || reply.len() > MAX_MESSAGE || id_of(query) != id_of(reply) {
+        return false;
+    }
+    match question_of(query) {
+        Some((name, ty, class, _)) => question_of(reply).is_some_and(|(n, t, c, _)| n == name && t == ty && c == class),
+        None => true,
+    }
+}
+
+/// `reply` as evidence for the IP-to-names map: it fits a query that could be
+/// read, and could be read itself. Anything else may still reach the client
+/// but never becomes evidence.
+pub fn reply_answers(query: &[u8], reply: &[u8]) -> Option<Message> {
+    parse(query).filter(|q| !q.response)?;
+    reply_fits(query, reply).then(|| parse(reply)).flatten().filter(|m| m.response)
+}
 
 /// A message's question name and its address answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,26 +291,31 @@ fn name_at(msg: &[u8], mut pos: usize) -> Option<(String, usize)> {
     Some((labels.join("."), end?))
 }
 
+/// The one question of a QUERY: its name, type, class and where it ends.
+fn question_of(msg: &[u8]) -> Option<(String, u16, u16, usize)> {
+    let mut r = Reader::new(msg);
+    let (_id, flags, qd) = (r.u16()?, r.u16()?, r.u16()?);
+    // One question is the only unambiguous association for this cache.
+    if qd != 1 || flags & FLAG_OPCODE != 0 {
+        return None;
+    }
+    let (question, next) = name_at(msg, HEADER)?;
+    let mut q = Reader::new(msg.get(next..)?);
+    let (qtype, qclass) = (q.u16()?, q.u16()?);
+    (!question.is_empty()).then_some((question, qtype, qclass, next + 4))
+}
+
 /// Parses a DNS message over UDP (or one TCP message without its length).
 pub fn parse(msg: &[u8]) -> Option<Message> {
     let mut r = Reader::new(msg);
     let id = r.u16()?;
     let flags = r.u16()?;
-    let qd = r.u16()?;
+    let _qd = r.u16()?;
     let an = r.u16()?;
-    let _ns = r.u16()?;
-    let _ar = r.u16()?;
-    // One question is the only unambiguous association for this cache.
-    if qd != 1 || flags & 0x7800 != 0 {
+    let (question, qtype, qclass, mut pos) = question_of(msg)?;
+    if qclass != CLASS_IN {
         return None;
     }
-    let (question, next) = name_at(msg, 12)?;
-    let mut q = Reader::new(msg.get(next..)?);
-    let (qtype, qclass) = (q.u16()?, q.u16()?);
-    if question.is_empty() || qclass != CLASS_IN {
-        return None;
-    }
-    let mut pos = next + 4;
     let mut addresses = Vec::new();
     let mut aliases: HashMap<String, (String, u32)> = HashMap::new();
     for _ in 0..an {
@@ -133,7 +352,7 @@ pub fn parse(msg: &[u8]) -> Option<Message> {
             _ => {}
         }
     }
-    let response = flags & 0x8000 != 0;
+    let response = flags & FLAG_QR != 0;
     let mut answers = Vec::new();
     // Error and truncated packets are not evidence that an address belongs
     // to a name. Only the question owner and its CNAME chain are evidence;
@@ -164,53 +383,6 @@ pub fn parse(msg: &[u8]) -> Option<Message> {
         question_type: qtype,
         answers,
     })
-}
-
-/// Per connected DNS flow, remember only a bounded set of requests. The
-/// connected socket establishes the server; ID, name and type establish
-/// which outstanding request an answer belongs to. Unmatched replies may
-/// still be relayed, but must never become host-blocking evidence.
-#[derive(Default)]
-pub struct Transactions {
-    pending: HashMap<u16, (String, u16, u64)>,
-}
-
-const TRANSACTION_CAP: usize = 256;
-const TRANSACTION_LIFETIME_MS: u64 = 5_000;
-
-impl Transactions {
-    pub fn remember(&mut self, bytes: &[u8], now_ms: u64) {
-        self.pending.retain(|_, (_, _, expires)| *expires > now_ms);
-        // Even a malformed replacement must invalidate the old ID.
-        if let Some(id) = bytes.get(..2) {
-            self.pending.remove(&u16::from_be_bytes([id[0], id[1]]));
-        }
-        let Some(m) = parse(bytes).filter(|m| !m.response) else {
-            return;
-        };
-        let Some(name) = m.question else { return };
-        if self.pending.len() < TRANSACTION_CAP {
-            self.pending.insert(
-                m.id,
-                (
-                    name,
-                    m.question_type,
-                    now_ms.saturating_add(TRANSACTION_LIFETIME_MS),
-                ),
-            );
-        }
-    }
-
-    pub fn answer(&mut self, bytes: &[u8], now_ms: u64) -> Option<Message> {
-        self.pending.retain(|_, (_, _, expires)| *expires > now_ms);
-        let m = parse(bytes).filter(|m| m.response)?;
-        let (name, ty, _) = self.pending.get(&m.id)?;
-        if m.question.as_ref() != Some(name) || m.question_type != *ty {
-            return None;
-        }
-        self.pending.remove(&m.id);
-        Some(m)
-    }
 }
 
 /// At most this many addresses are remembered; past it the soonest to
@@ -404,63 +576,105 @@ mod tests {
     }
 
     #[test]
-    fn only_an_outstanding_matching_answer_is_evidence_once() {
-        let mut tx = Transactions::default();
+    fn only_a_matching_answer_is_evidence() {
+        let q = query(7, "ads.example");
         let answer = build::response(7, "ads.example", &[(ip("192.0.2.1"), 30)]);
-        assert!(tx.answer(&answer, 0).is_none());
-        tx.remember(&query(7, "ads.example"), 0);
-        assert!(
-            tx.answer(&build::response(8, "ads.example", &[]), 1)
-                .is_none()
-        );
-        assert!(
-            tx.answer(&build::response(7, "other.example", &[]), 1)
-                .is_none()
-        );
+        assert!(reply_answers(&q, &build::response(8, "ads.example", &[])).is_none());
+        assert!(reply_answers(&q, &build::response(7, "other.example", &[])).is_none());
         let mut wrong_type = build::response(7, "ads.example", &[]);
         let end = wrong_type.len();
         wrong_type[end - 4..end - 2].copy_from_slice(&TYPE_AAAA.to_be_bytes());
-        assert!(tx.answer(&wrong_type, 1).is_none());
-        assert_eq!(
-            tx.answer(&answer, 2).unwrap().answers,
-            vec![(ip("192.0.2.1"), 30)]
-        );
-        assert!(
-            tx.answer(&answer, 3).is_none(),
-            "a replay is not fresh evidence"
-        );
+        assert!(reply_answers(&q, &wrong_type).is_none());
+        assert!(reply_answers(&q, &q).is_none(), "a query is no answer");
+        assert_eq!(reply_answers(&q, &answer).unwrap().answers, vec![(ip("192.0.2.1"), 30)]);
     }
 
     #[test]
-    fn replaced_expired_and_malformed_queries_cannot_validate_old_answers() {
-        let mut tx = Transactions::default();
-        let answer = build::response(7, "ads.example", &[]);
-        tx.remember(&query(7, "ads.example"), 0);
-        tx.remember(&query(7, "other.example"), 1);
-        assert!(tx.answer(&answer, 2).is_none());
-        tx.remember(&query(7, "ads.example"), 0);
-        assert!(tx.answer(&answer, TRANSACTION_LIFETIME_MS).is_none());
-        tx.remember(&query(7, "ads.example"), 0);
-        tx.remember(&[0, 7], 1);
-        assert!(tx.answer(&answer, 2).is_none());
+    fn a_reply_must_carry_the_id_and_the_question_of_its_query() {
+        let q = query(7, "ads.example");
+        assert!(reply_fits(&q, &build::response(7, "ADS.example", &[])), "names compare without case");
+        assert!(!reply_fits(&q, &build::response(8, "ads.example", &[])));
+        assert!(!reply_fits(&q, &build::response(7, "other.example", &[])));
+        assert!(!reply_fits(&q, &q));
+        assert!(!reply_fits(&q, &[0, 7, 0x80]), "shorter than a header");
+        let mut oversized = build::response(7, "ads.example", &[]);
+        oversized.resize(MAX_MESSAGE + 1, 0);
+        assert!(!reply_fits(&q, &oversized));
     }
 
     #[test]
-    fn outstanding_queries_are_bounded_and_expire() {
-        let mut tx = Transactions::default();
-        for id in 0..=TRANSACTION_CAP {
-            tx.remember(&query(id as u16, "ads.example"), 0);
-        }
-        assert_eq!(tx.pending.len(), TRANSACTION_CAP);
-        assert!(
-            tx.answer(
-                &build::response(TRANSACTION_CAP as u16, "ads.example", &[]),
-                1
-            )
-            .is_none()
-        );
-        tx.remember(&query(500, "news.example"), TRANSACTION_LIFETIME_MS);
-        assert_eq!(tx.pending.len(), 1);
+    fn an_opaque_query_has_only_its_id_to_compare_and_gives_no_evidence() {
+        // A label the name parser refuses: still forwarded, never evidence.
+        let mut q = vec![0, 7, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 2, b'a', 0xff, 0, 0, 1, 0, 1];
+        assert!(parse(&q).is_none());
+        let mut reply = q.clone();
+        reply[2] = 0x81;
+        assert!(reply_fits(&q, &reply));
+        assert!(reply_answers(&q, &reply).is_none());
+        q[1] = 8;
+        assert!(!reply_fits(&q, &reply));
+    }
+
+    #[test]
+    fn an_error_reply_keeps_the_id_and_the_question_and_states_its_code() {
+        let q = query(7, "ads.example");
+        let reply = servfail(&q).unwrap();
+        assert_eq!(id_of(&reply), Some(7));
+        let m = parse(&reply).unwrap();
+        assert!(m.response && m.answers.is_empty());
+        assert_eq!(m.question.as_deref(), Some("ads.example"));
+        assert_eq!(flags_of(&reply).unwrap() & 0xf, RCODE_SERVFAIL);
+        assert_eq!(flags_of(&reply).unwrap() & FLAG_RD, FLAG_RD);
+        assert_eq!(flags_of(&notimp(&q).unwrap()).unwrap() & 0xf, RCODE_NOTIMP);
+        // An UPDATE keeps its opcode; a query that cannot be walked keeps its ID.
+        let mut update = q.clone();
+        update[2] = 0x28;
+        assert_eq!(flags_of(&notimp(&update).unwrap()).unwrap() & FLAG_OPCODE, 0x2800);
+        let mut broken = q[..HEADER].to_vec();
+        broken.push(200);
+        let reply = servfail(&broken).unwrap();
+        assert_eq!((id_of(&reply), reply.len()), (Some(7), HEADER));
+        assert!(servfail(&q[..4]).is_none());
+    }
+
+    #[test]
+    fn truncation_keeps_the_question_and_drops_the_records() {
+        let reply = build::response(7, "ads.example", &[(ip("192.0.2.1"), 30)]);
+        let short = truncated(&reply).unwrap();
+        assert!(is_truncated(&short) && !is_truncated(&reply));
+        let m = parse(&short).unwrap();
+        assert_eq!((m.id, m.question.as_deref()), (7, Some("ads.example")));
+        assert_eq!(short[6..12], [0; 6]);
+    }
+
+    /// A query with an EDNS record announcing `payload`.
+    pub(crate) fn query_with_edns(id: u16, name: &str, payload: u16) -> Vec<u8> {
+        let mut q = query(id, name);
+        q[10..12].copy_from_slice(&1u16.to_be_bytes());
+        q.push(0);
+        q.extend_from_slice(&TYPE_OPT.to_be_bytes());
+        q.extend_from_slice(&payload.to_be_bytes());
+        q.extend_from_slice(&[0; 6]);
+        q
+    }
+
+    #[test]
+    fn the_udp_limit_is_the_clients_within_the_adapters_packet() {
+        assert_eq!(udp_limit(&query(1, "a.example"), 1500), 512, "no EDNS");
+        assert_eq!(udp_limit(&query_with_edns(1, "a.example", 1232), 1500), 1232);
+        assert_eq!(udp_limit(&query_with_edns(1, "a.example", 100), 1500), 512, "RFC 6891: at least 512");
+        assert_eq!(udp_limit(&query_with_edns(1, "a.example", 4096), 1500), 1452, "the MTU bound");
+        let mut cut = query_with_edns(1, "a.example", 1232);
+        cut.truncate(cut.len() - 3);
+        assert_eq!(udp_limit(&cut, 1500), 512, "a broken record reads as no EDNS");
+    }
+
+    #[test]
+    fn a_built_query_reads_back() {
+        let q = query_for("dns.example", TYPE_AAAA).unwrap();
+        let m = parse(&q).unwrap();
+        assert_eq!((m.response, m.question.as_deref(), m.question_type), (false, Some("dns.example"), TYPE_AAAA));
+        assert!(query_for("a..example", TYPE_A).is_none());
     }
 
     #[test]

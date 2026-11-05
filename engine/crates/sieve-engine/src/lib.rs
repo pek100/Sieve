@@ -7,7 +7,9 @@
 //!   of routing state (on the engine's own adapter, slice 3);
 //! - [`tun`]: the pinned wintun.dll and the adapter (slice 3);
 //! - [`stack`]: the relay of every flow, with attribution (slice 3);
-//! - [`dns`]: DNS answers read into the IP-to-names map (slice 3);
+//! - [`dns`]: lookups on the TUN answered over encrypted upstreams, and their
+//!   answers read into the IP-to-names map (slices 3, 4);
+//! - [`tls`]: the one owner of how the engine speaks TLS (plan 2.7);
 //! - [`coexist`]: AdGuard and VPN detection, read only (slice 3);
 //! - [`watchdog`], [`policy`]: hang and crash-loop safety (slice 3);
 //! - [`control`]: the running engine's facts and its routing loop.
@@ -26,6 +28,7 @@ pub mod policy;
 pub mod route;
 pub mod service;
 pub mod stack;
+pub mod tls;
 pub mod tun;
 pub mod watchdog;
 

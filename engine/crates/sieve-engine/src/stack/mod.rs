@@ -1,17 +1,23 @@
 //! The relay of every flow (plan 1.1, slice 3): ipstack terminates each flow
 //! that enters the adapter, the flow is attributed to its process, its first
-//! bytes are decoded (SNI, Host, QUIC Initial, the DNS question), and it is
-//! relayed to its destination through a socket pinned to the interface
-//! Windows would use without Sieve. Slice 3 filters nothing: every flow is
-//! relayed (or fails to connect, and is closed at once).
+//! bytes are decoded (SNI, Host, QUIC Initial), and it is relayed to its
+//! destination through a socket pinned to the interface Windows would use
+//! without Sieve. A flow to port 53 is answered by `dns::service` instead. Slice
+//! 3 filters nothing: every flow is relayed (or fails to connect, and is closed
+//! at once).
 //!
 //! - [`book`]: the flows as the app sees them, batched for the pipe;
 //! - [`Meters`]: the engine's own counters (attribution is read from them);
-//! - `relay` (Windows): the per-flow tasks.
+//! - `relay` (Windows): the per-flow tasks; `dns_flow` (Windows): port 53;
+//! - `egress` (Windows): the pinned sockets both of them leave through.
 
 pub mod book;
 #[cfg(feature = "attribution-diagnostics")]
 pub mod diagnostics;
+#[cfg(windows)]
+pub mod dns_flow;
+#[cfg(windows)]
+pub mod egress;
 #[cfg(windows)]
 pub mod relay;
 
@@ -66,6 +72,11 @@ pub fn kind_of(d: &Decoded) -> FlowKind {
 
 /// The port DNS is caught on (UDP and TCP), whatever the server address.
 pub const DNS_PORT: u16 = 53;
+
+/// A bound, non-blocking socket from a connector, handed to the runtime.
+pub fn datagram_socket(socket: socket2::Socket) -> std::io::Result<tokio::net::UdpSocket> {
+    tokio::net::UdpSocket::from_std(socket.into())
+}
 
 #[cfg(test)]
 mod tests {

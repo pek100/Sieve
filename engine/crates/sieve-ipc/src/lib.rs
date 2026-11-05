@@ -11,8 +11,12 @@
 //! - [`ClientMessage::SetPolicy`] is answered with the Status after the
 //!   change; [`ClientMessage::Subscribe`] turns the connection into an event
 //!   stream of [`EngineMessage::Flows`] batches, every [`FLOWS_BATCH_MS`].
+//! - [`ClientMessage::SetDnsUpstreams`] is answered with
+//!   [`EngineMessage::DnsUpstreams`], the list the engine then holds.
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
-//!   commit (v2, slice 3: policy, flows, coexistence and counters).
+//!   commit (v2, slice 3: policy, flows, coexistence and counters). A new
+//!   message type is no shape change: a peer that never sends it is unaffected,
+//!   and the app and engine ship together.
 //!
 //! There is no operation that signs anything, exports a key or names a
 //! certificate to mint (plan 7.2), and there never will be.
@@ -36,9 +40,9 @@ pub const FLOWS_BATCH_MS: u64 = 250;
 pub const FLOWS_PER_FRAME: usize = 500;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "set_dns_upstreams"];
 /// The `type` names of [`EngineMessage`], in declaration order.
-pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows"];
+pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "dns_upstreams"];
 
 /// App to engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +58,10 @@ pub enum ClientMessage {
     /// From now on the engine pushes [`EngineMessage::Flows`] batches of this
     /// client's session (and session 0, the services) on this connection.
     Subscribe,
+    /// The encrypted DNS resolvers (`filtering.upstreams`). Applied only when
+    /// `revision` is above the engine's and every address is valid, persisted,
+    /// answered with [`EngineMessage::DnsUpstreams`]; a refusal is an Error.
+    SetDnsUpstreams(DnsUpstreams),
 }
 
 /// Engine to app.
@@ -72,6 +80,19 @@ pub enum EngineMessage {
     Error { message: String },
     /// Flows that opened, moved bytes or closed since the last batch.
     Flows { flows: Vec<FlowEvent> },
+    /// The encrypted DNS resolvers the engine holds.
+    DnsUpstreams(DnsUpstreams),
+}
+
+/// The encrypted DNS resolvers as the engine holds them (`dns.json`). The
+/// engine validates the addresses; this crate only carries them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsUpstreams {
+    /// Raised by the app on every change; 0 is the engine's default list.
+    pub revision: u64,
+    /// `https://`, `tls://` or `quic://` addresses, tried in order.
+    pub upstreams: Vec<String>,
 }
 
 /// The user's switches as the engine holds them (`policy.json`).
@@ -112,7 +133,8 @@ pub struct Counters {
     pub attributed: u64,
     /// Flows owned by the engine itself, refused (loop guard).
     pub own_refused: u64,
-    /// DNS answers relayed from the original server.
+    /// DNS answers read for the IP-to-names map, from an encrypted upstream or
+    /// a LAN server.
     pub dns_answers: u64,
     /// Packets read from and written to the adapter.
     pub packets_in: u64,
@@ -340,6 +362,7 @@ mod tests {
             ClientMessage::Status => "status",
             ClientMessage::SetPolicy(_) => "set_policy",
             ClientMessage::Subscribe => "subscribe",
+            ClientMessage::SetDnsUpstreams(_) => "set_dns_upstreams",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -347,6 +370,7 @@ mod tests {
             EngineMessage::Status(_) => "status",
             EngineMessage::Error { .. } => "error",
             EngineMessage::Flows { .. } => "flows",
+            EngineMessage::DnsUpstreams(_) => "dns_upstreams",
         };
         let f = fixture();
         for m in f["client"].as_array().unwrap() {

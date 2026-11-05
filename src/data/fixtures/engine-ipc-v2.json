@@ -9,7 +9,12 @@
     { "type": "hello", "protocol": 2, "app_version": "0.1.0" },
     { "type": "status" },
     { "type": "set_policy", "revision": 3, "engine": true },
-    { "type": "subscribe" }
+    { "type": "subscribe" },
+    {
+      "type": "set_dns_upstreams",
+      "revision": 4,
+      "upstreams": ["https://cloudflare-dns.com/dns-query", "tls://dns.quad9.net", "quic://dns.example:8853"]
+    }
   ],
   "engine": [
     { "type": "welcome", "protocol": 2, "engine_version": "0.1.0", "session_id": 1 },
@@ -114,6 +119,11 @@
           "open": true
         }
       ]
+    },
+    {
+      "type": "dns_upstreams",
+      "revision": 0,
+      "upstreams": ["https://cloudflare-dns.com/dns-query", "https://dns.quad9.net/dns-query"]
     }
   ],
   "blockers": [

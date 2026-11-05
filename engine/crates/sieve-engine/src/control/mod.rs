@@ -12,10 +12,11 @@ pub mod routing;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use sieve_ipc::{Blocker, EngineStatus, FlowEvent, Policy};
+use sieve_ipc::{Blocker, DnsUpstreams, EngineStatus, FlowEvent, Policy};
 use tokio::sync::{Notify, broadcast, watch};
 
-use crate::dns::NameMap;
+use crate::dns::service::Service;
+use crate::dns::{NameMap, config};
 use crate::ipc::{Backend, Subscription};
 use crate::policy::{self, Runs};
 use crate::stack::Meters;
@@ -28,6 +29,9 @@ pub const FLOWS_BACKLOG: usize = 64;
 
 /// The engine's Status for an admin prompt (`scripts/live/engine-route.ps1`).
 pub const STATUS_FILE: &str = "status.json";
+/// The encrypted DNS sessions' facts for an admin prompt, at the same cadence
+/// (docs/live/encrypted-dns.md). Never a queried name; not on the pipe.
+pub const DNS_STATUS_FILE: &str = "dns-status.json";
 /// While routes are up, `status.json` is rewritten this often.
 pub const STATUS_FILE_EVERY_MS: u64 = 30_000;
 
@@ -55,6 +59,9 @@ pub struct Engine {
     runs: Mutex<Runs>,
     crash_loop: Mutex<Option<u32>>,
     facts: Mutex<Facts>,
+    dns_upstreams: Mutex<DnsUpstreams>,
+    /// Up only while the routes are.
+    dns_service: Mutex<Option<Arc<Service>>>,
     pub book: Arc<Mutex<FlowBook>>,
     pub names: Arc<Mutex<NameMap>>,
     pub meters: Arc<Meters>,
@@ -73,6 +80,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl Engine {
     pub fn new(dir: Option<PathBuf>, exe: PathBuf, policy: Policy, runs: Runs, crash_loop: Option<u32>) -> Self {
+        let (dns_upstreams, unused_dns_file) = dir.as_deref().map(config::load).unwrap_or_else(|| (config::defaults(), None));
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: dir.as_deref().map(crate::experiments::Loaded::load).unwrap_or_else(crate::experiments::Loaded::absent),
@@ -83,7 +91,9 @@ impl Engine {
             policy: Mutex::new(policy),
             runs: Mutex::new(runs),
             crash_loop: Mutex::new(crash_loop),
-            facts: Mutex::new(Facts::default()),
+            facts: Mutex::new(Facts { last_error: unused_dns_file, ..Facts::default() }),
+            dns_upstreams: Mutex::new(dns_upstreams),
+            dns_service: Mutex::new(None),
             book: Arc::default(),
             names: Arc::default(),
             meters: Arc::default(),
@@ -117,6 +127,16 @@ impl Engine {
         self.routes_up.send_if_modified(|was| std::mem::replace(was, up) != up);
     }
 
+    /// The encrypted DNS resolvers the engine holds.
+    pub fn dns_upstreams(&self) -> DnsUpstreams {
+        lock(&self.dns_upstreams).clone()
+    }
+
+    /// The routing loop's handle on the DNS service while the routes are up.
+    pub fn set_dns_service(&self, service: Option<Arc<Service>>) {
+        *lock(&self.dns_service) = service;
+    }
+
     /// Records this run's clean end (the service was asked to stop).
     pub fn stop_clean(&self) {
         let mut runs = lock(&self.runs);
@@ -146,6 +166,17 @@ impl Engine {
             if std::fs::write(&tmp, json).is_ok() {
                 let _ = std::fs::rename(&tmp, dir.join(STATUS_FILE));
             }
+        }
+        self.write_dns_status_file();
+    }
+
+    /// Beside `status.json`: an empty list while nothing is up, so an old fact
+    /// is never read as a current one. Best effort.
+    fn write_dns_status_file(&self) {
+        let Some(dir) = &self.dir else { return };
+        let upstreams = lock(&self.dns_service).as_ref().map(|s| s.report()).unwrap_or_default();
+        if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({ "upstreams": upstreams })) {
+            let _ = policy::write_atomic(&dir.join(DNS_STATUS_FILE), &json);
         }
     }
 
@@ -218,6 +249,19 @@ impl Backend for Engine {
         }
         self.wake.notify_one();
         Ok(self.status())
+    }
+
+    fn set_dns_upstreams(&self, asked: DnsUpstreams) -> Result<DnsUpstreams, String> {
+        let mut held = lock(&self.dns_upstreams);
+        let (next, endpoints) = config::accept(&held, asked)?;
+        if let Some(dir) = &self.dir {
+            config::save(dir, &next)?;
+        }
+        *held = next.clone();
+        if let Some(service) = lock(&self.dns_service).as_ref() {
+            service.set_list(endpoints);
+        }
+        Ok(next)
     }
 
     fn subscribe(&self) -> Subscription {
@@ -335,6 +379,61 @@ mod tests {
         let s = engine(Policy::default(), None).status();
         assert!(!s.routes_up && !s.filtering && !s.policy.engine);
         assert_eq!(s.blocker, None);
+    }
+
+    #[tokio::test]
+    async fn set_dns_upstreams_answers_the_held_list_persists_it_and_refuses_a_stale_or_bad_one() {
+        use sieve_ipc::nonblocking::{read_frame, write_frame};
+        use sieve_ipc::{ClientMessage, EngineMessage, PROTOCOL};
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None));
+        assert_eq!(engine.dns_upstreams(), config::defaults(), "no file: the defaults, and no error");
+        assert_eq!(engine.status().last_error, None);
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let backend = engine.clone();
+        let task = tokio::spawn(async move { crate::ipc::serve_client(&mut server, 1, backend.as_ref()).await });
+        write_frame(&mut client, &ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.1.0".into() }).await.unwrap();
+        let _: EngineMessage = read_frame(&mut client).await.unwrap();
+
+        let good = DnsUpstreams { revision: 3, upstreams: vec!["tls://dns.example".into(), "quic://192.0.2.9".into()] };
+        write_frame(&mut client, &ClientMessage::SetDnsUpstreams(good.clone())).await.unwrap();
+        assert_eq!(read_frame::<_, EngineMessage>(&mut client).await.unwrap(), EngineMessage::DnsUpstreams(good.clone()));
+
+        for (bad, why) in [
+            (DnsUpstreams { revision: 3, upstreams: vec!["tls://other.example".into()] }, "stale"),
+            (DnsUpstreams { revision: 9, upstreams: vec![] }, "empty"),
+            (DnsUpstreams { revision: 9, upstreams: vec!["udp://1.1.1.1".into()] }, "udp://1.1.1.1"),
+            (DnsUpstreams { revision: 9, upstreams: vec!["tls://a.example".to_string(); 9] }, "limit"),
+        ] {
+            write_frame(&mut client, &ClientMessage::SetDnsUpstreams(bad)).await.unwrap();
+            let answer: EngineMessage = read_frame(&mut client).await.unwrap();
+            assert!(matches!(&answer, EngineMessage::Error { message } if message.contains(why)), "{why}: {answer:?}");
+        }
+        drop(client);
+        task.await.unwrap().unwrap();
+
+        assert_eq!(engine.dns_upstreams(), good, "a refusal changes nothing");
+        let reloaded = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        assert_eq!(reloaded.dns_upstreams(), good, "it survives a restart");
+    }
+
+    #[test]
+    fn a_bad_dns_file_reads_as_the_defaults_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(config::DNS_FILE), b"{\"revision\":1,\"upstreams\":[\"udp://1.1.1.1\"]}").unwrap();
+        let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        assert_eq!(e.dns_upstreams(), config::defaults());
+        assert!(e.status().last_error.unwrap().contains("read as the defaults"));
+    }
+
+    #[test]
+    fn the_dns_status_file_holds_no_upstream_while_nothing_is_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        e.write_status_file();
+        let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(DNS_STATUS_FILE)).unwrap()).unwrap();
+        assert_eq!(status["upstreams"], serde_json::json!([]));
     }
 
     #[test]

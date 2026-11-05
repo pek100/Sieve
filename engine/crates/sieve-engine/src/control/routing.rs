@@ -6,14 +6,16 @@
 //! [`RECHECK_EVERY`] for AdGuard's service; with the switch off it waits
 //! with no timer at all (plan 6: idle CPU 0).
 //!
-//! Bringing up: load the pinned wintun.dll, create the adapter, give it its
-//! addresses, journal and add each planned route, start the stack, arm the
-//! watchdog. Any failure takes down what was added and reports a Setup
-//! blocker: the network stays as it was. While up, a route change re-reads
-//! the tables (pinning follows them) and adds or removes the routes whose
-//! plan changed.
+//! Bringing up: build the DNS service's TLS, load the pinned wintun.dll, create
+//! the adapter, give it its addresses, journal and add each planned route,
+//! start the stack, arm the watchdog. Any failure takes down what was added and
+//! reports a Setup blocker: the network stays as it was. While up, a route
+//! change re-reads the tables (pinning follows them), drops DNS's sessions when
+//! the network outside Sieve changed (they are pinned to the old egress), and
+//! adds or removes the routes whose plan changed. Taking down drops the DNS
+//! service, so its connections end with the routes.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ipstack::{IpStack, IpStackConfig, IpStackStream};
@@ -23,6 +25,9 @@ use tokio::task::JoinHandle;
 
 use super::Engine;
 use crate::coexist::{self, Coexistence};
+use crate::dns::pool::{Context, Tls};
+use crate::dns::service::Service;
+use crate::dns::{config, upstream};
 use crate::flow::tasks::FlowTasks;
 use crate::route::apply::{self, SieveLuid};
 use crate::route::journal::Journal;
@@ -30,6 +35,7 @@ use crate::route::plan::{self, RoutePlan};
 use crate::route::prefix::Prefix;
 use crate::route::table::{NetTables, read};
 use crate::route::watch::{RouteWatch, watch as watch_routes};
+use crate::stack::egress::Egress;
 use crate::stack::relay::{Relay, UDP_IDLE, handle_tcp, handle_udp};
 use crate::tun::device::{Tun, TunDevice};
 #[cfg(not(feature = "relay-experiments"))]
@@ -133,7 +139,15 @@ pub async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
 /// pins with the new tables.
 fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
     let RoutePlan { routes, .. } = plan::plan(&tables);
-    *up.relay.tables.write().unwrap_or_else(|p| p.into_inner()) = tables;
+    let network_moved = {
+        let mut held = up.relay.tables.write().unwrap_or_else(|p| p.into_inner());
+        let moved = held.outside_sieve() != tables.outside_sieve();
+        *held = tables;
+        moved
+    };
+    if network_moved {
+        up.relay.dns.reset();
+    }
     if routes == up.routes {
         return up;
     }
@@ -163,6 +177,11 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
         return Err("this computer has no default route, so there is nothing to route".into());
     }
     let journal = journal(engine).ok_or("the engine has no state folder for its route journal")?;
+    // Everything DNS can fail on comes before the first route: a Setup blocker
+    // here leaves the network as it was.
+    let dns_endpoints = config::validate(&engine.dns_upstreams())?;
+    let resolver_tls = Arc::new(Tls::new(crate::tls::public_roots())?);
+    let resolvers = upstream::known_resolvers()?;
     let mut config = IpStackConfig::default();
     #[cfg(feature = "relay-experiments")]
     config.mtu(engine.experiments.settings.tun_mtu).map_err(|e| format!("stack MTU: {e}"))?;
@@ -190,11 +209,20 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
         added.push(*p);
     }
 
+    let shared_tables = Arc::new(RwLock::new(tables.clone()));
+    let egress = Arc::new(Egress::new(tun.index, shared_tables.clone()));
+    let context = Context { connector: egress.clone(), tls: resolver_tls, resolvers };
     #[cfg(not(feature = "relay-experiments"))]
-    let relay = Arc::new(Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone()));
+    let mtu = MTU;
+    #[cfg(feature = "relay-experiments")]
+    let mtu = engine.experiments.settings.tun_mtu;
+    let dns = Arc::new(Service::new(dns_endpoints, context, shared_tables.clone(), engine.names.clone(), engine.meters.clone(), usize::from(mtu)));
+    engine.set_dns_service(Some(dns.clone()));
+    #[cfg(not(feature = "relay-experiments"))]
+    let relay = Arc::new(Relay::new(shared_tables, egress, dns, engine.book.clone(), engine.meters.clone()));
     #[cfg(feature = "relay-experiments")]
     let relay = {
-        let mut relay = Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone());
+        let mut relay = Relay::new(shared_tables, egress, dns, engine.book.clone(), engine.meters.clone());
         relay.experiments = engine.experiments.settings.clone();
         Arc::new(relay)
     };
@@ -251,13 +279,15 @@ async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiv
 
 /// The order that keeps the network: disarm, close the session (the reader
 /// returns), cancel the flows while the runtime runs, delete the routes,
-/// empty the journal, close the adapter (Wintun removes it).
+/// empty the journal, close the adapter (Wintun removes it). The DNS service
+/// goes with the last reference to it, the relay's, when this returns.
 async fn take_down(engine: &Engine, up: Up) {
     engine.arm.set(false);
     let _ = up.tun.session.shutdown();
     let _ = up.stop_accept.send(());
     let _ = up.accept.await;
     up.batches.abort();
+    engine.set_dns_service(None);
     for p in &up.routes {
         let _ = apply::delete_route(up.luid.value(), *p);
     }
