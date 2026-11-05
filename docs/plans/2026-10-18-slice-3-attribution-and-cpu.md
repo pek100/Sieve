@@ -90,7 +90,7 @@ Done: three valid runs at 0.15 cores per 100 Mbit/s or less, with throughput wit
 ## 4. Other slice 3 items still open
 
 - **Route-delete codes.** The watchdog reported 51 failed deletions while the journal replay succeeded and no routes remained. Log the real `DeleteIpForwardEntry2` return codes, and treat `ERROR_NOT_FOUND` (already gone) as success. Offline, with a unit test.
-- **Ordinary AdGuard pause.** `sc stop` leaves AdGuard in StopPending by design (`LeaveServiceRunning`). The coexistence check must judge whether AdGuard is intercepting by behaviour (does a test flow get redirected into AdguardSvc?), not by service state. Until then the product cannot pause AdGuard by itself. The test runner's disable-and-kill path is a test workaround only.
+- **Ordinary AdGuard pause.** `sc stop` leaves AdGuard in StopPending by design (`LeaveServiceRunning`). The coexistence check must judge whether AdGuard is intercepting by behaviour (does a test flow get redirected into AdguardSvc?), not by service state. Until then the product cannot pause AdGuard by itself. The test runner's disable-and-kill path is a test workaround only. **Dated note, 2026-11-05:** built offline (`docs/tasks/2026-11-02-coexist.md`): a test connection to a documentation address decides, and the app no longer waits for `Stopped`. The real AdGuard's behaviour is unproven until L1 to L6 in `docs/live/engine-slice-3.md`.
 - **Reboot and uninstall checks** for slices 2 and 3, at a restart that suits Michael.
 
 ## 5. Who does what
