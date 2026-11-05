@@ -18,7 +18,7 @@ const switchedOn = (page: Page) =>
   page.addInitScript(() => window.localStorage.setItem("sieve.settings", JSON.stringify({ schema: 4, values: { "filtering.engine": true } })));
 
 test.describe("engine updates", () => {
-  test("an offered release: plain text, one button, and the Home banner; installing it shows it applying", async ({ page }, info) => {
+  test("an offered release: plain text and one button; installing it shows it applying", async ({ page }, info) => {
     const { block, errors } = await openEngine(page, "update_available");
     const update = block.locator("[data-engine-update]");
     await expect(update).toHaveAttribute("data-engine-update", "available");
