@@ -74,8 +74,8 @@ fn refuse_body(response: &FetchResponse) -> Result<&str, String> {
     let text = std::str::from_utf8(&response.body).map_err(|e| format!("not UTF-8: {e}"))?;
     let text = text.strip_prefix(BOM).unwrap_or(text);
     let declared_html = response.content_type.as_deref().is_some_and(|t| t.to_ascii_lowercase().starts_with(HTML_TYPE));
-    let head = text.trim_start().get(..HTML_STARTS[0].len()).unwrap_or_default().to_ascii_lowercase();
-    if declared_html || HTML_STARTS.iter().any(|start| head.starts_with(start)) {
+    let head = text.trim_start().as_bytes();
+    if declared_html || HTML_STARTS.iter().any(|start| head.get(..start.len()).is_some_and(|h| h.eq_ignore_ascii_case(start.as_bytes()))) {
         return Err("an HTML page, not a filter list".into());
     }
     if !has_a_rule(text) {
@@ -238,6 +238,11 @@ mod tests {
             (FetchResponse { status: 302, ..FetchResponse::default() }, "HTTP 302"),
             (ok("<!DOCTYPE html><html>portal</html>"), "HTML"),
             (ok("  \n<html>portal</html>"), "HTML"),
+            // Shorter than the longest start, or a character across where it ends.
+            (ok("<html>é中<body>sign in</body></html>"), "HTML"),
+            (ok("<html>"), "HTML"),
+            (ok("<html>\n"), "HTML"),
+            (ok("<HTML"), "HTML"),
             (FetchResponse { content_type: Some("Text/HTML; charset=utf-8".into()), ..ok("||ads.example^\n") }, "HTML"),
             (ok(""), "no rule"),
             (ok("! comments only\n"), "no rule"),
