@@ -6,9 +6,10 @@
 //!   (S17: a skipped rule is a count, never silently partial).
 //! - [`RuleEngine::check_host`] is the host-level decision for flows that
 //!   carry only a name (TLS SNI, HTTP Host, QUIC SNI, DNS): a synthetic
-//!   request `https://<host>/` of type `other` with no initiator, which
-//!   matches exactly the `||host^` rules without type or party constraints
-//!   (the DNS filter's semantics, S14 by construction).
+//!   request `https://<host>/` of type `other` with no initiator. A block
+//!   needs rules that cover every party and every network request type, so
+//!   `$third-party`, `$image` and `$~image` never close a host (the DNS
+//!   filter's semantics, S14 by construction).
 //! - [`RuleSet`] is what a flow asks: the user's rules first, then the lists.
 //!   Two engines make "the user wins" hold by construction: in one engine a
 //!   list's `$important` would beat a user allow and a list's `@@` a user block.
@@ -34,6 +35,11 @@ const SYNTHETIC_METHOD: &str = "GET";
 /// A block verdict is re-asked as this type: `@@||host^$document` says the
 /// whole site is allowed, and a synthetic `other` request does not match it.
 const DOCUMENT_TYPE: &str = "document";
+/// The request types a rule with no type constraint matches, beside
+/// [`SYNTHETIC_TYPE`] (the library's `FROM_NETWORK_TYPES`; a test keeps them equal).
+const OTHER_NETWORK_TYPES: [&str; 10] = ["font", "image", "media", "object", "ping", "script", "stylesheet", "sub_frame", "websocket", "xhr"];
+/// A rule without this character has no options, hence no constraints.
+const OPTIONS_START: char = '$';
 
 /// The id of the user's own rules in reports and decisions.
 pub const USER_LIST: &str = "user";
@@ -247,7 +253,8 @@ impl RuleEngine {
     /// `$third-party` rule would decide a bare host (and block a site the
     /// user opened directly). The request is asked twice, as third-party and
     /// as first-party, and blocks only when both block: then the rule that
-    /// decided carries no party constraint.
+    /// decided carries no party constraint. Type constraints get the same
+    /// treatment (`closes_every_type`).
     ///
     /// Exceptions are always looked for, not only after a block rule matched:
     /// a user's allow entry lives in an engine with no block rule to match.
@@ -260,7 +267,7 @@ impl RuleEngine {
         let first = Request::preparsed(&third.url, &third.hostname, "", SYNTHETIC_TYPE, false, SYNTHETIC_METHOD);
         let as_third: BlockerResult = self.engine.check_network_request_subset(&third, false, true);
         let as_first: BlockerResult = self.engine.check_network_request_subset(&first, false, true);
-        if as_third.should_block() && as_first.should_block() {
+        if as_third.should_block() && as_first.should_block() && self.closes_every_type(&third, &as_third) {
             return self.after_block(&url, as_third, as_first);
         }
         let exception = as_third.exception.or(as_first.exception);
@@ -270,7 +277,24 @@ impl RuleEngine {
         HostDecision::NO_RULE
     }
 
-    /// The block path's third question: an `$important` rule stands, anything
+    /// Closing a host stops all its traffic, so block rules must cover every
+    /// request type from either party: `||host^$~image` and `||host^$other` say
+    /// less than that and wait for full URLs. Only block rules are asked about:
+    /// exceptions are `after_block`'s question. A decided rule with no options
+    /// covers them all by itself, so only a rule with options pays the questions
+    /// (20 of them would put the host p99 over the matcher's limit).
+    fn closes_every_type(&self, request: &Request, decided: &BlockerResult) -> bool {
+        let no_options = decided.filter.as_ref().and_then(|f| f.raw_line.as_deref()).is_some_and(|line| !line.contains(OPTIONS_START));
+        no_options
+            || OTHER_NETWORK_TYPES.iter().all(|kind| {
+                [true, false].into_iter().all(|third_party| {
+                    let asked = Request::preparsed(&request.url, &request.hostname, "", kind, third_party, SYNTHETIC_METHOD);
+                    self.engine.check_network_request_subset(&asked, false, false).filter.is_some()
+                })
+            })
+    }
+
+    /// The block path's last question: an `$important` rule stands, anything
     /// else yields to a `$document` exception on the host.
     fn after_block(&self, url: &str, as_third: BlockerResult, as_first: BlockerResult) -> HostDecision {
         let important = as_third.important && as_first.important;
@@ -319,6 +343,7 @@ impl RuleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adblock::filters::network::NetworkFilterMask;
     use proptest::prelude::*;
 
     /// The slice 1 acceptance fixture (plan section 9).
@@ -368,6 +393,50 @@ example.invalid##+js(set-constant, adsAllowed, true)
         let constrained = engine("||img.sieve-test.invalid^$image\n||fp.sieve-test.invalid^$1p\n");
         assert_eq!(verdict(&constrained, "img.sieve-test.invalid"), HostVerdict::None);
         assert_eq!(verdict(&constrained, "fp.sieve-test.invalid"), HostVerdict::None);
+    }
+
+    /// `||host^$~image` leaves images alone, so it may not close the host; the
+    /// same for every type, named or negated.
+    #[test]
+    fn a_rule_that_leaves_any_type_open_does_not_decide_a_host() {
+        let options = ["font", "image", "media", "object", "other", "ping", "script", "stylesheet", "subdocument", "websocket", "xhr"];
+        assert_eq!(options.len(), OTHER_NETWORK_TYPES.len() + 1);
+        for option in options {
+            assert_eq!(verdict(&engine(&format!("||x.example^$~{option}\n")), "x.example"), HostVerdict::None, "$~{option}");
+            assert_eq!(verdict(&engine(&format!("||x.example^${option}\n")), "x.example"), HostVerdict::None, "${option}");
+        }
+        assert_eq!(verdict(&engine("||x.example^$~image,~script\n"), "x.example"), HostVerdict::None);
+        assert_eq!(verdict(&engine("||x.example^$~image,important\n"), "x.example"), HostVerdict::None);
+    }
+
+    /// The types are asked as a question about the host, not about one rule.
+    #[test]
+    fn a_host_every_type_blocks_is_decided_whichever_rules_block_it() {
+        assert_eq!(verdict(&engine("||x.example^$~image\n||x.example^\n"), "x.example"), HostVerdict::Block, "a narrower rule first");
+        assert_eq!(verdict(&engine("||x.example^\n||x.example^$~image\n"), "x.example"), HostVerdict::Block, "a narrower rule last");
+        assert_eq!(verdict(&engine("||x.example^$~image\n||x.example^$image\n"), "x.example"), HostVerdict::Block, "together they cover every type");
+        assert_eq!(verdict(&engine("||x.example^$~image\n||x.example^$image,3p\n"), "x.example"), HostVerdict::None, "first-party images stay open");
+        assert_eq!(verdict(&engine("||x.example\n"), "x.example"), HostVerdict::Block, "no ^, no type constraint");
+    }
+
+    /// Pinned so a change of the library is seen.
+    #[test]
+    fn other_constraints_on_a_host_rule() {
+        // The parser refuses it, so it is a skipped rule and no decision.
+        let negated_document = engine("||x.example^$~document\n");
+        assert_eq!(verdict(&negated_document, "x.example"), HostVerdict::None);
+        assert_eq!(negated_document.reports()[0].skipped, 1);
+        // The library matches any exception on a `document` request, so a partial
+        // one opens the host (`after_block`): fewer blocks, never more.
+        assert_eq!(verdict(&engine("||x.example^\n@@||x.example^$image\n"), "x.example"), HostVerdict::Allow);
+        assert_eq!(verdict(&engine("||x.example^\n@@||x.example^$~image\n"), "x.example"), HostVerdict::Allow);
+        assert_eq!(verdict(&engine("||x.example^$domain=site.example\n"), "x.example"), HostVerdict::None);
+        assert_eq!(verdict(&engine("||x.example^$domain=~site.example\n"), "x.example"), HostVerdict::Block);
+    }
+
+    #[test]
+    fn the_types_asked_are_every_network_type_of_the_library() {
+        assert_eq!(NetworkFilterMask::FROM_NETWORK_TYPES.bits().count_ones() as usize, OTHER_NETWORK_TYPES.len() + 1, "+1 is {SYNTHETIC_TYPE}");
     }
 
     #[test]
