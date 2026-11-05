@@ -42,7 +42,7 @@ pub fn save(dir: &Path, policy: &Policy) -> Result<(), String> {
     write_atomic(&dir.join(POLICY_FILE), &serde_json::to_vec_pretty(policy).map_err(|e| e.to_string())?)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
