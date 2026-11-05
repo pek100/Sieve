@@ -18,8 +18,19 @@
 //! `sc.exe start "Adguard Service"`, from System32, with fixed arguments (no
 //! input from the web side reaches them). This is the app's only elevation,
 //! and law 8 holds it to exactly these two commands.
+//!
+//! What a stop ends at (observed live 2026-10-18): AdGuard stops filtering
+//! within about a second and leaves its service in StopPending for good, so
+//! `Stopped` may never come and StopPending is a finished pause. `sc start`
+//! cannot resume from there (it returns 1056), so the app offers Start only for
+//! a service that is really stopped. Whether AdGuard still intercepts is the
+//! engine's verdict (`Blocker::Adguard`), not this module's.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
+
+use crate::engine::ServiceFact;
 
 /// Process image names (lower case) that mean AdGuard for Windows is running.
 pub const ADGUARD_EXES: [&str; 2] = ["adguard.exe", "adguardsvc.exe"];
@@ -161,23 +172,27 @@ pub async fn adguard_running() -> Result<bool, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Whether the service reached where `action` ends (see the module docs).
+fn reached(action: ServiceAction, fact: ServiceFact) -> bool {
+    match action {
+        ServiceAction::Stop => matches!(fact, ServiceFact::Stopped | ServiceFact::Stopping),
+        ServiceAction::Start => fact == ServiceFact::Running,
+    }
+}
+
 /// Runs the action (elevated, the user approves) and waits until the service
 /// reached its end state, read only.
 #[cfg(windows)]
 fn change(action: ServiceAction) -> Result<(), String> {
-    use crate::engine::{ServiceFact, service_fact};
+    use crate::engine::service_fact;
     let code = imp::run_elevated_sc(action)?;
     if code != 0 && !SC_ALREADY.contains(&code) {
         return Err(format!("sc.exe {} ended with code {code}", action.sc_arguments()));
     }
-    let want = match action {
-        ServiceAction::Stop => ServiceFact::Stopped,
-        ServiceAction::Start => ServiceFact::Running,
-    };
     let deadline = Instant::now() + SERVICE_WAIT;
     loop {
         let now = service_fact(ADGUARD_SERVICE)?;
-        if now == want {
+        if reached(action, now) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -199,7 +214,7 @@ pub async fn adguard_stop() -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(|| change(ServiceAction::Stop)).await.map_err(|e| e.to_string())?
 }
 
-/// Command: "Start AdGuard again", the pause offer's undo.
+/// Command: "Start AdGuard again", offered only while its service is stopped.
 #[tauri::command]
 pub async fn adguard_start() -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(|| change(ServiceAction::Start)).await.map_err(|e| e.to_string())?
@@ -222,6 +237,22 @@ mod tests {
     fn the_pause_offer_runs_sc_with_fixed_arguments_only() {
         assert_eq!(ServiceAction::Stop.sc_arguments(), r#"stop "Adguard Service""#);
         assert_eq!(ServiceAction::Start.sc_arguments(), r#"start "Adguard Service""#);
+    }
+
+    #[test]
+    fn a_stop_ends_at_stopped_or_stopping_and_a_start_only_at_running() {
+        use ServiceFact::*;
+        for (fact, stop, start) in [
+            (Missing, false, false),
+            (Stopped, true, false),
+            (Starting, false, false),
+            (Stopping, true, false),
+            (Running, false, true),
+            (Other, false, false),
+        ] {
+            assert_eq!(reached(ServiceAction::Stop, fact), stop, "stop at {fact:?}");
+            assert_eq!(reached(ServiceAction::Start, fact), start, "start at {fact:?}");
+        }
     }
 
     #[test]
