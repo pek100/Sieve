@@ -17,14 +17,14 @@ async fn main() -> Result<(), String> {
         println!("{USAGE}");
         return Ok(());
     }
-    let service = coexist::adguard_service()?;
+    let (state, service) = coexist::adguard_service_state()?;
     let AdguardService::Alive { pid } = service else {
-        println!("{}", serde_json::json!({ "service": "not_running", "probed": false, "verdict": false }));
+        println!("{}", serde_json::json!({ "service": state, "probed": false, "verdict": false }));
         return Ok(());
     };
     let tables = read::tables()?;
     let Some(obs) = coexist::probe_adguard(&tables).await? else {
-        println!("{}", serde_json::json!({ "service": "alive", "pid": pid, "probed": false, "verdict": false, "no_egress": true }));
+        println!("{}", serde_json::json!({ "service": state, "pid": pid, "probed": false, "verdict": false, "no_egress": true }));
         return Ok(());
     };
     let row_text = |r: &OwnerRow| serde_json::json!({ "local": r.local.to_string(), "remote": r.remote.map(|a| a.to_string()), "pid": r.pid });
@@ -34,7 +34,7 @@ async fn main() -> Result<(), String> {
     println!(
         "{}",
         serde_json::json!({
-            "service": "alive",
+            "service": state,
             "pid": pid,
             "probed": true,
             "local": obs.local.to_string(),

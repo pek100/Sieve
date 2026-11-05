@@ -142,10 +142,37 @@ fn service_of(state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_ST
     }
 }
 
-/// AdGuard's service state and process, in one call, with connect and query
-/// access only. A service that does not exist is not running.
+/// The service state in the words of `fixtures/adguard-probe.json`, so a
+/// recorded line of the L1 tool can replace a constructed case.
+#[cfg(windows)]
+fn state_name(state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE) -> &'static str {
+    use windows::Win32::System::Services::{
+        SERVICE_CONTINUE_PENDING, SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STOP_PENDING,
+        SERVICE_STOPPED,
+    };
+    match state {
+        SERVICE_STOPPED => "stopped",
+        SERVICE_START_PENDING => "start_pending",
+        SERVICE_STOP_PENDING => "stop_pending",
+        SERVICE_RUNNING => "running",
+        SERVICE_CONTINUE_PENDING => "continue_pending",
+        SERVICE_PAUSE_PENDING => "pause_pending",
+        SERVICE_PAUSED => "paused",
+        _ => "unknown",
+    }
+}
+
+/// AdGuard's service as the probe sees it.
 #[cfg(windows)]
 pub fn adguard_service() -> Result<AdguardService, String> {
+    adguard_service_state().map(|(_, service)| service)
+}
+
+/// The state's name and the service it means, from one read of state and
+/// process, with connect and query access only. A service that does not exist
+/// is "absent" and not running.
+#[cfg(windows)]
+pub fn adguard_service_state() -> Result<(&'static str, AdguardService), String> {
     use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
     use windows::Win32::System::Services::{
         CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS,
@@ -158,7 +185,7 @@ pub fn adguard_service() -> Result<AdguardService, String> {
     unsafe {
         let scm = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT).map_err(|e| format!("service manager: {e}"))?;
         let result = match OpenServiceW(scm, &HSTRING::from(ADGUARD_SERVICE), SERVICE_QUERY_STATUS) {
-            Err(e) if e.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => Ok(AdguardService::NotRunning),
+            Err(e) if e.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => Ok(("absent", AdguardService::NotRunning)),
             Err(e) => Err(format!("{ADGUARD_SERVICE}: {e}")),
             Ok(service) => {
                 let mut status = SERVICE_STATUS_PROCESS::default();
@@ -166,7 +193,8 @@ pub fn adguard_service() -> Result<AdguardService, String> {
                 let mut needed = 0u32;
                 let read = QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, Some(bytes), &mut needed);
                 let _ = CloseServiceHandle(service);
-                read.map(|()| service_of(status.dwCurrentState, status.dwProcessId)).map_err(|e| format!("{ADGUARD_SERVICE} status: {e}"))
+                read.map(|()| (state_name(status.dwCurrentState), service_of(status.dwCurrentState, status.dwProcessId)))
+                    .map_err(|e| format!("{ADGUARD_SERVICE} status: {e}"))
             }
         };
         let _ = CloseServiceHandle(scm);
@@ -515,6 +543,26 @@ mod tests {
         #[test]
         fn adguards_service_is_readable_without_admin() {
             assert!(adguard_service().is_ok());
+            let (state, service) = adguard_service_state().unwrap();
+            assert_eq!(matches!(state, "stopped" | "absent"), service == AdguardService::NotRunning, "{state} {service:?}");
+        }
+
+        /// StopPending and Running both mean alive, and only the name tells them apart.
+        #[test]
+        fn every_service_state_has_its_own_name() {
+            let named = [
+                (SERVICE_STOPPED, "stopped"),
+                (SERVICE_START_PENDING, "start_pending"),
+                (SERVICE_STOP_PENDING, "stop_pending"),
+                (SERVICE_RUNNING, "running"),
+                (SERVICE_CONTINUE_PENDING, "continue_pending"),
+                (SERVICE_PAUSE_PENDING, "pause_pending"),
+                (SERVICE_PAUSED, "paused"),
+            ];
+            for (state, name) in named {
+                assert_eq!(state_name(state), name);
+            }
+            assert_eq!(state_name(windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE(0)), "unknown");
         }
 
         #[test]
