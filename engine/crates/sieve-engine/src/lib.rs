@@ -9,6 +9,7 @@
 //! - [`stack`]: the relay of every flow, with attribution (slice 3);
 //! - [`dns`]: DNS answers read into the IP-to-names map (slice 3);
 //! - [`coexist`]: AdGuard and VPN detection, read only (slice 3);
+//! - [`update`]: signed updates, the service as the only updater (slice 13);
 //! - [`watchdog`], [`policy`]: hang and crash-loop safety (slice 3);
 //! - [`control`]: the running engine's facts and its routing loop.
 //!
@@ -27,6 +28,7 @@ pub mod route;
 pub mod service;
 pub mod stack;
 pub mod tun;
+pub mod update;
 pub mod watchdog;
 
 #[cfg(test)]

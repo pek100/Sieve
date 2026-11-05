@@ -54,6 +54,10 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2.workspace = true
 
+# Signed updates (plan 7.5): verifies minisign signatures, no dependencies of
+# its own. Signing exists only in tests (dev-dependency `minisign`).
+minisign-verify = "0.2.5"
+
 # Userspace TCP/IP stack (vendored, see engine/vendor/ipstack/Cargo.toml).
 ipstack = "1.0.1"
 socket2 = "0.6"
@@ -89,6 +93,8 @@ windows = { workspace = true, features = [
 windows-service = "0.8.1"
 
 [dev-dependencies]
+# Tests sign with the real tool, with a key pair generated in memory (update::testing).
+minisign = "0.8.0"
 proptest.workspace = true
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

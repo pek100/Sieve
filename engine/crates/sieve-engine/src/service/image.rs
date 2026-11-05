@@ -626,6 +626,19 @@ mod tests {
         assert_eq!(verdict(&c), Ok(()));
     }
 
+    /// Slice 13: an update's staging folder and `.old` files inherit the lock,
+    /// so they pass the check the new engine runs at its start (real ACLs on a
+    /// real swap stay UNVERIFIED, docs/live/updates.md).
+    #[test]
+    fn staged_files_pass_the_folder_rule() {
+        let names = ["sieve.exe", "sieve-engine.exe", "sieve-engine.exe.old", "update-staging", MARKER_FILE];
+        let c = installed(r"E:\Sieve\sieve-engine.exe", &names, e_sieve_locked_file(), e_sieve_locked(), vec![e_root()]);
+        assert!(c.iter().any(|(p, ..)| p.ends_with("update-staging")), "the folder rule looks at it");
+        assert_eq!(verdict(&c), Ok(()));
+        let c = installed(r"E:\Sieve\sieve-engine.exe", &names, e_sieve_inherited_file(), e_sieve_locked(), vec![e_root()]);
+        assert!(verdict(&c).is_err(), "control: the same entries with a user's write right are refused");
+    }
+
     /// The live finding, 2026-10-18.
     #[test]
     fn an_e_drive_folder_inheriting_authenticated_users_modify_is_refused() {
