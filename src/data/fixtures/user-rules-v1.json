@@ -1,0 +1,28 @@
+{
+  "v": 1,
+  "rules": [
+    { "line": "", "ts": "blank", "parser": null },
+    { "line": "! a note to myself", "ts": "comment", "parser": null },
+    { "line": "example.com", "ts": "hint", "parser": null },
+    { "line": "||example.com^", "ts": "ok", "parser": null },
+    { "line": "@@||example.com^", "ts": "ok", "parser": null },
+    { "line": "##.ad", "ts": "ok", "parser": null },
+    { "line": "example.com##.ad", "ts": "ok", "parser": null },
+    { "line": "||example.com^$not-an-option", "ts": "ok", "parser": "network filter error: unrecognised option" },
+    { "line": "||exa mple.com^", "ts": "error", "parser": null },
+    { "line": "||", "ts": "error", "parser": null },
+    { "line": "##+js(trusted-x)", "ts": "error", "parser": "cosmetic filter error: generic script inject" },
+    { "line": "example.com##+js(trusted-x)", "ts": "error", "parser": null },
+    { "line": "##+js(", "ts": "error", "parser": null }
+  ],
+  "domains": [
+    { "raw": "https://WWW.Example.com/a?b", "host": "www.example.com" },
+    { "raw": "ads.example.com", "host": "ads.example.com" },
+    { "raw": "xn--bcher-kva.example", "host": "xn--bcher-kva.example" },
+    { "raw": "localhost", "host": null, "problem": "one-label" },
+    { "raw": "1.2.3.4", "host": null, "problem": "ip" },
+    { "raw": "a b.com", "host": null, "problem": "spaces" },
+    { "raw": "bad_char.com", "host": null, "problem": "characters" },
+    { "raw": "-bad.example", "host": null, "problem": "characters" }
+  ]
+}

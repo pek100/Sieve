@@ -17,8 +17,10 @@ pub mod adguard;
 pub mod commands;
 pub mod dns;
 pub mod engine;
+pub mod filters;
 pub mod history;
 pub mod icons;
+pub mod lock;
 pub mod netstat;
 pub mod protocol;
 pub mod tray;
@@ -32,12 +34,14 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .manage(dns::commands::DnsState::default())
         .manage(std::sync::Arc::new(engine::EngineFlows::default()))
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             app.manage(history::HistoryState::open_at(&dir));
             app.manage(icons::IconStore::open_at(&dir));
+            app.manage(lock::LockState::open_at(&dir));
             tray::install(app)?;
             #[cfg(windows)]
             tauri::async_runtime::spawn(engine::follow_flows(app.state::<std::sync::Arc<engine::EngineFlows>>().inner().clone()));
@@ -60,6 +64,12 @@ pub fn run() {
             engine::engine_probe,
             engine::engine_set_policy,
             windns::windows_dns,
+            filters::filter_catalogue,
+            filters::rule_check,
+            lock::lock_status,
+            lock::lock_verify,
+            lock::lock_set,
+            lock::lock_clear,
         ])
         .run(tauri::generate_context!());
     if let Err(e) = result {

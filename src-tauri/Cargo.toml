@@ -37,8 +37,24 @@ sieve-ipc = { path = "../engine/crates/sieve-ipc", features = ["tokio"] }
 # App icons (src/icons): the shell's icon of an exe, encoded as PNG for the UI.
 png = "0.18"
 
+# The filter catalogue and the rule parser (src/filters.rs): the engine's one
+# table and one parser, read here so the app never copies either.
+sieve-filter = { path = "../engine/crates/sieve-filter" }
+
+# The settings password (src/lock.rs): Argon2id, hash kept in the app data dir.
+argon2 = "0.6.0"
+
+# Desktop notifications, only when the user turns the setting on.
+tauri-plugin-notification = "2.8.0"
+
 [dev-dependencies]
 tempfile = "3"
+
+# Argon2id at its OWASP parameters is many times slower unoptimised, in tests and dev builds alike.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
 
 # Windows calls, all read only (Sieve never writes system network state):
 # the IP Helper owner-pid tables, process image names and file version info

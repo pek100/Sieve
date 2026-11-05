@@ -1,0 +1,40 @@
+{
+  "v": 1,
+  "examples": {
+    "pending": {
+      "v": 1,
+      "lists": [
+        { "id": "adguard-base", "title": "AdGuard Base filter", "url": "https://filters.adtidy.org/extension/ublock/filters/2.txt", "licence": "GPL-3.0-only", "default": "on", "trusted": true, "report": null },
+        { "id": "adguard-tracking", "title": "AdGuard Tracking Protection", "url": "https://filters.adtidy.org/extension/ublock/filters/3.txt", "licence": "GPL-3.0-only", "default": "on", "trusted": true, "report": null },
+        { "id": "adguard-url-tracking", "title": "AdGuard URL Tracking", "url": "https://filters.adtidy.org/extension/ublock/filters/17.txt", "licence": "GPL-3.0-only", "default": "on", "trusted": true, "report": null },
+        { "id": "adguard-dns", "title": "AdGuard DNS filter", "url": "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt", "licence": "GPL-3.0-only", "default": "on", "trusted": true, "report": null },
+        { "id": "ubo-filters", "title": "uBlock filters", "url": "https://ublockorigin.github.io/uAssets/filters/filters.txt", "licence": "GPL-3.0-only", "default": "gated", "trusted": true, "report": null },
+        { "id": "ubo-quick-fixes", "title": "uBlock filters: Quick fixes", "url": "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt", "licence": "GPL-3.0-only", "default": "gated", "trusted": true, "report": null },
+        { "id": "ubo-unbreak", "title": "uBlock filters: Unbreak", "url": "https://ublockorigin.github.io/uAssets/filters/unbreak.txt", "licence": "GPL-3.0-only", "default": "gated", "trusted": true, "report": null },
+        { "id": "adguard-cookies", "title": "AdGuard Annoyances: cookie notices", "url": "https://filters.adtidy.org/extension/ublock/filters/18.txt", "licence": "GPL-3.0-only", "default": "off", "trusted": true, "report": null },
+        { "id": "adguard-popups", "title": "AdGuard Annoyances: popups", "url": "https://filters.adtidy.org/extension/ublock/filters/19.txt", "licence": "GPL-3.0-only", "default": "off", "trusted": true, "report": null },
+        { "id": "adguard-mobile", "title": "AdGuard Annoyances: mobile app banners", "url": "https://filters.adtidy.org/extension/ublock/filters/20.txt", "licence": "GPL-3.0-only", "default": "off", "trusted": true, "report": null },
+        { "id": "adguard-other", "title": "AdGuard Annoyances: other", "url": "https://filters.adtidy.org/extension/ublock/filters/21.txt", "licence": "GPL-3.0-only", "default": "off", "trusted": true, "report": null },
+        { "id": "adguard-widgets", "title": "AdGuard Annoyances: widgets", "url": "https://filters.adtidy.org/extension/ublock/filters/22.txt", "licence": "GPL-3.0-only", "default": "off", "trusted": true, "report": null }
+      ]
+    },
+    "loaded": {
+      "v": 1,
+      "lists": [
+        { "id": "adguard-base", "title": "AdGuard Base filter", "url": "https://filters.adtidy.org/extension/ublock/filters/2.txt", "licence": "GPL-3.0-only", "default": "on", "trusted": true, "report": { "applied": 48211, "skipped": 12, "reasons": { "network filter error: unrecognised option": 9, "cosmetic filter error: invalid css selector": 3 } } },
+        { "id": "adguard-tracking", "title": "AdGuard Tracking Protection", "url": "https://filters.adtidy.org/extension/ublock/filters/3.txt", "licence": "GPL-3.0-only", "default": "on", "trusted": true, "report": { "applied": 21874, "skipped": 0, "reasons": {} } },
+        { "id": "adguard-url-tracking", "title": "AdGuard URL Tracking", "url": "https://filters.adtidy.org/extension/ublock/filters/17.txt", "licence": "GPL-3.0-only", "default": "on", "trusted": true, "report": { "applied": 1502, "skipped": 4, "reasons": { "network filter error: removeparam regex unsupported": 4 } } },
+        { "id": "adguard-dns", "title": "AdGuard DNS filter", "url": "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt", "licence": "GPL-3.0-only", "default": "on", "trusted": true, "report": { "applied": 73490, "skipped": 0, "reasons": {} } },
+        { "id": "ubo-filters", "title": "uBlock filters", "url": "https://ublockorigin.github.io/uAssets/filters/filters.txt", "licence": "GPL-3.0-only", "default": "gated", "trusted": true, "report": null },
+        { "id": "ubo-quick-fixes", "title": "uBlock filters: Quick fixes", "url": "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt", "licence": "GPL-3.0-only", "default": "gated", "trusted": true, "report": null },
+        { "id": "ubo-unbreak", "title": "uBlock filters: Unbreak", "url": "https://ublockorigin.github.io/uAssets/filters/unbreak.txt", "licence": "GPL-3.0-only", "default": "gated", "trusted": true, "report": null },
+        { "id": "adguard-cookies", "title": "AdGuard Annoyances: cookie notices", "url": "https://filters.adtidy.org/extension/ublock/filters/18.txt", "licence": "GPL-3.0-only", "default": "off", "trusted": true, "report": null },
+        { "id": "adguard-popups", "title": "AdGuard Annoyances: popups", "url": "https://filters.adtidy.org/extension/ublock/filters/19.txt", "licence": "GPL-3.0-only", "default": "off", "trusted": true, "report": null },
+        { "id": "adguard-mobile", "title": "AdGuard Annoyances: mobile app banners", "url": "https://filters.adtidy.org/extension/ublock/filters/20.txt", "licence": "GPL-3.0-only", "default": "off", "trusted": true, "report": null },
+        { "id": "adguard-other", "title": "AdGuard Annoyances: other", "url": "https://filters.adtidy.org/extension/ublock/filters/21.txt", "licence": "GPL-3.0-only", "default": "off", "trusted": true, "report": null },
+        { "id": "adguard-widgets", "title": "AdGuard Annoyances: widgets", "url": "https://filters.adtidy.org/extension/ublock/filters/22.txt", "licence": "GPL-3.0-only", "default": "off", "trusted": true, "report": null }
+      ]
+    },
+    "empty": { "v": 1, "lists": [] }
+  }
+}
