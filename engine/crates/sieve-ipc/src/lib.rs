@@ -12,7 +12,8 @@
 //!   change; [`ClientMessage::Subscribe`] turns the connection into an event
 //!   stream of [`EngineMessage::Flows`] batches, every [`FLOWS_BATCH_MS`].
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
-//!   commit (v2, slice 3: policy, flows, coexistence and counters).
+//!   commit (v2, slice 3: policy, flows, coexistence and counters; v3, slice 4:
+//!   the `log` message and the status's filter facts).
 //!
 //! There is no operation that signs anything, exports a key or names a
 //! certificate to mint (plan 7.2), and there never will be.
@@ -23,9 +24,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 /// The oldest and newest protocol versions this build accepts.
-pub const SUPPORTED: [u32; 2] = [2, 2];
+pub const SUPPORTED: [u32; 2] = [3, 3];
 pub const PIPE_NAME: &str = r"\\.\pipe\sieve-engine";
 /// Largest frame body in bytes (1 MiB).
 pub const MAX_FRAME: usize = 1 << 20;
@@ -34,11 +35,17 @@ pub const FLOWS_BATCH_MS: u64 = 250;
 /// At most this many flow events per `flows` frame; a larger batch is split,
 /// so a frame stays far under [`MAX_FRAME`] (an event is a few hundred bytes).
 pub const FLOWS_PER_FRAME: usize = 500;
+/// At most this many log rows per `log` frame; a larger batch is split.
+pub const LOG_PER_FRAME: usize = 200;
+/// The engine truncates a row's URL and rule to these, so a full `log` frame
+/// fits [`MAX_FRAME`].
+pub const LOG_URL_MAX: usize = 2048;
+pub const LOG_RULE_MAX: usize = 1024;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
 pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe"];
 /// The `type` names of [`EngineMessage`], in declaration order.
-pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows"];
+pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "log"];
 
 /// App to engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +79,9 @@ pub enum EngineMessage {
     Error { message: String },
     /// Flows that opened, moved bytes or closed since the last batch.
     Flows { flows: Vec<FlowEvent> },
+    /// What the filter did since the last batch, on the Subscribe connection,
+    /// session scoped like flows (plan 8.3).
+    Log { rows: Vec<LogRow> },
 }
 
 /// The user's switches as the engine holds them (`policy.json`).
@@ -142,6 +152,34 @@ pub struct EngineStatus {
     /// Sieve, which the app states (plan 1.7).
     pub split_tunnels: Vec<String>,
     pub counters: Counters,
+    /// What it filters with; None until it holds compiled lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterFacts>,
+}
+
+/// What the engine filters with, as the app shows it. The catalogue stays in
+/// `sieve-filter`, which the app does not link; only its facts cross the pipe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilterFacts {
+    pub lists: Vec<ListFact>,
+    /// The resource library's pin (plan 8.4).
+    pub resource_pin: Option<String>,
+}
+
+/// One filter list as the engine compiled it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListFact {
+    /// The catalogue's id.
+    pub id: String,
+    pub title: String,
+    /// The list's public project page; its issue page derives from it.
+    pub homepage: String,
+    /// The list's own `! Version:`.
+    pub version: Option<String>,
+    pub applied: u64,
+    pub skipped: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +232,48 @@ pub struct FlowEvent {
     pub bytes_down: u64,
     /// False in the last event of a flow.
     pub open: bool,
+}
+
+/// What the filter did with one request or flow (plan 8.3). A reason is a
+/// slug the app turns into words; later slices add reasons with no bump.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LogOutcome {
+    Blocked,
+    Redirected,
+    ParamsRemoved,
+    Hidden { elements: u32 },
+    Scriptlets { count: u32 },
+    Passed { reason: String },
+    NotDecrypted { reason: String },
+}
+
+/// One row of the filtering log. A host-level row leaves `url` and
+/// `request_type` null.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogRow {
+    /// Unique for the engine's run.
+    pub id: u64,
+    /// When, ms since the Unix epoch.
+    pub t: u64,
+    pub flow_id: u64,
+    pub pid: Option<u32>,
+    pub exe: Option<String>,
+    pub session: Option<u32>,
+    pub kind: FlowKind,
+    /// The name, else the remote IP.
+    pub host: String,
+    /// The far end, `ip:port` (`[v6]:port`).
+    pub remote: String,
+    /// At most [`LOG_URL_MAX`] bytes.
+    pub url: Option<String>,
+    pub request_type: Option<String>,
+    pub outcome: LogOutcome,
+    /// At most [`LOG_RULE_MAX`] bytes.
+    pub rule: Option<String>,
+    /// A catalogue id, or `user`.
+    pub list: Option<String>,
 }
 
 /// The engine's answer to a client's Hello.
@@ -306,6 +386,9 @@ mod tests {
         assert_eq!(f["maxFrame"], MAX_FRAME);
         assert_eq!(f["flowsBatchMs"], FLOWS_BATCH_MS);
         assert_eq!(f["flowsPerFrame"], FLOWS_PER_FRAME);
+        assert_eq!(f["logPerFrame"], LOG_PER_FRAME);
+        assert_eq!(f["logUrlMax"], LOG_URL_MAX);
+        assert_eq!(f["logRuleMax"], LOG_RULE_MAX);
         assert_eq!(types(&f["client"]), CLIENT_TYPES);
         assert_eq!(types(&f["engine"]), ENGINE_TYPES);
     }
@@ -347,6 +430,7 @@ mod tests {
             EngineMessage::Status(_) => "status",
             EngineMessage::Error { .. } => "error",
             EngineMessage::Flows { .. } => "flows",
+            EngineMessage::Log { .. } => "log",
         };
         let f = fixture();
         for m in f["client"].as_array().unwrap() {
@@ -443,6 +527,72 @@ mod tests {
         }
     }
 
+    /// Every outcome kind round trips, so the TS law sees each wire name, and
+    /// a new variant fails here until it has a fixture example.
+    #[test]
+    fn every_fixture_outcome_round_trips_and_every_kind_is_shown() {
+        let f = fixture();
+        let outcomes = f["outcomes"].as_array().unwrap();
+        let name = |o: &LogOutcome| match o {
+            LogOutcome::Blocked => "blocked",
+            LogOutcome::Redirected => "redirected",
+            LogOutcome::ParamsRemoved => "params_removed",
+            LogOutcome::Hidden { .. } => "hidden",
+            LogOutcome::Scriptlets { .. } => "scriptlets",
+            LogOutcome::Passed { .. } => "passed",
+            LogOutcome::NotDecrypted { .. } => "not_decrypted",
+        };
+        let mut seen = Vec::new();
+        for o in outcomes {
+            let parsed: LogOutcome = serde_json::from_value(o.clone()).unwrap();
+            assert_eq!(&serde_json::to_value(&parsed).unwrap(), o);
+            assert_eq!(name(&parsed), o["kind"]);
+            seen.push(name(&parsed));
+        }
+        seen.dedup();
+        assert_eq!(seen, ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted"]);
+    }
+
+    /// The status's filter facts are additive: without them the wire is as
+    /// before, so a status with none round trips with no `filter` key.
+    #[test]
+    fn filter_facts_are_absent_until_the_engine_holds_lists() {
+        let none = serde_json::to_value(EngineMessage::Status(EngineStatus::default())).unwrap();
+        assert!(none.get("filter").is_none());
+        let facts = FilterFacts {
+            lists: vec![ListFact { id: "a".into(), title: "A".into(), homepage: "https://a.example/a".into(), version: None, applied: 1, skipped: 0 }],
+            resource_pin: Some("sha256:0".into()),
+        };
+        let some = EngineMessage::Status(EngineStatus { filter: Some(facts), ..EngineStatus::default() });
+        let wire = serde_json::to_value(&some).unwrap();
+        assert_eq!(wire["filter"]["lists"][0]["homepage"], "https://a.example/a");
+        assert_eq!(serde_json::from_value::<EngineMessage>(wire).unwrap(), some);
+    }
+
+    /// The caps are what makes this true: a full frame of rows at every cap.
+    #[test]
+    fn a_full_log_frame_at_the_caps_stays_under_the_frame_limit() {
+        let row = LogRow {
+            id: u64::MAX,
+            t: u64::MAX,
+            flow_id: u64::MAX,
+            pid: Some(u32::MAX),
+            exe: Some(format!(r"C:\{}\app.exe", "d".repeat(250))),
+            session: Some(u32::MAX),
+            kind: FlowKind::Tls,
+            host: "h".repeat(253),
+            remote: "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535".into(),
+            url: Some("u".repeat(LOG_URL_MAX)),
+            request_type: Some("xmlhttprequest".into()),
+            outcome: LogOutcome::NotDecrypted { reason: "r".repeat(64) },
+            rule: Some("r".repeat(LOG_RULE_MAX)),
+            list: Some("adguard-url-tracking".into()),
+        };
+        let msg = EngineMessage::Log { rows: vec![row; LOG_PER_FRAME] };
+        let frame = encode(&msg).unwrap();
+        assert!(frame.len() <= MAX_FRAME, "{}", frame.len());
+    }
+
     #[test]
     fn a_full_flows_frame_stays_under_the_frame_limit() {
         let ev = FlowEvent {
@@ -470,7 +620,7 @@ mod tests {
             answer_hello(PROTOCOL, "0.1.0", 3),
             EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 3 }
         );
-        for v in [0, 1, 3, u32::MAX] {
+        for v in [0, 1, 2, 4, u32::MAX] {
             assert_eq!(answer_hello(v, "0.1.0", 3), EngineMessage::Incompatible { supported: SUPPORTED }, "v{v}");
         }
     }

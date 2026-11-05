@@ -1,19 +1,22 @@
 {
-  "protocol": 2,
-  "supported": [2, 2],
+  "protocol": 3,
+  "supported": [3, 3],
   "pipe": "\\\\.\\pipe\\sieve-engine",
   "maxFrame": 1048576,
   "flowsBatchMs": 250,
   "flowsPerFrame": 500,
+  "logPerFrame": 200,
+  "logUrlMax": 2048,
+  "logRuleMax": 1024,
   "client": [
-    { "type": "hello", "protocol": 2, "app_version": "0.1.0" },
+    { "type": "hello", "protocol": 3, "app_version": "0.1.0" },
     { "type": "status" },
     { "type": "set_policy", "revision": 3, "engine": true },
     { "type": "subscribe" }
   ],
   "engine": [
-    { "type": "welcome", "protocol": 2, "engine_version": "0.1.0", "session_id": 1 },
-    { "type": "incompatible", "supported": [2, 2] },
+    { "type": "welcome", "protocol": 3, "engine_version": "0.1.0", "session_id": 1 },
+    { "type": "incompatible", "supported": [3, 3] },
     {
       "type": "status",
       "filtering": true,
@@ -114,7 +117,55 @@
           "open": true
         }
       ]
+    },
+    {
+      "type": "log",
+      "rows": [
+        {
+          "id": 1,
+          "t": 1760000000000,
+          "flow_id": 7,
+          "pid": 4242,
+          "exe": "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+          "session": 1,
+          "kind": "tls",
+          "host": "example.com",
+          "remote": "192.0.2.14:443",
+          "url": null,
+          "request_type": null,
+          "outcome": { "kind": "blocked" },
+          "rule": "||example.com^",
+          "list": "adguard-base"
+        },
+        {
+          "id": 2,
+          "t": 1760000001000,
+          "flow_id": 8,
+          "pid": null,
+          "exe": null,
+          "session": null,
+          "kind": "other",
+          "host": "198.51.100.25",
+          "remote": "198.51.100.25:25",
+          "url": null,
+          "request_type": null,
+          "outcome": { "kind": "passed", "reason": "app_off" },
+          "rule": null,
+          "list": null
+        }
+      ]
     }
+  ],
+  "outcomes": [
+    { "kind": "blocked" },
+    { "kind": "redirected" },
+    { "kind": "params_removed" },
+    { "kind": "hidden", "elements": 3 },
+    { "kind": "scriptlets", "count": 2 },
+    { "kind": "passed", "reason": "no_rule" },
+    { "kind": "passed", "reason": "exception" },
+    { "kind": "passed", "reason": "app_off" },
+    { "kind": "not_decrypted", "reason": "no_rule" }
   ],
   "blockers": [
     { "kind": "adguard", "service": "Adguard Service" },

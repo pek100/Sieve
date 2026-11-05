@@ -197,6 +197,7 @@ impl Backend for Engine {
             blocker,
             split_tunnels: f.split_tunnels,
             counters: self.meters.counters(),
+            filter: None,
         }
     }
 

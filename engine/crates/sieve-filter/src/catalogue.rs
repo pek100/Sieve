@@ -22,9 +22,13 @@ pub struct List {
     pub licence: &'static str,
     pub default: Default,
     pub trusted: bool,
+    /// The list's public project page; a report's issue page derives from it (plan 8.4).
+    pub homepage: &'static str,
 }
 
 const UBO_SLICE: &str = "slice 10 (YouTube acceptance, two arms)";
+const ADGUARD_HOME: &str = "https://github.com/AdguardTeam/AdguardFilters";
+const UASSETS_HOME: &str = "https://github.com/uBlockOrigin/uAssets";
 
 macro_rules! adguard {
     ($id:literal, $title:literal, $n:literal, $default:expr) => {
@@ -35,6 +39,7 @@ macro_rules! adguard {
             licence: "GPL-3.0-only",
             default: $default,
             trusted: true,
+            homepage: ADGUARD_HOME,
         }
     };
 }
@@ -48,6 +53,7 @@ macro_rules! uassets {
             licence: "GPL-3.0-only",
             default: $default,
             trusted: true,
+            homepage: UASSETS_HOME,
         }
     };
 }
@@ -64,6 +70,7 @@ pub const LISTS: &[List] = &[
         licence: "GPL-3.0-only",
         default: Default::On,
         trusted: true,
+        homepage: "https://github.com/AdguardTeam/AdGuardSDNSFilter",
     },
     uassets!("ubo-filters", "uBlock filters", "filters.txt", Default::Gated(UBO_SLICE)),
     uassets!("ubo-quick-fixes", "uBlock filters: Quick fixes", "quick-fixes.txt", Default::Gated(UBO_SLICE)),
@@ -105,6 +112,22 @@ mod tests {
         }
         assert!(LISTS.iter().filter(|l| l.url.starts_with(ADGUARD_UBO)).count() >= 3);
         assert!(LISTS.iter().filter(|l| l.url.starts_with(UASSETS)).count() == 3);
+    }
+
+    /// The app derives the issue page from this, and may open only these owners
+    /// (src-tauri/capabilities/default.json).
+    #[test]
+    fn every_homepage_is_https_on_an_owner_the_app_may_open() {
+        for l in LISTS {
+            assert!(
+                l.homepage.starts_with("https://github.com/AdguardTeam/") || l.homepage.starts_with("https://github.com/uBlockOrigin/"),
+                "{}",
+                l.id
+            );
+            assert!(!l.homepage.ends_with('/'), "{}", l.id);
+        }
+        assert_eq!(find("adguard-base").map(|l| l.homepage), Some(ADGUARD_HOME));
+        assert_eq!(find("ubo-filters").map(|l| l.homepage), Some(UASSETS_HOME));
     }
 
     #[test]

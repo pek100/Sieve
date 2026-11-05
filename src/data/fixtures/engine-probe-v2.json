@@ -46,6 +46,34 @@
         }
       }
     },
+    "hosts": {
+      "v": 2,
+      "service": "running",
+      "adguard": "stopped",
+      "pipe": {
+        "kind": "welcome",
+        "engine_version": "0.1.0",
+        "session_id": 1,
+        "status": {
+          "filtering": true,
+          "routes_up": true,
+          "flows": 42,
+          "decrypting": false,
+          "last_error": null,
+          "policy": { "revision": 2, "engine": true },
+          "blocker": null,
+          "split_tunnels": [],
+          "counters": { "flows": 1200, "attributed": 1188, "own_refused": 0, "dns_answers": 310, "packets_in": 90000, "packets_out": 88000, "not_unicast": 51 },
+          "filter": {
+            "lists": [
+              { "id": "adguard-base", "title": "AdGuard Base filter", "homepage": "https://github.com/AdguardTeam/AdguardFilters", "version": "2.3.72", "applied": 90000, "skipped": 120 },
+              { "id": "ubo-filters", "title": "uBlock filters", "homepage": "https://github.com/uBlockOrigin/uAssets", "version": null, "applied": 52000, "skipped": 7 }
+            ],
+            "resource_pin": "sha256:0f4e2c7a"
+          }
+        }
+      }
+    },
     "adguard": {
       "v": 2,
       "service": "running",
