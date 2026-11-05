@@ -161,6 +161,8 @@ mod tests {
     fn assert_contained(payload: &str) {
         let parsed = parse(payload);
         assert_eq!(parsed.elements, ["style", "script"], "{payload}");
+        // An early `</script>` can leave the same two elements, but cuts the text.
+        assert!(parsed.script_text.ends_with("})();"), "{payload}");
         assert!(payload.is_ascii(), "{payload}");
         assert!(payload.ends_with("</script>"), "{payload}");
     }
