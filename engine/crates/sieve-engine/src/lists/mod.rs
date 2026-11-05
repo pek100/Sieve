@@ -158,13 +158,19 @@ impl Lists {
             let answer = tokio::time::timeout(FETCH_TIMEOUT, fetcher.fetch(list.url, state.conditional_headers())).await;
             match answer {
                 Ok(Ok(response)) => {
-                    if let Applied::Replaced(text) = state.apply(response, now_ms)
-                        && let Some(cache) = &self.cache
-                    {
-                        match cache.write_text(list.id, &text) {
-                            Ok(()) => replaced = true,
-                            Err(why) => state.failed(why, now_ms),
+                    // The state describes the copy on disk, so a new one only
+                    // counts once it is written.
+                    let mut next = state.clone();
+                    let written = match (next.apply(response, now_ms), &self.cache) {
+                        (Applied::Replaced(text), Some(cache)) => cache.write_text(list.id, &text).map(|()| true),
+                        _ => Ok(false),
+                    };
+                    match written {
+                        Ok(wrote) => {
+                            state = next;
+                            replaced |= wrote;
                         }
+                        Err(why) => state.failed(why, now_ms),
                     }
                 }
                 Ok(Err(why)) => state.failed(why, now_ms),
@@ -372,6 +378,55 @@ mod tests {
         assert!(!l.fetch_due(&hang, now).await);
         assert!(state(&l, LIST_A).last_error.unwrap().contains("no answer"));
         assert_eq!(Cache::new(dir.path()).read_text(LIST_A).as_deref(), Some(BODY));
+    }
+
+    /// `<id>.txt` as a directory makes the rename of the new copy fail.
+    fn block_the_copy(dir: &Path) -> std::path::PathBuf {
+        let copy = dir.join(cache::FOLDER).join(format!("{LIST_A}.txt"));
+        std::fs::create_dir_all(&copy).unwrap();
+        copy
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_cannot_be_written_is_a_failed_attempt_with_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = block_the_copy(dir.path());
+        let l = lists_at(dir.path(), &[LIST_A]);
+        assert!(!l.fetch_due(&FakeFetcher::answering(LIST_A, vec![ok(BODY)]), 1_000).await, "nothing to compile");
+        let s = state(&l, LIST_A);
+        assert_eq!((s.etag.as_deref(), s.fetched_at_ms, s.failed_at_ms), (None, None, Some(1_000)));
+        assert!(s.last_error.is_some());
+
+        let retry_at = 1_000 + NO_COPY_RETRY.as_millis() as u64;
+        let f = FakeFetcher::answering(LIST_A, vec![ok(BODY)]);
+        assert!(!l.fetch_due(&f, retry_at - 1).await);
+        assert!(f.asked_urls().is_empty(), "not before the retry");
+        std::fs::remove_dir(&copy).unwrap();
+        assert!(l.fetch_due(&f, retry_at).await);
+        assert!(f.asked.lock().unwrap()[0].1.is_empty(), "an ETag now would earn a 304 and no list");
+        assert_eq!(Cache::new(dir.path()).read_text(LIST_A).as_deref(), Some(BODY));
+        assert_eq!(state(&l, LIST_A).last_error, None);
+    }
+
+    #[tokio::test]
+    async fn a_new_copy_that_cannot_be_written_keeps_the_state_of_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = lists_at(dir.path(), &[LIST_A]);
+        l.fetch_due(&FakeFetcher::answering(LIST_A, vec![ok(BODY)]), 0).await;
+        let old = state(&l, LIST_A);
+        let copy = dir.path().join(cache::FOLDER).join(format!("{LIST_A}.txt"));
+        std::fs::remove_file(&copy).unwrap();
+        block_the_copy(dir.path());
+
+        let at = 12 * HOUR_MS;
+        let new = Ok(FetchResponse { status: 200, etag: Some("\"v2\"".into()), body: BODY_2.as_bytes().to_vec(), ..FetchResponse::default() });
+        assert!(!l.fetch_due(&FakeFetcher::answering(LIST_A, vec![new]), at).await);
+        let s = state(&l, LIST_A);
+        assert_eq!((s.etag, s.fetched_at_ms, s.refresh), (old.etag, old.fetched_at_ms, old.refresh), "the state describes the copy on disk");
+        assert_eq!(s.failed_at_ms, Some(at));
+        assert!(s.last_error.is_some());
+        let saved = std::fs::read_to_string(dir.path().join(cache::FOLDER).join(format!("{LIST_A}.json"))).unwrap();
+        assert!(saved.contains("v1") && !saved.contains("v2"), "{saved}");
     }
 
     #[tokio::test]
