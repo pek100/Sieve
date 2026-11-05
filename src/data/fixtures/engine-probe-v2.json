@@ -1,11 +1,11 @@
 {
-  "v": 2,
+  "v": 3,
   "examples": {
-    "missing": { "v": 2, "service": "missing", "adguard": "missing", "pipe": null },
-    "stopped": { "v": 2, "service": "stopped", "adguard": "running", "pipe": null },
-    "starting": { "v": 2, "service": "starting", "adguard": "missing", "pipe": null },
+    "missing": { "v": 3, "service": "missing", "adguard": "missing", "pipe": null },
+    "stopped": { "v": 3, "service": "stopped", "adguard": "running", "pipe": null },
+    "starting": { "v": 3, "service": "starting", "adguard": "missing", "pipe": null },
     "idle": {
-      "v": 2,
+      "v": 3,
       "service": "running",
       "adguard": "missing",
       "pipe": {
@@ -18,7 +18,7 @@
           "flows": 0,
           "decrypting": false,
           "last_error": null,
-          "policy": { "revision": 0, "engine": false },
+          "policy": { "revision": 0, "engine": false, "https": false },
           "blocker": null,
           "split_tunnels": [],
           "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
@@ -26,7 +26,7 @@
       }
     },
     "filtering": {
-      "v": 2,
+      "v": 3,
       "service": "running",
       "adguard": "stopped",
       "pipe": {
@@ -39,7 +39,7 @@
           "flows": 42,
           "decrypting": false,
           "last_error": null,
-          "policy": { "revision": 2, "engine": true },
+          "policy": { "revision": 2, "engine": true, "https": false },
           "blocker": null,
           "split_tunnels": ["Corp VPN"],
           "counters": { "flows": 1200, "attributed": 1188, "own_refused": 0, "dns_answers": 310, "packets_in": 90000, "packets_out": 88000, "not_unicast": 51 }
@@ -47,7 +47,7 @@
       }
     },
     "adguard": {
-      "v": 2,
+      "v": 3,
       "service": "running",
       "adguard": "running",
       "pipe": {
@@ -60,7 +60,7 @@
           "flows": 0,
           "decrypting": false,
           "last_error": null,
-          "policy": { "revision": 2, "engine": true },
+          "policy": { "revision": 2, "engine": true, "https": false },
           "blocker": { "kind": "adguard", "service": "Adguard Service" },
           "split_tunnels": [],
           "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
@@ -68,7 +68,7 @@
       }
     },
     "vpn": {
-      "v": 2,
+      "v": 3,
       "service": "running",
       "adguard": "missing",
       "pipe": {
@@ -81,7 +81,7 @@
           "flows": 0,
           "decrypting": false,
           "last_error": null,
-          "policy": { "revision": 2, "engine": true },
+          "policy": { "revision": 2, "engine": true, "https": false },
           "blocker": { "kind": "vpn", "adapter": "AdGuard VPN" },
           "split_tunnels": [],
           "counters": { "flows": 300, "attributed": 297, "own_refused": 0, "dns_answers": 80, "packets_in": 20000, "packets_out": 19000, "not_unicast": 4 }
@@ -89,7 +89,7 @@
       }
     },
     "crash_loop": {
-      "v": 2,
+      "v": 3,
       "service": "running",
       "adguard": "missing",
       "pipe": {
@@ -102,7 +102,7 @@
           "flows": 0,
           "decrypting": false,
           "last_error": "the watchdog stopped the engine: the relay did not answer for 5000 ms",
-          "policy": { "revision": 2, "engine": true },
+          "policy": { "revision": 2, "engine": true, "https": false },
           "blocker": { "kind": "crash_loop", "starts": 3 },
           "split_tunnels": [],
           "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
@@ -110,7 +110,7 @@
       }
     },
     "setup": {
-      "v": 2,
+      "v": 3,
       "service": "running",
       "adguard": "missing",
       "pipe": {
@@ -123,22 +123,22 @@
           "flows": 0,
           "decrypting": false,
           "last_error": null,
-          "policy": { "revision": 2, "engine": true },
+          "policy": { "revision": 2, "engine": true, "https": false },
           "blocker": { "kind": "setup", "message": "wintun.dll: SHA-256 does not match the pinned 0.14.1 build" },
           "split_tunnels": [],
           "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
         }
       }
     },
-    "incompatible": { "v": 2, "service": "running", "adguard": "missing", "pipe": { "kind": "incompatible", "supported": [3, 3] } },
+    "incompatible": { "v": 3, "service": "running", "adguard": "missing", "pipe": { "kind": "incompatible", "supported": [4, 4] } },
     "refused": {
-      "v": 2,
+      "v": 3,
       "service": "running",
       "adguard": "missing",
       "pipe": { "kind": "refused", "message": "only the installed Sieve app may connect to the engine" }
     },
     "unreachable": {
-      "v": 2,
+      "v": 3,
       "service": "running",
       "adguard": "missing",
       "pipe": { "kind": "unreachable", "message": "The system cannot find the file specified. (os error 2)" }

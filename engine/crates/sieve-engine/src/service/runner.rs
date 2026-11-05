@@ -13,6 +13,10 @@
 //!
 //! A panic on any thread but a flow worker deletes Sieve's routes before the
 //! process dies (plan 1.6.6); a flow task's panic ends that flow only.
+//!
+//! Started with [`PURGE_ARG`] (by `uninstall` only, as SYSTEM is the one
+//! account the key's DACL admits), after the same folder check it deletes the
+//! recorded CA keys and stops: no routing, no pipe.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -28,7 +32,10 @@ use windows_service::{define_windows_service, service_dispatcher};
 use super::acl::pipe_sddl;
 use super::image::check_this_exe;
 use super::{EXIT_UNSAFE_FOLDER, EXIT_WATCHDOG, SERVICE_NAME, state};
-use crate::control::{Engine, routing};
+use crate::ca::removal::{PURGE_ARG, purge_keys};
+use crate::ca::win::{CngKeyStore, RegistryFirefoxPolicy, WindowsRootStore};
+use crate::ca::{Ca, Seams};
+use crate::control::{Engine, certs, routing};
 use crate::ipc::server;
 use crate::policy::{self, crash_loop};
 use crate::route::apply::clear_stale;
@@ -61,7 +68,21 @@ fn system32_only() {
     let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
 }
 
-fn service_main(_args: Vec<OsString>) {
+/// The CA over the real system. A failure here means no root and no
+/// interception; the engine still runs.
+fn real_ca(dir: &std::path::Path) -> Result<Arc<Ca>, crate::ca::CaError> {
+    let seams = Seams { keys: Arc::new(CngKeyStore), store: Arc::new(WindowsRootStore), firefox: Arc::new(RegistryFirefoxPolicy) };
+    let machine = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "this computer".to_string());
+    Ca::new(dir.to_path_buf(), machine, seams).map(Arc::new)
+}
+
+/// `uninstall`'s key step. Its outcome is on disk for the verb to read.
+fn purge_ca_keys() -> Result<(), String> {
+    let dir = state::engine_dir(&state::program_data()?);
+    purge_keys(&dir, &CngKeyStore).map(|_| ())
+}
+
+fn service_main(args: Vec<OsString>) {
     system32_only();
     let (stop_tx, stop_rx) = watch::channel(false);
     let handler = move |control| match control {
@@ -89,6 +110,18 @@ fn service_main(_args: Vec<OsString>) {
     if let Err(why) = check_this_exe() {
         record_failure(&why);
         report(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::ServiceSpecific(UNSAFE_FOLDER));
+        return;
+    }
+    if args.iter().any(|a| a == PURGE_ARG) {
+        report(ServiceState::Running, ServiceControlAccept::empty(), ServiceExitCode::Win32(0));
+        let code = match purge_ca_keys() {
+            Ok(()) => ServiceExitCode::Win32(0),
+            Err(why) => {
+                record_failure(&why);
+                ServiceExitCode::ServiceSpecific(FAILED)
+            }
+        };
+        report(ServiceState::Stopped, ServiceControlAccept::empty(), code);
         return;
     }
     report(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, ServiceExitCode::Win32(0));
@@ -163,6 +196,16 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let engine = Arc::new(Engine::new(Some(dir.clone()), exe, policy, runs, crash));
     engine.set_facts(|f| f.last_error = policy_error.or_else(|| cleaned.contains("FAILED").then(|| format!("start-up cleanup: {cleaned}"))));
+    let ca = match real_ca(&dir) {
+        Ok(ca) => {
+            engine.attach_ca(ca.clone());
+            Some(ca)
+        }
+        Err(why) => {
+            engine.set_facts(|f| f.last_error = Some(format!("certificate: {why}")));
+            None
+        }
+    };
 
     // The watchdog: a plain thread, armed only while routes are up.
     let (ping_tx, ping_rx) = mpsc::unbounded_channel();
@@ -199,6 +242,9 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
     let result = rt.block_on(async {
         tokio::spawn(routing::answer_pings(engine.clone(), ping_rx));
         let (halt_tx, halt_rx) = watch::channel(false);
+        if let Some(ca) = ca {
+            tokio::spawn(certs::run(engine.clone(), ca, halt_rx.clone()));
+        }
         let routing = tokio::spawn(routing::run(engine.clone(), halt_rx));
         let served = server::serve(&sddl, engine.clone(), stop).await;
         // The pipe ended (a stop, or a pipe error): the routes go down either way.

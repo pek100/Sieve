@@ -12,7 +12,8 @@
 //!   change; [`ClientMessage::Subscribe`] turns the connection into an event
 //!   stream of [`EngineMessage::Flows`] batches, every [`FLOWS_BATCH_MS`].
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
-//!   commit (v2, slice 3: policy, flows, coexistence and counters).
+//!   commit (v2, slice 3: policy, flows, coexistence and counters; v3,
+//!   slice 5: the certificate's status, `InstallRoot` and `Policy.https`).
 //!
 //! There is no operation that signs anything, exports a key or names a
 //! certificate to mint (plan 7.2), and there never will be.
@@ -23,9 +24,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 /// The oldest and newest protocol versions this build accepts.
-pub const SUPPORTED: [u32; 2] = [2, 2];
+pub const SUPPORTED: [u32; 2] = [3, 3];
 pub const PIPE_NAME: &str = r"\\.\pipe\sieve-engine";
 /// Largest frame body in bytes (1 MiB).
 pub const MAX_FRAME: usize = 1 << 20;
@@ -36,9 +37,9 @@ pub const FLOWS_BATCH_MS: u64 = 250;
 pub const FLOWS_PER_FRAME: usize = 500;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "cert_status", "install_root"];
 /// The `type` names of [`EngineMessage`], in declaration order.
-pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows"];
+pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "cert_status"];
 
 /// App to engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +55,12 @@ pub enum ClientMessage {
     /// From now on the engine pushes [`EngineMessage::Flows`] batches of this
     /// client's session (and session 0, the services) on this connection.
     Subscribe,
+    /// Asks for [`EngineMessage::CertStatus`].
+    CertStatus,
+    /// Reinstall: a new root and key, the old root removed at once. Refused
+    /// unless `policy.https` is on. Answered with the status as it stands;
+    /// the engine does the work on its own thread.
+    InstallRoot,
 }
 
 /// Engine to app.
@@ -72,6 +79,8 @@ pub enum EngineMessage {
     Error { message: String },
     /// Flows that opened, moved bytes or closed since the last batch.
     Flows { flows: Vec<FlowEvent> },
+    /// The root certificate, from facts the engine holds (plan 8.1).
+    CertStatus(CertStatus),
 }
 
 /// The user's switches as the engine holds them (`policy.json`).
@@ -83,6 +92,48 @@ pub struct Policy {
     /// `filtering.engine`: route this computer's traffic through the engine.
     /// Off (the default) means the engine adds no adapter and no route.
     pub engine: bool,
+    /// `filtering.https`: hold a root certificate (plan 2.4). Off removes it.
+    /// Defaulted, because `policy.json` denies unknown fields and a file from
+    /// before slice 5 must keep its engine switch rather than read as off.
+    #[serde(default)]
+    pub https: bool,
+}
+
+/// The root certificate's state; the engine derives it, the app shows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertState {
+    #[default]
+    NotInstalled,
+    Installed,
+    /// The rotation window has come and no new root is in place yet.
+    ExpiresSoon,
+}
+
+/// Whether Firefox trusts the Windows store. `NotUsingWindows` is a policy
+/// someone else set to 0: it must not read as a claim of trust.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirefoxTrust {
+    #[default]
+    NotInstalled,
+    UsesWindows,
+    NotUsingWindows,
+}
+
+/// The `cert_status` message (plan 8.1). A fact the engine does not have is
+/// `null`, never a stand-in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertStatus {
+    pub state: CertState,
+    /// The active root's notAfter, ms since the Unix epoch.
+    pub valid_until_ms: Option<u64>,
+    /// SHA-1 of the root's DER, lowercase hex (`certutil -store Root <hash>`).
+    pub thumbprint: Option<String>,
+    pub firefox: FirefoxTrust,
+    pub last_rotation_ms: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 /// Why the engine does not route although its switch is on (plan 1.6, 1.7).
@@ -340,6 +391,8 @@ mod tests {
             ClientMessage::Status => "status",
             ClientMessage::SetPolicy(_) => "set_policy",
             ClientMessage::Subscribe => "subscribe",
+            ClientMessage::CertStatus => "cert_status",
+            ClientMessage::InstallRoot => "install_root",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -347,6 +400,7 @@ mod tests {
             EngineMessage::Status(_) => "status",
             EngineMessage::Error { .. } => "error",
             EngineMessage::Flows { .. } => "flows",
+            EngineMessage::CertStatus(_) => "cert_status",
         };
         let f = fixture();
         for m in f["client"].as_array().unwrap() {
@@ -443,6 +497,34 @@ mod tests {
         }
     }
 
+    /// The fixture's `certStatuses` are what the app's mock serves, so TS,
+    /// Rust and the mock share one shape; each state has an example.
+    #[test]
+    fn every_fixture_cert_status_round_trips_and_every_state_is_shown() {
+        let f = fixture();
+        let examples = f["certStatuses"].as_object().unwrap();
+        for (name, example) in examples {
+            let parsed: CertStatus = serde_json::from_value(example.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(&serde_json::to_value(&parsed).unwrap(), example, "{name}");
+        }
+        let text = f.to_string();
+        for wire in ["not_installed", "installed", "expires_soon", "uses_windows", "not_using_windows"] {
+            assert!(text.contains(&format!(r#""{wire}""#)), "{wire}");
+        }
+        let _exhaustive = |s: CertState, ff: FirefoxTrust| match (s, ff) {
+            (CertState::NotInstalled | CertState::Installed | CertState::ExpiresSoon, _) => match ff {
+                FirefoxTrust::NotInstalled | FirefoxTrust::UsesWindows | FirefoxTrust::NotUsingWindows => (),
+            },
+        };
+    }
+
+    #[test]
+    fn an_old_policy_file_keeps_its_engine_switch_and_reads_https_off() {
+        let old: Policy = serde_json::from_str(r#"{"revision":4,"engine":true}"#).unwrap();
+        assert_eq!(old, Policy { revision: 4, engine: true, https: false });
+        assert!(serde_json::from_str::<Policy>(r#"{"revision":4,"engine":true,"x":1}"#).is_err(), "unknown fields stay refused");
+    }
+
     #[test]
     fn a_full_flows_frame_stays_under_the_frame_limit() {
         let ev = FlowEvent {
@@ -470,7 +552,7 @@ mod tests {
             answer_hello(PROTOCOL, "0.1.0", 3),
             EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 3 }
         );
-        for v in [0, 1, 3, u32::MAX] {
+        for v in [0, 1, 2, 4, u32::MAX] {
             assert_eq!(answer_hello(v, "0.1.0", 3), EngineMessage::Incompatible { supported: SUPPORTED }, "v{v}");
         }
     }

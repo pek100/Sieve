@@ -42,7 +42,7 @@ pub fn save(dir: &Path, policy: &Policy) -> Result<(), String> {
     write_atomic(&dir.join(POLICY_FILE), &serde_json::to_vec_pretty(policy).map_err(|e| e.to_string())?)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
@@ -132,7 +132,7 @@ mod tests {
     fn the_policy_defaults_off_round_trips_and_a_bad_file_reads_as_off() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load(dir.path()), (Policy::default(), None));
-        let on = Policy { revision: 4, engine: true };
+        let on = Policy { revision: 4, engine: true, ..Policy::default() };
         save(dir.path(), &on).unwrap();
         assert_eq!(load(dir.path()), (on, None));
         std::fs::write(dir.path().join(POLICY_FILE), b"{\"engine\":true}").unwrap();
@@ -143,10 +143,10 @@ mod tests {
 
     #[test]
     fn only_a_newer_revision_is_accepted() {
-        let cur = Policy { revision: 4, engine: true };
-        assert_eq!(accept(cur, Policy { revision: 5, engine: false }), Ok(Policy { revision: 5, engine: false }));
-        assert!(accept(cur, Policy { revision: 4, engine: false }).is_err());
-        assert!(accept(cur, Policy { revision: 1, engine: true }).is_err());
+        let cur = Policy { revision: 4, engine: true, ..Policy::default() };
+        assert_eq!(accept(cur, Policy { revision: 5, engine: false, ..Policy::default() }), Ok(Policy { revision: 5, engine: false, ..Policy::default() }));
+        assert!(accept(cur, Policy { revision: 4, engine: false, ..Policy::default() }).is_err());
+        assert!(accept(cur, Policy { revision: 1, engine: true, ..Policy::default() }).is_err());
     }
 
     /// A fake clock in minutes: three crashes in an hour stop routing at the

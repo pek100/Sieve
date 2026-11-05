@@ -23,6 +23,8 @@ use super::{
     DESCRIPTION, DISPLAY_NAME, FAILURE_RESET, FOLDER_STEP, REQUIRED_PRIVILEGES, RESTART_DELAY, RESTARTS, SERVICE_NAME,
     STOP_WAIT, Step, image_exe,
 };
+use crate::ca::removal;
+use crate::ca::win::{RegistryFirefoxPolicy, WindowsRootStore};
 use crate::route::apply::clear_stale;
 use crate::route::journal::Journal;
 
@@ -191,12 +193,35 @@ fn delete() -> Result<String, String> {
     Ok(format!("deleted (its image was {})", image.display()))
 }
 
+/// Keeps `engine\ca.json` while it records anything unremoved, so rerunning
+/// uninstall still knows the thumbprints.
 fn remove_program_data() -> Result<String, String> {
-    let sieve = state::sieve_dir(&state::program_data()?);
-    match std::fs::remove_dir_all(&sieve) {
-        Ok(()) => Ok(format!("{} deleted", sieve.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(format!("{} not there", sieve.display())),
-        Err(e) => Err(format!("{}: {e}", sieve.display())),
+    let pd = state::program_data()?;
+    removal::remove_program_data(&state::sieve_dir(&pd), &state::engine_dir(&pd))
+}
+
+/// Every root Sieve recorded and the Firefox policy if Sieve set it. Admin
+/// rights reach both, so this runs in the verb, first (plan 2.4).
+fn trust() -> Result<String, String> {
+    let dir = state::engine_dir(&state::program_data()?);
+    removal::remove_trust(&dir, &WindowsRootStore, &RegistryFirefoxPolicy)
+}
+
+/// The keys: their DACL is SYSTEM only, so the service deletes them, started
+/// once with [`removal::PURGE_ARG`]. It writes the outcome to `ca.json`.
+fn ca_keys() -> Result<String, String> {
+    let dir = state::engine_dir(&state::program_data()?);
+    if removal::remaining(&dir).is_none() {
+        return Ok("no key recorded".into());
+    }
+    let Some(service) = open(ServiceAccess::QUERY_STATUS | ServiceAccess::START)? else {
+        return Err("the service is not installed, so the keys cannot be reached".into());
+    };
+    service.start(&[removal::PURGE_ARG]).map_err(|e| format!("start: {e}"))?;
+    wait_for(&service, ServiceState::Stopped)?;
+    match removal::remaining(&dir) {
+        None => Ok("keys deleted".into()),
+        Some(why) => Err(why),
     }
 }
 
@@ -231,13 +256,20 @@ fn install_steps(folder: impl FnOnce() -> Result<String, String>, rest: impl FnO
     steps
 }
 
+/// Removal comes first in every off path (plan 2.4); `ca keys` needs the
+/// service, so it comes before the deletion, and `program data` last.
+type StepFn = fn() -> Result<String, String>;
+const UNINSTALL: [(&str, StepFn); 6] = [
+    ("routes", routes),
+    ("stop", stop),
+    ("trust", trust),
+    ("ca keys", ca_keys),
+    ("delete service", delete),
+    ("program data", remove_program_data),
+];
+
 pub fn uninstall() -> Vec<Step> {
-    vec![
-        Step::run("routes", routes),
-        Step::run("stop", stop),
-        Step::run("delete service", delete),
-        Step::run("program data", remove_program_data),
-    ]
+    UNINSTALL.iter().map(|(name, step)| Step::run(name, *step)).collect()
 }
 
 pub fn restore() -> Vec<Step> {
@@ -268,6 +300,12 @@ mod tests {
             ]
         );
         assert!(matches!(r.reset_period, ServiceFailureResetPeriod::After(d) if d == FAILURE_RESET));
+    }
+
+    #[test]
+    fn trust_steps_come_before_service_deletion() {
+        let names: Vec<&str> = UNINSTALL.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["routes", "stop", "trust", "ca keys", "delete service", "program data"]);
     }
 
     #[test]

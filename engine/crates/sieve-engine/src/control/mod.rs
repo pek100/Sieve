@@ -6,15 +6,18 @@
 //! Turning the engine on through `SetPolicy` after a crash loop forgives
 //! the earlier failures (the user's explicit act, plan 1.6.4).
 
+pub mod certs;
 #[cfg(windows)]
 pub mod routing;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use sieve_ipc::{Blocker, EngineStatus, FlowEvent, Policy};
+use sieve_ipc::{Blocker, CertStatus, EngineStatus, FlowEvent, Policy};
 use tokio::sync::{Notify, broadcast, watch};
 
+use crate::ca::Ca;
 use crate::dns::NameMap;
 use crate::ipc::{Backend, Subscription};
 use crate::policy::{self, Runs};
@@ -65,7 +68,20 @@ pub struct Engine {
     pub wake: Arc<Notify>,
     pub beats: Arc<Beats>,
     pub arm: Arc<Arm>,
+    /// The root CA, set by the runner (unset when it could not be made, and
+    /// in tests that have no use for one).
+    ca: OnceLock<Arc<Ca>>,
+    /// Wakes the certificate loop. Its own: `wake` is the routing loop's and
+    /// a single permit would be stolen.
+    pub ca_wake: Notify,
+    /// The user asked for a new root; the certificate loop takes it.
+    reinstall: AtomicBool,
 }
+
+/// `install_root`'s refusal while the switch is off (plan 7.3: no root
+/// without the user's act, and the act here is the switch).
+pub const HTTPS_OFF: &str = "HTTPS filtering is off, so there is no certificate to reinstall";
+pub const NO_CA: &str = "the certificate service did not start";
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -92,7 +108,20 @@ impl Engine {
             wake: Arc::default(),
             beats: Arc::default(),
             arm: Arc::default(),
+            ca: OnceLock::new(),
+            ca_wake: Notify::new(),
+            reinstall: AtomicBool::new(false),
         }
+    }
+
+    /// Gives the running engine its CA (once, from the runner).
+    pub fn attach_ca(&self, ca: Arc<Ca>) {
+        let _ = self.ca.set(ca);
+    }
+
+    /// Whether the user asked for a new root since the last call.
+    pub fn take_reinstall(&self) -> bool {
+        self.reinstall.swap(false, Ordering::SeqCst)
     }
 
     pub fn policy(&self) -> Policy {
@@ -217,6 +246,7 @@ impl Backend for Engine {
             *current = next;
         }
         self.wake.notify_one();
+        self.ca_wake.notify_one();
         Ok(self.status())
     }
 
@@ -224,6 +254,22 @@ impl Backend for Engine {
         let book = lock(&self.book);
         // Subscribed under the book's lock: no batch slips between the two.
         Subscription { open: book.snapshot(), batches: self.flows.subscribe(), routes_up: self.routes_up.subscribe() }
+    }
+
+    fn cert_status(&self) -> CertStatus {
+        self.ca.get().map(|ca| ca.status(policy::wall_ms())).unwrap_or_default()
+    }
+
+    fn install_root(&self) -> Result<CertStatus, String> {
+        if !self.policy().https {
+            return Err(HTTPS_OFF.to_string());
+        }
+        if self.ca.get().is_none() {
+            return Err(NO_CA.to_string());
+        }
+        self.reinstall.store(true, Ordering::SeqCst);
+        self.ca_wake.notify_one();
+        Ok(self.cert_status())
     }
 }
 
@@ -339,28 +385,28 @@ mod tests {
 
     #[test]
     fn a_stale_policy_is_refused_and_a_newer_one_wakes_the_loop() {
-        let e = engine(Policy { revision: 2, engine: false }, None);
-        assert!(e.set_policy(Policy { revision: 2, engine: true }).unwrap_err().contains("stale"));
+        let e = engine(Policy { revision: 2, engine: false, ..Policy::default() }, None);
+        assert!(e.set_policy(Policy { revision: 2, engine: true, ..Policy::default() }).unwrap_err().contains("stale"));
         assert!(!e.policy().engine);
-        let s = e.set_policy(Policy { revision: 3, engine: true }).unwrap();
-        assert_eq!(s.policy, Policy { revision: 3, engine: true });
+        let s = e.set_policy(Policy { revision: 3, engine: true, ..Policy::default() }).unwrap();
+        assert_eq!(s.policy, Policy { revision: 3, engine: true, ..Policy::default() });
     }
 
     #[test]
     fn a_crash_loop_blocks_until_the_user_turns_the_engine_on_again() {
-        let e = engine(Policy { revision: 1, engine: true }, Some(3));
+        let e = engine(Policy { revision: 1, engine: true, ..Policy::default() }, Some(3));
         assert_eq!(e.status().blocker, Some(Blocker::CrashLoop { starts: 3 }));
-        e.set_policy(Policy { revision: 2, engine: false }).unwrap();
+        e.set_policy(Policy { revision: 2, engine: false, ..Policy::default() }).unwrap();
         assert_eq!(e.status().blocker, None, "off: nothing to explain");
         assert_eq!(e.crash_loop(), Some(3), "turning off does not forgive");
-        e.set_policy(Policy { revision: 3, engine: true }).unwrap();
+        e.set_policy(Policy { revision: 3, engine: true, ..Policy::default() }).unwrap();
         assert_eq!(e.crash_loop(), None);
         assert_eq!(e.status().blocker, None);
     }
 
     #[test]
     fn a_routing_engine_reports_routes_and_split_tunnels() {
-        let e = engine(Policy { revision: 1, engine: true }, None);
+        let e = engine(Policy { revision: 1, engine: true, ..Policy::default() }, None);
         e.set_facts(|f| {
             f.routes_up = true;
             f.split_tunnels = vec!["Corp VPN".into()];

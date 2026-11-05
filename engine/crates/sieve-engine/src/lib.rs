@@ -10,10 +10,12 @@
 //! - [`dns`]: DNS answers read into the IP-to-names map (slice 3);
 //! - [`coexist`]: AdGuard and VPN detection, read only (slice 3);
 //! - [`watchdog`], [`policy`]: hang and crash-loop safety (slice 3);
-//! - [`control`]: the running engine's facts and its routing loop.
+//! - [`control`]: the running engine's facts and its routing loop;
+//! - [`ca`]: the root CA, its removal paths and the leaf API (slice 5).
 //!
 //! Slice 3 routes and relays; it filters nothing. Traffic goes through the
 //! engine only while the user's `filtering.engine` switch is on.
+pub mod ca;
 pub mod coexist;
 pub mod control;
 pub mod dns;

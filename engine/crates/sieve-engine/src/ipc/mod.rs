@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sieve_ipc::nonblocking::{read_frame, write_frame};
-use sieve_ipc::{ClientMessage, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, Policy, answer_hello};
+use sieve_ipc::{CertStatus, ClientMessage, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, Policy, answer_hello};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 
@@ -38,6 +38,11 @@ pub trait Backend: Send + Sync + 'static {
     /// up (a subscription ends when they go down: the app then reads the
     /// connection tables again).
     fn subscribe(&self) -> Subscription;
+    /// The root certificate's status.
+    fn cert_status(&self) -> CertStatus;
+    /// Asks for a new root (refused unless `policy.https` is on) and answers
+    /// the status as it stands; the certificate loop does the work.
+    fn install_root(&self) -> Result<CertStatus, String>;
 }
 
 pub struct Subscription {
@@ -104,6 +109,11 @@ where
                 Err(message) => EngineMessage::Error { message },
             },
             Ok(ClientMessage::Subscribe) => return stream_flows(stream, session_id, backend).await,
+            Ok(ClientMessage::CertStatus) => EngineMessage::CertStatus(backend.cert_status()),
+            Ok(ClientMessage::InstallRoot) => match backend.install_root() {
+                Ok(status) => EngineMessage::CertStatus(status),
+                Err(message) => EngineMessage::Error { message },
+            },
             Ok(ClientMessage::Hello { .. }) => return refuse(stream, HELLO_ONCE).await,
             Err(FrameError::Closed) => return Ok(()),
             Err(e) => return refuse(stream, &e.to_string()).await,
@@ -229,6 +239,12 @@ mod tests {
         fn subscribe(&self) -> Subscription {
             Subscription { open: self.open.clone(), batches: self.flows.subscribe(), routes_up: self.routes.subscribe() }
         }
+        fn cert_status(&self) -> CertStatus {
+            CertStatus { thumbprint: Some("abc".into()), ..CertStatus::default() }
+        }
+        fn install_root(&self) -> Result<CertStatus, String> {
+            if self.policy.lock().unwrap().https { Ok(self.cert_status()) } else { Err("https is off".into()) }
+        }
     }
 
     async fn send(s: &mut DuplexStream, m: &ClientMessage) {
@@ -273,13 +289,39 @@ mod tests {
         let (mut c, task) = start(1);
         send(&mut c, &hello(PROTOCOL)).await;
         recv(&mut c).await;
-        let on = Policy { revision: 1, engine: true };
+        let on = Policy { revision: 1, engine: true, ..Policy::default() };
         send(&mut c, &ClientMessage::SetPolicy(on)).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.policy == on));
-        send(&mut c, &ClientMessage::SetPolicy(Policy { revision: 1, engine: false })).await;
+        send(&mut c, &ClientMessage::SetPolicy(Policy { revision: 1, engine: false, ..Policy::default() })).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Error { message } if message.contains("stale")));
         send(&mut c, &ClientMessage::Status).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.policy == on), "the connection stays usable");
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cert_status_answers_over_the_pipe() {
+        let (mut c, task) = start(1);
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::CertStatus).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::CertStatus(s) if s.thumbprint.as_deref() == Some("abc")));
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_root_answers_the_status_or_the_refusal_and_the_pipe_stays_usable() {
+        let (mut c, task) = start(1);
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::InstallRoot).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Error { message } if message.contains("off")));
+        send(&mut c, &ClientMessage::SetPolicy(Policy { revision: 1, https: true, ..Policy::default() })).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::InstallRoot).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::CertStatus(_)));
         drop(c);
         task.await.unwrap().unwrap();
     }

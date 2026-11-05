@@ -11,11 +11,16 @@
 //!   restart after 5 s twice then stay stopped, required privileges trimmed),
 //!   create `ProgramData\Sieve\engine` with an admin-only DACL, record the
 //!   installing user's SID (the pipe's one non-admin user), start it;
-//! - `uninstall`: remove Sieve's routes, stop and delete the service (by
-//!   name, wherever its registered image is), delete `ProgramData\Sieve`.
-//!   Every step runs even when one fails, and rerunning it is safe;
+//! - `uninstall`: remove Sieve's routes, stop the service, remove the roots
+//!   and the Firefox policy (admin rights reach those), start the service
+//!   once with [`crate::ca::removal::PURGE_ARG`] to delete the CNG keys (their
+//!   DACL is SYSTEM only), delete the service (by name, wherever its
+//!   registered image is), delete `ProgramData\Sieve` (keeping `ca.json`
+//!   while it records anything unremoved). Every step runs even when one
+//!   fails, and rerunning it is safe;
 //! - `restore`: the emergency off. Delete every route on an interface named
-//!   "Sieve" and stop the service; nothing else.
+//!   "Sieve" and stop the service; nothing else (the root is not network
+//!   state, and an update runs `restore` then `install`).
 //!
 //! The service runs the same `image` check at every start and refuses to run
 //! (exit code [`EXIT_UNSAFE_FOLDER`], reason in `last-error.txt`) when it
