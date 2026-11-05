@@ -35,10 +35,13 @@ pub const FLOWS_BATCH_MS: u64 = 250;
 /// At most this many flow events per `flows` frame; a larger batch is split,
 /// so a frame stays far under [`MAX_FRAME`] (an event is a few hundred bytes).
 pub const FLOWS_PER_FRAME: usize = 500;
-/// At most this many log rows per `log` frame; a larger batch is split.
+/// At most this many log rows per `log` frame; [`log_frames`] splits a larger
+/// batch, and sooner when the rows' encoded size says so.
 pub const LOG_PER_FRAME: usize = 200;
-/// The engine truncates a row's URL and rule to these, so a full `log` frame
-/// fits [`MAX_FRAME`].
+/// The engine truncates a row's URL and rule to these many raw bytes. They bound
+/// one row, not a frame: JSON escaping can make a byte six on the wire, so 200
+/// rows at the caps can pass [`MAX_FRAME`]. [`log_frames`] is what keeps a frame
+/// within it.
 pub const LOG_URL_MAX: usize = 2048;
 pub const LOG_RULE_MAX: usize = 1024;
 
@@ -80,7 +83,8 @@ pub enum EngineMessage {
     /// Flows that opened, moved bytes or closed since the last batch.
     Flows { flows: Vec<FlowEvent> },
     /// What the filter did since the last batch, on the Subscribe connection,
-    /// session scoped like flows (plan 8.3).
+    /// session scoped like flows (plan 8.3). Built with [`log_frames`]: a frame
+    /// refused as too large would end the stream, flows included.
     Log { rows: Vec<LogRow> },
 }
 
@@ -274,6 +278,43 @@ pub struct LogRow {
     pub rule: Option<String>,
     /// A catalogue id, or `user`.
     pub list: Option<String>,
+}
+
+/// A batch of rows as the `log` messages to send.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LogFrames {
+    /// In the batch's order, each encoding to at most [`MAX_FRAME`] and holding
+    /// at most [`LOG_PER_FRAME`] rows.
+    pub messages: Vec<EngineMessage>,
+    /// Rows left out because one alone is over [`MAX_FRAME`]: only a row that
+    /// skipped the caps. The caller says so; the stream goes on.
+    pub oversized: usize,
+}
+
+/// Splits rows by their encoded size, which is what [`MAX_FRAME`] limits.
+pub fn log_frames(rows: &[LogRow]) -> Result<LogFrames, FrameError> {
+    const SEPARATOR: usize = b",".len();
+    let empty = serde_json::to_vec(&EngineMessage::Log { rows: Vec::new() })?.len();
+    let mut frames = LogFrames::default();
+    let mut current: Vec<LogRow> = Vec::new();
+    let mut size = empty;
+    for row in rows {
+        let len = serde_json::to_vec(row)?.len();
+        if empty + len > MAX_FRAME {
+            frames.oversized += 1;
+            continue;
+        }
+        if !current.is_empty() && (current.len() == LOG_PER_FRAME || size + SEPARATOR + len > MAX_FRAME) {
+            frames.messages.push(EngineMessage::Log { rows: std::mem::take(&mut current) });
+            size = empty;
+        }
+        size += len + if current.is_empty() { 0 } else { SEPARATOR };
+        current.push(row.clone());
+    }
+    if !current.is_empty() {
+        frames.messages.push(EngineMessage::Log { rows: current });
+    }
+    Ok(frames)
 }
 
 /// The engine's answer to a client's Hello.
@@ -569,10 +610,9 @@ mod tests {
         assert_eq!(serde_json::from_value::<EngineMessage>(wire).unwrap(), some);
     }
 
-    /// The caps are what makes this true: a full frame of rows at every cap.
-    #[test]
-    fn a_full_log_frame_at_the_caps_stays_under_the_frame_limit() {
-        let row = LogRow {
+    /// A row at every cap, its URL and rule made of `url` and `rule` repeated.
+    fn log_row_at_caps(url: char, rule: char) -> LogRow {
+        LogRow {
             id: u64::MAX,
             t: u64::MAX,
             flow_id: u64::MAX,
@@ -582,15 +622,91 @@ mod tests {
             kind: FlowKind::Tls,
             host: "h".repeat(253),
             remote: "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535".into(),
-            url: Some("u".repeat(LOG_URL_MAX)),
+            url: Some(url.to_string().repeat(LOG_URL_MAX)),
             request_type: Some("xmlhttprequest".into()),
             outcome: LogOutcome::NotDecrypted { reason: "r".repeat(64) },
-            rule: Some("r".repeat(LOG_RULE_MAX)),
+            rule: Some(rule.to_string().repeat(LOG_RULE_MAX)),
             list: Some("adguard-url-tracking".into()),
-        };
-        let msg = EngineMessage::Log { rows: vec![row; LOG_PER_FRAME] };
-        let frame = encode(&msg).unwrap();
-        assert!(frame.len() <= MAX_FRAME, "{}", frame.len());
+        }
+    }
+
+    fn rows_of(frames: &LogFrames) -> Vec<LogRow> {
+        frames.messages.iter().flat_map(|m| match m {
+            EngineMessage::Log { rows } => rows.clone(),
+            other => panic!("not a log message: {other:?}"),
+        }).collect()
+    }
+
+    /// Every frame encodes and holds what the limits allow, and no frame could
+    /// have taken the next one's first row: nothing lost, nothing split early.
+    fn assert_split_exactly(rows: &[LogRow], frames: &LogFrames) {
+        assert_eq!(rows_of(frames), rows);
+        let batches: Vec<&Vec<LogRow>> = frames.messages.iter().map(|m| match m {
+            EngineMessage::Log { rows } => rows,
+            other => panic!("not a log message: {other:?}"),
+        }).collect();
+        for (i, batch) in batches.iter().enumerate() {
+            assert!(!batch.is_empty());
+            assert!(batch.len() <= LOG_PER_FRAME);
+            let body = encode(&frames.messages[i]).unwrap().len() - 4;
+            assert!(body <= MAX_FRAME, "{body}");
+            if let Some(next) = batches.get(i + 1) {
+                let next_row = serde_json::to_vec(&next[0]).unwrap().len();
+                assert!(batch.len() == LOG_PER_FRAME || body + 1 + next_row > MAX_FRAME, "frame {i} of {body} bytes split early");
+            }
+        }
+    }
+
+    #[test]
+    fn plain_rows_at_the_caps_fill_one_frame_by_count() {
+        let rows = vec![log_row_at_caps('u', 'r'); LOG_PER_FRAME];
+        let frames = log_frames(&rows).unwrap();
+        assert_eq!(frames.messages.len(), 1);
+        assert_split_exactly(&rows, &frames);
+
+        let rows = vec![log_row_at_caps('u', 'r'); LOG_PER_FRAME + 1];
+        let frames = log_frames(&rows).unwrap();
+        assert_eq!(frames.messages.len(), 2);
+        assert_split_exactly(&rows, &frames);
+    }
+
+    /// The raw caps do not bound a frame: escaping does the rest, up to six
+    /// bytes for one. Sent whole these are refused, and that would end the stream.
+    #[test]
+    fn rows_that_escape_at_the_caps_split_by_encoded_size() {
+        for (url, rule, parts) in [('\\', 'r', 2), ('\\', '\\', 2), ('\u{1}', 'r', 3), ('\u{1}', '\u{1}', 4)] {
+            let rows = vec![log_row_at_caps(url, rule); LOG_PER_FRAME];
+            assert!(matches!(encode(&EngineMessage::Log { rows: rows.clone() }), Err(FrameError::TooLarge(_))));
+            let frames = log_frames(&rows).unwrap();
+            assert_eq!(frames.messages.len(), parts, "{url:?} {rule:?}");
+            assert_eq!(frames.oversized, 0);
+            assert_split_exactly(&rows, &frames);
+        }
+    }
+
+    #[test]
+    fn a_row_too_large_alone_is_counted_and_the_rest_still_go() {
+        let plain = log_row_at_caps('u', 'r');
+        let huge = LogRow { url: Some("u".repeat(MAX_FRAME)), ..plain.clone() };
+        let frames = log_frames(&[plain.clone(), huge, plain.clone()]).unwrap();
+        assert_eq!(frames.oversized, 1);
+        assert_split_exactly(&[plain.clone(), plain], &frames);
+    }
+
+    #[test]
+    fn no_rows_are_no_frames() {
+        assert_eq!(log_frames(&[]).unwrap(), LogFrames::default());
+    }
+
+    /// A row that just fits alone is sent: the limit is on the body, inclusive.
+    #[test]
+    fn a_frame_of_exactly_the_limit_goes() {
+        let mut row = log_row_at_caps('u', 'r');
+        let overhead = encode(&EngineMessage::Log { rows: vec![row.clone()] }).unwrap().len() - 4 - LOG_URL_MAX;
+        row.url = Some("u".repeat(MAX_FRAME - overhead));
+        let frames = log_frames(std::slice::from_ref(&row)).unwrap();
+        assert_eq!(frames.oversized, 0);
+        assert_eq!(encode(&frames.messages[0]).unwrap().len() - 4, MAX_FRAME);
     }
 
     #[test]
