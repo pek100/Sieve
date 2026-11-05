@@ -57,6 +57,11 @@ sha2.workspace = true
 # Signed updates (plan 7.5): verifies minisign signatures, no dependencies of
 # its own. Signing exists only in tests (dev-dependency `minisign`).
 minisign-verify = "0.2.5"
+# The update fetch's own validated TLS (plan 2.7): rustls on aws-lc-rs,
+# webpki-roots as the trust store, never the Windows store.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "prefer-post-quantum"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+webpki-roots = "1"
 
 # Userspace TCP/IP stack (vendored, see engine/vendor/ipstack/Cargo.toml).
 ipstack = "1.0.1"
@@ -96,6 +101,8 @@ windows-service = "0.8.1"
 # Tests sign with the real tool, with a key pair generated in memory (update::testing).
 minisign = "0.8.0"
 proptest.workspace = true
+# Test only: a CA the client does not trust (update::https).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 # Benchmark only: craft packets for ipstack (same version ipstack uses).

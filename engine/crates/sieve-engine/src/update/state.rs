@@ -113,6 +113,29 @@ pub fn recover(pending: &Pending, own: u64) -> Recovery {
     }
 }
 
+/// Runs before anything else when the service starts, and handles a reboot in
+/// the middle, when no supervisor exists any more. The release to report healthy
+/// for, if this build is it. `.old` files stay for the next check: a live
+/// supervisor may still need them for its rollback.
+pub fn on_service_start(dir: &Path, own: u64, log: &dyn Log) -> Option<Pending> {
+    let pending = match load_pending(dir) {
+        Ok(p) => p?,
+        Err(why) => {
+            log.line(&why);
+            return None;
+        }
+    };
+    let recovery = recover(&pending, own);
+    if recovery == Recovery::Probe {
+        return Some(pending);
+    }
+    log.line(&format!("{} {} in flight, this build is {own}: {recovery:?}", pending.kind, pending.to_version));
+    if let Err(why) = clear_pending(dir) {
+        log.line(&why);
+    }
+    None
+}
+
 /// The new engine answered its own pipe: the record rises, then the pending
 /// file goes. The supervisor reads both, in that order.
 pub fn commit_healthy(dir: &Path, pending: &Pending) -> Result<(), String> {
@@ -219,6 +242,30 @@ pub(crate) mod tests {
         for (own, want) in [(1, Recovery::NotSwapped), (2, Recovery::Probe), (3, Recovery::Mislabelled), (0, Recovery::Mislabelled)] {
             assert_eq!(recover(&pending(1, 2), own), want, "{own}");
         }
+    }
+
+    #[test]
+    fn a_start_with_a_release_in_flight_probes_or_clears_and_never_raises() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = MemLog::default();
+        assert_eq!(on_service_start(dir.path(), 2, &log), None, "nothing in flight");
+        assert!(log.0.lock().unwrap().is_empty());
+
+        let p = pending(1, 2);
+        save_pending(dir.path(), &p).unwrap();
+        assert_eq!(on_service_start(dir.path(), 2, &log), Some(p.clone()));
+        assert_eq!(load_pending(dir.path()).unwrap(), Some(p.clone()), "the probe clears it, not the start");
+
+        for own in [1, 3] {
+            save_pending(dir.path(), &p).unwrap();
+            assert_eq!(on_service_start(dir.path(), own, &log), None, "{own}");
+            assert_eq!(load_pending(dir.path()).unwrap(), None, "{own}");
+            assert_eq!(load_record(dir.path()).unwrap(), Record::default(), "{own}: never raised");
+        }
+        assert_eq!(log.0.lock().unwrap().len(), 2, "each reported");
+
+        std::fs::write(dir.path().join(PENDING_FILE), b"not json").unwrap();
+        assert_eq!(on_service_start(dir.path(), 2, &log), None, "a damaged record starts the engine anyway");
     }
 
     #[test]

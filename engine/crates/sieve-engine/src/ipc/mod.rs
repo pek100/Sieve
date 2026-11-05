@@ -38,6 +38,10 @@ pub trait Backend: Send + Sync + 'static {
     /// up (a subscription ends when they go down: the app then reads the
     /// connection tables again).
     fn subscribe(&self) -> Subscription;
+    /// `RequestUpdate`: a check, or applying the release on offer, decided from
+    /// the engine's own state, answered at once with the Status. An error when
+    /// asked again inside the cooldown.
+    fn request_update(&self) -> Result<EngineStatus, String>;
 }
 
 pub struct Subscription {
@@ -100,6 +104,10 @@ where
         let reply = match read_frame::<_, ClientMessage>(stream).await {
             Ok(ClientMessage::Status) => EngineMessage::Status(backend.status()),
             Ok(ClientMessage::SetPolicy(p)) => match backend.set_policy(p) {
+                Ok(status) => EngineMessage::Status(status),
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::RequestUpdate {}) => match backend.request_update() {
                 Ok(status) => EngineMessage::Status(status),
                 Err(message) => EngineMessage::Error { message },
             },
@@ -208,12 +216,13 @@ mod tests {
         open: Vec<FlowEvent>,
         flows: broadcast::Sender<Arc<Vec<FlowEvent>>>,
         routes: tokio::sync::watch::Sender<bool>,
+        update_requests: Mutex<u32>,
     }
 
     impl Fake {
         fn new(open: Vec<FlowEvent>) -> Arc<Self> {
             let routes = tokio::sync::watch::channel(true).0;
-            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, routes })
+            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, routes, update_requests: Mutex::new(0) })
         }
     }
 
@@ -229,6 +238,44 @@ mod tests {
         fn subscribe(&self) -> Subscription {
             Subscription { open: self.open.clone(), batches: self.flows.subscribe(), routes_up: self.routes.subscribe() }
         }
+        fn request_update(&self) -> Result<EngineStatus, String> {
+            let mut asked = self.update_requests.lock().unwrap();
+            *asked += 1;
+            if *asked > 1 {
+                return Err("too soon".into());
+            }
+            Ok(EngineStatus { update: sieve_ipc::UpdateStatus::Checking, ..EngineStatus::default() })
+        }
+    }
+
+    #[tokio::test]
+    async fn request_update_answers_status() {
+        let (mut c, task) = start(1);
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::RequestUpdate {}).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.update == sieve_ipc::UpdateStatus::Checking));
+        send(&mut c, &ClientMessage::RequestUpdate {}).await;
+        assert_eq!(recv(&mut c).await, EngineMessage::Error { message: "too soon".into() }, "over the limit: an error, and the pipe stays");
+        send(&mut c, &ClientMessage::Status).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Status(_)));
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_update_with_any_field_is_refused() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = start_with(1, fake.clone());
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        let body = br#"{"type":"request_update","url":"https://elsewhere.example/x.exe"}"#;
+        let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(body);
+        c.write_all(&frame).await.unwrap();
+        assert!(matches!(recv(&mut c).await, EngineMessage::Error { .. }));
+        task.await.unwrap().unwrap();
+        assert_eq!(*fake.update_requests.lock().unwrap(), 0, "the engine never saw a request");
     }
 
     async fn send(s: &mut DuplexStream, m: &ClientMessage) {

@@ -15,7 +15,8 @@
 //!   name, wherever its registered image is), delete `ProgramData\Sieve`.
 //!   Every step runs even when one fails, and rerunning it is safe;
 //! - `restore`: the emergency off. Delete every route on an interface named
-//!   "Sieve" and stop the service; nothing else.
+//!   "Sieve" and stop the service; nothing else;
+//! - `update-finish`: the supervisor of a signed update (`update::finish`).
 //!
 //! The service runs the same `image` check at every start and refuses to run
 //! (exit code [`EXIT_UNSAFE_FOLDER`], reason in `last-error.txt`) when it
@@ -60,12 +61,17 @@ pub const REQUIRED_PRIVILEGES: &[&str] =
 /// How long `uninstall` and `restore` wait for the service to stop.
 pub const STOP_WAIT: Duration = Duration::from_secs(20);
 
+/// The supervisor of a signed update (`update::finish`), started by the engine
+/// from a copy of itself in the staging folder.
+pub const FINISH_VERB: &str = "update-finish";
+
 pub const USAGE: &str = "\
-usage: sieve-engine.exe [install | uninstall | restore]
+usage: sieve-engine.exe [install | uninstall | restore | update-finish]
   (no argument)  run as the Windows service (started by Windows only)
   install        create or update the service and start it (admin)
   uninstall      stop filtering, delete the service and ProgramData\\Sieve (admin)
   restore        delete every route on an interface named \"Sieve\" and stop the service (admin)
+  update-finish  finish a signed update in flight, or do nothing (started by the engine only)
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +81,7 @@ pub enum Verb {
     Install,
     Uninstall,
     Restore,
+    UpdateFinish,
 }
 
 /// The verb from the command line (program name already skipped).
@@ -86,6 +93,7 @@ pub fn parse_verb<I: IntoIterator<Item = String>>(args: I) -> Result<Verb, Strin
             "install" => Ok(Verb::Install),
             "uninstall" => Ok(Verb::Uninstall),
             "restore" => Ok(Verb::Restore),
+            FINISH_VERB => Ok(Verb::UpdateFinish),
             other => Err(format!("unknown verb: {other}")),
         },
         _ => Err("one verb at most".into()),
@@ -169,6 +177,14 @@ mod tests {
         assert_eq!(parse_verb(args(&["restore"])), Ok(Verb::Restore));
         assert!(parse_verb(args(&["start"])).is_err());
         assert!(parse_verb(args(&["install", "now"])).is_err());
+    }
+
+    /// No arguments: every input comes from the pending record (plan 7.5).
+    #[test]
+    fn update_finish_parses_with_no_arguments_and_usage_names_it() {
+        assert_eq!(parse_verb(args(&[FINISH_VERB])), Ok(Verb::UpdateFinish));
+        assert!(parse_verb(args(&[FINISH_VERB, r"C:\elsewhere"])).is_err());
+        assert!(USAGE.contains(FINISH_VERB));
     }
 
     #[test]

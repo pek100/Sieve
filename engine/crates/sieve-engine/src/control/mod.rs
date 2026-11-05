@@ -20,6 +20,7 @@ use crate::ipc::{Backend, Subscription};
 use crate::policy::{self, Runs};
 use crate::stack::Meters;
 use crate::stack::book::FlowBook;
+use crate::update::cycle::UpdateControl;
 use crate::watchdog::{Arm, Beats};
 
 /// Batches a slow client may fall behind by before it is disconnected (it
@@ -65,6 +66,8 @@ pub struct Engine {
     pub wake: Arc<Notify>,
     pub beats: Arc<Beats>,
     pub arm: Arc<Arm>,
+    /// Signed updates: `not_configured` until the service attaches its worker.
+    pub updates: Arc<UpdateControl>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -92,6 +95,7 @@ impl Engine {
             wake: Arc::default(),
             beats: Arc::default(),
             arm: Arc::default(),
+            updates: Arc::default(),
         }
     }
 
@@ -197,6 +201,7 @@ impl Backend for Engine {
             blocker,
             split_tunnels: f.split_tunnels,
             counters: self.meters.counters(),
+            update: self.updates.status(),
         }
     }
 
@@ -224,6 +229,11 @@ impl Backend for Engine {
         let book = lock(&self.book);
         // Subscribed under the book's lock: no batch slips between the two.
         Subscription { open: book.snapshot(), batches: self.flows.subscribe(), routes_up: self.routes_up.subscribe() }
+    }
+
+    fn request_update(&self) -> Result<EngineStatus, String> {
+        self.updates.request(crate::watchdog::monotonic_ms())?;
+        Ok(self.status())
     }
 }
 
@@ -356,6 +366,14 @@ mod tests {
         e.set_policy(Policy { revision: 3, engine: true }).unwrap();
         assert_eq!(e.crash_loop(), None);
         assert_eq!(e.status().blocker, None);
+    }
+
+    /// A build with no worker: nothing to report and nothing queued.
+    #[test]
+    fn an_engine_without_an_updater_answers_not_configured() {
+        let e = engine(Policy::default(), None);
+        assert_eq!(e.status().update, sieve_ipc::UpdateStatus::NotConfigured);
+        assert_eq!(e.request_update().unwrap().update, sieve_ipc::UpdateStatus::NotConfigured);
     }
 
     #[test]

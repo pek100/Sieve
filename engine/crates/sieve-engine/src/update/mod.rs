@@ -17,11 +17,19 @@
 //! - [`health`]: the new engine's report to its supervisor;
 //! - `win`: the real service control, process spawn and worker.
 
+pub mod cycle;
+pub mod fetch;
+pub mod finish;
+#[cfg(windows)]
+pub mod health;
+pub mod https;
 pub mod index;
 pub mod state;
 pub mod swap;
 pub mod trust;
 pub mod verify;
+#[cfg(windows)]
+pub mod win;
 
 #[cfg(test)]
 pub(crate) mod testing;

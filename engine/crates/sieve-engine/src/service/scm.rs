@@ -157,7 +157,7 @@ fn wait_for(service: &Service, want: ServiceState) -> Result<(), String> {
     }
 }
 
-fn start() -> Result<String, String> {
+pub(crate) fn start() -> Result<String, String> {
     let service = open(ServiceAccess::QUERY_STATUS | ServiceAccess::START)?.ok_or("not installed")?;
     if service.query_status().map_err(|e| e.to_string())?.current_state == ServiceState::Running {
         return Ok("already running".into());
@@ -167,7 +167,7 @@ fn start() -> Result<String, String> {
     Ok("running".into())
 }
 
-fn stop() -> Result<String, String> {
+pub(crate) fn stop() -> Result<String, String> {
     let Some(service) = open(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)? else {
         return Ok("not installed".into());
     };

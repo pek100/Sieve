@@ -12,7 +12,8 @@
 //!   change; [`ClientMessage::Subscribe`] turns the connection into an event
 //!   stream of [`EngineMessage::Flows`] batches, every [`FLOWS_BATCH_MS`].
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
-//!   commit (v2, slice 3: policy, flows, coexistence and counters).
+//!   commit (v2, slice 3: policy, flows, coexistence and counters; v3, slice
+//!   13: `request_update` and the `update` status).
 //!
 //! There is no operation that signs anything, exports a key or names a
 //! certificate to mint (plan 7.2), and there never will be.
@@ -23,9 +24,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 /// The oldest and newest protocol versions this build accepts.
-pub const SUPPORTED: [u32; 2] = [2, 2];
+pub const SUPPORTED: [u32; 2] = [3, 3];
 pub const PIPE_NAME: &str = r"\\.\pipe\sieve-engine";
 /// Largest frame body in bytes (1 MiB).
 pub const MAX_FRAME: usize = 1 << 20;
@@ -36,7 +37,7 @@ pub const FLOWS_BATCH_MS: u64 = 250;
 pub const FLOWS_PER_FRAME: usize = 500;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "request_update"];
 /// The `type` names of [`EngineMessage`], in declaration order.
 pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows"];
 
@@ -54,6 +55,13 @@ pub enum ClientMessage {
     /// From now on the engine pushes [`EngineMessage::Flows`] batches of this
     /// client's session (and session 0, the services) on this connection.
     Subscribe,
+    /// Asks for an update check, or to apply the release [`UpdateStatus::Available`]
+    /// names; the engine decides which from its own state. No field, ever: the
+    /// app cannot supply a URL, a path, a version or any bytes (plan 7.5). A
+    /// struct variant on purpose: serde ignores extra keys on an internally
+    /// tagged unit variant, even with `deny_unknown_fields`, and this one must
+    /// refuse them.
+    RequestUpdate {},
 }
 
 /// Engine to app.
@@ -101,6 +109,32 @@ pub enum Blocker {
     Setup { message: String },
 }
 
+/// Where signed updates stand (plan 7.5). `version` is the display form of a
+/// release, for reading only; the app never sends it back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UpdateStatus {
+    /// This build has no update key or host; nothing is ever fetched.
+    #[default]
+    NotConfigured,
+    /// Nothing checked yet in this run.
+    Idle,
+    Checking,
+    /// The last check found nothing newer.
+    Current,
+    /// A verified index offers this release; it installs only when asked.
+    Available { version: String },
+    Applying { version: String },
+    /// The index expired: a stale index is reported, not trusted.
+    Stale,
+    /// The check could not finish (the network, a local file).
+    Failed { message: String },
+    /// Signed bytes were refused; nothing was replaced.
+    Refused { message: String },
+    /// This release did not come up; the previous one is back.
+    RolledBack { version: String },
+}
+
 /// The engine's own counters since it started (attribution is
 /// `attributed / flows`, plan 6).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +176,8 @@ pub struct EngineStatus {
     /// Sieve, which the app states (plan 1.7).
     pub split_tunnels: Vec<String>,
     pub counters: Counters,
+    /// Signed updates (protocol 3).
+    pub update: UpdateStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +376,7 @@ mod tests {
             ClientMessage::Status => "status",
             ClientMessage::SetPolicy(_) => "set_policy",
             ClientMessage::Subscribe => "subscribe",
+            ClientMessage::RequestUpdate {} => "request_update",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -444,6 +481,55 @@ mod tests {
     }
 
     #[test]
+    fn every_fixture_update_round_trips_and_a_v2_status_is_refused() {
+        let updates = fixture()["updates"].as_array().unwrap().clone();
+        assert!(!updates.is_empty());
+        for u in updates {
+            let parsed: UpdateStatus = serde_json::from_value(u.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), u);
+        }
+        let f = fixture();
+        let mut status = f["engine"].as_array().unwrap().iter().find(|m| m["type"] == "status").unwrap().clone();
+        status.as_object_mut().unwrap().remove("update");
+        assert!(serde_json::from_value::<EngineMessage>(status).is_err(), "a v2 status lacks update");
+    }
+
+    /// The fixture carries every update state, so the TS law sees each name (a
+    /// new state without an example fails here: the match is exhaustive).
+    #[test]
+    fn the_fixture_shows_every_update_kind() {
+        let name = |u: &UpdateStatus| match u {
+            UpdateStatus::NotConfigured => "not_configured",
+            UpdateStatus::Idle => "idle",
+            UpdateStatus::Checking => "checking",
+            UpdateStatus::Current => "current",
+            UpdateStatus::Available { .. } => "available",
+            UpdateStatus::Applying { .. } => "applying",
+            UpdateStatus::Stale => "stale",
+            UpdateStatus::Failed { .. } => "failed",
+            UpdateStatus::Refused { .. } => "refused",
+            UpdateStatus::RolledBack { .. } => "rolled_back",
+        };
+        let f = fixture();
+        let shown: Vec<&str> = f["updates"].as_array().unwrap().iter().map(|u| name(&serde_json::from_value(u.clone()).unwrap())).collect();
+        assert_eq!(
+            shown,
+            ["not_configured", "idle", "checking", "current", "available", "applying", "stale", "failed", "refused", "rolled_back"]
+        );
+    }
+
+    /// Plan 7.5: the one update message carries no field, and a client message
+    /// names no file, path or data of any kind.
+    #[test]
+    fn request_update_has_no_fields_and_refuses_any() {
+        assert_eq!(serde_json::to_value(ClientMessage::RequestUpdate {}).unwrap(), serde_json::json!({"type": "request_update"}));
+        assert_eq!(serde_json::from_str::<ClientMessage>(r#"{"type":"request_update"}"#).unwrap(), ClientMessage::RequestUpdate {});
+        for extra in [r#"{"type":"request_update","url":"x"}"#, r#"{"type":"request_update","version":"9"}"#, r#"{"type":"request_update","path":"C:\\x"}"#] {
+            assert!(serde_json::from_str::<ClientMessage>(extra).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
     fn a_full_flows_frame_stays_under_the_frame_limit() {
         let ev = FlowEvent {
             id: u64::MAX,
@@ -470,7 +556,7 @@ mod tests {
             answer_hello(PROTOCOL, "0.1.0", 3),
             EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 3 }
         );
-        for v in [0, 1, 3, u32::MAX] {
+        for v in [0, 1, 2, SUPPORTED[1] + 1, u32::MAX] {
             assert_eq!(answer_hello(v, "0.1.0", 3), EngineMessage::Incompatible { supported: SUPPORTED }, "v{v}");
         }
     }
