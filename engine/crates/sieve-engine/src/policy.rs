@@ -13,10 +13,12 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use sieve_ipc::Policy;
+use sieve_ipc::{MAX_FRAME, Policy};
 
 pub const POLICY_FILE: &str = "policy.json";
 pub const RUNS_FILE: &str = "runs.json";
+/// Half a frame: the Status that carries the policy has the other half.
+pub const MAX_POLICY_BYTES: usize = MAX_FRAME / 2;
 
 /// Restarts within [`CRASH_WINDOW_MS`] that stop routing (plan 1.6.4).
 pub const CRASH_LOOP_RESTARTS: u32 = 3;
@@ -42,17 +44,23 @@ pub fn save(dir: &Path, policy: &Policy) -> Result<(), String> {
     write_atomic(&dir.join(POLICY_FILE), &serde_json::to_vec_pretty(policy).map_err(|e| e.to_string())?)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The policy a SetPolicy asks for, or why it is refused: an older or equal
-/// revision is a stale write (another window, a retry) and changes nothing.
-pub fn accept(current: Policy, asked: Policy) -> Result<Policy, String> {
+/// revision is a stale write (another window, a retry) and changes nothing. A
+/// policy is sent back in every Status, so one that could not fit a frame
+/// beside the rest of a Status is refused here and not at the next answer.
+pub fn accept(current: &Policy, asked: Policy) -> Result<Policy, String> {
     if asked.revision <= current.revision {
         return Err(format!("stale policy revision {} (the engine holds {})", asked.revision, current.revision));
+    }
+    let size = serde_json::to_vec(&asked).map_err(|e| e.to_string())?.len();
+    if size > MAX_POLICY_BYTES {
+        return Err(format!("a policy of {size} bytes is over the {MAX_POLICY_BYTES} byte limit"));
     }
     Ok(asked)
 }
@@ -132,7 +140,7 @@ mod tests {
     fn the_policy_defaults_off_round_trips_and_a_bad_file_reads_as_off() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load(dir.path()), (Policy::default(), None));
-        let on = Policy { revision: 4, engine: true };
+        let on = Policy { revision: 4, engine: true, sieving: true, off_apps: vec!["app".into()], ..Policy::default() };
         save(dir.path(), &on).unwrap();
         assert_eq!(load(dir.path()), (on, None));
         std::fs::write(dir.path().join(POLICY_FILE), b"{\"engine\":true}").unwrap();
@@ -142,11 +150,31 @@ mod tests {
     }
 
     #[test]
+    fn an_old_policy_file_loads_with_sieving_off() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(POLICY_FILE), br#"{"revision":7,"engine":true}"#).unwrap();
+        let (p, why) = load(dir.path());
+        assert_eq!(why, None);
+        assert_eq!((p.revision, p.engine, p.sieving), (7, true, false));
+        assert!(p.off_apps.is_empty() && p.lists.is_none() && p.domain_lists.is_empty());
+    }
+
+    fn policy(revision: u64, engine: bool) -> Policy {
+        Policy { revision, engine, ..Policy::default() }
+    }
+
+    #[test]
     fn only_a_newer_revision_is_accepted() {
-        let cur = Policy { revision: 4, engine: true };
-        assert_eq!(accept(cur, Policy { revision: 5, engine: false }), Ok(Policy { revision: 5, engine: false }));
-        assert!(accept(cur, Policy { revision: 4, engine: false }).is_err());
-        assert!(accept(cur, Policy { revision: 1, engine: true }).is_err());
+        let cur = policy(4, true);
+        assert_eq!(accept(&cur, policy(5, false)), Ok(policy(5, false)));
+        assert!(accept(&cur, policy(4, false)).is_err());
+        assert!(accept(&cur, policy(1, true)).is_err());
+    }
+
+    #[test]
+    fn a_policy_too_large_for_a_status_frame_is_refused() {
+        let big = Policy { off_apps: vec!["a".repeat(MAX_POLICY_BYTES)], ..policy(5, true) };
+        assert!(accept(&policy(4, true), big).unwrap_err().contains("over the"));
     }
 
     /// A fake clock in minutes: three crashes in an hour stop routing at the

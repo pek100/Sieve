@@ -27,10 +27,10 @@ use std::time::{Duration, Instant};
 use ipstack::{IpStackTcpStream, IpStackUdpStream};
 use sieve_engine::flow::classify::{Decoded, UdpClassifier};
 use sieve_engine::flow::relay::relay_tcp;
-use sieve_engine::flow::flows::{Action, AppPolicy, Attributor, ExeCache, FiveTuple, Owner, os::IpHelper, verdict};
+use sieve_engine::domain::DomainFilter;
+use sieve_engine::flow::flows::{Action, AppPolicy, Attributor, ExeCache, FiveTuple, Owner, os::IpHelper};
 use sieve_engine::flow::packet::Proto;
-use crate::support::{FlowLog, Summary, admit_owner, record};
-use sieve_filter::rules::RuleEngine;
+use crate::support::{FlowLog, Summary, admit_owner, decide_flow, record};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
@@ -54,7 +54,7 @@ pub struct Shared {
     pub own_pid: u32,
     pub attributor: Mutex<Attributor<IpHelper>>,
     pub exes: Mutex<ExeCache<ExeLookup>>,
-    pub rules: RuleEngine,
+    pub filter: DomainFilter,
     pub policy: AppPolicy,
     pub enforce: bool,
     /// Egress per routed address. Only these destinations are forwarded.
@@ -116,7 +116,8 @@ impl Shared {
     /// Decide, log and count one flow. Returns the action to apply.
     fn decide(&self, proto: &'static str, flow: &FiveTuple, pid: Option<u32>, retried: bool, d: &Decoded) -> Action {
         let exe = self.exe(pid);
-        let decision = verdict(d.domain.as_deref(), exe.as_deref(), &self.rules, &self.policy);
+        let decision = decide_flow(d.domain.as_deref(), exe.as_deref(), flow.remote.ip(), &self.filter, &self.policy);
+        let action = decision.action;
         let rec = record(self.now_ms(), proto, flow.local, flow.remote, pid, exe, d, decision, self.enforce);
         {
             let mut s = self.summary();
@@ -128,7 +129,7 @@ impl Shared {
         if let Some(line) = self.log.lock().unwrap_or_else(|p| p.into_inner()).push(rec) {
             println!("{line}");
         }
-        if self.enforce { decision.action } else { Action::Pass }
+        if self.enforce { action } else { Action::Pass }
     }
 
     fn egress_for(&self, ip: IpAddr) -> Result<Egress, String> {

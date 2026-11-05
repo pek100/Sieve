@@ -1,9 +1,9 @@
-//! The relay of every flow (plan 1.1, slice 3): ipstack terminates each flow
-//! that enters the adapter, the flow is attributed to its process, its first
-//! bytes are decoded (SNI, Host, QUIC Initial, the DNS question), and it is
-//! relayed to its destination through a socket pinned to the interface
-//! Windows would use without Sieve. Slice 3 filters nothing: every flow is
-//! relayed (or fails to connect, and is closed at once).
+//! The relay of every flow (plan 1.1, slice 3, 4): ipstack terminates each
+//! flow that enters the adapter, the flow is attributed to its process, its
+//! first bytes are decoded (SNI, Host, QUIC Initial, the DNS question), the
+//! one decision (`crate::domain`) is asked, and it is relayed to its
+//! destination through a socket pinned to the interface Windows would use
+//! without Sieve, or closed with nothing sent upstream.
 //!
 //! - [`book`]: the flows as the app sees them, batched for the pipe;
 //! - [`Meters`]: the engine's own counters (attribution is read from them);
@@ -15,11 +15,19 @@ pub mod diagnostics;
 #[cfg(windows)]
 pub mod relay;
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use sieve_ipc::{Counters, FlowKind};
+use sieve_ipc::{Counters, FlowAction, FlowEvent, FlowKind, MAX_RULE_BYTES, cap_text};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
+use crate::domain::Decision;
 use crate::flow::classify::{Decoded, Kind};
+use book::FlowBook;
+
+/// Only datagram boundaries matter while draining; a smaller read loses nothing.
+const DRAIN_BUFFER: usize = 2_048;
 
 /// Counters since the engine started.
 #[derive(Debug, Default)]
@@ -33,6 +41,7 @@ pub struct Meters {
     pub packets_in: AtomicU64,
     pub packets_out: AtomicU64,
     pub not_unicast: AtomicU64,
+    pub blocked: AtomicU64,
 }
 
 impl Meters {
@@ -50,6 +59,34 @@ impl Meters {
             packets_in: l(&self.packets_in),
             packets_out: l(&self.packets_out),
             not_unicast: l(&self.not_unicast),
+            blocked: l(&self.blocked),
+        }
+    }
+}
+
+/// Fills a decided flow's event: what its first bytes said and the decision.
+pub fn record_decision(event: &mut FlowEvent, d: &Decoded, dns: bool, decision: &Decision) {
+    event.kind = if dns { FlowKind::Dns } else { kind_of(d) };
+    event.host.clone_from(&d.domain);
+    event.reason = Some(decision.reason);
+    event.rule = decision.rule.as_deref().map(|r| cap_text(r, MAX_RULE_BYTES).to_string());
+    event.list.clone_from(&decision.list);
+}
+
+/// A flow the decision closed: one book entry, one count.
+pub fn close_blocked(book: &Mutex<FlowBook>, meters: &Meters, id: u64) {
+    book.lock().unwrap_or_else(|p| p.into_inner()).close(id, FlowAction::Blocked, 0, 0);
+    Meters::bump(&meters.blocked);
+}
+
+/// Swallows a blocked UDP flow's datagrams until it has been idle for `idle`.
+/// Ending at once would turn each QUIC retransmit into a new flow with a new
+/// owner lookup; the stack's own timeout then frees the flow.
+pub async fn drain_udp<S: AsyncRead + Unpin>(app: &mut S, idle: Duration) {
+    let mut buf = vec![0u8; DRAIN_BUFFER];
+    while let Ok(Ok(n)) = tokio::time::timeout(idle, app.read(&mut buf)).await {
+        if n == 0 {
+            return;
         }
     }
 }
@@ -79,6 +116,53 @@ mod tests {
         Meters::bump(&m.attributed);
         let c = m.counters();
         assert_eq!((c.flows, c.attributed, c.own_refused), (2, 1, 0));
+    }
+
+    /// Fake clock: a retransmit inside the idle time keeps the drain alive,
+    /// nothing is booked again, and silence ends it.
+    #[tokio::test(start_paused = true)]
+    async fn blocked_udp_drains_until_idle_and_books_one_flow() {
+        use tokio::io::AsyncWriteExt;
+        const IDLE: Duration = Duration::from_secs(30);
+        let book = Mutex::new(FlowBook::default());
+        let meters = Meters::default();
+        let id = book.lock().unwrap().open(book::tests_event(Some(1))).unwrap();
+        close_blocked(&book, &meters, id);
+        let (mut app, mut stack) = tokio::io::duplex(4096);
+        let started = tokio::time::Instant::now();
+        let drain = tokio::spawn(async move { drain_udp(&mut stack, IDLE).await });
+        for _ in 0..3 {
+            tokio::time::sleep(IDLE - Duration::from_secs(1)).await;
+            app.write_all(b"retransmit").await.unwrap();
+        }
+        assert!(!drain.is_finished(), "datagrams keep the flow alive");
+        let last = tokio::time::Instant::now();
+        drain.await.unwrap();
+        assert_eq!(tokio::time::Instant::now() - last, IDLE);
+        assert!(last - started >= IDLE * 2);
+        let batch = book.lock().unwrap().take_batch();
+        assert_eq!(batch.iter().map(|e| (e.action, e.open)).collect::<Vec<_>>(), [(FlowAction::Blocked, false)]);
+        assert_eq!(meters.counters().blocked, 1);
+        drop(app);
+    }
+
+    #[tokio::test]
+    async fn a_closed_stack_ends_the_drain_at_once() {
+        let (app, mut stack) = tokio::io::duplex(64);
+        drop(app);
+        tokio::time::timeout(Duration::from_secs(5), drain_udp(&mut stack, Duration::from_secs(3_600))).await.expect("ended");
+    }
+
+    #[test]
+    fn a_decision_fills_the_event_and_a_long_rule_is_cut() {
+        let mut e = book::tests_event(Some(1));
+        let d = Decoded { kind: Some(Kind::Tls), domain: Some("ads.example".into()), ..Decoded::default() };
+        let rule = "r".repeat(MAX_RULE_BYTES + 10);
+        let decision = Decision { action: crate::flow::flows::Action::Drop, reason: sieve_ipc::FlowReason::NamedBlock, rule: Some(rule), list: Some("l".into()) };
+        record_decision(&mut e, &d, false, &decision);
+        assert_eq!((e.kind, e.host.as_deref(), e.reason), (FlowKind::Tls, Some("ads.example"), Some(sieve_ipc::FlowReason::NamedBlock)));
+        assert_eq!(e.rule.map(|r| r.len()), Some(MAX_RULE_BYTES));
+        assert_eq!(e.list.as_deref(), Some("l"));
     }
 
     #[test]

@@ -10,10 +10,12 @@
 //! - [`dns`]: DNS answers read into the IP-to-names map (slice 3);
 //! - [`coexist`]: AdGuard and VPN detection, read only (slice 3);
 //! - [`watchdog`], [`policy`]: hang and crash-loop safety (slice 3);
-//! - [`control`]: the running engine's facts and its routing loop.
+//! - [`control`]: the running engine's facts and its routing loop;
+//! - [`domain`]: the one per-flow decision (slice 4);
+//! - [`lists`]: the default lists' download, cache and compile (slice 4).
 //!
-//! Slice 3 routes and relays; it filters nothing. Traffic goes through the
-//! engine only while the user's `filtering.engine` switch is on.
+//! Traffic goes through the engine only while the user's `filtering.engine`
+//! switch is on; off, killed or crashed is a normal network.
 pub mod coexist;
 pub mod control;
 pub mod dns;
@@ -22,6 +24,7 @@ pub mod domain;
 pub mod experiments;
 pub mod flow;
 pub mod ipc;
+pub mod lists;
 pub mod policy;
 pub mod route;
 pub mod service;

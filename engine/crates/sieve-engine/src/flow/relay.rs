@@ -468,6 +468,74 @@ mod tests {
         assert!(server.await.unwrap().is_empty(), "nothing reached the upstream");
     }
 
+    fn decision_filter() -> (crate::domain::DomainFilter, std::sync::Mutex<crate::dns::NameMap>) {
+        use sieve_filter::rules::{ListText, RuleEngine, RuleSet};
+        let lists = RuleEngine::compile(&[ListText { id: "test", text: "||blocked.example^\n", trusted: false }]);
+        let rules = RuleSet { user: std::sync::Arc::new(RuleEngine::empty()), lists: std::sync::Arc::new(lists) };
+        let policy = sieve_ipc::Policy { sieving: true, off_apps: vec!["off app".into()], ..sieve_ipc::Policy::default() };
+        (crate::domain::DomainFilter::new(&policy, rules), std::sync::Mutex::default())
+    }
+
+    fn decide_as(key: &'static str) -> impl FnOnce(&Decoded) -> Action {
+        use crate::domain::{Flow, Owner};
+        move |d| {
+            let (filter, names) = decision_filter();
+            filter.decide(Flow::from_decoded(d, false, "192.0.2.1".parse().unwrap(), Owner::App { key }), &names, 0).action
+        }
+    }
+
+    /// The real classifier and the real decision: the sieved app's hello never
+    /// leaves, and once the caller closes as `stop` asks, the app sees the FIN.
+    #[tokio::test]
+    async fn blocked_flow_sends_nothing_upstream_and_closes_the_app() {
+        let (up, server) = upstream(|mut s| async move {
+            let mut all = Vec::new();
+            let _ = s.read_to_end(&mut all).await;
+            all
+        })
+        .await;
+        let (mut app, mut relay_side) = tokio::io::duplex(PIPE_BYTES);
+        app.write_all(&build::typical("x.blocked.example")).await.unwrap();
+        let relay = tokio::spawn(async move {
+            let out = relay_tcp(&mut relay_side, up, WAIT, decide_as("browser")).await;
+            if out.stop {
+                relay_side.shutdown().await.unwrap();
+            }
+            out
+        });
+        let out = relay.await.unwrap();
+        assert!(out.dropped && out.stop);
+        assert_eq!((out.bytes_up, out.decided.and_then(|d| d.domain).as_deref()), (0, Some("x.blocked.example")));
+        assert!(server.await.unwrap().is_empty(), "nothing reached the upstream");
+        let mut closed = Vec::new();
+        tokio::time::timeout(WAIT, app.read_to_end(&mut closed)).await.expect("the app sees a close").unwrap();
+    }
+
+    /// The same flow from an Off app: its hello, then its data, reach upstream
+    /// byte for byte, in order, once.
+    #[tokio::test]
+    async fn off_app_held_bytes_reach_upstream_intact() {
+        let hello = build::typical("x.blocked.example");
+        let (up, server) = upstream(|mut s| async move {
+            let mut all = Vec::new();
+            let _ = s.read_to_end(&mut all).await;
+            all
+        })
+        .await;
+        let (mut app, mut relay_side) = tokio::io::duplex(PIPE_BYTES);
+        let relay = tokio::spawn(async move { relay_tcp(&mut relay_side, up, WAIT, decide_as("off app")).await });
+        app.write_all(&hello[..50]).await.unwrap();
+        tokio::task::yield_now().await;
+        app.write_all(&hello[50..]).await.unwrap();
+        app.write_all(b"APPDATA").await.unwrap();
+        app.shutdown().await.unwrap();
+        let out = relay.await.unwrap();
+        let expected = [hello.as_slice(), b"APPDATA"].concat();
+        assert!(!out.dropped && !out.stop);
+        assert_eq!(out.bytes_up, expected.len() as u64);
+        assert_eq!(server.await.unwrap(), expected);
+    }
+
     #[tokio::test]
     async fn server_first_banner_reaches_the_app_before_any_client_byte() {
         let (up, server) = upstream(|s| async move {

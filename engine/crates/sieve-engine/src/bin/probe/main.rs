@@ -248,14 +248,14 @@ mod live {
             }
         }
 
-        let (rules, policy) = support::policy_for(&args, list_text.as_deref());
+        let (filter, policy) = support::policy_for(&args, list_text.as_deref());
         let counters = Arc::new(TunCounters::default());
         let shared = Arc::new(Shared {
             start: Instant::now(),
             own_pid: std::process::id(),
             attributor: Mutex::new(Attributor::new(IpHelper)),
             exes: Mutex::new(ExeCache::new(sieve_engine::flow::flows::os::exe_path as fn(u32) -> Option<String>)),
-            rules,
+            filter,
             policy,
             enforce: args.enforce.is_some(),
             egress,

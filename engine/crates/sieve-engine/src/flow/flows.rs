@@ -17,16 +17,15 @@
 //!   answers `Pending` until [`GIVE_UP_MS`] after the first miss, then
 //!   `Unknown`. The caller holds the flow's packets meanwhile (classify).
 //!
-//! Decision: [`verdict`] is pure: (domain, exe, rules, policy) -> pass or
-//! drop with a reason. Per-app levels mirror Sieve's (`sieve` filters,
-//! `off` and `watch` never drop). A flow whose domain is unknown (no SNI,
-//! no Host, undecodable) passes, and the reason says so.
+//! The decision itself is `crate::domain`. Here: [`Action`], the probe's
+//! [`AppPolicy`], and each executable's app key ([`AppKeys`]).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Mutex;
 
 use crate::flow::packet::{Packet, Proto};
-use sieve_filter::rules::{HostVerdict, RuleEngine};
+use sieve_ipc::app_key;
 
 /// A refresh of a table is never more frequent than this on misses.
 pub const REFRESH_MIN_MS: u64 = 15;
@@ -281,6 +280,71 @@ impl<F: FnMut(u32) -> Option<String>> ExeCache<F> {
     }
 }
 
+/// At most this many exe paths keep their key; past it the cache starts over
+/// (a machine has far fewer executables with sockets; this only bounds it).
+const MAX_APP_KEYS: usize = 4_096;
+
+/// exe path -> app key, read once per path: version info does not change
+/// while a file is in use. The lookup runs outside the lock.
+pub struct AppKeys<F> {
+    product_of: F,
+    keys: Mutex<HashMap<String, String>>,
+}
+
+impl<F: Fn(&str) -> Option<String>> AppKeys<F> {
+    pub fn new(product_of: F) -> Self {
+        Self { product_of, keys: Mutex::default() }
+    }
+
+    fn keys(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.keys.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn key(&self, exe: &str) -> String {
+        if let Some(hit) = self.keys().get(exe) {
+            return hit.clone();
+        }
+        let key = app_key((self.product_of)(exe).as_deref(), Some(exe), "");
+        let mut keys = self.keys();
+        if keys.len() >= MAX_APP_KEYS {
+            keys.clear();
+        }
+        keys.insert(exe.to_string(), key.clone());
+        key
+    }
+
+    /// The app key of `pid`: from its exe, or the fixed label of a kernel pid
+    /// (the app's `label`). None when the exe is hidden: the app names those
+    /// by the services they host, which the engine does not read, and an
+    /// unattributed flow is sieved rather than given a guessed exemption.
+    pub fn of_pid(&self, pid: u32, exe: Option<&str>) -> Option<String> {
+        match (exe, pid) {
+            (Some(exe), _) => Some(self.key(exe)),
+            (None, 0) => Some(app_key(None, None, "System idle")),
+            (None, 4) => Some(app_key(None, None, "System")),
+            (None, _) => None,
+        }
+    }
+}
+
+/// A version-resource string as a name: it ends at the first NUL (Windows'
+/// reported length can run past it), control and invisible characters go, and
+/// whitespace runs collapse. Empty after that means no name.
+///
+/// TENSION: the OS read and this cleaning also live in
+/// `src-tauri/src/netstat/process.rs`. `sieve-ipc` and `sieve-filter` make no
+/// Windows calls and the engine never links Tauri, so the pure key rule is
+/// shared (`sieve_ipc::app_key`) and this read is duplicated.
+pub fn clean_resource_string(words: &[u16]) -> Option<String> {
+    let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());
+    let text: String = char::decode_utf16(words[..end].iter().copied())
+        .filter_map(Result::ok)
+        .filter(|c| !c.is_control() && !matches!(*c, '\u{FFFD}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{E000}'..='\u{F8FF}'))
+        .collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
 /// Per-app level, mirroring Sieve's `off < watch < sieve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -324,48 +388,6 @@ impl AppPolicy {
 pub enum Action {
     Pass,
     Drop,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reason {
-    /// No domain could be read from the flow (no SNI, no Host, not decoded).
-    UnknownDomain,
-    /// The app's level is below `sieve`.
-    AppNotFiltered(Level),
-    /// An allow rule matched.
-    Allowed,
-    /// No rule matched.
-    NoRule,
-    /// A block rule matched for a filtered app.
-    Blocked,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Decision {
-    pub action: Action,
-    pub reason: Reason,
-}
-
-impl Decision {
-    fn pass(reason: Reason) -> Self {
-        Self { action: Action::Pass, reason }
-    }
-}
-
-/// The verdict for one flow.
-pub fn verdict(domain: Option<&str>, exe: Option<&str>, rules: &RuleEngine, policy: &AppPolicy) -> Decision {
-    let Some(domain) = domain else {
-        return Decision::pass(Reason::UnknownDomain);
-    };
-    let level = policy.level_of(exe);
-    if level != Level::Sieve {
-        return Decision::pass(Reason::AppNotFiltered(level));
-    }
-    match rules.check_host(domain) {
-        HostVerdict::Block => Decision { action: Action::Drop, reason: Reason::Blocked },
-        HostVerdict::Allow => Decision::pass(Reason::Allowed),
-        HostVerdict::None => Decision::pass(Reason::NoRule),
-    }
 }
 
 /// The OS lookups the probe uses. Read only.
@@ -445,6 +467,68 @@ pub mod os {
         let _ = unsafe { CloseHandle(handle) };
         ok.ok()?;
         buf.get(..len as usize).map(String::from_utf16_lossy).filter(|p| !p.is_empty())
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// ProductName from an exe's version resource (uncached: see `AppKeys`).
+    pub fn product_name(exe: &str) -> Option<String> {
+        use std::ffi::c_void;
+        use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW};
+        use windows::core::PCWSTR;
+
+        let path = wide(exe);
+        // SAFETY: `path` is a NUL-terminated UTF-16 string that outlives the calls.
+        let size = unsafe { GetFileVersionInfoSizeW(PCWSTR(path.as_ptr()), None) };
+        if size == 0 {
+            return None;
+        }
+        // u32 storage keeps the block aligned for the u16 strings inside it.
+        let mut block = vec![0u32; (size as usize).div_ceil(4)];
+        // SAFETY: `block` has at least `size` bytes.
+        unsafe { GetFileVersionInfoW(PCWSTR(path.as_ptr()), None, size, block.as_mut_ptr().cast::<c_void>()) }.ok()?;
+
+        let mut keys: Vec<(u16, u16)> = Vec::new();
+        if let Some(words) = version_value(&block, "\\VarFileInfo\\Translation") {
+            keys.extend(words.chunks_exact(2).map(|p| (p[0], p[1])));
+        }
+        // Common fallbacks when the translation table is missing or wrong:
+        // US English with Unicode, US English with Windows-1252, neutral Unicode.
+        keys.extend([(0x0409, 0x04B0), (0x0409, 0x04E4), (0x0000, 0x04B0)]);
+        keys.into_iter().find_map(|(lang, cp)| {
+            let words = version_value(&block, &format!("\\StringFileInfo\\{lang:04x}{cp:04x}\\ProductName"))?;
+            super::clean_resource_string(words)
+        })
+    }
+
+    /// VerQueryValueW for `sub`, as the u16 words it points at (the
+    /// translation table's length is in bytes, a string's in characters).
+    fn version_value<'a>(block: &'a [u32], sub: &str) -> Option<&'a [u16]> {
+        use std::ffi::c_void;
+        use windows::Win32::Storage::FileSystem::VerQueryValueW;
+        use windows::core::PCWSTR;
+
+        let key = wide(sub);
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let mut len: u32 = 0;
+        // SAFETY: `block` is the buffer GetFileVersionInfoW filled; `ptr` is
+        // set to a location inside it and `len` to its length.
+        let ok = unsafe { VerQueryValueW(block.as_ptr().cast::<c_void>(), PCWSTR(key.as_ptr()), &mut ptr, &mut len) };
+        if !ok.as_bool() || ptr.is_null() || len == 0 || !ptr.cast::<u16>().is_aligned() {
+            return None;
+        }
+        let words = if sub.starts_with("\\VarFileInfo") { len as usize / 2 } else { len as usize };
+        let start = block.as_ptr() as usize;
+        let end = start + block.len() * 4;
+        let at = ptr as usize;
+        if at < start || at + words * 2 > end {
+            return None;
+        }
+        // SAFETY: checked above that [ptr, ptr + words * 2) lies inside `block`
+        // and is 2-byte aligned; the slice borrows `block`.
+        Some(unsafe { std::slice::from_raw_parts(ptr.cast::<u16>(), words) })
     }
 }
 
@@ -668,61 +752,34 @@ mod tests {
         assert_eq!(calls, 2);
     }
 
-    /// The spike matched with a copy of the DNS rule set; the engine asks
-    /// the one rule engine (plan 5.1). The rules below are the same text.
-    fn rules(text: &str) -> RuleEngine {
-        RuleEngine::compile(&[sieve_filter::rules::ListText { id: "test", text, trusted: false }])
-    }
-
-    const CURL: &str = r"C:\Windows\System32\curl.exe";
-    const OTHER: &str = r"C:\Users\me\AppData\Local\Temp\curl-other.exe";
-
     #[test]
-    fn blocked_domain_drops_only_for_filtered_apps() {
-        let r = rules("||ads.example^\n@@||ok.ads.example^");
-        let policy = AppPolicy::new(Level::Sieve).set("curl-other.exe", Level::Off);
-        assert_eq!(verdict(Some("x.ads.example"), Some(CURL), &r, &policy), Decision { action: Action::Drop, reason: Reason::Blocked });
-        assert_eq!(
-            verdict(Some("x.ads.example"), Some(OTHER), &r, &policy),
-            Decision { action: Action::Pass, reason: Reason::AppNotFiltered(Level::Off) }
-        );
-        assert_eq!(verdict(Some("ok.ads.example"), Some(CURL), &r, &policy).reason, Reason::Allowed);
-        assert_eq!(verdict(Some("news.example"), Some(CURL), &r, &policy).reason, Reason::NoRule);
+    fn an_exes_key_is_read_once_per_path() {
+        let asked = Mutex::new(Vec::new());
+        let keys = AppKeys::new(|exe: &str| {
+            asked.lock().unwrap().push(exe.to_string());
+            exe.contains("chrome").then(|| "Google Chrome".to_string())
+        });
+        assert_eq!(keys.key(r"C:\x\chrome.exe"), "google chrome");
+        assert_eq!(keys.key(r"C:\x\chrome.exe"), "google chrome");
+        assert_eq!(keys.key(r"C:\x\Tool.exe"), "tool");
+        assert_eq!(asked.lock().unwrap().len(), 2);
     }
 
     #[test]
-    fn unknown_domain_always_passes_and_says_so() {
-        let r = rules("||ads.example^");
-        let policy = AppPolicy::new(Level::Sieve);
-        for exe in [Some(CURL), None] {
-            assert_eq!(verdict(None, exe, &r, &policy), Decision { action: Action::Pass, reason: Reason::UnknownDomain });
-        }
+    fn a_pid_has_a_key_from_its_exe_or_its_fixed_label_never_a_guess() {
+        let keys = AppKeys::new(|_: &str| None);
+        assert_eq!(keys.of_pid(99, Some(r"C:\x\Tool.exe")).as_deref(), Some("tool"));
+        assert_eq!(keys.of_pid(4, None).as_deref(), Some("system"));
+        assert_eq!(keys.of_pid(0, None).as_deref(), Some("system idle"));
+        assert_eq!(keys.of_pid(99, None), None);
     }
 
     #[test]
-    fn unknown_app_gets_the_default_level() {
-        let r = rules("||ads.example^");
-        assert_eq!(verdict(Some("ads.example"), None, &r, &AppPolicy::new(Level::Sieve)).action, Action::Drop);
-        assert_eq!(verdict(Some("ads.example"), None, &r, &AppPolicy::new(Level::Off)).action, Action::Pass);
-    }
-
-    #[test]
-    fn enforce_test_policy_blocks_one_exe_only() {
-        // The probe's --enforce-test shape: default off, one exe sieved.
-        let r = rules("||sieve-spike-test.example^");
-        let policy = AppPolicy::new(Level::Off).set(CURL, Level::Sieve);
-        assert_eq!(verdict(Some("sieve-spike-test.example"), Some(CURL), &r, &policy).action, Action::Drop);
-        assert_eq!(verdict(Some("sieve-spike-test.example"), Some(&CURL.to_uppercase()), &r, &policy).action, Action::Drop);
-        assert_eq!(verdict(Some("sieve-spike-test.example"), Some(OTHER), &r, &policy).action, Action::Pass);
-        assert_eq!(verdict(Some("other.example"), Some(CURL), &r, &policy).action, Action::Pass);
-    }
-
-    #[test]
-    fn watch_level_never_drops_and_full_path_beats_file_name() {
-        let r = rules("||ads.example^");
-        let policy = AppPolicy::new(Level::Off).set("curl.exe", Level::Sieve).set(CURL, Level::Watch);
-        assert_eq!(verdict(Some("ads.example"), Some(CURL), &r, &policy).reason, Reason::AppNotFiltered(Level::Watch));
-        assert_eq!(verdict(Some("ads.example"), Some(r"D:\x\curl.exe"), &r, &policy).action, Action::Drop);
+    fn a_resource_string_ends_at_its_nul_and_loses_invisible_characters() {
+        let words = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert_eq!(clean_resource_string(&words("NVIDIA App\0junk")).as_deref(), Some("NVIDIA App"));
+        assert_eq!(clean_resource_string(&words("  a \t b\u{200B} ")).as_deref(), Some("a b"));
+        assert_eq!(clean_resource_string(&words("\u{FEFF}  ")), None);
     }
 
     proptest! {
@@ -733,16 +790,5 @@ mod tests {
             }
         }
 
-        #[test]
-        fn verdict_never_drops_for_off_or_watch(domain in "[a-z]{1,8}\\.example", exe in "[a-z]{1,8}\\.exe") {
-            let r = rules("||example^\nexample.com");
-            let r2 = rules(&format!("||{domain}^"));
-            for level in [Level::Off, Level::Watch] {
-                let p = AppPolicy::new(level);
-                prop_assert_eq!(verdict(Some(&domain), Some(&exe), &r, &p).action, Action::Pass);
-                prop_assert_eq!(verdict(Some(&domain), Some(&exe), &r2, &p).action, Action::Pass);
-            }
-            prop_assert_eq!(verdict(Some(&domain), Some(&exe), &r2, &AppPolicy::new(Level::Sieve)).action, Action::Drop);
-        }
     }
 }

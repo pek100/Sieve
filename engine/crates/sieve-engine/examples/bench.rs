@@ -17,10 +17,12 @@ use std::time::Instant;
 use etherparse::{PacketBuilder, SlicedPacket, TransportSlice};
 use ipstack::{IpStack, IpStackConfig, IpStackStream};
 use sieve_engine::flow::classify::{TcpClassifier, UdpClassifier};
-use sieve_engine::flow::flows::{AppPolicy, FiveTuple, Level, OwnerRow, match_owner, verdict};
+use sieve_engine::domain::{DomainFilter, Flow, Owner};
+use sieve_engine::flow::flows::{FiveTuple, OwnerRow, match_owner};
 use sieve_engine::flow::packet::{self, Proto};
 use sieve_engine::flow::quic::{self, VERSION_1};
-use sieve_filter::rules::{ListText, RuleEngine};
+use sieve_filter::rules::{ListText, RuleEngine, RuleSet};
+use sieve_ipc::Policy;
 use sieve_engine::flow::sni::build;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
@@ -173,12 +175,16 @@ fn main() {
     time("owner match, 500-row table, last row", 200_000, || match_owner(&flow, &rows));
 
     let text: String = (0..100_000).map(|i| format!("||ads{i}.tracker{}.com^\n", i % 997)).collect();
-    let rules = RuleEngine::compile(&[ListText { id: "bench", text: &text, trusted: false }]);
-    let policy = AppPolicy::new(Level::Sieve);
-    time("verdict, 100k rules, 5-label miss", 1_000_000, || {
-        verdict(Some("a.b.cdn.example.org"), Some(r"C:\x\chrome.exe"), &rules, &policy)
-    });
-    time("verdict, 100k rules, hit", 1_000_000, || verdict(Some("x.ads77.tracker77.com"), Some("chrome.exe"), &rules, &policy));
+    let lists = RuleEngine::compile(&[ListText { id: "bench", text: &text, trusted: false }]);
+    let rules = RuleSet { user: std::sync::Arc::new(RuleEngine::empty()), lists: std::sync::Arc::new(lists) };
+    let filter = DomainFilter::new(&Policy { sieving: true, ..Policy::default() }, rules);
+    let names = std::sync::Mutex::default();
+    let decide = |name| {
+        let flow = Flow { dns: false, name: Some(name), remote: flow.remote.ip(), owner: Owner::App { key: "chrome" } };
+        filter.decide(flow, &names, 0)
+    };
+    time("decision, 100k rules, 5-label miss", 1_000_000, || decide("a.b.cdn.example.org"));
+    time("decision, 100k rules, hit", 1_000_000, || decide("x.ads77.tracker77.com"));
 
     println!("\n== ipstack ingress (every packet; one flow, one task hop each) ==");
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();

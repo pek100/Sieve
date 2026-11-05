@@ -6,12 +6,15 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
 use sieve_engine::flow::classify::{Decoded, Kind};
-use sieve_engine::flow::flows::{Action, AppPolicy, Decision, Level, Reason};
-use sieve_filter::rules::{ListText, RuleEngine};
+use sieve_engine::domain::{Decision, DomainFilter, Flow, Owner, Reason};
+use sieve_engine::flow::flows::{Action, AppPolicy, Level};
+use sieve_filter::rules::{ListText, RuleEngine, RuleSet};
+use sieve_ipc::Policy;
 
 /// Default test host: nginx's own HTTP/3 test site. Its addresses are
 /// dedicated (AWS, IPv4 only today) rather than a shared CDN anycast front
@@ -273,8 +276,12 @@ impl FlowLog {
 }
 
 /// The rules and per-app policy the run decides with.
-pub fn policy_for(args: &Args, list_text: Option<&str>) -> (RuleEngine, AppPolicy) {
-    let compile = |text: &str| RuleEngine::compile(&[ListText { id: "probe", text, trusted: false }]);
+pub fn policy_for(args: &Args, list_text: Option<&str>) -> (DomainFilter, AppPolicy) {
+    let compile = |text: &str| {
+        let lists = RuleEngine::compile(&[ListText { id: "probe", text, trusted: false }]);
+        let rules = RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(lists) };
+        DomainFilter::new(&Policy { sieving: true, off_apps: vec![PROBE_OFF_KEY.to_string()], ..Policy::default() }, rules)
+    };
     match &args.enforce {
         Some(e) => (compile(&format!("||{}^", e.domain)), AppPolicy::new(Level::Off).set(&e.exe, Level::Sieve)),
         None => {
@@ -282,6 +289,19 @@ pub fn policy_for(args: &Args, list_text: Option<&str>) -> (RuleEngine, AppPolic
             (compile(list_text.unwrap_or_default()), policy)
         }
     }
+}
+
+/// The engine's one decision for a flow of this run. The probe names apps by
+/// executable (its command line), the engine by app key, so each flow's level
+/// becomes one of two keys and the Off row holds the first.
+const PROBE_OFF_KEY: &str = "probe-off";
+const PROBE_SIEVED_KEY: &str = "probe-sieved";
+
+pub fn decide_flow(domain: Option<&str>, exe: Option<&str>, remote: std::net::IpAddr, filter: &DomainFilter, policy: &AppPolicy) -> Decision {
+    let key = if policy.level_of(exe) == Level::Sieve { PROBE_SIEVED_KEY } else { PROBE_OFF_KEY };
+    // The probe records no DNS answers: an unnamed flow is unknown to it.
+    let names = Mutex::default();
+    filter.decide(Flow { dns: false, name: domain, remote, owner: Owner::App { key } }, &names, 0)
 }
 
 /// One decided flow, as logged and reported.
@@ -307,11 +327,11 @@ pub struct FlowRecord {
 
 pub fn reason_label(r: Reason) -> String {
     match r {
-        Reason::UnknownDomain => "unknown domain (passes)".into(),
-        Reason::AppNotFiltered(l) => format!("app level {l:?} (not filtered)").to_lowercase(),
-        Reason::Allowed => "allow rule".into(),
-        Reason::NoRule => "no rule".into(),
-        Reason::Blocked => "block rule".into(),
+        Reason::UnknownDomain | Reason::MixedResolvedNames => "unknown domain (passes)".into(),
+        Reason::AppExempt | Reason::Disabled | Reason::Dns => "app not filtered".into(),
+        Reason::NamedAllow => "allow rule".into(),
+        Reason::NamedNoRule => "no rule".into(),
+        Reason::NamedBlock | Reason::AllResolvedNamesBlocked => "block rule".into(),
     }
 }
 
@@ -503,7 +523,20 @@ pub fn admin_command(exe: &str, args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sieve_engine::flow::flows::verdict;
+
+    const REMOTE: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+
+    fn verdict(domain: Option<&str>, exe: Option<&str>, filter: &DomainFilter, policy: &AppPolicy) -> Decision {
+        decide_flow(domain, exe, REMOTE, filter, policy)
+    }
+
+    fn pass_unknown() -> Decision {
+        Decision { action: Action::Pass, reason: Reason::UnknownDomain, rule: None, list: None }
+    }
+
+    fn drop_named() -> Decision {
+        Decision { action: Action::Drop, reason: Reason::NamedBlock, rule: None, list: None }
+    }
 
     fn args(s: &str) -> Result<Args, String> {
         parse_args(s.split_whitespace().map(String::from))
@@ -584,20 +617,18 @@ mod tests {
     #[test]
     fn summary_counts_and_text() {
         let d = Decoded { kind: Some(Kind::Tls), domain: Some("a.example".into()), alpn: vec![], ech: true, failure: None };
-        let drop = Decision { action: Action::Drop, reason: Reason::Blocked };
-        let pass = Decision { action: Action::Pass, reason: Reason::UnknownDomain };
         let l = "10.0.0.2:5000".parse().unwrap();
         let r = "1.1.1.1:443".parse().unwrap();
         let mut s = Summary::default();
-        s.add(&record(1, "tcp", l, r, Some(7), Some("C:\\c.exe".into()), &d, drop, true));
-        s.add(&record(2, "udp", l, r, None, None, &Decoded { failure: Some("not tls/quic/http"), ..Default::default() }, pass, false));
+        s.add(&record(1, "tcp", l, r, Some(7), Some("C:\\c.exe".into()), &d, drop_named(), true));
+        s.add(&record(2, "udp", l, r, None, None, &Decoded { failure: Some("not tls/quic/http"), ..Default::default() }, pass_unknown(), false));
         assert_eq!((s.flows, s.tcp_flows, s.udp_flows, s.attributed, s.unattributed), (2, 1, 1, 1, 1));
         assert_eq!((s.ech, s.dropped, s.would_drop), (1, 1, 0));
         assert_eq!(s.decoded.get("tls"), Some(&1));
         assert_eq!(s.no_domain.get("not tls/quic/http"), Some(&1));
         let t = s.text();
         assert!(t.contains("decoded domains by kind: tls=1"), "{t}");
-        let line = record(1, "tcp", l, r, Some(7), Some("C:\\x\\c.exe".into()), &d, drop, false).line();
+        let line = record(1, "tcp", l, r, Some(7), Some("C:\\x\\c.exe".into()), &d, drop_named(), false).line();
         assert!(line.contains("exe=c.exe") && line.contains("verdict=drop (would)"), "{line}");
         assert!(serde_json::to_string(&s).unwrap().contains("\"dropped\":1"));
     }
@@ -648,14 +679,13 @@ mod tests {
     #[test]
     fn flow_log_prints_a_capped_number_of_lines_and_keeps_counting() {
         let d = Decoded::default();
-        let pass = Decision { action: Action::Pass, reason: Reason::UnknownDomain };
         let l = "198.18.211.1:5000".parse().unwrap();
         let r = "239.255.255.250:1900".parse().unwrap();
         let mut log = FlowLog::default();
         let total = RECORD_CAP as u64 + 500;
         let mut printed = 0u64;
         for i in 0..total {
-            if let Some(line) = log.push(record(i, "udp", l, r, Some(1), None, &d, pass, false)) {
+            if let Some(line) = log.push(record(i, "udp", l, r, Some(1), None, &d, pass_unknown(), false)) {
                 printed += 1;
                 if i + 1 == LOG_PRINT_CAP {
                     assert!(line.contains("capped"), "{line}");

@@ -8,8 +8,21 @@
   "client": [
     { "type": "hello", "protocol": 3, "app_version": "0.1.0" },
     { "type": "status" },
-    { "type": "set_policy", "revision": 3, "engine": true },
-    { "type": "subscribe" }
+    {
+      "type": "set_policy",
+      "revision": 3,
+      "engine": true,
+      "sieving": true,
+      "off_apps": ["firefox", "vm:unidentified"],
+      "lists": null,
+      "domain_lists": [
+        { "kind": "block", "entries": ["ads.example"], "enabled": true },
+        { "kind": "allow", "entries": ["ok.ads.example"], "enabled": true }
+      ]
+    },
+    { "type": "subscribe" },
+    { "type": "lists" },
+    { "type": "lists_refresh" }
   ],
   "engine": [
     { "type": "welcome", "protocol": 3, "engine_version": "0.1.0", "session_id": 1 },
@@ -18,10 +31,11 @@
       "type": "status",
       "filtering": true,
       "routes_up": true,
+      "blocking": true,
       "flows": 2,
       "decrypting": false,
       "last_error": null,
-      "policy": { "revision": 3, "engine": true },
+      "policy": { "revision": 3, "engine": true, "sieving": true, "off_apps": ["firefox"], "lists": ["adguard-dns"], "domain_lists": [] },
       "blocker": null,
       "split_tunnels": ["Corp VPN"],
       "counters": {
@@ -31,7 +45,8 @@
         "dns_answers": 40,
         "packets_in": 9000,
         "packets_out": 8800,
-        "not_unicast": 12
+        "not_unicast": 12,
+        "blocked": 5
       }
     },
     { "type": "error", "message": "send hello first" },
@@ -51,7 +66,10 @@
           "action": "relayed",
           "bytes_up": 812,
           "bytes_down": 4096,
-          "open": true
+          "open": true,
+          "reason": "named_no_rule",
+          "rule": null,
+          "list": null
         },
         {
           "id": 8,
@@ -66,7 +84,10 @@
           "action": "relayed",
           "bytes_up": 29,
           "bytes_down": 45,
-          "open": false
+          "open": false,
+          "reason": "dns",
+          "rule": null,
+          "list": null
         },
         {
           "id": 9,
@@ -81,7 +102,10 @@
           "action": "relayed",
           "bytes_up": 1200,
           "bytes_down": 0,
-          "open": true
+          "open": true,
+          "reason": "app_exempt",
+          "rule": null,
+          "list": null
         },
         {
           "id": 10,
@@ -96,7 +120,10 @@
           "action": "failed",
           "bytes_up": 0,
           "bytes_down": 0,
-          "open": false
+          "open": false,
+          "reason": null,
+          "rule": null,
+          "list": null
         },
         {
           "id": 11,
@@ -111,9 +138,62 @@
           "action": "relayed",
           "bytes_up": 30,
           "bytes_down": 60,
-          "open": true
+          "open": true,
+          "reason": "unknown_domain",
+          "rule": null,
+          "list": null
+        },
+        {
+          "id": 12,
+          "pid": 4242,
+          "exe": "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+          "session": 1,
+          "proto": "tcp",
+          "local": "198.18.0.1:50115",
+          "remote": "198.51.100.30:443",
+          "kind": "tls",
+          "host": "ads.example",
+          "action": "blocked",
+          "bytes_up": 0,
+          "bytes_down": 0,
+          "open": false,
+          "reason": "named_block",
+          "rule": "||ads.example^",
+          "list": "adguard-dns"
         }
       ]
+    },
+    {
+      "type": "lists",
+      "lists": [
+        {
+          "id": "adguard-dns",
+          "enabled": true,
+          "fetched_at_ms": 1793000000000,
+          "refresh_s": 14400,
+          "last_error": null,
+          "network": 120000,
+          "cosmetic": 0,
+          "skipped": 2,
+          "skip_reasons": { "network filter error: invalid option": 2 },
+          "skipped_exceptions": ["@@||ok.example^$elemhide"],
+          "skipped_exceptions_total": 1
+        },
+        {
+          "id": "adguard-base",
+          "enabled": true,
+          "fetched_at_ms": null,
+          "refresh_s": null,
+          "last_error": "HTTP 503",
+          "network": 0,
+          "cosmetic": 0,
+          "skipped": 0,
+          "skip_reasons": {},
+          "skipped_exceptions": [],
+          "skipped_exceptions_total": 0
+        }
+      ],
+      "compile_ms": 840
     }
   ],
   "blockers": [

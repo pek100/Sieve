@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sieve_ipc::nonblocking::{read_frame, write_frame};
-use sieve_ipc::{ClientMessage, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, Policy, answer_hello};
+use sieve_ipc::{ClientMessage, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, ListStatus, Policy, answer_hello};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 
@@ -38,6 +38,10 @@ pub trait Backend: Send + Sync + 'static {
     /// up (a subscription ends when they go down: the app then reads the
     /// connection tables again).
     fn subscribe(&self) -> Subscription;
+    /// The per-list report, and the last compile's time.
+    fn lists(&self) -> (Vec<ListStatus>, Option<u64>);
+    /// Downloads every selected list at the next chance, whatever its age.
+    fn lists_refresh(&self);
 }
 
 pub struct Subscription {
@@ -104,12 +108,22 @@ where
                 Err(message) => EngineMessage::Error { message },
             },
             Ok(ClientMessage::Subscribe) => return stream_flows(stream, session_id, backend).await,
+            Ok(ClientMessage::Lists) => lists_answer(backend),
+            Ok(ClientMessage::ListsRefresh) => {
+                backend.lists_refresh();
+                lists_answer(backend)
+            }
             Ok(ClientMessage::Hello { .. }) => return refuse(stream, HELLO_ONCE).await,
             Err(FrameError::Closed) => return Ok(()),
             Err(e) => return refuse(stream, &e.to_string()).await,
         };
         write_frame(stream, &reply).await?;
     }
+}
+
+fn lists_answer<B: Backend + ?Sized>(backend: &B) -> EngineMessage {
+    let (lists, compile_ms) = backend.lists();
+    EngineMessage::Lists { lists, compile_ms }
 }
 
 /// Sends `events` the client may see, in frames of at most FLOWS_PER_FRAME.
@@ -208,26 +222,34 @@ mod tests {
         open: Vec<FlowEvent>,
         flows: broadcast::Sender<Arc<Vec<FlowEvent>>>,
         routes: tokio::sync::watch::Sender<bool>,
+        refreshes: Mutex<u64>,
     }
 
     impl Fake {
         fn new(open: Vec<FlowEvent>) -> Arc<Self> {
             let routes = tokio::sync::watch::channel(true).0;
-            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, routes })
+            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, routes, refreshes: Mutex::default() })
         }
     }
 
     impl Backend for Fake {
         fn status(&self) -> EngineStatus {
-            EngineStatus { policy: *self.policy.lock().unwrap(), ..EngineStatus::default() }
+            EngineStatus { policy: self.policy.lock().unwrap().clone(), ..EngineStatus::default() }
         }
         fn set_policy(&self, p: Policy) -> Result<EngineStatus, String> {
-            let next = crate::policy::accept(*self.policy.lock().unwrap(), p)?;
+            let next = crate::policy::accept(&self.policy.lock().unwrap(), p)?;
             *self.policy.lock().unwrap() = next;
             Ok(self.status())
         }
         fn subscribe(&self) -> Subscription {
             Subscription { open: self.open.clone(), batches: self.flows.subscribe(), routes_up: self.routes.subscribe() }
+        }
+        fn lists(&self) -> (Vec<ListStatus>, Option<u64>) {
+            let refreshes = *self.refreshes.lock().unwrap();
+            (vec![ListStatus { id: "adguard-dns".into(), network: refreshes, ..ListStatus::default() }], Some(5))
+        }
+        fn lists_refresh(&self) {
+            *self.refreshes.lock().unwrap() += 1;
         }
     }
 
@@ -273,13 +295,27 @@ mod tests {
         let (mut c, task) = start(1);
         send(&mut c, &hello(PROTOCOL)).await;
         recv(&mut c).await;
-        let on = Policy { revision: 1, engine: true };
-        send(&mut c, &ClientMessage::SetPolicy(on)).await;
+        let on = Policy { revision: 1, engine: true, ..Policy::default() };
+        send(&mut c, &ClientMessage::SetPolicy(on.clone())).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.policy == on));
-        send(&mut c, &ClientMessage::SetPolicy(Policy { revision: 1, engine: false })).await;
+        send(&mut c, &ClientMessage::SetPolicy(Policy { revision: 1, engine: false, ..Policy::default() })).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Error { message } if message.contains("stale")));
         send(&mut c, &ClientMessage::Status).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.policy == on), "the connection stays usable");
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_list_report_is_answered_and_a_refresh_reaches_the_engine() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = start_with(1, fake.clone());
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::Lists).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Lists { lists, compile_ms: Some(5) } if lists[0].network == 0));
+        send(&mut c, &ClientMessage::ListsRefresh).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Lists { lists, .. } if lists[0].network == 1));
         drop(c);
         task.await.unwrap().unwrap();
     }
