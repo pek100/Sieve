@@ -213,9 +213,10 @@ export const ADGUARD_START_TEXT = "AdGuard's service is stopped. Starting it aga
 /**
  * The phases in which the engine ran its AdGuard check and found no
  * interception (AdGuard wins over a VPN). Every other phase gives no verdict:
- * the switch is off, the engine did not answer, or the check itself failed.
+ * the switch is off, the engine did not answer, the check itself failed, or
+ * (`starting`) the engine answered a new policy before its first check.
  */
-const ADGUARD_CLEARED: ReadonlySet<EnginePhase> = new Set<EnginePhase>(["routing", "starting", "vpn"]);
+const ADGUARD_CLEARED: ReadonlySet<EnginePhase> = new Set<EnginePhase>(["routing", "vpn"]);
 
 /**
  * What the AdGuard action offers, from facts: pause while the engine waits

@@ -26,6 +26,14 @@ import {
 type Example = keyof typeof fixture.examples;
 const facts = (name: Example): EngineSlice => ({ probe: parseEngineProbe(fixture.examples[name]), error: null });
 const ALL = Object.keys(fixture.examples) as Example[];
+// The fixture has no example of a switched-on engine still bringing its routes up: the idle one, told to route.
+const startingEngine = (): EngineSlice => {
+  const idle = facts("idle");
+  const pipe = idle.probe!.pipe!;
+  if (pipe.kind !== "welcome") throw new Error("idle is a welcome");
+  const status = { ...pipe.status, policy: { ...pipe.status.policy, engine: true } };
+  return { ...idle, probe: { ...idle.probe!, pipe: { ...pipe, status } } };
+};
 
 describe("engine phase", () => {
   it("derives every phase from the fixture's facts", () => {
@@ -132,6 +140,10 @@ describe("the AdGuard offer", () => {
       ["refused", "stopping", null],
     ];
     for (const [name, service, want] of table) expect(adguardOffer(withService(name, service)), `${name} ${service}`).toBe(want);
+    // The switch just went on: the engine answers before its first check, so there is no verdict yet.
+    const starting = startingEngine();
+    expect(enginePhase(starting)).toBe("starting");
+    expect(adguardOffer({ ...starting, probe: { ...starting.probe!, adguard: "stopping" } }), "starting stopping").toBeNull();
     for (const service of ["missing", "starting", "other"] as const) {
       for (const name of ALL) expect(adguardOffer(withService(name, service)), `${name} ${service}`).toBeNull();
     }
@@ -175,15 +187,7 @@ describe("the AdGuard offer", () => {
 });
 
 describe("engine lock (the switch the engine carries out)", () => {
-  // The fixture has no example of a switched-on engine still bringing its routes up: the idle one, told to route.
-  const starting = (): EngineSlice => {
-    const idle = facts("idle");
-    const pipe = idle.probe!.pipe!;
-    if (pipe.kind !== "welcome") throw new Error("idle is a welcome");
-    const status = { ...pipe.status, policy: { ...pipe.status.policy, engine: true } };
-    return { ...idle, probe: { ...idle.probe!, pipe: { ...pipe, status } } };
-  };
-  const slices = (): EngineSlice[] => [EMPTY_ENGINE, { probe: null, error: "denied" }, starting(), ...ALL.map(facts)];
+  const slices = (): EngineSlice[] => [EMPTY_ENGINE, { probe: null, error: "denied" }, startingEngine(), ...ALL.map(facts)];
 
   it("law: the engine takes a policy exactly when it answered with its Status; every other phase locks with one line", () => {
     const seen = new Set<string>();
