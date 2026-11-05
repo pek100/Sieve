@@ -76,10 +76,13 @@ fn real_ca(dir: &std::path::Path) -> Result<Arc<Ca>, crate::ca::CaError> {
     Ca::new(dir.to_path_buf(), machine, seams).map(Arc::new)
 }
 
-/// `uninstall`'s key step. Its outcome is on disk for the verb to read.
-fn purge_ca_keys() -> Result<(), String> {
-    let dir = state::engine_dir(&state::program_data()?);
-    purge_keys(&dir, &CngKeyStore).map(|_| ())
+/// `uninstall`'s key step. Its outcome is in `ca.json`, which the verb reads
+/// back, and a failure's reason in `last-error.txt`.
+fn purge_ca_keys() {
+    let purged = state::program_data().and_then(|pd| purge_keys(&state::engine_dir(&pd), &CngKeyStore));
+    if let Err(why) = purged {
+        record_failure(&why);
+    }
 }
 
 fn service_main(args: Vec<OsString>) {
@@ -114,14 +117,10 @@ fn service_main(args: Vec<OsString>) {
     }
     if args.iter().any(|a| a == PURGE_ARG) {
         report(ServiceState::Running, ServiceControlAccept::empty(), ServiceExitCode::Win32(0));
-        let code = match purge_ca_keys() {
-            Ok(()) => ServiceExitCode::Win32(0),
-            Err(why) => {
-                record_failure(&why);
-                ServiceExitCode::ServiceSpecific(FAILED)
-            }
-        };
-        report(ServiceState::Stopped, ServiceControlAccept::empty(), code);
+        purge_ca_keys();
+        // Exit code 0 even after a failure: a failure code would make the
+        // SCM's recovery start the engine again in the middle of uninstall.
+        report(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::Win32(0));
         return;
     }
     report(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, ServiceExitCode::Win32(0));

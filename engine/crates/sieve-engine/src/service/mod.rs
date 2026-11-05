@@ -69,7 +69,7 @@ pub const USAGE: &str = "\
 usage: sieve-engine.exe [install | uninstall | restore]
   (no argument)  run as the Windows service (started by Windows only)
   install        create or update the service and start it (admin)
-  uninstall      stop filtering, delete the service and ProgramData\\Sieve (admin)
+  uninstall      stop filtering, remove the certificate, delete the service and ProgramData\\Sieve (admin)
   restore        delete every route on an interface named \"Sieve\" and stop the service (admin)
 ";
 

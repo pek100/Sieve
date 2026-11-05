@@ -157,13 +157,16 @@ impl Ca {
                 return Err(CaError::State(why));
             }
         };
+        let loaded = state.clone();
         let mut errors = Vec::new();
         if wanted {
             self.hold(&mut held, &mut state, replace, now_ms, &mut errors);
         } else {
             self.release(&mut held, &mut state, &mut errors);
         }
-        self.save(&state, &mut errors);
+        if state != loaded {
+            self.save(&state, &mut errors);
+        }
         held.state = Some(state);
         held.last_error = (!errors.is_empty()).then(|| errors.join("; "));
         match &held.last_error {

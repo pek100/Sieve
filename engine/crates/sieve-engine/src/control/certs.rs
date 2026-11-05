@@ -37,7 +37,12 @@ pub async fn run(engine: Arc<Engine>, ca: Arc<Ca>, mut stop: watch::Receiver<boo
         tokio::select! {
             _ = engine.ca_wake.notified() => {}
             _ = tick => {}
-            _ = stop.changed() => {}
+            changed = stop.changed() => {
+                // No sender left means nobody can ever ask again: stop too.
+                if changed.is_err() {
+                    return;
+                }
+            }
         }
         if *stop.borrow() {
             return;
@@ -125,6 +130,16 @@ mod tests {
         stop.send(true).unwrap();
         task.await.unwrap();
         assert_eq!(r.store.thumbprints().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_stop_sender_ends_the_loop_instead_of_spinning() {
+        let r = rig(Policy { revision: 1, https: true, ..Policy::default() });
+        let (stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run(r.engine.clone(), r.ca.clone(), stop_rx));
+        until("the root is installed", || r.store.thumbprints().len() == 1).await;
+        drop(stop);
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
     }
 
     #[test]

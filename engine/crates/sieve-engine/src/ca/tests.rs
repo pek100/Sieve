@@ -140,6 +140,7 @@ fn off_with_nothing_recorded_touches_nothing() {
     let ca = rig.ca();
     ca.reconcile(false, T0).unwrap();
     assert!(rig.faults.log.lock().unwrap().is_empty(), "{:?}", rig.faults.log.lock().unwrap());
+    assert!(!rig.dir.path().join(state::CA_FILE).exists(), "no file either");
     assert!(!ca.holding());
     assert_eq!(ca.status(T0), CertStatus::default());
 }
