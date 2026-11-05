@@ -1,8 +1,14 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ENGINE_SWITCH } from "@/core/engine";
+import { VM_GROUP_LABEL, VM_OFF_MEANS } from "@/core/guests";
 import { GLOBAL_SWITCH } from "@/core/policy";
+import { createMockEngine } from "@/data/engine-mock";
+import type { EngineSource } from "@/data/engine-source";
+import fixture from "@/data/fixtures/engine-probe-v2.json";
 import { createMockSource } from "@/data/mock-source";
+import { parseEngineProbe } from "@/data/protocol";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "@/hooks/runtime";
 import { AppShell } from "@/components/sieve/shell/app-shell";
@@ -181,5 +187,117 @@ describe("apps screen", () => {
   it("every button has an accessible name", async () => {
     await setup({ "apps.pinned": ["D:\\Tools\\quiet.exe"] });
     for (const b of screen.getAllByRole("button")) expect(b).toHaveAccessibleName();
+  });
+});
+
+describe("Virtual machines and WSL", () => {
+  const vmRow = (key: string) => document.querySelector<HTMLElement>(`[data-testid="vm-row"][data-app="${key}"]`)!;
+  const group = () => screen.queryByTestId("vm-group");
+
+  // The user's engine switch is on: off, the engine controller would turn routing off.
+  async function withEngine(engine: EngineSource, stored?: Record<string, unknown>) {
+    const runtime: Runtime = createRuntime({
+      source: createMockSource({ seed: 1 }),
+      settings: memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true, ...stored } }),
+      engine,
+    });
+    render(
+      <AppShell runtime={runtime}>
+        <AppsScreen />
+      </AppShell>,
+    );
+    await act(async () => {
+      await runtime.settings.ready;
+    });
+    await screen.findAllByTestId("app-row");
+    return { runtime, user: userEvent.setup() };
+  }
+
+  async function routing(stored?: Record<string, unknown>) {
+    const ready = await withEngine(createMockEngine("filtering"), stored);
+    await screen.findByTestId("vm-group");
+    return ready;
+  }
+
+  it("is hidden with no status, a null pipe, or no guests", async () => {
+    await withEngine(createMockEngine("missing"));
+    expect(group()).toBeNull();
+    cleanup();
+    await withEngine(createMockEngine("idle"), { [ENGINE_SWITCH]: false });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(group()).toBeNull();
+  });
+
+  it("stays hidden when the engine sends no guests or broken ones, and keeps the good rows", async () => {
+    const example = fixture.examples.filtering as unknown as { pipe: { status: Record<string, unknown> } };
+    const probing = (guests: unknown): EngineSource => ({
+      ...createMockEngine("filtering"),
+      probe: async () => parseEngineProbe({ ...example, pipe: { ...example.pipe, status: { ...example.pipe.status, guests } } }),
+    });
+    await withEngine(probing(undefined));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(group()).toBeNull();
+    cleanup();
+    await withEngine(probing([{ key: 7 }, { key: "vm:devbox", vm: "DevBox", seen: 1, open: 0 }]));
+    await screen.findByTestId("vm-group");
+    expect(screen.getAllByTestId("vm-row").map((r) => r.dataset.app)).toEqual(["vm:devbox"]);
+  });
+
+  it("sits above Mine, one row per VM, with the note and the exact unidentified label", async () => {
+    await routing({ "apps.pinned": ["D:\\Tools\\quiet.exe"] });
+    const headers = screen.getAllByRole("button", { expanded: true }).map((b) => b.textContent?.replace(/\d+$/, ""));
+    expect(headers).toEqual([VM_GROUP_LABEL, "Mine", "Apps", "System"]);
+    expect(VM_GROUP_LABEL).toBe("Virtual machines and WSL");
+    expect(screen.getAllByTestId("vm-row").map((r) => r.dataset.app)).toEqual(["vm:devbox", "vm:unidentified"]);
+    expect(within(vmRow("vm:devbox")).getByText("DevBox")).toBeInTheDocument();
+    expect(within(vmRow("vm:unidentified")).getByText("Unidentified virtual machine traffic")).toBeInTheDocument();
+    for (const key of ["vm:devbox", "vm:unidentified"]) expect(within(vmRow(key)).getByText("Filtered by domain only")).toBeInTheDocument();
+  });
+
+  it("a row's switch writes its key into apps.levels and says what Off does there", async () => {
+    const { runtime, user } = await routing();
+    const toggle = within(vmRow("vm:devbox")).getByRole("switch", { name: "Sieve DevBox" });
+    expect(toggle).toBeChecked();
+    expect(toggle).toHaveAccessibleDescription(VM_OFF_MEANS);
+    expect(VM_OFF_MEANS).not.toBe(APP_OFF_MEANS);
+    expect(VM_OFF_MEANS).not.toMatch(/chart|track/i);
+    await user.click(toggle);
+    expect(runtime.settings.get("apps.levels")).toEqual({ "vm:devbox": "off" });
+    expect(vmRow("vm:devbox")).toHaveAttribute("data-off");
+    await user.click(toggle);
+    expect(runtime.settings.get("apps.levels")).toEqual({});
+  });
+
+  it("an Off stored earlier applies when the row returns, and does not touch the being-sieved count", async () => {
+    await routing({ "apps.levels": { "vm:unidentified": "off" } });
+    expect(within(vmRow("vm:unidentified")).getByRole("switch")).not.toBeChecked();
+    expect(within(vmRow("vm:devbox")).getByRole("switch")).toBeChecked();
+  });
+
+  it("search narrows it; a name only a VM has is not 'nothing by that name'", async () => {
+    const { user } = await routing();
+    const box = screen.getByRole("searchbox", { name: "Search apps" });
+    await user.type(box, "devb");
+    expect(screen.getAllByTestId("vm-row").map((r) => r.dataset.app)).toEqual(["vm:devbox"]);
+    expect(screen.queryByText("Nothing by that name")).toBeNull();
+    await user.clear(box);
+    await user.type(box, "chrome");
+    expect(group()).toBeNull();
+  });
+
+  it("bulk Off includes the rows, since its notice says every app; Sieve all clears them", async () => {
+    const { runtime, user } = await routing();
+    await user.click(screen.getByRole("button", { name: "More app actions" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Turn every app off" }));
+    const levels = runtime.settings.get("apps.levels");
+    expect(levels["vm:devbox"]).toBe("off");
+    expect(levels["vm:unidentified"]).toBe("off");
+    await user.click(screen.getByRole("button", { name: "More app actions" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Sieve every app" }));
+    expect(runtime.settings.get("apps.levels")).toEqual({});
   });
 });

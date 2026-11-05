@@ -217,7 +217,10 @@ switch ($Step) {
     $s = Read-Status
     Write-Evidence "route-soak-status.json" ((Get-Content -Raw $StatusFile) + "")
     $rate = if ($s.counters.flows -gt 0) { $s.counters.attributed / $s.counters.flows } else { 0 }
-    Check "attribution of at least 0.95 from the engine's counters" ($rate -ge 0.95) ("{0} of {1} flows ({2:P1})" -f $s.counters.attributed, $s.counters.flows, $rate)
+    # The gate stays the rate of ALL flows; host only is reported beside it.
+    $hostFlows = $s.counters.flows - $s.counters.forwarded
+    $hostRate = if ($hostFlows -gt 0) { "{0:P1}" -f (($s.counters.attributed - $s.counters.forwarded_named) / $hostFlows) } else { "n/a" }
+    Check "attribution of at least 0.95 from the engine's counters" ($rate -ge 0.95) ("{0} of {1} flows ({2:P1}); host only {3}; {4} forwarded, {5} named" -f $s.counters.attributed, $s.counters.flows, $rate, $hostRate, $s.counters.forwarded, $s.counters.forwarded_named)
     Check "the engine refused none of its own flows" ($s.counters.own_refused -eq 0) "own_refused $($s.counters.own_refused)"
     Check "DNS was answered on the TUN" ($s.counters.dns_answers -gt 0) "dns_answers $($s.counters.dns_answers)"
     Check "Home and Apps show the apps you used" (Ask "Do Home and Apps show the apps you used in these 30 minutes?")

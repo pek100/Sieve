@@ -227,6 +227,18 @@ export function attribution(e: EngineSlice): number | null {
   return c && c.flows > 0 ? c.attributed / c.flows : null;
 }
 
+/**
+ * The same share of host flows only, reported beside it once any flow was
+ * forwarded; the gate stays the rate of all flows. Null before any host flow
+ * (every flow forwarded divides by nothing).
+ */
+export function hostAttribution(e: EngineSlice): number | null {
+  const c = engineStatus(e)?.counters;
+  if (!c) return null;
+  const hostFlows = c.flows - c.forwarded;
+  return hostFlows > 0 ? (c.attributed - c.forwarded_named) / hostFlows : null;
+}
+
 /** The engine's version, when it said it. */
 export function engineVersion(e: EngineSlice): string | null {
   const pipe = e.probe?.pipe;

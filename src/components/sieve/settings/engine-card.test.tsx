@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import { ADGUARD_PAUSE_TEXT, ENGINE_SWITCH } from "@/core/engine";
 import { createMockEngine, MOCK_ENGINE_ERROR, type EngineScenario } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
+import fixture from "@/data/fixtures/engine-probe-v2.json";
 import { createMockSource } from "@/data/mock-source";
+import { parseEngineProbe } from "@/data/protocol";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
@@ -60,6 +62,27 @@ describe("Engine block", () => {
     await vi.waitFor(() => expect(phase()).toBe("routing"));
     expect(block().querySelector("[data-engine-split]")).toHaveTextContent("Corp VPN sends some traffic around Sieve");
     expect(block().querySelector("[data-engine-attribution]")).toHaveTextContent("1,200 flows relayed since the engine started, 99% tied to an app.");
+  });
+
+  it("forwarded flows: both rates are said; with none, the sentence is exactly the old one", async () => {
+    await setup(createMockEngine("filtering"), true);
+    await vi.waitFor(() => expect(phase()).toBe("routing"));
+    // 1188 of 1200 is the gate; 1184 of 1194 is this computer's own, floored to a tenth.
+    expect(block().querySelector("[data-engine-attribution]")).toHaveTextContent(
+      "1,200 flows relayed since the engine started, 99% tied to an app. 6 came from virtual machines; 99.1% of this computer's own flows are tied to an app.",
+    );
+  });
+
+  it("no forwarded flow: the attribution sentence does not mention them", async () => {
+    const example = fixture.examples.filtering as unknown as { pipe: { status: { counters: Record<string, number> } } };
+    const counters = { ...example.pipe.status.counters, forwarded: 0, forwarded_named: 0 };
+    const engine: EngineSource = {
+      ...createMockEngine("filtering"),
+      probe: async () => parseEngineProbe({ ...example, pipe: { ...example.pipe, status: { ...example.pipe.status, counters } } }),
+    };
+    await setup(engine, true);
+    await vi.waitFor(() => expect(phase()).toBe("routing"));
+    expect(block().querySelector("[data-engine-attribution]")?.textContent).toBe("1,200 flows relayed since the engine started, 99% tied to an app.");
   });
 
   it("AdGuard running: the pause offer says what it does, and pausing lets the engine route; then Start AdGuard again", async () => {

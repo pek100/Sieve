@@ -18,6 +18,60 @@ async function noHorizontalScroll(page: Page) {
   expect(overflow).toBeLessThanOrEqual(0);
 }
 
+test.describe("virtual machines and WSL", () => {
+  const ROUTING = `${APPS}&engine=filtering`;
+
+  async function switchedOn(page: Page) {
+    // The engine routes only while the user's switch is on, as in the app.
+    await page.goto("/settings/?source=mock&seed=1&engine=filtering");
+    const route = page.getByRole("switch", { name: /Route traffic through the engine/ });
+    await expect(route).toBeVisible();
+    if (!(await route.isChecked())) await route.click();
+    await expect(route).toBeChecked();
+  }
+
+  test("default mock: no group", async ({ page }) => {
+    await page.goto(APPS);
+    await expect(row(page, CHROME)).toBeVisible();
+    await expect(page.getByTestId("vm-group")).toHaveCount(0);
+  });
+
+  test("routing: the group is first, each toggle ends on the header actions' line, and Off persists across a reload", async ({ page }, info) => {
+    const errors = collectErrors(page);
+    await switchedOn(page);
+    await page.goto(ROUTING);
+    const group = page.getByTestId("vm-group");
+    await expect(group).toBeVisible();
+    await expect(group.getByText("Virtual machines and WSL")).toBeVisible();
+    await expect(group.getByText("Unidentified virtual machine traffic")).toBeVisible();
+    await expect(group.getByText("Filtered by domain only")).toHaveCount(2);
+
+    const mine = page.getByRole("button", { name: /^Mine/ });
+    const [groupBox, mineBox] = [(await group.boundingBox())!, (await mine.boundingBox())!];
+    expect(groupBox.y).toBeLessThan(mineBox.y);
+
+    const devbox = page.locator('[data-testid="vm-row"][data-app="vm:devbox"]');
+    expect((await devbox.boundingBox())?.height).toBe(44);
+    const toggle = devbox.getByRole("switch", { name: "Sieve DevBox" });
+    const appToggle = row(page, CHROME).getByRole("switch", { name: "Sieve Google Chrome" });
+    const edge = async (l: typeof toggle) => {
+      const b = (await l.boundingBox())!;
+      return b.x + b.width;
+    };
+    expect(await edge(toggle)).toBeCloseTo(await edge(appToggle), 0);
+
+    await expect(toggle).toBeChecked();
+    await toggle.click();
+    await expect(toggle).not.toBeChecked();
+    await page.reload();
+    await expect(page.locator('[data-testid="vm-row"][data-app="vm:devbox"]').getByRole("switch", { name: "Sieve DevBox" })).not.toBeChecked();
+
+    await noHorizontalScroll(page);
+    await page.screenshot({ path: `test-results/screens/apps-vm-${info.project.name}.png`, fullPage: true });
+    expect(errors).toEqual([]);
+  });
+});
+
 test.describe("apps", () => {
   test("lists apps by derived category with 44 px rows, each sieved by default", async ({ page }, info) => {
     const errors = collectErrors(page);

@@ -14,6 +14,7 @@ import {
   enginePhase,
   engineStatus,
   engineVersion,
+  hostAttribution,
   splitTunnelText,
 } from "@/core/engine";
 import { useEngine, useEngineActions } from "@/hooks/use-sieve";
@@ -40,7 +41,9 @@ export function EngineCard() {
   const offer = adguardOffer(e);
   const split = splitTunnelText(e);
   const share = attribution(e);
+  const hostShare = hostAttribution(e);
   const flows = engineStatus(e)?.counters.flows ?? 0;
+  const forwarded = engineStatus(e)?.counters.forwarded ?? 0;
   const busy = e.adguard ?? null;
 
   return (
@@ -66,6 +69,13 @@ export function EngineCard() {
             <p className="text-label text-on-surface-muted" data-engine-attribution="">
               <span className="tabular">{flows.toLocaleString("en-US")}</span> flows relayed since the engine started,{" "}
               <span className="tabular">{percent(share)}</span> tied to an app.
+              {forwarded > 0 && hostShare !== null && (
+                <>
+                  {" "}
+                  <span className="tabular">{forwarded.toLocaleString("en-US")}</span> came from virtual machines;{" "}
+                  <span className="tabular">{percent(hostShare)}</span> of this computer&apos;s own flows are tied to an app.
+                </>
+              )}
             </p>
           )}
           {version && (
