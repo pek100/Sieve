@@ -53,8 +53,9 @@ The four sum to `flows`, and a law checks it.
 
 **D4. NAT is consulted on an owner miss, not on every flow.**
 
-- After `Owner::Unknown` (the existing 250 ms give-up), the relay asks for a fresh read, rate limited to one per `NAT_REFRESH_MIN_MS` (250) and bounded by `NAT_READ_TIMEOUT_MS` (1000; a timeout is no match, and counted).
+- After `Owner::Unknown` (the existing 250 ms give-up), the relay asks for a fresh read, rate limited to one per `NAT_REFRESH_MIN_MS` (250) and bounded by `NAT_READ_TIMEOUT_MS` (1000; a timeout adds no new match, the flow gets what the last finished read holds, and it is counted).
 - All reads run on one dedicated thread, which owns its COM apartment. Flow tasks wait on a reply channel and never block a runtime worker.
+- Flows share reads: a flow joins the last read asked for if that read started no earlier than its own first lookup, otherwise it asks for a new one, and a read queued but not started serves every flow behind it. The timeout covers a flow's whole wait, so a slow read costs a counted timeout per flow and never a growing queue.
 - A machine with no VMs issues a WMI query only for its rare unknown flows, so no timer is added and idle CPU is unaffected.
 
 **D5. Precedence: both answering is a conflict, and a conflict is unknown.**
@@ -68,6 +69,8 @@ The four sum to `flows`, and a law checks it.
 | none | none | unknown |
 
 A forwarded UDP flow whose external port equals a host wildcard-bound port would match `match_owner`'s wildcard fallback and borrow that app's exemption. So UDP owner answers are checked against the NAT snapshot already held, without a fresh read.
+
+The loop guard comes before this table. It asks the raw owner answer (`stack::attribution::is_own`), so the engine's own flow is refused even where the table above would leave it unknown with no PID.
 
 *Stated limit (TENSION, S24):* a NAT session newer than the last snapshot can slip past this check. A fresh read on every UDP flow would add a WMI round trip to every host DNS lookup, which is not acceptable. On a machine with an active VM, its own misses keep the snapshot fresh. L3 counts collisions live. If WinNAT avoids host-bound ports, the limit is moot. A code comment at the check must record this (S53).
 
@@ -83,7 +86,7 @@ A forwarded UDP flow whose external port equals a host wildcard-bound port would
 **D7. The ring holds unique tuples, not raw events.** Keyed by (proto, local, remote), it stores pid and last-seen time, with FIFO eviction at `ETW_RING_CAP` (4096).
 
 - A repeat from the same PID refreshes the entry and takes no slot. A UDP-heavy socket would otherwise churn a raw ring and read as constant loss.
-- The engine's own PID is dropped at ingestion: every upstream UDP send would otherwise be an event.
+- The engine's own PID is dropped at ingestion: every upstream UDP send would otherwise be an event. PID 0 is dropped too and means no answer, as it does in the owner tables (D1).
 - A different PID on a tuple seen within `ETW_MATCH_WINDOW_MS` (2000) marks it conflicted, and a conflicted tuple answers unknown. An older entry is simply replaced (port reuse).
 - `Counters.etw_dropped` is evictions plus the session's `EventsLost`.
 - Addresses compare as ip and port with scope ignored. A v4-mapped IPv6 address is normalised to IPv4 in the decoder. The Codex measurement says dual-mode sockets show in the IPv4 tables, so without this the same socket could never match.

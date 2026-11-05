@@ -85,7 +85,7 @@ impl Shared {
             let answer = self.attributor.lock().unwrap_or_else(|p| p.into_inner()).owner(&flow, now);
             match answer {
                 Owner::Pid(pid) | Owner::WitnessOnly(pid) => return (Some(pid), retried),
-                Owner::Unknown | Owner::Disagreed => return (None, retried),
+                Owner::Unknown | Owner::Disagreed { .. } => return (None, retried),
                 Owner::Pending => {
                     retried = true;
                     tokio::time::sleep(Duration::from_millis(sieve_engine::flow::flows::REFRESH_MIN_MS)).await;

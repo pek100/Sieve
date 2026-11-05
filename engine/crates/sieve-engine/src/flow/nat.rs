@@ -10,7 +10,8 @@
 //! - [`NatTable`]: the index of the last read. All reads run on one thread
 //!   ([`NatTable::spawn`]), which owns whatever its sources need (a COM
 //!   apartment), so a flow task waits on a reply and never blocks a runtime
-//!   worker. A read is rate limited and bounded; a timeout is no match.
+//!   worker. Reads are rate limited and flows share them, so a flow's wait is
+//!   bounded whatever the flows around it do; a timeout adds no new match.
 //!
 //! A failed read costs attribution only, never routing. No timer: a machine
 //! with no VMs reads NAT state only for its rare unknown flows.
@@ -25,7 +26,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use sieve_ipc::{Forwarded, VM_NAME_MAX, VM_UNIDENTIFIED};
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 use crate::flow::flows::FiveTuple;
 use crate::flow::packet::Proto;
@@ -35,8 +36,8 @@ pub mod os;
 
 /// A fresh read is asked for at most this often.
 pub const NAT_REFRESH_MIN_MS: u64 = 250;
-/// A flow waits this long for a read; past it the flow has no match, and the
-/// timeout is counted.
+/// A flow waits this long for a read; past it the flow gets what the last
+/// finished read holds (nothing, before the first), and the timeout is counted.
 pub const NAT_READ_TIMEOUT_MS: u64 = 1_000;
 
 /// `Microsoft-Windows-WinNat`, from the local manifest.
@@ -193,12 +194,21 @@ fn read_all(sources: &mut [Box<dyn NatSource>], directory: &mut dyn VmDirectory,
     }
 }
 
+/// The reads asked of the thread, numbered from 1 in the order it runs them.
+#[derive(Debug, Default)]
+struct Asked {
+    read: u64,
+    /// That read starts no earlier than this (monotonic ms).
+    not_before_ms: Option<u64>,
+}
+
 /// The NAT state the engine holds, and the one thread that reads it.
 pub struct NatTable {
     shared: Arc<Shared>,
-    requests: SyncSender<oneshot::Sender<()>>,
-    /// One read at a time; holds when the last one started (monotonic ms).
-    last_read: tokio::sync::Mutex<Option<u64>>,
+    requests: SyncSender<u64>,
+    asked: Mutex<Asked>,
+    /// The number of the last read that ended.
+    finished: watch::Receiver<u64>,
 }
 
 impl NatTable {
@@ -212,16 +222,17 @@ impl NatTable {
     {
         let shared = Arc::new(Shared::default());
         // One waiting behind a read in progress: a hung source cannot pile up work.
-        let (requests, queue) = sync_channel::<oneshot::Sender<()>>(1);
+        let (requests, queue) = sync_channel::<u64>(1);
+        let (ended, finished) = watch::channel(0);
         let thread_shared = shared.clone();
         let _ = std::thread::Builder::new().name("sieve-nat".into()).spawn(move || {
             let (mut sources, mut directory) = make();
-            while let Ok(done) = queue.recv() {
+            while let Ok(read) = queue.recv() {
                 read_all(&mut sources, directory.as_mut(), &thread_shared);
-                let _ = done.send(());
+                let _ = ended.send(read);
             }
         });
-        Self { shared, requests, last_read: tokio::sync::Mutex::new(None) }
+        Self { shared, requests, asked: Mutex::default(), finished }
     }
 
     /// The match in what is held, with no read: for a flow that already has
@@ -233,31 +244,36 @@ impl NatTable {
     /// The match after a read that started no earlier than `now_ms` minus
     /// [`NAT_REFRESH_MIN_MS`]. A flow gives up on its owner that long after its
     /// first lookup, so such a read already saw any session behind this flow.
+    /// The whole wait is bounded by [`NAT_READ_TIMEOUT_MS`] from this call.
     pub async fn fresh_match(&self, flow: &FiveTuple, now_ms: u64) -> Option<Forwarded> {
-        self.refresh(now_ms).await;
+        let read = self.ask(now_ms);
+        let mut finished = self.finished.clone();
+        // An Err inside is a reader thread that is gone: nothing left to wait for.
+        let ended = finished.wait_for(|last| *last >= read);
+        if tokio::time::timeout(Duration::from_millis(NAT_READ_TIMEOUT_MS), ended).await.is_err() {
+            self.shared.timeouts.fetch_add(1, Ordering::Relaxed);
+        }
         self.held_match(flow)
     }
 
-    async fn refresh(&self, now_ms: u64) {
-        let mut last = self.last_read.lock().await;
-        if last.is_some_and(|at| now_ms.saturating_sub(at) < NAT_REFRESH_MIN_MS) {
-            return;
+    /// The read that answers a flow at `now_ms`: the last one asked for when it
+    /// started late enough, otherwise a new one. The lock is never held across
+    /// a wait, so flows share a read instead of queueing for their own.
+    fn ask(&self, now_ms: u64) -> u64 {
+        let mut asked = lock(&self.asked);
+        if asked.not_before_ms.is_some_and(|at| now_ms.saturating_sub(at) < NAT_REFRESH_MIN_MS) {
+            return asked.read;
         }
-        *last = Some(now_ms);
-        let (done, finished) = oneshot::channel();
-        match self.requests.try_send(done) {
-            Ok(()) => {
-                let outcome = tokio::time::timeout(Duration::from_millis(NAT_READ_TIMEOUT_MS), finished).await;
-                if outcome.is_err() {
-                    self.shared.timeouts.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            // An overrunning read still holds the thread: already counted.
+        asked.not_before_ms = Some(now_ms);
+        match self.requests.try_send(asked.read + 1) {
+            Ok(()) => asked.read += 1,
+            // One is queued and has not started, so it is fresh for this flow too.
             Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => {
                 self.shared.read_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
+        asked.read
     }
 
     pub fn stats(&self) -> NatStats {
@@ -575,6 +591,7 @@ mod tests {
         // A read overrunning holds the thread: one more waits behind it, no pile-up.
         assert_eq!(t.fresh_match(&udp_flow(SRC, DST), 2_000).await, None);
         assert_eq!(t.fresh_match(&udp_flow(SRC, DST), 3_000).await, None);
+        assert_eq!(t.stats().timeouts, 3, "each flow that waited it out");
         drop(release);
         // The late read still lands, for the flows after it.
         for _ in 0..200 {
@@ -584,6 +601,86 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("the late read never landed");
+    }
+
+    /// Flows spaced past the rate limit, on reads that never finish: a flow's
+    /// wait may not grow with the flows queued before it.
+    #[tokio::test(start_paused = true)]
+    async fn reads_slower_than_the_flow_gap_keep_every_wait_bounded() {
+        const FLOWS: u64 = 12;
+        let bound = Duration::from_millis(NAT_READ_TIMEOUT_MS);
+        let gap = Duration::from_millis(NAT_REFRESH_MIN_MS + 10);
+        let (release, wait) = mpsc::channel();
+        let t = Arc::new(NatTable::spawn(move || (vec![Box::new(Slow(wait)) as Box<dyn NatSource>], Box::new(NoDirectory))));
+        let start = tokio::time::Instant::now();
+        let flows: Vec<_> = (0..FLOWS)
+            .map(|i| {
+                let t = t.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(gap * i as u32).await;
+                    let began = tokio::time::Instant::now();
+                    let now_ms = 1_000 + (began - start).as_millis() as u64;
+                    (t.fresh_match(&udp_flow(SRC, DST), now_ms).await, began.elapsed())
+                })
+            })
+            .collect();
+        for (i, flow) in flows.into_iter().enumerate() {
+            let (answer, waited) = flow.await.unwrap();
+            assert_eq!(answer, None, "flow {i}");
+            assert!(waited <= bound, "flow {i} waited {waited:?}");
+        }
+        assert_eq!(t.stats().timeouts, FLOWS, "every overrun is counted");
+        drop(release);
+    }
+
+    /// Reports each read as it starts and holds it until the test lets it end.
+    /// The session exists only from the second read on.
+    struct Gated {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: mpsc::Receiver<()>,
+        reads: u32,
+    }
+
+    impl NatSource for Gated {
+        fn read(&mut self) -> Result<Vec<NatSession>, String> {
+            self.reads += 1;
+            let _ = self.started.send(());
+            let _ = self.release.recv();
+            Ok(if self.reads > 1 { vec![the_session()] } else { Vec::new() })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flow_joins_a_read_that_is_fresh_for_it_and_never_an_older_one() {
+        let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let (release, gate) = mpsc::channel();
+        let source = Gated { started: started_tx, release: gate, reads: 0 };
+        let t = Arc::new(NatTable::spawn(move || (vec![Box::new(source) as Box<dyn NatSource>], Box::new(NoDirectory))));
+        let ask = |now_ms: u64| {
+            let t = t.clone();
+            tokio::spawn(async move { t.fresh_match(&udp_flow(SRC, DST), now_ms).await })
+        };
+        let first = ask(1_000);
+        started.recv().await.unwrap();
+        // Within the limit of the read in flight: it started after this flow's first lookup.
+        let joins_first = ask(1_000 + NAT_REFRESH_MIN_MS - 1);
+        tokio::task::yield_now().await;
+        // Past the limit: the read in flight is too old, so one is queued behind it.
+        let queues = ask(1_000 + NAT_REFRESH_MIN_MS);
+        tokio::task::yield_now().await;
+        // Past the limit again, but the queued read has not started: it serves this flow too.
+        let joins_queued = ask(1_000 + 2 * NAT_REFRESH_MIN_MS);
+        tokio::task::yield_now().await;
+
+        release.send(()).unwrap();
+        assert_eq!(first.await.unwrap(), None);
+        assert_eq!(joins_first.await.unwrap(), None, "the read in flight answered it");
+        started.recv().await.unwrap();
+        assert!(!queues.is_finished(), "a read older than the limit answers nobody past it");
+        release.send(()).unwrap();
+        assert!(queues.await.unwrap().is_some());
+        assert!(joins_queued.await.unwrap().is_some());
+        assert_eq!(t.stats(), NatStats { reads: 2, read_errors: 0, timeouts: 0 });
     }
 
     #[tokio::test]

@@ -11,7 +11,8 @@
 //!
 //! Nothing is guessed, and a conflict is never resolved in favour of either
 //! side: a forwarded flow must not borrow a host app's exemption, and a host
-//! flow must not pass as a guest's.
+//! flow must not pass as a guest's. The loop guard, [`is_own`], is asked of the
+//! raw owner and not of this decision, which can hide the PID it needs.
 
 use sieve_ipc::Forwarded;
 
@@ -50,11 +51,22 @@ pub fn decide(owner: Owner, nat: Option<Forwarded>) -> Attribution {
     match owner {
         Owner::Pid(pid) => host(pid, false),
         Owner::WitnessOnly(pid) => host(pid, true),
-        Owner::Disagreed => Attribution::Unknown(Unproven::Disagreed),
+        Owner::Disagreed { .. } => Attribution::Unknown(Unproven::Disagreed),
         Owner::Unknown | Owner::Pending => match nat {
             Some(forwarded) => Attribution::Forwarded(forwarded),
             None => Attribution::Unknown(Unproven::NoAnswer),
         },
+    }
+}
+
+/// Whether any source named the engine itself. Relaying such a flow can loop,
+/// so it is refused even when a NAT match or a contradiction leaves the flow
+/// unknown: the guard errs toward refusing, attribution toward not guessing.
+pub fn is_own(owner: Owner, own_pid: u32) -> bool {
+    match owner {
+        Owner::Pid(pid) | Owner::WitnessOnly(pid) => pid == own_pid,
+        Owner::Disagreed { table } => table == Some(own_pid),
+        Owner::Unknown | Owner::Pending => false,
     }
 }
 
@@ -121,9 +133,23 @@ mod tests {
         assert_eq!(decide(Owner::Unknown, Some(unnamed())), Attribution::Forwarded(unnamed()));
         assert_eq!(decide(Owner::Pid(7), Some(named())), Attribution::Unknown(Unproven::OwnerAndNat));
         assert_eq!(decide(Owner::WitnessOnly(7), Some(unnamed())), Attribution::Unknown(Unproven::OwnerAndNat));
-        assert_eq!(decide(Owner::Disagreed, Some(named())), Attribution::Unknown(Unproven::Disagreed));
-        assert_eq!(decide(Owner::Disagreed, None), Attribution::Unknown(Unproven::Disagreed));
+        assert_eq!(decide(Owner::Disagreed { table: Some(7) }, Some(named())), Attribution::Unknown(Unproven::Disagreed));
+        assert_eq!(decide(Owner::Disagreed { table: None }, None), Attribution::Unknown(Unproven::Disagreed));
         assert_eq!(decide(Owner::Unknown, None), Attribution::Unknown(Unproven::NoAnswer));
+    }
+
+    /// `decide` has no PID left in the first two cases: the guard must not ask it.
+    #[test]
+    fn the_engines_own_flow_is_seen_through_nat_and_conflict() {
+        const OWN: u32 = 999;
+        assert_eq!(decide(Owner::Pid(OWN), Some(named())).pid(), None);
+        assert!(is_own(Owner::Pid(OWN), OWN), "own PID and a NAT match");
+        assert_eq!(decide(Owner::Disagreed { table: Some(OWN) }, None).pid(), None);
+        assert!(is_own(Owner::Disagreed { table: Some(OWN) }, OWN), "the table said own PID, ETW said another");
+        assert!(is_own(Owner::WitnessOnly(OWN), OWN));
+        for other in [Owner::Pid(7), Owner::WitnessOnly(7), Owner::Disagreed { table: Some(7) }, Owner::Disagreed { table: None }, Owner::Unknown, Owner::Pending] {
+            assert!(!is_own(other, OWN), "{other:?}");
+        }
     }
 
     /// A forwarded UDP flow whose external port equals a host wildcard-bound
@@ -173,7 +199,7 @@ mod tests {
             decide(Owner::Pid(7), Some(named())),
             decide(Owner::Unknown, Some(named())),
             decide(Owner::Unknown, None),
-            decide(Owner::Disagreed, None),
+            decide(Owner::Disagreed { table: None }, None),
         ] {
             let (pid, forwarded) = a.event_fields();
             assert!(pid.is_none() || forwarded.is_none(), "{a:?}");
@@ -202,7 +228,7 @@ mod tests {
     fn counters_name_what_etw_did_and_a_conflict_is_a_miss() {
         let m = Meters::default();
         decide(Owner::WitnessOnly(7), None).count(&m);
-        decide(Owner::Disagreed, None).count(&m);
+        decide(Owner::Disagreed { table: Some(7) }, None).count(&m);
         decide(Owner::Pid(7), Some(named())).count(&m);
         decide(Owner::Unknown, None).count(&m);
         let c = m.counters();

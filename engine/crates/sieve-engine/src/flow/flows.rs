@@ -40,6 +40,8 @@ pub const REFRESH_MIN_MS: u64 = 15;
 pub const GIVE_UP_MS: u64 = 250;
 /// A table snapshot older than this is refreshed before any lookup.
 pub const SNAPSHOT_MAX_AGE_MS: u64 = 2_000;
+/// PID 0 names no process, in an owner row or an ETW event: no owner is proven.
+pub const NO_OWNER_PID: u32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FiveTuple {
@@ -152,7 +154,7 @@ pub fn match_owner(flow: &FiveTuple, rows: &[OwnerRow]) -> Option<u32> {
     // exemption. At the first matching specificity, require one known PID.
     fn unique<'a>(mut rows: impl Iterator<Item = &'a OwnerRow>) -> Option<Option<u32>> {
         let first = rows.next()?.pid;
-        Some((first != 0 && rows.all(|r| r.pid == first)).then_some(first))
+        Some((first != NO_OWNER_PID && rows.all(|r| r.pid == first)).then_some(first))
     }
     if flow.proto == Proto::Tcp {
         if let Some(owner) = unique(rows.iter().filter(|r| r.local == flow.local && r.remote == Some(flow.remote))) {
@@ -178,8 +180,10 @@ pub enum Owner {
     Pid(u32),
     /// A PID only the witness gave: no table row, an exact tuple in ETW.
     WitnessOnly(u32),
-    /// The sources contradict each other: the flow is unknown.
-    Disagreed,
+    /// The sources contradict each other: the flow is unknown. `table` is what
+    /// the owner tables said, kept for the loop guard and nothing else. The
+    /// witness side needs no such field: the ring never holds the engine's PID.
+    Disagreed { table: Option<u32> },
     /// Not in the table yet; ask again (hold the packet meanwhile).
     Pending,
     /// Still not found after [`GIVE_UP_MS`]: unattributed.
@@ -188,10 +192,12 @@ pub enum Owner {
 
 /// What the owner tables and the witness say together. A contradiction never
 /// picks a side: a witness conflict or two different PIDs is [`Owner::Disagreed`].
+/// A witness saying [`NO_OWNER_PID`] has said nothing, whichever witness it is.
 pub fn combine(table: Option<u32>, witnessed: Witnessed, gave_up: bool) -> Owner {
+    let witnessed = if witnessed == Witnessed::Pid(NO_OWNER_PID) { Witnessed::Nothing } else { witnessed };
     match (table, witnessed) {
-        (_, Witnessed::Conflict) => Owner::Disagreed,
-        (Some(t), Witnessed::Pid(w)) if t != w => Owner::Disagreed,
+        (_, Witnessed::Conflict) => Owner::Disagreed { table },
+        (Some(t), Witnessed::Pid(w)) if t != w => Owner::Disagreed { table },
         (Some(t), _) => Owner::Pid(t),
         (None, Witnessed::Pid(w)) => Owner::WitnessOnly(w),
         (None, Witnessed::Nothing) if gave_up => Owner::Unknown,
@@ -273,7 +279,7 @@ impl<S: OwnerSource, W: PidWitness> Attributor<S, W> {
         match owner {
             Owner::Pid(_) | Owner::WitnessOnly(_) if retried => self.stats.found_after_retry += 1,
             Owner::Pid(_) | Owner::WitnessOnly(_) => self.stats.found_first_try += 1,
-            Owner::Disagreed => self.stats.disagreed += 1,
+            Owner::Disagreed { .. } => self.stats.disagreed += 1,
             Owner::Unknown => self.stats.unknown += 1,
             Owner::Pending => {}
         }
@@ -657,12 +663,19 @@ mod tests {
         assert_eq!(combine(Some(7), Pid(7), false), Owner::Pid(7), "agree");
         assert_eq!(combine(None, Pid(7), false), Owner::WitnessOnly(7), "ETW only");
         assert_eq!(combine(Some(7), Nothing, false), Owner::Pid(7), "table only");
-        assert_eq!(combine(Some(7), Pid(8), false), Owner::Disagreed, "disagree");
-        assert_eq!(combine(Some(7), Conflict, false), Owner::Disagreed, "ETW conflict, with a table row");
-        assert_eq!(combine(None, Conflict, false), Owner::Disagreed, "ETW conflict alone");
+        assert_eq!(combine(Some(7), Pid(8), false), Owner::Disagreed { table: Some(7) }, "disagree");
+        assert_eq!(combine(Some(7), Conflict, false), Owner::Disagreed { table: Some(7) }, "ETW conflict, with a table row");
+        assert_eq!(combine(None, Conflict, false), Owner::Disagreed { table: None }, "ETW conflict alone");
         assert_eq!(combine(None, Nothing, false), Owner::Pending, "neither, still waiting");
         assert_eq!(combine(None, Nothing, true), Owner::Unknown, "neither, past the give-up");
         assert_eq!(combine(None, Pid(7), true), Owner::WitnessOnly(7), "a late ETW answer still counts");
+    }
+
+    #[test]
+    fn a_witness_pid_zero_is_no_answer() {
+        assert_eq!(combine(None, Witnessed::Pid(0), false), Owner::Pending);
+        assert_eq!(combine(None, Witnessed::Pid(0), true), Owner::Unknown);
+        assert_eq!(combine(Some(7), Witnessed::Pid(0), false), Owner::Pid(7));
     }
 
     #[test]
@@ -681,7 +694,7 @@ mod tests {
         assert_eq!(a.owner(&f, 0), Owner::Pending);
         assert_eq!(a.first_miss.len(), 1);
         a.witness.answer = Some(Witnessed::Pid(43));
-        assert_eq!(a.owner(&f, REFRESH_MIN_MS), Owner::Disagreed);
+        assert_eq!(a.owner(&f, REFRESH_MIN_MS), Owner::Disagreed { table: Some(42) });
         assert!(a.first_miss.is_empty());
         assert_eq!(a.stats.disagreed, 1);
     }

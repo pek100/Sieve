@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use crate::flow::flows::FiveTuple;
+use crate::flow::flows::{FiveTuple, NO_OWNER_PID};
 use crate::flow::nat::WinNatTable;
 use crate::flow::packet::Proto;
 use crate::stack::Meters;
@@ -152,9 +152,11 @@ impl EtwRing {
     }
 
     /// Stores one event; true when it evicted an older tuple. The engine's
-    /// own events are dropped here: every upstream UDP send would be one.
+    /// own events are dropped here: every upstream UDP send would be one. So
+    /// is PID 0, which names no owner: stored, it could conflict with a real
+    /// PID on the tuple or replace it.
     pub fn insert(&mut self, e: &EtwEvent, now_ms: u64) -> bool {
-        if e.pid == self.own_pid {
+        if e.pid == self.own_pid || e.pid == NO_OWNER_PID {
             return false;
         }
         let key = (e.proto, e.local, e.remote);
@@ -613,6 +615,16 @@ mod tests {
         let mut ring = EtwRing::new(OWN);
         ring.insert(&event(OWN, Proto::Udp, L, R), 0);
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn a_pid_zero_event_is_no_answer_and_leaves_a_real_pid_alone() {
+        let mut ring = EtwRing::new(OWN);
+        ring.insert(&event(0, Proto::Udp, L, R), 0);
+        assert!(ring.is_empty(), "PID 0 names no owner");
+        ring.insert(&event(7, Proto::Udp, L, R), 1);
+        ring.insert(&event(0, Proto::Udp, L, R), 2);
+        assert_eq!(ring.answer(&flow(Proto::Udp, L, R), 2), Witnessed::Pid(7), "neither a conflict nor a replacement");
     }
 
     #[test]

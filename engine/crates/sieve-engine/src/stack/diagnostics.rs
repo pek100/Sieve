@@ -265,7 +265,7 @@ mod tests {
             (decide(Owner::Unknown, Some(Forwarded {vm: Some("DevBox".into())})), vec![]),
             (decide(Owner::Unknown, Some(Forwarded {vm: None})), vec![]),
             (decide(Owner::Pid(7), Some(Forwarded {vm: None})), vec![]),
-            (decide(Owner::Disagreed, None), vec![]),
+            (decide(Owner::Disagreed { table: None }, None), vec![]),
             (no_answer(), vec![pid_zero]),
             (no_answer(), vec![]),
         ];
@@ -284,7 +284,7 @@ mod tests {
         let row = |remote: Option<&str>, pid| OwnerRow {local: flow.local, remote: remote.map(|r| r.parse().unwrap()), pid};
         let exact = "1.1.1.1:443";
         let cases: Vec<(Attribution, Vec<OwnerRow>, Category)> = vec![
-            (decide(Owner::Disagreed, None), vec![], Category::HostUnknown),
+            (decide(Owner::Disagreed { table: None }, None), vec![], Category::HostUnknown),
             (decide(Owner::Pid(7), Some(Forwarded {vm: None})), vec![], Category::HostUnknown),
             (no_answer(), vec![row(Some(exact), 0)], Category::HostUnknown),
             (no_answer(), vec![row(Some(exact), 7), row(Some(exact), 8)], Category::HostUnknown),
@@ -321,7 +321,7 @@ mod tests {
         host.record_syn(flow, syn(128));
         forwarded.record_syn(flow, syn(63));
         // The same evidence with a different TTL: the same decision and the same category.
-        for owner in [Owner::Pid(7), Owner::WitnessOnly(7), Owner::Unknown, Owner::Disagreed] {
+        for owner in [Owner::Pid(7), Owner::WitnessOnly(7), Owner::Unknown, Owner::Disagreed { table: Some(7) }] {
             for nat in [None, Some(Forwarded {vm: None})] {
                 let a = decide(owner, nat.clone());
                 host.observe(flow, &a, 0, Some(&rows), None, 0);

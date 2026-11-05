@@ -23,7 +23,7 @@ use sieve_ipc::{FlowAction, FlowEvent, FlowKind, FlowProto};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
-use super::attribution::{Attribution, decide};
+use super::attribution::{Attribution, decide, is_own};
 use super::book::FlowBook;
 use super::{DNS_PORT, Meters, kind_of};
 use crate::dns::{self, NameMap};
@@ -56,6 +56,8 @@ pub type Witness = Box<dyn PidWitness + Send>;
 /// A flow's origin, and (diagnostic builds) how long finding it took.
 pub struct Attributed {
     attribution: Attribution,
+    /// A source named the engine itself (`is_own`): the loop guard refuses it.
+    own: bool,
     #[cfg(feature = "attribution-diagnostics")]
     elapsed_ms: u64,
 }
@@ -141,12 +143,13 @@ impl Relay {
         let started = monotonic_ms();
         let owner = self.owner(flow).await;
         let nat = match owner {
-            Owner::Disagreed => None,
+            Owner::Disagreed { .. } => None,
             Owner::Unknown => self.nat.fresh_match(&flow, monotonic_ms()).await,
             _ => self.nat.held_match(&flow),
         };
         Attributed {
             attribution: decide(owner, nat),
+            own: is_own(owner, self.own_pid),
             #[cfg(feature = "attribution-diagnostics")]
             elapsed_ms: monotonic_ms().saturating_sub(started),
         }
@@ -172,11 +175,11 @@ impl Relay {
     /// Counts the flow and registers it in the book; None when it is the
     /// engine's own (refused) or the book is full.
     fn admit(&self, flow: &FiveTuple, attributed: &Attributed, proto: FlowProto, kind: FlowKind) -> Option<u64> {
-        let attribution = &attributed.attribution;
-        if attribution.pid() == Some(self.own_pid) {
+        if attributed.own {
             Meters::bump(&self.meters.own_refused);
             return None;
         }
+        let attribution = &attributed.attribution;
         attribution.count(&self.meters);
         #[cfg(feature = "attribution-diagnostics")]
         self.observe(*flow, attributed);
