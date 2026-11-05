@@ -1,19 +1,19 @@
 {
-  "protocol": 2,
-  "supported": [2, 2],
+  "protocol": 3,
+  "supported": [3, 3],
   "pipe": "\\\\.\\pipe\\sieve-engine",
   "maxFrame": 1048576,
   "flowsBatchMs": 250,
   "flowsPerFrame": 500,
   "client": [
-    { "type": "hello", "protocol": 2, "app_version": "0.1.0" },
+    { "type": "hello", "protocol": 3, "app_version": "0.1.0" },
     { "type": "status" },
     { "type": "set_policy", "revision": 3, "engine": true },
     { "type": "subscribe" }
   ],
   "engine": [
-    { "type": "welcome", "protocol": 2, "engine_version": "0.1.0", "session_id": 1 },
-    { "type": "incompatible", "supported": [2, 2] },
+    { "type": "welcome", "protocol": 3, "engine_version": "0.1.0", "session_id": 1 },
+    { "type": "incompatible", "supported": [3, 3] },
     {
       "type": "status",
       "filtering": true,

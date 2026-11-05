@@ -1,13 +1,13 @@
 /**
  * Law 9, engine IPC: the app and the engine speak one pipe protocol, owned by
  * the Rust crate `engine/crates/sieve-ipc`. Its fixture
- * `src/data/fixtures/engine-ipc-v1.json` is read by the Rust tests
+ * `src/data/fixtures/engine-ipc-v3.json` is read by the Rust tests
  * (`cargo test -p sieve-ipc`: every message round trips) and here: the
  * version, the limits and every message type name agree with the crate.
  * Changing a message shape bumps PROTOCOL and the fixture in one commit.
  */
 import { describe, expect, it } from "vitest";
-import fixture from "@/data/fixtures/engine-ipc-v2.json";
+import fixture from "@/data/fixtures/engine-ipc-v3.json";
 import { BLOCKER_KINDS, parseEngineStatus } from "@/data/protocol";
 import { read } from "./files";
 

@@ -1,6 +1,6 @@
 //! The pipe protocol between the Sieve app and its engine (plan 1.3). One
 //! owner for the shape (S29): the engine and src-tauri both use this crate,
-//! and `src/data/fixtures/engine-ipc-v2.json` is the shared fixture the TS
+//! and `src/data/fixtures/engine-ipc-v3.json` is the shared fixture the TS
 //! side reads too (law `tests/laws/engine-ipc.test.ts`).
 //!
 //! - One named pipe, [`PIPE_NAME`], carrying frames: a u32 little-endian
@@ -12,7 +12,7 @@
 //!   change; [`ClientMessage::Subscribe`] turns the connection into an event
 //!   stream of [`EngineMessage::Flows`] batches, every [`FLOWS_BATCH_MS`].
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
-//!   commit (v2, slice 3: policy, flows, coexistence and counters).
+//!   commit (v3, slice 4: blocked flows, the grown policy, the list report).
 //!
 //! There is no operation that signs anything, exports a key or names a
 //! certificate to mint (plan 7.2), and there never will be.
@@ -23,9 +23,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 /// The oldest and newest protocol versions this build accepts.
-pub const SUPPORTED: [u32; 2] = [2, 2];
+pub const SUPPORTED: [u32; 2] = [3, 3];
 pub const PIPE_NAME: &str = r"\\.\pipe\sieve-engine";
 /// Largest frame body in bytes (1 MiB).
 pub const MAX_FRAME: usize = 1 << 20;
@@ -287,7 +287,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    const FIXTURE: &str = include_str!("../../../../src/data/fixtures/engine-ipc-v2.json");
+    const FIXTURE: &str = include_str!("../../../../src/data/fixtures/engine-ipc-v3.json");
 
     fn fixture() -> Value {
         serde_json::from_str(FIXTURE).unwrap()
@@ -470,7 +470,7 @@ mod tests {
             answer_hello(PROTOCOL, "0.1.0", 3),
             EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 3 }
         );
-        for v in [0, 1, 3, u32::MAX] {
+        for v in [0, 1, 2, 4, u32::MAX] {
             assert_eq!(answer_hello(v, "0.1.0", 3), EngineMessage::Incompatible { supported: SUPPORTED }, "v{v}");
         }
     }

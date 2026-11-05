@@ -315,7 +315,7 @@ mod tests {
     use serde_json::Value;
 
     const FIXTURE: &str = include_str!("../../src/data/fixtures/engine-probe-v2.json");
-    const IPC_FIXTURE: &str = include_str!("../../src/data/fixtures/engine-ipc-v2.json");
+    const IPC_FIXTURE: &str = include_str!("../../src/data/fixtures/engine-ipc-v3.json");
 
     #[test]
     fn every_fixture_example_round_trips_unchanged() {
