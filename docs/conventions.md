@@ -55,10 +55,12 @@ src-tauri/src/              lib.rs (builder), commands.rs, protocol.rs, netstat/
                             adguard.rs (is AdGuard running, read only)
 engine/                     the filtering engine, its own Cargo workspace (section 8, "Engine workspace")
   crates/sieve-ipc/         the app-engine pipe protocol (no Windows calls)
-  crates/sieve-filter/      lists, the rule engine, HTTPS exclusions, resource pin (pure)
+  crates/sieve-filter/      lists, the rule engine, page cosmetics, HTTPS exclusions, resource bundle (pure)
   crates/sieve-engine/      the Windows service; src/flow/ the flow decoders from the Wintun spike;
                             slice 3: route/ tun/ stack/ dns coexist watchdog policy control/;
+                            slice 9: inject/ (a library, not yet wired to traffic);
                             fixtures/net-*.json (adapter and forwarding tables for the pure tests)
+  injected/                 what goes into pages beside the scriptlets (MPL applier at a pin, bootstrap)
   vendor/ipstack/           ipstack 1.0.1 without its build script, with lazy TCP log formatting
   vendor/wintun/LICENSE.txt Wintun's prebuilt-binaries licence (the DLL itself is never committed)
 tests/laws/                 repo-wide law tests (run by `pnpm test`)
@@ -227,6 +229,9 @@ Run in PowerShell from the repo or worktree root.
 - `vendor/ipstack` keeps TCP diagnostic formatting inside the log macros, so disabled logging does not allocate strings per packet. Protocol behavior is unchanged. It is ipstack 1.0.1 with its `build.rs` removed (upstream copied `wintun.dll` into `target/` on every Windows build) and is wired in with `[patch.crates-io]`. Law: `vendored_ipstack_has_no_build_script` in `sieve-engine`. Wintun itself is never in the repo (`*.dll` and `*.sys` under `engine/` are ignored); it lives at `E:\ml-tools\wintun`.
 - Tests that need a server use in-memory streams (`tokio::io::duplex`), not 127.0.0.1: with AdGuard for Windows running (it filters localhost), loopback TCP lost replies under parallel load on this machine (61 of 200 parallel exchanges, 0 of 300 sequential, std sockets, 2026-10-18).
 - The em dash law covers `engine/crates`.
+- Content injection (slice 9) is the pure library `sieve-engine/src/inject/`: `begin` decides from a response head, then `PageRewriter::{push, finish}` per body chunk; on an `InjectError` the caller resets the connection. `sieve_filter::rules::RuleEngine::page_cosmetics` decides what a page gets. No traffic reaches it until slice 6 wires it in. Its loopback integration test is `tests/inject_page.rs`: sequential, one connection at a time, per the note above.
+- The resource bundle is a JSON array of adblock-rust `Resource` values, written by `scripts/resources/assemble-ubo.mjs <ubo-checkout> <out.json>` and pinned by SHA-256. `sieve_filter::resources::load_bundle` refuses all of it on any bad resource; nothing in it runs in the service. `testdata/resources-fixture.json` is its output on `tests/fixtures/ubo-tree` (Sieve-authored scriptlets only).
+- `engine/injected/` holds what goes into pages beside the scriptlets: the vendored MPL applier at a pinned hash, its transpiled output (`pnpm injected:build`, checked in, so cargo builds never need node), and Sieve's `bootstrap.js`. Pin and bump steps: its `README.md`. `tests/laws/injected.test.ts` runs them under jsdom. `.gitattributes` keeps these bytes through a CRLF checkout.
 - Slice 3 (2026-10-18): routing, relay, DNS on the TUN, the watchdog, the crash-loop stop, coexistence and the Flows stream were built and tested offline only (fixture tables, fake clocks, in-memory pipes). Never run by an agent: the adapter, a route, the service, the Stall build, the AdGuard stop or start. Not verified until the user runs `scripts/live/engine-route.ps1` (`docs/live/engine-slice-3.md`): Wintun adapter creation under the four required privileges, the routes and pinning on the real tables, relay throughput and CPU, attribution from the TUN at full route, DNS through the host routes, the watchdog trip, the crash-loop stop across a reboot, `sc.exe` through the Windows prompt, and the shortcut's run-as-administrator flag.
 - Slice 2 (2026-10-18): the service, verbs, pipe and bundle were built and tested offline only. Never run by an agent: the installer, the service, the verbs, anything elevated. Not verified until the user runs `scripts/live/engine-install.ps1` (`docs/live/engine-slice-2.md`): the service registration and recovery, the ProgramData and pipe ACLs on the real objects, the installed app being admitted by the client check, the second-user denial on the real pipe, the trimmed privileges being enough for the service to start, the NSIS hooks themselves.
 

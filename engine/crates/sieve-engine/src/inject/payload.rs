@@ -8,6 +8,7 @@
 //! and lol_html never transcodes it.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use sieve_filter::cosmetic::PageCosmetics;
 
@@ -54,16 +55,49 @@ fn script_source(cosmetics: &PageCosmetics) -> String {
     js_text(&js)
 }
 
-/// The elements for a page, or an empty string when it has nothing to inject.
-pub fn render(cosmetics: &PageCosmetics, nonce: &str) -> String {
-    let mut out = String::new();
+/// A page's elements, in parts: the generic stylesheet is shared by the snapshot
+/// and can be a megabyte, so it is written out once, not copied here first.
+#[derive(Debug, Default)]
+pub struct Payload {
+    before_generic: String,
+    generic_css: Arc<str>,
+    after_generic: String,
+}
+
+impl From<&str> for Payload {
+    fn from(text: &str) -> Self {
+        Self { before_generic: text.to_string(), ..Self::default() }
+    }
+}
+
+impl Payload {
+    pub fn len(&self) -> usize {
+        self.before_generic.len() + self.generic_css.len() + self.after_generic.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.before_generic.as_bytes());
+        out.extend_from_slice(self.generic_css.as_bytes());
+        out.extend_from_slice(self.after_generic.as_bytes());
+    }
+}
+
+/// The elements for a page; empty when it has nothing to inject.
+pub fn render(cosmetics: &PageCosmetics, nonce: &str) -> Payload {
+    let mut payload = Payload::default();
     if !cosmetics.generic_css.is_empty() || !cosmetics.specific_css.is_empty() {
-        let _ = write!(out, "<style nonce=\"{nonce}\">{}{}</style>", cosmetics.generic_css, cosmetics.specific_css);
+        payload.before_generic = format!("<style nonce=\"{nonce}\">");
+        payload.generic_css = cosmetics.generic_css.clone();
+        let _ = write!(payload.after_generic, "{}</style>", cosmetics.specific_css);
     }
     if !cosmetics.scriptlets.is_empty() || !cosmetics.procedural.is_empty() {
-        let _ = write!(out, "<script nonce=\"{nonce}\">{}</script>", script_source(cosmetics));
+        let _ = write!(payload.after_generic, "<script nonce=\"{nonce}\">{}</script>", script_source(cosmetics));
     }
-    out
+    payload
 }
 
 #[cfg(test)]
@@ -76,6 +110,14 @@ mod tests {
 
     const URL: &str = "https://sieve-test.invalid/";
     const BUNDLE: &[u8] = include_bytes!("../../../sieve-filter/testdata/resources-fixture.json");
+
+    fn rendered(cosmetics: &PageCosmetics, nonce: &str) -> String {
+        let mut out = Vec::new();
+        let payload = render(cosmetics, nonce);
+        payload.write_to(&mut out);
+        assert_eq!(out.len(), payload.len());
+        String::from_utf8(out).unwrap()
+    }
 
     fn page_for(rules: &str) -> PageCosmetics {
         let mut engine = RuleEngine::compile(&[ListText { id: "l", text: rules, trusted: true }]);
@@ -127,7 +169,7 @@ mod tests {
     fn a_selector_cannot_close_the_style_element() {
         let cosmetics = page_for(&format!("sieve-test.invalid##[title=\"{ATTACK}\"]\nsieve-test.invalid##+js(sieve-set-flag, a, b)\n"));
         assert!(cosmetics.specific_css.contains("\\3c "), "the rule must reach the CSS: {cosmetics:?}");
-        let payload = render(&cosmetics, "n");
+        let payload = rendered(&cosmetics, "n");
         assert_contained(&payload);
         assert!(parse(&payload).style_text.contains("\\3c /style>"), "{payload}");
     }
@@ -136,14 +178,14 @@ mod tests {
     fn a_style_value_cannot_close_the_style_element() {
         let cosmetics = page_for(&format!("sieve-test.invalid##.x:style(content: \"{ATTACK}\")\nsieve-test.invalid##+js(sieve-set-flag, a, b)\n"));
         assert!(cosmetics.specific_css.contains("content"), "{cosmetics:?}");
-        assert_contained(&render(&cosmetics, "n"));
+        assert_contained(&rendered(&cosmetics, "n"));
     }
 
     #[test]
     fn a_scriptlet_argument_cannot_close_the_script_element() {
         let cosmetics = page_for(&format!("##.x\nsieve-test.invalid##+js(sieve-set-flag, a, {ATTACK})\n"));
         assert!(cosmetics.scriptlets.contains("</script>"), "the attack must reach the emitter: {cosmetics:?}");
-        let payload = render(&cosmetics, "n");
+        let payload = rendered(&cosmetics, "n");
         assert_contained(&payload);
         assert!(parse(&payload).script_text.contains("\\x3c/script>"), "{payload}");
     }
@@ -152,13 +194,13 @@ mod tests {
     fn a_procedural_argument_cannot_close_the_script_element() {
         let cosmetics = page_for(&format!("##.x\nsieve-test.invalid##.a:has-text({ATTACK})\n"));
         assert_eq!(cosmetics.procedural.len(), 1, "{cosmetics:?}");
-        assert_contained(&render(&cosmetics, "n"));
+        assert_contained(&rendered(&cosmetics, "n"));
     }
 
     #[test]
     fn comment_open_cannot_start_the_double_escape_state() {
         let cosmetics = page_for("##.x\nsieve-test.invalid##+js(sieve-set-flag, a, <!--<script>)\n");
-        let payload = render(&cosmetics, "n");
+        let payload = rendered(&cosmetics, "n");
         assert_contained(&payload);
         assert!(!payload.contains("<!--"), "{payload}");
     }
@@ -166,7 +208,7 @@ mod tests {
     #[test]
     fn non_ascii_rule_text_becomes_escapes() {
         let cosmetics = page_for("##.caf\u{e9}\nsieve-test.invalid##+js(sieve-set-flag, a, caf\u{e9}\u{1f600})\n");
-        let payload = render(&cosmetics, "n");
+        let payload = rendered(&cosmetics, "n");
         assert_contained(&payload);
         assert!(payload.contains(".caf\\e9 {"), "{payload}");
         assert!(payload.contains("caf\\u00e9\\ud83d\\ude00"), "{payload}");
@@ -184,21 +226,21 @@ mod tests {
 
     #[test]
     fn each_element_appears_only_when_it_has_content() {
-        assert_eq!(render(&PageCosmetics::default(), "n"), "");
-        assert_eq!(parse(&render(&page_for("##.x\n"), "n")).elements, ["style"]);
-        assert_eq!(parse(&render(&page_for("sieve-test.invalid##+js(sieve-set-flag, a)\n"), "n")).elements, ["script"]);
+        assert_eq!(rendered(&PageCosmetics::default(), "n"), "");
+        assert_eq!(parse(&rendered(&page_for("##.x\n"), "n")).elements, ["style"]);
+        assert_eq!(parse(&rendered(&page_for("sieve-test.invalid##+js(sieve-set-flag, a)\n"), "n")).elements, ["script"]);
     }
 
     #[test]
     fn the_applier_ships_only_with_procedural_filters() {
-        assert!(!render(&page_for("sieve-test.invalid##+js(sieve-set-flag, a)\n"), "n").contains("compileProceduralSelector"));
-        let payload = render(&page_for("sieve-test.invalid##.a:has-text(ad)\n"), "n");
+        assert!(!rendered(&page_for("sieve-test.invalid##+js(sieve-set-flag, a)\n"), "n").contains("compileProceduralSelector"));
+        let payload = rendered(&page_for("sieve-test.invalid##.a:has-text(ad)\n"), "n");
         assert!(payload.contains("compileProceduralSelector") && payload.contains("sieveRunProcedural(sieveApplier,["), "{payload}");
     }
 
     #[test]
     fn both_elements_carry_the_nonce() {
-        let payload = render(&page_for("##.x\nsieve-test.invalid##+js(sieve-set-flag, a)\n"), "abc+/=");
+        let payload = rendered(&page_for("##.x\nsieve-test.invalid##+js(sieve-set-flag, a)\n"), "abc+/=");
         assert!(payload.starts_with("<style nonce=\"abc+/=\">"), "{payload}");
         assert!(payload.contains("<script nonce=\"abc+/=\">"), "{payload}");
     }

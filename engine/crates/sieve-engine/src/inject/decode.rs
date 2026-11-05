@@ -106,7 +106,7 @@ struct Inflate {
 }
 
 fn is_zlib_header(first: u8, second: u8) -> bool {
-    first & 0x0f == ZLIB_METHOD_DEFLATE && first >> 4 <= ZLIB_MAX_WINDOW_INFO && u16::from_be_bytes([first, second]) % ZLIB_HEADER_MODULUS == 0
+    first & 0x0f == ZLIB_METHOD_DEFLATE && first >> 4 <= ZLIB_MAX_WINDOW_INFO && u16::from_be_bytes([first, second]).is_multiple_of(ZLIB_HEADER_MODULUS)
 }
 
 impl Inflate {

@@ -26,6 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::sync::Arc;
 
 use adblock::Engine;
@@ -196,11 +197,19 @@ impl CosmeticBuilder {
     }
 
     pub(crate) fn build(self) -> CosmeticIndex {
-        let (stylesheet, dropped) = render_generic(self.generic.iter());
+        let mut css = String::new();
+        let mut dropped = 0;
+        let mut generic = BTreeMap::new();
+        // One rule per selector: one bad selector in a group would kill the group.
+        for selector in self.generic {
+            let start = css.len();
+            dropped += usize::from(!push_css_rule(&mut css, &selector, HIDE_DECLARATION));
+            generic.insert(selector, start..css.len());
+        }
         CosmeticIndex {
-            generic_css: stylesheet.into(),
+            generic_css: css.into(),
             generic_dropped: dropped,
-            generic: self.generic,
+            generic,
             document: exception_engine(self.document),
             elemhide: exception_engine(self.elemhide),
             specifichide: exception_engine(self.specifichide),
@@ -218,16 +227,6 @@ fn scriptlet_identifier(filter: &CosmeticFilter) -> Option<String> {
     Some(if name.ends_with(SCRIPTLET_EXTENSION) { name.to_string() } else { format!("{name}{SCRIPTLET_EXTENSION}") })
 }
 
-/// One rule per selector: one bad selector in a group would kill the group.
-fn render_generic<'a>(selectors: impl Iterator<Item = &'a String>) -> (String, usize) {
-    let mut css = String::new();
-    let mut dropped = 0;
-    for selector in selectors {
-        dropped += usize::from(!push_css_rule(&mut css, selector, HIDE_DECLARATION));
-    }
-    (css, dropped)
-}
-
 fn exception_engine(rules: Vec<String>) -> Engine {
     let mut set = FilterSet::new(false);
     set.add_filter_list(rules.join("\n"), ParseOptions::default());
@@ -236,8 +235,9 @@ fn exception_engine(rules: Vec<String>) -> Engine {
 
 /// The snapshot's cosmetic facts beside its engine.
 pub(crate) struct CosmeticIndex {
-    /// Every plain generic selector, sorted (stable output, S15).
-    generic: BTreeSet<String>,
+    /// Every plain generic selector, sorted (stable output, S15), with where its
+    /// rule sits in `generic_css`. A dropped selector has an empty range.
+    generic: BTreeMap<String, Range<usize>>,
     generic_css: Arc<str>,
     generic_dropped: usize,
     document: Engine,
@@ -246,12 +246,22 @@ pub(crate) struct CosmeticIndex {
 }
 
 impl CosmeticIndex {
-    fn generic_for_page(&self, exceptions: &HashSet<String>) -> (Arc<str>, usize) {
-        if !exceptions.iter().any(|selector| self.generic.contains(selector)) {
-            return (self.generic_css.clone(), self.generic_dropped);
+    /// The stylesheet this page gets: the shared one, or a copy with the page's
+    /// exceptions cut out.
+    fn generic_for_page(&self, exceptions: &HashSet<String>) -> Arc<str> {
+        let mut cuts: Vec<&Range<usize>> = exceptions.iter().filter_map(|selector| self.generic.get(selector)).collect();
+        if cuts.is_empty() {
+            return self.generic_css.clone();
         }
-        let (css, dropped) = render_generic(self.generic.iter().filter(|selector| !exceptions.contains(*selector)));
-        (css.into(), dropped)
+        cuts.sort_unstable_by_key(|cut| cut.start);
+        let mut css = String::with_capacity(self.generic_css.len());
+        let mut kept_from = 0;
+        for cut in cuts {
+            css.push_str(&self.generic_css[kept_from..cut.start]);
+            kept_from = cut.end;
+        }
+        css.push_str(&self.generic_css[kept_from..]);
+        css.into()
     }
 }
 
@@ -284,7 +294,8 @@ impl RuleEngine {
 
         let mut page = PageCosmetics { scriptlets: resources.injected_script, ..PageCosmetics::default() };
         if !generichide {
-            (page.generic_css, page.dropped_rules) = self.cosmetic.generic_for_page(&resources.exceptions);
+            page.generic_css = self.cosmetic.generic_for_page(&resources.exceptions);
+            page.dropped_rules = self.cosmetic.generic_dropped;
         }
         if specifichide {
             return page;
@@ -292,7 +303,7 @@ impl RuleEngine {
 
         // Without `$generichide`, adblock-rust mixes generic selectors into
         // `hide_selectors`. The generic stylesheet already holds them.
-        let is_specific = |selector: &String| resources.generichide || !self.cosmetic.generic.contains(selector);
+        let is_specific = |selector: &String| resources.generichide || !self.cosmetic.generic.contains_key(selector);
         let specific: BTreeSet<_> = resources.hide_selectors.iter().filter(|s| is_specific(s)).collect();
         for selector in specific {
             page.dropped_rules += usize::from(!push_css_rule(&mut page.specific_css, selector, HIDE_DECLARATION));
@@ -434,6 +445,13 @@ sieve-test.invalid##+js(sieve-set-flag, a, b)
     }
 
     #[test]
+    fn cutting_several_exceptions_leaves_exactly_the_other_rules() {
+        let exceptions = format!("{HOST}#@#.a\n{HOST}#@#.c\n{HOST}#@#.e\n");
+        let p = engine_with(&format!("##.a\n##.b\n##.c\n##.d\n##.e\n{exceptions}"), true).page_cosmetics(URL);
+        assert_eq!(&*p.generic_css, ".b{display:none!important}.d{display:none!important}");
+    }
+
+    #[test]
     fn a_negated_host_rule_is_generic_except_on_that_host() {
         let engine = engine_with(&format!("~{HOST}##.not-here\n"), true);
         assert!(!engine.page_cosmetics(URL).generic_css.contains(".not-here"));
@@ -502,7 +520,9 @@ sieve-test.invalid##+js(sieve-set-flag, a, b)
         // F7: without css-validation every one of these was a plain selector.
         let p = engine_with(&format!("{HOST}##.a:has-text(ad)\n{HOST}##.b:remove()\n{HOST}##.c:style(color: red)\n"), true).page_cosmetics(URL);
         assert_eq!(p.procedural.len(), 2, "{p:?}");
-        assert!(p.procedural.iter().any(|j| j.contains("has-text")), "{p:?}");
+        // The exact shape tests/laws/injected.test.ts feeds the in-page applier.
+        assert!(p.procedural.iter().any(|j| j == r#"{"selector":[{"type":"css-selector","arg":".a"},{"type":"has-text","arg":"ad"}]}"#), "{p:?}");
+        assert!(p.procedural.iter().any(|j| j == r#"{"selector":[{"type":"css-selector","arg":".b"}],"action":{"type":"remove"}}"#), "{p:?}");
         assert!(p.specific_css.contains(".c{color: red}"), "{p:?}");
     }
 
