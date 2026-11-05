@@ -106,6 +106,7 @@ mod tests {
     use super::*;
     use crate::dns::rules::host_name;
     use serde_json::Value;
+    use sieve_filter::rules::HostVerdict;
 
     fn fixture(text: &str) -> Value {
         serde_json::from_str(text).expect("fixture json")
@@ -140,6 +141,41 @@ mod tests {
         assert_eq!(problems[0].line, 3);
         assert!(rule_problems(&["||a.example^".to_string()]).is_empty());
         assert!(rule_problems(&[]).is_empty());
+    }
+
+    /// What an allowlist entry means, against the engine that will carry it out
+    /// (allowRule in src/core/rules.ts; the fixture is the shared table).
+    #[test]
+    fn an_allowlist_rule_means_what_the_fixture_says_in_a_real_engine() {
+        let cases = fixture(include_str!("../../src/data/fixtures/user-rules-v1.json"));
+        let allow = &cases["allowlist"];
+        let rule = allow["rule"].as_str().expect("rule");
+        let table = allow["cases"].as_array().expect("cases");
+        assert!(table.len() >= 5);
+        for case in table {
+            let list = case["list"].as_str().expect("list");
+            let ask = case["ask"].as_str().expect("ask");
+            let got = RuleEngine::compile(&[
+                ListText { id: "list", text: list, trusted: true },
+                ListText { id: USER_RULES, text: rule, trusted: false },
+            ])
+            .check_host(ask);
+            let want = match case["verdict"].as_str().expect("verdict") {
+                "allow" => HostVerdict::Allow,
+                "block" => HostVerdict::Block,
+                other => panic!("verdict {other}"),
+            };
+            assert_eq!(got, want, "{list} with {rule}, asking {ask}");
+        }
+    }
+
+    /// Why allowRule carries no `$important`: on an exception it wins nothing. The
+    /// crate files any exception before it reads the option, and skips exceptions
+    /// once an important block matched.
+    #[test]
+    fn important_on_an_exception_does_not_beat_an_important_block() {
+        let got = RuleEngine::compile(&[ListText { id: "list", text: "||a.example^$important\n@@||a.example^$important\n", trusted: true }]);
+        assert_eq!(got.check_host("a.example"), HostVerdict::Block);
     }
 
     #[test]

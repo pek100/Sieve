@@ -8,10 +8,10 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import type { RouteDef } from "@/core/routes";
-import { readValue, type SettingsDoc } from "@/core/settings/document";
+import type { SettingsDoc } from "@/core/settings/document";
 import { defaultValue, settingDef, type SettingKey } from "@/core/settings/registry";
 import { formatNumber, formatValue, numberChoices } from "@/core/settings/transfer";
-import type { Lock } from "./use-settings-view";
+import { valueInForce, type Lock } from "./use-settings-view";
 
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -64,10 +64,7 @@ export function SettingRow({
   onReset: (key: SettingKey) => void;
 }) {
   const d = settingDef(k);
-  // The value in force: what the engine itself holds for a setting it carries
-  // out but cannot take now (off when it did not say), else the stored value.
-  const engineLock = lock?.kind === "password" ? lock.beneath : lock;
-  const value = engineLock?.kind === "engine" ? engineLock.inForce === true : readValue(doc, k);
+  const value = valueInForce(k, doc, lock);
   const labelId = `setting-${k}-label`;
   const helpId = `setting-${k}-help`;
   const disabled = lock !== null;

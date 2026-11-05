@@ -128,7 +128,17 @@ export function normalizeDomain(raw: string): DomainResult {
   return { ok: true, host };
 }
 
-/** The rule an allowlist entry stands for: it wins over every list. */
-export const allowRule = (host: string) => `@@||${host}^$important`;
+/**
+ * The rule an allowlist entry stands for: connections to the host and its
+ * subdomains pass an ordinary block from any list or user rule. It is not a
+ * master switch. adblock-rust skips every exception, `$important` ones too, once
+ * an `$important` block matches, and it says nothing about what the host's pages
+ * load from elsewhere. The fixture's `allowlist` table, read by Rust
+ * `filters::tests` with a real RuleEngine, holds this.
+ */
+export const allowRule = (host: string) => `@@||${host}^`;
+/** What the allowlist does, in the words of `allowRule` above. */
+export const ALLOWLIST_TEXT =
+  "Connections to these sites go through even when a list or rule would block them, unless that rule is marked $important. What their pages load from other sites is still filtered.";
 /** The rule "Block a site" writes. */
 export const blockRule = (host: string) => `||${host}^`;

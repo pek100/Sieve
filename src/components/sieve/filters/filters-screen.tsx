@@ -5,6 +5,7 @@ import { GridRegion, LayoutGrid } from "@/components/sieve/shell/layout-grid";
 import { Page } from "@/components/sieve/shell/page";
 import { nothingLoaded } from "@/core/filter-lists";
 import { isShut } from "@/core/lock";
+import { ALLOWLIST_TEXT } from "@/core/rules";
 import { useFilters } from "@/hooks/use-filters";
 import { useLock } from "@/hooks/use-lock";
 import { DomainList } from "./domain-list";
@@ -42,7 +43,7 @@ export function FiltersScreen() {
         </GridRegion>
         <GridRegion span={6} className="flex flex-col gap-8">
           <RulesEditor saved={model.rules} onSave={model.saveRules} disabled={shut} />
-          <DomainList title="Allowlist" description="Sites no filter list or rule will touch." hosts={model.allowlist} onAdd={model.addAllowed} onRemove={model.removeAllowed} disabled={shut} />
+          <DomainList title="Allowlist" description={ALLOWLIST_TEXT} hosts={model.allowlist} onAdd={model.addAllowed} onRemove={model.removeAllowed} disabled={shut} />
         </GridRegion>
       </LayoutGrid>
     </Page>

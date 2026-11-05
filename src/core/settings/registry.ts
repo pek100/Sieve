@@ -11,7 +11,7 @@
  */
 import { isUpstream } from "../dns";
 import { APP_STATES, type AppState } from "../policy";
-import { checkRuleLine, normalizeDomain } from "../rules";
+import { ALLOWLIST_TEXT, checkRuleLine, normalizeDomain } from "../rules";
 
 /**
  * 2: apps.levels became on/off per app. 3: filtering.systemDns is gone. 4: a
@@ -294,7 +294,7 @@ export const REGISTRY = {
     kind: "list",
     section: "filters",
     label: "Allowlist",
-    help: "Sites no filter list or rule will touch. Saved now; the engine starts using them in a later version.",
+    help: `${ALLOWLIST_TEXT} Saved now; the engine starts using them in a later version.`,
     default: [] as readonly string[],
     of: { type: "domain" },
   } satisfies ListSetting<string>,

@@ -1,7 +1,7 @@
 /**
  * Law 14, the settings password and the first-run guide. The hash stays in Rust
- * and off the wire; every UI write passes the one gate; the guide writes one
- * setting and no other.
+ * and off the wire; every UI write passes the one gate, except the guide's one
+ * flag, which is the only setting it writes.
  */
 import { describe, expect, it } from "vitest";
 import { MIN_PASSWORD_CHARS } from "@/core/lock";
@@ -66,11 +66,19 @@ describe("settings password law", () => {
 describe("first-run guide law", () => {
   const guide = [...code("src/components/sieve/welcome"), "src/core/welcome.ts", "src/hooks/use-welcome.ts"];
 
-  it("it never writes a setting other than its own flag, and no setter but that flag's is taken", () => {
+  it("it never writes a setting other than its own flag, and that write is its only way past the gate", () => {
     expect(WELCOME_DONE).toBe("startup.welcomeDone");
-    expect(guide.flatMap((f) => hits(f, /\bsettings\.(set|reset|replace)\(/))).toEqual([]);
-    const setters = guide.flatMap((f) => [...read(f).matchAll(/useSetting\(([^)]*)\)/g)].map((m) => m[1]));
-    expect(setters).toEqual(["WELCOME_DONE"]);
+    // Skip is always one click, so this one write does not wait on a password.
+    // It changes no traffic and no protected setting, and it can only say "done".
+    const writes = guide.flatMap((f) => hits(f, /\bsettings\.(set|reset|replace)\(/));
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toContain("src/hooks/use-welcome.ts");
+    expect(writes[0]).toContain("settings.set(WELCOME_DONE, true)");
+    const reads = guide.flatMap((f) => [...read(f).matchAll(/useSetting\(([^)]*)\)/g)].map((m) => m[1]));
+    expect(reads).toEqual(["WELCOME_DONE"]);
+    expect(read("src/hooks/use-welcome.ts")).toMatch(/const \[finished\] = useSetting\(WELCOME_DONE\)/);
+    const view = guide.flatMap((f) => hits(f, /useSettingsView\(/));
+    for (const line of view) expect(line).toMatch(/const \{ doc, lockOf \} = useSettingsView\(/);
   });
 
   it("it never names the engine's policy", () => {

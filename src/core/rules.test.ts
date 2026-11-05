@@ -94,8 +94,8 @@ describe("normalizeDomain", () => {
 });
 
 describe("derived rules", () => {
-  it("an allowlist entry wins over every list; a block is the plain host rule", () => {
-    expect(allowRule("a.example")).toBe("@@||a.example^$important");
+  it("an allowlist entry is the fixture's rule (Rust holds what it means against the real engine); a block is the plain host rule", () => {
+    expect(allowRule(cases.allowlist.host)).toBe(cases.allowlist.rule);
     expect(blockRule("a.example")).toBe("||a.example^");
     for (const rule of [allowRule("a.example"), blockRule("a.example")]) expect(checkRuleLine(rule).kind).toBe("ok");
   });

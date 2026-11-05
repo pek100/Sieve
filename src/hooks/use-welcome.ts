@@ -11,7 +11,7 @@ import { useSetting } from "./use-sieve";
  */
 export function useWelcome(): { show: boolean; done: () => void } {
   const { settings, welcomeOnFirstRun } = useRuntime();
-  const [finished, setFinished] = useSetting(WELCOME_DONE);
+  const [finished] = useSetting(WELCOME_DONE);
   const [loaded, setLoaded] = useState(false);
   useEffect(() => {
     let live = true;
@@ -22,5 +22,7 @@ export function useWelcome(): { show: boolean; done: () => void } {
       live = false;
     };
   }, [settings]);
-  return { show: welcomeOnFirstRun && loaded && !finished, done: () => void setFinished(true) };
+  // Past the write gate on purpose (law 14): the guide replaces every screen, so
+  // leaving it must never wait on a password, and this flag changes no traffic.
+  return { show: welcomeOnFirstRun && loaded && !finished, done: () => void settings.set(WELCOME_DONE, true) };
 }

@@ -130,6 +130,20 @@ describe("user rules", () => {
   const editor = () => screen.getByRole("textbox", { name: "User rules" });
   const save = () => screen.getByRole("button", { name: "Save rules" });
 
+  it("a check that fails is said in the rule problems, nothing is saved, and the next edit clears it", async () => {
+    const rejecting: FilterListSource = { ...createMockFilterLists("pending"), checkRules: () => Promise.reject(new Error("task 7 panicked")) };
+    const rt = await setup(rejecting);
+    fireEvent.change(editor(), { target: { value: "||a.example^" } });
+    await userEvent.click(save());
+    const problems = await screen.findByRole("list", { name: "Rule problems" });
+    expect(within(problems).getByRole("alert")).toHaveTextContent("These rules were not saved: Sieve could not check or store them.");
+    expect(within(problems).getByRole("alert")).toHaveTextContent("task 7 panicked");
+    expect(rt.settings.get("filters.userRules")).toEqual([]);
+    expect(editor()).toHaveValue("||a.example^");
+    fireEvent.change(editor(), { target: { value: "||b.example^" } });
+    expect(screen.queryByRole("list", { name: "Rule problems" })).toBeNull();
+  });
+
   it("an error names its line and Save is disabled; fixing it enables Save, and Save stores the lines", async () => {
     const rt = await setup();
     fireEvent.change(editor(), { target: { value: "! note\n\n||bad rule^" } });

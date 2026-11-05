@@ -12,6 +12,7 @@ import {
   setGroupOn,
   setListOn,
 } from "./filter-lists";
+import { allowRule } from "./rules";
 import { EMPTY_DOC, writeValue } from "./settings/document";
 
 const { lists } = parseFilterCatalogue(fixture.examples.pending);
@@ -97,6 +98,6 @@ describe("filterPolicy", () => {
     expect(p.lists).not.toContain(on.id);
     expect(p.lists).not.toContain(gated.id);
     expect(p.userRules).toEqual(["||a.example^"]);
-    expect(p.allowRules).toEqual(["@@||b.example^$important"]);
+    expect(p.allowRules).toEqual([allowRule("b.example")]);
   });
 });

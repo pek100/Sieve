@@ -30,6 +30,15 @@ export type Lock =
    */
   | { kind: "engine"; reason: string; inForce: boolean | null };
 
+/**
+ * A setting's value in force: what the engine itself holds for a setting it
+ * carries out but cannot take now (off when it did not say), else the stored value.
+ */
+export function valueInForce(key: SettingKey, doc: SettingsDoc, lock: Lock | null): unknown {
+  const engineLock = lock?.kind === "password" ? lock.beneath : lock;
+  return engineLock?.kind === "engine" ? engineLock.inForce === true : readValue(doc, key);
+}
+
 export interface SettingsView {
   doc: SettingsDoc;
   /** Sections in registry order with the keys that match the search; sections with none are left out. */

@@ -5,21 +5,35 @@ import { Page } from "@/components/sieve/shell/page";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { useSettingsView, valueInForce } from "@/components/sieve/settings/use-settings-view";
 import { ADGUARD_PAUSE_TEXT } from "@/core/engine";
-import { dataSwitchSummary, welcomeAdguard, welcomeSteps } from "@/core/welcome";
+import type { Section } from "@/core/settings/registry";
+import { dataSwitchSummary, switchesState, welcomeAdguard, welcomeSteps } from "@/core/welcome";
 import { useEngine, useEngineActions } from "@/hooks/use-sieve";
+
+const NO_BLOCKS: ReadonlySet<Section> = new Set();
 
 /**
  * The first-run guide. It explains; it never changes the network: no step writes
- * a data switch, they show read only and off, and the one action is the existing
- * pause offer, on the person's click. Skip is always one click (plan D14).
+ * a data switch, they show read only at the value in force (as a Settings row
+ * does), and the one action is the existing pause offer, on the person's click.
+ * Skip is always one click (plan D14).
  */
 export function WelcomeScreen({ onDone }: { onDone: () => void }) {
   const engine = useEngine();
   const { stopAdguard } = useEngineActions();
+  const { doc, lockOf } = useSettingsView("", NO_BLOCKS);
   const [at, setAt] = useState(0);
   const [offerSeen, setOfferSeen] = useState(false);
-  const steps = welcomeSteps(engine, offerSeen);
+  const switches = dataSwitchSummary().map((s) => ({ ...s, on: valueInForce(s.key, doc, lockOf(s.key)) === true }));
+  const steps = welcomeSteps(
+    engine,
+    offerSeen,
+    switchesState(
+      switches.map((s) => s.on),
+      engine,
+    ),
+  );
   const index = Math.min(at, steps.length - 1);
   const step = steps[index];
   const last = index === steps.length - 1;
@@ -38,13 +52,13 @@ export function WelcomeScreen({ onDone }: { onDone: () => void }) {
         <EmptyState line={step.title} body={step.body} className="p-0" />
         {step.id === "switches" && (
           <ul aria-label="What can change traffic" className="flex flex-col gap-3">
-            {dataSwitchSummary().map((s) => (
+            {switches.map((s) => (
               <li key={s.key} className="flex min-h-11 items-center justify-between gap-4" data-welcome-switch={s.key}>
                 <div className="min-w-0">
                   <p className="text-body-strong text-on-surface">{s.label}</p>
                   <p className="text-label text-on-surface-muted">{s.help}</p>
                 </div>
-                <Switch checked={false} disabled aria-label={s.label} />
+                <Switch checked={s.on} disabled aria-label={s.label} />
               </li>
             ))}
           </ul>

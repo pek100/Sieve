@@ -23,6 +23,19 @@
     { "raw": "1.2.3.4", "host": null, "problem": "ip" },
     { "raw": "a b.com", "host": null, "problem": "spaces" },
     { "raw": "bad_char.com", "host": null, "problem": "characters" },
-    { "raw": "-bad.example", "host": null, "problem": "characters" }
-  ]
+    { "raw": "-bad.example", "host": null, "problem": "characters" },
+    { "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "host": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+    { "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "host": null, "problem": "too-long" }
+  ],
+  "allowlist": {
+    "host": "ok.example",
+    "rule": "@@||ok.example^",
+    "cases": [
+      { "list": "||ok.example^", "ask": "ok.example", "verdict": "allow" },
+      { "list": "||ok.example^", "ask": "cdn.ok.example", "verdict": "allow" },
+      { "list": "||cdn.ok.example^", "ask": "cdn.ok.example", "verdict": "allow" },
+      { "list": "||other.example^", "ask": "other.example", "verdict": "block" },
+      { "list": "||ok.example^$important", "ask": "ok.example", "verdict": "block" }
+    ]
+  }
 }

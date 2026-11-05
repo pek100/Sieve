@@ -3,10 +3,10 @@ import fixture from "@/data/fixtures/engine-probe-v2.json";
 import { parseEngineProbe } from "@/data/protocol";
 import type { EngineSlice } from "./engine";
 import { SETTING_KEYS, isAvailable, settingDef } from "./settings/registry";
-import { dataSwitchSummary, welcomeAdguard, welcomeSteps } from "./welcome";
+import { dataSwitchSummary, switchesState, welcomeAdguard, welcomeSteps } from "./welcome";
 
 const slice = (name: keyof typeof fixture.examples): EngineSlice => ({ probe: parseEngineProbe(fixture.examples[name]), error: null });
-const ids = (e: EngineSlice, keep?: boolean) => welcomeSteps(e, keep).map((s) => s.id);
+const ids = (e: EngineSlice, keep = false) => welcomeSteps(e, keep, "off").map((s) => s.id);
 const unknown: EngineSlice = { probe: null, error: null };
 
 describe("welcome steps", () => {
@@ -26,7 +26,27 @@ describe("welcome steps", () => {
   });
 
   it("says nothing is blocked", () => {
-    expect(welcomeSteps(unknown)[0].body).toContain("blocks nothing yet");
+    expect(welcomeSteps(unknown, false, "off")[0].body).toContain("blocks nothing yet");
+  });
+
+  it("words the switches step by what is in force", () => {
+    const body = (s: Parameters<typeof welcomeSteps>[2]) => welcomeSteps(unknown, false, s)[1].body;
+    expect(body("off")).toContain("They are off");
+    for (const s of ["on", "unknown"] as const) expect(body(s), s).not.toContain("They are off");
+  });
+});
+
+describe("switchesState", () => {
+  it("any switch on is on, whatever the engine says", () => {
+    expect(switchesState([false, true], slice("missing"))).toBe("on");
+    expect(switchesState([true], unknown)).toBe("on");
+  });
+
+  it("all off reads off only where the engine's state is known", () => {
+    for (const name of ["missing", "stopped", "idle"] as const) expect(switchesState([false], slice(name)), name).toBe("off");
+    for (const name of ["refused", "incompatible"] as const) expect(switchesState([false], slice(name)), name).toBe("unknown");
+    expect(switchesState([false], unknown)).toBe("unknown");
+    expect(switchesState([false], { probe: null, error: "denied" })).toBe("unknown");
   });
 });
 

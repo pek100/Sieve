@@ -14,6 +14,8 @@ export function RulesEditor({ saved, onSave, disabled }: { saved: readonly strin
   // Null while nothing was typed: the editor then follows what is stored (an import, an undo).
   const [draft, setDraft] = useState<string | null>(null);
   const [refused, setRefused] = useState<RuleProblem[]>([]);
+  // Why the last save failed: the parser could not be asked, or the write did not land.
+  const [saveFailed, setSaveFailed] = useState<string | null>(null);
   const [site, setSite] = useState("");
   const [siteError, setSiteError] = useState<string | null>(null);
   const text = draft ?? savedText;
@@ -24,6 +26,7 @@ export function RulesEditor({ saved, onSave, disabled }: { saved: readonly strin
   const edit = (next: string) => {
     setDraft(next);
     setRefused([]);
+    setSaveFailed(null);
   };
 
   const blockSite = (e: FormEvent) => {
@@ -38,7 +41,14 @@ export function RulesEditor({ saved, onSave, disabled }: { saved: readonly strin
   };
 
   const save = async () => {
-    const problems = await onSave(check.stored);
+    setSaveFailed(null);
+    let problems: RuleProblem[];
+    try {
+      problems = await onSave(check.stored);
+    } catch (e) {
+      setSaveFailed(e instanceof Error ? e.message : String(e));
+      return;
+    }
     // The parser counts stored lines; the person reads the editor's, blanks included.
     const editorLines = check.lines.filter((l) => l.check.kind !== "blank");
     setRefused(problems.map((p) => ({ line: editorLines[p.line - 1]?.n ?? p.line, reason: p.reason })));
@@ -78,11 +88,16 @@ export function RulesEditor({ saved, onSave, disabled }: { saved: readonly strin
           spellCheck={false}
           className="h-44 w-full resize-y rounded-md bg-inset p-3 font-mono text-mono text-on-surface shadow-inset outline-none placeholder:text-on-surface-faint"
         />
-        {(notes.length > 0 || refused.length > 0 || check.tooLong) && (
+        {(notes.length > 0 || refused.length > 0 || check.tooLong || saveFailed !== null) && (
           <ul aria-label="Rule problems" className="flex flex-col gap-1 text-label">
             {check.tooLong && (
               <li role="alert" className="text-blocked">
                 {check.tooLong}
+              </li>
+            )}
+            {saveFailed !== null && (
+              <li role="alert" className="text-blocked" data-rule-note="save">
+                These rules were not saved: Sieve could not check or store them. <span className="font-mono text-mono text-on-surface-muted">{saveFailed}</span>
               </li>
             )}
             {notes.map((n) => (
