@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createDnsSource, createEngineSource, sourceOptions } from "./source";
+import { createEngineSource, createWindowsDnsSource, sourceOptions } from "./source";
 
 describe("source choice (seam law: Tauri when present, mock forced by ?source=mock)", () => {
   it("picks tauri inside Tauri and mock in a plain browser", () => {
@@ -16,21 +16,19 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
       kind: "mock",
       seed: 7,
       scenario: "busy",
-      dns: "off",
-      adguard: false,
       pointed: false,
       icons: false,
       engine: "missing",
+      logError: false,
     });
     expect(sourceOptions({ search: "?seed=abc&scenario=nope", isTauri: false })).toEqual({
       kind: "mock",
       seed: 1,
       scenario: "steady",
-      dns: "off",
-      adguard: false,
       pointed: false,
       icons: false,
       engine: "missing",
+      logError: false,
     });
   });
 
@@ -55,12 +53,17 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
     expect(await createMockSource({ seed: 1 }).appIcon("C:\\Program Files\\App\\app.exe")).toBeNull();
   });
 
-  it("reads the mock DNS scenario, the AdGuard flag and a pointed adapter; the DNS seam follows the source kind", () => {
-    expect(sourceOptions({ search: "?dns=error&adguard=1&pointed=1", isTauri: false })).toMatchObject({ dns: "error", adguard: true, pointed: true });
-    expect(sourceOptions({ search: "?dns=nope", isTauri: false })).toMatchObject({ dns: "off", pointed: false });
-    // The retired scenario (Windows pointed by Sieve, with a backup) reads as off.
-    expect(sourceOptions({ search: "?dns=running", isTauri: false }).dns).toBe("off");
-    expect(createDnsSource(sourceOptions({ search: "", isTauri: true })).kind).toBe("tauri");
-    expect(createDnsSource(sourceOptions({ search: "?source=mock&dns=error", isTauri: true })).kind).toBe("mock");
+  it("reads a pointed adapter, and the safety net's read follows it", async () => {
+    expect(sourceOptions({ search: "?pointed=1", isTauri: false }).pointed).toBe(true);
+    const pointed = await createWindowsDnsSource(sourceOptions({ search: "?pointed=1", isTauri: false })).windowsDns();
+    expect(pointed.adapters[0].servers).toEqual(["127.0.0.1", "::1"]);
+    const own = await createWindowsDnsSource(sourceOptions({ search: "", isTauri: false })).windowsDns();
+    expect(own.adapters.flatMap((a) => a.servers)).not.toContain("127.0.0.1");
+  });
+
+  it("?log=error makes the mock's log unreadable", async () => {
+    expect(sourceOptions({ search: "?log=error", isTauri: false }).logError).toBe(true);
+    const engine = createEngineSource(sourceOptions({ search: "?engine=hosts&log=error", isTauri: false }));
+    await expect(engine.logTail(0)).rejects.toThrow();
   });
 });

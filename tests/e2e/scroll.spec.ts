@@ -22,6 +22,8 @@ const PAGES = [
   { name: "Home", url: "/?source=mock&seed=1" },
   { name: "Apps", url: "/apps/?source=mock&seed=1" },
   { name: "Settings", url: "/settings/?source=mock&seed=1" },
+  { name: "Log", url: "/log/?source=mock&seed=1&engine=hosts" },
+  { name: "Log", url: "/log/?source=mock&seed=1", empty: true },
 ];
 
 async function measure(page: Page) {
@@ -60,14 +62,19 @@ test.describe("scroll law", () => {
 
   for (const size of SIZES) {
     for (const p of PAGES) {
-      test(`${p.name} at ${size.width}x${size.height}: vertical scroll in the content area only`, async ({ page }, info) => {
+      const label = "empty" in p ? `${p.name} (empty)` : p.name;
+      test(`${label} at ${size.width}x${size.height}: vertical scroll in the content area only`, async ({ page }, info) => {
         test.skip(info.project.name !== "desktop", "window sizes are set on the desktop project");
         await page.setViewportSize(size);
+        // The Log's rows need the engine routing, so its switch stored on, as an earlier session leaves it.
+        if (p.url.includes("engine=hosts")) await page.addInitScript(() => window.localStorage.setItem("sieve.settings", JSON.stringify({ schema: 5, values: { "filtering.engine": true } })));
         await page.goto(p.url);
         await expect(page.getByRole("heading", { level: 1 })).toHaveText(p.name === "Home" ? "Sieving now" : p.name);
         if (p.name === "Home") {
           await expect(page.getByRole("region", { name: "When apps are busy" }).locator("[data-cell]").first()).toBeVisible();
           await expect(page.locator('svg[data-chart-plot] path[data-part="line"]').first()).toBeAttached();
+        } else if (p.name === "Log") {
+          await expect("empty" in p ? page.getByText("Nothing to show") : page.getByTestId("log-row").first()).toBeVisible();
         } else {
           await expect(page.locator(p.name === "Apps" ? "[data-testid=app-row]" : "[data-setting]").first()).toBeVisible();
         }
@@ -85,6 +92,10 @@ test.describe("scroll law", () => {
           const plot = page.locator("svg[data-chart-plot]").locator("xpath=..");
           await hoverWithTooltip(page, plot, failures, "chart right edge");
         }
+        // The path's full text is a floating tooltip, at the width that shows the column.
+        if (p.name === "Log" && !("empty" in p) && size.width >= 1280) {
+          await hoverWithTooltip(page, page.locator("[data-log-path]").filter({ hasText: "/" }).first(), failures, "log path");
+        }
 
         // Scrolling the content area moves the content, never the window or the top bar.
         if (m.rootY > 0) {
@@ -95,7 +106,7 @@ test.describe("scroll law", () => {
           if (after.windowScrolled) failures.push("the window scrolled");
           if (after.docX > 0 || after.rootX > 0) failures.push("sideways overflow after scrolling");
         }
-        await page.screenshot({ path: `test-results/screens/scroll-${p.name.toLowerCase()}-${size.width}x${size.height}.png` });
+        await page.screenshot({ path: `test-results/screens/scroll-${label.toLowerCase().replace(/\W+/g, "-")}-${size.width}x${size.height}.png` });
         expect(failures, failures.join("\n")).toEqual([]);
       });
     }

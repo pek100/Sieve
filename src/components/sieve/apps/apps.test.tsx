@@ -62,12 +62,23 @@ describe("apps screen", () => {
     const toggle = within(row(CHROME)).getByRole("switch", { name: "Sieve Google Chrome" });
     expect(toggle).toBeChecked();
     expect(toggle).toHaveAccessibleDescription(APP_OFF_MEANS);
-    expect(APP_OFF_MEANS).toMatch(/stops tracking and charting/);
-    // Nothing is blocked before the engine, so the copy must not claim blocking.
+    expect(APP_OFF_MEANS).toBe("Off: Sieve passes this app's traffic through untouched and stops charting it.");
     expect(APP_OFF_MEANS).not.toMatch(/block/i);
     // No Watch level and no locked per-app filtering anywhere.
     expect(document.body.textContent).not.toMatch(/Watch|network driver|Per-app filtering/);
     expect(screen.queryAllByRole("radio")).toHaveLength(0);
+  });
+
+  it("the app sheet opens the report dialog for that app, with no URL yet", async () => {
+    const { user } = await setup();
+    await user.click(within(row(CHROME)).getByRole("button", { name: /Open details/ }));
+    await user.click(await screen.findByRole("button", { name: "Report a broken site" }));
+    const report = await screen.findByRole<HTMLTextAreaElement>("textbox", { name: "The report" });
+    expect(report.value).toContain("Page URL: not known");
+    expect(report.value).toContain("Browser: chrome.exe");
+    expect(screen.getByRole("textbox", { name: "Page URL" })).toHaveValue("");
+    // No engine in this runtime: the reason, and no page to open.
+    expect(screen.getByRole("button", { name: "Open issue page" })).toBeDisabled();
   });
 
   it("turning an app off stores it and drops it from the being-sieved count", async () => {

@@ -269,6 +269,40 @@ test.describe("alignment law", () => {
   });
   }
 
+  /** The Log on the grid, at the project's size and, on desktop, at 960x800 too; with rows and empty. */
+  test("Log snaps to the grid, with rows and empty; each row's menu ends on the header actions' line", async ({ page }, info) => {
+    const errors = collectErrors(page);
+    const sizes = info.project.name === "desktop" ? [{ width: 1280, height: 800 }, { width: 960, height: 800 }] : [{ width: 375, height: 812 }];
+    await page.addInitScript(() => {
+      if (location.search.includes("engine=hosts")) window.localStorage.setItem("sieve.settings", JSON.stringify({ schema: 5, values: { "filtering.engine": true } }));
+      else window.localStorage.removeItem("sieve.settings");
+    });
+    for (const size of sizes) {
+      await page.setViewportSize(size);
+      await page.goto("/log/?source=mock&seed=1&engine=hosts");
+      const rows = page.getByTestId("log-row");
+      await expect(rows.first()).toBeVisible();
+      await page.getByRole("button", { name: "Pause the log" }).click();
+      const toolbar = page.getByRole("searchbox", { name: "Search the log" }).locator("xpath=ancestor::div[contains(@class,'flex-wrap')][1]");
+      const { grid, failures } = await expectOnGrid(page, { toolbar, list: page.getByRole("region", { name: "Log rows" }) }, { rows });
+      for (const r of await rows.all()) {
+        const b = (await r.getByRole("button", { name: /^Actions for/ }).boundingBox())!;
+        if (Math.abs(right(b) - grid.R) > TOL) failures.push(`a row's menu ends at ${right(b).toFixed(1)}, header actions at ${grid.R.toFixed(1)}`);
+        const h = (await r.boundingBox())!.height;
+        if (h !== 44) failures.push(`a log row is ${h}px tall`);
+      }
+      expect(failures, `${size.width}: ${failures.join("\n")}`).toEqual([]);
+      expect(await noSidewaysOverflow(page)).toBeLessThanOrEqual(0);
+
+      await page.goto("/log/?source=mock&seed=1");
+      await expect(page.getByText("Nothing to show")).toBeVisible();
+      const empty = await expectOnGrid(page, { list: page.getByRole("region", { name: "Log rows" }) });
+      expect(empty.failures, `${size.width} empty: ${empty.failures.join("\n")}`).toEqual([]);
+      expect(await noSidewaysOverflow(page)).toBeLessThanOrEqual(0);
+    }
+    expect(errors).toEqual([]);
+  });
+
   test("Settings snaps to the grid: rail on the title's line, content to the actions' line", async ({ page }) => {
     const errors = collectErrors(page);
     await page.goto("/settings/?source=mock&seed=1");
@@ -296,8 +330,7 @@ test.describe("alignment law", () => {
       const b = (await row.boundingBox())!;
       if (Math.abs(b.x - col.x) > TOL || Math.abs(right(b) - right(col)) > TOL) failures.push(`row ${await row.getAttribute("data-setting")} is not column wide`);
     }
-    // One owner for the upstream servers at most: the DNS filter's card, while it is available
-    // (hidden until the engine replaces it, so none today).
+    // One owner for the upstream servers: their registry row.
     if ((await page.getByText("Upstream DNS servers", { exact: true }).count()) > 1) failures.push("Upstream DNS servers appears more than once");
     expect(failures, failures.join("\n")).toEqual([]);
     expect(await noSidewaysOverflow(page)).toBeLessThanOrEqual(0);
@@ -332,6 +365,10 @@ test.describe("alignment law", () => {
     await page.goto("/?source=mock&seed=1");
     await expect(page.getByRole("region", { name: "Top apps" }).locator("li").first()).toBeVisible();
     failures.push(...(await lined("main li")));
+    await page.addInitScript(() => window.localStorage.setItem("sieve.settings", JSON.stringify({ schema: 5, values: { "filtering.engine": true } })));
+    await page.goto("/log/?source=mock&seed=1&engine=hosts");
+    await expect(page.getByTestId("log-row").first()).toBeVisible();
+    failures.push(...(await lined("[data-testid=log-row]")));
     expect(failures, failures.join("\n")).toEqual([]);
   });
 

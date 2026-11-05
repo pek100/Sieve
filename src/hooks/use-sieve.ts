@@ -1,8 +1,8 @@
 "use client";
 
 import { useCallback, useMemo, useSyncExternalStore } from "react";
-import type { DnsSlice } from "@/core/dns";
 import type { EngineSlice } from "@/core/engine";
+import type { LogSlice } from "@/core/log";
 import type { Notice } from "@/core/notices";
 import { effectiveOn, GLOBAL_SWITCH, offKeys, type AppStates } from "@/core/policy";
 import { readValue } from "@/core/settings/document";
@@ -69,13 +69,6 @@ export function useTracking(): Tracking {
   );
 }
 
-const selectDns = (s: SieveState): DnsSlice => s.dns;
-
-/** The DNS filter's state (owner: the DNS controller). */
-export function useDns(): DnsSlice {
-  return useSieve(selectDns);
-}
-
 const selectEngine = (s: SieveState): EngineSlice => s.engine;
 
 /** The filtering engine's facts (owner: the engine controller). */
@@ -89,6 +82,22 @@ export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdg
   return useMemo(
     () => ({ stopAdguard: () => engineController.stopAdguard(), startAdguard: () => engineController.startAdguard() }),
     [engineController],
+  );
+}
+
+const selectLog = (s: SieveState): LogSlice => s.log;
+
+/** The filtering log (owner: the log controller). */
+export function useLog(): LogSlice {
+  return useSieve(selectLog);
+}
+
+/** The log's user actions: pause, resume and clear (through the log controller). */
+export function useLogActions(): { pause: () => void; resume: () => void; clear: () => void } {
+  const { logController } = useRuntime();
+  return useMemo(
+    () => ({ pause: () => logController.pause(), resume: () => logController.resume(), clear: () => logController.clear() }),
+    [logController],
   );
 }
 

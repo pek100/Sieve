@@ -11,14 +11,18 @@ const PAGES = [
   { name: "home", url: "/?source=mock&seed=1", ready: (p: Page) => p.locator('svg[data-chart-plot] path[data-part="line"]').first() },
   { name: "apps", url: "/apps/?source=mock&seed=1", ready: (p: Page) => p.getByTestId("app-row").first() },
   { name: "settings", url: "/settings/?source=mock&seed=1", ready: (p: Page) => p.locator("[data-setting]").first() },
-  // Settings > Filtering: the engine, and no DNS filter while it waits for the engine (2026-10-18).
+  // Settings > Filtering: the engine and the encrypted upstreams.
   { name: "settings-filtering", url: "/settings/?source=mock&seed=1#section-filtering", ready: (p: Page) => p.getByRole("region", { name: "Engine" }) },
+  // The Log with rows (the engine filtering hosts, its switch stored on), and with no engine.
+  { name: "log", url: "/log/?source=mock&seed=1&engine=hosts", ready: (p: Page) => p.getByTestId("log-row").first(), switchOn: true },
+  { name: "log-empty", url: "/log/?source=mock&seed=1", ready: (p: Page) => p.getByText("Nothing to show") },
 ];
 
 test.describe("layout screenshots", () => {
   for (const p of PAGES) {
     test(`${p.name}`, async ({ page }, info) => {
       const sizes = info.project.name === "desktop" ? [{ width: 1280, height: 800 }, { width: 960, height: 800 }] : [{ width: 375, height: 812 }];
+      if ("switchOn" in p) await page.addInitScript(() => window.localStorage.setItem("sieve.settings", JSON.stringify({ schema: 5, values: { "filtering.engine": true } })));
       for (const size of sizes) {
         await page.setViewportSize(size);
         await page.goto(p.url);
