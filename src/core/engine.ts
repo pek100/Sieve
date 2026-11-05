@@ -3,10 +3,11 @@
  * about it, derived from facts only (plan 1.6.5: "Filtering is not running"
  * comes from facts, never assumed). The facts are `engine_probe`: the
  * Windows service's state and, while it runs, the engine's own answer on
- * its pipe (sieve-ipc v2 Status: policy, blocker, split tunnels, counters).
+ * its pipe (sieve-ipc v3 Status: policy, blocker, split tunnels, counters).
  *
- * Slice 3 routes and relays every flow and blocks nothing, so no phase says
- * "filtering" or "blocked": a routing engine is "Routing traffic".
+ * The phase says what routes, and whether anything is blocked is its own fact
+ * (`status.blocking`): routing with no list compiled yet closes nothing, and
+ * the copy must not claim it does.
  *
  * The slice has one writer, the engine controller (src/data/engine-controller.ts).
  */
@@ -188,7 +189,9 @@ export function engineDetail(e: EngineSlice): string {
     case "starting":
       return "The engine is bringing up its network adapter and routes.";
     case "routing":
-      return "This computer's traffic goes through the engine, which shows each app's connections. Nothing is blocked yet.";
+      return engineStatus(e)?.blocking
+        ? "This computer's traffic goes through the engine, which shows each app's connections and closes connections to blocked hosts."
+        : "This computer's traffic goes through the engine, which shows each app's connections. Nothing is blocked yet.";
     case "adguard":
       return "AdGuard is protecting this computer, and two filters would capture each other's connections. Sieve routes nothing while AdGuard's service runs; your network works as usual.";
     case "vpn":

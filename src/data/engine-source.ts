@@ -7,11 +7,11 @@
  * never replaced by mock data.
  *
  * The app never installs, starts or stops the engine. It sends the user's
- * switch (`setPolicy`), and, only when the user clicks, stops or starts
+ * switches (`setPolicy`), reads the per-list report (`lists`), and, only when the user clicks, stops or starts
  * AdGuard's service through one command Windows asks the user to approve.
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { parseEngineProbe, parseEngineStatus, type EnginePolicy, type EngineProbe, type EngineStatus } from "./protocol";
+import { parseEngineLists, parseEngineProbe, parseEngineStatus, type EngineLists, type EnginePolicy, type EngineProbe, type EngineStatus } from "./protocol";
 
 export interface EngineSource {
   readonly kind: "mock" | "tauri";
@@ -19,6 +19,10 @@ export interface EngineSource {
   probe(): Promise<EngineProbe>;
   /** Sends the user's switches; resolves with the engine's Status after the change. */
   setPolicy(policy: EnginePolicy): Promise<EngineStatus>;
+  /** The per-list report. */
+  lists(): Promise<EngineLists>;
+  /** Asks the engine to download every selected list now; the report as it stands. */
+  listsRefresh(): Promise<EngineLists>;
   /** Stops AdGuard's service (Windows asks the user first). Rejects when it did not stop. */
   stopAdguard(): Promise<void>;
   /** Starts AdGuard's service again (Windows asks the user first). */
@@ -32,6 +36,8 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     kind: "tauri",
     probe: async () => parseEngineProbe(await invoke<unknown>("engine_probe")),
     setPolicy: async (policy) => parseEngineStatus(await invoke<unknown>("engine_set_policy", { policy })),
+    lists: async () => parseEngineLists(await invoke<unknown>("engine_lists")),
+    listsRefresh: async () => parseEngineLists(await invoke<unknown>("engine_lists_refresh")),
     stopAdguard: async () => void (await invoke<unknown>("adguard_stop")),
     startAdguard: async () => void (await invoke<unknown>("adguard_start")),
   };

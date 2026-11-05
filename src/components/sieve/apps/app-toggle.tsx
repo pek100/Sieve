@@ -5,11 +5,9 @@ import { cn } from "@/lib/utils";
 
 /**
  * What per-app Off does, said once (the switch's tooltip and accessible
- * description). Only what is true today: Sieve blocks nothing yet (the DNS
- * filter is hidden until engine slice 4), so Off only stops tracking. With
- * the engine, Off becomes a real per-app exemption (plan section 1.4).
+ * description): tracking stops, and a routing engine relays the app untouched.
  */
-export const APP_OFF_MEANS = "Off: Sieve stops tracking and charting this app.";
+export const APP_OFF_MEANS = "Off: Sieve stops tracking and charting this app, and its traffic is left alone.";
 
 /**
  * Per-app on/off: Sieve (on, the default) or Off. `on` is the user's choice

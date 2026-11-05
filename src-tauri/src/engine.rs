@@ -5,11 +5,13 @@
 //!   - `adguard`: AdGuard for Windows' service state, read the same way (the
 //!     pause offer and its undo follow it);
 //!   - `pipe` (only while the service runs): the engine's own answer over
-//!     `\\.\pipe\sieve-engine` (protocol `sieve-ipc` v2): Welcome with its
+//!     `\\.\pipe\sieve-engine` (protocol `sieve-ipc` v3): Welcome with its
 //!     Status, Incompatible, the engine's refusal (only the installed app may
 //!     connect), or unreachable with the reason.
-//! - `engine_set_policy(policy) -> EngineStatus`: sends the user's switch
-//!   (`filtering.engine`) to the engine.
+//! - `engine_set_policy(policy) -> EngineStatus`: sends the user's switches
+//!   (the engine controller's whole policy) to the engine.
+//! - `engine_lists() -> EngineLists`, `engine_lists_refresh() -> EngineLists`:
+//!   the per-list report; the second also asks for a download of every list.
 //! - [`EngineFlows`]: while the engine routes, a subscription to its `Flows`
 //!   events; `net_snapshot` then builds the snapshot from them instead of
 //!   the connection tables (whose rows would show every flow twice: the
@@ -24,7 +26,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sieve_ipc::{EngineStatus, FlowEvent, FlowProto, PIPE_NAME, PROTOCOL, Policy};
+use sieve_ipc::{EngineStatus, FlowEvent, FlowProto, ListStatus, PIPE_NAME, PROTOCOL, Policy};
 
 use crate::protocol::{Endpoint, Family, Flow, FlowState, Proto};
 
@@ -68,6 +70,14 @@ pub struct EngineProbe {
     pub adguard: ServiceFact,
     /// None while the service is not running (the pipe is not asked).
     pub pipe: Option<PipeFact>,
+}
+
+/// The engine's per-list report (its `Lists` message).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineLists {
+    pub lists: Vec<ListStatus>,
+    pub compile_ms: Option<u64>,
 }
 
 /// The probe from its facts.
@@ -234,6 +244,28 @@ mod imp {
         }
     }
 
+    /// Asks for the list report on pipe `name` (`msg` is Lists or ListsRefresh).
+    pub async fn lists(name: &str, msg: ClientMessage) -> Result<EngineLists, String> {
+        let exchange = async {
+            let mut pipe = match hello(name).await? {
+                Ok((pipe, _, _)) => pipe,
+                Err(PipeFact::Incompatible { supported }) => return Err(format!("the engine speaks protocol {} to {}", supported[0], supported[1])),
+                Err(PipeFact::Refused { message } | PipeFact::Unreachable { message }) => return Err(message),
+                Err(other) => return Err(format!("unexpected answer to hello: {other:?}")),
+            };
+            write_frame(&mut pipe, &msg).await.map_err(|e| e.to_string())?;
+            match read_frame(&mut pipe).await.map_err(|e| e.to_string())? {
+                EngineMessage::Lists { lists, compile_ms } => Ok(EngineLists { lists, compile_ms }),
+                EngineMessage::Error { message } => Err(message),
+                other => Err(format!("unexpected answer: {other:?}")),
+            }
+        };
+        match tokio::time::timeout(PROBE_TIMEOUT, exchange).await {
+            Ok(answer) => answer,
+            Err(_) => Err(format!("no answer in {} s", PROBE_TIMEOUT.as_secs())),
+        }
+    }
+
     /// One subscription: Hello, Status; while the engine routes, Subscribe
     /// and apply every batch until the engine ends the stream (its routes
     /// went down) or the pipe breaks.
@@ -309,6 +341,32 @@ pub async fn engine_set_policy(_policy: Policy) -> Result<EngineStatus, String> 
     Err("the engine runs on Windows only".into())
 }
 
+/// Command: the engine's per-list report.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_lists() -> Result<EngineLists, String> {
+    imp::lists(PIPE_NAME, sieve_ipc::ClientMessage::Lists).await
+}
+
+/// Command: asks the engine to download every selected list now.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_lists_refresh() -> Result<EngineLists, String> {
+    imp::lists(PIPE_NAME, sieve_ipc::ClientMessage::ListsRefresh).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_lists() -> Result<EngineLists, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_lists_refresh() -> Result<EngineLists, String> {
+    Err("the engine runs on Windows only".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,7 +405,7 @@ mod tests {
     #[test]
     fn engine_flows_become_snapshot_rows_with_the_tables_meaning() {
         let rows: Vec<Flow> = fixture_flows().iter().filter_map(snapshot_flow).collect();
-        assert_eq!(rows.len(), 4, "the unattributed QUIC flow is left out");
+        assert_eq!(rows.len(), 5, "the unattributed QUIC flow is left out");
         assert_eq!(rows[0].pid, 4242);
         assert_eq!((rows[0].proto, rows[0].family, rows[0].state), (Proto::Tcp, Family::V4, FlowState::Established));
         assert_eq!(rows[0].local, Endpoint { addr: "198.18.0.1".into(), port: 50112 });
@@ -361,7 +419,7 @@ mod tests {
         assert_eq!(flows.flows(), None, "not live: the app reads the connection tables");
         flows.set_live(true);
         flows.apply(fixture_flows());
-        // Open in the fixture: ids 7, 9 (no pid) and 11; 8 and 10 are closed.
+        // Open in the fixture: ids 7, 9 (no pid) and 11; 8, 10 and 12 are closed.
         assert_eq!(flows.flows().unwrap().iter().map(|f| f.pid).collect::<Vec<_>>(), [4242, 912]);
         let mut close = fixture_flows()[0].clone();
         close.open = false;
@@ -405,7 +463,7 @@ mod tests {
                 None
             }
         });
-        let fact = match ask {
+        let fact = match ask.clone() {
             ClientAsk::Status => Ok(imp::pipe_fact(name).await),
             ClientAsk::Policy(p) => imp::set_policy(name, p).await.map(|status| PipeFact::Welcome { engine_version: String::new(), session_id: 0, status }),
         };
@@ -417,7 +475,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum ClientAsk {
         Status,
         Policy(Policy),
@@ -451,14 +509,39 @@ mod tests {
     #[tokio::test]
     async fn set_policy_sends_the_switch_and_returns_the_engines_status_or_its_refusal() {
         use sieve_ipc::EngineMessage;
-        let on = Policy { revision: 2, engine: true };
+        let on = Policy { revision: 2, engine: true, sieving: true, off_apps: vec!["firefox".into()], ..Policy::default() };
         let welcome = || EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 };
-        let after = EngineStatus { policy: on, ..EngineStatus::default() };
-        let got = fake_engine(&test_pipe("policy"), welcome(), EngineMessage::Status(after.clone()), ClientAsk::Policy(on)).await;
+        let after = EngineStatus { policy: on.clone(), ..EngineStatus::default() };
+        let got = fake_engine(&test_pipe("policy"), welcome(), EngineMessage::Status(after.clone()), ClientAsk::Policy(on.clone())).await;
         assert!(matches!(got, Ok(PipeFact::Welcome { status, .. }) if status == after));
         let stale = EngineMessage::Error { message: "stale policy revision 2 (the engine holds 5)".into() };
         let got = fake_engine(&test_pipe("stale"), welcome(), stale, ClientAsk::Policy(on)).await;
         assert_eq!(got, Err("stale policy revision 2 (the engine holds 5)".into()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_list_report_comes_from_the_engine_or_says_why_not() {
+        use sieve_ipc::nonblocking::{read_frame, write_frame};
+        use sieve_ipc::{ClientMessage, EngineMessage};
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let name = test_pipe("lists");
+        let mut server = ServerOptions::new().first_pipe_instance(true).create(&name).unwrap();
+        let report = vec![ListStatus { id: "adguard-dns".into(), network: 3, ..ListStatus::default() }];
+        let answer = EngineMessage::Lists { lists: report.clone(), compile_ms: Some(9) };
+        let engine = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let _: ClientMessage = read_frame(&mut server).await.unwrap();
+            write_frame(&mut server, &EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 }).await.unwrap();
+            let asked: ClientMessage = read_frame(&mut server).await.unwrap();
+            write_frame(&mut server, &answer).await.unwrap();
+            asked
+        });
+        let got = imp::lists(&name, ClientMessage::ListsRefresh).await.unwrap();
+        assert_eq!(got, EngineLists { lists: report, compile_ms: Some(9) });
+        assert_eq!(engine.await.unwrap(), ClientMessage::ListsRefresh);
+        assert!(imp::lists(&test_pipe("lists-nobody"), ClientMessage::Lists).await.is_err());
     }
 
     #[cfg(windows)]

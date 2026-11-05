@@ -151,6 +151,17 @@ describe("protocol law", () => {
     expect(() => parseEngineProbe(withStatus({ ...status, counters: { ...status.counters, attributed: -1 } }))).toThrow(/counters\.attributed/);
     const v1 = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "counters"));
     expect(() => parseEngineProbe(withStatus(v1))).toThrow(/counters/);
+    // Protocol 3's additions degrade to their defaults when absent; a wrong type still throws.
+    const noBlocking = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "blocking"));
+    const old = { ...noBlocking, policy: { revision: 3, engine: true }, counters: { flows: 1, attributed: 1, own_refused: 0, dns_answers: 0, packets_in: 0, packets_out: 0, not_unicast: 0 } };
+    const pipe = parseEngineProbe(withStatus(old)).pipe;
+    if (pipe?.kind !== "welcome") throw new Error("expected welcome");
+    expect(pipe.status.blocking).toBe(false);
+    expect(pipe.status.counters.blocked).toBe(0);
+    expect(pipe.status.policy).toEqual({ revision: 3, engine: true, sieving: false, off_apps: [], lists: null, domain_lists: [] });
+    expect(() => parseEngineProbe(withStatus({ ...status, blocking: "yes" }))).toThrow(/status\.blocking/);
+    expect(() => parseEngineProbe(withStatus({ ...status, policy: { revision: 1, engine: true, off_apps: [1] } }))).toThrow(/off_apps/);
+    expect(() => parseEngineProbe(withStatus({ ...status, policy: { revision: 1, engine: true, domain_lists: [{ kind: "nope", entries: [], enabled: true }] } }))).toThrow(/domain_lists/);
     expect(() => parseEngineProbe({ ...idle, service: "paused" })).toThrow(/service/);
     expect(() => parseEngineProbe({ ...idle, pipe: { kind: "sign" } })).toThrow(/pipe\.kind/);
     expect(() => parseEngineProbe({ ...idle, pipe: { ...idle.pipe, status: { ...idle.pipe.status, flows: -1 } } })).toThrow(/status\.flows/);

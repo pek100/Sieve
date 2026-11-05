@@ -6,12 +6,15 @@
  * or assumed state. Time comes from the injected clock.
  *
  * What it changes, and only these:
- * - the engine's policy follows the user's switch `filtering.engine`
- *   (ENGINE_SWITCH): whenever the engine answers with a different value, the
- *   switch is sent with the next revision (`setPolicy`). The switch defaults
+ * - the engine's policy follows the user's settings: the switch
+ *   `filtering.engine` (ENGINE_SWITCH), the global Sieving switch, the apps
+ *   turned off and the domain lists. Whenever the engine answers with anything
+ *   different, order aside, the whole policy is sent with the next revision
+ *   (`setPolicy`): a part-filled one would clear the rest. The switch defaults
  *   off, so the engine routes nothing until the user turns it on. Nothing is
  *   sent while the engine cannot take a policy (`engineTakesPolicy`); the
- *   stored value then waits untouched;
+ *   stored values then wait untouched. A refused send is retried at the next
+ *   probe, not at once;
  * - AdGuard's service, stopped or started only when the user clicks the
  *   pause offer (`stopAdguard`, `startAdguard`; Windows asks the user first).
  *
@@ -22,10 +25,12 @@
 import type { PassedChecks } from "@/core/checks";
 import { ENGINE_POLL_MS, ENGINE_SWITCH, engineStatus, enginePhase, engineTakesPolicy, type EngineSlice } from "@/core/engine";
 import type { NoticeBus } from "@/core/notices";
+import { GLOBAL_SWITCH, offKeys } from "@/core/policy";
 import type { SettingKey } from "@/core/settings/registry";
 import type { SieveStore } from "@/core/store";
 import type { EngineSource } from "./engine-source";
 import type { Clock } from "./poller";
+import type { EngineDomainList, EnginePolicy } from "./protocol";
 import type { SettingsStore } from "./settings-store";
 
 export interface EngineController {
@@ -52,6 +57,38 @@ export const CRASH_LOOP_BANNER =
 
 const SWITCH = ENGINE_SWITCH as SettingKey;
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+type WantedPolicy = Omit<EnginePolicy, "revision">;
+
+function domainList(kind: EngineDomainList["kind"], entries: readonly string[]): EngineDomainList[] {
+  return entries.length > 0 ? [{ kind, entries: [...entries], enabled: true }] : [];
+}
+
+/** The policy the settings ask for. List selection belongs to Settings' list view; null keeps the catalogue's defaults. */
+function wantedPolicy(settings: SettingsStore): WantedPolicy {
+  return {
+    engine: Boolean(settings.get(SWITCH)),
+    sieving: Boolean(settings.get(GLOBAL_SWITCH)),
+    off_apps: [...offKeys(settings.get("apps.levels"))],
+    lists: null,
+    domain_lists: [...domainList("block", settings.get("filtering.blockedDomains")), ...domainList("allow", settings.get("filtering.allowedDomains"))],
+  };
+}
+
+/** One form of a policy for comparing: its lists' order means nothing. */
+function normalised(p: WantedPolicy): string {
+  const sorted = (l: readonly string[]) => [...l].sort();
+  return JSON.stringify({
+    engine: p.engine,
+    sieving: p.sieving,
+    off_apps: sorted(p.off_apps),
+    lists: p.lists && sorted(p.lists),
+    domain_lists: p.domain_lists
+      .filter((l) => l.enabled && l.entries.length > 0)
+      .map((l) => ({ kind: l.kind, entries: sorted(l.entries) }))
+      .sort((a, b) => a.kind.localeCompare(b.kind)),
+  });
+}
 
 export function createEngineController({ engine, store, clock, settings, checks, notices }: EngineControllerDeps): EngineController {
   let disposed = true;
@@ -88,19 +125,22 @@ export function createEngineController({ engine, store, clock, settings, checks,
     const e = get();
     const status = engineStatus(e);
     if (disposed || !settingsReady || policyInFlight || !engineTakesPolicy(e) || status === null) return;
-    const want = Boolean(settings.get(SWITCH));
-    if (status.policy.engine === want) return;
+    const want = wantedPolicy(settings);
+    if (normalised(status.policy) === normalised(want)) return;
     policyInFlight = true;
+    let sent = false;
     try {
-      const next = await engine.setPolicy({ revision: status.policy.revision + 1, engine: want });
+      const next = await engine.setPolicy({ ...want, revision: status.policy.revision + 1 });
       const probe = get().probe;
       if (probe?.pipe?.kind === "welcome") set({ probe: { ...probe, pipe: { ...probe.pipe, status: next } }, actionError: null });
+      sent = true;
     } catch (e) {
       set({ actionError: `Could not tell the engine: ${message(e)}` });
     } finally {
       policyInFlight = false;
     }
-    if (!disposed) follow();
+    // A refusal waits for the next probe: following now would send it again at once, forever.
+    if (sent && !disposed) follow();
   };
 
   const adguard = async (action: "stopping" | "starting", run: () => Promise<void>) => {

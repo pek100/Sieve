@@ -3,11 +3,10 @@
  * user turned it off, and nothing is sieved while the global Sieving switch
  * is off. Effective = global on AND app not off.
  *
- * Honesty: per-app Off cannot exempt an app from DNS blocking. Windows sends
- * every lookup through one service (the DNS Client), so a DNS filter never
- * knows which app asked; exempting one app would need a network driver.
- * Off means Sieve leaves the app out of its tracking: the chart, the counts
- * and the saved history.
+ * Off means Sieve leaves the app out of its tracking (the chart, the counts
+ * and the saved history) and, while the engine routes, relays its flows
+ * untouched. The engine decides per flow and never blocks a DNS lookup, because
+ * Windows sends every lookup through one service that cannot say which app asked.
  */
 import type { SettingKey } from "./settings/registry";
 
@@ -18,9 +17,8 @@ export type AppState = (typeof APP_STATES)[number];
 export const DEFAULT_APP_STATE: AppState = "sieve";
 
 /**
- * The global Sieving switch (top bar). Off pauses sampling and puts a running
- * DNS filter into pass-through: it keeps answering, forwards everything and
- * blocks nothing, so whatever sends it lookups keeps resolving.
+ * The global Sieving switch (top bar). Off pauses sampling, and the engine
+ * relays every flow.
  */
 export const GLOBAL_SWITCH = "sampling.enabled" satisfies SettingKey;
 

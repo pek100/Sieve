@@ -700,6 +700,8 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
 
 ### Slice 4: host-level network filtering, per-app Off, retire the DNS proxy
 
+**Status (2026-11-06), engine side of domain filtering:** built on branch `wf-domain-policy`, offline tests green, live acceptance not run (`docs/tasks/2026-11-02-domain-policy.md`, UNVERIFIED). Encrypted DNS, ECH stripping and the canary, the log route, the DNS proxy's removal and the Settings view of the per-list report are other streams' or still open.
+
 - **Spec.**
   - Default lists downloaded and compiled in `sieve-filter`. Host decisions for SNI, Host, QUIC SNI and IP-map flows via the synthetic request (5.1). The per-app Off exemption.
   - DNS resolves and never blocks. ECH stripping and the Firefox canary.

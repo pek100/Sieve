@@ -15,13 +15,14 @@
         "status": {
           "filtering": false,
           "routes_up": false,
+          "blocking": false,
           "flows": 0,
           "decrypting": false,
           "last_error": null,
-          "policy": { "revision": 0, "engine": false },
+          "policy": { "revision": 0, "engine": false, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [] },
           "blocker": null,
           "split_tunnels": [],
-          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0 }
         }
       }
     },
@@ -36,13 +37,14 @@
         "status": {
           "filtering": true,
           "routes_up": true,
+          "blocking": false,
           "flows": 42,
           "decrypting": false,
           "last_error": null,
-          "policy": { "revision": 2, "engine": true },
+          "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [] },
           "blocker": null,
           "split_tunnels": ["Corp VPN"],
-          "counters": { "flows": 1200, "attributed": 1188, "own_refused": 0, "dns_answers": 310, "packets_in": 90000, "packets_out": 88000, "not_unicast": 51 }
+          "counters": { "flows": 1200, "attributed": 1188, "own_refused": 0, "dns_answers": 310, "packets_in": 90000, "packets_out": 88000, "not_unicast": 51, "blocked": 0 }
         }
       }
     },
@@ -57,13 +59,14 @@
         "status": {
           "filtering": false,
           "routes_up": false,
+          "blocking": false,
           "flows": 0,
           "decrypting": false,
           "last_error": null,
-          "policy": { "revision": 2, "engine": true },
+          "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [] },
           "blocker": { "kind": "adguard", "service": "Adguard Service" },
           "split_tunnels": [],
-          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0 }
         }
       }
     },
@@ -78,13 +81,14 @@
         "status": {
           "filtering": false,
           "routes_up": false,
+          "blocking": false,
           "flows": 0,
           "decrypting": false,
           "last_error": null,
-          "policy": { "revision": 2, "engine": true },
+          "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [] },
           "blocker": { "kind": "vpn", "adapter": "AdGuard VPN" },
           "split_tunnels": [],
-          "counters": { "flows": 300, "attributed": 297, "own_refused": 0, "dns_answers": 80, "packets_in": 20000, "packets_out": 19000, "not_unicast": 4 }
+          "counters": { "flows": 300, "attributed": 297, "own_refused": 0, "dns_answers": 80, "packets_in": 20000, "packets_out": 19000, "not_unicast": 4, "blocked": 0 }
         }
       }
     },
@@ -99,13 +103,14 @@
         "status": {
           "filtering": false,
           "routes_up": false,
+          "blocking": false,
           "flows": 0,
           "decrypting": false,
           "last_error": "the watchdog stopped the engine: the relay did not answer for 5000 ms",
-          "policy": { "revision": 2, "engine": true },
+          "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [] },
           "blocker": { "kind": "crash_loop", "starts": 3 },
           "split_tunnels": [],
-          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0 }
         }
       }
     },
@@ -120,13 +125,14 @@
         "status": {
           "filtering": false,
           "routes_up": false,
+          "blocking": false,
           "flows": 0,
           "decrypting": false,
           "last_error": null,
-          "policy": { "revision": 2, "engine": true },
+          "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [] },
           "blocker": { "kind": "setup", "message": "wintun.dll: SHA-256 does not match the pinned 0.14.1 build" },
           "split_tunnels": [],
-          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0 }
         }
       }
     },

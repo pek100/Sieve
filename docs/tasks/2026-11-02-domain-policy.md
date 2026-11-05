@@ -56,6 +56,16 @@ These change the work compared with what the spec implies. Library facts come fr
 | D18 | Provenance: the rule text comes from adblock-rust's debug info; the list comes from a compile-time `HashMap<u64, u16>` of rule-text hash to list bitmask. | 5.3, and far less memory than a text-keyed map. Debug retention's memory is measured by the benchmark. |
 | D19 | The benchmark is an ignored test run in release, with a counting global allocator. It refuses to run under `debug_assertions`. | Debug numbers mean nothing. `sieve-filter` makes no Windows calls, so allocator bytes stand in for RSS offline. Real RSS is a live check. |
 
+**Deviations found while building, each with its reason:**
+
+- **D18:** no rule-text hash map. adblock-rust's `source_location` already names the list, provided its pattern fusion is off, because fusion joins rules with ` <+> ` and drops the location. Engines are built with `Engine::new_with_filter_set_no_optimize`. That is one owner for the fact and less memory; the benchmark still passes. The library marks that constructor `#[doc(hidden)]`, so an upgrade must re-check it.
+- **D7:** `check_host` always looks for exceptions (`check_network_request_subset(.., false, true)`), not only after a block rule. Without it a user's allow entry, alone in its engine with no block rule, answered None and the list's block won. `user_allow_beats_a_list_important_block` caught this.
+- **Trust store:** `webpki-roots`, not `rustls-platform-verifier`, matching `wf-encrypted-dns` (S29) and keeping local filter roots out of the engine's own downloads.
+- **`-case`:** adblock-rust refuses it except on regex rules, so `||host^$match-case` is pinned as skipped. It is not an exception modifier, so this only under-blocks.
+- **Status guard:** `policy::accept` refuses a policy over half a frame, because the Status carries it back. The controller retries a refused send at the next probe instead of at once, which would have been a hot loop.
+- **Hidden-exe apps:** the app names an app whose exe it cannot read by the services it hosts; the engine, running as SYSTEM, reads the exe and derives another key. Such an Off row does not match, and the flow stays sieved. Recorded where the code is (`AppKeys::of_pid`).
+- **`MAX_LISTED_LINE_BYTES` (180):** a skipped exception line in the report is cut, so 200 lines per list fit one frame even when fully JSON-escaped.
+
 **Design gate.** New quantities and their owners: app key, `sieve-ipc` (Rust) and `appIdentity` (TS), tied by a fixture; rule priority, `RuleSet`; list freshness, `FetchState`, with `refresh` recomputed from the text and never stored (S23). Retired: `flows::verdict`, `flows::Decision`, `flows::Reason`. New dials: `MAX_LIST_BYTES`, `NO_COPY_RETRY`, the 200-line and 256-char caps, each a named, commented constant. No site names in engine source; tests use `.invalid` and `.example`.
 
 **TENSION, recorded where the code is:** an app key built from ProductName can be spoofed, since an exe that names itself like an Off product gets its exemption. Ad blocking is not a security boundary against local code, and this matches how the Apps page already groups apps.
