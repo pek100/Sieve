@@ -31,7 +31,7 @@ use crate::flow::flows::os::IpHelper;
 use crate::flow::flows::{Action, Attributor, ExeCache, FiveTuple, Owner, REFRESH_MIN_MS};
 use crate::flow::packet::Proto;
 use crate::flow::relay::relay_tcp;
-use crate::route::pin::{self, unicast_if_value};
+use crate::route::pin;
 use crate::route::table::NetTables;
 use crate::watchdog::monotonic_ms;
 
@@ -164,18 +164,11 @@ impl Relay {
     /// A socket for `target`, bound to the egress source and pinned to the
     /// egress interface (never the engine's adapter).
     fn egress_socket(&self, target: SocketAddr, udp: bool) -> Result<socket2::Socket, String> {
-        use socket2::{Domain, Protocol, Socket, Type};
         let e = {
             let tables = self.tables.read().unwrap_or_else(|p| p.into_inner());
             pin::egress(&tables, Some(self.tun_index), target.ip()).map_err(|e| e.to_string())?
         };
-        let domain = if target.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
-        let (ty, proto) = if udp { (Type::DGRAM, Protocol::UDP) } else { (Type::STREAM, Protocol::TCP) };
-        let sock = Socket::new(domain, ty, Some(proto)).map_err(|e| format!("socket: {e}"))?;
-        sock.set_nonblocking(true).map_err(|e| format!("nonblocking: {e}"))?;
-        sock.bind(&SocketAddr::new(e.source, 0).into()).map_err(|err| format!("bind {}: {err}", e.source))?;
-        pin_to_interface(&sock, target, e.if_index)?;
-        Ok(sock)
+        pin::egress_socket(e, target, udp)
     }
 
     async fn connect(&self, target: SocketAddr) -> Result<TcpStream, String> {
@@ -187,17 +180,6 @@ impl Relay {
             Err(_) => Err(format!("connect {target}: timeout")),
         }
     }
-}
-
-fn pin_to_interface(sock: &socket2::Socket, target: SocketAddr, index: u32) -> Result<(), String> {
-    use std::os::windows::io::AsRawSocket;
-    use windows::Win32::Networking::WinSock::{IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET, setsockopt};
-    let s = SOCKET(sock.as_raw_socket() as usize);
-    let (level, name) = if target.is_ipv4() { (IPPROTO_IP.0, IP_UNICAST_IF) } else { (IPPROTO_IPV6.0, IPV6_UNICAST_IF) };
-    let value = unicast_if_value(index, target.is_ipv4());
-    // SAFETY: `s` is a live socket; the option value is a 4-byte DWORD.
-    let r = unsafe { setsockopt(s, level, name, Some(&value)) };
-    if r == 0 { Ok(()) } else { Err(format!("setsockopt UNICAST_IF: {}", std::io::Error::last_os_error())) }
 }
 
 /// Closes the app side promptly (FIN).

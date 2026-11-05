@@ -8,6 +8,8 @@
 //! engine's adapter is refused as "would loop".
 
 use std::net::IpAddr;
+#[cfg(windows)]
+use std::net::SocketAddr;
 
 use super::is_sieve_interface;
 use super::table::NetTables;
@@ -79,6 +81,32 @@ fn is_unique_local(ip: IpAddr) -> bool {
 /// tested this order live (run 1 found the loop was multicast, not this).
 pub fn unicast_if_value(index: u32, ipv4: bool) -> [u8; 4] {
     if ipv4 { index.to_be_bytes() } else { index.to_ne_bytes() }
+}
+
+/// A nonblocking socket for `target`, bound to `egress`'s source address and
+/// pinned to its interface.
+#[cfg(windows)]
+pub fn egress_socket(egress: Egress, target: SocketAddr, udp: bool) -> Result<socket2::Socket, String> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if target.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let (ty, proto) = if udp { (Type::DGRAM, Protocol::UDP) } else { (Type::STREAM, Protocol::TCP) };
+    let sock = Socket::new(domain, ty, Some(proto)).map_err(|e| format!("socket: {e}"))?;
+    sock.set_nonblocking(true).map_err(|e| format!("nonblocking: {e}"))?;
+    sock.bind(&SocketAddr::new(egress.source, 0).into()).map_err(|err| format!("bind {}: {err}", egress.source))?;
+    pin_to_interface(&sock, target, egress.if_index)?;
+    Ok(sock)
+}
+
+#[cfg(windows)]
+fn pin_to_interface(sock: &socket2::Socket, target: SocketAddr, index: u32) -> Result<(), String> {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET, setsockopt};
+    let s = SOCKET(sock.as_raw_socket() as usize);
+    let (level, name) = if target.is_ipv4() { (IPPROTO_IP.0, IP_UNICAST_IF) } else { (IPPROTO_IPV6.0, IPV6_UNICAST_IF) };
+    let value = unicast_if_value(index, target.is_ipv4());
+    // SAFETY: `s` is a live socket; the option value is a 4-byte DWORD.
+    let r = unsafe { setsockopt(s, level, name, Some(&value)) };
+    if r == 0 { Ok(()) } else { Err(format!("setsockopt UNICAST_IF: {}", std::io::Error::last_os_error())) }
 }
 
 #[cfg(test)]
