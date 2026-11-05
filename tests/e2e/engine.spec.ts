@@ -68,19 +68,41 @@ test.describe("engine", () => {
     expect(errors).toEqual([]);
   });
 
-  test("AdGuard running: the engine waits, the offer says it stops AdGuard's service, and Start AdGuard again undoes it", async ({ page }, info) => {
+  test("AdGuard filtering: the engine waits, the offer says it asks AdGuard's service to stop, and a pause routes with no Start button", async ({ page }, info) => {
     await switchedOn(page);
     const { block, errors } = await openEngine(page, "adguard");
     await expect(block.locator("[data-engine-state]")).toHaveText("Waiting for AdGuard");
     const offer = block.locator("[data-adguard-offer]");
     await expect(offer).toHaveAttribute("data-adguard-offer", "pause");
-    await expect(offer).toContainText("Pausing AdGuard stops its Windows service (Adguard Service). Windows asks you to approve it.");
+    await expect(offer).toContainText("Pausing AdGuard asks its Windows service (Adguard Service) to stop. Windows asks you to approve it.");
     await block.scrollIntoViewIfNeeded();
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
     await block.screenshot({ path: `test-results/screens/engine-adguard-${info.project.name}.png` });
     await block.getByRole("button", { name: "Pause AdGuard" }).click();
     await expect(block.locator("[data-engine-state]")).toHaveText("Routing traffic");
-    await expect(offer).toHaveAttribute("data-adguard-offer", "start");
+    await expect(offer).toHaveAttribute("data-adguard-offer", "paused");
+    await expect(block.getByRole("button", { name: "Start AdGuard again" })).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+
+  test("AdGuard paused: routing, the block says how to turn it back on, and offers no button", async ({ page }, info) => {
+    await switchedOn(page);
+    const { block, errors } = await openEngine(page, "adguard_paused");
+    await expect(block.locator("[data-engine-state]")).toHaveText("Routing traffic");
+    const offer = block.locator("[data-adguard-offer]");
+    await expect(offer).toHaveAttribute("data-adguard-offer", "paused");
+    await expect(offer).toContainText("To turn it back on, use AdGuard's own window or restart the computer.");
+    await expect(offer.getByRole("button")).toHaveCount(0);
+    await block.scrollIntoViewIfNeeded();
+    expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
+    await block.screenshot({ path: `test-results/screens/engine-adguard-paused-${info.project.name}.png` });
+    expect(errors).toEqual([]);
+  });
+
+  test("AdGuard's service really stopped: Start AdGuard again is offered and makes the engine wait", async ({ page }) => {
+    await switchedOn(page);
+    const { block, errors } = await openEngine(page, "filtering");
+    await expect(block.locator("[data-adguard-offer]")).toHaveAttribute("data-adguard-offer", "start");
     await block.getByRole("button", { name: "Start AdGuard again" }).click();
     await expect(block.locator("[data-engine-state]")).toHaveText("Waiting for AdGuard");
     expect(errors).toEqual([]);

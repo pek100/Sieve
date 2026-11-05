@@ -67,6 +67,27 @@
         }
       }
     },
+    "adguard_paused": {
+      "v": 2,
+      "service": "running",
+      "adguard": "stopping",
+      "pipe": {
+        "kind": "welcome",
+        "engine_version": "0.1.0",
+        "session_id": 1,
+        "status": {
+          "filtering": true,
+          "routes_up": true,
+          "flows": 7,
+          "decrypting": false,
+          "last_error": null,
+          "policy": { "revision": 2, "engine": true },
+          "blocker": null,
+          "split_tunnels": [],
+          "counters": { "flows": 120, "attributed": 118, "own_refused": 0, "dns_answers": 30, "packets_in": 9000, "packets_out": 8800, "not_unicast": 5 }
+        }
+      }
+    },
     "vpn": {
       "v": 2,
       "service": "running",

@@ -1,7 +1,7 @@
 import { act, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { ADGUARD_PAUSE_TEXT, ENGINE_SWITCH } from "@/core/engine";
-import { createMockEngine, MOCK_ENGINE_ERROR, type EngineScenario } from "@/data/engine-mock";
+import { ADGUARD_PAUSE_TEXT, ADGUARD_PAUSED_TEXT, ADGUARD_START_TEXT, ENGINE_SWITCH } from "@/core/engine";
+import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_ENGINE_ERROR, type EngineScenario } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
 import { createMockSource } from "@/data/mock-source";
 import { memoryBackend } from "@/data/settings-store";
@@ -13,7 +13,7 @@ vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
 vi.setConfig({ testTimeout: 20_000 });
 
 /** The user's engine switch as the fixture's welcome examples hold it (on for every example the engine routes or explains). */
-const SWITCHED_ON = new Set<EngineScenario>(["filtering", "adguard", "vpn", "crash_loop", "setup"]);
+const SWITCHED_ON = new Set<EngineScenario>(["filtering", "adguard", "adguard_paused", "vpn", "crash_loop", "setup"]);
 
 async function setup(engine: EngineSource, on = false) {
   const settings = memoryBackend(on ? { schema: 4, values: { [ENGINE_SWITCH]: true } } : undefined);
@@ -40,7 +40,7 @@ describe("Engine block", () => {
     ["unreachable", "not_running", "Not running", /does not answer: The system cannot find the file specified/],
     ["idle", "idle", "Installed, not routing", /changes nothing: no traffic goes through it/],
     ["filtering", "routing", "Routing traffic", /Nothing is blocked yet/],
-    ["adguard", "adguard", "Waiting for AdGuard", /AdGuard's service runs/],
+    ["adguard", "adguard", "Waiting for AdGuard", /AdGuard is filtering this computer/],
     ["vpn", "vpn", "Paused for a VPN", /Paused while AdGuard VPN is connected/],
     ["crash_loop", "crash_loop", "Stopped after repeated failures", /restarted 3 times within an hour/],
     ["setup", "setup_failed", "Could not start", /SHA-256 does not match/],
@@ -62,16 +62,33 @@ describe("Engine block", () => {
     expect(block().querySelector("[data-engine-attribution]")).toHaveTextContent("1,200 flows relayed since the engine started, 99% tied to an app.");
   });
 
-  it("AdGuard running: the pause offer says what it does, and pausing lets the engine route; then Start AdGuard again", async () => {
+  it("AdGuard filtering: the pause offer says what it does, and pausing lets the engine route with the service left stopping", async () => {
     await setup(createMockEngine("adguard"), true);
     await vi.waitFor(() => expect(phase()).toBe("adguard"));
-    const offer = block().querySelector("[data-adguard-offer]")!;
-    expect(offer.getAttribute("data-adguard-offer")).toBe("pause");
-    expect(offer).toHaveTextContent(ADGUARD_PAUSE_TEXT);
-    expect(offer).toHaveTextContent(/stops its Windows service \(Adguard Service\)\. Windows asks you to approve it/);
+    const offer = () => block().querySelector("[data-adguard-offer]")!;
+    expect(offer().getAttribute("data-adguard-offer")).toBe("pause");
+    expect(offer()).toHaveTextContent(ADGUARD_PAUSE_TEXT);
+    expect(offer()).toHaveTextContent(/asks its Windows service \(Adguard Service\) to stop\. Windows asks you to approve it/);
     await act(async () => screen.getByRole("button", { name: "Pause AdGuard" }).click());
     await vi.waitFor(() => expect(phase()).toBe("routing"));
+    expect(offer().getAttribute("data-adguard-offer")).toBe("paused");
+    expect(offer()).toHaveTextContent(ADGUARD_PAUSED_TEXT);
+    expect(screen.queryByRole("button", { name: "Start AdGuard again" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Pause AdGuard" })).toBeNull();
+  });
+
+  it("the mock's pause leaves AdGuard stopping, never stopped", async () => {
+    const engine = createMockEngine("adguard");
+    await engine.stopAdguard();
+    expect((await engine.probe()).adguard).toBe("stopping");
+    await expect(engine.startAdguard()).rejects.toThrow(MOCK_ADGUARD_ERROR);
+  });
+
+  it("AdGuard's service really stopped: Start is offered and makes the engine wait", async () => {
+    await setup(createMockEngine("filtering"), true);
+    await vi.waitFor(() => expect(phase()).toBe("routing"));
     expect(block().querySelector("[data-adguard-offer]")!.getAttribute("data-adguard-offer")).toBe("start");
+    expect(block().querySelector("[data-adguard-offer]")).toHaveTextContent(ADGUARD_START_TEXT);
     await act(async () => screen.getByRole("button", { name: "Start AdGuard again" }).click());
     await vi.waitFor(() => expect(phase()).toBe("adguard"));
   });

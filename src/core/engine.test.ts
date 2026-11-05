@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 import fixture from "@/data/fixtures/engine-probe-v2.json";
 import { parseEngineProbe } from "@/data/protocol";
 import {
+  ADGUARD_PAUSE_TEXT,
   EMPTY_ENGINE,
   ENGINE_LOCK_TEXT,
   ENGINE_PHASES,
   ENGINE_STATE_TEXT,
   ENGINE_UNREACHED,
+  adguardOffer,
   attribution,
   engineDetail,
   engineInForce,
@@ -39,6 +41,7 @@ describe("engine phase", () => {
       idle: "idle",
       filtering: "routing",
       adguard: "adguard",
+      adguard_paused: "routing",
       vpn: "vpn",
       crash_loop: "crash_loop",
       setup: "setup_failed",
@@ -56,13 +59,16 @@ describe("engine phase", () => {
   it("never claims filtering or blocking: slice 3 relays every flow", () => {
     for (const s of [EMPTY_ENGINE, { probe: null, error: "e" }, ...ALL.map(facts)]) {
       expect(ENGINE_STATE_TEXT[enginePhase(s)]).not.toMatch(/filtering|blocked|blocking/i);
-      expect(engineDetail(s)).not.toMatch(/is filtering|blocks |are blocked|blocked for/i);
+      // AdGuard's filtering is a fact the refusal states; Sieve's own never is claimed.
+      expect(engineDetail(s).replace("AdGuard is filtering", "")).not.toMatch(/is filtering|blocks |are blocked|blocked for/i);
     }
     expect(engineDetail(facts("filtering"))).toContain("Nothing is blocked yet");
   });
 
-  it("names the blocker: AdGuard's service, the VPN adapter, the restarts, the setup error", () => {
-    expect(engineDetail(facts("adguard"))).toMatch(/AdGuard's service runs/);
+  it("names the blocker: AdGuard filtering, the VPN adapter, the restarts, the setup error", () => {
+    expect(engineDetail(facts("adguard"))).toBe(
+      "AdGuard is filtering this computer, and two filters would capture each other's connections. Sieve routes nothing while AdGuard filters; your network works as usual.",
+    );
     expect(engineDetail(facts("vpn"))).toBe(
       "Paused while AdGuard VPN is connected. Sieve steps aside for a VPN that carries all traffic and resumes when it disconnects.",
     );
@@ -79,7 +85,7 @@ describe("engine phase", () => {
   });
 
   it("the app reads engine flows only while the engine routes", () => {
-    expect(ALL.filter((n) => engineRoutes(facts(n)))).toEqual(["filtering"]);
+    expect(ALL.filter((n) => engineRoutes(facts(n)))).toEqual(["filtering", "adguard_paused"]);
     expect(engineRoutes({ ...facts("filtering"), error: "x" })).toBe(false);
   });
 
@@ -97,6 +103,74 @@ describe("engine phase", () => {
     expect(engineVersion(facts("idle"))).toBe("0.1.0");
     expect(engineVersion(facts("refused"))).toBeNull();
     expect(engineVersion(EMPTY_ENGINE)).toBeNull();
+  });
+});
+
+describe("the AdGuard offer", () => {
+  type Service = NonNullable<EngineSlice["probe"]>["adguard"];
+  /** An example's engine facts, with AdGuard's service in another state. */
+  const withService = (name: Example, adguard: Service): EngineSlice => {
+    const s = facts(name);
+    return { ...s, probe: { ...s.probe!, adguard } };
+  };
+  const SERVICES: readonly Service[] = ["missing", "stopped", "starting", "stopping", "running", "other"];
+
+  it("follows the table: service state beside the engine's verdict", () => {
+    const table: [Example, Service, ReturnType<typeof adguardOffer>][] = [
+      ["adguard", "running", "pause"],
+      ["filtering", "running", null], // protection off in AdGuard's own window: nothing to pause
+      ["idle", "running", null],
+      ["filtering", "stopped", "start"],
+      ["adguard", "stopped", "start"],
+      ["idle", "stopped", "start"],
+      ["adguard_paused", "stopping", "paused"],
+      ["vpn", "stopping", "paused"], // AdGuard wins over a VPN, so a VPN blocker means it is not intercepting
+      ["idle", "stopping", null], // the switch is off: the engine gave no verdict
+      ["adguard", "stopping", null], // still intercepting: the detail line says Sieve re-checks
+      ["crash_loop", "stopping", null], // no check ran
+      ["setup", "stopping", null], // the check may be what failed
+      ["refused", "stopping", null],
+    ];
+    for (const [name, service, want] of table) expect(adguardOffer(withService(name, service)), `${name} ${service}`).toBe(want);
+    for (const service of ["missing", "starting", "other"] as const) {
+      for (const name of ALL) expect(adguardOffer(withService(name, service)), `${name} ${service}`).toBeNull();
+    }
+  });
+
+  it("a switch going off takes the paused claim with it, even while routes are still up", () => {
+    const s = facts("adguard_paused");
+    const pipe = s.probe!.pipe!;
+    if (pipe.kind !== "welcome") throw new Error("adguard_paused is a welcome");
+    const off = { ...pipe, status: { ...pipe.status, policy: { ...pipe.status.policy, engine: false } } };
+    expect(adguardOffer({ ...s, probe: { ...s.probe!, pipe: off } })).toBeNull();
+  });
+
+  it("says it re-checks only while a stopping service still intercepts", () => {
+    expect(engineDetail(withService("adguard", "stopping"))).toBe(
+      "AdGuard is filtering this computer, and two filters would capture each other's connections. Sieve routes nothing while AdGuard filters; your network works as usual. Sieve checks again every few seconds. If this stays, turn protection off in AdGuard's own window.",
+    );
+    expect(engineDetail(withService("adguard", "running"))).not.toMatch(/checks again/);
+  });
+
+  it("the pause text promises no resume it cannot do", () => {
+    expect(ADGUARD_PAUSE_TEXT).not.toMatch(/start it again here/);
+    expect(ADGUARD_PAUSE_TEXT).toMatch(/AdGuard's own window or restart the computer/);
+  });
+
+  it("degraded facts offer nothing and never throw", () => {
+    const unreadable: EngineSlice = { probe: null, error: "denied" };
+    expect(adguardOffer(EMPTY_ENGINE)).toBeNull();
+    expect(adguardOffer(unreadable)).toBeNull();
+    for (const service of SERVICES.filter((v) => v !== "stopped")) {
+      expect(adguardOffer({ ...withService("adguard_paused", service), error: "read failed" }), service).toBeNull();
+    }
+    // Old or partial probes reach the render path only past the boundary; the guard holds anyway.
+    const partial = { ...facts("adguard_paused"), probe: { v: 2, service: "running", pipe: null } } as unknown as EngineSlice;
+    expect(adguardOffer(partial)).toBeNull();
+    expect(() => engineDetail(partial)).not.toThrow();
+    const noPipe: EngineSlice = { probe: { v: 2, service: "running", adguard: "stopping", pipe: null }, error: null };
+    expect(adguardOffer(noPipe)).toBeNull();
+    expect(adguardOffer(withService("adguard_paused", "other"))).toBeNull();
   });
 });
 

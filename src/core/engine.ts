@@ -149,7 +149,11 @@ export const ENGINE_STATE_TEXT: Record<EnginePhase, string> = {
 
 /** The exact words of the pause offer (the user's decision: the UI says exactly what happens). */
 export const ADGUARD_PAUSE_TEXT =
-  "Pausing AdGuard stops its Windows service (Adguard Service). Windows asks you to approve it. AdGuard stops protecting this computer until you start it again here.";
+  "Pausing AdGuard asks its Windows service (Adguard Service) to stop. Windows asks you to approve it. AdGuard stops protecting this computer until you turn its protection on in AdGuard's own window or restart the computer.";
+
+/** The text after a pause: the service stays StopPending, so there is no Start button, and this says what resumes it. */
+export const ADGUARD_PAUSED_TEXT =
+  "AdGuard is paused: its service is stopping and it no longer filters this computer. To turn it back on, use AdGuard's own window or restart the computer. Sieve steps aside when AdGuard filters again.";
 
 /** Phases whose detail is a problem the user should read. */
 export const ENGINE_PROBLEMS: ReadonlySet<EnginePhase> = new Set<EnginePhase>([
@@ -190,7 +194,10 @@ export function engineDetail(e: EngineSlice): string {
     case "routing":
       return "This computer's traffic goes through the engine, which shows each app's connections. Nothing is blocked yet.";
     case "adguard":
-      return "AdGuard is protecting this computer, and two filters would capture each other's connections. Sieve routes nothing while AdGuard's service runs; your network works as usual.";
+      return (
+        "AdGuard is filtering this computer, and two filters would capture each other's connections. Sieve routes nothing while AdGuard filters; your network works as usual." +
+        (p?.adguard === "stopping" ? " Sieve checks again every few seconds. If this stays, turn protection off in AdGuard's own window." : "")
+      );
     case "vpn":
       return `Paused while ${blocker?.kind === "vpn" ? blocker.adapter : "a VPN"} is connected. Sieve steps aside for a VPN that carries all traffic and resumes when it disconnects.`;
     case "crash_loop":
@@ -204,14 +211,25 @@ export function engineDetail(e: EngineSlice): string {
 export const ADGUARD_START_TEXT = "AdGuard's service is stopped. Starting it again also stops Sieve's routing, because the two cannot run together.";
 
 /**
+ * The phases in which the engine ran its AdGuard check and found no
+ * interception (AdGuard wins over a VPN). Every other phase gives no verdict:
+ * the switch is off, the engine did not answer, or the check itself failed.
+ */
+const ADGUARD_CLEARED: ReadonlySet<EnginePhase> = new Set<EnginePhase>(["routing", "starting", "vpn"]);
+
+/**
  * What the AdGuard action offers, from facts: pause while the engine waits
  * for AdGuard's running service; start again while that service is stopped
- * (whoever stopped it). Never shown when AdGuard is not installed.
+ * (whoever stopped it); "paused" (words only, `sc start` cannot resume it) for
+ * a service stuck stopping once the engine found it no longer intercepts.
+ * Never shown when AdGuard is not installed.
  */
-export function adguardOffer(e: EngineSlice): "pause" | "start" | null {
+export function adguardOffer(e: EngineSlice): "pause" | "start" | "paused" | null {
   const adguard = e.probe?.adguard;
-  if (enginePhase(e) === "adguard" && adguard === "running") return "pause";
-  return adguard === "stopped" ? "start" : null;
+  const phase = enginePhase(e);
+  if (adguard === "running") return phase === "adguard" ? "pause" : null;
+  if (adguard === "stopped") return "start";
+  return adguard === "stopping" && engineInForce(e) === true && ADGUARD_CLEARED.has(phase) ? "paused" : null;
 }
 
 /** Split-tunnel VPNs the engine reported: their traffic bypasses Sieve, and the UI says so. */

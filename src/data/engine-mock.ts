@@ -7,9 +7,10 @@
  *
  * The actions move between the fixture's examples the way the engine would:
  * turning routing on from `idle` routes; off from any welcome state is idle;
- * pausing AdGuard lets a waiting engine route (the `filtering` example has
- * AdGuard's service stopped); starting it again makes the engine wait.
- * Nothing else is invented.
+ * pausing AdGuard lets a waiting engine route with AdGuard's service left
+ * stopping (`adguard_paused`, as the real AdGuard does); starting a service
+ * that is really stopped (the `filtering` example) makes the engine wait, and
+ * a stopping one cannot be started. Nothing else is invented.
  */
 import fixture from "./fixtures/engine-probe-v2.json";
 import type { EngineSource } from "./engine-source";
@@ -22,6 +23,7 @@ export const ENGINE_SCENARIOS = [
   "idle",
   "filtering",
   "adguard",
+  "adguard_paused",
   "vpn",
   "crash_loop",
   "setup",
@@ -36,7 +38,7 @@ export const MOCK_ENGINE_ERROR = "service manager: Access is denied. (os error 5
 /** What the mock's AdGuard actions answer when they cannot apply (no AdGuard to stop or start). */
 export const MOCK_ADGUARD_ERROR = "Adguard Service: the service is not in a state that allows this";
 
-const WELCOME: readonly EngineScenario[] = ["idle", "filtering", "adguard", "vpn", "crash_loop", "setup"];
+const WELCOME: readonly EngineScenario[] = ["idle", "filtering", "adguard", "adguard_paused", "vpn", "crash_loop", "setup"];
 
 function statusOf(scenario: EngineScenario): EngineStatus {
   const example = fixture.examples[scenario as keyof typeof fixture.examples];
@@ -62,7 +64,7 @@ export function createMockEngine(start: EngineScenario = "missing"): EngineSourc
     },
     stopAdguard: async () => {
       if (scenario !== "adguard") throw new Error(MOCK_ADGUARD_ERROR);
-      scenario = "filtering";
+      scenario = "adguard_paused";
     },
     startAdguard: async () => {
       if (scenario !== "filtering") throw new Error(MOCK_ADGUARD_ERROR);
