@@ -1,13 +1,14 @@
 // Sieve's own runner around Brave's procedural filter applier, which only selects
 // elements. Runs each filter at DOMContentLoaded, then again whenever elements
 // come or go, at most once per throttle period.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- the payload calls it
 function sieveRunProcedural(applier, filters) {
   const THROTTLE_MS = 100;
   const compiled = [];
   for (const filter of filters) {
     try {
       compiled.push({ selector: applier.compileProceduralSelector(filter.selector), action: filter.action, styled: new WeakSet() });
-    } catch (_) {
+    } catch {
       // One filter the applier cannot compile must not cost the others.
     }
   }
@@ -35,7 +36,7 @@ function sieveRunProcedural(applier, filters) {
     for (const filter of compiled) {
       try {
         for (const element of applier.applyCompiledSelector(filter.selector)) act(element, filter);
-      } catch (_) {
+      } catch {
         // A filter can throw on one page's DOM; the rest still run.
       }
     }

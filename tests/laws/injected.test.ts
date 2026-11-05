@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { APPLIER_OUTPUT, APPLIER_SOURCE, transpileApplier } from "../../scripts/injected-build.mjs";
-import { ROOT, read } from "./files";
+import { ROOT, hits, read, walk } from "./files";
 
 const PINNED_SHA256 = "85a6545f0138127eb86bd5a9ac1d5c852c3c74f34b75d9414c153b199de97c6b";
 const MPL_HEADER = "This Source Code Form is subject to the terms of the Mozilla Public";
@@ -205,10 +205,30 @@ describe("the bootstrap under jsdom", () => {
   });
 });
 
-describe("no site names in the fixtures", () => {
-  it("names only .invalid hosts in the rule fixtures", () => {
-    const source = read("engine/crates/sieve-engine/tests/inject_page.rs");
-    const hosts = source.match(/[a-z0-9-]+(\.[a-z0-9-]+)+(?=##|\/article)/g) ?? [];
+describe("no site names", () => {
+  const SITE_NAME = /\b[a-z0-9-]+\.(com|net|org|io|tv|co|dev|app)\b/;
+  const SOURCES = [
+    ...walk("engine/crates/sieve-engine/src/inject", [".rs"]),
+    "engine/crates/sieve-engine/tests/inject_page.rs",
+    "engine/crates/sieve-engine/examples/inject_bench.rs",
+    "engine/crates/sieve-filter/src/cosmetic.rs",
+    "engine/crates/sieve-filter/src/resources.rs",
+    "engine/injected/bootstrap.js",
+    ...walk("tests/fixtures/ubo-tree", [".js"]),
+    "scripts/resources/assemble-ubo.mjs",
+  ];
+
+  it("appear in the new source and fixtures", () => {
+    expect(SOURCES.flatMap((file) => hits(file, SITE_NAME))).toEqual([]);
+  });
+
+  it("would be caught", () => {
+    expect(SITE_NAME.test("ads.example.com##.x")).toBe(true);
+    expect(SITE_NAME.test("page.sieve-test.invalid##.x")).toBe(false);
+  });
+
+  it("the fixture rules name only .invalid hosts", () => {
+    const hosts = read("engine/crates/sieve-engine/tests/inject_page.rs").match(/[a-z0-9-]+(\.[a-z0-9-]+)+(?=##|\/article)/g) ?? [];
     expect(hosts.length).toBeGreaterThan(0);
     for (const host of hosts) expect(host.endsWith(".invalid")).toBe(true);
   });

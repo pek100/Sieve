@@ -444,6 +444,15 @@ mod tests {
         assert_eq!(decode(ContentEncoding::Gzip, &body).unwrap(), b"one two");
     }
 
+    /// Characterises a known gap: Chromium ignores bytes after a gzip member, and
+    /// MultiGzDecoder reads them as a bad next member, so this body gets a reset.
+    #[test]
+    fn junk_after_a_gzip_member_errors_today() {
+        let mut body = gzip(b"hello");
+        body.extend_from_slice(b"junk");
+        assert!(decode(ContentEncoding::Gzip, &body).is_err());
+    }
+
     #[test]
     fn a_zstd_frame_over_the_window_limit_errors() {
         let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
