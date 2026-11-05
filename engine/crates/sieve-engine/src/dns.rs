@@ -648,7 +648,7 @@ mod tests {
     }
 
     /// A query with an EDNS record announcing `payload`.
-    pub(crate) fn query_with_edns(id: u16, name: &str, payload: u16) -> Vec<u8> {
+    fn query_with_edns(id: u16, name: &str, payload: u16) -> Vec<u8> {
         let mut q = query(id, name);
         q[10..12].copy_from_slice(&1u16.to_be_bytes());
         q.push(0);

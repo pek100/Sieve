@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_idle_flow_ends_and_one_with_a_query_in_flight_waits_for_it() {
+    async fn an_idle_flow_ends_after_its_idle_time() {
         let ca = Ca::new();
         let b = bed(&ca, &["tls://127.0.0.1:1".to_string()], None, Arc::new(Loopback::default()));
         let (client, mut flow) = DatagramPipe::pair();
