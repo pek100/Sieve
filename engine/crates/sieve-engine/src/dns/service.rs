@@ -101,8 +101,11 @@ impl Service {
     }
 
     /// Sessions are pinned to the old egress: a network change drops them all.
+    /// The list is read and replaced under one lock, so a list set meanwhile is
+    /// never written over with the one it replaced.
     pub fn reset(&self) {
-        self.set_list(self.active().endpoints.clone());
+        let mut active = self.active.write().unwrap_or_else(|p| p.into_inner());
+        *active = Arc::new(Active::new(active.endpoints.clone(), &self.context));
     }
 
     pub fn report(&self) -> Vec<UpstreamReport> {
@@ -656,6 +659,41 @@ mod tests {
         assert!(!b.service.report()[0].connected);
         b.ask(&client_query(2, "a.example"), Transport::Stream).await;
         assert_eq!(doh.accepted(), 2);
+    }
+
+    /// Lists set while another thread resets without pause. Each is checked once
+    /// every reset that began before it has ended.
+    const RESET_ROUNDS: usize = 5_000;
+    /// Completed resets that guarantee one began after a given moment and ended.
+    const RESETS_TO_SETTLE: usize = 2;
+
+    #[test]
+    fn a_list_set_around_a_reset_survives_it() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let ca = Ca::new();
+        let b = bed(&ca, &["tls://first.example".to_string()], None, Arc::new(Loopback::default()));
+        let (stop, resets) = (AtomicBool::new(false), AtomicUsize::new(0));
+        let lost = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::SeqCst) {
+                    b.service.reset();
+                    resets.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let lost = (0..RESET_ROUNDS).find_map(|round| {
+                let address = format!("tls://list{round}.example");
+                b.service.set_list(vec![address.parse().unwrap()]);
+                let settled = resets.load(Ordering::SeqCst) + RESETS_TO_SETTLE;
+                while resets.load(Ordering::SeqCst) < settled {
+                    std::thread::yield_now();
+                }
+                let held = b.service.report()[0].address.clone();
+                (held != address).then(|| format!("round {round}: set {address}, holds {held}"))
+            });
+            stop.store(true, Ordering::SeqCst);
+            lost
+        });
+        assert_eq!(lost, None);
     }
 
     #[test]

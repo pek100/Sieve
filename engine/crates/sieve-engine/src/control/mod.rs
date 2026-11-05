@@ -42,7 +42,11 @@ pub struct Facts {
     pub routes_up: bool,
     pub blocker: Option<Blocker>,
     pub split_tunnels: Vec<String>,
+    /// Reasons reported once each, kept for the whole run ([`Engine::add_error`]).
     pub last_error: Option<String>,
+    /// The newest route failure ([`Engine::route_failed`]). Status reports it
+    /// after `last_error`.
+    pub route_error: Option<String>,
     /// When the routes came up (monotonic ms), for the Stall test build.
     pub up_since: Option<u64>,
 }
@@ -77,6 +81,14 @@ pub struct Engine {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// One error text from whichever of the two reasons exist.
+fn beside(held: Option<String>, reason: Option<String>) -> Option<String> {
+    match (held, reason) {
+        (Some(held), Some(reason)) => Some(format!("{held}; {reason}")),
+        (held, reason) => held.or(reason),
+    }
 }
 
 impl Engine {
@@ -130,12 +142,13 @@ impl Engine {
 
     /// Reports `reason` beside the reasons already held, so one never hides another.
     pub fn add_error(&self, reason: String) {
-        self.set_facts(|f| {
-            f.last_error = Some(match f.last_error.take() {
-                Some(held) => format!("{held}; {reason}"),
-                None => reason,
-            });
-        });
+        self.set_facts(|f| f.last_error = beside(f.last_error.take(), Some(reason)));
+    }
+
+    /// Reports a route that could not be added. The routing loop retries it on
+    /// every wake, so the newest failure replaces the one before it.
+    pub fn route_failed(&self, reason: String) {
+        self.set_facts(|f| f.route_error = Some(reason));
     }
 
     /// The encrypted DNS resolvers the engine holds.
@@ -243,7 +256,7 @@ impl Backend for Engine {
             routes_up: f.routes_up,
             flows: u32::try_from(lock(&self.book).live()).unwrap_or(u32::MAX),
             decrypting: false,
-            last_error: f.last_error,
+            last_error: beside(f.last_error, f.route_error),
             policy,
             blocker,
             split_tunnels: f.split_tunnels,
@@ -445,6 +458,28 @@ mod tests {
         let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
         assert_eq!(e.dns_upstreams(), config::defaults());
         assert!(e.status().last_error.unwrap().contains("read as the defaults"));
+    }
+
+    #[test]
+    fn a_repeating_route_failure_replaces_itself_and_hides_no_other_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(config::DNS_FILE), b"{\"revision\":1,\"upstreams\":[\"udp://1.1.1.1\"]}").unwrap();
+        let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        e.add_error("policy.json: broken".into());
+        e.route_failed("route 10.0.0.0/8: code 5".into());
+        e.route_failed("route 10.0.0.0/8: code 87".into());
+        let reported = e.status().last_error.unwrap();
+        for held in ["read as the defaults", "policy.json: broken", "route 10.0.0.0/8: code 87"] {
+            assert!(reported.contains(held), "{held} in {reported}");
+        }
+        assert!(!reported.contains("code 5"), "{reported}");
+    }
+
+    #[test]
+    fn a_route_failure_alone_is_the_whole_reason() {
+        let e = engine(Policy::default(), None);
+        e.route_failed("route 10.0.0.0/8: code 5".into());
+        assert_eq!(e.status().last_error.as_deref(), Some("route 10.0.0.0/8: code 5"));
     }
 
     fn service_from(endpoints: Vec<Upstream>) -> Arc<Service> {

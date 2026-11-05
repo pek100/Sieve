@@ -164,7 +164,7 @@ fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
         for p in routes.iter().filter(|p| !up.routes.contains(p)) {
             match apply::add_route(&j, up.luid, *p) {
                 Ok(()) => kept.push(*p),
-                Err(e) => engine.set_facts(|f| f.last_error = Some(e)),
+                Err(e) => engine.route_failed(e),
             }
         }
     }
