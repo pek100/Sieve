@@ -8,11 +8,14 @@
 //! decoders report success on a truncated stream, and only `Status::StreamEnd`
 //! tells the two apart.
 //!
-//! gzip uses flate2's single-member decoder, because its multi-member one reads
-//! any byte after a member as the start of the next. Here a next member starts
-//! only at the 2-byte magic and all else is ignored, as with zlib and deflate. A
-//! lone `1f` at the end is therefore ignored too. Once the magic has matched the
-//! bytes are a member: cut or broken, it errors, since data may have been lost.
+//! A body ends where its stream ends, and bytes after that are ignored, because
+//! the browser would render that page: resetting it would break a page that
+//! works with Sieve off. For gzip the stream is the first member, so a later
+//! member is ignored too, whole, cut or broken. Chromium 1228 was run on all
+//! three and shows only the first member. Firefox was not run (plan, UNVERIFIED).
+//!
+//! zstd is the exception: Chromium did not load a zstd body with trailing bytes
+//! either, so erroring there breaks nothing that works with Sieve off.
 //!
 //! Known residual risk: `zstd` is a C decoder fed hostile input in a SYSTEM
 //! service. `ruzstd` is pure Rust but pull-only, which does not fit this path.
@@ -36,8 +39,6 @@ const ZLIB_METHOD_DEFLATE: u8 = 8;
 const ZLIB_MAX_WINDOW_INFO: u8 = 7;
 const ZLIB_HEADER_MODULUS: u16 = 31;
 const ZLIB_HEADER_BYTES: usize = 2;
-/// RFC 1952: the first two bytes of every gzip member.
-const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
 /// The body encodings Sieve reads. [`ContentEncoding::from_header`] is the one
 /// place a header value becomes one of these.
@@ -168,73 +169,24 @@ impl Inflate {
     }
 }
 
-#[derive(Clone, Copy)]
-enum GzipPhase {
-    InMember,
-    /// A member ended and its trailer checked; this many magic bytes matched.
-    AfterMember(usize),
-    IgnoringRest,
-}
-
-/// A gzip body: members one after another, then anything (module doc).
-struct Gzip {
-    member: GzDecoder<CappedSink>,
-    phase: GzipPhase,
-}
-
-impl Gzip {
-    fn new(sink: CappedSink) -> Self {
-        Self { member: GzDecoder::new(sink), phase: GzipPhase::InMember }
-    }
-
-    fn write(&mut self, mut input: &[u8]) -> io::Result<()> {
-        while let Some(&next) = input.first() {
-            match self.phase {
-                GzipPhase::InMember => {
-                    // Ok(0) on non-empty input: the member and its trailer are complete.
-                    let consumed = self.member.write(input)?;
-                    if consumed == 0 {
-                        self.member.try_finish()?;
-                        self.phase = GzipPhase::AfterMember(0);
-                    }
-                    input = &input[consumed..];
-                }
-                GzipPhase::AfterMember(matched) if next != GZIP_MAGIC[matched] => self.phase = GzipPhase::IgnoringRest,
-                GzipPhase::AfterMember(matched) => {
-                    input = &input[1..];
-                    self.phase = GzipPhase::AfterMember(matched + 1);
-                    if matched + 1 == GZIP_MAGIC.len() {
-                        self.start_member()?;
-                    }
-                }
-                GzipPhase::IgnoringRest => return Ok(()),
-            }
+/// Feeds a gzip or brotli decoder. Both answer Ok(0) on non-empty input, now and
+/// on every later write, once their stream is complete; `write_all` would call
+/// that an error. The rest is ignored (module doc), and their own finish step
+/// still catches a stream that never reached its end.
+fn write_to_stream_end(decoder: &mut impl Write, mut input: &[u8]) -> io::Result<()> {
+    while !input.is_empty() {
+        let consumed = decoder.write(input)?;
+        if consumed == 0 {
+            break;
         }
-        match self.phase {
-            GzipPhase::InMember => self.member.flush(),
-            _ => Ok(()),
-        }
+        input = &input[consumed..];
     }
-
-    /// The finished decoder holds the sink and has nothing left to write to it,
-    /// so the default left behind on drop stays empty.
-    fn start_member(&mut self) -> io::Result<()> {
-        self.member = GzDecoder::new(std::mem::take(self.member.get_mut()));
-        self.phase = GzipPhase::InMember;
-        self.member.write_all(&GZIP_MAGIC)
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        match self.phase {
-            GzipPhase::InMember => self.member.try_finish(),
-            _ => Ok(()),
-        }
-    }
+    decoder.flush()
 }
 
 enum Decoder {
     Identity,
-    Gzip(Box<Gzip>),
+    Gzip(Box<GzDecoder<CappedSink>>),
     Deflate(Box<(Inflate, CappedSink)>),
     Brotli(Box<brotli_decompressor::DecompressorWriter<CappedSink>>),
     Zstd(Box<ZstdDecoder<'static, CappedSink>>),
@@ -253,7 +205,7 @@ impl BodyDecoder {
         let sink = CappedSink::new(limits);
         let decoder = match encoding {
             ContentEncoding::Identity => Decoder::Identity,
-            ContentEncoding::Gzip => Decoder::Gzip(Box::new(Gzip::new(sink))),
+            ContentEncoding::Gzip => Decoder::Gzip(Box::new(GzDecoder::new(sink))),
             ContentEncoding::Deflate => Decoder::Deflate(Box::new((Inflate::new(), sink))),
             ContentEncoding::Brotli => Decoder::Brotli(Box::new(brotli_decompressor::DecompressorWriter::new(sink, BROTLI_BUFFER_BYTES))),
             ContentEncoding::Zstd => {
@@ -268,7 +220,7 @@ impl BodyDecoder {
     fn sink_mut(&mut self) -> Option<&mut CappedSink> {
         match &mut self.decoder {
             Decoder::Identity => None,
-            Decoder::Gzip(d) => Some(d.member.get_mut()),
+            Decoder::Gzip(d) => Some(d.get_mut()),
             Decoder::Deflate(d) => Some(&mut d.1),
             Decoder::Brotli(d) => Some(d.get_mut()),
             Decoder::Zstd(d) => Some(d.get_mut()),
@@ -296,12 +248,12 @@ impl BodyDecoder {
         }
         let written = match &mut self.decoder {
             Decoder::Identity => return Ok(chunk.to_vec()),
-            Decoder::Gzip(d) => d.write(chunk),
+            Decoder::Gzip(d) => write_to_stream_end(&mut **d, chunk),
             Decoder::Deflate(d) => {
                 let (inflate, sink) = &mut **d;
                 inflate.write(chunk, sink)
             }
-            Decoder::Brotli(d) => d.write_all(chunk).and_then(|()| d.flush()),
+            Decoder::Brotli(d) => write_to_stream_end(&mut **d, chunk),
             Decoder::Zstd(d) => d.write_all(chunk).and_then(|()| d.flush()),
         };
         written.map_err(|e| self.failure(&e))?;
@@ -316,7 +268,7 @@ impl BodyDecoder {
         }
         let finished = match &mut self.decoder {
             Decoder::Identity => return Ok(Vec::new()),
-            Decoder::Gzip(d) => d.finish(),
+            Decoder::Gzip(d) => d.try_finish(),
             Decoder::Deflate(d) => {
                 let (inflate, sink) = &mut **d;
                 match inflate.finish(sink) {
@@ -341,6 +293,9 @@ mod tests {
     use proptest::prelude::*;
 
     const ENCODINGS: [ContentEncoding; 4] = [ContentEncoding::Gzip, ContentEncoding::Deflate, ContentEncoding::Brotli, ContentEncoding::Zstd];
+    /// Not zstd: Chromium does not load a zstd body with trailing bytes either,
+    /// so that error is not a Sieve-only breakage (module doc).
+    const ENDS_AT_STREAM_END: [ContentEncoding; 3] = [ContentEncoding::Gzip, ContentEncoding::Deflate, ContentEncoding::Brotli];
     const MIB: u64 = 1024 * 1024;
 
     fn gzip(data: &[u8]) -> Vec<u8> {
@@ -510,43 +465,54 @@ mod tests {
         assert_eq!(decode(ContentEncoding::Deflate, &raw_deflate(&plain)).unwrap(), plain);
     }
 
-    #[test]
-    fn two_gzip_members_decode_as_one_body() {
-        let mut body = gzip(b"one ");
-        body.extend(gzip(b"two"));
-        assert_eq!(decode(ContentEncoding::Gzip, &body).unwrap(), b"one two");
+    fn with_tail(encoding: ContentEncoding, tail: &[u8]) -> Vec<u8> {
+        [encode(encoding, b"hello").as_slice(), tail].concat()
     }
 
-    fn gzip_with_tail(tail: &[u8]) -> Vec<u8> {
-        let mut body = gzip(b"hello");
-        body.extend_from_slice(tail);
-        body
+    fn assert_decodes_to_hello(encoding: ContentEncoding, tail: &[u8]) {
+        let body = with_tail(encoding, tail);
+        assert_eq!(decode(encoding, &body).unwrap(), b"hello", "{encoding:?} {tail:?}");
+        assert_eq!(decode_chunks(encoding, body.chunks(1), InjectLimits::default()).unwrap(), b"hello", "{encoding:?} {tail:?} in one byte chunks");
     }
 
     #[test]
-    fn bytes_after_a_gzip_member_that_are_not_a_member_are_ignored() {
-        let tails: [&[u8]; 6] = [b"junk\n", &[0; 16], b"\n", &[0x1f], &[0x1f, 0x00, 0x1f, 0x8b], b"x\x1f\x8b"];
-        for tail in tails {
-            let body = gzip_with_tail(tail);
-            assert_eq!(decode(ContentEncoding::Gzip, &body).unwrap(), b"hello", "{tail:?}");
-            assert_eq!(decode_chunks(ContentEncoding::Gzip, body.chunks(1), InjectLimits::default()).unwrap(), b"hello", "{tail:?} in one byte chunks");
+    fn bytes_after_the_end_of_a_stream_are_ignored() {
+        let tails: [&[u8]; 3] = [b"\n", b"junk", &[0; 16]];
+        for encoding in ENDS_AT_STREAM_END {
+            for tail in tails {
+                assert_decodes_to_hello(encoding, tail);
+            }
         }
     }
 
     #[test]
     fn junk_in_the_chunk_of_the_last_data_keeps_that_output() {
-        let mut decoder = BodyDecoder::new(ContentEncoding::Gzip, InjectLimits::default()).unwrap();
-        assert_eq!(decoder.push(&gzip_with_tail(b"junk")).unwrap(), b"hello");
-        assert_eq!(decoder.push(b"more junk").unwrap(), b"");
-        assert_eq!(decoder.finish().unwrap(), b"");
+        for encoding in ENDS_AT_STREAM_END {
+            let mut decoder = BodyDecoder::new(encoding, InjectLimits::default()).unwrap();
+            assert_eq!(decoder.push(&with_tail(encoding, b"junk")).unwrap(), b"hello", "{encoding:?}");
+            assert_eq!(decoder.push(b"more junk").unwrap(), b"", "{encoding:?}");
+            assert_eq!(decoder.finish().unwrap(), b"", "{encoding:?}");
+        }
+    }
+
+    /// Whole, cut or broken, a later member is only more bytes after the end
+    /// (module doc).
+    #[test]
+    fn a_later_gzip_member_is_ignored() {
+        let second = gzip(b"two");
+        let tails: [&[u8]; 8] = [&second, &second[..2], &second[..5], &second[..second.len() - 1], &[0x1f], &[0x1f, 0x8b, 0xff, 0xff], &[0x1f, 0x00, 0x1f, 0x8b], b"x\x1f\x8b"];
+        for tail in tails {
+            assert_decodes_to_hello(ContentEncoding::Gzip, tail);
+        }
     }
 
     #[test]
-    fn junk_after_the_last_of_several_members_is_ignored() {
-        let mut body = gzip(b"one ");
-        body.extend(gzip_with_tail(b"junk"));
-        assert_eq!(decode(ContentEncoding::Gzip, &body).unwrap(), b"one hello");
-        assert_eq!(decode_chunks(ContentEncoding::Gzip, body.chunks(1), InjectLimits::default()).unwrap(), b"one hello");
+    fn a_later_gzip_member_cannot_trip_the_caps() {
+        let limits = InjectLimits { max_decoded_bytes: 4096, max_ratio: u64::MAX, ..InjectLimits::default() };
+        let plain = noise(3000);
+        let member = gzip(&plain);
+        let body = [member.as_slice(), member.as_slice()].concat();
+        assert_eq!(decode_chunks(ContentEncoding::Gzip, [&body[..]], limits).unwrap(), plain);
     }
 
     #[test]
@@ -558,24 +524,10 @@ mod tests {
         assert!(matches!(decode(ContentEncoding::Gzip, &body), Err(InjectError::Corrupt { .. })));
     }
 
-    /// The magic says a member began, so what follows is a member: cut or
-    /// broken, it errors like a first member would (module doc).
     #[test]
-    fn a_second_member_that_began_and_broke_errors() {
-        let second = gzip(b"two");
-        let tails: [&[u8]; 3] = [&second[..2], &second[..5], &second[..second.len() - 1]];
-        for tail in tails {
-            assert!(matches!(decode(ContentEncoding::Gzip, &gzip_with_tail(tail)), Err(InjectError::Corrupt { .. })), "{tail:?}");
-        }
-        assert!(decode(ContentEncoding::Gzip, &gzip_with_tail(&[0x1f, 0x8b, 0xff, 0xff])).is_err());
-    }
-
-    #[test]
-    fn the_caps_count_across_gzip_members() {
-        let limits = InjectLimits { max_decoded_bytes: 4096, max_ratio: u64::MAX, ..InjectLimits::default() };
-        let member = gzip(&noise(3000));
-        let body = [member.as_slice(), member.as_slice()].concat();
-        assert!(matches!(decode_chunks(ContentEncoding::Gzip, [&body[..]], limits), Err(InjectError::DecodedTooLarge { .. })));
+    fn a_brotli_stream_cut_one_byte_before_its_end_errors() {
+        let br = brotli_of(&noise(4096));
+        assert!(matches!(decode(ContentEncoding::Brotli, &br[..br.len() - 1]), Err(InjectError::Corrupt { .. })));
     }
 
     #[test]
