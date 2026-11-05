@@ -13,8 +13,10 @@ import {
   engineDetail,
   enginePhase,
   engineStatus,
+  engineUpdate,
   engineVersion,
   splitTunnelText,
+  updateNotice,
 } from "@/core/engine";
 import { useEngine, useEngineActions } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
@@ -30,11 +32,14 @@ const percent = (share: number) => `${Math.floor(share * 1000) / 10}%`;
  * means, then what the engine itself reported: split tunnels, its flow
  * counters, its version. While AdGuard's service blocks it, the pause offer
  * says exactly what it does (it stops that service; Windows asks first) and
- * "Start AdGuard again" undoes it.
+ * "Start AdGuard again" undoes it. Updates are plain text and one button: the
+ * button only sends `RequestUpdate`, and the engine fetches and verifies.
  */
 export function EngineCard() {
   const e = useEngine();
-  const { stopAdguard, startAdguard } = useEngineActions();
+  const { stopAdguard, startAdguard, requestUpdate } = useEngineActions();
+  const update = engineUpdate(e);
+  const notice = updateNotice(update);
   const phase = enginePhase(e);
   const version = engineVersion(e);
   const offer = adguardOffer(e);
@@ -84,6 +89,18 @@ export function EngineCard() {
             ) : (
               <Button variant="secondary" disabled={busy !== null} onClick={() => void startAdguard()}>
                 {busy === "starting" ? "Starting AdGuard" : "Start AdGuard again"}
+              </Button>
+            )}
+          </div>
+        )}
+        {notice && (
+          <div className="flex flex-col items-start gap-2" data-engine-update={update.kind}>
+            <p role={notice.problem ? "alert" : undefined} className={cn("text-label break-words", notice.problem ? "text-blocked" : "text-on-surface-muted")}>
+              {notice.text}
+            </p>
+            {notice.action && (
+              <Button variant="secondary" disabled={e.requestingUpdate === true} onClick={() => void requestUpdate()}>
+                {notice.action}
               </Button>
             )}
           </div>

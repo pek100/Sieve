@@ -2,11 +2,14 @@ import { describe, expect, it } from "vitest";
 import fixture from "@/data/fixtures/engine-probe-v2.json";
 import { parseEngineProbe } from "@/data/protocol";
 import {
+  CHECK_AGAIN,
   EMPTY_ENGINE,
   ENGINE_LOCK_TEXT,
   ENGINE_PHASES,
   ENGINE_STATE_TEXT,
   ENGINE_UNREACHED,
+  INSTALL_UPDATE,
+  NO_UPDATE_NEWS,
   attribution,
   engineDetail,
   engineInForce,
@@ -15,8 +18,11 @@ import {
   engineRoutes,
   engineStatus,
   engineTakesPolicy,
+  engineUpdate,
   engineVersion,
   splitTunnelText,
+  updateBanner,
+  updateNotice,
   type EngineSlice,
   type EngineUnreached,
 } from "./engine";
@@ -24,6 +30,40 @@ import {
 type Example = keyof typeof fixture.examples;
 const facts = (name: Example): EngineSlice => ({ probe: parseEngineProbe(fixture.examples[name]), error: null });
 const ALL = Object.keys(fixture.examples) as Example[];
+
+describe("engine updates", () => {
+  const quiet = ["not_configured", "idle", "checking"] as const;
+
+  it("shows nothing for the quiet states, and the engine that did not answer says nothing", () => {
+    for (const kind of quiet) expect(updateNotice({ kind })).toBeNull();
+    expect(engineUpdate(EMPTY_ENGINE)).toEqual(NO_UPDATE_NEWS);
+    expect(engineUpdate(facts("missing"))).toEqual(NO_UPDATE_NEWS);
+    expect(updateNotice(engineUpdate(facts("idle")))).toBeNull();
+  });
+
+  it("only an offered release installs; every other button only checks; applying has none", () => {
+    expect(updateNotice(engineUpdate(facts("update_available")))?.action).toBe(INSTALL_UPDATE);
+    expect(updateNotice(engineUpdate(facts("update_applying")))?.action).toBeNull();
+    for (const name of ["update_current", "update_stale", "update_failed", "update_refused", "update_rolled_back"] as const) {
+      expect(updateNotice(engineUpdate(facts(name)))?.action, name).toBe(CHECK_AGAIN);
+    }
+  });
+
+  it("says the reason, and never claims filtering or blocking", () => {
+    expect(updateNotice(engineUpdate(facts("update_refused")))?.text).toContain("the signature does not verify");
+    expect(updateNotice(engineUpdate(facts("update_failed")))?.text).toContain("could not reach the update host");
+    expect(updateNotice(engineUpdate(facts("update_rolled_back")))?.text).toContain("0.2.0");
+    for (const name of ALL) {
+      const notice = updateNotice(engineUpdate(facts(name)));
+      expect(notice?.text ?? "").not.toMatch(/is filtering|blocked/i);
+    }
+  });
+
+  it("a banner only for an offered release and a rolled back one", () => {
+    const banners = ALL.filter((n) => updateBanner(engineUpdate(facts(n))) !== null);
+    expect(banners).toEqual(["update_available", "update_rolled_back"]);
+  });
+});
 
 describe("engine phase", () => {
   it("derives every phase from the fixture's facts", () => {
@@ -42,6 +82,13 @@ describe("engine phase", () => {
       vpn: "vpn",
       crash_loop: "crash_loop",
       setup: "setup_failed",
+      update_current: "idle",
+      update_available: "idle",
+      update_applying: "idle",
+      update_stale: "idle",
+      update_failed: "idle",
+      update_refused: "idle",
+      update_rolled_back: "idle",
     };
     for (const name of ALL) expect(enginePhase(facts(name)), name).toBe(want[name]);
   });
@@ -84,7 +131,7 @@ describe("engine phase", () => {
   });
 
   it("a running service with no pipe answer is not running, and an error wins over old facts", () => {
-    const running: EngineSlice = { probe: { v: 2, service: "running", adguard: "missing", pipe: null }, error: null };
+    const running: EngineSlice = { probe: { v: 3, service: "running", adguard: "missing", pipe: null }, error: null };
     expect(enginePhase(running)).toBe("not_running");
     expect(enginePhase({ ...facts("idle"), error: "x" })).toBe("unreadable");
   });

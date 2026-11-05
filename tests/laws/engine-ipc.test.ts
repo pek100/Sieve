@@ -1,14 +1,14 @@
 /**
  * Law 9, engine IPC: the app and the engine speak one pipe protocol, owned by
  * the Rust crate `engine/crates/sieve-ipc`. Its fixture
- * `src/data/fixtures/engine-ipc-v1.json` is read by the Rust tests
+ * `src/data/fixtures/engine-ipc-v2.json` is read by the Rust tests
  * (`cargo test -p sieve-ipc`: every message round trips) and here: the
  * version, the limits and every message type name agree with the crate.
  * Changing a message shape bumps PROTOCOL and the fixture in one commit.
  */
 import { describe, expect, it } from "vitest";
 import fixture from "@/data/fixtures/engine-ipc-v2.json";
-import { BLOCKER_KINDS, parseEngineStatus } from "@/data/protocol";
+import { BLOCKER_KINDS, UPDATE_KINDS, parseEngineStatus } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -42,6 +42,16 @@ describe("engine IPC law", () => {
     expect(snake).toEqual([...BLOCKER_KINDS]);
     expect(fixture.blockers.map((b) => b.kind)).toEqual([...BLOCKER_KINDS]);
     for (const b of fixture.blockers) expect(parseEngineStatus({ ...body, blocker: b }).blocker).toEqual(b);
+  });
+
+  it("the app reads every update state the crate declares, unchanged", () => {
+    const status = fixture.engine.find((m) => m.type === "status")!;
+    const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
+    const crate = (RUST.match(/pub enum UpdateStatus \{([\s\S]*?)\n\}/)?.[1] ?? "").match(/^\s{4}(?!#|\/)(\w+)\b/gm) ?? [];
+    const snake = crate.map((v) => v.trim().replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()));
+    expect(snake).toEqual([...UPDATE_KINDS]);
+    expect(fixture.updates.map((u) => u.kind)).toEqual([...UPDATE_KINDS]);
+    for (const u of fixture.updates) expect(parseEngineStatus({ ...body, update: u }).update).toEqual(u);
   });
 
   it("fixture names every message type of the crate, in order", () => {

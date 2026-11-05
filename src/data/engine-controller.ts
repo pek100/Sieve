@@ -17,10 +17,11 @@
  *
  * The passed live check of ENGINE_SWITCH is recorded while the engine
  * reports routing, and forgotten when it stops. A crash loop pushes one Home
- * banner, dismissed when it is over.
+ * banner, dismissed when it is over; so does an update on offer or rolled back.
+ * Update state rides the probe: there is no separate poll.
  */
 import type { PassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, engineStatus, enginePhase, engineTakesPolicy, type EngineSlice } from "@/core/engine";
+import { ENGINE_POLL_MS, ENGINE_SWITCH, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, updateBanner, type EngineSlice } from "@/core/engine";
 import type { NoticeBus } from "@/core/notices";
 import type { SettingKey } from "@/core/settings/registry";
 import type { SieveStore } from "@/core/store";
@@ -35,6 +36,8 @@ export interface EngineController {
   stopAdguard(): Promise<void>;
   /** Start AdGuard's service again (Windows asks the user), then probe. */
   startAdguard(): Promise<void>;
+  /** The update button: `RequestUpdate`, whose meaning the engine decides. */
+  requestUpdate(): Promise<void>;
 }
 
 export interface EngineControllerDeps {
@@ -59,6 +62,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
   // The switch is read only after the settings loaded: before that it reads as its default (off).
   let settingsReady = false;
   let banner: number | null = null;
+  let update: { id: number; text: string } | null = null;
   let probeNow: () => Promise<void> = async () => {};
 
   const get = () => store.getState().engine;
@@ -76,6 +80,11 @@ export function createEngineController({ engine, store, clock, settings, checks,
     if (phase !== "crash_loop" && banner !== null) {
       notices.dismiss(banner);
       banner = null;
+    }
+    const text = updateBanner(engineUpdate(e));
+    if (text !== (update?.text ?? null)) {
+      if (update !== null) notices.dismiss(update.id);
+      update = text === null ? null : { id: notices.push({ kind: "info", surface: "banner", text }), text };
     }
     void syncPolicy();
   };
@@ -99,6 +108,22 @@ export function createEngineController({ engine, store, clock, settings, checks,
       set({ actionError: `Could not tell the engine: ${message(e)}` });
     } finally {
       policyInFlight = false;
+    }
+    if (!disposed) follow();
+  };
+
+  // Answered at once with the Status; the engine's work then shows through the probe.
+  const requestUpdate = async () => {
+    if (get().requestingUpdate) return;
+    set({ requestingUpdate: true, actionError: null });
+    try {
+      const next = await engine.requestUpdate();
+      const probe = get().probe;
+      if (probe?.pipe?.kind === "welcome") set({ probe: { ...probe, pipe: { ...probe.pipe, status: next } } });
+    } catch (e) {
+      set({ actionError: `The update request did not go through: ${message(e)}` });
+    } finally {
+      set({ requestingUpdate: false });
     }
     if (!disposed) follow();
   };
@@ -156,8 +181,11 @@ export function createEngineController({ engine, store, clock, settings, checks,
         probeNow = async () => {};
         if (banner !== null) notices.dismiss(banner);
         banner = null;
+        if (update !== null) notices.dismiss(update.id);
+        update = null;
       };
     },
+    requestUpdate,
     stopAdguard: () => adguard("stopping", () => engine.stopAdguard()),
     startAdguard: () => adguard("starting", () => engine.startAdguard()),
   };

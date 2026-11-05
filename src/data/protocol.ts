@@ -4,6 +4,7 @@
  * which sockets they own. Changing the shape bumps PROTOCOL_VERSION and the
  * fixture (src/data/fixtures/snapshot-v1.json) in the same commit.
  */
+import { NO_UPDATE_NEWS } from "@/core/engine";
 import { GRAIN_NAMES, type GrainName } from "@/core/history";
 
 export const PROTOCOL_VERSION = 1 as const;
@@ -367,17 +368,26 @@ export function parseWindowsDns(raw: unknown): WindowsDns {
  * `src/data/fixtures/engine-probe-v2.json`): the filtering engine from
  * facts. `service` is the Windows service's state ("missing" when not
  * installed); `pipe` is the engine's own answer, asked only while the service
- * runs. `status` is the engine's `sieve-ipc` Status (protocol 2, fixture
+ * runs. `status` is the engine's `sieve-ipc` Status (protocol 3, fixture
  * `engine-ipc-v2.json`). v2: the status carries the policy, the blocker, the
  * split tunnels and the engine's counters; the probe also reads AdGuard's
- * service state (`adguard`), for the pause offer.
+ * service state (`adguard`), for the pause offer. v3: the status carries the
+ * signed updates' state (`update`).
  */
-export const ENGINE_PROBE_VERSION = 2 as const;
+export const ENGINE_PROBE_VERSION = 3 as const;
 export const SERVICE_FACTS = ["missing", "stopped", "starting", "stopping", "running", "other"] as const;
 export type ServiceFact = (typeof SERVICE_FACTS)[number];
 export const PIPE_KINDS = ["welcome", "incompatible", "refused", "unreachable"] as const;
 /** `sieve-ipc` Blocker kinds, in declaration order. */
 export const BLOCKER_KINDS = ["adguard", "vpn", "crash_loop", "setup"] as const;
+/** `sieve-ipc` UpdateStatus kinds, in declaration order. */
+export const UPDATE_KINDS = ["not_configured", "idle", "checking", "current", "available", "applying", "stale", "failed", "refused", "rolled_back"] as const;
+
+/** Where signed updates stand, as the engine says it (plan 7.5). `version` is for reading only. */
+export type EngineUpdate =
+  | { kind: "not_configured" | "idle" | "checking" | "current" | "stale" }
+  | { kind: "available" | "applying" | "rolled_back"; version: string }
+  | { kind: "failed" | "refused"; message: string };
 
 export type EngineBlocker =
   | { kind: "adguard"; service: string }
@@ -410,6 +420,7 @@ export interface EngineStatus {
   blocker: EngineBlocker | null;
   split_tunnels: string[];
   counters: EngineCounters;
+  update: EngineUpdate;
 }
 
 const COUNTER_KEYS = ["flows", "attributed", "own_refused", "dns_answers", "packets_in", "packets_out", "not_unicast"] as const;
@@ -430,7 +441,34 @@ function blocker(raw: unknown): EngineBlocker {
   }
 }
 
-/** Validate an untrusted engine Status (sieve-ipc v2). Throws ProtocolError. */
+/**
+ * The update state. Unlike the rest of the Status it never refuses the
+ * answer: updates are news, and a missing, partial or unknown one must not
+ * take the Engine block's facts down with it. It reads as nothing to say.
+ */
+function engineUpdate(raw: unknown): EngineUpdate {
+  if (!isRec(raw)) return NO_UPDATE_NEWS;
+  const { kind, version, message } = raw;
+  switch (kind) {
+    case "idle":
+    case "checking":
+    case "current":
+    case "stale":
+    case "not_configured":
+      return { kind };
+    case "available":
+    case "applying":
+    case "rolled_back":
+      return typeof version === "string" ? { kind, version } : NO_UPDATE_NEWS;
+    case "failed":
+    case "refused":
+      return typeof message === "string" ? { kind, message } : NO_UPDATE_NEWS;
+    default:
+      return NO_UPDATE_NEWS;
+  }
+}
+
+/** Validate an untrusted engine Status (sieve-ipc v3). Throws ProtocolError. */
 export function parseEngineStatus(raw: unknown): EngineStatus {
   const s = rec(raw, "status");
   const p = rec(s.policy, "status.policy");
@@ -445,6 +483,7 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
     blocker: s.blocker === null ? null : blocker(s.blocker),
     split_tunnels: strings(s.split_tunnels, "status.split_tunnels"),
     counters: Object.fromEntries(COUNTER_KEYS.map((k) => [k, int(c[k], `counters.${k}`)])) as unknown as EngineCounters,
+    update: engineUpdate(s.update),
   };
 }
 

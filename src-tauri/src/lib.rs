@@ -59,6 +59,7 @@ pub fn run() {
             adguard::adguard_start,
             engine::engine_probe,
             engine::engine_set_policy,
+            engine::engine_request_update,
             windns::windows_dns,
         ])
         .run(tauri::generate_context!());

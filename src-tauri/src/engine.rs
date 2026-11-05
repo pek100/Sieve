@@ -5,11 +5,13 @@
 //!   - `adguard`: AdGuard for Windows' service state, read the same way (the
 //!     pause offer and its undo follow it);
 //!   - `pipe` (only while the service runs): the engine's own answer over
-//!     `\\.\pipe\sieve-engine` (protocol `sieve-ipc` v2): Welcome with its
+//!     `\\.\pipe\sieve-engine` (protocol `sieve-ipc` v3): Welcome with its
 //!     Status, Incompatible, the engine's refusal (only the installed app may
 //!     connect), or unreachable with the reason.
 //! - `engine_set_policy(policy) -> EngineStatus`: sends the user's switch
 //!   (`filtering.engine`) to the engine.
+//! - `engine_request_update() -> EngineStatus`: asks the engine to update; it
+//!   carries nothing, and the engine alone fetches and verifies (plan 7.5).
 //! - [`EngineFlows`]: while the engine routes, a subscription to its `Flows`
 //!   events; `net_snapshot` then builds the snapshot from them instead of
 //!   the connection tables (whose rows would show every flow twice: the
@@ -28,7 +30,7 @@ use sieve_ipc::{EngineStatus, FlowEvent, FlowProto, PIPE_NAME, PROTOCOL, Policy}
 
 use crate::protocol::{Endpoint, Family, Flow, FlowState, Proto};
 
-pub const ENGINE_PROBE_VERSION: u32 = 2;
+pub const ENGINE_PROBE_VERSION: u32 = 3;
 /// The engine's service name (sieve-engine `service::SERVICE_NAME`).
 pub const SERVICE_NAME: &str = "sieve-engine";
 /// A probe that gets no answer in this time reports the pipe unreachable.
@@ -225,7 +227,17 @@ mod imp {
 
     /// Sends the policy; the engine's Status after it, or why not.
     pub async fn set_policy(name: &str, policy: Policy) -> Result<EngineStatus, String> {
-        match tokio::time::timeout(PROBE_TIMEOUT, request(name, ClientMessage::SetPolicy(policy))).await {
+        status_of(name, ClientMessage::SetPolicy(policy)).await
+    }
+
+    /// `RequestUpdate`; the engine's Status, or why it refused (asked too soon).
+    pub async fn request_update(name: &str) -> Result<EngineStatus, String> {
+        status_of(name, ClientMessage::RequestUpdate {}).await
+    }
+
+    /// One request answered with a Status, or the reason it was not.
+    async fn status_of(name: &str, msg: ClientMessage) -> Result<EngineStatus, String> {
+        match tokio::time::timeout(PROBE_TIMEOUT, request(name, msg)).await {
             Ok(Ok(PipeFact::Welcome { status, .. })) => Ok(status),
             Ok(Ok(PipeFact::Refused { message } | PipeFact::Unreachable { message })) => Err(message),
             Ok(Ok(PipeFact::Incompatible { supported })) => Err(format!("the engine speaks protocol {} to {}", supported[0], supported[1])),
@@ -306,6 +318,21 @@ pub async fn engine_set_policy(policy: Policy) -> Result<EngineStatus, String> {
 #[cfg(not(windows))]
 #[tauri::command]
 pub async fn engine_set_policy(_policy: Policy) -> Result<EngineStatus, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// Command: the update button. No argument: the engine alone decides what this
+/// means, where it fetches from and what it verifies (plan 7.5). The engine's
+/// Status, or its refusal.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_request_update() -> Result<EngineStatus, String> {
+    imp::request_update(PIPE_NAME).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_request_update() -> Result<EngineStatus, String> {
     Err("the engine runs on Windows only".into())
 }
 
@@ -405,13 +432,17 @@ mod tests {
                 None
             }
         });
+        let welcome = |status| PipeFact::Welcome { engine_version: String::new(), session_id: 0, status };
         let fact = match ask {
             ClientAsk::Status => Ok(imp::pipe_fact(name).await),
-            ClientAsk::Policy(p) => imp::set_policy(name, p).await.map(|status| PipeFact::Welcome { engine_version: String::new(), session_id: 0, status }),
+            ClientAsk::Policy(p) => imp::set_policy(name, p).await.map(welcome),
+            ClientAsk::Update => imp::request_update(name).await.map(welcome),
         };
         let asked = engine.await.unwrap();
-        if let (Some(asked), ClientAsk::Policy(p)) = (asked, ask) {
-            assert_eq!(asked, ClientMessage::SetPolicy(p));
+        match (asked, ask) {
+            (Some(asked), ClientAsk::Policy(p)) => assert_eq!(asked, ClientMessage::SetPolicy(p)),
+            (Some(asked), ClientAsk::Update) => assert_eq!(asked, ClientMessage::RequestUpdate {}),
+            _ => {}
         }
         fact
     }
@@ -421,6 +452,7 @@ mod tests {
     enum ClientAsk {
         Status,
         Policy(Policy),
+        Update,
     }
 
     #[cfg(windows)]
@@ -459,6 +491,19 @@ mod tests {
         let stale = EngineMessage::Error { message: "stale policy revision 2 (the engine holds 5)".into() };
         let got = fake_engine(&test_pipe("stale"), welcome(), stale, ClientAsk::Policy(on)).await;
         assert_eq!(got, Err("stale policy revision 2 (the engine holds 5)".into()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn request_update_sends_the_one_message_and_returns_the_status_or_its_refusal() {
+        use sieve_ipc::{EngineMessage, UpdateStatus};
+        let welcome = || EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 };
+        let after = EngineStatus { update: UpdateStatus::Checking, ..EngineStatus::default() };
+        let got = fake_engine(&test_pipe("update"), welcome(), EngineMessage::Status(after.clone()), ClientAsk::Update).await;
+        assert!(matches!(got, Ok(PipeFact::Welcome { status, .. }) if status == after));
+        let soon = EngineMessage::Error { message: "try again in a few minutes".into() };
+        let got = fake_engine(&test_pipe("update-soon"), welcome(), soon, ClientAsk::Update).await;
+        assert_eq!(got, Err("try again in a few minutes".into()));
     }
 
     #[cfg(windows)]

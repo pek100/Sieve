@@ -1,6 +1,9 @@
 //! The scriptlet and redirect resource archive is pinned by SHA-256 in code
 //! (plan 5.5, 7.1): a download whose hash differs is refused and the last
-//! verified copy is kept. This module only checks; the engine downloads.
+//! verified copy is kept. This module only checks; the engine downloads. From
+//! slice 13 the engine also receives the bundle as a signed update
+//! (`updates\resources`, `sieve_engine::update`); the pin retires once a loader
+//! here reads that file.
 
 use sha2::{Digest, Sha256};
 

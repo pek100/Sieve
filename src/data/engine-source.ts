@@ -7,7 +7,8 @@
  * never replaced by mock data.
  *
  * The app never installs, starts or stops the engine. It sends the user's
- * switch (`setPolicy`), and, only when the user clicks, stops or starts
+ * switch (`setPolicy`), asks the engine to update (`requestUpdate`, the engine
+ * alone fetches and verifies), and, only when the user clicks, stops or starts
  * AdGuard's service through one command Windows asks the user to approve.
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
@@ -19,6 +20,12 @@ export interface EngineSource {
   probe(): Promise<EngineProbe>;
   /** Sends the user's switches; resolves with the engine's Status after the change. */
   setPolicy(policy: EnginePolicy): Promise<EngineStatus>;
+  /**
+   * `RequestUpdate`: no argument, ever. The engine decides from its own state
+   * whether this checks or applies the release it offers, and verifies
+   * everything itself. Rejects when it refused (asked again too soon).
+   */
+  requestUpdate(): Promise<EngineStatus>;
   /** Stops AdGuard's service (Windows asks the user first). Rejects when it did not stop. */
   stopAdguard(): Promise<void>;
   /** Starts AdGuard's service again (Windows asks the user first). */
@@ -32,6 +39,7 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     kind: "tauri",
     probe: async () => parseEngineProbe(await invoke<unknown>("engine_probe")),
     setPolicy: async (policy) => parseEngineStatus(await invoke<unknown>("engine_set_policy", { policy })),
+    requestUpdate: async () => parseEngineStatus(await invoke<unknown>("engine_request_update")),
     stopAdguard: async () => void (await invoke<unknown>("adguard_stop")),
     startAdguard: async () => void (await invoke<unknown>("adguard_start")),
   };

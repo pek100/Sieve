@@ -8,8 +8,9 @@
  * The actions move between the fixture's examples the way the engine would:
  * turning routing on from `idle` routes; off from any welcome state is idle;
  * pausing AdGuard lets a waiting engine route (the `filtering` example has
- * AdGuard's service stopped); starting it again makes the engine wait.
- * Nothing else is invented.
+ * AdGuard's service stopped); starting it again makes the engine wait;
+ * requesting an update while one is on offer starts applying it, and any other
+ * request answers the state as it is. Nothing else is invented.
  */
 import fixture from "./fixtures/engine-probe-v2.json";
 import type { EngineSource } from "./engine-source";
@@ -29,6 +30,13 @@ export const ENGINE_SCENARIOS = [
   "refused",
   "unreachable",
   "error",
+  "update_current",
+  "update_available",
+  "update_applying",
+  "update_stale",
+  "update_failed",
+  "update_refused",
+  "update_rolled_back",
 ] as const;
 export type EngineScenario = (typeof ENGINE_SCENARIOS)[number];
 
@@ -36,7 +44,21 @@ export const MOCK_ENGINE_ERROR = "service manager: Access is denied. (os error 5
 /** What the mock's AdGuard actions answer when they cannot apply (no AdGuard to stop or start). */
 export const MOCK_ADGUARD_ERROR = "Adguard Service: the service is not in a state that allows this";
 
-const WELCOME: readonly EngineScenario[] = ["idle", "filtering", "adguard", "vpn", "crash_loop", "setup"];
+const WELCOME: readonly EngineScenario[] = [
+  "idle",
+  "filtering",
+  "adguard",
+  "vpn",
+  "crash_loop",
+  "setup",
+  "update_current",
+  "update_available",
+  "update_applying",
+  "update_stale",
+  "update_failed",
+  "update_refused",
+  "update_rolled_back",
+];
 
 function statusOf(scenario: EngineScenario): EngineStatus {
   const example = fixture.examples[scenario as keyof typeof fixture.examples];
@@ -57,7 +79,13 @@ export function createMockEngine(start: EngineScenario = "missing"): EngineSourc
     setPolicy: async (policy: EnginePolicy) => {
       requireWelcome();
       if (!policy.engine) scenario = "idle";
-      else if (scenario === "idle" || scenario === "crash_loop") scenario = "filtering";
+      // The update examples are the idle engine with another update state.
+      else if (scenario === "idle" || scenario === "crash_loop" || scenario.startsWith("update_")) scenario = "filtering";
+      return statusOf(scenario);
+    },
+    requestUpdate: async () => {
+      requireWelcome();
+      if (scenario === "update_available") scenario = "update_applying";
       return statusOf(scenario);
     },
     stopAdguard: async () => {
