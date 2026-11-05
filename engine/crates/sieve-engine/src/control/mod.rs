@@ -16,6 +16,7 @@ use sieve_ipc::{Blocker, DnsUpstreams, EngineStatus, FlowEvent, Policy};
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::dns::service::Service;
+use crate::dns::upstream::Upstream;
 use crate::dns::{NameMap, config};
 use crate::ipc::{Backend, Subscription};
 use crate::policy::{self, Runs};
@@ -60,7 +61,7 @@ pub struct Engine {
     crash_loop: Mutex<Option<u32>>,
     facts: Mutex<Facts>,
     dns_upstreams: Mutex<DnsUpstreams>,
-    /// Up only while the routes are.
+    /// Up from just before the routes are added until they are taken down.
     dns_service: Mutex<Option<Arc<Service>>>,
     pub book: Arc<Mutex<FlowBook>>,
     pub names: Arc<Mutex<NameMap>>,
@@ -127,14 +128,33 @@ impl Engine {
         self.routes_up.send_if_modified(|was| std::mem::replace(was, up) != up);
     }
 
+    /// Reports `reason` beside the reasons already held, so one never hides another.
+    pub fn add_error(&self, reason: String) {
+        self.set_facts(|f| {
+            f.last_error = Some(match f.last_error.take() {
+                Some(held) => format!("{held}; {reason}"),
+                None => reason,
+            });
+        });
+    }
+
     /// The encrypted DNS resolvers the engine holds.
     pub fn dns_upstreams(&self) -> DnsUpstreams {
         lock(&self.dns_upstreams).clone()
     }
 
-    /// The routing loop's handle on the DNS service while the routes are up.
-    pub fn set_dns_service(&self, service: Option<Arc<Service>>) {
-        *lock(&self.dns_service) = service;
+    /// Builds the DNS service from the held list and installs it, all under the
+    /// list's lock: a list set on the pipe reaches either the build or the
+    /// installed service, so what the pipe answers is what the service uses.
+    pub fn start_dns_service(&self, build: impl FnOnce(Vec<Upstream>) -> Arc<Service>) -> Result<Arc<Service>, String> {
+        let held = lock(&self.dns_upstreams);
+        let service = build(config::validate(&held)?);
+        *lock(&self.dns_service) = Some(service.clone());
+        Ok(service)
+    }
+
+    pub fn stop_dns_service(&self) {
+        *lock(&self.dns_service) = None;
     }
 
     /// Records this run's clean end (the service was asked to stop).
@@ -425,6 +445,63 @@ mod tests {
         let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
         assert_eq!(e.dns_upstreams(), config::defaults());
         assert!(e.status().last_error.unwrap().contains("read as the defaults"));
+    }
+
+    fn service_from(endpoints: Vec<Upstream>) -> Arc<Service> {
+        use crate::route::table::fixtures::{HOME, load};
+        let context = crate::dns::testing::Ca::new().context(Arc::default(), Vec::new());
+        Arc::new(Service::new(endpoints, context, Arc::new(std::sync::RwLock::new(load(HOME))), Arc::default(), Arc::default(), usize::from(crate::tun::MTU)))
+    }
+
+    fn addresses(service: &Service) -> Vec<String> {
+        service.report().into_iter().map(|r| r.address).collect()
+    }
+
+    /// How long the pipe's request gets to overtake a build, were it able to.
+    const OVERTAKE: std::time::Duration = std::time::Duration::from_millis(100);
+
+    #[test]
+    fn a_list_set_while_the_dns_service_starts_reaches_the_service() {
+        let e = Arc::new(engine(Policy::default(), None));
+        let asked = DnsUpstreams { revision: 1, upstreams: vec!["tls://new.example".into()] };
+        let (answered, answer) = std::sync::mpsc::channel();
+        let service = e
+            .start_dns_service(|endpoints| {
+                let (pipe, list) = (e.clone(), asked.clone());
+                std::thread::spawn(move || answered.send(pipe.set_dns_upstreams(list)));
+                assert!(answer.recv_timeout(OVERTAKE).is_err(), "the pipe waits for the service to be installed");
+                service_from(endpoints)
+            })
+            .unwrap();
+        assert_eq!(answer.recv().unwrap().unwrap(), asked);
+        assert_eq!(addresses(&service), asked.upstreams, "the service uses what the pipe answered");
+    }
+
+    #[test]
+    fn a_list_set_before_the_dns_service_starts_is_the_one_it_starts_with() {
+        let e = engine(Policy::default(), None);
+        let asked = DnsUpstreams { revision: 1, upstreams: vec!["tls://new.example".into()] };
+        e.set_dns_upstreams(asked.clone()).unwrap();
+        assert_eq!(addresses(&e.start_dns_service(service_from).unwrap()), asked.upstreams);
+    }
+
+    #[test]
+    fn a_held_list_that_does_not_validate_starts_no_service() {
+        let e = engine(Policy::default(), None);
+        lock(&e.dns_upstreams).upstreams.clear();
+        let refused = e.start_dns_service(|_| panic!("nothing to build from")).err().unwrap();
+        assert!(refused.contains("empty"), "{refused}");
+        assert!(lock(&e.dns_service).is_none());
+    }
+
+    #[test]
+    fn a_stopped_dns_service_no_longer_hears_the_list() {
+        let e = engine(Policy::default(), None);
+        let service = e.start_dns_service(service_from).unwrap();
+        let before = addresses(&service);
+        e.stop_dns_service();
+        e.set_dns_upstreams(DnsUpstreams { revision: 1, upstreams: vec!["tls://new.example".into()] }).unwrap();
+        assert_eq!(addresses(&service), before);
     }
 
     #[test]

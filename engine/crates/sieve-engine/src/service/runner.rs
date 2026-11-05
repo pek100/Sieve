@@ -145,6 +145,14 @@ fn install_panic_cleanup(journal_dir: std::path::PathBuf) {
     }));
 }
 
+/// Adds what start-up found to what the engine already reports (a bad `dns.json`).
+fn report_start_problems(engine: &Engine, policy_error: Option<String>, cleaned: &str) {
+    let cleanup = cleaned.contains("FAILED").then(|| format!("start-up cleanup: {cleaned}"));
+    for problem in [policy_error, cleanup].into_iter().flatten() {
+        engine.add_error(problem);
+    }
+}
+
 /// The engine until the stop signal. An error ends the process with a
 /// failure code, so the SCM's recovery restarts it.
 fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
@@ -162,7 +170,7 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
     let sddl = pipe_sddl(owner.as_deref())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let engine = Arc::new(Engine::new(Some(dir.clone()), exe, policy, runs, crash));
-    engine.set_facts(|f| f.last_error = policy_error.or_else(|| cleaned.contains("FAILED").then(|| format!("start-up cleanup: {cleaned}"))));
+    report_start_problems(&engine, policy_error, &cleaned);
 
     // The watchdog: a plain thread, armed only while routes are up.
     let (ping_tx, ping_rx) = mpsc::unbounded_channel();
@@ -213,4 +221,39 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
         engine.stop_clean();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::control::STATUS_FILE;
+    use crate::dns::config::DNS_FILE;
+
+    /// `last_error` as `status.json` says it, after a start with a bad `dns.json`.
+    fn reported_after_start(dir: &Path, policy_error: Option<String>, cleaned: &str) -> Option<String> {
+        std::fs::write(dir.join(DNS_FILE), b"{\"revision\":1,\"upstreams\":[\"udp://1.1.1.1\"]}").unwrap();
+        let engine = Engine::new(Some(dir.to_path_buf()), PathBuf::new(), Default::default(), Default::default(), None);
+        report_start_problems(&engine, policy_error, cleaned);
+        engine.write_status_file();
+        let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(STATUS_FILE)).unwrap()).unwrap();
+        status["last_error"].as_str().map(str::to_string)
+    }
+
+    #[test]
+    fn a_bad_dns_file_is_still_reported_after_a_healthy_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let reported = reported_after_start(dir.path(), None, "removed 0 routes").unwrap();
+        assert!(reported.contains("read as the defaults"), "{reported}");
+    }
+
+    #[test]
+    fn every_start_problem_is_reported_beside_a_bad_dns_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let reported = reported_after_start(dir.path(), Some("policy.json: broken".into()), "route delete FAILED").unwrap();
+        for reason in ["read as the defaults", "policy.json: broken", "start-up cleanup: route delete FAILED"] {
+            assert!(reported.contains(reason), "{reason} in {reported}");
+        }
+    }
 }

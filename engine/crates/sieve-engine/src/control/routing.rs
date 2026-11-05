@@ -7,8 +7,9 @@
 //! with no timer at all (plan 6: idle CPU 0).
 //!
 //! Bringing up: build the DNS service's TLS, load the pinned wintun.dll, create
-//! the adapter, give it its addresses, journal and add each planned route,
-//! start the stack, arm the watchdog. Any failure takes down what was added and
+//! the adapter, start the DNS service, give the adapter its addresses, journal
+//! and add each planned route, start the stack, arm the watchdog. Any failure
+//! takes down what was added and
 //! reports a Setup blocker: the network stays as it was. While up, a route
 //! change re-reads the tables (pinning follows them), drops DNS's sessions when
 //! the network outside Sieve changed (they are pinned to the old egress), and
@@ -27,7 +28,7 @@ use super::Engine;
 use crate::coexist::{self, Coexistence};
 use crate::dns::pool::{Context, Tls};
 use crate::dns::service::Service;
-use crate::dns::{config, upstream};
+use crate::dns::upstream;
 use crate::flow::tasks::FlowTasks;
 use crate::route::apply::{self, SieveLuid};
 use crate::route::journal::Journal;
@@ -76,7 +77,7 @@ pub async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
     let _watch: Option<RouteWatch> = match watch_routes(engine.wake.clone()) {
         Ok(w) => Some(w),
         Err(e) => {
-            engine.set_facts(|f| f.last_error = Some(format!("route changes are not watched: {e}")));
+            engine.add_error(format!("route changes are not watched: {e}"));
             None
         }
     };
@@ -171,6 +172,27 @@ fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
     Up { routes: kept, ..up }
 }
 
+/// Gives the adapter its addresses and journals and adds each route. A failed
+/// route removes the ones added before it.
+fn route_adapter(journal: &Journal, luid: SieveLuid, routes: &[Prefix]) -> Result<Vec<Prefix>, String> {
+    apply::add_address(luid, TUN_V4.into())?;
+    if routes.iter().any(|p| !p.is_ipv4()) {
+        apply::add_address(luid, TUN_V6.into())?;
+    }
+    let mut added = Vec::new();
+    for p in routes {
+        if let Err(e) = apply::add_route(journal, luid, *p) {
+            for a in &added {
+                let _ = apply::delete_route(luid.value(), *a);
+            }
+            let _ = journal.truncate();
+            return Err(e);
+        }
+        added.push(*p);
+    }
+    Ok(added)
+}
+
 async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String> {
     let plan = plan::plan(tables);
     if plan.routes.is_empty() {
@@ -179,7 +201,6 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     let journal = journal(engine).ok_or("the engine has no state folder for its route journal")?;
     // Everything DNS can fail on comes before the first route: a Setup blocker
     // here leaves the network as it was.
-    let dns_endpoints = config::validate(&engine.dns_upstreams())?;
     let resolver_tls = Arc::new(Tls::new(crate::tls::public_roots())?);
     let resolvers = upstream::known_resolvers()?;
     let mut config = IpStackConfig::default();
@@ -193,22 +214,6 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     #[cfg(feature = "relay-experiments")]
     let tun = crate::tun::device::open(&engine.exe, engine.experiments.settings.tun_mtu)?;
     let luid = tun.luid;
-    apply::add_address(luid, TUN_V4.into())?;
-    if plan.routes.iter().any(|p| !p.is_ipv4()) {
-        apply::add_address(luid, TUN_V6.into())?;
-    }
-    let mut added = Vec::new();
-    for p in &plan.routes {
-        if let Err(e) = apply::add_route(&journal, luid, *p) {
-            for a in &added {
-                let _ = apply::delete_route(luid.value(), *a);
-            }
-            let _ = journal.truncate();
-            return Err(e);
-        }
-        added.push(*p);
-    }
-
     let shared_tables = Arc::new(RwLock::new(tables.clone()));
     let egress = Arc::new(Egress::new(tun.index, shared_tables.clone()));
     let context = Context { connector: egress.clone(), tls: resolver_tls, resolvers };
@@ -216,8 +221,15 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     let mtu = MTU;
     #[cfg(feature = "relay-experiments")]
     let mtu = engine.experiments.settings.tun_mtu;
-    let dns = Arc::new(Service::new(dns_endpoints, context, shared_tables.clone(), engine.names.clone(), engine.meters.clone(), usize::from(mtu)));
-    engine.set_dns_service(Some(dns.clone()));
+    let dns = engine.start_dns_service(|endpoints| Arc::new(Service::new(endpoints, context, shared_tables.clone(), engine.names.clone(), engine.meters.clone(), usize::from(mtu))))?;
+    let added = match route_adapter(&journal, luid, &plan.routes) {
+        Ok(added) => added,
+        Err(e) => {
+            engine.stop_dns_service();
+            return Err(e);
+        }
+    };
+
     #[cfg(not(feature = "relay-experiments"))]
     let relay = Arc::new(Relay::new(shared_tables, egress, dns, engine.book.clone(), engine.meters.clone()));
     #[cfg(feature = "relay-experiments")]
@@ -287,7 +299,7 @@ async fn take_down(engine: &Engine, up: Up) {
     let _ = up.stop_accept.send(());
     let _ = up.accept.await;
     up.batches.abort();
-    engine.set_dns_service(None);
+    engine.stop_dns_service();
     for p in &up.routes {
         let _ = apply::delete_route(up.luid.value(), *p);
     }
