@@ -1,6 +1,8 @@
 "use client";
 
 import type { ReactNode } from "react";
+import { UnlockDialog } from "@/components/sieve/lock/unlock-dialog";
+import { WelcomeGate } from "@/components/sieve/welcome/welcome-gate";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Runtime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
@@ -29,9 +31,10 @@ export function AppShell({ children, runtime }: { children: ReactNode; runtime?:
         <div className="relative flex h-dvh flex-col overflow-hidden">
           <TopBar />
           <div data-scroll-root="" className="relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto">
-            {children}
+            <WelcomeGate>{children}</WelcomeGate>
           </div>
         </div>
+        <UnlockDialog />
         <NoticeToaster />
       </TooltipProvider>
     </SieveProvider>
