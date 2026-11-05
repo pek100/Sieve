@@ -68,6 +68,9 @@ socket2 = "0.6"
 # (Services, through windows-service for the rest), the ProgramData ACL, and
 # the deletion of routes on the "Sieve" interface and in the journal. The
 # probe binary alone creates the spike's test adapter (run by the user).
+# Attribution reads: a real-time ETW session (Diagnostics_Etw, Time) and WMI
+# queries of NAT state on its own COM thread (Com, Ole for VARIANT, Rpc,
+# Variant, Wmi).
 [target.'cfg(windows)'.dependencies]
 # Loads wintun.dll at run time (libloading); verify_binary_signature refuses
 # a DLL whose Authenticode signer is not "WireGuard LLC".
@@ -79,11 +82,18 @@ windows = { workspace = true, features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Etw",
     "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
     "Win32_System_Pipes",
     "Win32_System_RemoteDesktop",
+    "Win32_System_Rpc",
     "Win32_System_Services",
     "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
 ] }
 # The SCM dispatcher and service configuration (MIT or Apache-2.0).
 windows-service = "0.8.1"

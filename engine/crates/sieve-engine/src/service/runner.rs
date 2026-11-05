@@ -29,6 +29,7 @@ use super::acl::pipe_sddl;
 use super::image::check_this_exe;
 use super::{EXIT_UNSAFE_FOLDER, EXIT_WATCHDOG, SERVICE_NAME, state};
 use crate::control::{Engine, routing};
+use crate::flow::etw::os::stop_stale;
 use crate::ipc::server;
 use crate::policy::{self, crash_loop};
 use crate::route::apply::clear_stale;
@@ -151,6 +152,8 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
     let dir = state::engine_dir(&state::program_data()?);
     let journal = Journal::new(&dir);
     let cleaned = clear_stale(&journal);
+    // A real-time session outlives a killed controller; nothing routes yet.
+    let _ = stop_stale();
     install_panic_cleanup(dir.clone());
 
     let mut runs = policy::load_runs(&dir);
@@ -207,8 +210,9 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
         served
     });
     rt.shutdown_timeout(SHUTDOWN_BOUND);
-    // Whatever the loop managed, nothing of Sieve's stays routed.
+    // Whatever the loop managed, nothing of Sieve's stays routed or tracing.
     clear_stale(&journal);
+    let _ = stop_stale();
     if result.is_ok() {
         engine.stop_clean();
     }

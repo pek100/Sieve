@@ -76,6 +76,16 @@ pub fn admit(dst: IpAddr) -> bool {
     !not_unicast && !own_addresses().contains(&dst)
 }
 
+/// A diagnostic build's look at a packet from the adapter, on both reader
+/// paths: a SYN's fingerprint, raw. Nothing here reaches a decision.
+#[cfg(feature = "attribution-diagnostics")]
+pub fn record_fingerprint(bytes: &[u8], meters: &crate::stack::Meters) {
+    use crate::flow::{flows::FiveTuple, packet};
+    let Some(fingerprint) = packet::syn_fingerprint(bytes) else { return };
+    let Some(parsed) = packet::parse(bytes) else { return };
+    meters.attribution.lock().unwrap_or_else(|p| p.into_inner()).record_syn(FiveTuple::outbound(&parsed), fingerprint);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

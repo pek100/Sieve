@@ -1,0 +1,15 @@
+{
+  "source": "The real session shape of a guest's NTP flow, from the Codex diagnostic run of 2026-10-18 (matching-nat-sessions.json); the fields are those of MSFT_NetNatSession (Get-CimClass).",
+  "flow": { "proto": "udp", "local": "198.18.0.1:62049", "remote": "185.125.190.57:123" },
+  "sessions": [
+    {
+      "Protocol": 17,
+      "InternalSourceAddress": "172.17.83.30",
+      "InternalSourcePort": 36099,
+      "ExternalSourceAddress": "198.18.0.1",
+      "ExternalSourcePort": 62049,
+      "ExternalDestinationAddress": "185.125.190.57",
+      "ExternalDestinationPort": 123
+    }
+  ]
+}

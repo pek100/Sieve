@@ -23,12 +23,15 @@ use sieve_ipc::{FlowAction, FlowEvent, FlowKind, FlowProto};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
+use super::attribution::{Attribution, decide};
 use super::book::FlowBook;
 use super::{DNS_PORT, Meters, kind_of};
 use crate::dns::{self, NameMap};
 use crate::flow::classify::{Decoded, UdpClassifier};
+use crate::flow::etw::PidWitness;
 use crate::flow::flows::os::IpHelper;
 use crate::flow::flows::{Action, Attributor, ExeCache, FiveTuple, Owner, REFRESH_MIN_MS};
+use crate::flow::nat::NatTable;
 use crate::flow::packet::Proto;
 use crate::flow::relay::relay_tcp;
 use crate::route::pin::{self, unicast_if_value};
@@ -47,6 +50,15 @@ pub const DNS_IDLE: Duration = Duration::from_secs(5);
 const DATAGRAM: usize = 65_535;
 
 type ExeLookup = fn(u32) -> Option<String>;
+/// The ETW ring, or nothing when its session could not start.
+pub type Witness = Box<dyn PidWitness + Send>;
+
+/// A flow's origin, and (diagnostic builds) how long finding it took.
+pub struct Attributed {
+    attribution: Attribution,
+    #[cfg(feature = "attribution-diagnostics")]
+    elapsed_ms: u64,
+}
 
 /// What every flow task shares.
 pub struct Relay {
@@ -54,7 +66,9 @@ pub struct Relay {
     pub experiments: crate::experiments::Settings,
     pub own_pid: u32,
     pub tun_index: u32,
-    pub attributor: Mutex<Attributor<IpHelper>>,
+    pub attributor: Mutex<Attributor<IpHelper, Witness>>,
+    /// The NAT state that proves a guest's flow.
+    pub nat: Arc<NatTable>,
     pub exes: Mutex<ExeCache<ExeLookup>>,
     /// Re-read on every route change (control); pinning asks it.
     pub tables: RwLock<NetTables>,
@@ -76,13 +90,22 @@ pub fn session_of(pid: u32) -> Option<u32> {
 }
 
 impl Relay {
-    pub fn new(tun_index: u32, tables: NetTables, book: Arc<Mutex<FlowBook>>, names: Arc<Mutex<NameMap>>, meters: Arc<Meters>) -> Self {
+    pub fn new(
+        tun_index: u32,
+        tables: NetTables,
+        book: Arc<Mutex<FlowBook>>,
+        names: Arc<Mutex<NameMap>>,
+        meters: Arc<Meters>,
+        witness: Witness,
+        nat: Arc<NatTable>,
+    ) -> Self {
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: crate::experiments::Settings::default(),
             own_pid: std::process::id(),
             tun_index,
-            attributor: Mutex::new(Attributor::new(IpHelper)),
+            attributor: Mutex::new(Attributor::new(IpHelper, witness)),
+            nat,
             exes: Mutex::new(ExeCache::new(crate::flow::flows::os::exe_path as ExeLookup)),
             tables: RwLock::new(tables),
             book,
@@ -91,50 +114,73 @@ impl Relay {
         }
     }
 
-    /// The owner pid, retried while the owner table lags (bounded by the
+    /// The owner, retried while the owner table lags (bounded by the
     /// attributor's give-up time).
-    async fn owner(&self, flow: FiveTuple) -> Option<u32> {
-        #[cfg(feature = "attribution-diagnostics")]
-        let started = monotonic_ms();
+    async fn owner(&self, flow: FiveTuple) -> Owner {
         loop {
             let answer = lock(&self.attributor).owner(&flow, monotonic_ms());
-            match answer {
-                Owner::Pid(pid) => {
-                    #[cfg(feature = "attribution-diagnostics")]
-                    lock(&self.meters.attribution).observe(flow, true, monotonic_ms(), None, None, monotonic_ms().saturating_sub(started));
-                    return Some(pid);
-                }
-                Owner::Unknown => {
-                    #[cfg(feature = "attribution-diagnostics")]
-                    self.unknown_diagnostics(flow, monotonic_ms().saturating_sub(started));
-                    return None;
-                }
-                Owner::Pending => tokio::time::sleep(Duration::from_millis(REFRESH_MIN_MS)).await,
+            if answer != Owner::Pending {
+                return answer;
             }
+            tokio::time::sleep(Duration::from_millis(REFRESH_MIN_MS)).await;
         }
     }
 
+    /// The flow's origin (`stack::attribution`). NAT is read only on an owner
+    /// miss, so a machine with no VMs issues a query only for its rare unknown
+    /// flows. An owner answer is checked against the NAT state already held: a
+    /// forwarded UDP flow whose external port equals a host wildcard-bound
+    /// port would otherwise match that row and borrow that app's exemption.
+    ///
+    /// TENSION (S24): a NAT session newer than the last read can slip past
+    /// that check. A fresh read here would add a WMI round trip to every host
+    /// DNS lookup, which is not acceptable. On a machine with an active VM,
+    /// its own misses keep the index fresh; live proof L3 counts collisions.
+    async fn attribute(&self, flow: FiveTuple) -> Attributed {
+        #[cfg(feature = "attribution-diagnostics")]
+        let started = monotonic_ms();
+        let owner = self.owner(flow).await;
+        let nat = match owner {
+            Owner::Disagreed => None,
+            Owner::Unknown => self.nat.fresh_match(&flow, monotonic_ms()).await,
+            _ => self.nat.held_match(&flow),
+        };
+        Attributed {
+            attribution: decide(owner, nat),
+            #[cfg(feature = "attribution-diagnostics")]
+            elapsed_ms: monotonic_ms().saturating_sub(started),
+        }
+    }
+
+    /// The evidence of one admitted flow. An unknown flow's tables are read
+    /// again here, for the report only: nothing here reaches a decision.
     #[cfg(feature = "attribution-diagnostics")]
-    fn unknown_diagnostics(&self, flow: FiveTuple, lookup_elapsed_ms: u64) {
+    fn observe(&self, flow: FiveTuple, attributed: &Attributed) {
         use crate::flow::flows::{OwnerSource, Table};
-        let same_table = Table::of(&flow);
-        let other_table = match same_table {Table::Tcp4 => Table::Tcp6, Table::Tcp6 => Table::Tcp4, Table::Udp4 => Table::Udp6, Table::Udp6 => Table::Udp4};
-        let same = IpHelper.read(same_table);
-        let other = IpHelper.read(other_table);
-        lock(&self.meters.attribution).observe(flow, false, monotonic_ms(), same.as_deref(), other.as_deref(), lookup_elapsed_ms);
+        let (same, other) = if matches!(attributed.attribution, Attribution::Unknown(_)) {
+            let same_table = Table::of(&flow);
+            let other_table = match same_table {Table::Tcp4 => Table::Tcp6, Table::Tcp6 => Table::Tcp4, Table::Udp4 => Table::Udp6, Table::Udp6 => Table::Udp4};
+            (IpHelper.read(same_table), IpHelper.read(other_table))
+        } else {
+            (None, None)
+        };
+        let mut report = lock(&self.meters.attribution);
+        report.nat = self.nat.stats();
+        report.observe(flow, &attributed.attribution, monotonic_ms(), same.as_deref(), other.as_deref(), attributed.elapsed_ms);
     }
 
     /// Counts the flow and registers it in the book; None when it is the
     /// engine's own (refused) or the book is full.
-    fn admit(&self, flow: &FiveTuple, pid: Option<u32>, proto: FlowProto, kind: FlowKind) -> Option<u64> {
-        if pid == Some(self.own_pid) {
+    fn admit(&self, flow: &FiveTuple, attributed: &Attributed, proto: FlowProto, kind: FlowKind) -> Option<u64> {
+        let attribution = &attributed.attribution;
+        if attribution.pid() == Some(self.own_pid) {
             Meters::bump(&self.meters.own_refused);
             return None;
         }
-        Meters::bump(&self.meters.flows);
-        if pid.is_some() {
-            Meters::bump(&self.meters.attributed);
-        }
+        attribution.count(&self.meters);
+        #[cfg(feature = "attribution-diagnostics")]
+        self.observe(*flow, attributed);
+        let (pid, forwarded) = attribution.event_fields();
         let exe = pid.and_then(|p| lock(&self.exes).exe(p, monotonic_ms()));
         let event = FlowEvent {
             id: 0,
@@ -150,6 +196,7 @@ impl Relay {
             bytes_up: 0,
             bytes_down: 0,
             open: true,
+            forwarded,
         };
         lock(&self.book).open(event)
     }
@@ -208,9 +255,9 @@ async fn close_app(app: &mut IpStackTcpStream) {
 pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
     let flow = FiveTuple { proto: Proto::Tcp, local: app.local_addr(), remote: app.peer_addr() };
     let dns = flow.remote.port() == DNS_PORT;
-    let (pid, upstream) = tokio::join!(ctx.owner(flow), ctx.connect(flow.remote));
+    let (attributed, upstream) = tokio::join!(ctx.attribute(flow), ctx.connect(flow.remote));
     let kind = if dns { FlowKind::Dns } else { FlowKind::Other };
-    let Some(id) = ctx.admit(&flow, pid, FlowProto::Tcp, kind) else { return close_app(&mut app).await };
+    let Some(id) = ctx.admit(&flow, &attributed, FlowProto::Tcp, kind) else { return close_app(&mut app).await };
     let upstream = match upstream {
         Ok(u) => u,
         Err(_) => {
@@ -246,9 +293,9 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
 pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
     let flow = FiveTuple { proto: Proto::Udp, local: app.local_addr(), remote: app.peer_addr() };
     let dns = flow.remote.port() == DNS_PORT;
-    let owner = {
+    let attribution = {
         let c = ctx.clone();
-        tokio::spawn(async move { c.owner(flow).await })
+        tokio::spawn(async move { c.attribute(flow).await })
     };
     // Datagrams are held until the flow is decoded (a QUIC ClientHello can
     // span two Initials); a DNS query is decoded by its question.
@@ -269,8 +316,8 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
             _ => return,
         }
     };
-    let pid = owner.await.unwrap_or(None);
-    let Some(id) = ctx.admit(&flow, pid, FlowProto::Udp, if dns { FlowKind::Dns } else { kind_of(&decided) }) else { return };
+    let Ok(attributed) = attribution.await else { return };
+    let Some(id) = ctx.admit(&flow, &attributed, FlowProto::Udp, if dns { FlowKind::Dns } else { kind_of(&decided) }) else { return };
     ctx.decided(id, &decided, dns);
     let up = match ctx.egress_socket(flow.remote, true).and_then(|s| UdpSocket::from_std(s.into()).map_err(|e| e.to_string())) {
         Ok(u) => u,
