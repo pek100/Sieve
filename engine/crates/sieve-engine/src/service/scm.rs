@@ -211,18 +211,28 @@ fn trust() -> Result<String, String> {
 /// once with [`removal::PURGE_ARG`]. It writes the outcome to `ca.json`.
 fn ca_keys() -> Result<String, String> {
     let dir = state::engine_dir(&state::program_data()?);
-    if removal::remaining(&dir).is_none() {
-        return Ok("no key recorded".into());
-    }
-    let Some(service) = open(ServiceAccess::QUERY_STATUS | ServiceAccess::START)? else {
-        return Err("the service is not installed, so the keys cannot be reached".into());
+    removal::purge_through_service(&dir, || {
+        let Some(service) = open(ServiceAccess::QUERY_STATUS | ServiceAccess::START)? else {
+            return Err("the service is not installed, so the keys cannot be reached: run install, then uninstall".into());
+        };
+        service.start(&[removal::PURGE_ARG]).map_err(|e| format!("start: {e}"))?;
+        wait_for(&service, ServiceState::Stopped)
+    })
+}
+
+/// A service kept for uninstall's rerun starts on demand only: nothing of Sieve
+/// runs at the next boot, and `install` makes it automatic again.
+fn hold_for_rerun() -> Result<(), String> {
+    let Some(service) = open(ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG)? else {
+        return Err("the service is not installed: run install, then uninstall".into());
     };
-    service.start(&[removal::PURGE_ARG]).map_err(|e| format!("start: {e}"))?;
-    wait_for(&service, ServiceState::Stopped)?;
-    match removal::remaining(&dir) {
-        None => Ok("keys deleted".into()),
-        Some(why) => Err(why),
-    }
+    let held = ServiceInfo { start_type: ServiceStartType::OnDemand, executable_path: registered_image(&service)?, ..info()? };
+    service.change_config(&held).map_err(|e| format!("change config: {e}"))
+}
+
+fn delete_service() -> Result<String, String> {
+    let dir = state::engine_dir(&state::program_data()?);
+    removal::delete_service_once_clear(&dir, hold_for_rerun, delete)
 }
 
 /// Every route on an interface named "Sieve" and every journalled one (a
@@ -257,14 +267,15 @@ fn install_steps(folder: impl FnOnce() -> Result<String, String>, rest: impl FnO
 }
 
 /// Removal comes first in every off path (plan 2.4); `ca keys` needs the
-/// service, so it comes before the deletion, and `program data` last.
+/// service, so it comes before the deletion, which waits until nothing recorded
+/// remains (a rerun needs it too), and `program data` last.
 type StepFn = fn() -> Result<String, String>;
 const UNINSTALL: [(&str, StepFn); 6] = [
     ("routes", routes),
     ("stop", stop),
     ("trust", trust),
     ("ca keys", ca_keys),
-    ("delete service", delete),
+    ("delete service", delete_service),
     ("program data", remove_program_data),
 ];
 

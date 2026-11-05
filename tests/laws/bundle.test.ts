@@ -62,6 +62,15 @@ describe("bundle law", () => {
     expect(macro("NSIS_HOOK_POSTUNINSTALL")).toContain('Delete "$SieveEngine"');
   });
 
+  it("a failed uninstall verb keeps the engine its rerun needs, and says how to finish", () => {
+    const pre = macro("NSIS_HOOK_PREUNINSTALL");
+    expect(pre).toMatch(/" uninstall'\s+Pop \$0\s+\$\{If\} \$0 != 0\s+StrCpy \$SieveEngineKept 1\s+MessageBox/);
+    const post = macro("NSIS_HOOK_POSTUNINSTALL");
+    expect(post).toMatch(/\$\{AndIf\} \$SieveEngineKept != 1\s+Delete "\$SieveEngine"/);
+    // No delete of an engine file sits outside that guard.
+    expect(post.indexOf("Delete")).toBeGreaterThan(post.indexOf("$SieveEngineKept"));
+  });
+
   it("locks the install folder before any file is copied, owner first", () => {
     const pre = macro("NSIS_HOOK_PREINSTALL");
     expect(pre).not.toMatch(/\bFile\b/);

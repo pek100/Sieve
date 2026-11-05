@@ -15,9 +15,11 @@
 //!   and the Firefox policy (admin rights reach those), start the service
 //!   once with [`crate::ca::removal::PURGE_ARG`] to delete the CNG keys (their
 //!   DACL is SYSTEM only), delete the service (by name, wherever its
-//!   registered image is), delete `ProgramData\Sieve` (keeping `ca.json`
-//!   while it records anything unremoved). Every step runs even when one
-//!   fails, and rerunning it is safe;
+//!   registered image is), delete `ProgramData\Sieve`. While `ca.json` records
+//!   anything unremoved it stays, and so does the service (set to start on
+//!   demand), because a rerun reaches the keys only through it; that step
+//!   reports FAILED. Every other step runs even when one fails, and rerunning
+//!   the verb with the same exe finishes the job;
 //! - `restore`: the emergency off. Delete every route on an interface named
 //!   "Sieve" and stop the service; nothing else (the root is not network
 //!   state, and an update runs `restore` then `install`).

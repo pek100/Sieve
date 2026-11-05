@@ -84,4 +84,11 @@ describe("trust write law", () => {
     expect(order.every((at) => at >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
   });
+
+  it("the verb's service deletion goes through the gate that keeps it for the rerun", () => {
+    const scm = read(SERVICE_SIDE[1]);
+    expect(scm).toContain('("delete service", delete_service)');
+    expect(scm).toContain("removal::delete_service_once_clear(&dir, hold_for_rerun, delete)");
+    expect(scm).toContain("removal::purge_through_service(&dir, ");
+  });
 });

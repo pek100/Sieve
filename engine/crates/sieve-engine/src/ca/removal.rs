@@ -2,7 +2,8 @@
 //! admin rights reach the store and HKLM, so [`remove_trust`] runs in the
 //! verb, first. The key's DACL is SYSTEM only, so [`purge_keys`] runs in the
 //! service, which the verb starts with [`PURGE_ARG`]. Each records what it
-//! did in `ca.json`; [`remaining`] says what is still on the machine.
+//! did in `ca.json`; [`remaining`] says what is still on the machine, and
+//! while it says anything the service and `ca.json` stay for the rerun.
 
 use std::path::Path;
 
@@ -87,6 +88,32 @@ pub fn remaining(dir: &Path) -> Option<String> {
         }
         Err(why) => Some(why),
     }
+}
+
+/// `ca keys`: asks the service to purge when anything is recorded, then reads
+/// the outcome from `ca.json`.
+pub fn purge_through_service(dir: &Path, purge: impl FnOnce() -> Result<(), String>) -> Result<String, String> {
+    if remaining(dir).is_none() {
+        return Ok("no key recorded".into());
+    }
+    purge()?;
+    remaining(dir).map_or_else(|| Ok("keys deleted".into()), Err)
+}
+
+/// `delete service`: runs `delete` once [`remaining`] is clear. Until then the
+/// service is the rerun's only way to the keys, so it runs `hold` instead and
+/// reports the step failed.
+pub fn delete_service_once_clear(
+    dir: &Path,
+    hold: impl FnOnce() -> Result<(), String>,
+    delete: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    let Some(why) = remaining(dir) else { return delete() };
+    let kept = format!("service kept so that rerunning uninstall can reach the keys: {why}");
+    Err(match hold() {
+        Ok(()) => kept,
+        Err(held) => format!("{kept}; {held}"),
+    })
 }
 
 /// Deletes `sieve_dir`, except `engine\ca.json` while it still records
@@ -267,5 +294,144 @@ mod tests {
         assert!(remove_program_data(&sieve, &engine).unwrap().ends_with("deleted"));
         assert!(!sieve.exists());
         assert!(remove_program_data(&sieve, &engine).unwrap().ends_with("not there"), "rerun is safe");
+    }
+
+    /// The machine as uninstall's steps see it. The service purges as the real
+    /// one does: a failed purge still stops cleanly and leaves its outcome in
+    /// `ca.json` alone.
+    struct Machine {
+        root: tempfile::TempDir,
+        store: FakeRootStore,
+        firefox: FakeFirefox,
+        keys: MemoryKeyStore,
+        service_installed: std::cell::Cell<bool>,
+        service_held: std::cell::Cell<bool>,
+        service_start: std::cell::RefCell<Result<(), String>>,
+    }
+
+    impl Machine {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let (_, engine) = laid_out(root.path());
+            recorded(&engine);
+            let keys = MemoryKeyStore::default();
+            for name in ["new", "old", "foreign"] {
+                keys.create(name).unwrap();
+            }
+            Self {
+                root,
+                store: store(),
+                firefox: FakeFirefox::default(),
+                keys,
+                service_installed: true.into(),
+                service_held: false.into(),
+                service_start: Ok(()).into(),
+            }
+        }
+
+        fn sieve(&self) -> std::path::PathBuf {
+            self.root.path().join("Sieve")
+        }
+
+        fn engine(&self) -> std::path::PathBuf {
+            self.sieve().join("engine")
+        }
+
+        /// The verb's CA steps in the verb's order, each running whatever the
+        /// last one did. Returns (trust, ca keys, delete service, program data).
+        fn uninstall(&self) -> [Result<String, String>; 4] {
+            let engine = self.engine();
+            let trust = remove_trust(&engine, &self.store, &self.firefox);
+            let keys = purge_through_service(&engine, || {
+                if !self.service_installed.get() {
+                    return Err("the service is not installed".into());
+                }
+                self.service_start.borrow().clone()?;
+                let _ = purge_keys(&engine, &self.keys);
+                Ok(())
+            });
+            let delete = delete_service_once_clear(
+                &engine,
+                || {
+                    self.service_held.set(true);
+                    Ok(())
+                },
+                || {
+                    self.service_installed.set(false);
+                    Ok("deleted".into())
+                },
+            );
+            let data = remove_program_data(&self.sieve(), &engine);
+            [trust, keys, delete, data]
+        }
+
+        fn assert_finished(&self) {
+            assert_eq!(self.store.thumbprints(), ["cc"]);
+            assert_eq!(self.keys.names(), ["foreign"]);
+            assert!(!self.service_installed.get());
+            assert!(!self.sieve().exists());
+        }
+    }
+
+    #[test]
+    fn a_clean_uninstall_deletes_the_service_and_never_holds_it() {
+        let machine = Machine::new();
+        assert!(machine.uninstall().iter().all(Result::is_ok));
+        assert!(!machine.service_held.get());
+        machine.assert_finished();
+    }
+
+    #[test]
+    fn a_failed_key_delete_keeps_the_service_and_the_rerun_finishes() {
+        let machine = Machine::new();
+        machine.keys.faults.fail_named.lock().unwrap().insert("key delete");
+        let [trust, keys, delete, data] = machine.uninstall();
+        assert!(trust.is_ok(), "the root does not wait for the key");
+        assert!(keys.is_err() && data.is_err());
+        assert!(delete.unwrap_err().contains("kept"), "keeping the service is reported, not silent");
+        assert!(machine.service_installed.get() && machine.service_held.get());
+        assert_eq!(machine.store.thumbprints(), ["cc"]);
+        assert!(machine.engine().join(state::CA_FILE).exists());
+
+        machine.keys.faults.clear();
+        assert!(machine.uninstall().iter().all(Result::is_ok));
+        machine.assert_finished();
+    }
+
+    #[test]
+    fn a_service_that_would_not_start_is_kept_and_the_rerun_finishes() {
+        let machine = Machine::new();
+        *machine.service_start.borrow_mut() = Err("start: refused".into());
+        let [_, keys, delete, _] = machine.uninstall();
+        assert_eq!(keys.unwrap_err(), "start: refused");
+        assert!(delete.is_err() && machine.service_installed.get());
+
+        *machine.service_start.borrow_mut() = Ok(());
+        assert!(machine.uninstall().iter().all(Result::is_ok));
+        machine.assert_finished();
+    }
+
+    /// The key went on the first run, but its entry stays while the root is
+    /// there, and the rerun still has to clear that entry through the service.
+    #[test]
+    fn a_failed_root_removal_keeps_the_service_too() {
+        let machine = Machine::new();
+        machine.store.faults.fail_named.lock().unwrap().insert("store remove");
+        let [trust, keys, delete, _] = machine.uninstall();
+        assert!(trust.is_err() && keys.is_err() && delete.is_err());
+        assert_eq!(machine.keys.names(), ["foreign"]);
+        assert!(machine.service_installed.get());
+
+        machine.store.faults.clear();
+        assert!(machine.uninstall().iter().all(Result::is_ok));
+        machine.assert_finished();
+    }
+
+    #[test]
+    fn a_failed_hold_is_reported_with_the_reason_the_service_stayed() {
+        let dir = tempfile::tempdir().unwrap();
+        recorded(dir.path());
+        let why = delete_service_once_clear(dir.path(), || Err("change config: denied".into()), || panic!("must not delete")).unwrap_err();
+        assert!(why.contains("not removed") && why.contains("change config: denied"), "{why}");
     }
 }
