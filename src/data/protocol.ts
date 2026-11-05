@@ -398,6 +398,21 @@ export interface EngineCounters {
   packets_in: number;
   packets_out: number;
   not_unicast: number;
+  forwarded: number;
+  forwarded_named: number;
+  etw_found: number;
+  etw_disagreed: number;
+  etw_dropped: number;
+}
+
+/** One row of "Virtual machines and WSL": what the engine has seen of one VM since it started. */
+export interface EngineGuest {
+  /** `sieve_ipc::vm_key`, its key in `apps.levels`. */
+  key: string;
+  /** Null is the unidentified row. */
+  vm: string | null;
+  seen: number;
+  open: number;
 }
 
 export interface EngineStatus {
@@ -410,9 +425,41 @@ export interface EngineStatus {
   blocker: EngineBlocker | null;
   split_tunnels: string[];
   counters: EngineCounters;
+  guests: EngineGuest[];
 }
 
-const COUNTER_KEYS = ["flows", "attributed", "own_refused", "dns_answers", "packets_in", "packets_out", "not_unicast"] as const;
+const COUNTER_KEYS = [
+  "flows",
+  "attributed",
+  "own_refused",
+  "dns_answers",
+  "packets_in",
+  "packets_out",
+  "not_unicast",
+  "forwarded",
+  "forwarded_named",
+  "etw_found",
+  "etw_disagreed",
+  "etw_dropped",
+] as const;
+
+const GUEST_KEY_PREFIX = "vm:";
+
+/** One guest row, or null when it is broken: the rest of the list still renders. */
+function guest(raw: unknown): EngineGuest | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const g = raw as Record<string, unknown>;
+  const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+  if (typeof g.key !== "string" || !g.key.startsWith(GUEST_KEY_PREFIX)) return null;
+  if (g.vm !== null && typeof g.vm !== "string") return null;
+  if (!count(g.seen) || !count(g.open)) return null;
+  return { key: g.key, vm: g.vm, seen: g.seen as number, open: g.open as number };
+}
+
+/** The guests of a status. A missing or broken list is no guests: an optional group never fails the whole status. */
+function guests(raw: unknown): EngineGuest[] {
+  return Array.isArray(raw) ? raw.map(guest).filter((g) => g !== null) : [];
+}
 
 function blocker(raw: unknown): EngineBlocker {
   const b = rec(raw, "status.blocker");
@@ -430,7 +477,7 @@ function blocker(raw: unknown): EngineBlocker {
   }
 }
 
-/** Validate an untrusted engine Status (sieve-ipc v2). Throws ProtocolError. */
+/** Validate an untrusted engine Status (sieve-ipc). Throws ProtocolError. */
 export function parseEngineStatus(raw: unknown): EngineStatus {
   const s = rec(raw, "status");
   const p = rec(s.policy, "status.policy");
@@ -445,6 +492,7 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
     blocker: s.blocker === null ? null : blocker(s.blocker),
     split_tunnels: strings(s.split_tunnels, "status.split_tunnels"),
     counters: Object.fromEntries(COUNTER_KEYS.map((k) => [k, int(c[k], `counters.${k}`)])) as unknown as EngineCounters,
+    guests: guests(s.guests),
   };
 }
 

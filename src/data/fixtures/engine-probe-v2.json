@@ -21,7 +21,8 @@
           "policy": { "revision": 0, "engine": false },
           "blocker": null,
           "split_tunnels": [],
-          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "guests": []
         }
       }
     },
@@ -42,7 +43,11 @@
           "policy": { "revision": 2, "engine": true },
           "blocker": null,
           "split_tunnels": ["Corp VPN"],
-          "counters": { "flows": 1200, "attributed": 1188, "own_refused": 0, "dns_answers": 310, "packets_in": 90000, "packets_out": 88000, "not_unicast": 51 }
+          "counters": { "flows": 1200, "attributed": 1188, "own_refused": 0, "dns_answers": 310, "packets_in": 90000, "packets_out": 88000, "not_unicast": 51, "forwarded": 6, "forwarded_named": 4, "etw_found": 3, "etw_disagreed": 1, "etw_dropped": 0 },
+          "guests": [
+            { "key": "vm:devbox", "vm": "DevBox", "seen": 4, "open": 1 },
+            { "key": "vm:unidentified", "vm": null, "seen": 2, "open": 1 }
+          ]
         }
       }
     },
@@ -63,7 +68,8 @@
           "policy": { "revision": 2, "engine": true },
           "blocker": { "kind": "adguard", "service": "Adguard Service" },
           "split_tunnels": [],
-          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "guests": []
         }
       }
     },
@@ -84,7 +90,8 @@
           "policy": { "revision": 2, "engine": true },
           "blocker": { "kind": "vpn", "adapter": "AdGuard VPN" },
           "split_tunnels": [],
-          "counters": { "flows": 300, "attributed": 297, "own_refused": 0, "dns_answers": 80, "packets_in": 20000, "packets_out": 19000, "not_unicast": 4 }
+          "counters": { "flows": 300, "attributed": 297, "own_refused": 0, "dns_answers": 80, "packets_in": 20000, "packets_out": 19000, "not_unicast": 4, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "guests": []
         }
       }
     },
@@ -105,7 +112,8 @@
           "policy": { "revision": 2, "engine": true },
           "blocker": { "kind": "crash_loop", "starts": 3 },
           "split_tunnels": [],
-          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "guests": []
         }
       }
     },
@@ -126,7 +134,8 @@
           "policy": { "revision": 2, "engine": true },
           "blocker": { "kind": "setup", "message": "wintun.dll: SHA-256 does not match the pinned 0.14.1 build" },
           "split_tunnels": [],
-          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0 }
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "guests": []
         }
       }
     },

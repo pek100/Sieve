@@ -21,6 +21,7 @@ import {
   PIPE_KINDS,
   SERVICE_FACTS,
   parseEngineProbe,
+  parseEngineStatus,
   PROTOCOL_VERSION,
   WINDOWS_DNS_VERSION,
   parseDnsStatus,
@@ -156,6 +157,20 @@ describe("protocol law", () => {
     expect(() => parseEngineProbe({ ...idle, pipe: { ...idle.pipe, status: { ...idle.pipe.status, flows: -1 } } })).toThrow(/status\.flows/);
     expect(() => parseEngineProbe({ ...idle, pipe: { kind: "incompatible", supported: [1] } })).toThrow(/supported/);
     expect(() => parseEngineProbe(null)).toThrow(ProtocolError);
+  });
+
+  it("engine status: a broken guest list degrades to the good rows; a missing counter is refused", () => {
+    const status = engineFixture.examples.filtering.pipe.status;
+    const named = { key: "vm:devbox", vm: "DevBox", seen: 4, open: 1 };
+    const { guests: _dropped, ...withoutGuests } = status;
+    expect(parseEngineStatus(withoutGuests).guests).toEqual([]);
+    for (const notAList of [null, "x", 7, {}]) expect(parseEngineStatus({ ...status, guests: notAList }).guests).toEqual([]);
+    const broken = [null, 7, {}, { ...named, key: 7 }, { ...named, key: "devbox" }, { ...named, vm: 7 }, { ...named, seen: -1 }, { ...named, open: "1" }, { key: "vm:x", vm: null, seen: 1 }];
+    for (const entry of broken) expect(parseEngineStatus({ ...status, guests: [entry, named] }).guests, JSON.stringify(entry)).toEqual([named]);
+    for (const counter of ["forwarded", "forwarded_named", "etw_found", "etw_disagreed", "etw_dropped"]) {
+      const counters = Object.fromEntries(Object.entries(status.counters).filter(([k]) => k !== counter));
+      expect(() => parseEngineStatus({ ...status, counters }), counter).toThrow(new RegExp(`counters\\.${counter}`));
+    }
   });
 
   it("engine_probe: version, service facts and pipe kinds agree with src-tauri/src/engine.rs", () => {

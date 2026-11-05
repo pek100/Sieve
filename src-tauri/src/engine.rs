@@ -347,7 +347,8 @@ mod tests {
     #[test]
     fn engine_flows_become_snapshot_rows_with_the_tables_meaning() {
         let rows: Vec<Flow> = fixture_flows().iter().filter_map(snapshot_flow).collect();
-        assert_eq!(rows.len(), 4, "the unattributed QUIC flow is left out");
+        assert_eq!(rows.len(), 4, "the unattributed QUIC flow and both forwarded flows are left out");
+        assert!(fixture_flows().iter().filter(|f| f.forwarded.is_some()).count() == 2);
         assert_eq!(rows[0].pid, 4242);
         assert_eq!((rows[0].proto, rows[0].family, rows[0].state), (Proto::Tcp, Family::V4, FlowState::Established));
         assert_eq!(rows[0].local, Endpoint { addr: "198.18.0.1".into(), port: 50112 });
@@ -361,7 +362,7 @@ mod tests {
         assert_eq!(flows.flows(), None, "not live: the app reads the connection tables");
         flows.set_live(true);
         flows.apply(fixture_flows());
-        // Open in the fixture: ids 7, 9 (no pid) and 11; 8 and 10 are closed.
+        // Open in the fixture: ids 7, 9 (no pid), 11, and 12 and 13 (forwarded, no pid); 8 and 10 are closed.
         assert_eq!(flows.flows().unwrap().iter().map(|f| f.pid).collect::<Vec<_>>(), [4242, 912]);
         let mut close = fixture_flows()[0].clone();
         close.open = false;

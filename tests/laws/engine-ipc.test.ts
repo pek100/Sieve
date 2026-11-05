@@ -1,7 +1,7 @@
 /**
  * Law 9, engine IPC: the app and the engine speak one pipe protocol, owned by
  * the Rust crate `engine/crates/sieve-ipc`. Its fixture
- * `src/data/fixtures/engine-ipc-v1.json` is read by the Rust tests
+ * `src/data/fixtures/engine-ipc-v2.json` is read by the Rust tests
  * (`cargo test -p sieve-ipc`: every message round trips) and here: the
  * version, the limits and every message type name agree with the crate.
  * Changing a message shape bumps PROTOCOL and the fixture in one commit.
@@ -47,6 +47,18 @@ describe("engine IPC law", () => {
   it("fixture names every message type of the crate, in order", () => {
     expect(fixture.client.map((m) => m.type)).toEqual(rustNames("CLIENT_TYPES"));
     expect(fixture.engine.map((m) => m.type)).toEqual(rustNames("ENGINE_TYPES"));
+  });
+
+  it("a VM row's key is the crate's vm_key, and a flow is a process's or a guest's, never both", () => {
+    const body = RUST.match(/pub fn vm_key\(vm: Option<&str>\) -> String \{([\s\S]*?)\n\}/)?.[1] ?? "";
+    expect(body).toContain('format!("vm:{}"');
+    expect(body).toContain("to_lowercase");
+    expect(rustConst("VM_UNIDENTIFIED")).toBe('"unidentified"');
+    const status = fixture.engine.find((m) => m.type === "status")! as unknown as { guests: { key: string; vm: string | null }[] };
+    expect(status.guests.length).toBeGreaterThan(1);
+    for (const g of status.guests) expect(g.key).toBe(`vm:${(g.vm ?? "unidentified").toLowerCase()}`);
+    const flows = fixture.engine.find((m) => m.type === "flows")! as unknown as { flows: { pid: number | null; forwarded: unknown }[] };
+    for (const f of flows.flows) expect(f.pid === null || f.forwarded === null).toBe(true);
   });
 
   it("no message can sign, export or mint", () => {
