@@ -42,7 +42,11 @@ describe("engine updates", () => {
   });
 
   it("only an offered release installs; every other button only checks; applying has none", () => {
-    expect(updateNotice(engineUpdate(facts("update_available")))?.action).toBe(INSTALL_UPDATE);
+    const available = updateNotice(engineUpdate(facts("update_available")));
+    expect(available?.action).toBe(INSTALL_UPDATE);
+    // An engine release never closes the app and the status does not carry the kind.
+    expect(available?.text).toContain("may close");
+    expect(available?.text).not.toContain("closes Sieve");
     expect(updateNotice(engineUpdate(facts("update_applying")))?.action).toBeNull();
     for (const name of ["update_current", "update_stale", "update_failed", "update_refused", "update_rolled_back"] as const) {
       expect(updateNotice(engineUpdate(facts(name)))?.action, name).toBe(CHECK_AGAIN);

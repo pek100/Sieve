@@ -137,8 +137,12 @@ pub fn on_service_start(dir: &Path, own: u64, log: &dyn Log) -> Option<Pending> 
 }
 
 /// The new engine answered its own pipe: the record rises, then the pending
-/// file goes. The supervisor reads both, in that order.
+/// file goes. The supervisor reads both, in that order. With the release no
+/// longer in flight the supervisor has already decided, and nothing rises.
 pub fn commit_healthy(dir: &Path, pending: &Pending) -> Result<(), String> {
+    if load_pending(dir)?.as_ref() != Some(pending) {
+        return Ok(());
+    }
     let mut record = load_record(dir)?;
     record.versions.insert(pending.kind.clone(), pending.to_version);
     save_record(dir, &record)?;
@@ -151,13 +155,22 @@ pub fn is_committed(dir: &Path, pending: &Pending) -> Result<bool, String> {
     Ok(load_record(dir)?.versions.get(&pending.kind) == Some(&pending.to_version))
 }
 
-/// Rollback: the version record stays where it was, the failed version is
-/// remembered, and the pending file goes.
+/// Rollback: the failed version is remembered and the pending file goes. The
+/// version record says what is installed, and that is not this release: if its
+/// report landed before the verdict, the raise is undone. The entry goes rather
+/// than falling to an older number, since [`installed`] already has the restored
+/// build's own as its baseline. A damaged record is reported, never reset, and
+/// the release is over all the same.
 pub fn record_rollback(dir: &Path, pending: &Pending) -> Result<(), String> {
-    let mut record = load_record(dir)?;
-    record.rolled_back.insert(pending.kind.clone(), pending.to_version);
-    save_record(dir, &record)?;
-    clear_pending(dir)
+    let recorded = load_record(dir).and_then(|mut record| {
+        if record.versions.get(&pending.kind) == Some(&pending.to_version) {
+            record.versions.remove(&pending.kind);
+        }
+        record.rolled_back.insert(pending.kind.clone(), pending.to_version);
+        save_record(dir, &record)
+    });
+    let cleared = clear_pending(dir);
+    recorded.and(cleared)
 }
 
 /// Where refusal reasons go.
@@ -296,6 +309,48 @@ pub(crate) mod tests {
         commit_healthy(dir.path(), &p).unwrap();
         assert!(is_committed(dir.path(), &p).unwrap());
         assert_eq!(load_pending(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_rollback_takes_back_a_commit_that_landed_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pending(1, 2);
+        save_pending(dir.path(), &p).unwrap();
+        commit_healthy(dir.path(), &p).unwrap();
+        save_pending(dir.path(), &p).unwrap();
+        record_rollback(dir.path(), &p).unwrap();
+        let r = load_record(dir.path()).unwrap();
+        assert_eq!((r.versions.get("engine"), r.rolled_back.get("engine")), (None, Some(&2)));
+        assert_eq!(installed(&Kind::Engine, &r, 1), 1);
+
+        let mut kept = Record::default();
+        kept.versions.insert("engine".into(), 1);
+        kept.versions.insert("app".into(), 2);
+        save_record(dir.path(), &kept).unwrap();
+        record_rollback(dir.path(), &p).unwrap();
+        let r = load_record(dir.path()).unwrap();
+        assert_eq!(r.versions, kept.versions, "only this release's own raise is undone");
+    }
+
+    #[test]
+    fn a_report_after_the_rollback_raises_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pending(1, 2);
+        save_pending(dir.path(), &p).unwrap();
+        record_rollback(dir.path(), &p).unwrap();
+        commit_healthy(dir.path(), &p).unwrap();
+        assert!(!is_committed(dir.path(), &p).unwrap());
+    }
+
+    #[test]
+    fn a_rollback_over_a_damaged_record_still_ends_the_flight_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pending(1, 2);
+        save_pending(dir.path(), &p).unwrap();
+        std::fs::write(dir.path().join(STATE_FILE), b"not json").unwrap();
+        assert!(record_rollback(dir.path(), &p).is_err());
+        assert_eq!(load_pending(dir.path()).unwrap(), None);
+        assert_eq!(std::fs::read(dir.path().join(STATE_FILE)).unwrap(), b"not json", "never reset");
     }
 
     #[test]

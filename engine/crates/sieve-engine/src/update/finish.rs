@@ -92,7 +92,7 @@ impl Supervisor<'_> {
         if let Err(why) = self.service.start() {
             return self.roll_back(&kind, &pending, &format!("the new version did not start: {why}"));
         }
-        match self.wait_healthy(&pending)? {
+        match self.wait_healthy(&pending) {
             Health::Healthy => {
                 self.log.line(&format!("{} {} is healthy", pending.kind, pending.to_version));
                 // A file still in use stays until the next check; this is not a failure.
@@ -123,18 +123,35 @@ impl Supervisor<'_> {
         }
     }
 
-    fn wait_healthy(&self, pending: &Pending) -> Result<Health, String> {
+    /// A state file that cannot be read proves nothing either way: the new set
+    /// stays unproven, so the wait goes on, and the deadline rolls it back.
+    fn wait_healthy(&self, pending: &Pending) -> Health {
         let deadline = self.clock.now_ms() + HEALTH_DEADLINE_MS;
+        let mut reported = None;
         loop {
-            if state::load_pending(&self.engine_dir)?.is_none() {
-                let raised = state::is_committed(&self.engine_dir, pending)?;
-                return Ok(if raised { Health::Healthy } else { Health::Refused });
+            match self.read_health(pending) {
+                Ok(Some(health)) => return health,
+                Ok(None) => {}
+                Err(why) if reported.as_ref() != Some(&why) => {
+                    self.log.line(&why);
+                    reported = Some(why);
+                }
+                Err(_) => {}
             }
             if self.clock.now_ms() >= deadline {
-                return Ok(Health::Timeout);
+                return Health::Timeout;
             }
             self.clock.sleep_ms(HEALTH_POLL_MS);
         }
+    }
+
+    /// The new engine's verdict, or None while the release is still in flight.
+    fn read_health(&self, pending: &Pending) -> Result<Option<Health>, String> {
+        if state::load_pending(&self.engine_dir)?.is_some() {
+            return Ok(None);
+        }
+        let raised = state::is_committed(&self.engine_dir, pending)?;
+        Ok(Some(if raised { Health::Healthy } else { Health::Refused }))
     }
 
     fn roll_back(&self, kind: &Kind, pending: &Pending, why: &str) -> Result<Outcome, String> {
@@ -172,7 +189,7 @@ enum Health {
 #[cfg(test)]
 mod tests {
     use super::super::state::tests::MemLog;
-    use super::super::state::{Record, Recovery, load_record, recover};
+    use super::super::state::{Record, Recovery, installed, load_record, recover};
     use super::super::swap::tests::{FailingFs, NEW_ENGINE, OLD_ENGINE};
     use super::super::swap::{OLD_SUFFIX, RealFs};
     use super::super::testing::listing;
@@ -193,6 +210,10 @@ mod tests {
         ExitsAtStart,
         /// It runs and never reports.
         Silent,
+        /// It reports after the deadline, while the rollback's stop is under way.
+        ReportsDuringStop,
+        /// It reports, while the service manager's wait for it times out.
+        ReportsButStartTimesOut,
     }
 
     struct FakeService<'a> {
@@ -204,6 +225,13 @@ mod tests {
         starts: Cell<u32>,
         /// Whether `.old` existed at each transition after the first stop.
         old_seen: RefCell<Vec<bool>>,
+    }
+
+    /// The new engine's report, when one is still in flight.
+    fn report(engine_dir: &Path) {
+        if let Some(p) = state::load_pending(engine_dir).unwrap() {
+            state::commit_healthy(engine_dir, &p).unwrap();
+        }
     }
 
     impl<'a> FakeService<'a> {
@@ -228,6 +256,9 @@ mod tests {
         fn stop(&self) -> Result<(), String> {
             self.stops.set(self.stops.get() + 1);
             self.note();
+            if matches!(self.engine, Engine::ReportsDuringStop) && self.starts.get() > 0 {
+                report(self.engine_dir);
+            }
             if self.refuses_stop { Err("still StopPending".into()) } else { Ok(()) }
         }
 
@@ -237,7 +268,11 @@ mod tests {
             self.note();
             let own = match self.engine {
                 Engine::ExitsAtStart => return Err("exited at start".into()),
-                Engine::Silent => return Ok(()),
+                Engine::Silent | Engine::ReportsDuringStop => return Ok(()),
+                Engine::ReportsButStartTimesOut => {
+                    report(self.engine_dir);
+                    return Err("still StartPending".into());
+                }
                 Engine::Report(own) => own,
             };
             if let Some(p) = state::load_pending(self.engine_dir).unwrap() {
@@ -254,6 +289,8 @@ mod tests {
     struct FakeInstaller {
         calls: RefCell<Vec<(PathBuf, PathBuf, PathBuf)>>,
         fails: bool,
+        /// Its post-install hook started the new engine, which reported here.
+        hook_engine_reports_to: Option<PathBuf>,
     }
 
     impl Installer for FakeInstaller {
@@ -262,6 +299,9 @@ mod tests {
             std::fs::write(install.join(ENGINE_EXE), NEW_ENGINE).unwrap();
             std::fs::write(install.join("sieve.exe"), b"new app").unwrap();
             std::fs::write(install.join("added.dll"), b"new").unwrap();
+            if let Some(dir) = &self.hook_engine_reports_to {
+                report(dir);
+            }
             if self.fails { Err("exit code 2".into()) } else { Ok(()) }
         }
     }
@@ -277,6 +317,24 @@ mod tests {
         }
         fn sleep_ms(&self, ms: u64) {
             self.now.set(self.now.get() + ms);
+        }
+    }
+
+    /// A fake clock that also lets the world change on each poll.
+    struct ChangingClock<'a> {
+        clock: FakeClock,
+        polls: Cell<u32>,
+        on_poll: &'a dyn Fn(u32),
+    }
+
+    impl Clock for ChangingClock<'_> {
+        fn now_ms(&self) -> u64 {
+            self.clock.now_ms()
+        }
+        fn sleep_ms(&self, ms: u64) {
+            self.clock.sleep_ms(ms);
+            self.polls.set(self.polls.get() + 1);
+            (self.on_poll)(self.polls.get());
         }
     }
 
@@ -338,6 +396,22 @@ mod tests {
 
         fn run(&self, service: &dyn ServiceControl) -> Result<Outcome, String> {
             self.run_with(&RealFs, service, &FakeInstaller::default()).0
+        }
+
+        fn run_changing(&self, service: &dyn ServiceControl, on_poll: &dyn Fn(u32)) -> (Result<Outcome, String>, MemLog) {
+            let log = MemLog::default();
+            let clock = ChangingClock { clock: FakeClock::default(), polls: Cell::new(0), on_poll };
+            let out = Supervisor {
+                fs: &RealFs,
+                service,
+                installer: &FakeInstaller::default(),
+                clock: &clock,
+                log: &log,
+                engine_dir: self.engine.clone(),
+                install_dir: self.install.clone(),
+            }
+            .finish();
+            (out, log)
         }
 
         fn assert_rolled_back(&self) {
@@ -406,6 +480,70 @@ mod tests {
         assert!(clock.now.get() < HEALTH_DEADLINE_MS + 2 * HEALTH_POLL_MS);
         w.assert_rolled_back();
         assert!(log.0.lock().unwrap().iter().any(|l| l.contains("did not report healthy")));
+    }
+
+    /// A commit can land first when the report and the verdict race. The old
+    /// files come back, so the record must say so.
+    #[test]
+    fn a_commit_that_lands_before_the_rollback_does_not_stay_in_the_record() {
+        for engine in [Engine::ReportsDuringStop, Engine::ReportsButStartTimesOut] {
+            let w = World::engine_only();
+            let service = FakeService::new(&w, engine);
+            assert_eq!(w.run(&service), Ok(Outcome::RolledBack));
+            w.assert_rolled_back();
+            assert_eq!(installed(&Kind::Engine, &w.record(), FROM), FROM);
+        }
+
+        let w = World::new("app", &[ENGINE_EXE, "sieve.exe"]);
+        let service = FakeService::new(&w, Engine::Silent);
+        let installer = FakeInstaller { fails: true, hook_engine_reports_to: Some(w.engine.clone()), ..FakeInstaller::default() };
+        let (out, _) = w.run_with(&RealFs, &service, &installer);
+        assert_eq!(out, Ok(Outcome::RolledBack));
+        w.assert_rolled_back();
+    }
+
+    #[test]
+    fn a_pending_file_damaged_during_the_wait_rolls_back_at_the_deadline() {
+        let w = World::engine_only();
+        let service = FakeService::new(&w, Engine::Silent);
+        let pending_file = w.engine.join(state::PENDING_FILE);
+        let (out, log) = w.run_changing(&service, &|_| std::fs::write(&pending_file, b"not json").unwrap());
+        assert_eq!(out, Ok(Outcome::RolledBack));
+        w.assert_rolled_back();
+        let lines = log.0.lock().unwrap();
+        assert_eq!(lines.iter().filter(|l| l.contains(state::PENDING_FILE)).count(), 1, "said once, not every poll: {lines:?}");
+    }
+
+    #[test]
+    fn a_record_damaged_during_the_wait_restores_the_files_and_reports_the_damage() {
+        let w = World::engine_only();
+        let service = FakeService::new(&w, Engine::Silent);
+        let (out, _) = w.run_changing(&service, &|poll| {
+            if poll == 1 {
+                state::clear_pending(&w.engine).unwrap();
+                std::fs::write(w.engine.join(state::STATE_FILE), b"not json").unwrap();
+            }
+        });
+        assert!(out.as_ref().is_err_and(|why| why.contains(state::STATE_FILE)), "{out:?}");
+        assert_eq!(w.exe(), OLD_ENGINE);
+        assert_eq!(state::load_pending(&w.engine).unwrap(), None);
+        assert_eq!(service.starts.get(), 2, "and the old engine runs again");
+    }
+
+    #[test]
+    fn a_read_error_that_clears_does_not_end_the_wait() {
+        let w = World::engine_only();
+        let service = FakeService::new(&w, Engine::Silent);
+        let pending_file = w.engine.join(state::PENDING_FILE);
+        let good = std::fs::read(&pending_file).unwrap();
+        let (out, _) = w.run_changing(&service, &|poll| match poll {
+            1 => std::fs::write(&pending_file, b"not json").unwrap(),
+            2 => std::fs::write(&pending_file, &good).unwrap(),
+            3 => report(&w.engine),
+            _ => {}
+        });
+        assert_eq!(out, Ok(Outcome::Healthy));
+        assert_eq!(w.exe(), NEW_ENGINE);
     }
 
     #[test]

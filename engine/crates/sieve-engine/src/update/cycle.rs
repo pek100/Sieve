@@ -2,8 +2,9 @@
 //!
 //! The daily check applies data kinds and only reports a release. `RequestUpdate`
 //! carries no field and takes its meaning from the state: while a release is
-//! `available` it applies that one, otherwise it runs a check, so "check again"
-//! can never install something the user was not shown.
+//! `available` it applies that one, otherwise it runs a check, so neither "check
+//! again" nor a host publishing between the check and the click can install
+//! something the user was not shown.
 //!
 //! Every refusal leaves both trees as they were: staged files go, and nothing is
 //! recorded, the accepted index version included, until a cycle had no refusal.
@@ -38,10 +39,11 @@ pub const NOT_RUNNING_MESSAGE: &str = "the updater is not running";
 pub const UNFINISHED_MESSAGE: &str = "the update did not finish; the current version keeps running";
 
 /// A worker's job; the pipe only ever queues one of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Job {
     Check,
-    Apply,
+    /// Installs the release the user was shown, and only that one.
+    Apply { shown: String },
 }
 
 /// What the pipe sees: the status, and the one way to queue work.
@@ -75,7 +77,7 @@ impl UpdateControl {
         let mut status = lock(&self.status);
         let (job, next) = match &*status {
             UpdateStatus::NotConfigured | UpdateStatus::Checking | UpdateStatus::Applying { .. } => return Ok(()),
-            UpdateStatus::Available { version } => (Job::Apply, UpdateStatus::Applying { version: version.clone() }),
+            UpdateStatus::Available { version } => (Job::Apply { shown: version.clone() }, UpdateStatus::Applying { version: version.clone() }),
             _ => {
                 let mut last = lock(&self.last_request_ms);
                 if last.is_some_and(|at| now_ms.saturating_sub(at) < REQUEST_COOLDOWN_MS) {
@@ -212,9 +214,9 @@ impl Updater {
             Ok(None) => self.clear_leftovers(),
             Err(message) => return UpdateStatus::Failed { message },
         }
-        let done = match job {
+        let done = match &job {
             Job::Check => self.check(anchor, now_unix),
-            Job::Apply => self.apply(anchor, now_unix),
+            Job::Apply { shown } => self.apply(anchor, now_unix, shown),
         };
         done.unwrap_or_else(|stop| {
             let status = UpdateStatus::from(stop);
@@ -322,10 +324,12 @@ impl Updater {
         rolled_back(record, self.own).map_or(UpdateStatus::Current, |n| UpdateStatus::RolledBack { version: display_version(n) })
     }
 
-    fn apply(&self, anchor: &TrustAnchor, now_unix: u64) -> Result<UpdateStatus, Stop> {
+    /// The index may have moved since the check: anything but the release on the
+    /// user's screen is shown to them instead, never installed.
+    fn apply(&self, anchor: &TrustAnchor, now_unix: u64, shown: &str) -> Result<UpdateStatus, Stop> {
         let record = state::load_record(&self.engine_dir)?;
         let index = self.read_index(anchor, &record, now_unix)?;
-        let Some((kind, entry)) = offer(&index, &record, self.own) else {
+        let Some((kind, entry)) = offer(&index, &record, self.own).filter(|(_, entry)| display_version(entry.version) == shown) else {
             return Ok(self.outcome(&index, &record));
         };
         let mut staging = Staging::new(self.install_dir.join(STAGING_DIR))?;
@@ -502,6 +506,11 @@ mod tests {
         Kind::Resources
     }
 
+    /// Applying what a check of the usual catalogue showed.
+    fn apply_next() -> Job {
+        Job::Apply { shown: "0.2.0".into() }
+    }
+
     /// Every way the host can serve bad bytes, each from a world holding a
     /// valid catalogue for a data kind and a release: a mutation and whether it
     /// is seen by a check (data, index) or only by applying the release.
@@ -573,24 +582,24 @@ mod tests {
             ("data: shorter than signed", Job::Check, |w| {
                 w.host.put("res.bin", &DATA_BYTES[..3]);
             }),
-            ("release: byte changed", Job::Apply, |w| {
+            ("release: byte changed", apply_next(), |w| {
                 let mut b = NEW_BYTES.to_vec();
                 b[0] ^= 1;
                 w.host.put("new.exe", b);
             }),
-            ("release: no signature", Job::Apply, |w| {
+            ("release: no signature", apply_next(), |w| {
                 w.host.files.lock().unwrap().remove(&signature_name("new.exe"));
             }),
-            ("release: another key", Job::Apply, |w| {
+            ("release: another key", apply_next(), |w| {
                 w.host.put(&signature_name("new.exe"), TestKey::new().sign(NEW_BYTES, &comment(&Kind::Engine, NEXT)));
             }),
-            ("release: a signed list served as engine", Job::Apply, |w| {
+            ("release: a signed list served as engine", apply_next(), |w| {
                 w.host.put(&signature_name("new.exe"), w.key.sign(NEW_BYTES, &comment(&Kind::List("x".into()), NEXT)));
             }),
-            ("release: the old version re-served", Job::Apply, |w| {
+            ("release: the old version re-served", apply_next(), |w| {
                 w.host.put(&signature_name("new.exe"), w.key.sign(NEW_BYTES, &comment(&Kind::Engine, OWN)));
             }),
-            ("release: longer than signed", Job::Apply, |w| {
+            ("release: longer than signed", apply_next(), |w| {
                 let mut b = NEW_BYTES.to_vec();
                 b.push(0);
                 w.host.put("new.exe", b);
@@ -606,12 +615,12 @@ mod tests {
             std::fs::write(w.engine_dir().join(DATA_DIR).join("resources"), b"the previous bundle").unwrap();
             w.publish(7, &[(resources(), 3, "res.bin", DATA_BYTES), (Kind::Engine, NEXT, "new.exe", NEW_BYTES)]);
             mutate(&w);
-            if *job == Job::Apply {
+            if matches!(job, Job::Apply { .. }) {
                 // The data applies first, so this compares only what the release could change.
                 assert!(matches!(w.run(Job::Check), UpdateStatus::Available { .. }), "{name}");
             }
             let before = w.trees();
-            let status = w.run(*job);
+            let status = w.run(job.clone());
             let refused = matches!(status, UpdateStatus::Refused { .. } | UpdateStatus::Stale);
             assert!(refused, "{name}: {status:?}");
             assert_eq!(w.trees(), before, "{name}");
@@ -654,7 +663,7 @@ mod tests {
         let w = World::with_anchor(false);
         w.publish(7, &[(Kind::Engine, NEXT, "new.exe", NEW_BYTES)]);
         assert_eq!(w.updater.initial_status(), UpdateStatus::NotConfigured);
-        for job in [Job::Check, Job::Apply] {
+        for job in [Job::Check, apply_next()] {
             assert_eq!(w.run(job), UpdateStatus::NotConfigured);
         }
         assert_eq!(w.host.call_count(), 0);
@@ -707,8 +716,8 @@ mod tests {
 
         w.updater.control.request(1).unwrap();
         assert_eq!(w.updater.control.status(), UpdateStatus::Applying { version: "0.2.0".into() });
-        assert_eq!(rx.try_recv(), Ok(Job::Apply), "available and inside the cooldown: applying is not a check");
-        w.updater.run(Job::Apply, NOW);
+        assert_eq!(rx.try_recv(), Ok(apply_next()), "available and inside the cooldown: applying is not a check");
+        w.updater.run(apply_next(), NOW);
 
         assert_eq!(w.updater.control.status(), UpdateStatus::Applying { version: "0.2.0".into() });
         let pending = state::load_pending(w.engine_dir()).unwrap().unwrap();
@@ -720,6 +729,49 @@ mod tests {
 
         w.updater.control.request(2).unwrap();
         assert!(rx.try_recv().is_err(), "while applying a request queues nothing");
+    }
+
+    /// The host published again between the check and the click.
+    #[test]
+    fn apply_never_installs_a_release_the_user_was_not_shown() {
+        let w = World::new();
+        w.publish(7, &[(Kind::Engine, NEXT, "new.exe", NEW_BYTES)]);
+        assert_eq!(w.run(Job::Check), UpdateStatus::Available { version: "0.2.0".into() });
+        w.publish(8, &[(Kind::Engine, NEXT + 1, "newer.exe", NEW_BYTES)]);
+        let before = w.trees();
+        assert_eq!(w.run(apply_next()), UpdateStatus::Available { version: "0.2.1".into() }, "shown first, not applied");
+        assert_eq!(w.trees(), before);
+        assert_eq!(state::load_pending(w.engine_dir()).unwrap(), None);
+        assert_eq!(w.starter.calls.load(Ordering::Relaxed), 0);
+
+        assert_eq!(w.run(Job::Apply { shown: "0.2.1".into() }), UpdateStatus::Applying { version: "0.2.1".into() });
+        assert_eq!(state::load_pending(w.engine_dir()).unwrap().unwrap().to_version, NEXT + 1);
+    }
+
+    /// A scheduled check may overwrite `applying` before the queued job runs;
+    /// the job still carries what was on screen when the user clicked.
+    #[test]
+    fn the_queued_apply_carries_the_version_on_screen() {
+        let c = UpdateControl::default();
+        let (tx, rx) = mpsc::channel();
+        c.attach(tx);
+        c.set_status(UpdateStatus::Available { version: "0.2.0".into() });
+        c.request(0).unwrap();
+        c.set_status(UpdateStatus::Available { version: "0.2.1".into() });
+        assert_eq!(rx.try_recv(), Ok(apply_next()));
+    }
+
+    #[test]
+    fn a_commit_that_lost_to_a_rollback_is_still_shown_as_rolled_back() {
+        let w = World::new();
+        let p = Pending { kind: "engine".into(), from_version: OWN, to_version: NEXT, staged: "new.exe".into(), aside: vec![ENGINE_EXE.into()] };
+        state::save_pending(w.engine_dir(), &p).unwrap();
+        state::commit_healthy(w.engine_dir(), &p).unwrap();
+        state::save_pending(w.engine_dir(), &p).unwrap();
+        state::record_rollback(w.engine_dir(), &p).unwrap();
+        assert_eq!(w.updater.initial_status(), UpdateStatus::RolledBack { version: "0.2.0".into() });
+        w.publish(7, &[(Kind::Engine, NEXT, "new.exe", NEW_BYTES)]);
+        assert_eq!(w.run(Job::Check), UpdateStatus::RolledBack { version: "0.2.0".into() }, "and it is not offered again");
     }
 
     #[test]
@@ -749,7 +801,7 @@ mod tests {
         let w = World::new();
         w.publish(7, &[(Kind::App, NEXT, "setup.exe", b"installer"), (Kind::Engine, NEXT + 1, "new.exe", NEW_BYTES)]);
         assert_eq!(w.run(Job::Check), UpdateStatus::Available { version: "0.2.0".into() });
-        w.run(Job::Apply);
+        w.run(apply_next());
         let pending = state::load_pending(w.engine_dir()).unwrap().unwrap();
         assert_eq!((pending.kind.as_str(), pending.staged.as_str()), ("app", "setup.exe"));
         assert_eq!(pending.aside, [ENGINE_EXE, "sieve.exe"], "derived from the listing, without the marker");
@@ -763,7 +815,7 @@ mod tests {
         });
         w.publish(7, &[(Kind::App, NEXT, "setup.exe", b"installer")]);
         assert_eq!(w.run(Job::Check), UpdateStatus::Current);
-        assert_eq!(w.run(Job::Apply), UpdateStatus::Current);
+        assert_eq!(w.run(apply_next()), UpdateStatus::Current);
         assert_eq!(state::load_pending(w.engine_dir()).unwrap(), None);
     }
 
@@ -776,7 +828,7 @@ mod tests {
         assert_eq!(w.updater.initial_status(), UpdateStatus::RolledBack { version: "0.2.0".into() });
         w.publish(7, &[(Kind::Engine, NEXT, "new.exe", NEW_BYTES)]);
         assert_eq!(w.run(Job::Check), UpdateStatus::RolledBack { version: "0.2.0".into() }, "still shown, still not offered");
-        assert_eq!(w.run(Job::Apply), UpdateStatus::RolledBack { version: "0.2.0".into() });
+        assert_eq!(w.run(apply_next()), UpdateStatus::RolledBack { version: "0.2.0".into() });
         assert_eq!(state::load_pending(w.engine_dir()).unwrap(), None);
         w.publish(8, &[(Kind::Engine, NEXT + 1, "new.exe", NEW_BYTES)]);
         assert_eq!(w.run(Job::Check), UpdateStatus::Available { version: "0.2.1".into() });
@@ -799,7 +851,7 @@ mod tests {
         w.updater.starter = Box::new(FakeStarter { fail: true, ..FakeStarter::default() });
         w.publish(7, &[(Kind::Engine, NEXT, "new.exe", NEW_BYTES)]);
         let before = w.trees();
-        assert!(matches!(w.run(Job::Apply), UpdateStatus::Failed { .. }));
+        assert!(matches!(w.run(apply_next()), UpdateStatus::Failed { .. }));
         assert_eq!(state::load_pending(w.engine_dir()).unwrap(), None);
         assert!(!w.install_dir().join(STAGING_DIR).exists());
         assert_eq!(w.trees(), before);
@@ -809,7 +861,7 @@ mod tests {
     fn while_a_release_is_in_flight_nothing_else_runs_and_a_vanished_one_is_reported() {
         let w = World::new();
         w.publish(7, &[(Kind::Engine, NEXT, "new.exe", NEW_BYTES)]);
-        w.run(Job::Apply);
+        w.run(apply_next());
         let calls = w.host.call_count();
         assert_eq!(w.run(Job::Check), UpdateStatus::Applying { version: "0.2.0".into() });
         assert_eq!(w.host.call_count(), calls);

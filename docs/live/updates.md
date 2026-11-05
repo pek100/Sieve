@@ -69,6 +69,8 @@ Publish an `app` release and install it.
 
 Check, with `/S /UPDATE /D=<folder>` running as SYSTEM: the hooks run, icacls `/setowner` works under the trimmed token, a running `sieve.exe` is force-closed, shortcuts and the uninstall entry are written from session 0, and `TEMP` in the staging folder works for NSIS plugins. Sieve does not relaunch by itself (`/R` is never passed from session 0): open it from the Start menu.
 
+Then check the pipe still belongs to you. `ProgramData\Sieve\engine\state.json` must hold your own SID (`whoami /user`), not `S-1-5-18`, and the unelevated app must connect and show the new version. The installer's post-install hook runs the `install` verb as SYSTEM here; the unit test `an_install_as_system_keeps_the_recorded_pipe_user` covers the decision, not this real path.
+
 ## 6. A new engine that fails
 
 Publish an engine build that exits at start. Check that the real supervisor rolls back within about 90 seconds, that the old build runs again, that the record did not rise, and that the app says the version did not start and does not offer it again.

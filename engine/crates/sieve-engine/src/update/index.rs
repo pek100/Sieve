@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+use super::swap::SUPERVISOR_EXE;
 use super::trust::TrustAnchor;
 use super::verify::verify_artefact;
 use super::{Kind, Refusal};
@@ -53,10 +54,12 @@ impl Index {
 }
 
 /// A bare file name: no separator, no drive, no dots of its own, no device
-/// trailer. It only ever joins the catalogue URL and a staging folder.
+/// trailer. It only ever joins the catalogue URL and a staging folder, so it
+/// cannot be the name the supervisor's own copy takes in that folder.
 fn valid_file_name(name: &str) -> bool {
     const FORBIDDEN: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|', '%', '&', '#'];
     !name.is_empty()
+        && !name.eq_ignore_ascii_case(SUPERVISOR_EXE)
         && !name.contains(FORBIDDEN)
         && !name.chars().any(char::is_control)
         && !name.starts_with('.')
@@ -175,6 +178,16 @@ mod tests {
         let key = TestKey::new();
         for bad in [r"..\x", "a/b", "C:x", "..", ".", "", "a.", "a ", r"\\host\share", "a%2fb", "a\nb"] {
             assert_eq!(parse(&key, &body(4, NOW + 1, bad), 0, NOW), Err(Refusal::BadFileName(bad.into())), "{bad:?}");
+        }
+    }
+
+    /// The staging folder holds the supervisor under this name, in the path's
+    /// own case-insensitive reading: a release so named would be overwritten.
+    #[test]
+    fn the_supervisors_own_name_is_refused() {
+        let key = TestKey::new();
+        for bad in [SUPERVISOR_EXE.to_string(), SUPERVISOR_EXE.to_uppercase()] {
+            assert_eq!(parse(&key, &body(4, NOW + 1, &bad), 0, NOW), Err(Refusal::BadFileName(bad.clone())), "{bad}");
         }
     }
 

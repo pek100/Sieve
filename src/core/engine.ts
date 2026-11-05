@@ -256,7 +256,7 @@ export function updateNotice(update: EngineUpdate): UpdateNotice | null {
       return { text: "Sieve is up to date.", problem: false, action: CHECK_AGAIN };
     case "available":
       return {
-        text: `Sieve ${update.version} is available. Installing it stops the engine for a few seconds and closes Sieve. Your network works as usual.`,
+        text: `Sieve ${update.version} is available. Installing it stops the engine for a few seconds and may close this window. Your network works as usual.`,
         problem: false,
         action: INSTALL_UPDATE,
       };
