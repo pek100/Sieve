@@ -17,6 +17,8 @@ use adblock::lists::{FilterSet, ParseOptions, parse_filter};
 use adblock::request::Request;
 use adblock::resources::PermissionMask;
 
+use crate::cosmetic::{CosmeticBuilder, CosmeticIndex, ScriptletUse, page_exception};
+
 /// The synthetic host-level request (module doc).
 const SYNTHETIC_TYPE: &str = "other";
 const SYNTHETIC_METHOD: &str = "GET";
@@ -38,6 +40,9 @@ pub struct ListReport {
     pub skipped: usize,
     /// Skip reason (the parser's own words) to count.
     pub skip_reasons: BTreeMap<String, usize>,
+    /// Rules naming a scriptlet the loaded bundle lacks ("N rules need a newer
+    /// resource library", plan 5.5). `None` until a bundle is loaded.
+    pub missing_scriptlets: Option<usize>,
 }
 
 /// The engine's answer for a host.
@@ -51,8 +56,11 @@ pub enum HostVerdict {
 }
 
 pub struct RuleEngine {
-    engine: Engine,
-    reports: Vec<ListReport>,
+    pub(crate) engine: Engine,
+    pub(crate) reports: Vec<ListReport>,
+    pub(crate) cosmetic: CosmeticIndex,
+    /// Per list, parallel to `reports`.
+    pub(crate) scriptlets: Vec<ScriptletUse>,
 }
 
 impl std::fmt::Debug for RuleEngine {
@@ -71,18 +79,33 @@ fn options(trusted: bool) -> ParseOptions {
     ParseOptions { permissions, ..ParseOptions::default() }
 }
 
-fn report(list: &ListText<'_>) -> ListReport {
+fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, ScriptletUse) {
+    let opts = options(list.trusted);
     let mut r = ListReport { id: list.id.to_string(), ..ListReport::default() };
+    let mut scriptlets = ScriptletUse::new();
     for line in list.text.lines().map(str::trim).filter(|l| !l.is_empty() && !is_comment(l)) {
-        match parse_filter(line, false, options(list.trusted)) {
-            Ok(_) => r.applied += 1,
+        // A skipped exception is a defect (plan 5.2): the parser refuses these
+        // options, so a line it can answer through `page_exception` is applied.
+        let exception = page_exception(line).filter(|e| parse_filter(e.rule(), false, opts).is_ok());
+        let answered = exception.is_some();
+        if let Some(exception) = exception {
+            cosmetic.add_exception(exception);
+        }
+        match parse_filter(line, false, opts) {
+            Ok(parsed) => {
+                r.applied += 1;
+                if let Some(name) = cosmetic.observe(&parsed) {
+                    *scriptlets.entry(name).or_default() += 1;
+                }
+            }
+            Err(_) if answered => r.applied += 1,
             Err(e) => {
                 r.skipped += 1;
                 *r.skip_reasons.entry(e.to_string()).or_default() += 1;
             }
         }
     }
-    r
+    (r, scriptlets)
 }
 
 impl RuleEngine {
@@ -90,14 +113,15 @@ impl RuleEngine {
     /// skipped and counted in [`RuleEngine::reports`].
     pub fn compile(lists: &[ListText<'_>]) -> Self {
         let mut set = FilterSet::new(true);
-        let reports = lists
+        let mut cosmetic = CosmeticBuilder::default();
+        let (reports, scriptlets) = lists
             .iter()
             .map(|list| {
                 set.add_filter_list(list.text.to_string(), options(list.trusted));
-                report(list)
+                report(list, &mut cosmetic)
             })
-            .collect();
-        Self { engine: Engine::new_with_filter_set(set), reports }
+            .unzip();
+        Self { engine: Engine::new_with_filter_set(set), reports, cosmetic: cosmetic.build(), scriptlets }
     }
 
     pub fn reports(&self) -> &[ListReport] {

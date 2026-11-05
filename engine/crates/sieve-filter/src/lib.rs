@@ -5,10 +5,12 @@
 //! - [`rules`]: the one rule engine (adblock-rust), compiled from list text
 //!   with per-list applied and skipped counts, and the host-level check;
 //! - [`exclusions`]: the HTTPS exclusion syntax (E10) and its matcher;
-//! - [`resources`]: the pinned resource-archive hash check.
+//! - [`cosmetic`]: what one page gets (CSS, procedural filters, scriptlets);
+//! - [`resources`]: the pinned resource bundle, verified then loaded.
 //!
 //! No I/O happens here: the engine downloads, this crate decides.
 pub mod catalogue;
+pub mod cosmetic;
 pub mod exclusions;
 pub mod lists;
 pub mod resources;

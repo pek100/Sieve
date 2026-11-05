@@ -10,10 +10,13 @@ publish.workspace = true
 [dependencies]
 # brave/adblock-rust (MPL-2.0), the one rule engine (plan 5.1). Without the
 # default `single-thread` feature, so a compiled engine is Send + Sync and can
-# sit behind an ArcSwap shared by the flow tasks.
-adblock = { version = "0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+# sit behind an ArcSwap shared by the flow tasks. `css-validation` parses
+# procedural operators and refuses invalid selectors and styles: without it
+# the validator is a stub and every list line reaches the page unchecked.
+adblock = { version = "0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling", "css-validation"] }
 sha2.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
