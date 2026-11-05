@@ -66,7 +66,8 @@ export function SettingRow({
   const d = settingDef(k);
   // The value in force: what the engine itself holds for a setting it carries
   // out but cannot take now (off when it did not say), else the stored value.
-  const value = lock?.kind === "engine" ? lock.inForce === true : readValue(doc, k);
+  const engineLock = lock?.kind === "password" ? lock.beneath : lock;
+  const value = engineLock?.kind === "engine" ? engineLock.inForce === true : readValue(doc, k);
   const labelId = `setting-${k}-label`;
   const helpId = `setting-${k}-help`;
   const disabled = lock !== null;

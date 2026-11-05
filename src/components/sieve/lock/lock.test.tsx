@@ -123,6 +123,14 @@ describe("the write gate, one test per writer, while locked", () => {
     expect(row("appearance.theme").querySelector("[data-lock=password]")).toBeNull();
   });
 
+  it("a locked row the engine carries out still shows the engine's value, never the stored wish", async () => {
+    await setup(<SettingsScreen />, { stored: { schema: 4, values: { "filtering.engine": true } } });
+    const sw = within(row("filtering.engine")).getByRole("switch");
+    expect(sw).toBeDisabled();
+    expect(sw).not.toBeChecked();
+    expect(row("filtering.engine").querySelector("[data-lock=password]")).toBeInTheDocument();
+  });
+
   it("a list row's Clear is disabled while locked", async () => {
     await setup(<SettingsScreen />, { stored: { schema: 4, values: { "apps.pinned": ["C:\\a.exe"] } } });
     expect(within(row("apps.pinned")).getByRole("button", { name: /Clear/ })).toBeDisabled();

@@ -51,13 +51,15 @@ test.describe("settings password", () => {
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
     await page.screenshot({ path: `test-results/screens/lock-rows-${info.project.name}.png` });
 
-    await page.getByRole("banner").getByRole("switch", { name: "Sieving" }).click();
+    // By its element: an open dialog hides the rest of the page from the accessibility tree.
+    const master = page.locator('header[data-tauri-drag-region] [role="switch"]');
+    await master.click();
     const unlock = page.getByRole("dialog", { name: "Unlock settings" });
     await expect(unlock).toBeVisible();
-    await expect(page.getByRole("banner").getByRole("switch", { name: "Sieving" })).toBeChecked();
+    await expect(master).toHaveAttribute("aria-checked", "true");
     await unlock.getByLabel("Password").fill(MOCK_PASSWORD);
     await unlock.getByRole("button", { name: "Unlock" }).click();
-    await expect(page.getByRole("banner").getByRole("switch", { name: "Sieving" })).not.toBeChecked();
+    await expect(master).toHaveAttribute("aria-checked", "false");
     await expect(theme.locator("[data-lock=password]")).toHaveCount(0);
   });
 

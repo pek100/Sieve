@@ -1,6 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const GUIDE = "/?source=mock&seed=1&welcome=1&engine=adguard";
+/** Home's title. */
+const HOME = "Sieving now";
 
 const noHorizontalScroll = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
 const step = (page: Page, id: string) => page.locator(`[data-welcome-step="${id}"]`);
@@ -29,9 +31,9 @@ test.describe("first-run guide", () => {
     await page.getByRole("button", { name: "Finish" }).click();
 
     await expect(page.locator("[data-welcome-step]")).toHaveCount(0);
-    await expect(page.getByRole("heading", { level: 1 })).toHaveText("Home");
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText(HOME);
     await page.reload();
-    await expect(page.getByRole("heading", { level: 1 })).toHaveText("Home");
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText(HOME);
     await expect(page.locator("[data-welcome-step]")).toHaveCount(0);
     expect(await page.evaluate(() => JSON.parse(window.localStorage.getItem("sieve.settings")!).values)).toEqual({ "startup.welcomeDone": true });
     expect(errors).toEqual([]);
@@ -40,13 +42,13 @@ test.describe("first-run guide", () => {
   test("Skip leaves at once and changes only its flag", async ({ page }) => {
     await page.goto(GUIDE);
     await page.getByRole("button", { name: "Skip" }).click();
-    await expect(page.getByRole("heading", { level: 1 })).toHaveText("Home");
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText(HOME);
     expect(await page.evaluate(() => JSON.parse(window.localStorage.getItem("sieve.settings")!).values)).toEqual({ "startup.welcomeDone": true });
   });
 
   test("a browser without ?welcome=1 never shows it", async ({ page }) => {
     await page.goto("/?source=mock&seed=1");
-    await expect(page.getByRole("heading", { level: 1 })).toHaveText("Home");
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText(HOME);
     await expect(page.locator("[data-welcome-step]")).toHaveCount(0);
   });
 });

@@ -14,8 +14,12 @@ import { useCheckPassed, useEngine, useSwitchOn } from "@/hooks/use-sieve";
 
 /** Why a setting cannot be changed here and now. */
 export type Lock =
-  /** The settings password holds (`locked`, or `unreadable`: then nothing opens it). Checked first. */
-  | { kind: "password"; phase: LockPhase }
+  /**
+   * The settings password holds (`locked`, or `unreadable`: then nothing opens
+   * it). Checked first. `beneath`: what would still lock the row without it, so
+   * a row the engine carries out shows the engine's value here too.
+   */
+  | { kind: "password"; phase: LockPhase; beneath: Lock | null }
   | { kind: "desktop" }
   /** `checking`: the switch it needs is on but its live check has not passed (yet). */
   | { kind: "requires"; label: string; checking: boolean }
@@ -71,10 +75,9 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
     })).filter((s) => s.keys.length > 0 || (!searching && blocks.has(s.id)));
   }, [query, blocks]);
 
-  const lockOf = useCallback(
+  const unpasswordedLock = useCallback(
     (key: SettingKey): Lock | null => {
       const d = settingDef(key);
-      if (isShut(lockPhase)) return { kind: "password", phase: lockPhase };
       if (d.desktopOnly && !(hydrated && isTauri)) return { kind: "desktop" };
       if (needsEngine(key)) {
         const reason = engineLockReason(engine);
@@ -90,7 +93,12 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
       }
       return null;
     },
-    [passed, hydrated, isTauri, switchOn, engine, lockPhase],
+    [passed, hydrated, isTauri, switchOn, engine],
+  );
+
+  const lockOf = useCallback(
+    (key: SettingKey): Lock | null => (isShut(lockPhase) ? { kind: "password", phase: lockPhase, beneath: unpasswordedLock(key) } : unpasswordedLock(key)),
+    [lockPhase, unpasswordedLock],
   );
 
   const apply = useCallback(
@@ -111,8 +119,7 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
     set: (key, value) => {
       // The control offered only valid values; a locked row offers none. A
       // password is the gate's to ask for, so the write waits for it.
-      const held = lockOf(key);
-      if (held !== null && held.kind !== "password") return;
+      if (unpasswordedLock(key) !== null) return;
       void guard(() => settings.set(key, value as never));
     },
     reset: (key) => {

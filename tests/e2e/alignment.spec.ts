@@ -69,7 +69,8 @@ async function gridLines(page: Page) {
     return r;
   });
   const L = title.x;
-  const R = actions;
+  // A page with no header action: the grid's own right edge is the line the top bar must meet.
+  const R = actions > -Infinity ? actions : right((await page.locator("main .layout-grid").first().boundingBox())!);
   const col = (R - L - 11 * g) / 12;
   const starts = Array.from({ length: 12 }, (_, i) => L + i * (col + g));
   const ends = starts.map((s) => s + col);

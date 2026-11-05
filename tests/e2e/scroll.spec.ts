@@ -70,7 +70,7 @@ test.describe("scroll law", () => {
           await expect(page.getByRole("region", { name: "When apps are busy" }).locator("[data-cell]").first()).toBeVisible();
           await expect(page.locator('svg[data-chart-plot] path[data-part="line"]').first()).toBeAttached();
         } else {
-          await expect(page.locator(p.name === "Apps" ? "[data-testid=app-row]" : "[data-setting]").first()).toBeVisible();
+          await expect(page.locator(p.name === "Apps" ? "[data-testid=app-row]" : p.name === "Filters" ? "[data-list]" : "[data-setting]").first()).toBeVisible();
         }
         const failures: string[] = [];
         const m = await measure(page);
