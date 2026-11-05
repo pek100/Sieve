@@ -8,6 +8,11 @@ import { useSetting } from "./use-sieve";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+export interface RuleSave {
+  saved: boolean;
+  refused: RuleProblem[];
+}
+
 export interface FiltersModel {
   /** Null while loading and after a failed read. */
   catalogue: FilterCatalogue | null;
@@ -17,8 +22,8 @@ export interface FiltersModel {
   setList: (list: FilterList, on: boolean) => void;
   setGroup: (lists: readonly FilterList[], on: boolean) => void;
   rules: readonly string[];
-  /** Saves `lines` unless the parser refuses one; resolves to what it refused. */
-  saveRules: (lines: string[]) => Promise<RuleProblem[]>;
+  /** Saves `lines` unless the parser refuses one. `saved` is false too when the lock dropped the write. */
+  saveRules: (lines: string[]) => Promise<RuleSave>;
   allowlist: readonly string[];
   addAllowed: (host: string) => void;
   removeAllowed: (host: string) => void;
@@ -57,8 +62,7 @@ export function useFilters(): FiltersModel {
     rules,
     saveRules: async (lines) => {
       const refused = await filterLists.checkRules(lines);
-      if (refused.length === 0) await writeRules(lines);
-      return refused;
+      return { saved: refused.length === 0 && (await writeRules(lines)), refused };
     },
     allowlist,
     addAllowed: (host) => {
@@ -69,11 +73,13 @@ export function useFilters(): FiltersModel {
       void writeAllowlist([...allowedNow(), host]);
     },
     removeAllowed: (host) => {
-      void writeAllowlist(allowedNow().filter((h) => h !== host));
-      notices.push({
-        kind: "info",
-        text: `Removed ${host} from the allowlist`,
-        action: { label: "Undo", run: () => void writeAllowlist(allowedNow().includes(host) ? allowedNow() : [...allowedNow(), host]) },
+      void writeAllowlist(allowedNow().filter((h) => h !== host)).then((ran) => {
+        if (!ran) return;
+        notices.push({
+          kind: "info",
+          text: `Removed ${host} from the allowlist`,
+          action: { label: "Undo", run: () => void writeAllowlist(allowedNow().includes(host) ? allowedNow() : [...allowedNow(), host]) },
+        });
       });
     },
   };

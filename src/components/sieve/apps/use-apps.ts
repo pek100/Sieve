@@ -46,8 +46,13 @@ export function useApps(): AppsModel {
   // Writers read the latest stored value at call time, so undo after other edits stays correct.
   const statesNow = () => settings.get("apps.levels");
   const pinnedNow = () => settings.get("apps.pinned");
-  const undoStates = (text: string, before: ReturnType<typeof statesNow>) =>
-    notices.push({ kind: "info", text, action: { label: "Undo", run: () => void writeStates(before) } });
+  // A toast says only what happened: it waits for the write, which the lock may park or drop.
+  const writeAllStates = (next: ReturnType<typeof statesNow>, text: string) => {
+    const before = statesNow();
+    void writeStates(next).then((ran) => {
+      if (ran) notices.push({ kind: "info", text, action: { label: "Undo", run: () => void writeStates(before) } });
+    });
+  };
 
   return {
     apps,
@@ -57,16 +62,8 @@ export function useApps(): AppsModel {
     sievedNow,
     isOn: (key) => isAppOn(states, key),
     setOn: (key, on) => void writeStates(setAppState(statesNow(), key, on ? "sieve" : "off")),
-    sieveAll: () => {
-      const before = statesNow();
-      void writeStates(sieveAll());
-      undoStates("Every app is sieved", before);
-    },
-    offAll: () => {
-      const before = statesNow();
-      void writeStates(offAll(before, apps.map((a) => a.key)));
-      undoStates("Every app is off", before);
-    },
+    sieveAll: () => writeAllStates(sieveAll(), "Every app is sieved"),
+    offAll: () => writeAllStates(offAll(statesNow(), apps.map((a) => a.key)), "Every app is off"),
     pin: (path) => {
       const before = pinnedNow();
       const next = pin(before, path);
@@ -74,21 +71,24 @@ export function useApps(): AppsModel {
         notices.push({ kind: "info", text: `${exeStem(path.trim())} is already in your apps` });
         return;
       }
-      void writePinned(next);
-      notices.push({ kind: "success", text: `Added ${exeStem(path.trim())}` });
+      void writePinned(next).then((ran) => {
+        if (ran) notices.push({ kind: "success", text: `Added ${exeStem(path.trim())}` });
+      });
     },
     unpin: (key) => {
       const app = apps.find((a) => a.key === key);
       if (!app || app.pinnedPaths.length === 0) return;
       const removed = app.pinnedPaths;
-      void writePinned(unpin(pinnedNow(), key, apps));
-      notices.push({
-        kind: "info",
-        text: `Removed ${app.name} from your apps`,
-        action: {
-          label: "Undo",
-          run: () => void writePinned(removed.reduce((acc, path) => pin(acc, path), pinnedNow())),
-        },
+      void writePinned(unpin(pinnedNow(), key, apps)).then((ran) => {
+        if (!ran) return;
+        notices.push({
+          kind: "info",
+          text: `Removed ${app.name} from your apps`,
+          action: {
+            label: "Undo",
+            run: () => void writePinned(removed.reduce((acc, path) => pin(acc, path), pinnedNow())),
+          },
+        });
       });
     },
   };

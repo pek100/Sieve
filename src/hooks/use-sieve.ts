@@ -23,13 +23,16 @@ export function useSieve<T>(selector: (s: SieveState) => T): T {
   return useMemo(() => selector(state), [state, selector]);
 }
 
-/** One setting's value and its setter. */
-export function useSetting<K extends SettingKey>(key: K): [SettingValue<K>, (v: SettingValue<K>) => Promise<void>] {
+/** One setting's value and its setter, which resolves to whether the write ran: anything that reports the change waits for true. */
+export function useSetting<K extends SettingKey>(key: K): [SettingValue<K>, (v: SettingValue<K>) => Promise<boolean>] {
   const { settings, lockController } = useRuntime();
   const get = useCallback(() => settings.get(key), [settings, key]);
   const value = useSyncExternalStore(settings.subscribe, get, get);
-  // The write gate: while a password holds, the write waits for it or is dropped.
-  const set = useCallback((v: SettingValue<K>) => lockController.guard(() => settings.set(key, v)), [settings, lockController, key]);
+  // The write gate: while a password holds, the write waits for it or is dropped (undefined here).
+  const set = useCallback(
+    async (v: SettingValue<K>) => (await lockController.guard(() => settings.set(key, v).then(() => true))) === true,
+    [settings, lockController, key],
+  );
   return [value, set];
 }
 

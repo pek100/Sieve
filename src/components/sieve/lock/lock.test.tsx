@@ -1,4 +1,4 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
@@ -6,10 +6,14 @@ import { AppsScreen } from "@/components/sieve/apps/apps-screen";
 import { EngineCard } from "@/components/sieve/settings/engine-card";
 import { SettingsScreen } from "@/components/sieve/settings/settings-screen";
 import { AppShell } from "@/components/sieve/shell/app-shell";
+import { LOCK_UNREADABLE_TEXT } from "@/core/lock";
 import { exportText, resetPlan } from "@/core/settings/transfer";
 import { createMockEngine } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
+import { createMockFilterLists } from "@/data/filter-lists-mock";
+import type { FilterListSource } from "@/data/filter-lists-source";
 import { MOCK_PASSWORD, createMockLock, type LockScenario } from "@/data/lock-mock";
+import type { LockSource } from "@/data/lock-source";
 import { createMockSource } from "@/data/mock-source";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "@/hooks/runtime";
@@ -25,12 +29,13 @@ const settle = () =>
     await new Promise((r) => setTimeout(r, 0));
   });
 
-async function setup(children: ReactNode, o: { lock?: LockScenario; engine?: EngineSource; stored?: unknown } = {}) {
+async function setup(children: ReactNode, o: { lock?: LockScenario | LockSource; engine?: EngineSource; stored?: unknown; filterLists?: FilterListSource } = {}) {
   const runtime = createRuntime({
     source: createMockSource({ seed: 1 }),
     settings: memoryBackend(o.stored),
-    lock: createMockLock(o.lock ?? "set"),
+    lock: typeof o.lock === "object" ? o.lock : createMockLock(o.lock ?? "set"),
     engine: o.engine,
+    filterLists: o.filterLists,
   });
   render(<AppShell runtime={runtime}>{children}</AppShell>);
   await act(async () => {
@@ -189,6 +194,147 @@ describe("the write gate, one test per writer, while locked", () => {
     await answerRight();
     await userEvent.click(sw);
     expect(rt.settings.get("filters.lists")).toEqual({ "adguard-base": "off" });
+  });
+});
+
+const cancelPrompt = async () => {
+  await userEvent.click(within(await dialog()).getByRole("button", { name: "Cancel" }));
+  await settle();
+};
+
+/** A lock whose status stays unanswered until the test says, so the phase holds at `checking`. */
+function slowLock() {
+  const inner = createMockLock("set");
+  let answer = () => {};
+  const answered = new Promise<void>((r) => (answer = r));
+  const source: LockSource = { ...inner, status: () => answered.then(inner.status) };
+  return { source, answer: () => act(async () => answer()) };
+}
+
+describe("a toast says only what happened", () => {
+  const said = (rt: Runtime) => rt.notices.list().map((n) => n.text);
+  const addApp = async () => {
+    await userEvent.click(await screen.findByRole("button", { name: /add app/i }));
+    await userEvent.type(await screen.findByRole("textbox", { name: /path/i }), "C:\\Tools\\tool.exe{Enter}");
+  };
+  const bulk = (name: string) => async () => {
+    await userEvent.click(await screen.findByRole("button", { name: "More app actions" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name }));
+  };
+  const writers = [
+    { name: "pin", key: "apps.pinned", values: {}, act: addApp, text: "Added tool" },
+    {
+      name: "unpin",
+      key: "apps.pinned",
+      values: { "apps.pinned": ["D:\\Tools\\quiet.exe"] },
+      act: async () => userEvent.click(await screen.findByRole("button", { name: "Remove quiet from my apps" })),
+      text: "Removed quiet from your apps",
+    },
+    { name: "sieve all", key: "apps.levels", values: { "apps.levels": { discord: "off" } }, act: bulk("Sieve every app"), text: "Every app is sieved" },
+    { name: "off all", key: "apps.levels", values: { "apps.pinned": ["D:\\Tools\\quiet.exe"] }, act: bulk("Turn every app off"), text: "Every app is off" },
+  ] as const;
+
+  it.each(writers)("$name, cancelled: nothing is written and nothing is said", async ({ key, values, act: run, text }) => {
+    const rt = await setup(<AppsScreen />, { stored: { schema: 4, values } });
+    const before = rt.settings.get(key);
+    await run();
+    await cancelPrompt();
+    expect(rt.settings.get(key)).toEqual(before);
+    expect(said(rt)).not.toContain(text);
+  });
+
+  it.each(writers)("$name, unlocked: the toast comes with the write", async ({ key, values, act: run, text }) => {
+    const rt = await setup(<AppsScreen />, { stored: { schema: 4, values } });
+    const before = rt.settings.get(key);
+    await run();
+    await dialog();
+    expect(said(rt)).not.toContain(text);
+    await answerRight();
+    expect(said(rt)).toContain(text);
+    expect(rt.settings.get(key)).not.toEqual(before);
+  });
+
+  it.each(writers)("$name, unreadable: refused, and only the refusal is said", async ({ values, act: run, text }) => {
+    const rt = await setup(<AppsScreen />, { stored: { schema: 4, values }, lock: "unreadable" });
+    await run();
+    await settle();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(said(rt)).toEqual([LOCK_UNREADABLE_TEXT]);
+    expect(said(rt)).not.toContain(text);
+  });
+
+  it("allowlist removal parked while the lock is checking, then cancelled: the host stays and nothing is said", async () => {
+    const lock = slowLock();
+    const rt = await setup(<FiltersScreen />, { lock: lock.source, stored: { schema: 4, values: { "filters.allowlist": ["a.example"] } } });
+    await userEvent.click(screen.getByRole("button", { name: "Remove a.example" }));
+    await lock.answer();
+    await cancelPrompt();
+    expect(rt.settings.get("filters.allowlist")).toEqual(["a.example"]);
+    expect(said(rt)).toEqual([]);
+  });
+});
+
+describe("rules typed but not saved stay in the editor", () => {
+  const editor = () => screen.getByRole("textbox", { name: "User rules" });
+  const save = () => screen.getByRole("button", { name: "Save rules" });
+  const RULE = "||a.example^";
+
+  /** A parser check that stays unanswered until the test says. */
+  function slowCheck() {
+    let answer = () => {};
+    const answered = new Promise<void>((r) => (answer = r));
+    const source: FilterListSource = { ...createMockFilterLists(), checkRules: () => answered.then(() => []) };
+    return { source, answer: () => act(async () => answer()) };
+  }
+
+  async function lockedDuringCheck() {
+    const check = slowCheck();
+    const rt = await setup(<FiltersScreen />, { filterLists: check.source });
+    await act(() => rt.lockController.unlock(MOCK_PASSWORD));
+    fireEvent.change(editor(), { target: { value: RULE } });
+    await userEvent.click(save());
+    act(() => rt.lockController.lockNow());
+    await check.answer();
+    return rt;
+  }
+
+  it("locked during the check, then cancelled: not stored, still in the editor", async () => {
+    const rt = await lockedDuringCheck();
+    await cancelPrompt();
+    expect(rt.settings.get("filters.userRules")).toEqual([]);
+    expect(editor()).toHaveValue(RULE);
+  });
+
+  it("locked during the check, then unlocked: stored, and the editor follows the store", async () => {
+    const rt = await lockedDuringCheck();
+    await answerRight();
+    expect(rt.settings.get("filters.userRules")).toEqual([RULE]);
+    expect(editor()).toHaveValue(RULE);
+    expect(save()).toBeDisabled();
+  });
+
+  it("saved while the lock is checking, then cancelled: not stored, still in the editor", async () => {
+    const lock = slowLock();
+    const rt = await setup(<FiltersScreen />, { lock: lock.source });
+    fireEvent.change(editor(), { target: { value: RULE } });
+    await userEvent.click(save());
+    await settle();
+    await lock.answer();
+    await cancelPrompt();
+    expect(rt.settings.get("filters.userRules")).toEqual([]);
+    expect(editor()).toHaveValue(RULE);
+  });
+
+  it("typing on while the check runs keeps what was typed after the save", async () => {
+    const check = slowCheck();
+    const rt = await setup(<FiltersScreen />, { filterLists: check.source, lock: "none" });
+    fireEvent.change(editor(), { target: { value: RULE } });
+    await userEvent.click(save());
+    fireEvent.change(editor(), { target: { value: `${RULE}\n||b.example^` } });
+    await check.answer();
+    await settle();
+    expect(rt.settings.get("filters.userRules")).toEqual([RULE]);
+    expect(editor()).toHaveValue(`${RULE}\n||b.example^`);
   });
 });
 

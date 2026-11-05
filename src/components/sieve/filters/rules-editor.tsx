@@ -7,9 +7,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { blockRule, checkRuleText, friendlyRuleReason, normalizeDomain } from "@/core/rules";
 import type { RuleProblem } from "@/data/protocol";
+import type { RuleSave } from "@/hooks/use-filters";
 
 /** The one rule editor: a text area, friendly per-line words under it, and "Block a site", which writes the rule for you. */
-export function RulesEditor({ saved, onSave, disabled }: { saved: readonly string[]; onSave: (lines: string[]) => Promise<RuleProblem[]>; disabled: boolean }) {
+export function RulesEditor({ saved, onSave, disabled }: { saved: readonly string[]; onSave: (lines: string[]) => Promise<RuleSave>; disabled: boolean }) {
   const savedText = saved.join("\n");
   // Null while nothing was typed: the editor then follows what is stored (an import, an undo).
   const [draft, setDraft] = useState<string | null>(null);
@@ -42,17 +43,18 @@ export function RulesEditor({ saved, onSave, disabled }: { saved: readonly strin
 
   const save = async () => {
     setSaveFailed(null);
-    let problems: RuleProblem[];
+    let result: RuleSave;
     try {
-      problems = await onSave(check.stored);
+      result = await onSave(check.stored);
     } catch (e) {
       setSaveFailed(e instanceof Error ? e.message : String(e));
       return;
     }
     // The parser counts stored lines; the person reads the editor's, blanks included.
     const editorLines = check.lines.filter((l) => l.check.kind !== "blank");
-    setRefused(problems.map((p) => ({ line: editorLines[p.line - 1]?.n ?? p.line, reason: p.reason })));
-    if (problems.length === 0) setDraft(null);
+    setRefused(result.refused.map((p) => ({ line: editorLines[p.line - 1]?.n ?? p.line, reason: p.reason })));
+    // Only what was stored leaves the editor: not a write the lock dropped, nor what was typed since.
+    if (result.saved) setDraft((d) => (d === text ? null : d));
   };
 
   return (

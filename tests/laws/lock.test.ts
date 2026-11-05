@@ -55,7 +55,7 @@ describe("settings password law", () => {
 
   it("the hooks every other component writes through are gated", () => {
     const hooks = read("src/hooks/use-sieve.ts");
-    expect(hooks).toMatch(/lockController\.guard\(\(\) => settings\.set\(key, v\)\)/);
+    expect(hooks).toMatch(/lockController\.guard\(\(\) => settings\.set\(key, v\)\.then\(\(\) => true\)\)/);
     expect(hooks).toMatch(/lockController\.guard\(\(\) => engineController\.stopAdguard\(\)\)/);
     expect(hooks).toMatch(/lockController\.guard\(\(\) => engineController\.startAdguard\(\)\)/);
     // No hook other than the gate's own writes settings.
