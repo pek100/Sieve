@@ -3,7 +3,7 @@
  * store (core) <- poller (data) <- source (data); settings store; notice bus.
  * Tests build their own with createRuntime and inject a source and backend.
  */
-import { createNoticeBus, type NoticeBus } from "@/core/notices";
+import { createNoticeBus, desktopWorthy, type NoticeBus } from "@/core/notices";
 import { offKeys } from "@/core/policy";
 import { createStore, phase, type SieveStore } from "@/core/store";
 import { trayState } from "@/core/tray";
@@ -18,7 +18,21 @@ import { createEngineController, type EngineController } from "@/data/engine-con
 import { createMockEngine } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
 import { createMockSource } from "@/data/mock-source";
-import { createDnsSource, createEngineSource, createSource, isTauriWindow, sourceOptions, type SieveSource } from "@/data/source";
+import { createMockFilterLists } from "@/data/filter-lists-mock";
+import type { FilterListSource } from "@/data/filter-lists-source";
+import { createLockController, type LockController } from "@/data/lock-controller";
+import { createMockLock } from "@/data/lock-mock";
+import type { LockSource } from "@/data/lock-source";
+import {
+  createDnsSource,
+  createEngineSource,
+  createFilterListSource,
+  createLockSource,
+  createSource,
+  isTauriWindow,
+  sourceOptions,
+  type SieveSource,
+} from "@/data/source";
 
 export interface Runtime {
   readonly isTauri: boolean;
@@ -41,6 +55,14 @@ export interface Runtime {
   readonly engine: EngineSource;
   /** The one owner of the store's engine part. */
   readonly engineController: EngineController;
+  /** The filter list seam (the Tauri commands or the mock). */
+  readonly filterLists: FilterListSource;
+  /** The settings password seam (the Tauri commands or the mock). */
+  readonly lock: LockSource;
+  /** The one owner of the password's state and the one write gate. */
+  readonly lockController: LockController;
+  /** The first-run guide may take over this window. */
+  readonly welcomeOnFirstRun: boolean;
 }
 
 export interface RuntimeOptions {
@@ -53,6 +75,12 @@ export interface RuntimeOptions {
   dns?: DnsSource;
   /** Default: the mock engine, not installed. */
   engine?: EngineSource;
+  /** Default: the mock lists, nothing loaded. */
+  filterLists?: FilterListSource;
+  /** Default: the mock password, none set. */
+  lock?: LockSource;
+  /** Default: only the desktop app offers the guide. */
+  welcomeOnFirstRun?: boolean;
 }
 
 export function createRuntime(o: RuntimeOptions): Runtime {
@@ -64,6 +92,7 @@ export function createRuntime(o: RuntimeOptions): Runtime {
   const desktop = o.desktop ?? null;
   const dns = o.dns ?? createMockDns({ seed: 1, now: clock.now });
   const engine = o.engine ?? createMockEngine();
+  const lock = o.lock ?? createMockLock();
   return {
     isTauri: o.isTauri ?? false,
     source: o.source,
@@ -85,6 +114,10 @@ export function createRuntime(o: RuntimeOptions): Runtime {
     }),
     engine,
     engineController: createEngineController({ engine, store, clock, settings, checks: passedChecks, notices }),
+    filterLists: o.filterLists ?? createMockFilterLists(),
+    lock,
+    lockController: createLockController({ source: lock, clock, settings, notices }),
+    welcomeOnFirstRun: o.welcomeOnFirstRun ?? o.isTauri ?? false,
   };
 }
 
@@ -101,9 +134,12 @@ export function createBrowserRuntime(): Runtime {
     source: createSource(options, () => offKeys(settings?.get("apps.levels") ?? {})),
     dns: createDnsSource(options),
     engine: createEngineSource(options),
+    filterLists: createFilterListSource(options),
+    lock: createLockSource(options),
     settings: isTauri ? tauriBackend() : localBackend(),
     isTauri,
     desktop: isTauri ? tauriDesktop() : null,
+    welcomeOnFirstRun: isTauri || options.welcome,
   });
   settings = rt.settings;
   return rt;
@@ -119,7 +155,77 @@ export function bindEngine(rt: Runtime): () => void {
   return rt.engineController.bind();
 }
 
+/** Run the lock controller (status, idle relock) and feed it the window's activity. Returns the undo. */
+export function bindLock(rt: Runtime): () => void {
+  const undo = rt.lockController.bind();
+  const active = () => rt.lockController.activity();
+  window.addEventListener("pointerdown", active);
+  window.addEventListener("keydown", active);
+  return () => {
+    undo();
+    window.removeEventListener("pointerdown", active);
+    window.removeEventListener("keydown", active);
+  };
+}
+
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+const NOTIFICATIONS_KEY = "notifications.desktop";
+/** The title of every desktop notification. */
+export const NOTIFICATION_TITLE = "Sieve";
+export const NOTIFICATIONS_REFUSED = "Windows did not allow notifications, so they stayed off.";
+
+/**
+ * Desktop notifications for the problems the app already raises (`desktopWorthy`
+ * on the notice bus; no-op without a desktop). Once per notice, only while the
+ * setting is on and the window lacks focus; a notice seen while it was off or the
+ * window in front stays in the window. Turning the setting on asks permission,
+ * and a refusal turns it back off with a toast: that write only ever turns off,
+ * so it does not go through the lock. A failed send is a console warning and
+ * never reaches the bus. Returns the undo.
+ */
+export function bindNotifications(rt: Runtime, isFocused: () => boolean = () => document.hasFocus()): () => void {
+  const n = rt.desktop?.notifications;
+  if (!n) return () => {};
+  let cancelled = false;
+  const seen = new Set<number>();
+
+  const follow = () => {
+    for (const notice of rt.notices.list()) {
+      if (!desktopWorthy(notice) || seen.has(notice.id)) continue;
+      seen.add(notice.id);
+      if (!rt.settings.get(NOTIFICATIONS_KEY) || isFocused()) continue;
+      n.send(NOTIFICATION_TITLE, notice.text).catch((e: unknown) => console.warn(`Notification: ${message(e)}`));
+    }
+  };
+
+  let asked = false;
+  const syncPermission = async () => {
+    const want = rt.settings.get(NOTIFICATIONS_KEY);
+    if (cancelled || want === asked) return;
+    asked = want;
+    if (!want) return;
+    let allowed = false;
+    try {
+      allowed = (await n.granted()) || (await n.request());
+    } catch (e) {
+      console.warn(`Notification permission: ${message(e)}`);
+    }
+    if (allowed || cancelled) return;
+    await rt.settings.set(NOTIFICATIONS_KEY, false);
+    rt.notices.push({ kind: "error", text: NOTIFICATIONS_REFUSED });
+  };
+
+  const unNotices = rt.notices.subscribe(follow);
+  const unSettings = rt.settings.subscribe(() => void syncPermission());
+  void rt.settings.ready.then(syncPermission);
+  follow();
+  return () => {
+    cancelled = true;
+    unNotices();
+    unSettings();
+  };
+}
 
 function clockTime(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });

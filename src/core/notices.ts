@@ -27,6 +27,9 @@ export interface NoticeBus {
   subscribe(listener: () => void): () => void;
 }
 
+/** Worth a desktop notification: an error that stays until dismissed, the problems the app already raises. */
+export const desktopWorthy = (n: Pick<Notice, "kind" | "surface">) => n.kind === "error" && n.surface === "banner";
+
 export function createNoticeBus(): NoticeBus {
   let notices: readonly Notice[] = [];
   let nextId = 1;

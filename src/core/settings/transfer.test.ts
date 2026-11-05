@@ -110,7 +110,7 @@ describe("settings search and words", () => {
     expect(searchSettings("dns")).toEqual([]);
     expect(searchSettings("per-app filtering")).toEqual([]);
     expect(searchSettings("turned off")).toEqual(["apps.levels"]);
-    expect(searchSettings("startup")).toEqual(["startup.launchAtLogin"]);
+    expect(searchSettings("startup")).toEqual(["startup.launchAtLogin", "startup.welcomeDone"]);
     expect(searchSettings("sample every")).toEqual(["sampling.intervalMs"]);
     expect(searchSettings("zzzz")).toEqual([]);
   });

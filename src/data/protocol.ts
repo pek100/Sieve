@@ -519,6 +519,113 @@ export function parseAppIcon(x: unknown): AppIcon | null {
   return typeof x1 === "string" && typeof x2 === "string" && BASE64.test(x1) && BASE64.test(x2) ? { x1, x2 } : null;
 }
 
+/** `filter_catalogue` (src-tauri/src/filters.rs, the engine's catalogue::LISTS). Fixture: filter-lists-v1.json. */
+export const FILTER_CATALOGUE_VERSION = 1 as const;
+export const LIST_DEFAULTS = ["on", "off", "gated"] as const;
+
+/** What compiling one list did. Absent (null on the list) is not zero: not loaded yet. */
+export interface FilterReport {
+  applied: number;
+  skipped: number;
+  /** The parser's reason to how many rules it skipped. */
+  reasons: Record<string, number>;
+}
+
+export interface FilterList {
+  id: string;
+  title: string;
+  url: string;
+  licence: string;
+  default: (typeof LIST_DEFAULTS)[number];
+  trusted: boolean;
+  report: FilterReport | null;
+}
+
+export interface FilterCatalogue {
+  v: typeof FILTER_CATALOGUE_VERSION;
+  lists: FilterList[];
+  /** Rows that could not be read, left out and said in a line. */
+  dropped: number;
+}
+
+function filterReport(x: unknown): FilterReport | null {
+  if (!isRec(x) || !isRec(x.reasons)) return null;
+  const { applied, skipped } = x;
+  const count = (n: unknown) => typeof n === "number" && Number.isInteger(n) && n >= 0;
+  if (!count(applied) || !count(skipped)) return null;
+  const reasons = Object.fromEntries(Object.entries(x.reasons).filter(([, n]) => count(n))) as Record<string, number>;
+  return { applied: applied as number, skipped: skipped as number, reasons };
+}
+
+function filterList(x: unknown): FilterList | null {
+  if (!isRec(x)) return null;
+  const { id, title, url, licence, trusted } = x;
+  if (typeof id !== "string" || id === "" || typeof title !== "string" || title === "") return null;
+  if (!(LIST_DEFAULTS as readonly unknown[]).includes(x.default)) return null;
+  return {
+    id,
+    title,
+    url: typeof url === "string" ? url : "",
+    licence: typeof licence === "string" ? licence : "",
+    default: x.default as FilterList["default"],
+    trusted: trusted === true,
+    report: filterReport(x.report),
+  };
+}
+
+/**
+ * The one normaliser of the catalogue. A wrong version or a missing list array
+ * throws (the block's error state); a malformed row is dropped and counted, a
+ * bad report reads null.
+ */
+export function parseFilterCatalogue(raw: unknown): FilterCatalogue {
+  if (!isRec(raw)) throw new ProtocolError("filter catalogue must be an object");
+  if (raw.v !== FILTER_CATALOGUE_VERSION) throw new ProtocolError(`filter catalogue version ${String(raw.v)} is not ${FILTER_CATALOGUE_VERSION}`);
+  if (!Array.isArray(raw.lists)) throw new ProtocolError("filter catalogue lists must be an array");
+  const lists = raw.lists.map(filterList).filter((l): l is FilterList => l !== null);
+  return { v: FILTER_CATALOGUE_VERSION, lists, dropped: raw.lists.length - lists.length };
+}
+
+/** One line `rule_check` refused. `line` counts from 1; `reason` is the parser's own words. */
+export interface RuleProblem {
+  line: number;
+  reason: string;
+}
+
+export function parseRuleProblems(raw: unknown): RuleProblem[] {
+  if (!Array.isArray(raw)) throw new ProtocolError("rule check must be an array");
+  return raw.map((p, i) => {
+    if (!isRec(p)) throw new ProtocolError(`rule check[${i}] must be an object`);
+    return { line: int(p.line, `rule check[${i}].line`), reason: str(p.reason, `rule check[${i}].reason`) };
+  });
+}
+
+/** `lock_status` and `lock_verify` (src-tauri/src/lock.rs). Neither carries a hash. */
+export const LOCK_STATES = ["none", "set", "unreadable"] as const;
+
+export interface LockStatus {
+  state: (typeof LOCK_STATES)[number];
+  retry_after_secs: number;
+}
+
+export interface LockVerdict {
+  ok: boolean;
+  retry_after_secs: number;
+}
+
+const waitSecs = (x: unknown) => (typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0);
+
+/** Anything unknown reads `unreadable`: settings stay locked, never open. */
+export function parseLockStatus(raw: unknown): LockStatus {
+  const state = isRec(raw) && (LOCK_STATES as readonly unknown[]).includes(raw.state) ? (raw.state as LockStatus["state"]) : "unreadable";
+  return { state, retry_after_secs: isRec(raw) ? waitSecs(raw.retry_after_secs) : 0 };
+}
+
+/** Only an explicit `ok: true` opens anything. */
+export function parseLockVerdict(raw: unknown): LockVerdict {
+  return { ok: isRec(raw) && raw.ok === true, retry_after_secs: isRec(raw) ? waitSecs(raw.retry_after_secs) : 0 };
+}
+
 /** Validate an untrusted value as a v1 Snapshot. Throws ProtocolError. */
 export function parseSnapshot(x: unknown): Snapshot {
   if (!isRec(x)) throw new ProtocolError("snapshot must be an object");

@@ -14,6 +14,10 @@ import { createMockDns, DNS_SCENARIOS, type DnsScenario } from "./dns-mock";
 import { createTauriDns, type DnsSource } from "./dns-source";
 import { createMockEngine, ENGINE_SCENARIOS, type EngineScenario } from "./engine-mock";
 import { createTauriEngine, type EngineSource } from "./engine-source";
+import { FILTER_LIST_SCENARIOS, createMockFilterLists, type FilterListScenario } from "./filter-lists-mock";
+import { createTauriFilterLists, type FilterListSource } from "./filter-lists-source";
+import { LOCK_SCENARIOS, createMockLock, type LockScenario } from "./lock-mock";
+import { createTauriLock, type LockSource } from "./lock-source";
 
 export type { SourceKind };
 
@@ -51,6 +55,12 @@ export interface SourceOptions {
   icons: boolean;
   /** Mock engine scenario (?engine=missing|stopped|idle|..., default missing). */
   engine: EngineScenario;
+  /** Mock filter lists (?lists=pending|loaded|empty|error, default pending). */
+  lists: FilterListScenario;
+  /** Mock settings password (?lock=none|set|unreadable, default none). */
+  lock: LockScenario;
+  /** Show the first-run guide here too (?welcome=1); the desktop app always offers it. */
+  welcome: boolean;
 }
 
 /** Read the source choice from the environment: query string and Tauri presence. */
@@ -66,7 +76,23 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   const dns = (DNS_SCENARIOS as readonly string[]).includes(d ?? "") ? (d as DnsScenario) : "off";
   const e = q.get("engine");
   const engine = (ENGINE_SCENARIOS as readonly string[]).includes(e ?? "") ? (e as EngineScenario) : "missing";
-  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1", pointed: q.get("pointed") === "1", icons: q.get("icons") === "1", engine };
+  const li = q.get("lists");
+  const lists = (FILTER_LIST_SCENARIOS as readonly string[]).includes(li ?? "") ? (li as FilterListScenario) : "pending";
+  const lo = q.get("lock");
+  const lock = (LOCK_SCENARIOS as readonly string[]).includes(lo ?? "") ? (lo as LockScenario) : "none";
+  return {
+    kind,
+    seed,
+    scenario,
+    dns,
+    adguard: q.get("adguard") === "1",
+    pointed: q.get("pointed") === "1",
+    icons: q.get("icons") === "1",
+    engine,
+    lists,
+    lock,
+    welcome: q.get("welcome") === "1",
+  };
 }
 
 /**
@@ -86,6 +112,16 @@ export function createDnsSource(o: SourceOptions): DnsSource {
 /** The engine seam follows the same choice: the Tauri command, or the mock. */
 export function createEngineSource(o: SourceOptions): EngineSource {
   return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine);
+}
+
+/** The filter list seam follows the same choice. */
+export function createFilterListSource(o: SourceOptions): FilterListSource {
+  return o.kind === "tauri" ? createTauriFilterLists() : createMockFilterLists(o.lists);
+}
+
+/** The settings password seam follows the same choice. */
+export function createLockSource(o: SourceOptions): LockSource {
+  return o.kind === "tauri" ? createTauriLock() : createMockLock(o.lock);
 }
 
 export function isTauriWindow(): boolean {

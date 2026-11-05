@@ -33,6 +33,7 @@ function fakeDesktop(startEnabled = false) {
         enabled = on;
       },
     },
+    notifications: null,
   };
   return {
     desktop,

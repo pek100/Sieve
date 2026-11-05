@@ -6,13 +6,14 @@
 export interface RouteDef {
   href: string;
   label: string;
-  icon: "activity" | "app-window" | "list" | "settings";
+  icon: "activity" | "app-window" | "list" | "settings" | "filter";
 }
 
 export const ROUTES: readonly RouteDef[] = [
   { href: "/", label: "Home", icon: "activity" },
   { href: "/apps", label: "Apps", icon: "app-window" },
   { href: "/settings", label: "Settings", icon: "settings" },
+  { href: "/filters", label: "Filters", icon: "filter" },
 ];
 
 /** Which route a pathname belongs to (static export uses trailing slashes). */

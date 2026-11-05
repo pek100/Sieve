@@ -45,6 +45,11 @@ function statusOf(scenario: EngineScenario): EngineStatus {
 
 export function createMockEngine(start: EngineScenario = "missing"): EngineSource {
   let scenario = start;
+  /**
+   * AdGuard's service as it stands once the engine went idle: the idle example
+   * has no AdGuard, but turning routing off does not uninstall it.
+   */
+  let adguardWhileIdle: "running" | "stopped" | null = null;
   const requireWelcome = () => {
     if (!WELCOME.includes(scenario)) throw new Error("The system cannot find the file specified. (os error 2)");
   };
@@ -52,19 +57,35 @@ export function createMockEngine(start: EngineScenario = "missing"): EngineSourc
     kind: "mock",
     probe: async () => {
       if (scenario === "error") throw new Error(MOCK_ENGINE_ERROR);
-      return parseEngineProbe(fixture.examples[scenario]);
+      const probe = parseEngineProbe(fixture.examples[scenario]);
+      return adguardWhileIdle === null ? probe : { ...probe, adguard: adguardWhileIdle };
     },
     setPolicy: async (policy: EnginePolicy) => {
       requireWelcome();
-      if (!policy.engine) scenario = "idle";
-      else if (scenario === "idle" || scenario === "crash_loop") scenario = "filtering";
+      if (!policy.engine) {
+        if (scenario === "adguard") adguardWhileIdle = "running";
+        if (scenario === "filtering" && adguardWhileIdle === null) adguardWhileIdle = "stopped";
+        scenario = "idle";
+      } else if (scenario === "idle" || scenario === "crash_loop") {
+        // A running AdGuard keeps the engine waiting; otherwise it routes.
+        scenario = adguardWhileIdle === "running" ? "adguard" : "filtering";
+        adguardWhileIdle = null;
+      }
       return statusOf(scenario);
     },
     stopAdguard: async () => {
+      if (adguardWhileIdle === "running") {
+        adguardWhileIdle = "stopped";
+        return;
+      }
       if (scenario !== "adguard") throw new Error(MOCK_ADGUARD_ERROR);
       scenario = "filtering";
     },
     startAdguard: async () => {
+      if (adguardWhileIdle === "stopped") {
+        adguardWhileIdle = "running";
+        return;
+      }
       if (scenario !== "filtering") throw new Error(MOCK_ADGUARD_ERROR);
       scenario = "adguard";
     },

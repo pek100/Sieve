@@ -21,6 +21,9 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
       pointed: false,
       icons: false,
       engine: "missing",
+      lists: "pending",
+      lock: "none",
+      welcome: false,
     });
     expect(sourceOptions({ search: "?seed=abc&scenario=nope", isTauri: false })).toEqual({
       kind: "mock",
@@ -31,6 +34,9 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
       pointed: false,
       icons: false,
       engine: "missing",
+      lists: "pending",
+      lock: "none",
+      welcome: false,
     });
   });
 

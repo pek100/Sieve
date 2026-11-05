@@ -11,6 +11,7 @@
  */
 import { isUpstream } from "../dns";
 import { APP_STATES, type AppState } from "../policy";
+import { checkRuleLine, normalizeDomain } from "../rules";
 
 /**
  * 2: apps.levels became on/off per app. 3: filtering.systemDns is gone. 4: a
@@ -26,6 +27,9 @@ export const SECTIONS = [
   { id: "startup", label: "Startup" },
   { id: "apps", label: "Apps" },
   { id: "filtering", label: "Filtering" },
+  { id: "notifications", label: "Notifications" },
+  { id: "filters", label: "Filter lists" },
+  { id: "password", label: "Password" },
 ] as const;
 
 export type Section = (typeof SECTIONS)[number]["id"];
@@ -49,8 +53,13 @@ interface Base<T> {
   unavailableUntil?: string;
 }
 
-/** Shape of one element of a map or list setting. `upstream`: a DNS server address (see isUpstream). */
-export type ElementSpec = { type: "string" } | { type: "upstream" } | { type: "enum"; options: readonly string[] };
+/**
+ * Shape of one element of a map or list setting. `upstream`: a DNS server
+ * address (see isUpstream). `rule`: one user rule or comment line. `domain`: a
+ * normalized host name. So an import cannot smuggle in a trusted scriptlet or a
+ * junk host: the registry refuses it.
+ */
+export type ElementSpec = { type: "string" } | { type: "upstream" } | { type: "rule" } | { type: "domain" } | { type: "enum"; options: readonly string[] };
 
 export function isValidElement(spec: ElementSpec, v: unknown): boolean {
   if (typeof v !== "string") return false;
@@ -59,9 +68,35 @@ export function isValidElement(spec: ElementSpec, v: unknown): boolean {
       return v.trim().length > 0;
     case "upstream":
       return isUpstream(v);
+    case "rule": {
+      const kind = checkRuleLine(v).kind;
+      return kind !== "blank" && kind !== "error";
+    }
+    case "domain": {
+      const d = normalizeDomain(v);
+      return d.ok && d.host === v;
+    }
     case "enum":
       return spec.options.includes(v);
   }
+}
+
+/** The person's sentence for why this list value is refused, when its element shape has one. */
+export function listValueProblem(key: SettingKey, value: unknown): string | null {
+  const def = settingDef(key);
+  if (def.kind !== "list" || !Array.isArray(value)) return null;
+  for (const v of value) {
+    if (isValidElement(def.of, v) || typeof v !== "string") continue;
+    if (def.of.type === "rule") {
+      const check = checkRuleLine(v);
+      if (check.kind === "error") return check.message;
+    }
+    if (def.of.type === "domain") {
+      const d = normalizeDomain(v);
+      if (!d.ok) return d.error;
+    }
+  }
+  return null;
 }
 
 export interface EnumSetting<O extends string = string> extends Base<O> {
@@ -82,6 +117,8 @@ export interface MapSetting<V> extends Base<Readonly<Record<string, V>>> {
   kind: "map";
   /** Shape of every value in the map. */
   of: ElementSpec;
+  /** What one entry is called, for summaries ("3 apps"). */
+  noun: string;
 }
 export interface ListSetting<V> extends Base<readonly V[]> {
   kind: "list";
@@ -166,6 +203,7 @@ export const REGISTRY = {
     help: "Apps Sieve leaves out of its charts, counts and history. Every other app is sieved.",
     default: {} as Readonly<Record<string, AppState>>,
     of: { type: "enum", options: APP_STATES },
+    noun: "app",
   } satisfies MapSetting<AppState>,
   "apps.pinned": {
     kind: "list",
@@ -216,6 +254,61 @@ export const REGISTRY = {
     of: { type: "upstream" },
     unavailableUntil: ENGINE_SLICE_4,
   } satisfies ListSetting<string>,
+  // The first-run guide is finished or skipped. Off shows it again.
+  "startup.welcomeDone": {
+    kind: "boolean",
+    section: "startup",
+    label: "Welcome guide finished",
+    help: "Off shows the welcome guide the next time Sieve opens.",
+    default: false,
+  } satisfies BooleanSetting,
+  // Not a data switch: it changes no traffic. On asks Windows for permission first.
+  "notifications.desktop": {
+    kind: "boolean",
+    section: "notifications",
+    label: "Desktop notifications",
+    help: "Tell you when the engine stops after repeated failures or sites may not load, while Sieve's window is not in front.",
+    default: false,
+    desktopOnly: true,
+  } satisfies BooleanSetting,
+  // Only differences from a list's own default are stored (core/filter-lists).
+  // The engine reads none of these three until its slice 4.
+  "filters.lists": {
+    kind: "map",
+    section: "filters",
+    label: "Lists changed",
+    help: "Filter lists you changed from their default. Saved now; the engine starts using them in a later version.",
+    default: {} as Readonly<Record<string, string>>,
+    of: { type: "enum", options: ["on", "off"] },
+    noun: "list",
+  } satisfies MapSetting<string>,
+  "filters.userRules": {
+    kind: "list",
+    section: "filters",
+    label: "User rules",
+    help: "Rules you wrote, in the same language as the filter lists. Saved now; the engine starts using them in a later version.",
+    default: [] as readonly string[],
+    of: { type: "rule" },
+  } satisfies ListSetting<string>,
+  "filters.allowlist": {
+    kind: "list",
+    section: "filters",
+    label: "Allowlist",
+    help: "Sites no filter list or rule will touch. Saved now; the engine starts using them in a later version.",
+    default: [] as readonly string[],
+    of: { type: "domain" },
+  } satisfies ListSetting<string>,
+  "password.idleMinutes": {
+    kind: "number",
+    section: "password",
+    label: "Lock again after",
+    help: "With a password set, Sieve locks settings again after this long without a click or a key press.",
+    default: 15,
+    min: 5,
+    max: 60,
+    step: 5,
+    unit: "min",
+  } satisfies NumberSetting,
 } as const;
 
 export type SettingKey = keyof typeof REGISTRY;
