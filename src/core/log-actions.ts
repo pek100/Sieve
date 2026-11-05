@@ -18,13 +18,21 @@ export const LOG_ACTION_TEXT: Record<LogAction, string> = {
   report: "Report a broken site",
 };
 
+/**
+ * The one reason a block rule would change what the row shows. An exception
+ * rule outranks a plain block rule, and an app that is off is not filtered at
+ * all; a reason this build does not know promises nothing either.
+ */
+const BLOCK_WOULD_APPLY = "no_rule";
+
 /** Which actions apply to a row, in menu order. */
 export function rowActions(row: Pick<LogRow, "url" | "kind" | "host" | "outcome" | "rule">): LogAction[] {
-  const kind = row.outcome?.kind;
+  const outcome = row.outcome;
+  const kind = outcome?.kind;
   const applies: Record<LogAction, boolean> = {
     copy_url: rowUrl(row) !== null,
     unblock: kind === "blocked" && row.rule !== null,
-    block: kind === "passed",
+    block: kind === "passed" && outcome?.reason === BLOCK_WOULD_APPLY,
     do_not_decrypt: kind !== "not_decrypted",
     report: true,
   };

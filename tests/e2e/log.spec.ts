@@ -115,6 +115,36 @@ test.describe("log", () => {
     expect(errors).toEqual([]);
   });
 
+  for (const { action, host, key, line } of [
+    { action: "Unblock", host: "ads.example.com", key: "filtering.userRules", line: "@@||ads.example.com^" },
+    { action: "Block", host: "shop.example.net", key: "filtering.userRules", line: "||shop.example.net^" },
+    { action: "Do not decrypt this site", host: "shop.example.net", key: "filtering.exclusions", line: "shop.example.net" },
+  ]) {
+    test(`from the details sheet, ${action}: Cancel goes back to the sheet; once added nothing covers the toast, and a real click on Undo takes it back`, async ({ page }) => {
+      const { errors, outside } = await setup(page);
+      await hold(page);
+      const stored = () => page.evaluate((k) => JSON.parse(window.localStorage.getItem("sieve.settings")!).values[k] ?? null, key);
+      await rowOf(page, host).getByRole("button", { name: new RegExp(`^${host.replaceAll(".", "\\.")},`) }).click();
+      const details = page.locator("[data-log-details-actions]");
+
+      await details.getByRole("button", { name: action }).click();
+      await page.getByRole("button", { name: "Cancel" }).click();
+      await expect(details).toBeVisible();
+      expect(await stored()).toBeNull();
+
+      await details.getByRole("button", { name: action }).click();
+      await expect(page.locator("[data-rule-preview]")).toHaveText(line);
+      await page.getByRole("button", { name: "Add it" }).click();
+      await expect.poll(stored).toEqual([line]);
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      // Not forced: Playwright clicks only once the toast is what the point hits. It expires after 4 s.
+      await page.getByRole("button", { name: "Undo" }).click({ timeout: 3_000 });
+      await expect.poll(stored).toBeNull();
+      expect(outside).toEqual([]);
+      expect(errors).toEqual([]);
+    });
+  }
+
   test("the report: no query by default, restored on request, copied, and nothing is sent", async ({ page, context }, info) => {
     await context.grantPermissions(["clipboard-read", "clipboard-write"]);
     const { errors, outside } = await setup(page);

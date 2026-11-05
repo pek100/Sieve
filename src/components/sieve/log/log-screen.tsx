@@ -109,7 +109,15 @@ export function LogScreen() {
         <CardBoundary title="Log details">
           <LogDetailsSheet row={open} titles={view.titles} onClose={() => setOpen(null)} onAction={rowActions.run} />
         </CardBoundary>
-        <RulePreview preview={rowActions.preview} onConfirm={() => void rowActions.confirm()} onCancel={rowActions.cancelPreview} />
+        <RulePreview
+          preview={rowActions.preview}
+          onConfirm={() => {
+            // A modal still open would make its toast's Undo unclickable. Cancel keeps the sheet: nothing happened.
+            setOpen(null);
+            void rowActions.confirm();
+          }}
+          onCancel={rowActions.cancelPreview}
+        />
         <CardBoundary title="Report a broken site">
           <ReportDialog seed={rowActions.report} onClose={rowActions.closeReport} />
         </CardBoundary>

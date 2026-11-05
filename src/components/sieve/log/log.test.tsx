@@ -276,6 +276,29 @@ describe("row actions", () => {
     await vi.waitFor(() => expect(rt.settings.get("filtering.userRules")).toEqual([]));
   });
 
+  it("from the details sheet: Cancel goes back to the sheet; Add it leaves no modal over the toast", async () => {
+    const rt = await withRows();
+    await userEvent.click(within(rowOf("ads.example.com")).getByRole("button", { name: /^ads\.example\.com,/ }));
+    await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Unblock" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(within(await screen.findByRole("dialog")).getByRole("button", { name: "Unblock" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Unblock" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Add it" }));
+    await vi.waitFor(() => expect(rt.settings.get("filtering.userRules")).toEqual(["@@||ads.example.com^"]));
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(await screen.findByRole("button", { name: "Undo" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["cdn.example.com", "an exception rule lets it through"],
+    ["tracker.example.org", "its app is off"],
+  ])("no Block on %s: %s, so a block rule would change nothing", async (host) => {
+    await withRows();
+    await userEvent.click(within(rowOf(host)).getByRole("button", { name: `Actions for ${host}` }));
+    expect((await screen.findAllByRole("menuitem")).map((m) => m.textContent)).toEqual(["Copy URL", "Do not decrypt this site", "Report a broken site"]);
+  });
+
   it.each([
     ["Unblock", "ads.example.com", "filtering.userRules", "@@||ads.example.com^", "@@||ads.example.com^ is already in your rules."],
     ["Do not decrypt this site", "shop.example.net", "filtering.exclusions", "shop.example.net", "shop.example.net is already in the sites not decrypted."],

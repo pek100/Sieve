@@ -11,8 +11,11 @@ describe("row actions per outcome", () => {
     expect(rowActions(row({ kind: "passed", reason: "no_rule" }, { rule: "@@||a.example^" }))).not.toContain("unblock");
   });
 
-  it("Block only on Passed through", () => {
+  it("Block only on Passed through with no rule matched: elsewhere the rule it adds would change nothing", () => {
     expect(rowActions(row({ kind: "passed", reason: "no_rule" }))).toContain("block");
+    for (const reason of ["exception", "app_off", "a_later_reason"]) {
+      expect(rowActions(row({ kind: "passed", reason })), reason).not.toContain("block");
+    }
     for (const o of [{ kind: "blocked" }, { kind: "redirected" }, { kind: "hidden", elements: 1 }, { kind: "not_decrypted", reason: "x" }] as LogOutcome[]) {
       expect(rowActions(row(o)), o.kind).not.toContain("block");
     }
