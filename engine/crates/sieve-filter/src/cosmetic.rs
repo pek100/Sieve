@@ -71,23 +71,9 @@ impl PageCosmetics {
 
 /// Makes text safe inside a `<style>` element and valid in any ASCII-compatible
 /// page encoding: `<` and non-ASCII become CSS escapes. `None` for what no
-/// escape repairs: control characters, or braces that would close the rule.
+/// escape repairs: control characters, or text [`css_is_self_contained`] refuses.
 pub fn css_text(text: &str) -> Option<String> {
-    if text.chars().any(char::is_control) {
-        return None;
-    }
-    let mut depth = 0i32;
-    for c in text.chars() {
-        depth += match c {
-            '{' => 1,
-            '}' => -1,
-            _ => 0,
-        };
-        if depth < 0 {
-            return None;
-        }
-    }
-    if depth != 0 {
+    if text.chars().any(char::is_control) || !css_is_self_contained(text) {
         return None;
     }
     let mut out = String::with_capacity(text.len());
@@ -100,6 +86,41 @@ pub fn css_text(text: &str) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// Rules are concatenated, so a string, comment, bracket or escape left open by
+/// one (CSS Syntax 4) would swallow every rule after it, and a stray closer would
+/// end its own early. True when the text opens and closes all of them itself.
+fn css_is_self_contained(text: &str) -> bool {
+    let mut closers = Vec::new();
+    let mut quote = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if chars.next().is_none() {
+                return false;
+            }
+        } else if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            }
+        } else if c == '/' && chars.as_str().starts_with('*') {
+            let Some((_, after)) = chars.as_str()[1..].split_once("*/") else {
+                return false;
+            };
+            chars = after.chars();
+        } else {
+            match c {
+                '"' | '\'' => quote = Some(c),
+                '{' => closers.push('}'),
+                '(' => closers.push(')'),
+                '[' => closers.push(']'),
+                '}' | ')' | ']' if closers.pop() != Some(c) => return false,
+                _ => {}
+            }
+        }
+    }
+    quote.is_none() && closers.is_empty()
 }
 
 /// Appends `selector{declarations}`, or returns false when either part is unsafe.
@@ -552,6 +573,30 @@ sieve-test.invalid##+js(sieve-set-flag, a, b)
     fn css_text_refuses_what_no_escape_repairs() {
         for bad in ["a{", "a}", "}a{", "a}b{c", "a\nb", "a\u{0}b", "a\u{9f}"] {
             assert_eq!(css_text(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn css_text_refuses_what_would_swallow_the_rules_after_it() {
+        for bad in ["content:\"", "content:'", "content:\"a\\\"", "a:\"b'", "width:calc(1px", "[a", "a)", "a]", "(]", "(}", "{)", "a\\", "a/*", "a/*/", "/* a"] {
+            assert_eq!(css_text(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn css_text_reads_strings_escapes_and_comments_as_css_does() {
+        for good in ["content:\"}\"", "content:'\"'", "content:\"\\\"\"", "[a=\"(\"]", ".a\\{", ".a\\\"b", "a:not(.b[c])", "a/* ) \" */b", "a/*\\*/b", "\"/*\"", "a/b*c"] {
+            assert_eq!(css_text(good).as_deref(), Some(good), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn a_poisoned_style_is_counted_and_leaves_the_next_rule_intact() {
+        for poison in ["content:\"", "content:'", "width:calc(1px"] {
+            let p = engine_with(&format!("{HOST}##.y:style({poison})\n{HOST}##.z:style(color: red)\n"), true).page_cosmetics(URL);
+            assert!(p.specific_css.contains(".z{color: red}"), "{poison}: {p:?}");
+            assert!(!p.specific_css.contains(".y"), "{poison}: {p:?}");
+            assert_eq!(p.dropped_rules, 1, "{poison}: {p:?}");
         }
     }
 
