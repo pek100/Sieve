@@ -11,6 +11,7 @@ const PAGES = [
   { name: "home", url: "/?source=mock&seed=1", ready: (p: Page) => p.locator('svg[data-chart-plot] path[data-part="line"]').first() },
   { name: "apps", url: "/apps/?source=mock&seed=1", ready: (p: Page) => p.getByTestId("app-row").first() },
   { name: "settings", url: "/settings/?source=mock&seed=1", ready: (p: Page) => p.locator("[data-setting]").first() },
+  { name: "filters", url: "/filters/?source=mock&seed=1", ready: (p: Page) => p.locator("[data-list]").first() },
   // Settings > Filtering: the engine, and no DNS filter while it waits for the engine (2026-10-18).
   { name: "settings-filtering", url: "/settings/?source=mock&seed=1#section-filtering", ready: (p: Page) => p.getByRole("region", { name: "Engine" }) },
 ];

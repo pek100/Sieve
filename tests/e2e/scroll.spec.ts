@@ -22,6 +22,7 @@ const PAGES = [
   { name: "Home", url: "/?source=mock&seed=1" },
   { name: "Apps", url: "/apps/?source=mock&seed=1" },
   { name: "Settings", url: "/settings/?source=mock&seed=1" },
+  { name: "Filters", url: "/filters/?source=mock&seed=1" },
 ];
 
 async function measure(page: Page) {

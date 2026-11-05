@@ -304,6 +304,23 @@ test.describe("alignment law", () => {
     expect(errors).toEqual([]);
   });
 
+  test("Filters snaps to the grid: the catalogue on the title's line, rules and allowlist to the actions' line", async ({ page }) => {
+    const errors = collectErrors(page);
+    await page.goto("/filters/?source=mock&seed=1");
+    await expect(page.locator("[data-list]").first()).toBeVisible();
+    const { failures } = await expectOnGrid(page, {
+      lists: page.getByRole("region", { name: "Filter lists" }),
+      rules: page.getByRole("region", { name: "User rules" }),
+    });
+    for (const r of (await page.locator("[data-list]").all()).slice(0, 5)) {
+      const h = (await r.boundingBox())!.height;
+      if (h < 44) failures.push(`list row ${h}px tall`);
+    }
+    expect(failures, failures.join("\n")).toEqual([]);
+    expect(await noSidewaysOverflow(page)).toBeLessThanOrEqual(0);
+    expect(errors).toEqual([]);
+  });
+
   test("list rows are set apart by space, never a line, and keep 44 px rows where they are pressed", async ({ page }) => {
     const lined = (sel: string) =>
       page.evaluate((s) => {
