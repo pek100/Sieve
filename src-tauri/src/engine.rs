@@ -51,7 +51,7 @@ pub enum ServiceFact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PipeFact {
-    Welcome { engine_version: String, session_id: u32, status: EngineStatus },
+    Welcome { engine_version: String, session_id: u32, status: Box<EngineStatus> },
     Incompatible { supported: [u32; 2] },
     /// The engine answered with an error (for example: this is not the
     /// installed app).
@@ -208,7 +208,7 @@ mod imp {
         };
         write_frame(&mut pipe, &msg).await.map_err(|e| e.to_string())?;
         match read_frame(&mut pipe).await.map_err(|e| e.to_string())? {
-            EngineMessage::Status(status) => Ok(PipeFact::Welcome { engine_version, session_id, status }),
+            EngineMessage::Status(status) => Ok(PipeFact::Welcome { engine_version, session_id, status: Box::new(status) }),
             EngineMessage::Error { message } => Ok(PipeFact::Refused { message }),
             other => Err(format!("unexpected answer: {other:?}")),
         }
@@ -226,7 +226,7 @@ mod imp {
     /// Sends the policy; the engine's Status after it, or why not.
     pub async fn set_policy(name: &str, policy: Policy) -> Result<EngineStatus, String> {
         match tokio::time::timeout(PROBE_TIMEOUT, request(name, ClientMessage::SetPolicy(policy))).await {
-            Ok(Ok(PipeFact::Welcome { status, .. })) => Ok(status),
+            Ok(Ok(PipeFact::Welcome { status, .. })) => Ok(*status),
             Ok(Ok(PipeFact::Refused { message } | PipeFact::Unreachable { message })) => Err(message),
             Ok(Ok(PipeFact::Incompatible { supported })) => Err(format!("the engine speaks protocol {} to {}", supported[0], supported[1])),
             Ok(Err(message)) => Err(message),
@@ -408,7 +408,7 @@ mod tests {
         });
         let fact = match ask {
             ClientAsk::Status => Ok(imp::pipe_fact(name).await),
-            ClientAsk::Policy(p) => imp::set_policy(name, p).await.map(|status| PipeFact::Welcome { engine_version: String::new(), session_id: 0, status }),
+            ClientAsk::Policy(p) => imp::set_policy(name, p).await.map(|status| PipeFact::Welcome { engine_version: String::new(), session_id: 0, status: Box::new(status) }),
         };
         let asked = engine.await.unwrap();
         if let (Some(asked), ClientAsk::Policy(p)) = (asked, ask) {
@@ -437,7 +437,7 @@ mod tests {
         let welcome = EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "9.9.9".into(), session_id: 4 };
         assert_eq!(
             fake_engine(&test_pipe("welcome"), welcome, status(), ClientAsk::Status).await,
-            Ok(PipeFact::Welcome { engine_version: "9.9.9".into(), session_id: 4, status: EngineStatus::default() })
+            Ok(PipeFact::Welcome { engine_version: "9.9.9".into(), session_id: 4, status: Box::default() })
         );
         let old = EngineMessage::Incompatible { supported: [3, 3] };
         assert_eq!(fake_engine(&test_pipe("old"), old, status(), ClientAsk::Status).await, Ok(PipeFact::Incompatible { supported: [3, 3] }));
@@ -456,7 +456,7 @@ mod tests {
         let welcome = || EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 };
         let after = EngineStatus { policy: on, ..EngineStatus::default() };
         let got = fake_engine(&test_pipe("policy"), welcome(), EngineMessage::Status(after.clone()), ClientAsk::Policy(on)).await;
-        assert!(matches!(got, Ok(PipeFact::Welcome { status, .. }) if status == after));
+        assert!(matches!(got, Ok(PipeFact::Welcome { status, .. }) if *status == after));
         let stale = EngineMessage::Error { message: "stale policy revision 2 (the engine holds 5)".into() };
         let got = fake_engine(&test_pipe("stale"), welcome(), stale, ClientAsk::Policy(on)).await;
         assert_eq!(got, Err("stale policy revision 2 (the engine holds 5)".into()));

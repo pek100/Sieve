@@ -260,6 +260,9 @@ describe("Virtual machines and WSL", () => {
 
   it("a row's switch writes its key into apps.levels and says what Off does there", async () => {
     const { runtime, user } = await routing();
+    // Freeze sampling so the count can only move because of the toggle.
+    act(() => runtime.poller.stop());
+    const sieved = screen.getByTestId("sieved-count").textContent;
     const toggle = within(vmRow("vm:devbox")).getByRole("switch", { name: "Sieve DevBox" });
     expect(toggle).toBeChecked();
     expect(toggle).toHaveAccessibleDescription(VM_OFF_MEANS);
@@ -268,11 +271,12 @@ describe("Virtual machines and WSL", () => {
     await user.click(toggle);
     expect(runtime.settings.get("apps.levels")).toEqual({ "vm:devbox": "off" });
     expect(vmRow("vm:devbox")).toHaveAttribute("data-off");
+    expect(screen.getByTestId("sieved-count").textContent).toBe(sieved);
     await user.click(toggle);
     expect(runtime.settings.get("apps.levels")).toEqual({});
   });
 
-  it("an Off stored earlier applies when the row returns, and does not touch the being-sieved count", async () => {
+  it("an Off stored earlier applies when the row returns", async () => {
     await routing({ "apps.levels": { "vm:unidentified": "off" } });
     expect(within(vmRow("vm:unidentified")).getByRole("switch")).not.toBeChecked();
     expect(within(vmRow("vm:devbox")).getByRole("switch")).toBeChecked();
