@@ -1,9 +1,9 @@
 /**
  * Live checks that passed this session, by the settings key of their data
  * switch. Observable, so the level ceiling and the settings locks follow it.
- * Writer: the DNS controller (src/data/dns-controller.ts) records a passed
- * self check and forgets it when the filter stops. Nothing is persisted: a
- * new session proves itself again.
+ * Writer: the engine controller (src/data/engine-controller.ts) records the
+ * engine's switch while the engine reports routing and forgets it when that
+ * stops. Nothing is persisted: a new session proves itself again.
  */
 export interface PassedChecks {
   has(key: string): boolean;

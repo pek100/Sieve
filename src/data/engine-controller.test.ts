@@ -65,6 +65,7 @@ function fakeEngine(start: EngineScenario) {
     },
     stopAdguard: () => mock.stopAdguard(),
     startAdguard: () => mock.startAdguard(),
+    logTail: (since) => mock.logTail(since),
   };
   return { source, set: (s: EngineScenario) => void (mock = createMockEngine(s)), probes: () => probes, policies };
 }

@@ -169,7 +169,7 @@ export function formatValue(key: SettingKey, value: unknown): string {
     }
     case "list": {
       const n = Array.isArray(value) ? value.length : 0;
-      // Server addresses are short and are the point: say them.
+      // The servers are the point: say them.
       if (d.of.type === "upstream" && Array.isArray(value)) return n === 0 ? "None" : value.join(", ");
       return n === 0 ? "None" : n === 1 ? "1 item" : `${n} items`;
     }

@@ -11,7 +11,9 @@ import {
   adguardOffer,
   attribution,
   engineDetail,
+  engineLists,
   enginePhase,
+  engineRoutes,
   engineStatus,
   engineVersion,
   splitTunnelText,
@@ -28,7 +30,7 @@ const percent = (share: number) => `${Math.floor(share * 1000) / 10}%`;
  * "Route traffic through the engine" switch above turns its routing on.
  * Flat like every block: a title, a status line, one sentence on what it
  * means, then what the engine itself reported: split tunnels, its flow
- * counters, its version. While AdGuard's service blocks it, the pause offer
+ * counters, each filter list's applied and skipped rules, its version. While AdGuard's service blocks it, the pause offer
  * says exactly what it does (it stops that service; Windows asks first) and
  * "Start AdGuard again" undoes it.
  */
@@ -42,9 +44,10 @@ export function EngineCard() {
   const share = attribution(e);
   const flows = engineStatus(e)?.counters.flows ?? 0;
   const busy = e.adguard ?? null;
+  const lists = engineLists(e);
 
   return (
-    <Card title="Engine" icon={<Cpu strokeWidth={1.75} />} tone={phase === "routing" ? "mint" : "neutral"}>
+    <Card title="Engine" icon={<Cpu strokeWidth={1.75} />} tone={engineRoutes(e) ? "mint" : "neutral"}>
       <div className="flex flex-col gap-4" data-engine-card="" data-engine-phase={phase}>
         <div className="flex flex-col gap-1">
           <p role="status" className="text-body text-on-surface" data-engine-state="">
@@ -74,6 +77,16 @@ export function EngineCard() {
             </p>
           )}
         </div>
+        {lists.length > 0 && (
+          <ul aria-label="Filter lists" className="flex flex-col gap-1" data-engine-lists="">
+            {lists.map((l) => (
+              <li key={l.id} className="text-label text-on-surface-muted break-words" data-engine-list={l.id}>
+                <span className="text-on-surface">{l.title}</span>: <span className="tabular">{l.applied.toLocaleString("en-US")}</span> rules applied,{" "}
+                <span className="tabular">{l.skipped.toLocaleString("en-US")}</span> skipped
+              </li>
+            ))}
+          </ul>
+        )}
         {offer && (
           <div className="flex flex-col items-start gap-2" data-adguard-offer={offer}>
             <p className="text-label text-on-surface-muted break-words">{offer === "pause" ? ADGUARD_PAUSE_TEXT : ADGUARD_START_TEXT}</p>

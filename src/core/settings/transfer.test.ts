@@ -1,13 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { EMPTY_DOC, readValue, writeValue, type SettingsDoc } from "./document";
-import { SETTING_KEYS, isAvailable, settingDef } from "./registry";
-
-// One test runs the import rules for a data switch as a build where one is available would.
-const availability = vi.hoisted(() => ({ every: false }));
-vi.mock("./registry", async (importOriginal) => {
-  const real = await importOriginal<typeof import("./registry")>();
-  return { ...real, isAvailable: (k: Parameters<typeof real.isAvailable>[0]) => availability.every || real.isAvailable(k) };
-});
+import { SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef } from "./registry";
 import { EXPORT_KIND, exportText, formatNumber, formatValue, numberChoices, planImport, resetPlan, searchSettings } from "./transfer";
 
 const changed: SettingsDoc = writeValue(writeValue(EMPTY_DOC, "appearance.theme", "light"), "apps.pinned", ["C:\\Tools\\a.exe"]);
@@ -50,14 +43,18 @@ describe("settings export and import", () => {
     });
     const plan = planImport(changed, file);
     if (!plan.ok) throw new Error(plan.error);
-    expect(plan.refused.map((r) => r.key).sort()).toEqual(["appearance.theme", "apps.levels", "filtering.upstreams", "nope.key"]);
-    // The retired Windows DNS switch, and the DNS switch that is unavailable until the engine
-    // replaces it (schema 4), are dropped by the migration before the plan even sees them.
+    // A schema 2 file: the migration drops the bare upstream, and the retired switches, before the plan sees them.
+    expect(plan.refused.map((r) => r.key).sort()).toEqual(["appearance.theme", "apps.levels", "nope.key"]);
     expect(plan.next.values).not.toHaveProperty("filtering.systemDns");
     expect(plan.next.values).not.toHaveProperty("filtering.dns");
-    // Unavailable (law 11): refused before its value is looked at.
-    expect(plan.refused.find((r) => r.key === "filtering.upstreams")?.reason).toBe("Not available in this version of Sieve");
-    expect(readValue(plan.next, "filtering.dns")).toBe(false);
+    expect(plan.next.values).not.toHaveProperty("filtering.upstreams");
+    // A current file with a bare upstream is refused as a bad value.
+    const current = planImport(changed, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filtering.upstreams": ["1.1.1.1"], "filtering.dns": true } }));
+    if (!current.ok) throw new Error(current.error);
+    expect(current.refused).toEqual([
+      { key: "filtering.upstreams", reason: "Not a valid value for this setting" },
+      { key: "filtering.dns", reason: "Not a setting in this version of Sieve" },
+    ]);
     // A refused known key keeps its current value: the theme stays light.
     expect(readValue(plan.next, "appearance.theme")).toBe("light");
     // Every data switch, every time: no import path turns one on.
@@ -68,21 +65,14 @@ describe("settings export and import", () => {
   });
 
   it("an available data switch: an import never turns it on, turning it off is imported, one already on stays on", () => {
-    // No data switch is available today (filtering.dns waits for the engine), so this runs the
-    // rule as a build where it is available would.
-    availability.every = true;
-    try {
-      const refused = planImport(EMPTY_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: 1, values: { "filtering.dns": true } }));
-      expect(refused.ok && refused.refused.find((r) => r.key === "filtering.dns")?.reason).toMatch(/never turns this on/);
-      expect(refused.ok && readValue(refused.next, "filtering.dns")).toBe(false);
-      const on = writeValue(EMPTY_DOC, "filtering.dns", true);
-      const off = planImport(on, JSON.stringify({ kind: EXPORT_KIND, schema: 1, values: {} }));
-      expect(off.ok && readValue(off.next, "filtering.dns")).toBe(false);
-      const kept = planImport(on, JSON.stringify({ kind: EXPORT_KIND, schema: 1, values: { "filtering.dns": true } }));
-      expect(kept.ok && readValue(kept.next, "filtering.dns")).toBe(true);
-    } finally {
-      availability.every = false;
-    }
+    const refused = planImport(EMPTY_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filtering.engine": true } }));
+    expect(refused.ok && refused.refused.find((r) => r.key === "filtering.engine")?.reason).toMatch(/never turns this on/);
+    expect(refused.ok && readValue(refused.next, "filtering.engine")).toBe(false);
+    const on = writeValue(EMPTY_DOC, "filtering.engine", true);
+    const off = planImport(on, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: {} }));
+    expect(off.ok && readValue(off.next, "filtering.engine")).toBe(false);
+    const kept = planImport(on, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filtering.engine": true } }));
+    expect(kept.ok && readValue(kept.next, "filtering.engine")).toBe(true);
   });
 
   it("says plainly when the text is not a settings file", () => {
@@ -105,9 +95,7 @@ describe("settings search and words", () => {
     expect(searchSettings("")).toEqual(SETTING_KEYS.filter(isAvailable));
     expect(searchSettings("theme")).toEqual(["appearance.theme"]);
     expect(searchSettings("LIGHT")).toEqual(["appearance.theme"]);
-    // The DNS filter's own keys are unavailable until the engine replaces it, and no visible
-    // help mentions DNS, so a search for it finds nothing.
-    expect(searchSettings("dns")).toEqual([]);
+    expect(searchSettings("dns")).toEqual(["filtering.upstreams"]);
     expect(searchSettings("per-app filtering")).toEqual([]);
     expect(searchSettings("turned off")).toEqual(["apps.levels"]);
     expect(searchSettings("startup")).toEqual(["startup.launchAtLogin"]);
@@ -119,11 +107,11 @@ describe("settings search and words", () => {
     expect(formatNumber(1500, "ms")).toBe("1.5 s");
     expect(formatNumber(500, "ms")).toBe("500 ms");
     expect(formatValue("appearance.theme", "dark")).toBe("Dark");
-    expect(formatValue("filtering.dns", false)).toBe("Off");
+    expect(formatValue("filtering.engine", false)).toBe("Off");
     expect(formatValue("apps.levels", { a: "off", b: "off" })).toBe("2 apps");
     expect(formatValue("apps.levels", {})).toBe("None");
     expect(formatValue("apps.pinned", [])).toBe("None");
-    expect(formatValue("filtering.upstreams", ["1.1.1.1", "9.9.9.9"])).toBe("1.1.1.1, 9.9.9.9");
+    expect(formatValue("filtering.upstreams", ["tls://a.example", "quic://b.example"])).toBe("tls://a.example, quic://b.example");
     const choices = numberChoices("sampling.intervalMs");
     expect(choices[0]).toBe(500);
     expect(choices.at(-1)).toBe(10_000);

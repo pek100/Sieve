@@ -8,18 +8,16 @@ import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { GridRegion, LayoutGrid } from "@/components/sieve/shell/layout-grid";
 import { Page } from "@/components/sieve/shell/page";
 import { Button } from "@/components/ui/button";
-import { DNS_SWITCH } from "@/core/dns";
-import { ENGINE_ANCHOR } from "@/core/engine";
-import { isAvailable, settingDef, type Section } from "@/core/settings/registry";
+import { ENGINE_ANCHOR, ENGINE_SWITCH } from "@/core/engine";
+import { settingDef, type Section, type SettingKey } from "@/core/settings/registry";
 import { cn } from "@/lib/utils";
-import { DNS_CARD_KEYS, DnsCard } from "./dns-card";
 import { EngineCard } from "./engine-card";
 import { SettingRow } from "./setting-row";
 import { TransferMenu } from "./transfer-menu";
 import { useSettingsView } from "./use-settings-view";
 
-/** The section that owns the DNS switch shows the filtering blocks under its rows: the DNS filter (while available) and the engine. */
-const FILTERING_SECTION = settingDef(DNS_SWITCH).section;
+/** The section that owns the engine's switch shows the Engine block under its rows. */
+const FILTERING_SECTION = settingDef(ENGINE_SWITCH as SettingKey).section;
 /** Sections with blocks of their own, listed even when none of their keys is available. */
 const BLOCK_SECTIONS: ReadonlySet<Section> = new Set([FILTERING_SECTION]);
 
@@ -31,17 +29,12 @@ const BLOCK_SECTIONS: ReadonlySet<Section> = new Set([FILTERING_SECTION]);
  * of chips under 960 px) and the content (9 columns, ending on the header
  * actions' line) with the search, the section titles and the rows on its
  * edges. Search covers label, help, key and options; the overflow menu has
- * export, import and reset. The section that owns the DNS switch also
- * carries the DNS filter card (status, counters, list, upstreams, the safety
- * notice) while that switch is available, and the engine (EngineCard, read
- * only, anchor ENGINE_ANCHOR); a key the DNS card edits itself
- * (DNS_CARD_KEYS) has no row of its own, so each setting has one owner on
- * the screen.
+ * export, import and reset. The section that owns the engine's switch also
+ * carries the engine (EngineCard, read only, anchor ENGINE_ANCHOR).
  */
 export function SettingsScreen() {
   const [query, setQuery] = useState("");
   const view = useSettingsView(query, BLOCK_SECTIONS);
-  const dnsCard = isAvailable(DNS_SWITCH);
 
   return (
     <Page title="Settings" action={<TransferMenu view={view} />}>
@@ -77,14 +70,13 @@ export function SettingsScreen() {
             />
           ) : (
             view.sections.map((s) => {
-              const keys = s.keys.filter((k) => !DNS_CARD_KEYS.has(k));
               const filtering = s.id === FILTERING_SECTION;
               return (
                 <div key={s.id} id={`section-${s.id}`} className="scroll-mt-[4rem]">
-                  {keys.length > 0 && (
+                  {s.keys.length > 0 && (
                     <Card title={s.label}>
                       <div className="flex flex-col gap-4">
-                        {keys.map((k) => (
+                        {s.keys.map((k) => (
                           <SettingRow
                             key={k}
                             k={k}
@@ -99,8 +91,7 @@ export function SettingsScreen() {
                     </Card>
                   )}
                   {filtering && (
-                    <div className={cn("flex flex-col gap-8", keys.length > 0 && "pt-8")}>
-                      {dnsCard && <DnsCard lockOf={view.lockOf} />}
+                    <div className={cn("flex flex-col gap-8", s.keys.length > 0 && "pt-8")}>
                       <div id={ENGINE_ANCHOR} className="scroll-mt-[4rem]">
                         <EngineCard />
                       </div>

@@ -8,14 +8,10 @@ import { GRAINS } from "@/core/history";
 import { parseTrayAction } from "@/core/tray";
 import { TRAY_EVENT } from "@/data/desktop";
 import historyFixture from "@/data/fixtures/history-v1.json";
-import dnsFixture from "@/data/fixtures/dns-status-v3.json";
 import fixture from "@/data/fixtures/snapshot-v1.json";
 import windowsFixture from "@/data/fixtures/windows-dns-v1.json";
 import engineFixture from "@/data/fixtures/engine-probe-v2.json";
-import { MOCK_CANARY } from "@/data/dns-mock";
 import {
-  CHECK_KINDS,
-  DNS_STATUS_VERSION,
   ENGINE_PROBE_VERSION,
   FLOW_STATES,
   PIPE_KINDS,
@@ -23,9 +19,7 @@ import {
   parseEngineProbe,
   PROTOCOL_VERSION,
   WINDOWS_DNS_VERSION,
-  parseDnsStatus,
   parseHistory,
-  parseSelfCheck,
   parseSnapshot,
   parseWindowsDns,
   ProtocolError,
@@ -84,20 +78,6 @@ describe("protocol law", () => {
     expect(ids[0][2]).toBe(`Pause ${minutes} min`);
   });
 
-  it("dns_status: the v3 fixture parses losslessly and the version matches Rust", () => {
-    expect(parseDnsStatus(dnsFixture)).toEqual(dnsFixture);
-    const rust = read("src-tauri/src/dns/status.rs");
-    expect(Number(rust.match(/pub const DNS_STATUS_VERSION: u32 = (\d+);/)?.[1])).toBe(DNS_STATUS_VERSION);
-    // Rust serialises against the same file.
-    expect(rust).toContain('include_str!("../../../src/data/fixtures/dns-status-v3.json")');
-    expect(() => parseDnsStatus({ ...dnsFixture, v: 2 })).toThrow(/version 2 is not 3.*Restart Sieve/);
-    expect(() => parseDnsStatus({ ...dnsFixture, v: 2 })).toThrow(ProtocolError);
-    expect(() => parseDnsStatus({ ...dnsFixture, pass_through: "no" })).toThrow(/pass_through/);
-    expect(() => parseDnsStatus({ ...dnsFixture, binds: "127.0.0.1:53" })).toThrow(/binds/);
-    expect(() => parseDnsStatus({ ...dnsFixture, counters: { ...dnsFixture.counters, blocked: -1 } })).toThrow(/counters\.blocked/);
-    expect(() => parseDnsStatus({ ...dnsFixture, top_blocked: [{ domain: 3, count: 1 }] })).toThrow(/top_blocked\[0\]\.domain/);
-  });
-
   it("windows_dns: the v1 fixture parses losslessly and the version matches Rust", () => {
     expect(parseWindowsDns(windowsFixture)).toEqual(windowsFixture);
     const rust = read("src-tauri/src/windns.rs");
@@ -106,27 +86,6 @@ describe("protocol law", () => {
     expect(() => parseWindowsDns({ ...windowsFixture, v: 2 })).toThrow(ProtocolError);
     expect(() => parseWindowsDns({ ...windowsFixture, adapters: [{ ...windowsFixture.adapters[0], servers: null }] })).toThrow(/adapters\[0\]\.servers/);
     expect(() => parseWindowsDns({ ...windowsFixture, adapters: [{ ...windowsFixture.adapters[0], alias: 7 }] })).toThrow(/adapters\[0\]\.alias/);
-  });
-
-  it("dns_self_check: the Rust Check fields are the ones parsed", () => {
-    const probe = read("src-tauri/src/dns/probe.rs");
-    const fields = [...(probe.match(/pub struct Check \{([\s\S]*?)\}/)?.[1] ?? "").matchAll(/pub (\w+):/g)].map((m) => m[1]);
-    const check = { kind: "canary", server: "127.0.0.1:53", name: "selfcheck.sieve.invalid", expect: "x", got: "y", pass: true };
-    expect(fields).toEqual(Object.keys(check));
-    expect(parseSelfCheck({ pass: true, checks: [check] })).toEqual({ pass: true, checks: [check] });
-    expect(() => parseSelfCheck({ pass: "yes", checks: [] })).toThrow(/pass/);
-    expect(() => parseSelfCheck({ pass: true, checks: [{ ...check, kind: "call" }] })).toThrow(/checks\[0\]\.kind/);
-    expect(() => parseSelfCheck({ pass: true, checks: [{ ...check, kind: undefined }] })).toThrow(/checks\[0\]\.kind/);
-  });
-
-  it("dns_self_check: the Rust CheckKind variants are CHECK_KINDS, and the canary name agrees", () => {
-    const probe = read("src-tauri/src/dns/probe.rs");
-    const body = probe.match(/pub enum CheckKind \{([\s\S]*?)\}/)?.[1] ?? "";
-    const variants = [...body.matchAll(/^\s*(\w+),/gm)].map((m) => m[1].toLowerCase());
-    expect(variants).toEqual([...CHECK_KINDS]);
-    expect(probe).toContain('#[serde(rename_all = "lowercase")]');
-    const rules = read("src-tauri/src/dns/rules.rs");
-    expect(rules.match(/pub const CANARY_NAME: &str = "([^"]+)";/)?.[1]).toBe(MOCK_CANARY);
   });
 
   it("rejects a snapshot from another version or with a broken flow", () => {

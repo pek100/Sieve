@@ -8,7 +8,7 @@ describe("settings store (seam law: only non-default values are stored, defaults
     expect(s.get("sampling.enabled")).toBe(true);
     await s.ready;
     expect(s.get("appearance.theme")).toBe("dark");
-    expect(s.get("filtering.dns")).toBe(false);
+    expect(s.get("filtering.engine")).toBe(false);
   });
 
   it("stores only non-default values and drops a value set back to its default", async () => {

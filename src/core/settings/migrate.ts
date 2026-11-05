@@ -3,7 +3,8 @@
  * Renaming or retyping a key does: bump SETTINGS_SCHEMA and add a step here
  * that maps documents of schema N to N + 1.
  */
-import { SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef } from "./registry";
+import { parseUpstream } from "../upstream";
+import { SETTINGS_SCHEMA, SETTING_KEYS, defaultValue, isAvailable, settingDef, type SettingKey } from "./registry";
 
 type Values = Record<string, unknown>;
 
@@ -11,8 +12,7 @@ type Values = Record<string, unknown>;
  * 1 -> 2: per-app levels (off < watch < sieve, default watch) became on/off
  * per app (default sieve). An app the user turned off stays off; every other
  * entry ("watch", "sieve", or anything unreadable) is the new default, so it
- * is dropped (defaults are never stored). `filtering.perApp` is gone from the
- * registry; its stored value is left as an unknown key (kept, ignored).
+ * is dropped (defaults are never stored).
  */
 export function levelsToOnOff(values: Values): Values {
   const levels = values["apps.levels"];
@@ -41,18 +41,40 @@ export function dropSystemDns(values: Values): Values {
 }
 
 /**
- * 3 -> 4: the app-hosted DNS filter became unavailable until the engine
- * replaces it (2026-10-18; registry `unavailableUntil`). A stored value of
- * any data switch that is unavailable is dropped, so a stored "on" is off
- * (off is the default, never stored) and stays off when the switch comes
- * back: the user turns it on again where its checks run. Derived from the
- * registry rather than a key list, so the step and the attribute cannot
- * disagree. Other unavailable keys (the upstream list) are kept: they hold
- * no traffic change and read as their default while unavailable.
+ * 3 -> 4: a stored value of any data switch that is unavailable (registry
+ * `unavailableUntil`) is dropped, so a stored "on" is off (off is the default,
+ * never stored) and stays off when the switch comes back: the user turns it
+ * on again where its checks run. Derived from the registry rather than a key
+ * list, so the step and the attribute cannot disagree. Other unavailable keys
+ * are kept: they hold no traffic change and read as their default while
+ * unavailable. No key is unavailable today; the old decoder stays.
  */
 export function offUnavailableSwitches(values: Values): Values {
   const next: Values = { ...values };
   for (const k of SETTING_KEYS) if (settingDef(k).kind === "dataSwitch" && !isAvailable(k)) delete next[k];
+  return next;
+}
+
+const UPSTREAMS = "filtering.upstreams" satisfies SettingKey;
+
+/**
+ * 4 -> 5: the app-hosted DNS proxy is gone (engine slice 4). `filtering.dns`
+ * and the never-available `filtering.perApp` are deleted. `filtering.upstreams`
+ * now holds encrypted upstreams: of a stored list, the entries that parse as
+ * DoH, DoT or DoQ come first, followed by the defaults not already present;
+ * none parses (every list an old build could store, bare addresses): the key
+ * goes, so the defaults apply. A plain address is never carried forward,
+ * because the engine sends no plain DNS.
+ */
+export function retireDnsProxy(values: Values): Values {
+  const next: Values = { ...values };
+  delete next["filtering.dns"];
+  delete next["filtering.perApp"];
+  const stored = next[UPSTREAMS];
+  delete next[UPSTREAMS];
+  if (!Array.isArray(stored)) return next;
+  const kept = stored.filter((v): v is string => typeof v === "string" && parseUpstream(v) !== null);
+  if (kept.length > 0) next[UPSTREAMS] = [...new Set([...kept, ...defaultValue(UPSTREAMS)])];
   return next;
 }
 
@@ -61,6 +83,7 @@ const STEPS: Record<number, (values: Values) => Values> = {
   1: levelsToOnOff,
   2: dropSystemDns,
   3: offUnavailableSwitches,
+  4: retireDnsProxy,
 };
 
 export function migrate(doc: { schema: number; values: Values }): { schema: number; values: Values } {

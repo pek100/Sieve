@@ -22,12 +22,12 @@ test.describe("settings", () => {
     const rail = page.getByRole("navigation", { name: "Settings sections" });
     // Filtering stays: it carries the engine.
     await expect(rail.getByRole("link")).toHaveText(["Appearance", "Sampling", "Startup", "Apps", "Filtering"]);
-    // Seven rows: theme, sieving, interval, launch at startup, apps turned off, my apps, and the
-    // engine's switch (slice 3). DNS filtering and its upstream servers are unavailable until the
-    // engine replaces them (2026-10-18). There is no Windows DNS row: Sieve never changes Windows DNS.
-    await expect(page.locator("[data-setting]")).toHaveCount(7);
+    // Ten rows: theme, sieving, interval, launch at startup, apps turned off, my apps, the engine's
+    // switch, the encrypted upstreams, your rules and the sites not decrypted. There is no
+    // Windows DNS row: Sieve never changes Windows DNS.
+    await expect(page.locator("[data-setting]")).toHaveCount(10);
     await expect(row(page, "filtering.engine").getByRole("switch")).not.toBeChecked();
-    await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(1);
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
 
     if (info.project.name === "desktop") {
@@ -74,8 +74,7 @@ test.describe("settings", () => {
     );
     // Five registry sections with rows (Filtering's is the engine's switch, slice 3), then the engine.
     expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Engine"]);
-    // Was 686 px of empty space under Filtering's rows: its card took the height of the
-    // wrapper that also holds the DNS filter (Card h-full).
+    // Was 686 px of empty space under Filtering's rows: its card took the height of its wrapper (Card h-full).
     // Allowed: a row's own bottom padding (16) and at most a section's padding.
     for (const g of gaps) expect(g.gap, `${g.name} ends ${g.gap}px below its content`).toBeLessThanOrEqual(40);
   });
@@ -96,12 +95,12 @@ test.describe("settings", () => {
     await openSettings(page);
     await page.getByRole("button", { name: "Settings actions" }).click();
     await page.getByRole("menuitem", { name: "Import settings" }).click();
-    const file = JSON.stringify({ kind: "sieve.settings", schema: 4, values: { "sampling.intervalMs": 2000, "filtering.dns": true } });
+    const file = JSON.stringify({ kind: "sieve.settings", schema: 5, values: { "sampling.intervalMs": 2000, "filtering.dns": true } });
     await page.getByRole("textbox", { name: "Settings file to import" }).fill(file);
     await page.getByRole("button", { name: "Preview changes" }).click();
     await expect(page.getByRole("list", { name: "Changes" })).toContainText("Sample every");
     await expect(page.getByRole("list", { name: "Not imported" })).toContainText("filtering.dns");
-    await expect(page.getByRole("list", { name: "Not imported" })).toContainText("Not available in this version of Sieve");
+    await expect(page.getByRole("list", { name: "Not imported" })).toContainText("Not a setting in this version of Sieve");
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
     await page.screenshot({ path: `test-results/screens/settings-import-${info.project.name}.png` });
     await page.getByRole("button", { name: "Apply 1 change" }).click();

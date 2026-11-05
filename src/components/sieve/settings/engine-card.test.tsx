@@ -13,7 +13,7 @@ vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
 vi.setConfig({ testTimeout: 20_000 });
 
 /** The user's engine switch as the fixture's welcome examples hold it (on for every example the engine routes or explains). */
-const SWITCHED_ON = new Set<EngineScenario>(["filtering", "adguard", "vpn", "crash_loop", "setup"]);
+const SWITCHED_ON = new Set<EngineScenario>(["filtering", "hosts", "adguard", "vpn", "crash_loop", "setup"]);
 
 async function setup(engine: EngineSource, on = false) {
   const settings = memoryBackend(on ? { schema: 4, values: { [ENGINE_SWITCH]: true } } : undefined);
@@ -40,6 +40,7 @@ describe("Engine block", () => {
     ["unreachable", "not_running", "Not running", /does not answer: The system cannot find the file specified/],
     ["idle", "idle", "Installed, not routing", /changes nothing: no traffic goes through it/],
     ["filtering", "routing", "Routing traffic", /Nothing is blocked yet/],
+    ["hosts", "filtering", "Filtering hosts", /applies 142,000 rules from 2 lists to host names only/],
     ["adguard", "adguard", "Waiting for AdGuard", /AdGuard's service runs/],
     ["vpn", "vpn", "Paused for a VPN", /Paused while AdGuard VPN is connected/],
     ["crash_loop", "crash_loop", "Stopped after repeated failures", /restarted 3 times within an hour/],
@@ -60,6 +61,20 @@ describe("Engine block", () => {
     await vi.waitFor(() => expect(phase()).toBe("routing"));
     expect(block().querySelector("[data-engine-split]")).toHaveTextContent("Corp VPN sends some traffic around Sieve");
     expect(block().querySelector("[data-engine-attribution]")).toHaveTextContent("1,200 flows relayed since the engine started, 99% tied to an app.");
+  });
+
+  it("filtering: each list's applied and skipped rules, from the engine's facts; no lists, no block", async () => {
+    await setup(createMockEngine("hosts"), true);
+    await vi.waitFor(() => expect(phase()).toBe("filtering"));
+    const lists = screen.getByRole("list", { name: "Filter lists" });
+    expect(lists.querySelector('[data-engine-list="adguard-base"]')).toHaveTextContent("AdGuard Base filter: 90,000 rules applied, 120 skipped");
+    expect(lists.querySelector('[data-engine-list="ubo-filters"]')).toHaveTextContent("uBlock filters: 52,000 rules applied, 7 skipped");
+  });
+
+  it("routing with no facts lists nothing", async () => {
+    await setup(createMockEngine("filtering"), true);
+    await vi.waitFor(() => expect(phase()).toBe("routing"));
+    expect(screen.queryByRole("list", { name: "Filter lists" })).toBeNull();
   });
 
   it("AdGuard running: the pause offer says what it does, and pausing lets the engine route; then Start AdGuard again", async () => {

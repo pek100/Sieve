@@ -100,10 +100,22 @@ test.describe("engine", () => {
     expect(errors).toEqual([]);
   });
 
+  test("filtering hosts: the block says what it applies, from facts, with each list's counts", async ({ page }, info) => {
+    await switchedOn(page);
+    const { block, errors } = await openEngine(page, "hosts");
+    await expect(block.locator("[data-engine-state]")).toHaveText("Filtering hosts");
+    await expect(block.locator("[data-engine-detail]")).toContainText("to host names only");
+    await expect(block.locator("[data-engine-detail]")).not.toContainText("HTTPS");
+    await expect(block.locator('[data-engine-list="adguard-base"]')).toContainText("90,000 rules applied, 120 skipped");
+    await block.scrollIntoViewIfNeeded();
+    expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
+    await block.screenshot({ path: `test-results/screens/engine-hosts-${info.project.name}.png` });
+    expect(errors).toEqual([]);
+  });
+
   test("the engine sits on the settings column, under the other sections", async ({ page }, info) => {
     test.skip(info.project.name !== "desktop", "one column on a phone");
     const { block } = await openEngine(page, "idle");
-    // The DNS filter that used to sit above it is hidden until the engine replaces it.
     const apps = (await page.getByRole("region", { name: "Apps" }).boundingBox())!;
     const engine = (await block.boundingBox())!;
     expect(Math.abs(engine.x - apps.x)).toBeLessThanOrEqual(1);
