@@ -681,6 +681,8 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
 
 ### Slice 3: full route, relay, DNS on the TUN, crash safety, coexistence
 
+**Status (2026-11-06), wave-1 wiring, offline only:** a forwarded flow (attribution) reaches the decision as `Owner::Forwarded`, so a VM row's Off exempts that VM alone; `may_decrypt` refuses it. Not measured: the live check of this slice, attribution at full route and the CPU and memory budgets are still the user's, and were not run on this tree.
+
 **Status (2026-10-18): built and tested offline on branch `worktree-agent-a826a9ab33de5a613`; the live check is the user's (`docs/live/engine-slice-3.md`).** What differs from the spec below, and why:
 - The full route is the complement of the exclusions, all on the Sieve adapter (1.4, as built), not /1s plus exclusion routes on the original interface.
 - AdGuard: refuse and offer to pause (the user's decision), through `sc.exe` because AdGuard has no supported pause (finding in the decisions table).
@@ -710,7 +712,7 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
 
 ### Slice 4: host-level network filtering, per-app Off, retire the DNS proxy
 
-**Status (2026-11-06), engine side of domain filtering:** built on branch `wf-domain-policy`, offline tests green, live acceptance not run (`docs/tasks/2026-11-02-domain-policy.md`, UNVERIFIED). Encrypted DNS, ECH stripping and the canary, the log route, the DNS proxy's removal and the Settings view of the per-list report are other streams' or still open.
+**Status (2026-11-06), wave-1 wiring:** built and joined on branch `wave-1`, offline tests only. Built: default lists and host decisions, per-app Off, list selection sent from the app, the per-list report in Settings and on Filters, user rules and domain lists through `SetPolicy` (`filtering.userRules`, `filtering.blockedDomains`, `filtering.allowedDomains`, one store), encrypted DNS with `dns::upstream::resolve` called by `dns::service` and `filtering.upstreams` kept equal over the pipe, host-level log rows from the engine, the DNS proxy's removal and the settings migration. Open: ECH stripping and the canary, the upstream editor (the row is a summary with Reset), and an Off row keyed by a service label, which does not match the engine's key (`AppKeys::of_pid`, it stays sieved). Live-unverified: every live item below, including `doubleclick.net` in Edge beside an Off curl, the port 53 capture, PQ on the DNS upstream, and the matcher p99 on the scrubbed corpus.
 
 - **Spec.**
   - Default lists downloaded and compiled in `sieve-filter`. Host decisions for SNI, Host, QUIC SNI and IP-map flows via the synthetic request (5.1). The per-app Off exemption.
@@ -732,6 +734,8 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
 - **Files:** `engine/crates/sieve-filter/**`, `engine/crates/sieve-engine/src/{policy,dns}/**`, `src/app/log/**`, `src/components/sieve/log/**`, `src/core/routes.ts` (one entry), `src/core/settings/{registry,migrate}.ts`, removal of `src-tauri/src/dns/**` and its TS seams (`src/core/dns.ts` except the safety net, `src/data/dns-*.ts`, `src/components/sieve/settings/dns-card*.tsx`), `tests/laws/unavailable.test.ts` (its key list empties). **Live:** yes. **Switch:** none new (part of `filtering.engine`).
 
 ### Slice 5: root CA, install, Firefox, removal, certificate status
+
+**Status (2026-11-06), wave-1 wiring:** built on branch `wave-1`, offline tests only. `Policy.https` and the certificate messages are on protocol 3; `filtering.https` stays unavailable until slice 6, so nothing in the app turns it on. Live-unverified: every **live** item below (no root has been installed by this tree).
 
 - **Spec.** CNG key, rcgen root with the extensions in 2.1, store install with the EKU property, Firefox policy, rotation logic (clock injected), removal paths, `CertStatus` IPC, and the certificate group UI (8.1).
 - **Acceptance.**
@@ -767,6 +771,8 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
 
 ### Slice 9: content: HTML injection, cosmetics, scriptlets
 
+**Status (2026-11-06), wave-1 wiring:** the library is built and tested offline on branch `wave-1`; nothing feeds it traffic, because interception (slice 6) does not exist. The compile prefers `updates\resources` for the bundle (`lists::resources`) and reports its hash as `resource_pin`; `RESOURCE_PIN`, the fallback, is None until a real bundle is reviewed (`docs/tasks/2026-11-02-content.md`, Q1), so today no bundle loads on a real machine. Live-unverified: `live_content_injects_into_test_page` and its budgets.
+
 - **Spec.** Streaming decode and lol_html rewriting with caps, the CSP nonce rules (5.6), site-specific and generic CSS, scriptlets from the pinned uBO resource archive via adblock-rust's assembler, the vendored procedural applier, and `$generichide`/`$elemhide`/`$specifichide` honoured.
 - **Acceptance.**
   - unit tests: CSP rewrite table (unsafe-inline left alone, nonce added, default-src copied, report-only untouched); decompression caps; injection position before a meta CSP; resource archive hash mismatch refused;
@@ -791,6 +797,8 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
 
 ### Slice 12: log details and report a broken site
 
+**Status (2026-11-06), wave-1 wiring:** built on branch `wave-1`, tested with the mock; the engine now emits host-level rows, session scoped, and fills `status.filter`, which the report reads. Request-level rows wait for slice 6. The Log screen is behind `<LockGate>`. Not done: a look in `pnpm tauri dev`. A row blocked by the IP map (`AllResolvedNamesBlocked`) names the address, so its Unblock line does not reach the name that decided it.
+
 - **Spec.** Log details (rule, list, outcome, request facts), row actions (8.3), and the report dialog (8.4).
 - **Acceptance.**
   - component tests: the report contains the listed fields and no query string unless the user leaves it in; "Open issue page" picks the list's issue page; nothing is sent (the network mock records zero requests);
@@ -798,6 +806,8 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
 - **Files:** `src/components/sieve/log/**`, `src/core/report.ts`. **Live:** no (mock), then a look in `pnpm tauri dev`. **Switch:** none.
 
 ### Slice 13: signed updates
+
+**Status (2026-11-06), wave-1 wiring:** built and tested offline on branch `wave-1` over fakes; no update key exists, so this build answers `not_configured` and fetches nothing. Signed data has one path, `update::data_path`; the resource loader reads it. The sensitive list's consumer does not exist yet (slice 6). The update client's TLS now comes from `crate::tls`, as DNS's and the lists' do. Live-unverified: the whole of 7.5's acceptance.
 
 - **Spec.** 7.5: minisign verification with the compiled-in public key, signed kind and version in the trusted comment, a signed index with expiry, staging inside the locked folder, atomic swap with rollback, `RequestUpdate {}` over the pipe, the app's update notice. The user generates the key pair offline first; the public key is the only part that enters the repo.
 - **Acceptance.** The list in 7.5.
