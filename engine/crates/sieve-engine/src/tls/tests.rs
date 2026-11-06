@@ -1065,6 +1065,19 @@ arms!(off_during_the_client_handshake_closes_it_without_blaming_the_client, |arm
     assert!(watched.refused.lock().unwrap().is_empty(), "the engine closed it: not evidence about the client");
 });
 
+arms!(dns_hears_the_same_switches_a_flow_is_judged_by, |arm| async move {
+    let pki = Pki::new("Test Public Root");
+    let (dial, _) = echo_dial(arm, Vec::new());
+    let rig = Rig::new(dial, RigOpts::new(pki.roots()));
+    assert!(rig.deps.may_intercept_name(HOST));
+    assert!(!rig.deps.may_intercept_name("service.gov.uk"), "a restricted suffix");
+    let (dial, _) = echo_dial(arm, Vec::new());
+    let no_root = Rig::new(dial, RigOpts { minter: false, ..RigOpts::new(pki.roots()) });
+    assert!(!no_root.deps.may_intercept_name(HOST), "no root to mint from");
+    rig.deps.active.close_all();
+    assert!(!rig.deps.may_intercept_name(HOST), "the switch went off after the slot was taken");
+});
+
 arms!(a_flow_that_starts_after_the_close_never_decrypts, |arm| async move {
     // It took the slot's `Interception` before the switch went off.
     let pki = Pki::new("Test Public Root");

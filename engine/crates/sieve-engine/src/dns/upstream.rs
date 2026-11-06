@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::question_names;
+use super::{question_names, reverse};
 use crate::route::plan;
 use crate::route::prefix::Prefix;
-use crate::route::table::NetTables;
+use crate::route::table::{Adapter, NetTables};
 
 /// One default resolver: where it is, and its addresses, so reaching it never
 /// asks plain DNS (or the DNS it is about to serve).
@@ -222,12 +222,15 @@ pub struct SplitHorizon {
 
 /// Where one query goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SplitRoute {
-    /// To the encrypted upstreams: nothing in it is under a suffix.
-    Encrypted,
+pub enum Path {
+    /// To this LAN server and nowhere else.
     Lan(IpAddr),
     /// Nowhere: SERVFAIL, because it may be a LAN name and has no LAN server.
     Refused,
+    /// A private reverse name with no LAN server to ask: answered here.
+    NoServer,
+    /// To the encrypted upstreams: nothing in it is a LAN name.
+    Encrypted,
 }
 
 impl SplitHorizon {
@@ -236,11 +239,7 @@ impl SplitHorizon {
     /// when a caller accidentally supplies a default route as its LAN.
     pub fn new(suffix: &str, server: IpAddr, lan_prefixes: &[Prefix]) -> Option<Self> {
         let suffix = crate::flow::sni::host_name(suffix.as_bytes())?;
-        let private = match server {
-            IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
-            IpAddr::V6(ip) => (ip.segments()[0] & 0xfe00 == 0xfc00) || (ip.segments()[0] & 0xffc0 == 0xfe80),
-        };
-        (private && lan_prefixes.iter().any(|p| p.contains(server))).then_some(Self { suffix, server: Some(server) })
+        private_inside(server, lan_prefixes).then_some(Self { suffix, server: Some(server) })
     }
 
     /// A suffix whose adapter has no server this engine can reach.
@@ -254,6 +253,22 @@ impl SplitHorizon {
         let suffix = self.suffix.split('.').rev();
         suffix.clone().count() <= labels.len() && suffix.zip(labels.iter().rev()).all(|(want, label)| label.eq_ignore_ascii_case(want.as_bytes()))
     }
+}
+
+/// True for a private address inside these prefixes.
+fn private_inside(server: IpAddr, prefixes: &[Prefix]) -> bool {
+    let private = match server {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => (ip.segments()[0] & 0xfe00 == 0xfc00) || (ip.segments()[0] & 0xffc0 == 0xfe80),
+    };
+    private && prefixes.iter().any(|p| p.contains(server))
+}
+
+/// An adapter's first DNS server that plain DNS may reach: private, inside a
+/// hole, not a link-local IPv6 one (its address has no scope, and pinning refuses
+/// a link-local source).
+fn lan_server(adapter: &Adapter, holes: &[Prefix]) -> Option<IpAddr> {
+    adapter.dns.iter().copied().find(|ip| !is_v6_link_local(*ip) && private_inside(*ip, holes))
 }
 
 /// The most specific rule over a name, longest suffix first. Between two equal
@@ -270,27 +285,25 @@ fn rule_for<'a>(labels: &[Vec<u8>], rules: &'a [SplitHorizon]) -> Option<&'a Spl
 /// server for it is refused: the public upstream would publish that name. With
 /// no rules at all there is no LAN name to protect, and an unreadable query goes
 /// encrypted, opaque.
-pub fn split_route(query: &[u8], rules: &[SplitHorizon]) -> SplitRoute {
+pub fn split_route(query: &[u8], rules: &[SplitHorizon]) -> Path {
     if rules.is_empty() {
-        return SplitRoute::Encrypted;
+        return Path::Encrypted;
     }
-    let Some(names) = question_names(query) else { return SplitRoute::Refused };
+    let Some(names) = question_names(query) else { return Path::Refused };
     let mut matched = names.iter().map(|labels| rule_for(labels, rules));
-    let Some(first) = matched.next() else { return SplitRoute::Encrypted };
+    let Some(first) = matched.next() else { return Path::Encrypted };
     if matched.any(|other| other.map(|r| r.server) != first.map(|r| r.server)) {
-        return SplitRoute::Refused;
+        return Path::Refused;
     }
     match first {
-        None => SplitRoute::Encrypted,
-        Some(SplitHorizon { server: Some(server), .. }) => SplitRoute::Lan(*server),
-        Some(_) => SplitRoute::Refused,
+        None => Path::Encrypted,
+        Some(SplitHorizon { server: Some(server), .. }) => Path::Lan(*server),
+        Some(_) => Path::Refused,
     }
 }
 
 /// The rules these tables imply, computed per query (few adapters, no cache):
-/// each suffix of each other up adapter, with the adapter's first server that
-/// qualifies against the route plan's holes. A link-local IPv6 server is
-/// skipped: its address has no scope, and pinning refuses a link-local source.
+/// each suffix of each other up adapter, with [`lan_server`].
 /// When such servers are all the adapter has, its suffix still holds, with no
 /// server. A public server is another matter: an ISP's or a router's suffix under
 /// a public domain resolves publicly, so that suffix makes no rule.
@@ -299,8 +312,9 @@ pub fn split_rules(tables: &NetTables) -> Vec<SplitHorizon> {
     let mut rules = Vec::new();
     for adapter in tables.others() {
         let only_link_local = !adapter.dns.is_empty() && adapter.dns.iter().all(|ip| is_v6_link_local(*ip));
+        let server = lan_server(adapter, &holes);
         for suffix in &adapter.dns_suffixes {
-            let qualifying = adapter.dns.iter().filter(|ip| !is_v6_link_local(**ip)).find_map(|ip| SplitHorizon::new(suffix, *ip, &holes));
+            let qualifying = server.and_then(|server| SplitHorizon::new(suffix, server, &holes));
             rules.extend(qualifying.or_else(|| only_link_local.then(|| SplitHorizon::unreachable(suffix)).flatten()));
         }
     }
@@ -309,6 +323,22 @@ pub fn split_rules(tables: &NetTables) -> Vec<SplitHorizon> {
 
 fn is_v6_link_local(ip: IpAddr) -> bool {
     matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80)
+}
+
+/// The route of a query, `name` being its one question as [`parse`](super::parse)
+/// reads it. A configured suffix wins. A private reverse name goes
+/// to the server of the adapter whose on-link prefix holds the address, else to
+/// the first server of any other adapter, and never to the public upstream.
+pub fn path_of(query: &[u8], name: Option<&str>, tables: &NetTables) -> Path {
+    let configured = split_route(query, &split_rules(tables));
+    if configured != Path::Encrypted {
+        return configured;
+    }
+    let Some(address) = name.and_then(reverse::private_address) else { return Path::Encrypted };
+    let holes = plan::holes(tables);
+    let holds_address = |a: &&Adapter| a.addresses.iter().filter_map(|addr| addr.on_link()).any(|p| p.contains(address));
+    let covering = tables.others().filter(holds_address).find_map(|a| lan_server(a, &holes));
+    covering.or_else(|| tables.others().find_map(|a| lan_server(a, &holes))).map_or(Path::NoServer, Path::Lan)
 }
 
 #[cfg(test)]
@@ -460,9 +490,9 @@ mod tests {
         assert!(SplitHorizon::new("corp.example", "192.168.8.1".parse().unwrap(), &lan).is_none());
         assert!(SplitHorizon::new("corp.example", "8.8.8.8".parse().unwrap(), &["0.0.0.0/0".parse().unwrap()]).is_none());
         assert!(SplitHorizon::new("corp.example", "127.0.0.1".parse().unwrap(), &["127.0.0.0/8".parse().unwrap()]).is_none());
-        assert_eq!(route_of("host.CORP.example", std::slice::from_ref(&rule)), SplitRoute::Lan(server));
-        assert_eq!(route_of("notcorp.example", std::slice::from_ref(&rule)), SplitRoute::Encrypted);
-        assert_eq!(route_of("corp.example.attacker.test", &[rule]), SplitRoute::Encrypted);
+        assert_eq!(route_of("host.CORP.example", std::slice::from_ref(&rule)), Path::Lan(server));
+        assert_eq!(route_of("notcorp.example", std::slice::from_ref(&rule)), Path::Encrypted);
+        assert_eq!(route_of("corp.example.attacker.test", &[rule]), Path::Encrypted);
     }
 
     #[test]
@@ -470,7 +500,7 @@ mod tests {
         let lan = ["10.0.0.0/8".parse().unwrap()];
         let broad = SplitHorizon::new("corp.example", "10.0.0.1".parse().unwrap(), &lan).unwrap();
         let narrow = SplitHorizon::new("dev.corp.example", "10.0.0.2".parse().unwrap(), &lan).unwrap();
-        assert_eq!(route_of("api.dev.corp.example", &[narrow, broad]), SplitRoute::Lan("10.0.0.2".parse().unwrap()));
+        assert_eq!(route_of("api.dev.corp.example", &[narrow, broad]), Path::Lan("10.0.0.2".parse().unwrap()));
     }
 
     /// A query with these names, as raw labels.
@@ -498,16 +528,16 @@ mod tests {
 
         let one = wire_query(&[under]);
         assert!(crate::dns::parse(&one).is_none(), "the parser refuses it");
-        assert_eq!(split_route(&one, &rules), SplitRoute::Lan(server), "and it stays on the LAN");
-        assert_eq!(split_route(&wire_query(&[under, also_under]), &rules), SplitRoute::Lan(server), "several questions, one server");
-        assert_eq!(split_route(&wire_query(&[elsewhere]), &rules), SplitRoute::Encrypted);
-        assert_eq!(split_route(&wire_query(&[under, elsewhere]), &rules), SplitRoute::Refused, "the questions disagree");
-        assert_eq!(split_route(&wire_query(&[]), &rules), SplitRoute::Encrypted, "no name to protect");
+        assert_eq!(split_route(&one, &rules), Path::Lan(server), "and it stays on the LAN");
+        assert_eq!(split_route(&wire_query(&[under, also_under]), &rules), Path::Lan(server), "several questions, one server");
+        assert_eq!(split_route(&wire_query(&[elsewhere]), &rules), Path::Encrypted);
+        assert_eq!(split_route(&wire_query(&[under, elsewhere]), &rules), Path::Refused, "the questions disagree");
+        assert_eq!(split_route(&wire_query(&[]), &rules), Path::Encrypted, "no name to protect");
 
         let mut cut = wire_query(&[under]);
         cut.truncate(cut.len() - 6);
-        assert_eq!(split_route(&cut, &rules), SplitRoute::Refused, "it cannot be walked");
-        assert_eq!(split_route(&cut, &[]), SplitRoute::Encrypted, "with no rule there is no LAN name");
+        assert_eq!(split_route(&cut, &rules), Path::Refused, "it cannot be walked");
+        assert_eq!(split_route(&cut, &[]), Path::Encrypted, "with no rule there is no LAN name");
     }
 
     fn with_suffix(tables: &mut NetTables, alias: &str, suffix: &str) {
@@ -515,8 +545,76 @@ mod tests {
         adapter.dns_suffixes.push(suffix.into());
     }
 
-    fn route_of(name: &str, rules: &[SplitHorizon]) -> SplitRoute {
+    fn route_of(name: &str, rules: &[SplitHorizon]) -> Path {
         split_route(&crate::dns::query_for(name, crate::dns::TYPE_A).unwrap(), rules)
+    }
+
+    fn path_for(name: &str, tables: &NetTables) -> Path {
+        path_of(&crate::dns::query_for(name, crate::dns::TYPE_A).unwrap(), Some(name), tables)
+    }
+
+    const ROUTER_REVERSE: &str = "7.168.192.in-addr.arpa";
+
+    fn wifi(tables: &mut NetTables) -> &mut Adapter {
+        tables.adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap()
+    }
+
+    #[test]
+    fn a_private_reverse_name_goes_to_the_adapter_that_covers_it() {
+        use crate::route::table::fixtures::*;
+        let router = "192.168.7.1".parse().unwrap();
+        assert_eq!(path_for(ROUTER_REVERSE, &load(HOME)), Path::Lan(router));
+        // Another adapter holds the address and has its own private server.
+        let mut two = load(HOME);
+        let default_switch = two.adapters.iter_mut().find(|a| a.alias.starts_with("vEthernet")).unwrap();
+        let on_link = default_switch.addresses[0].on_link().unwrap();
+        let other_dns = on_link.addr();
+        default_switch.dns = vec![other_dns];
+        let octets = match on_link.addr() {
+            IpAddr::V4(ip) => ip.octets(),
+            IpAddr::V6(_) => panic!("the fixture's first address is IPv4"),
+        };
+        let name = format!("{}.{}.{}.{}.in-addr.arpa", octets[3], octets[2], octets[1], octets[0]);
+        assert_eq!(path_for(&name, &two), Path::Lan(other_dns));
+        assert_eq!(path_for(ROUTER_REVERSE, &two), Path::Lan(router), "each to its own");
+    }
+
+    #[test]
+    fn with_no_covering_adapter_any_adapters_private_server_answers() {
+        use crate::route::table::fixtures::*;
+        assert_eq!(path_for("5.0.0.10.in-addr.arpa", &load(HOME)), Path::Lan("192.168.7.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn with_no_private_server_a_private_reverse_name_has_no_path() {
+        use crate::route::table::fixtures::*;
+        let others_empty = |dns: Vec<IpAddr>| {
+            let mut t = load(HOME);
+            wifi(&mut t).dns = dns;
+            t
+        };
+        for dns in [vec!["8.8.8.8".parse().unwrap()], vec!["fe80::1".parse().unwrap()], vec![]] {
+            assert_eq!(path_for(ROUTER_REVERSE, &others_empty(dns.clone())), Path::NoServer, "{dns:?}");
+        }
+    }
+
+    #[test]
+    fn public_names_go_encrypted() {
+        use crate::route::table::fixtures::*;
+        for name in ["www.example", "8.8.8.8.in-addr.arpa", "192.in-addr.arpa", "in-addr.arpa", "example.arpa"] {
+            assert_eq!(path_for(name, &load(HOME)), Path::Encrypted, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_configured_suffix_wins_over_the_reverse_rule() {
+        use crate::route::table::fixtures::*;
+        let mut tables = load(HOME);
+        let default_switch = tables.adapters.iter_mut().find(|a| a.alias.starts_with("vEthernet")).unwrap();
+        let server = default_switch.addresses[0].on_link().unwrap().addr();
+        default_switch.dns = vec![server];
+        default_switch.dns_suffixes = vec!["168.192.in-addr.arpa".into()];
+        assert_eq!(path_for(ROUTER_REVERSE, &tables), Path::Lan(server), "not the Wi-Fi router, which covers the address");
     }
 
     #[test]
@@ -528,8 +626,8 @@ mod tests {
         assert!(split_rules(&home).is_empty(), "no suffix, no rule");
         with_suffix(&mut home, "Wi-Fi", "lan");
         let rules = split_rules(&home);
-        assert_eq!(route_of("router.lan", &rules), SplitRoute::Lan(lan));
-        assert_eq!(route_of("router.example", &rules), SplitRoute::Encrypted);
+        assert_eq!(route_of("router.lan", &rules), Path::Lan(lan));
+        assert_eq!(route_of("router.example", &rules), Path::Encrypted);
 
         // A public server, even in a public hole, qualifies nothing.
         let mut public = load(VPN_SPLIT);
@@ -537,7 +635,7 @@ mod tests {
         vpn.dns = vec!["203.0.113.53".parse().unwrap()];
         vpn.dns_suffixes = vec!["corp.example".into()];
         assert!(plan::holes(&public).iter().any(|p| p.contains("203.0.113.53".parse().unwrap())), "it is a hole");
-        assert_eq!(route_of("a.corp.example", &split_rules(&public)), SplitRoute::Encrypted);
+        assert_eq!(route_of("a.corp.example", &split_rules(&public)), Path::Encrypted);
 
         // A link-local IPv6 server is skipped, a later private one is taken.
         // With nothing else, the suffix's names are refused: they never go public.
@@ -545,17 +643,17 @@ mod tests {
         let wifi = scoped.adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap();
         wifi.dns = vec!["fe80::1".parse().unwrap()];
         wifi.dns_suffixes = vec!["lan".into()];
-        assert_eq!(route_of("router.lan", &split_rules(&scoped)), SplitRoute::Refused);
-        assert_eq!(route_of("router.example", &split_rules(&scoped)), SplitRoute::Encrypted);
+        assert_eq!(route_of("router.lan", &split_rules(&scoped)), Path::Refused);
+        assert_eq!(route_of("router.example", &split_rules(&scoped)), Path::Encrypted);
         scoped.adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap().dns.push(lan);
-        assert_eq!(route_of("router.lan", &split_rules(&scoped)), SplitRoute::Lan(lan));
+        assert_eq!(route_of("router.lan", &split_rules(&scoped)), Path::Lan(lan));
 
         // Two adapters with one suffix: the one with a reachable server answers,
         // in either order.
         let lan_rule = SplitHorizon { suffix: "lan".to_string(), server: Some(lan) };
         let no_server = SplitHorizon::unreachable("lan").unwrap();
-        assert_eq!(route_of("router.lan", &[lan_rule.clone(), no_server.clone()]), SplitRoute::Lan(lan));
-        assert_eq!(route_of("router.lan", &[no_server, lan_rule]), SplitRoute::Lan(lan));
+        assert_eq!(route_of("router.lan", &[lan_rule.clone(), no_server.clone()]), Path::Lan(lan));
+        assert_eq!(route_of("router.lan", &[no_server, lan_rule]), Path::Lan(lan));
 
         // A link-local server beside a public one: the suffix resolves publicly.
         let mut mixed = load(HOME);

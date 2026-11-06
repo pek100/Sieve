@@ -179,3 +179,4 @@ brotli = "8"
 # Real CRLite filters for tests (`tls::crlite::testing`).
 clubcard = { version = "0.3", features = ["builder"] }
 clubcard-crlite = { version = "0.6", features = ["builder"] }
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }

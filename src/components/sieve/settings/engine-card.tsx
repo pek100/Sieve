@@ -140,11 +140,6 @@ export function EngineCard() {
             {e.actionError}
           </p>
         )}
-        {e.dnsError && (
-          <p role="alert" className="text-label text-blocked break-words" data-engine-dns-error="">
-            {e.dnsError}
-          </p>
-        )}
       </div>
     </Card>
   );

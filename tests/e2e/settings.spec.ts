@@ -47,6 +47,43 @@ test.describe("settings", () => {
     expect(errors).toEqual([]);
   });
 
+  test("the upstream editor: add, reorder, read back, and it fits at every width", async ({ page }, info) => {
+    await page.route("**/*", (route) => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
+    await page.goto(`${SETTINGS}&engine=idle`);
+    const editor = row(page, "filtering.upstreams");
+    await editor.scrollIntoViewIfNeeded();
+    await editor.getByRole("radio", { name: "DoT" }).click();
+    await editor.getByRole("textbox", { name: "Add to Upstream DNS servers" }).fill("dns.example");
+    await editor.getByRole("button", { name: "Add", exact: true }).click();
+    await expect(editor.locator("[data-upstream]").last()).toHaveAttribute("data-upstream", "tls://dns.example");
+
+    // Moved first: it is tried first, and the engine's list follows.
+    for (let moves = 2; moves > 0; moves--) await editor.getByRole("button", { name: "Move tls://dns.example up" }).click();
+    await expect(editor.locator("[data-upstream]").first()).toHaveAttribute("data-upstream", "tls://dns.example");
+    await expect(editor.locator("[data-upstream-readback]")).toHaveText("The engine uses this list.");
+
+    // A long DoH address wraps inside the row.
+    const long = `https://a-very-long-resolver-name.dns.example/dns-query?profile=${"0123456789".repeat(6)}`;
+    await editor.getByRole("textbox", { name: "Add to Upstream DNS servers" }).fill(long);
+    await editor.getByRole("button", { name: "Add", exact: true }).click();
+    await expect(editor.locator("[data-upstream]").last()).toHaveAttribute("data-upstream", long);
+    expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
+    await editor.screenshot({ path: `test-results/screens/settings-upstreams-${info.project.name}.png` });
+
+    if (info.project.name !== "desktop") {
+      await editor.getByRole("textbox", { name: "Add to Upstream DNS servers" }).fill("x.example");
+      const controls = editor.locator("button:enabled, input, [role=radio]");
+      for (const control of await controls.all()) {
+        const box = (await control.boundingBox())!;
+        expect(Math.round(box.height), await control.evaluate((e) => e.outerHTML.slice(0, 80))).toBeGreaterThanOrEqual(44);
+      }
+    }
+
+    await page.reload();
+    await expect(editor.locator("[data-upstream]").first()).toHaveAttribute("data-upstream", "tls://dns.example");
+    await expect(editor.locator("[data-upstream]")).toHaveCount(4);
+  });
+
   test("there is no per-app filtering row, no Windows DNS row and no DNS filtering switch", async ({ page }, info) => {
     await openSettings(page);
     await expect(row(page, "filtering.perApp")).toHaveCount(0);

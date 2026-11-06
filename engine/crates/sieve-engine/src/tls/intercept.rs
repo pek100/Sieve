@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use rustls::{AlertDescription, NamedGroup};
-use sieve_filter::exclusions::{AutoReason, Decrypt, Floor, FlowFacts, PassReason, Transport, UpstreamVerdict, decrypt};
+use sieve_filter::exclusions::{AutoReason, Decrypt, Floor, FlowFacts, PassReason, Switches, Transport, UpstreamVerdict, decrypt, name_may_intercept};
 use sieve_ipc::FlowAction;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
@@ -205,12 +205,23 @@ fn rejection(verdict: UpstreamVerdict) -> Option<UpstreamVerdict> {
     (verdict != UpstreamVerdict::Eligible).then_some(verdict)
 }
 
+impl<C> Interception<C> {
+    fn switches(&self) -> Switches {
+        // A closed set means the switch went off after this flow took the slot.
+        self.exclusions.switches(!self.active.is_closed(), (self.minter)().is_some())
+    }
+
+    /// True when a flow to this name may be decrypted, for DNS to ask before a
+    /// flow exists (`dns::service`, plan 2.9).
+    pub fn may_intercept_name(&self, name: &str) -> bool {
+        name_may_intercept(name, &self.exclusions.get_at((self.clock)()), &self.switches())
+    }
+}
+
 impl<C: Dial> Interception<C> {
     fn says(&self, facts: &FlowFacts<'_>) -> Decrypt {
         let store = self.exclusions.get_at((self.clock)());
-        // A closed set means the switch went off after this flow took the slot.
-        let switches = self.exclusions.switches(!self.active.is_closed(), (self.minter)().is_some());
-        decrypt(facts, &store, &switches)
+        decrypt(facts, &store, &self.switches())
     }
 
     /// The facts of a flow whose first bytes were decoded, on either transport:

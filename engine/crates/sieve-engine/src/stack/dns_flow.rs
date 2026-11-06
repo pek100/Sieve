@@ -8,7 +8,7 @@ use ipstack::{IpStackTcpStream, IpStackUdpStream};
 use sieve_ipc::{FlowAction, FlowKind, FlowProto, FlowReason};
 
 use super::relay::{Attributed, Relay, close_app, lock};
-use crate::dns::service::{Totals, serve_datagrams, serve_tcp};
+use crate::dns::service::{Asker, Totals, serve_datagrams, serve_tcp};
 use crate::flow::flows::FiveTuple;
 
 /// Remembers the flow's first question as its host (a flow is usually one query).
@@ -21,11 +21,12 @@ fn first_question(ctx: &Relay, id: u64) -> impl FnMut(&str) + use<'_> {
     }
 }
 
-/// Books the flow as DNS: a lookup is never blocked (`domain`), whoever asks.
-fn admit(ctx: &Relay, flow: &FiveTuple, attributed: &Attributed, proto: FlowProto) -> Option<u64> {
-    let id = ctx.admit(flow, attributed, proto, FlowKind::Dns)?.id;
-    lock(&ctx.book).update(id, |e| e.reason = Some(FlowReason::Dns));
-    Some(id)
+/// Books the flow as DNS: a lookup is never blocked (`domain`), whoever asks. The
+/// answer does depend on who asks: a guest's flows are never decrypted.
+fn admit(ctx: &Relay, flow: &FiveTuple, attributed: &Attributed, proto: FlowProto) -> Option<(u64, Asker)> {
+    let admitted = ctx.admit(flow, attributed, proto, FlowKind::Dns)?;
+    lock(&ctx.book).update(admitted.id, |e| e.reason = Some(FlowReason::Dns));
+    Some((admitted.id, Asker { may_decrypt: admitted.may_decrypt() }))
 }
 
 fn finish(ctx: &Relay, id: u64, totals: Totals) {
@@ -35,15 +36,15 @@ fn finish(ctx: &Relay, id: u64, totals: Totals) {
 
 pub async fn udp(ctx: Arc<Relay>, mut app: IpStackUdpStream, flow: FiveTuple) {
     let attributed = ctx.attribute(flow).await;
-    let Some(id) = admit(&ctx, &flow, &attributed, FlowProto::Udp) else { return };
-    let totals = serve_datagrams(&ctx.dns, &mut app, first_question(&ctx, id)).await;
+    let Some((id, asker)) = admit(&ctx, &flow, &attributed, FlowProto::Udp) else { return };
+    let totals = serve_datagrams(&ctx.dns, &mut app, asker, first_question(&ctx, id)).await;
     finish(&ctx, id, totals);
 }
 
 pub async fn tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple) {
     let attributed = ctx.attribute(flow).await;
-    let Some(id) = admit(&ctx, &flow, &attributed, FlowProto::Tcp) else { return close_app(&mut app).await };
-    let totals = serve_tcp(&ctx.dns, &mut app, first_question(&ctx, id)).await;
+    let Some((id, asker)) = admit(&ctx, &flow, &attributed, FlowProto::Tcp) else { return close_app(&mut app).await };
+    let totals = serve_tcp(&ctx.dns, &mut app, asker, first_question(&ctx, id)).await;
     finish(&ctx, id, totals);
     close_app(&mut app).await;
 }

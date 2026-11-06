@@ -261,15 +261,21 @@ export function createEngineController({ engine, store, clock, settings, checks,
 
   // Compared with what the engine holds on every probe, so a list the engine lost
   // or never had is sent again. The setting is never empty (the registry refuses
-  // that, as the engine does), so there is always a list to compare.
+  // that, as the engine does), so there is always a list to compare. What it said it
+  // holds stays in the slice for the row to read back, null while it cannot be asked.
+  const keepHeld = (held: readonly string[] | null) => {
+    if (JSON.stringify(get().heldUpstreams ?? null) !== JSON.stringify(held)) set({ heldUpstreams: held });
+  };
   const syncUpstreams = async () => {
-    if (disposed || !settingsReady || upstreamsInFlight || !engineTakesPolicy(get())) return;
+    if (disposed || !settingsReady || upstreamsInFlight) return;
+    if (!engineTakesPolicy(get())) return keepHeld(null);
     upstreamsInFlight = true;
     try {
       const held = await engine.dnsUpstreams();
       const want = settings.get("filtering.upstreams");
       const same = want.length === held.upstreams.length && want.every((u, i) => u === held.upstreams[i]);
-      if (!same) await engine.setDnsUpstreams({ revision: held.revision + 1, upstreams: [...want] });
+      keepHeld(held.upstreams);
+      if (!same) keepHeld((await engine.setDnsUpstreams({ revision: held.revision + 1, upstreams: [...want] })).upstreams);
       if (get().dnsError) set({ dnsError: null });
     } catch (e) {
       set({ dnsError: `The DNS servers did not reach the engine: ${message(e)}` });

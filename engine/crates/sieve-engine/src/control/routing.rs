@@ -280,7 +280,10 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     let mtu = MTU;
     #[cfg(feature = "relay-experiments")]
     let mtu = engine.experiments.settings.tun_mtu;
-    let dns = engine.start_dns_service(|endpoints| Arc::new(Service::new(endpoints, context, shared_tables.clone(), engine.names.clone(), engine.meters.clone(), usize::from(mtu))))?;
+    // Asked per answer, so `filtering.https` going off keeps every ECH from then on.
+    let https = engine.https.clone();
+    let may_intercept = Box::new(move |name: &str| https.get().is_some_and(|i| i.may_intercept_name(name)));
+    let dns = engine.start_dns_service(|endpoints| Arc::new(Service::new(endpoints, context, shared_tables.clone(), engine.names.clone(), engine.meters.clone(), usize::from(mtu), may_intercept)))?;
     // Before the routes, so a hang starting it cannot hold a route.
     let (etw, witness, nat) = start_attribution(engine);
     let added = match route_adapter(&journal, luid, &plan.routes) {

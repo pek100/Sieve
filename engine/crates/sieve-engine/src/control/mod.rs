@@ -345,8 +345,8 @@ impl Engine {
     /// is never read as a current one. Best effort.
     fn write_dns_status_file(&self) {
         let Some(dir) = &self.dir else { return };
-        let upstreams = lock(&self.dns_service).as_ref().map(|s| s.report()).unwrap_or_default();
-        if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({ "upstreams": upstreams })) {
+        let (upstreams, counts) = lock(&self.dns_service).as_ref().map(|s| (s.report(), s.counts())).unwrap_or_default();
+        if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({ "upstreams": upstreams, "answers": counts })) {
             let _ = policy::write_report(&dir.join(DNS_STATUS_FILE), &json);
         }
     }
@@ -795,7 +795,7 @@ mod tests {
     fn service_from(endpoints: Vec<Upstream>) -> Arc<Service> {
         use crate::route::table::fixtures::{HOME, load};
         let context = crate::dns::testing::Ca::new().context(Arc::default(), Vec::new());
-        Arc::new(Service::new(endpoints, context, Arc::new(std::sync::RwLock::new(load(HOME))), Arc::default(), Arc::default(), usize::from(crate::tun::MTU)))
+        Arc::new(Service::new(endpoints, context, Arc::new(std::sync::RwLock::new(load(HOME))), Arc::default(), Arc::default(), usize::from(crate::tun::MTU), Box::new(|_| false)))
     }
 
     fn addresses(service: &Service) -> Vec<String> {
@@ -856,6 +856,7 @@ mod tests {
         e.write_status_file();
         let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(DNS_STATUS_FILE)).unwrap()).unwrap();
         assert_eq!(status["upstreams"], serde_json::json!([]));
+        assert_eq!(status["answers"]["ech_stripped"], serde_json::json!(0), "counts sit beside the list, and start at nothing");
     }
 
     #[test]

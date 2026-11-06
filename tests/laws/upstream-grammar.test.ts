@@ -7,7 +7,7 @@
  * it, or the other way round.
  */
 import { describe, expect, it } from "vitest";
-import { parseUpstream } from "@/core/upstream";
+import { MAX_UPSTREAMS, parseUpstream } from "@/core/upstream";
 import { settingDef } from "@/core/settings/registry";
 import ipc from "@/data/fixtures/engine-ipc-v3.json";
 import table from "@/data/fixtures/upstream-grammar.json";
@@ -41,6 +41,11 @@ describe("law: one upstream grammar", () => {
   it("the engine's half reads this same table and asks its real parser", () => {
     const rust = read("engine/crates/sieve-engine/tests/upstream_grammar.rs");
     expect(rust).toContain('include_str!("../../../../src/data/fixtures/upstream-grammar.json")');
-    expect(rust).toContain("sieve_engine::dns::upstream::Upstream");
+    expect(rust).toMatch(/sieve_engine::dns::upstream::\{MAX_UPSTREAMS, Upstream\}/);
+  });
+
+  it("one limit: the app's is the table's, and the engine's half holds its own to the table", () => {
+    expect(MAX_UPSTREAMS).toBe(table.max);
+    expect(read("engine/crates/sieve-engine/tests/upstream_grammar.rs")).toContain('table["max"].as_u64(), Some(MAX_UPSTREAMS as u64)');
   });
 });

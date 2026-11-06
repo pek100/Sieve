@@ -60,6 +60,8 @@ export interface EngineSlice {
   actionError?: string | null;
   /** Why `filtering.upstreams` did not reach the engine; null after a good read or send. */
   dnsError?: string | null;
+  /** The upstream list the engine last said it holds; null while it cannot be asked. */
+  heldUpstreams?: readonly string[] | null;
   /** The root certificate as the engine last said; null while it cannot be asked. */
   cert?: CertStatus | null;
   /** Why the newest certificate read failed; null after a good one. */

@@ -63,6 +63,12 @@ pub(super) struct Admitted {
     owner: HeldOwner,
 }
 
+impl Admitted {
+    pub(super) fn may_decrypt(&self) -> bool {
+        self.owner.as_owner().may_decrypt()
+    }
+}
+
 /// The ETW ring, or nothing when its session could not start.
 pub type Witness = Box<dyn PidWitness + Send>;
 

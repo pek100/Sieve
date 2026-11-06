@@ -1,4 +1,5 @@
 {
+  "max": 8,
   "accept": [
     "https://cloudflare-dns.com/dns-query",
     "https://dns.quad9.net/dns-query",

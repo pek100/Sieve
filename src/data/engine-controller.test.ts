@@ -627,6 +627,61 @@ describe("engine controller", () => {
     s.undo();
   });
 
+  it("the_slice_keeps_what_the_engine_said_it_holds_from_the_read_and_from_the_send", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    const defaults = settingDef("filtering.upstreams").default;
+    expect(s.store.getState().engine.heldUpstreams).toEqual(defaults);
+    const list = ["tls://b.example", "https://a.example/dns-query"];
+    await s.settings.set("filtering.upstreams", list);
+    await s.fc.flush();
+    expect(s.store.getState().engine.heldUpstreams, "the send's answer").toEqual(list);
+    s.undo();
+  });
+
+  it("a_list_read_the_same_again_writes_nothing_to_the_store", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    const before = s.store.getState().engine.heldUpstreams;
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.store.getState().engine.heldUpstreams, "the same array: no emit").toBe(before);
+    s.undo();
+  });
+
+  it("a_refused_send_keeps_showing_what_the_engine_still_holds", async () => {
+    const s = setup("idle", memoryBackend({ schema: 5, values: { "filtering.upstreams": ["tls://a.example"] } }));
+    s.fake.source.setDnsUpstreams = async () => {
+      throw new Error("refused");
+    };
+    await s.fc.flush();
+    expect(s.store.getState().engine.heldUpstreams).toEqual(settingDef("filtering.upstreams").default);
+    expect(s.store.getState().engine.dnsError).toContain("refused");
+    s.undo();
+  });
+
+  it("the_held_list_is_forgotten_when_the_engine_stops_taking_a_policy", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    expect(s.store.getState().engine.heldUpstreams).not.toBeNull();
+    s.fake.source.probe = async () => { throw new Error("gone"); };
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.store.getState().engine.heldUpstreams).toBeNull();
+    s.undo();
+  });
+
+  it("a_malformed_answer_sets_the_error_and_the_rest_of_the_slice_stands", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    const before = s.store.getState().engine.heldUpstreams;
+    s.fake.source.dnsUpstreams = async () => ({ revision: 1 }) as never;
+    await s.fc.advance(ENGINE_POLL_MS);
+    const engine = s.store.getState().engine;
+    expect(engine.dnsError).toContain("The DNS servers did not reach the engine");
+    expect(engine.probe).not.toBeNull();
+    expect(engine.heldUpstreams, "the last good answer stands").toBe(before);
+    s.undo();
+  });
+
   it("a_stored_empty_resolver_list_reads_as_the_default_and_an_unreachable_engine_is_not_asked", async () => {
     const custom = { revision: 4, upstreams: ["tls://held.example"] };
     const s = setup("idle", memoryBackend({ schema: 5, values: { "filtering.upstreams": [] } }));
