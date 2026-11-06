@@ -80,6 +80,9 @@ struct Snapshot {
 #[derive(Debug)]
 pub struct ExclusionSlot {
     dir: Option<PathBuf>,
+    /// None without a folder, and for a file that could not be read: only a
+    /// person may decide what a damaged record meant.
+    writer: Option<auto::Writer>,
     sources: Vec<Source>,
     skip_ev: bool,
     layers: Mutex<Layers>,
@@ -116,9 +119,10 @@ impl ExclusionSlot {
                 (s.id, entries)
             })
             .collect();
+        let writer = dir.filter(|_| auto_error.is_none()).map(auto::Writer::for_dir);
         let layers = Layers { user: user_entries(policy_exclusions), lists: list_layers, auto, auto_error, browsers: BrowserSet::default() };
         let (set, next_expiry) = layers.build(now_ms);
-        Self { dir: dir.map(Path::to_path_buf), sources: enabled, skip_ev: SKIP_EV, layers: Mutex::new(layers), snapshot: Mutex::new(Snapshot { set: Arc::new(set), next_expiry }) }
+        Self { dir: dir.map(Path::to_path_buf), writer, sources: enabled, skip_ev: SKIP_EV, layers: Mutex::new(layers), snapshot: Mutex::new(Snapshot { set: Arc::new(set), next_expiry }) }
     }
 
     /// The other value of the one dial with no setting yet.
@@ -152,9 +156,10 @@ impl ExclusionSlot {
         Switches { https, root_ready, lists_ready: lock(&self.layers).lists_ready(), skip_ev: self.skip_ev, scope: SCOPE }
     }
 
-    /// Why the store holds the floor, for the status file.
+    /// What is wrong with the file, for the status file: why the store holds the
+    /// floor, or why the last write failed (which holds nothing up).
     pub fn error(&self) -> Option<String> {
-        lock(&self.layers).auto_error.clone()
+        lock(&self.layers).auto_error.clone().or_else(|| self.writer.as_ref().and_then(auto::Writer::failure))
     }
 
     pub fn in_scope(&self, exe: Option<&str>) -> bool {
@@ -175,38 +180,43 @@ impl ExclusionSlot {
         }
     }
 
-    /// Slice 7 writes here too. Written through to the disk; a write that fails
-    /// is reported, and the entry still holds for this run.
-    pub fn add_auto(&self, entry: AutoEntry, now_ms: u64) -> Result<(), String> {
+    /// Slice 7 writes here too. Holds from this call on; the disk follows on the
+    /// writer's thread, and a write that fails is reported by [`Self::error`].
+    /// The newest [`auto::MAX_PER_REASON`] of a reason stay.
+    pub fn add_auto(&self, entry: AutoEntry, now_ms: u64) {
         let mut layers = lock(&self.layers);
-        let held = layers.auto.iter().position(|e| e.pattern == entry.pattern && e.app == entry.app && e.reason == entry.reason);
-        match held {
-            Some(i) => layers.auto[i] = entry,
-            None => layers.auto.push(entry),
-        }
         layers.auto.retain(|e| !e.expired(now_ms));
+        // A held entry moves to the newest place.
+        layers.auto.retain(|e| e.pattern != entry.pattern || e.app != entry.app || e.reason != entry.reason);
+        layers.auto.push(entry);
+        auto::cap(&mut layers.auto);
         self.rebuild(&layers, now_ms);
-        self.write(&layers)
+        self.write(&layers);
     }
 
     /// True when an entry was removed ("Try decrypting again", plan 4.3).
-    pub fn remove_auto(&self, pattern: &Pattern, app: Option<&str>) -> Result<bool, String> {
+    pub fn remove_auto(&self, pattern: &Pattern, app: Option<&str>) -> bool {
         let mut layers = lock(&self.layers);
         let before = layers.auto.len();
         layers.auto.retain(|e| !(&e.pattern == pattern && e.app.as_deref() == app));
         if layers.auto.len() == before {
-            return Ok(false);
+            return false;
         }
         self.rebuild(&layers, wall_ms());
-        self.write(&layers).map(|()| true)
+        self.write(&layers);
+        true
     }
 
-    fn write(&self, layers: &Layers) -> Result<(), String> {
-        // A file that could not be read is never overwritten: only a person
-        // may decide what a damaged record meant.
-        match (&self.dir, &layers.auto_error) {
-            (Some(dir), None) => auto::save(dir, &layers.auto),
-            _ => Ok(()),
+    fn write(&self, layers: &Layers) {
+        if let Some(writer) = &self.writer {
+            writer.queue(layers.auto.clone());
+        }
+    }
+
+    /// Waits for the disk to hold everything added so far: a clean stop loses nothing.
+    pub fn flush(&self) {
+        if let Some(writer) = &self.writer {
+            writer.flush();
         }
     }
 
@@ -265,13 +275,15 @@ mod tests {
     fn auto_entries_survive_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
-        slot.add_auto(AutoEntry::host("cert.example", AutoReason::ClientCert, NOW, None), NOW).unwrap();
-        slot.add_auto(pinned("pin.example"), NOW).unwrap();
+        slot.add_auto(AutoEntry::host("cert.example", AutoReason::ClientCert, NOW, None), NOW);
+        slot.add_auto(pinned("pin.example"), NOW);
+        slot.flush();
         let again = ExclusionSlot::new(Some(dir.path()), &[], NOW + DAY);
         assert_eq!(find(&again, "cert.example", NOW + DAY), Some(Src::Auto(AutoReason::ClientCert)));
         assert_eq!(find(&again, "pin.example", NOW + DAY), Some(Src::Auto(AutoReason::Pinning)));
-        assert!(again.remove_auto(&Pattern::Exact("pin.example".into()), None).unwrap());
-        assert!(!again.remove_auto(&Pattern::Exact("pin.example".into()), None).unwrap());
+        assert!(again.remove_auto(&Pattern::Exact("pin.example".into()), None));
+        assert!(!again.remove_auto(&Pattern::Exact("pin.example".into()), None));
+        again.flush();
         let third = ExclusionSlot::new(Some(dir.path()), &[], NOW + DAY);
         assert_eq!(find(&third, "pin.example", NOW + DAY), None, "try again removed it");
     }
@@ -284,7 +296,9 @@ mod tests {
             let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
             assert!(!slot.switches(true, true).lists_ready, "{:?}", String::from_utf8_lossy(bad));
             assert!(slot.error().is_some());
-            slot.add_auto(pinned("pin.example"), NOW).unwrap();
+            slot.add_auto(pinned("pin.example"), NOW);
+            slot.flush();
+            drop(slot);
             assert_eq!(std::fs::read(auto::path(dir.path())).unwrap(), bad, "a damaged record is not overwritten");
         }
         std::fs::remove_file(auto::path(dir.path())).unwrap();
@@ -295,7 +309,8 @@ mod tests {
     fn expired_auto_entry_is_gone() {
         let dir = tempfile::tempdir().unwrap();
         let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
-        slot.add_auto(AutoEntry::host("ev.example", AutoReason::Ev, NOW, Some(NOW + DAY)), NOW).unwrap();
+        slot.add_auto(AutoEntry::host("ev.example", AutoReason::Ev, NOW, Some(NOW + DAY)), NOW);
+        slot.flush();
         assert_eq!(find(&slot, "ev.example", NOW + DAY - 1), Some(Src::Auto(AutoReason::Ev)));
         assert_eq!(find(&slot, "ev.example", NOW + DAY), None, "at its end");
         let again = ExclusionSlot::new(Some(dir.path()), &[], NOW + DAY);
@@ -307,10 +322,56 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let slot = ExclusionSlot::new(Some(dir.path()), &["bank.example".to_string()], NOW);
         assert_eq!(find(&slot, "www.bank.example", NOW), Some(Src::User));
-        slot.add_auto(pinned("pin.example"), NOW).unwrap();
+        slot.add_auto(pinned("pin.example"), NOW);
+        slot.flush();
         assert!(!String::from_utf8(std::fs::read(auto::path(dir.path())).unwrap()).unwrap().contains("bank.example"), "never persisted a second time");
         slot.set_user(&[], NOW);
         assert_eq!(find(&slot, "www.bank.example", NOW), None);
+    }
+
+    #[test]
+    fn a_flood_of_hosts_stays_bounded_and_spares_the_other_reasons() {
+        const FLOOD: usize = 3 * auto::MAX_PER_REASON;
+        let dir = tempfile::tempdir().unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        slot.add_auto(pinned("pin.example"), NOW);
+        let began = std::time::Instant::now();
+        for i in 0..FLOOD {
+            slot.add_auto(AutoEntry::host(&format!("h{i}.flood.example"), AutoReason::ClientCert, NOW, None), NOW);
+        }
+        println!("{FLOOD} add_auto: {:?}", began.elapsed());
+        slot.flush();
+        assert_eq!(lock(&slot.layers).auto.len(), auto::MAX_PER_REASON + 1);
+        assert_eq!(find(&slot, "pin.example", NOW), Some(Src::Auto(AutoReason::Pinning)), "its own budget");
+        assert_eq!(find(&slot, "h0.flood.example", NOW), None, "the oldest went");
+        let newest = format!("h{}.flood.example", FLOOD - 1);
+        assert_eq!(find(&slot, &newest, NOW), Some(Src::Auto(AutoReason::ClientCert)));
+        let again = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        assert_eq!(find(&again, &newest, NOW), Some(Src::Auto(AutoReason::ClientCert)), "the disk has the last state");
+    }
+
+    #[test]
+    fn adding_a_held_entry_again_makes_it_the_newest() {
+        let slot = ExclusionSlot::new(None, &[], NOW);
+        slot.add_auto(pinned("a.example"), NOW);
+        slot.add_auto(pinned("b.example"), NOW);
+        slot.add_auto(AutoEntry::host("a.example", AutoReason::Pinning, NOW + 1, None), NOW + 1);
+        let auto = &lock(&slot.layers).auto;
+        assert_eq!(auto.iter().map(|e| (e.pattern.clone(), e.created_ms)).collect::<Vec<_>>(), [(Pattern::Exact("b.example".into()), NOW), (Pattern::Exact("a.example".into()), NOW + 1)]);
+    }
+
+    #[test]
+    fn a_write_that_fails_is_reported_and_the_entry_still_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        // `write_atomic` writes `exclusions.tmp` first; a folder there makes that fail.
+        std::fs::create_dir(auto::path(dir.path()).with_extension("tmp")).unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        assert_eq!(slot.error(), None);
+        slot.add_auto(pinned("pin.example"), NOW);
+        slot.flush();
+        assert!(slot.error().is_some());
+        assert_eq!(find(&slot, "pin.example", NOW), Some(Src::Auto(AutoReason::Pinning)));
+        assert!(slot.switches(true, true).lists_ready, "a failed write is not a damaged record");
     }
 
     #[test]

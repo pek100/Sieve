@@ -279,6 +279,7 @@ impl Engine {
 
     /// Records this run's clean end (the service was asked to stop).
     pub fn stop_clean(&self) {
+        self.exclusions.flush();
         let mut runs = lock(&self.runs);
         runs.stop_clean();
         if let Some(dir) = &self.dir {

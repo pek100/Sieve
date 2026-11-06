@@ -252,6 +252,8 @@ Schannel is rejected because it cannot mint a per-SNI server identity cheaply, i
 
 The upstream client config installs a client-certificate resolver that records "the server asked" and returns no certificate. On that signal the upstream handshake is abandoned, the host and port go into the exclusion store with reason "client certificate" (no expiry), and this flow passes through by replaying the ClientHello (2.6). The client then presents its own certificate to the real server. Post-handshake authentication (TLS 1.3) on an intercepted connection fails the request. The connection closes with the reason logged, and the host is excluded the same way.
 
+*Note 2026-11-06 (slice 6 review):* anyone can ask, and a web page can make a browser ask for many subdomains, so the handshake runs on until the chain is seen and only a chain that passes eligibility writes the entry; any other asker's verdict stays in the bounded verdict cache. "No expiry" holds, but each `auto:` reason keeps its newest 1024 entries (`exclusions::auto::MAX_PER_REASON`), and the file is written off the flows' threads, at most once a second. An evicted host costs one more upstream handshake at its next visit.
+
 ## 3. QUIC and HTTP/3
 
 **Decision: do not terminate QUIC. For flows that will be content-filtered, refuse that QUIC flow with an ICMP port-unreachable so the browser falls back to TCP at once. Every other QUIC flow is decoded and relayed.**
@@ -287,7 +289,7 @@ Every "do not decrypt" fact is an entry in one exclusion store, and one pure fun
 | `user` | the user | never |
 | `list:<file>` | HttpsExclusions file name (4.2) | replaced at each list refresh |
 | `auto:pinning` | self-healing (4.3) | never; the user can "try again" |
-| `auto:client-cert` | 2.11 | never |
+| `auto:client-cert` | 2.11 | never (the newest 1024 stay, 2.11's note) |
 | `auto:ev` | 2.6 | with the upstream verdict cache |
 
 **Floor (not stored, part of the function):**

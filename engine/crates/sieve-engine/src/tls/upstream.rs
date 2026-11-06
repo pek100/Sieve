@@ -115,8 +115,10 @@ pub struct Handshaken<S> {
 
 pub enum HandshakeEnd<S> {
     Done(Box<Handshaken<S>>),
-    /// The server asked for a client certificate.
-    ClientCertificate,
+    /// The server asked for a client certificate, and showed this chain. Not
+    /// judged yet, and a chain it cannot sign for is possible: judged good, it
+    /// can only make the name it covers pass through.
+    ClientCertificate(Chain),
     /// `Protocol` (it needs less than rustls offers) or `Unavailable` (a timeout
     /// or a dropped connection).
     Failed(UpstreamVerdict),
@@ -147,9 +149,13 @@ where
     let Ok(name) = ServerName::try_from(sni.to_string()) else { return HandshakeEnd::Failed(UpstreamVerdict::Protocol) };
     let connect = TlsConnector::from(Arc::new(config)).connect(name, stream);
     let answer = tokio::time::timeout(UPSTREAM_HANDSHAKE_TIMEOUT, connect).await;
-    if capture.asked_for_certificate.load(Ordering::Relaxed) {
-        return HandshakeEnd::ClientCertificate;
-    }
+    let chain = capture.chain.lock().unwrap_or_else(|p| p.into_inner()).take();
+    // An ask with no chain proves nothing about the server: it ends like any
+    // other handshake that did not finish.
+    let chain = match chain {
+        Some(chain) if capture.asked_for_certificate.load(Ordering::Relaxed) => return HandshakeEnd::ClientCertificate(chain),
+        chain => chain,
+    };
     let tls = match answer {
         Ok(Ok(tls)) => tls,
         // TLS itself said no: it needs less than rustls offers.
@@ -157,7 +163,6 @@ where
         // A reset or a timeout says nothing about the server, so it is not cached.
         Ok(Err(_)) | Err(_) => return HandshakeEnd::Failed(UpstreamVerdict::Unavailable),
     };
-    let chain = capture.chain.lock().unwrap_or_else(|p| p.into_inner()).take();
     let Some(chain) = chain else { return HandshakeEnd::Failed(UpstreamVerdict::Protocol) };
     let (_, connection) = tls.get_ref();
     let alpn = connection.alpn_protocol().map(<[u8]>::to_vec);

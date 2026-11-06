@@ -29,7 +29,7 @@ use sieve_ipc::FlowAction;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 
-use super::active::Active;
+use super::active::{Active, Registered};
 use super::first_bytes::{First, read_first};
 use super::server::{server_config, speaks_to};
 use super::splice::{AppSide, Prefixed, splice};
@@ -176,7 +176,8 @@ fn rejection(verdict: UpstreamVerdict) -> Option<UpstreamVerdict> {
 impl<C: Dial> Interception<C> {
     fn says(&self, facts: &FlowFacts<'_>) -> Decrypt {
         let store = self.exclusions.get_at((self.clock)());
-        let switches = self.exclusions.switches(true, (self.minter)().is_some());
+        // A closed set means the switch went off after this flow took the slot.
+        let switches = self.exclusions.switches(!self.active.is_closed(), (self.minter)().is_some());
         decrypt(facts, &store, &switches)
     }
 
@@ -189,7 +190,7 @@ impl<C: Dial> Interception<C> {
     /// holds for this run, and comes back at its next sighting after a restart.
     fn exclude(&self, host: &str, reason: AutoReason, expires_ms: Option<u64>) {
         let now = (self.clock)();
-        let _ = self.exclusions.add_auto(AutoEntry::host(host, reason, now, expires_ms), now);
+        self.exclusions.add_auto(AutoEntry::host(host, reason, now, expires_ms), now);
     }
 
     /// The pass-through after an upstream handshake: its socket has spoken, so
@@ -281,30 +282,46 @@ where
         app_off: flow.app_off,
         upstream: None,
     };
+    // Before the cache is read: see `active`, no close can fall in the gap.
+    let registered = host.map(|h| deps.active.register(h));
     let cached = host.and_then(|h| deps.verdicts.get(h, flow.remote.port(), (deps.clock)()));
     let before = FlowFacts { upstream: cached.and_then(|c| rejection(c.verdict)), ..facts };
     if let Decrypt::PassThrough(reason) = deps.says(&before) {
+        drop(registered);
         deps.not_decrypted(flow.id, &reason);
         return if splice(&mut app, upstream, &held).await { FlowAction::Relayed } else { FlowAction::Failed };
     }
     // `decrypt` said a name is there, or it would have been `floor:no-sni`.
-    let Some(host) = host else { return FlowAction::Relayed };
+    let (Some(host), Some(registered)) = (host, registered) else { return FlowAction::Relayed };
 
     let (shaken, verdict) = match handshake(upstream, host, filter_alpn(&decoded.alpn)).await {
-        HandshakeEnd::ClientCertificate => {
-            deps.exclude(host, AutoReason::ClientCert, None);
-            (None, None)
+        // Written down only if the chain is good: anyone can ask, and the rest
+        // stay in the bounded verdict cache. No trust call: the flow passes
+        // through either way.
+        HandshakeEnd::ClientCertificate(chain) => {
+            let verdict = deps.verifier.verify(&chain, host, true).await;
+            if verdict == UpstreamVerdict::Eligible {
+                deps.exclude(host, AutoReason::ClientCert, None);
+            } else {
+                let facts_of_leaf = leaf_facts(&chain.end_entity);
+                deps.verdicts.put(host, flow.remote.port(), verdict, facts_of_leaf.map(|l| l.hash), facts_of_leaf.map(|l| l.not_after_ms), (deps.clock)());
+            }
+            (None, verdict)
         }
         HandshakeEnd::Failed(verdict) => {
             deps.verdicts.put(host, flow.remote.port(), verdict, None, None, (deps.clock)());
-            (None, Some(verdict))
+            (None, verdict)
         }
         HandshakeEnd::Done(shaken) => {
             let facts_of_leaf = leaf_facts(&shaken.chain.end_entity);
             let leaf = facts_of_leaf.map(|l| l.hash);
             let known = cached.is_some_and(|c| c.verdict == UpstreamVerdict::Eligible && c.leaf.is_some() && c.leaf == leaf);
             let verdict = deps.verifier.verify(&shaken.chain, host, known).await;
-            deps.verdicts.put(host, flow.remote.port(), verdict, leaf, facts_of_leaf.map(|l| l.not_after_ms), (deps.clock)());
+            // A known leaf keeps its expiry: the 24 h run from the trust call
+            // that was really made, or a visited host would never reach it again.
+            if !(known && verdict == UpstreamVerdict::Eligible) {
+                deps.verdicts.put(host, flow.remote.port(), verdict, leaf, facts_of_leaf.map(|l| l.not_after_ms), (deps.clock)());
+            }
             if verdict == UpstreamVerdict::Revoked {
                 deps.active.close_host(host);
             }
@@ -313,23 +330,29 @@ where
             {
                 deps.exclude(host, AutoReason::Ev, Some(l.not_after_ms));
             }
-            (Some((shaken, facts_of_leaf)), Some(verdict))
+            (Some((shaken, facts_of_leaf)), verdict)
         }
     };
-    let after = FlowFacts { upstream: verdict.or(Some(UpstreamVerdict::Eligible)), ..facts };
+    // Another flow found this host revoked while this one was asking.
+    let verdict = if verdict == UpstreamVerdict::Eligible && registered.is_closed() { UpstreamVerdict::Revoked } else { verdict };
+    let after = FlowFacts { upstream: Some(verdict), ..facts };
     let judged = deps.says(&after);
     let (shaken, leaf) = match (judged, shaken) {
         (Decrypt::Intercept, Some((shaken, Some(leaf)))) => (shaken, leaf),
-        (Decrypt::Intercept, _) => {
-            deps.not_decrypted(flow.id, &PassReason::Floor(Floor::UpstreamInvalid));
-            return deps.fresh_splice(&mut app, flow.remote, &held).await;
-        }
-        (Decrypt::PassThrough(reason), _) => {
+        (judged, shaken) => {
+            let reason = match judged {
+                Decrypt::PassThrough(reason) => reason,
+                Decrypt::Intercept => PassReason::Floor(Floor::UpstreamInvalid),
+            };
+            // The handshaken session is of no more use: the server must not
+            // hold two connections for this flow.
+            drop(shaken);
+            drop(registered);
             deps.not_decrypted(flow.id, &reason);
             return deps.fresh_splice(&mut app, flow.remote, &held).await;
         }
     };
-    intercept(deps, app, *shaken, leaf, host, held, flow).await
+    intercept(deps, app, *shaken, leaf, registered, held, flow).await
 }
 
 /// Step 1's other ending: the server's bytes go to the app and the flow can
@@ -352,11 +375,12 @@ where
 }
 
 /// Step 6.
-async fn intercept<A, C>(deps: &Interception<C>, mut app: AppSide<A>, shaken: Handshaken<C::Stream>, leaf: LeafFacts, host: &str, held: Vec<u8>, flow: &FlowMeta<'_>) -> FlowAction
+async fn intercept<A, C>(deps: &Interception<C>, mut app: AppSide<A>, shaken: Handshaken<C::Stream>, leaf: LeafFacts, registered: Registered, held: Vec<u8>, flow: &FlowMeta<'_>) -> FlowAction
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     C: Dial,
 {
+    let host = registered.host();
     let now = (deps.clock)();
     let minted = (deps.minter)().ok_or(PassReason::Floor(Floor::NoRoot)).and_then(|minter| match minter.leaf(LeafRequest { host, upstream_not_after_ms: leaf.not_after_ms }, now) {
         Ok(minted) => Ok((minter, minted)),
@@ -370,12 +394,20 @@ where
     let config = match config {
         Ok(config) => config,
         Err(reason) => {
+            drop(shaken);
+            drop(registered);
             deps.not_decrypted(flow.id, &reason);
             return deps.fresh_splice(&mut app, flow.remote, &held).await;
         }
     };
     let pair = Pair { exe: flow.exe.map(str::to_string), host: host.to_string() };
-    let accepted = tokio::time::timeout(CLIENT_HANDSHAKE_TIMEOUT, TlsAcceptor::from(config).accept(Prefixed::new(held, app))).await;
+    // The client has our answer by now, so a close can only end the flow. That
+    // says nothing about the client, so the watch does not hear of it.
+    let accepted = tokio::select! {
+        biased;
+        () = registered.closed() => return FlowAction::Relayed,
+        accepted = tokio::time::timeout(CLIENT_HANDSHAKE_TIMEOUT, TlsAcceptor::from(config).accept(Prefixed::new(held, app))) => accepted,
+    };
     let client = match accepted {
         Ok(Ok(client)) => client,
         Ok(Err(e)) => {
@@ -391,12 +423,12 @@ where
     count_group(&deps.meters.https.upstream_groups, shaken.group);
     count_group(&deps.meters.https.client_groups, client.get_ref().1.negotiated_key_exchange_group().map(|g| g.name()));
 
-    let mut registered = deps.active.register(host);
     let started = Instant::now();
     let ctx = Arc::new(Serve::new(deps.filter.clone(), deps.book.clone(), deps.hook.clone(), deps.watch.clone(), flow.id, pair.clone(), host.to_string(), flow.remote.port(), deps.clock));
     let ended = tokio::select! {
-        ended = run_protocol(ctx.clone(), client, shaken.tls, shaken.alpn.as_deref()) => ended,
+        biased;
         () = registered.closed() => None,
+        ended = run_protocol(ctx.clone(), client, shaken.tls, shaken.alpn.as_deref()) => ended,
     };
     deps.after_serve(host, ended.as_ref());
     if !ctx.request_was_seen() {

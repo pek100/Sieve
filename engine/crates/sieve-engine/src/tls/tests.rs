@@ -144,6 +144,15 @@ pub(crate) fn server_tls(chain: (Vec<CertificateDer<'static>>, PrivateKeyDer<'st
     Arc::new(config)
 }
 
+/// The same, with no tickets. The engine hangs up on a server it rejected right
+/// after its handshake; one with tickets to send fails that write, so its side
+/// of the handshake would not count as finished.
+pub(crate) fn server_tls_no_tickets(chain: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)) -> Arc<ServerConfig> {
+    let mut config = (*server_tls(chain, &[], None)).clone();
+    config.send_tls13_tickets = 0;
+    Arc::new(config)
+}
+
 // ---- Streams that remember what crossed them.
 
 pub(crate) trait IoStream: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -369,11 +378,12 @@ pub(crate) struct RigOpts {
     pub(crate) skip_ev: bool,
     pub(crate) ca_made_ms: u64,
     pub(crate) watch: Arc<dyn ClientWatch>,
+    pub(crate) clock: fn() -> u64,
 }
 
 impl RigOpts {
     pub(crate) fn new(roots: Arc<RootCertStore>) -> Self {
-        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch) }
+        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), clock: wall_ms }
     }
 }
 
@@ -406,7 +416,7 @@ impl Rig {
             meters: Arc::new(Meters::default()),
             watch: opts.watch,
             hook: opts.hook,
-            clock: wall_ms,
+            clock: opts.clock,
         };
         Rig { deps: Arc::new(deps), minter, trust: opts.trust, _ca: ca, _dirs: vec![ca_dir, store_dir] }
     }
@@ -574,7 +584,7 @@ async fn round_trip<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
 // ---- Upstream first and the verifier stack.
 
 async fn passes_through(arm: Arm, pki: &Pki, leaf_pki: &Pki, opts: LeafOpts, sni_on_cert: &str, trust: Arc<FakeTrust>, reason: &str) -> Rig {
-    let config = server_tls(leaf_pki.leaf(sni_on_cert, opts), &[], None);
+    let config = server_tls_no_tickets(leaf_pki.leaf(sni_on_cert, opts));
     let (dial, shaken) = echo_dial(arm, vec![config]);
     let rig = Rig::new(dial, RigOpts { trust, ..RigOpts::new(pki.roots()) });
     let (app, task) = rig.flow(flow_opts()).await;
@@ -811,7 +821,7 @@ arms!(fresh_connect_failure_closes_the_app_side_and_the_book_says_failed, |arm| 
 
 arms!(verdict_cache_rejection_skips_the_handshake, |arm| async move {
     let pki = Pki::new("Test Public Root");
-    let (dial, shaken) = echo_dial(arm, vec![server_tls(pki.leaf("other.example", GOOD), &[], None)]);
+    let (dial, shaken) = echo_dial(arm, vec![server_tls_no_tickets(pki.leaf("other.example", GOOD))]);
     let rig = Rig::new(dial, RigOpts::new(pki.roots()));
     for _ in 0..2 {
         let (app, task) = rig.flow(flow_opts()).await;
@@ -841,6 +851,170 @@ arms!(same_leaf_skips_only_the_trust_call, |arm| async move {
     }
     assert_eq!(rig.trust.calls(), 1, "the trust call once");
     assert_eq!(shaken.load(Ordering::Relaxed), 2, "the handshake each time");
+});
+
+arms!(a_cached_trust_ends_at_24h_however_often_the_host_is_visited, |arm| async move {
+    static NOW: AtomicU64 = AtomicU64::new(0);
+    fn clock() -> u64 {
+        NOW.load(Ordering::Relaxed)
+    }
+    const HOUR_MS: u64 = 3_600_000;
+    let start = wall_ms();
+    NOW.store(start, Ordering::Relaxed);
+    let pki = Pki::new("Test Public Root");
+    // One leaf throughout: only the trust answer changes.
+    let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let rig = Rig::new(dial, RigOpts { clock, ..RigOpts::new(pki.roots()) });
+    let (app, open_task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut open = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert!(shown_is_sieves(&shown, &rig));
+    round_trip(&mut open).await;
+    *rig.trust.answer.lock().unwrap() = TrustAnswer::Revoked;
+    // A visit inside the 24 h skips the call, and must not extend the 24 h.
+    NOW.store(start + 23 * HOUR_MS, Ordering::Relaxed);
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert!(shown_is_sieves(&shown, &rig), "still inside the cached verdict");
+    round_trip(&mut tls).await;
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(rig.trust.calls(), 1, "the same leaf skips the call");
+    // 24 h after the call that was really made.
+    NOW.store(start + 24 * HOUR_MS, Ordering::Relaxed);
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert_eq!(rig.trust.calls(), 2, "the OS is asked again");
+    expect_real(&shown, &rig);
+    round_trip(&mut tls).await;
+    tokio::time::timeout(Duration::from_secs(10), open_task).await.expect("the open flow closed").unwrap();
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(rig.reasons(), ["floor:upstream-revoked"]);
+});
+
+/// A flow held inside its trust call; `during` runs while it is there.
+async fn close_during_the_trust_call(arm: Arm, during: impl FnOnce(&Rig), reason: &str) {
+    let pki = Pki::new("Test Public Root");
+    let trust = Arc::new(FakeTrust { answer: Mutex::new(TrustAnswer::Trusted), calls: AtomicUsize::new(0), blocks: Duration::from_millis(300) });
+    let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let rig = Rig::new(dial, RigOpts { trust: trust.clone(), ..RigOpts::new(pki.roots()) });
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let connecting = tokio::spawn(connect(app, client, HOST));
+    while trust.calls() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    during(&rig);
+    let mut tls = connecting.await.unwrap().unwrap_or_else(|(e, _)| panic!("{e}"));
+    expect_real(&shown, &rig);
+    round_trip(&mut tls).await;
+    assert_eq!(rig.deps.meters.https.intercepted.load(Ordering::Relaxed), 0);
+    assert!(rig.deps.active.is_empty(), "a pass-through is not an intercepted flow");
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(rig.reasons(), [reason]);
+}
+
+arms!(off_during_the_trust_call_never_decrypts, |arm| async move {
+    close_during_the_trust_call(
+        arm,
+        |rig| {
+            let slot = HttpsSlot::default();
+            slot.set(Some(rig.deps.clone()));
+            slot.set(None);
+        },
+        "off",
+    )
+    .await;
+});
+
+arms!(a_revocation_found_during_the_trust_call_reaches_the_flow, |arm| async move {
+    close_during_the_trust_call(arm, |rig| rig.deps.active.close_host(HOST), "floor:upstream-revoked").await;
+});
+
+arms!(off_during_the_client_handshake_closes_it_without_blaming_the_client, |arm| async move {
+    let pki = Pki::new("Test Public Root");
+    let watched = Arc::new(Watched::default());
+    let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let rig = Rig::new(dial, RigOpts { watch: watched.clone(), ..RigOpts::new(pki.roots()) });
+    let (mut app, task) = rig.flow(flow_opts()).await;
+    // A hello, then silence: the engine's answer proves the local handshake began.
+    let (client, _) = client_tls(&[], None);
+    let mut conn = rustls::ClientConnection::new(client, ServerName::try_from(HOST).unwrap()).unwrap();
+    let mut hello = Vec::new();
+    conn.write_tls(&mut hello).unwrap();
+    app.write_all(&hello).await.unwrap();
+    let mut answer = [0u8; 1];
+    app.read_exact(&mut answer).await.unwrap();
+    rig.deps.active.close_all();
+    tokio::time::timeout(LIMIT, task).await.expect("closed").unwrap();
+    let mut rest = Vec::new();
+    let _ = app.read_to_end(&mut rest).await;
+    assert!(watched.refused.lock().unwrap().is_empty(), "the engine closed it: not evidence about the client");
+});
+
+arms!(a_flow_that_starts_after_the_close_never_decrypts, |arm| async move {
+    // It took the slot's `Interception` before the switch went off.
+    let pki = Pki::new("Test Public Root");
+    let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let rig = Rig::new(dial, RigOpts::new(pki.roots()));
+    rig.deps.active.close_all();
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    expect_real(&shown, &rig);
+    round_trip(&mut tls).await;
+    assert_eq!(rig.deps.connector.count(), 1, "the SYN-time socket, unused until now");
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(rig.reasons(), ["off"]);
+});
+
+/// A pass-through decided after our handshake: while the fresh socket is spliced
+/// the first one has ended, so the server never holds two connections.
+async fn first_socket_ends_during_the_splice(arm: Arm, opts: LeafOpts, ca_made_ms: u64, reason: &str) {
+    let pki = Pki::new("Test Public Root");
+    let ended: Arc<Mutex<Vec<usize>>> = Arc::default();
+    let record = ended.clone();
+    let config = server_tls(pki.leaf(HOST, opts), &[], None);
+    // Ends with the socket, whichever step of the server's it finds that in.
+    let handler = raw(move |conn, stream| {
+        let (record, config) = (record.clone(), config.clone());
+        async move {
+            if let Ok(tls) = tokio_rustls::TlsAcceptor::from(config).accept(stream).await {
+                echo(tls).await;
+            }
+            record.lock().unwrap().push(conn);
+        }
+    });
+    let rig = Rig::new(TestDial::new(arm, handler), RigOpts { ca_made_ms, ..RigOpts::new(pki.roots()) });
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, _) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    round_trip(&mut tls).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ended.lock().unwrap().contains(&0) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("connection 0 saw its end");
+    round_trip(&mut tls).await;
+    assert!(!task.is_finished(), "the splice is still open");
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(rig.reasons(), [reason]);
+}
+
+arms!(a_rejected_upstream_ends_its_first_socket_before_the_splice, |arm| async move {
+    first_socket_ends_during_the_splice(arm, LeafOpts { from_days: -30, to_days: -1, ev: false }, wall_ms(), "floor:upstream-invalid").await;
+});
+
+arms!(a_failed_mint_ends_the_first_socket_before_the_splice, |arm| async move {
+    first_socket_ends_during_the_splice(arm, GOOD, wall_ms() - 400 * 86_400_000, "floor:no-root").await;
 });
 
 arms!(server_first_bytes_are_forwarded_and_the_flow_only_splices, |arm| async move {
@@ -886,6 +1060,27 @@ arms!(client_cert_request_passes_through_and_adds_auto_entry, |arm| async move {
     }
     assert_eq!(rig.reasons(), ["auto:client-cert", "auto:client-cert"]);
     assert!(rig.deps.exclusions.get_at(wall_ms()).find(Some(HOST), "192.0.2.1".parse().unwrap(), Some(CHROME), true) == Some(&EntrySource::Auto(AutoReason::ClientCert)));
+});
+
+arms!(an_asker_under_an_unknown_root_writes_nothing_to_the_store, |arm| async move {
+    let (public, private, clients) = (Pki::new("Test Public Root"), Pki::new("A Corporate Proxy"), Pki::new("Clients"));
+    let (dial, _) = echo_dial(arm, vec![cert_server(&private, &clients, false)]);
+    let rig = Rig::new(dial, RigOpts::new(public.roots()));
+    for round in 0..2 {
+        let (app, task) = rig.flow(flow_opts()).await;
+        let (client, shown) = client_tls(&[], None);
+        let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+        expect_real(&shown, &rig);
+        round_trip(&mut tls).await;
+        drop(tls);
+        task.await.unwrap();
+        assert_eq!(rig.deps.connector.count(), if round == 0 { 2 } else { 3 }, "the rejection is remembered, in the bounded cache");
+    }
+    assert_eq!(rig.reasons(), ["floor:non-public-root", "floor:non-public-root"]);
+    assert_eq!(rig.deps.exclusions.get_at(wall_ms()).find(Some(HOST), "192.0.2.1".parse().unwrap(), Some(CHROME), true), None);
+    assert_eq!(rig.trust.calls(), 0);
+    rig.deps.exclusions.flush();
+    assert!(!crate::exclusions::auto::path(rig._dirs[1].path()).exists(), "nothing reached the disk");
 });
 
 arms!(client_presents_its_own_certificate_to_the_real_server_through_the_splice, |arm| async move {
@@ -1337,8 +1532,8 @@ async fn the_tests_dial_only_loopback() {
 #[test]
 fn an_auto_entry_is_removed_by_its_pattern() {
     let slot = ExclusionSlot::with_sources(None, &[], Vec::new(), wall_ms());
-    slot.add_auto(AutoEntry::host(HOST, AutoReason::Pinning, wall_ms(), None), wall_ms()).unwrap();
-    assert!(slot.remove_auto(&Pattern::Exact(HOST.into()), None).unwrap());
+    slot.add_auto(AutoEntry::host(HOST, AutoReason::Pinning, wall_ms(), None), wall_ms());
+    assert!(slot.remove_auto(&Pattern::Exact(HOST.into()), None));
 }
 
 /// Slice 6's live check (`docs/live/engine-slice-6.md`), run by the user: U1 to
