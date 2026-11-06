@@ -354,18 +354,21 @@ export function createEngineController({ engine, store, clock, settings, checks,
   };
 
   // Cheap, so per probe; the rows are read only when their revision moved. A new
-  // engine run starts its revisions and ids over, so a cursor means nothing outside
-  // its run: everything the new run holds is read from the start, and told.
+  // engine run starts its revisions and ids over, so a cursor or a revision means
+  // nothing outside its run: everything the new run holds is read from the start, and
+  // told, and rows the read cannot replace go, being the old run's.
   const readHeal = async () => {
     if (!httpsInForce(get())) {
       if (get().exclusions || get().exclusionsError || (get().healNotices?.length ?? 0) > 0) set({ exclusions: null, exclusionsError: null, healNotices: [] });
       return;
     }
+    let newRun = false;
     try {
       const baseline = healCursor === null;
       let answer = await engine.healNotices(healCursor?.after ?? 0);
       if (healCursor !== null && answer.run !== healCursor.run) answer = await engine.healNotices(0);
       const { run } = answer;
+      newRun = healCursor?.run !== run;
       healCursor = { run, after: answer.revision };
       if (!baseline && answer.notices.length > 0) {
         const fresh: HealGroup[] = answer.notices.map((n) => ({ ...n, key: `${run}:${n.id}` }));
@@ -373,10 +376,10 @@ export function createEngineController({ engine, store, clock, settings, checks,
         set({ healNotices: [...kept, ...fresh].slice(-HEAL_KEPT) });
       }
       const held = get().exclusions;
-      const rows = held && held.revision === answer.exclusions_revision ? held : await walkRows(await engine.exclusions(0));
+      const rows = !newRun && held && held.revision === answer.exclusions_revision ? held : await walkRows(await engine.exclusions(0));
       set({ exclusions: rows, exclusionsError: null });
     } catch (e) {
-      set({ exclusionsError: message(e) });
+      set(newRun ? { exclusions: null, exclusionsError: message(e) } : { exclusionsError: message(e) });
     }
   };
 

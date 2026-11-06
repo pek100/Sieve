@@ -293,6 +293,65 @@ describe("engine controller, what is not decrypted", () => {
     s.undo();
   });
 
+  describe("the rows across engine runs, whose revisions start over", () => {
+    const page = (host: string) => ({ revision: 1, rows: [{ line: host, apps: [], reason: "list:x", created_ms: null, retries: 0 }], scope: "browsers" as const, browsers: [], skipped: 0, total: 1, next: null });
+    const shownRows = (s: ReturnType<typeof setup>) => slice(s).exclusions?.rows.map((r) => r.line);
+
+    /** Two polls in run 10 at exclusions revision 1, showing old.example. */
+    async function inRunTen() {
+      const s = await holdingOff();
+      const state = { run: 10, rows: page("old.example") as ReturnType<typeof page> | Error, reads: 0 };
+      s.fake.source.healNotices = async () => ({ run: state.run, revision: 0, exclusions_revision: 1, notices: [] });
+      s.fake.source.exclusions = async () => {
+        state.reads++;
+        if (state.rows instanceof Error) throw state.rows;
+        return state.rows;
+      };
+      await s.fc.advance(ENGINE_POLL_MS);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(state.reads, "the control: the same run at the same revision reads once").toBe(1);
+      return { s, state };
+    }
+
+    it("a new run at an equal revision has its rows read", async () => {
+      const { s, state } = await inRunTen();
+      state.run = 11;
+      state.rows = page("new.example");
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(state.reads).toBe(2);
+      expect(shownRows(s)).toEqual(["new.example"]);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(state.reads, "and its own revision holds from there").toBe(2);
+      s.undo();
+    });
+
+    it("a new run whose rows cannot be read shows no old row, and is read at the next poll", async () => {
+      const { s, state } = await inRunTen();
+      state.run = 11;
+      state.rows = new Error("the pipe closed");
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(slice(s).exclusionsError).toMatch(/pipe closed/);
+      expect(shownRows(s), "they were the old run's").toBeUndefined();
+      state.rows = page("new.example");
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(shownRows(s)).toEqual(["new.example"]);
+      expect(slice(s).exclusionsError).toBeNull();
+      s.undo();
+    });
+
+    it("the same run's failed read keeps its rows, which are still that run's", async () => {
+      const { s, state } = await inRunTen();
+      s.fake.source.healNotices = async () => {
+        throw new Error("the pipe closed");
+      };
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(slice(s).exclusionsError).toMatch(/pipe closed/);
+      expect(shownRows(s)).toEqual(["old.example"]);
+      expect(state.reads).toBe(1);
+      s.undo();
+    });
+  });
+
   it("a refused try again is said, and the rows stand", async () => {
     const s = await holding();
     s.fake.source.tryDecryptAgain = async () => {
