@@ -46,7 +46,7 @@ impl std::fmt::Debug for Fallback {
 pub struct QuicMeters {
     pub refused: AtomicU64,
     pub replies: AtomicU64,
-    /// Answers to blocked flows. Apart, so `replies` stays the refused path's figure.
+    /// Version Negotiation packets sent to blocked flows (`quic::negotiate`).
     pub blocked_replies: AtomicU64,
     pub send_failed: AtomicU64,
     /// A TCP flow accepted before the Initial: a race, never a sample of 0 (S17).

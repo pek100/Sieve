@@ -26,7 +26,7 @@ use crate::exclusions::AutoEntry;
 use crate::exclusions::lists::{Origin, Source};
 use crate::flow::classify::{Decoded, Kind, UdpClassifier};
 use crate::flow::flows::Action;
-use crate::flow::quic::{VERSION_1, crypto_frame, seal_client_initial};
+use crate::flow::quic::{MIN_INITIAL_DATAGRAM, VERSION_1, crypto_frame, seal_client_initial};
 use crate::flow::sni::{TlsOffer, build};
 use crate::policy::wall_ms;
 use crate::tls::intercept::{HttpsSlot, Who};
@@ -436,7 +436,7 @@ fn spawn_flow(refusal: Refusal, held: Vec<Vec<u8>>) -> FlowRig {
     let (s, m, o) = (sink.clone(), meters.clone(), on.clone());
     let task = tokio::spawn(async move {
         let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
-        let reply = Reply { ends, refusal, sink: &*s, meters: &m, replies: &m.replies };
+        let reply = Reply { ends, refusal, sink: &*s, meters: &m };
         let mut buf = vec![0u8; BUF];
         refuse(&mut stack, &reply, held, &mut buf, IDLE, || o.load(Ordering::Relaxed)).await
     });
@@ -520,7 +520,7 @@ async fn an_app_turned_off_ends_its_refused_flow_and_no_other() {
     let (sink, meters) = (FakeSink::default(), QuicMeters::default());
     let (mut app, mut stack) = tokio::io::duplex(BUF);
     let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
-    let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters, replies: &meters.replies };
+    let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters };
     let held = vec![vec![1u8; 200]];
     let mut buf = vec![0u8; BUF];
     let on = slot.clone();
@@ -555,7 +555,7 @@ async fn the_switch_going_off_ends_a_refused_flow() {
     let (sink, meters) = (FakeSink::default(), QuicMeters::default());
     let (mut app, mut stack) = tokio::io::duplex(BUF);
     let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
-    let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters, replies: &meters.replies };
+    let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters };
     let held = vec![vec![1u8; 200]];
     let mut buf = vec![0u8; BUF];
     let on = slot.clone();
@@ -638,16 +638,22 @@ impl AsyncWrite for MemDevice {
 
 /// `host`'s `h3` hello, split over two sealed Initials as a post-quantum one is.
 pub(crate) fn sealed_initials(host: &str) -> [Vec<u8>; 2] {
+    sealed_initials_of(VERSION_1, &DCID, &[], host)
+}
+
+/// The same, with the version and connection IDs a test names.
+pub(crate) fn sealed_initials_of(version: u32, dcid: &[u8], scid: &[u8], host: &str) -> [Vec<u8>; 2] {
     let groups = (0x000a_u16, vec![0, 2, 0, 0x1d]);
     let versions = (0x002b_u16, vec![2, 3, 4]);
     let schemes = (0x000d_u16, vec![0, 2, 4, 3]);
     let hello = build::handshake(&[build::sni_ext(host), build::alpn_ext(&["h3"]), groups, versions, schemes, (0x0033, vec![1; 1300])]);
     let (first, second) = hello.split_at(800);
+    // Padded past the 1200-byte floor, as a real client's are.
     let mut f1 = crypto_frame(0, first);
-    f1.resize(1100, 0);
+    f1.resize(MIN_INITIAL_DATAGRAM, 0);
     let mut f2 = crypto_frame(800, second);
-    f2.resize(1100, 0);
-    [seal_client_initial(VERSION_1, &DCID, &[], 0, 1, &f1), seal_client_initial(VERSION_1, &DCID, &[], 1, 1, &f2)]
+    f2.resize(MIN_INITIAL_DATAGRAM, 0);
+    [seal_client_initial(version, dcid, scid, 0, 1, &f1), seal_client_initial(version, dcid, scid, 1, 1, &f2)]
 }
 
 pub(crate) fn udp_packet(local: SocketAddr, remote: SocketAddr, payload: &[u8]) -> Vec<u8> {
@@ -702,7 +708,7 @@ async fn through_the_stack(rig: &Rig, local: SocketAddr, remote: SocketAddr) -> 
     let sink = FakeSink::default();
     if let UdpPath::Refuse(refusal) = answer {
         let meters = QuicMeters::default();
-        let reply = Reply { ends: (app.local_addr(), app.peer_addr()), refusal, sink: &sink, meters: &meters, replies: &meters.replies };
+        let reply = Reply { ends: (app.local_addr(), app.peer_addr()), refusal, sink: &sink, meters: &meters };
         assert!(refuse(&mut app, &reply, held, &mut buf, Duration::from_millis(50), || slot.refuses(BROWSER)).await.is_empty(), "it idled out");
     }
     StackRun { answer, sink, from_stack }

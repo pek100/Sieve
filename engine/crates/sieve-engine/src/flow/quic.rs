@@ -50,6 +50,12 @@ use crate::flow::{Progress, Reader};
 
 pub const VERSION_1: u32 = 0x0000_0001;
 pub const VERSION_2: u32 = 0x6b33_43cf;
+/// RFC 9000 section 17.2.
+pub const MAX_CID_LEN: usize = 20;
+/// RFC 9000 section 14.1: a server discards an Initial in a smaller UDP payload.
+pub const MIN_INITIAL_DATAGRAM: usize = 1200;
+/// RFC 9000 section 17.2: the Header Form and Fixed bits of a long header.
+const LONG_AND_FIXED_BITS: u8 = 0xc0;
 
 /// Per-version constants.
 struct Version {
@@ -205,19 +211,42 @@ pub fn open_datagram(datagram: &[u8]) -> Progress<Vec<Initial>> {
     if out.is_empty() { Progress::NotThis } else { Progress::Done(out) }
 }
 
+/// The two connection IDs of a long header, read after its first and version
+/// bytes. Versions 1 and 2 bound each at [`MAX_CID_LEN`].
+fn read_cids<'a>(r: &mut Reader<'a>) -> Result<(&'a [u8], &'a [u8]), &'static str> {
+    let dcid = r.vec(1).ok_or("short dcid")?;
+    if dcid.len() > MAX_CID_LEN {
+        return Err("dcid longer than 20");
+    }
+    let scid = r.vec(1).ok_or("short scid")?;
+    if scid.len() > MAX_CID_LEN {
+        return Err("scid longer than 20");
+    }
+    Ok((dcid, scid))
+}
+
+/// The client's (DCID, SCID) when `datagram` starts a connection: a long-header
+/// Initial of a supported version in a full-size datagram. Nothing is decrypted,
+/// so this also reads an Initial that does not open.
+pub fn initial_cids(datagram: &[u8]) -> Option<(&[u8], &[u8])> {
+    if datagram.len() < MIN_INITIAL_DATAGRAM {
+        return None;
+    }
+    let mut r = Reader::new(datagram);
+    let first = r.u8()?;
+    let v = version(r.u32()?)?;
+    if first & LONG_AND_FIXED_BITS != LONG_AND_FIXED_BITS || (first >> 4) & 0b11 != v.initial_type {
+        return None;
+    }
+    read_cids(&mut r).ok()
+}
+
 /// Opens one long-header packet at the start of `pkt`. Returns the bytes it
 /// spans and, for an Initial, its contents.
 fn open_one(pkt: &[u8], ver: u32, is_initial: bool) -> Result<(usize, Option<Initial>), &'static str> {
     let mut r = Reader::new(pkt);
     r.bytes(5).ok_or("short header")?;
-    let dcid = r.vec(1).ok_or("short dcid")?;
-    if dcid.len() > 20 {
-        return Err("dcid longer than 20");
-    }
-    let scid = r.vec(1).ok_or("short scid")?;
-    if scid.len() > 20 {
-        return Err("scid longer than 20");
-    }
+    let (dcid, _scid) = read_cids(&mut r)?;
     if is_initial {
         let token_len = r.varint().ok_or("short token length")?;
         r.bytes(usize::try_from(token_len).map_err(|_| "token length")?).ok_or("token past end")?;

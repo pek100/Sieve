@@ -11,9 +11,10 @@
 //! once, client bytes are held until decoded and decided, then relayed or the
 //! flow is reset with nothing sent). UDP holds datagrams until decoded and
 //! decided; the book entry of a blocked UDP flow, or of one `quic::path` refuses,
-//! closes at once and each of its datagrams is answered until idle (`quic::refuse`),
-//! with nothing sent upstream. Staying until idle means a retransmit costs no new
-//! owner lookup. Port 53 goes to `stack::dns_flow` instead and is never
+//! closes at once and the task stays until idle, so a retransmit costs no new owner
+//! lookup, with nothing sent upstream. A blocked flow's client Initials are answered
+//! with Version Negotiation (`quic::answer_blocked`) and anything else is swallowed; a
+//! refused flow's datagrams with ICMP (`quic::refuse`). Port 53 goes to `stack::dns_flow` instead and is never
 //! relayed or blocked. The upstream TCP connect happens before the decision, so
 //! server-first bytes may reach an app: a decoded name beats the IP map, so
 //! the decision cannot be earlier.
@@ -392,18 +393,14 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         match quic::path(action, &ctx.https, &decided, &who, id) {
             UdpPath::Drop => {
                 close_blocked(&ctx.book, &ctx.meters, id);
-                let quic = &ctx.meters.quic;
-                let reply = Reply { ends: (flow.local, flow.remote), refusal: quic::BLOCKED_ANSWER, sink: &*ctx.sink, meters: quic, replies: &quic.blocked_replies };
-                // A decided flow keeps its decision: nothing ends this before idle.
-                quic::refuse(&mut app, &reply, held, &mut buf, UDP_IDLE, || true).await;
-                return;
+                return quic::answer_blocked(&mut app, &held, &mut buf, UDP_IDLE, &ctx.meters.quic.blocked_replies).await;
             }
             UdpPath::Refuse(refusal) => {
                 quic::close_refused(&ctx.book, id);
                 if let (Some(pid), Some(host), Some(first)) = (event.as_ref().and_then(|e| e.pid), decided.domain.as_deref(), first_datagram_ms.take()) {
                     ctx.meters.quic.refused(pid, host, first);
                 }
-                let reply = Reply { ends: (flow.local, flow.remote), refusal, sink: &*ctx.sink, meters: &ctx.meters.quic, replies: &ctx.meters.quic.replies };
+                let reply = Reply { ends: (flow.local, flow.remote), refusal, sink: &*ctx.sink, meters: &ctx.meters.quic };
                 held = quic::refuse(&mut app, &reply, held, &mut buf, UDP_IDLE, || ctx.https.refuses(owner)).await;
                 if held.is_empty() {
                     return;

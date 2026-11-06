@@ -5,15 +5,17 @@
 //! QUIC, and nothing is sent upstream for a refused flow.
 //!
 //! - [`path`]: the one gate, after the host-level decision;
-//! - [`refuse`]: a refused flow, to its idle end, and a blocked one the same way;
-//! - [`icmp`]: the packet; [`fallback`]: the fallback-time measurement.
+//! - [`refuse`]: a refused flow, to its idle end;
+//! - [`icmp`]: the packet; [`fallback`]: the fallback-time measurement;
+//! - [`answer_blocked`], [`negotiate`]: a blocked flow, which needs none of the
+//!   above, so it works with the slot empty too.
 //!
 //! Refused exactly when `sieve_filter::exclusions::decrypt` says `Intercept`:
 //! there is no second condition, and every "relayed for" case is a `PassReason`.
-//! A blocked flow needs none of this: it is answered with the slot empty too.
 
 pub mod fallback;
 pub mod icmp;
+pub mod negotiate;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -24,7 +26,7 @@ use std::time::Duration;
 
 use sieve_filter::exclusions::{Decrypt, Transport};
 use sieve_ipc::FlowAction;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::flow::classify::{Decoded, Kind};
 use crate::flow::flows::Action;
@@ -53,11 +55,6 @@ impl Refusal {
 /// Plan section 3: if ICMP proves no faster than a drop, this word changes.
 pub const REFUSAL: Refusal = Refusal::PortUnreachable;
 
-/// How a blocked UDP flow is told. Apart from [`REFUSAL`]: that word is flipped to
-/// measure TCP fallback, and a blocked flow has nothing to fall back to, so silence
-/// only makes the browser wait out QUIC's idle timeout.
-pub const BLOCKED_ANSWER: Refusal = Refusal::PortUnreachable;
-
 /// The log's word for a refused flow. The app shows a slug it does not know
 /// with spaces (`reasonWords` in `src/core/log.ts`), so no protocol bump.
 pub const QUIC_REFUSED: &str = "quic_refused";
@@ -70,8 +67,7 @@ pub trait PacketSink: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpPath {
-    /// A blocked name: nothing goes upstream and each datagram is answered with
-    /// [`BLOCKED_ANSWER`] until idle.
+    /// A blocked name: nothing goes upstream ([`answer_blocked`]).
     Drop,
     Refuse(Refusal),
     Relay,
@@ -108,15 +104,13 @@ pub fn close_refused(book: &Mutex<FlowBook>, id: u64) {
     book.lock().unwrap_or_else(|p| p.into_inner()).close(id, FlowAction::Relayed, 0, 0);
 }
 
-/// What answers one refused or blocked flow.
+/// What answers one refused flow.
 pub struct Reply<'a> {
     /// (local, remote): the app's end first.
     pub ends: (SocketAddr, SocketAddr),
     pub refusal: Refusal,
     pub sink: &'a dyn PacketSink,
     pub meters: &'a QuicMeters,
-    /// Which figure a sent answer moves: refused and blocked flows are read apart.
-    pub replies: &'a AtomicU64,
 }
 
 impl Reply<'_> {
@@ -129,10 +123,36 @@ impl Reply<'_> {
         }
         let Some(packet) = icmp::port_unreachable(self.ends.0, self.ends.1, datagram) else { return };
         match self.sink.send(&packet) {
-            Ok(()) => Meters::bump(self.replies),
+            Ok(()) => Meters::bump(&self.meters.replies),
             Err(_) => Meters::bump(&self.meters.send_failed),
         }
     }
+}
+
+/// A blocked flow until it has been idle for `idle`: each client Initial, held or
+/// later, is answered with a Version Negotiation packet through `app`, and any other
+/// datagram is swallowed, so blocked UDP that is not QUIC stays silent. Ending
+/// earlier would turn each retransmit into a new flow with a new owner lookup; the
+/// stack's own timeout then frees the flow. At most one packet smaller than each
+/// datagram the local app itself sent. A failed write means the stack is gone.
+pub async fn answer_blocked<A: AsyncRead + AsyncWrite + Unpin>(app: &mut A, held: &[Vec<u8>], buf: &mut [u8], idle: Duration, answers: &AtomicU64) {
+    for datagram in held {
+        if answer_initial(app, datagram, answers).await.is_err() {
+            return;
+        }
+    }
+    while let Ok(Ok(n)) = tokio::time::timeout(idle, app.read(buf)).await {
+        if n == 0 || answer_initial(app, &buf[..n], answers).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn answer_initial<A: AsyncWrite + Unpin>(app: &mut A, datagram: &[u8], answers: &AtomicU64) -> std::io::Result<()> {
+    let Some(packet) = negotiate::version_negotiation(datagram) else { return Ok(()) };
+    app.write_all(&packet).await?;
+    Meters::bump(answers);
+    Ok(())
 }
 
 /// Answers the held datagrams and each later one until the flow has been idle

@@ -1,6 +1,6 @@
 //! How a blocked flow ends, through the real relay and a real `IpStack` in memory,
 //! with `filtering.https` off (its slot empty). Nothing leaves this machine: answers
-//! end at [`FakeSink`], the empty route table refuses every upstream socket, a TCP
+//! end at the in-memory device, the empty route table refuses every upstream socket, a TCP
 //! flow's upstream is on loopback, and the attributor only reads the owner tables.
 
 use std::future::Future;
@@ -27,9 +27,9 @@ use crate::domain::{DomainFilter, FilterSlot};
 use crate::flow::etw::Unwitnessed;
 use crate::flow::flows::FiveTuple;
 use crate::flow::nat::{NatTable, NoDirectory, VmDirectory};
-use crate::flow::packet::Proto;
-use crate::quic::icmp::tests::assert_answers;
-use crate::quic::tests::{FLOWS, FakeSink, MemDevice, sealed_initials, udp_packet};
+use crate::flow::packet::{self, Proto};
+use crate::flow::quic::{VERSION_1, VERSION_2};
+use crate::quic::tests::{FLOWS, FakeSink, MemDevice, sealed_initials, sealed_initials_of, udp_packet};
 use crate::route::table::NetTables;
 use crate::watchdog::monotonic_ms;
 
@@ -41,6 +41,8 @@ const NAME_TTL_S: u32 = 300;
 /// Far above the owner lookup's give-up time; only a failure waits this long.
 const WAIT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(5);
+/// Long enough for a packet that should not come to have come.
+const SETTLE: Duration = Duration::from_millis(100);
 
 fn relay(sink: Arc<FakeSink>) -> Arc<Relay> {
     let tables: Arc<RwLock<NetTables>> = Arc::default();
@@ -105,38 +107,91 @@ async fn ended<T>(task: impl Future<Output = T>) -> T {
     tokio::time::timeout(WAIT, task).await.expect("the flow ended")
 }
 
+/// The next packet the stack wrote: a datagram from the blocked server to the app,
+/// which is what reaches the browser's socket. Returns its payload.
+async fn next_datagram(wire: &mut Wire, local: SocketAddr, remote: SocketAddr) -> Vec<u8> {
+    let packet = tokio::time::timeout(WAIT, wire.from_stack.recv()).await.expect("a datagram").unwrap();
+    let parsed = packet::parse(&packet).expect("an IP packet");
+    assert_eq!((parsed.proto, parsed.src, parsed.dst), (Proto::Udp, remote.ip(), local.ip()));
+    assert_eq!((parsed.src_port, parsed.dst_port), (remote.port(), local.port()));
+    parsed.payload.to_vec()
+}
+
+/// Neither of the refused path's effects happened.
+fn assert_no_icmp_and_no_refusal(ctx: &Relay, sink: &FakeSink) {
+    let quic = &ctx.meters.quic;
+    assert_eq!(sink.tried.load(Ordering::Relaxed), 0, "no ICMP for a blocked flow");
+    assert_eq!((quic.replies.load(Ordering::Relaxed), quic.refused.load(Ordering::Relaxed)), (0, 0), "a block is not a refusal");
+}
+
+/// The exact bytes for both versions over both families, each retransmit answered on
+/// the one flow, with `filtering.https` off.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_blocked_quic_flow_is_answered_at_once_with_the_https_slot_empty() {
-    for flow in FLOWS {
-        let (local, remote) = ends(flow);
-        let sink = Arc::new(FakeSink::default());
-        let ctx = relay(sink.clone());
-        assert!(ctx.https.get().is_none(), "filtering.https is off");
-        let mut wire = wire();
-        for initial in sealed_initials(BLOCKED) {
-            wire.to_stack.send(udp_packet(local, remote, &initial)).unwrap();
-        }
-        let task = tokio::spawn(handle_udp(ctx.clone(), accept_udp(&mut wire).await));
+async fn a_blocked_quic_flow_gets_version_negotiation_and_a_retransmit_is_no_new_flow() {
+    const DCID: [u8; 8] = [0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7];
+    const SCID: [u8; 5] = [0x50, 0x51, 0x52, 0x53, 0x54];
+    #[rustfmt::skip]
+    const EXPECTED: [u8; 24] = [
+        0xc0,
+        0, 0, 0, 0,
+        5, 0x50, 0x51, 0x52, 0x53, 0x54,
+        8, 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7,
+        0x1a, 0x2a, 0x3a, 0x4a,
+    ];
+    for version in [VERSION_1, VERSION_2] {
+        for flow in FLOWS {
+            let (local, remote) = ends(flow);
+            let sink = Arc::new(FakeSink::default());
+            let ctx = relay(sink.clone());
+            assert!(ctx.https.get().is_none(), "filtering.https is off");
+            let mut wire = wire();
+            let initials = sealed_initials_of(version, &DCID, &SCID, BLOCKED);
+            for initial in &initials {
+                wire.to_stack.send(udp_packet(local, remote, initial)).unwrap();
+            }
+            let task = tokio::spawn(handle_udp(ctx.clone(), accept_udp(&mut wire).await));
 
-        until("each held Initial is answered", || sink.count() == 2).await;
-        wire.to_stack.send(udp_packet(local, remote, &sealed_initials(BLOCKED)[0])).unwrap();
-        until("a retransmit is answered", || sink.count() == 3).await;
+            for _ in &initials {
+                assert_eq!(next_datagram(&mut wire, local, remote).await, EXPECTED, "each held Initial");
+            }
+            wire.to_stack.send(udp_packet(local, remote, &initials[0])).unwrap();
+            assert_eq!(next_datagram(&mut wire, local, remote).await, EXPECTED, "a retransmit");
 
-        for packet in sink.sent.lock().unwrap().iter() {
-            assert_answers(packet, local, remote);
+            // Answered in order, so the answer after this one proves it got none.
+            wire.to_stack.send(udp_packet(local, remote, &[0x40; 1_250])).unwrap();
+            wire.to_stack.send(udp_packet(local, remote, &initials[1])).unwrap();
+            assert_eq!(next_datagram(&mut wire, local, remote).await, EXPECTED);
+            assert!(wire.from_stack.try_recv().is_err(), "the short header got nothing");
+
+            assert!(!task.is_finished(), "the flow stays until idle");
+            assert_blocked_once(&ctx, BLOCKED);
+            assert_eq!(ctx.meters.quic.blocked_replies.load(Ordering::Relaxed), 4, "the figure counts these packets");
+            assert_no_icmp_and_no_refusal(&ctx, &sink);
+            task.abort();
         }
-        assert!(!task.is_finished(), "the flow stays until idle, so a retransmit is no new flow");
-        assert_blocked_once(&ctx, BLOCKED);
-        let quic = &ctx.meters.quic;
-        assert_eq!(quic.blocked_replies.load(Ordering::Relaxed), 3);
-        assert_eq!((quic.replies.load(Ordering::Relaxed), quic.refused.load(Ordering::Relaxed)), (0, 0), "a block is not a refusal");
-        assert!(wire.from_stack.try_recv().is_err(), "the stack itself wrote nothing back");
-        task.abort();
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_blocked_datagram_that_is_not_quic_is_answered_too() {
+async fn zero_length_connection_ids_are_answered() {
+    const EXPECTED: [u8; 11] = [0xc0, 0, 0, 0, 0, 0, 0, 0x1a, 0x2a, 0x3a, 0x4a];
+    for flow in FLOWS {
+        let (local, remote) = ends(flow);
+        let ctx = relay(Arc::default());
+        let mut wire = wire();
+        for initial in sealed_initials_of(VERSION_1, &[], &[], BLOCKED) {
+            wire.to_stack.send(udp_packet(local, remote, &initial)).unwrap();
+        }
+        let task = tokio::spawn(handle_udp(ctx.clone(), accept_udp(&mut wire).await));
+        assert_eq!(next_datagram(&mut wire, local, remote).await, EXPECTED);
+        task.abort();
+    }
+}
+
+/// Blocked by the names its address was resolved for, not QUIC: swallowed, as
+/// before, with neither packet sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_datagram_that_is_not_quic_is_drained_silently() {
     for flow in FLOWS {
         let (local, remote) = ends(flow);
         let sink = Arc::new(FakeSink::default());
@@ -145,9 +200,13 @@ async fn a_blocked_datagram_that_is_not_quic_is_answered_too() {
         let mut wire = wire();
         wire.to_stack.send(udp_packet(local, remote, b"\x00\x01 not quic")).unwrap();
         let task = tokio::spawn(handle_udp(ctx.clone(), accept_udp(&mut wire).await));
-        until("the datagram is answered", || sink.count() == 1).await;
-        assert_answers(&sink.sent.lock().unwrap()[0], local, remote);
-        assert_eq!(ctx.meters.counters().blocked, 1);
+        until("the flow is blocked", || ctx.meters.counters().blocked == 1).await;
+        wire.to_stack.send(udp_packet(local, remote, b"\x00\x02 not quic")).unwrap();
+        tokio::time::sleep(SETTLE).await;
+        assert!(wire.from_stack.try_recv().is_err(), "nothing back");
+        assert_eq!(ctx.meters.quic.blocked_replies.load(Ordering::Relaxed), 0);
+        assert_no_icmp_and_no_refusal(&ctx, &sink);
+        assert!(!task.is_finished(), "the flow stays until idle");
         task.abort();
     }
 }
@@ -166,7 +225,10 @@ async fn an_allowed_flow_gets_no_answer() {
         }
         let app = accept_udp(&mut wire).await;
         ended(handle_udp(ctx.clone(), app)).await;
-        assert_eq!(sink.tried.load(Ordering::Relaxed), 0);
+        tokio::time::sleep(SETTLE).await;
+        assert!(wire.from_stack.try_recv().is_err(), "no Version Negotiation");
+        assert_eq!(ctx.meters.quic.blocked_replies.load(Ordering::Relaxed), 0);
+        assert_no_icmp_and_no_refusal(&ctx, &sink);
         assert_eq!(ctx.meters.counters().blocked, 0);
         let batch = ctx.book.lock().unwrap().take_batch();
         assert_eq!(batch.iter().map(|e| e.action).collect::<Vec<_>>(), [FlowAction::Failed], "no route, so nothing left");
