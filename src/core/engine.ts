@@ -254,12 +254,18 @@ export function engineDetail(e: EngineSlice): string {
 export const ADGUARD_START_TEXT = "AdGuard's service is stopped. Starting it again also stops Sieve's routing, because the two cannot run together.";
 
 /**
- * The phases in which the engine ran its AdGuard check and found no
- * interception (AdGuard wins over a VPN). Every other phase gives no verdict:
- * the switch is off, the engine did not answer, the check itself failed, or
- * (`starting`) the engine answered a new policy before its first check.
+ * The engine ran its AdGuard check and found no interception: it routes with no
+ * blocker, or the blocker is a VPN (AdGuard wins over a VPN). Read from the
+ * blocker and not the phase, because routes stay up for seconds after the engine
+ * publishes a blocker, and the phase still says routing then. Everything else
+ * gives no verdict: the switch is off, the engine did not answer, the check
+ * itself failed, or the engine answered a new policy before its first check.
  */
-const ADGUARD_CLEARED: ReadonlySet<EnginePhase> = new Set<EnginePhase>(["routing", "vpn"]);
+function adguardCleared(e: EngineSlice): boolean {
+  const s = engineStatus(e);
+  if (!engineTakesPolicy(e) || s?.policy.engine !== true) return false;
+  return s.blocker ? s.blocker.kind === "vpn" : s.filtering;
+}
 
 /**
  * What the AdGuard action offers, from facts: pause while the engine waits
@@ -270,10 +276,9 @@ const ADGUARD_CLEARED: ReadonlySet<EnginePhase> = new Set<EnginePhase>(["routing
  */
 export function adguardOffer(e: EngineSlice): "pause" | "start" | "paused" | null {
   const adguard = e.probe?.adguard;
-  const phase = enginePhase(e);
-  if (adguard === "running") return phase === "adguard" ? "pause" : null;
+  if (adguard === "running") return enginePhase(e) === "adguard" ? "pause" : null;
   if (adguard === "stopped") return "start";
-  return adguard === "stopping" && engineInForce(e) === true && ADGUARD_CLEARED.has(phase) ? "paused" : null;
+  return adguard === "stopping" && adguardCleared(e) ? "paused" : null;
 }
 
 /** Split-tunnel VPNs the engine reported: their traffic bypasses Sieve, and the UI says so. */
