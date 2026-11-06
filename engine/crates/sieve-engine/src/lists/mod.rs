@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use sieve_filter::catalogue::{self, LISTS, List};
 use sieve_filter::lists::{Applied, FetchResponse, FetchState, list_version};
 use sieve_filter::rules::{ListReport, ListText, RuleEngine, USER_LIST};
-use sieve_ipc::{FilterFacts, ListFact, ListStatus, MAX_LISTED_LINE_BYTES, cap_text};
+use sieve_ipc::{FilterFacts, ListFact, ListStatus, listed_line};
 use tokio::sync::Notify;
 
 use crate::domain::{DomainFilter, FilterSlot};
@@ -89,7 +89,7 @@ fn status_of(id: &str, enabled: bool, state: Option<&FetchState>, report: Option
         cosmetic: report.map_or(0, |r| counted(r.cosmetic)),
         skipped: report.map_or(0, |r| counted(r.skipped)),
         skip_reasons: reasons,
-        skipped_exceptions: report.map(|r| r.skipped_exceptions.iter().map(|l| cap_text(l, MAX_LISTED_LINE_BYTES).to_string()).collect()).unwrap_or_default(),
+        skipped_exceptions: report.map(|r| r.skipped_exceptions.iter().map(|l| listed_line(l)).collect()).unwrap_or_default(),
         skipped_exceptions_total: report.map_or(0, |r| counted(r.skipped_exceptions_total)),
     }
 }
@@ -140,18 +140,21 @@ impl Lists {
         }
     }
 
-    /// What the engine filters with, for the Status: the selected lists the last
-    /// compile holds. None until a compile finished. The user's rules are not a
-    /// list here: they have no project page and are never what a report names.
+    /// What the engine filters with, for the Status: the lists the snapshot in
+    /// force holds, whatever the selection has since become. None until a
+    /// compile finished. The user's rules are not a list here: they have no
+    /// project page and are never what a report names.
     pub fn facts(&self) -> Option<FilterFacts> {
         let filter = self.slot.get();
-        let selected = self.selected();
         let inner = self.inner();
         inner.compile_ms?;
-        let lists = selected
+        let lists = filter
+            .rules
+            .lists
+            .reports()
             .iter()
-            .filter_map(|l| {
-                let report = filter.rules.lists.reports().iter().find(|r| r.id == l.id)?;
+            .filter_map(|report| {
+                let l = catalogue::find(&report.id)?;
                 Some(ListFact {
                     id: l.id.to_string(),
                     title: l.title.to_string(),
@@ -273,8 +276,9 @@ impl Lists {
 
     /// The refresh task, for as long as routes are up.
     pub async fn run<F: Fetcher>(self: Arc<Self>, fetcher: F) {
-        self.compile_and_swap().await;
+        // Read before compiling: a change during the compile mismatches below.
         let mut compiled_for = self.selected();
+        self.compile_and_swap().await;
         loop {
             let replaced = self.fetch_due(&fetcher, wall_ms()).await;
             let selected = self.selected();
@@ -635,7 +639,48 @@ mod tests {
         let facts = l.facts().unwrap();
         assert_eq!(facts.lists.iter().map(|f| (f.id.as_str(), f.applied)).collect::<Vec<_>>(), [(LIST_A, 1)]);
         l.set_selection(Some(vec![]));
-        assert_eq!(l.facts().unwrap().lists, [], "a list turned off is not claimed");
+        assert_eq!(l.facts().unwrap().lists.len(), 1, "turned off, but it enforces until the next compile");
+        assert!(blocks(&l, "ads.example"), "the fact and the filter agree");
+        l.compile_and_swap().await;
+        assert_eq!(l.facts().unwrap().lists, [], "gone with the snapshot that held it");
+    }
+
+    #[test]
+    fn a_listed_line_carries_no_control_characters() {
+        let report = ListReport { skipped_exceptions: vec!["@@a\u{1}b".into()], ..ListReport::default() };
+        let row = status_of(LIST_A, true, None, Some(&report));
+        assert_eq!(row.skipped_exceptions, ["@@ab"]);
+    }
+
+    /// The list the first compile is holding, for [`deselects_while_compiling`].
+    static COMPILING: Mutex<Option<Arc<Lists>>> = Mutex::new(None);
+
+    /// A user who turns every list off while the first compile runs.
+    fn deselects_while_compiling(texts: &[ListText<'_>]) -> RuleEngine {
+        if let Some(l) = COMPILING.lock().unwrap().take() {
+            l.set_selection(Some(vec![]));
+        }
+        RuleEngine::compile(texts)
+    }
+
+    #[tokio::test]
+    async fn a_selection_changed_during_the_first_compile_is_compiled_next() {
+        let dir = tempfile::tempdir().unwrap();
+        Cache::new(dir.path()).write_text(LIST_A, BODY).unwrap();
+        let selection = Some(vec![LIST_A.to_string()]);
+        let l = Arc::new(Lists::with_compile(Some(dir.path()), slot(), selection, deselects_while_compiling));
+        *COMPILING.lock().unwrap() = Some(l.clone());
+        let task = tokio::spawn(l.clone().run(FakeFetcher::default()));
+        let mut compiled_twice = false;
+        for _ in 0..500 {
+            if COMPILING.lock().unwrap().is_none() && l.inner().compile_ms.is_some() && !blocks(&l, "ads.example") {
+                compiled_twice = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        assert!(compiled_twice, "the deselected list still drops hosts");
     }
 
     /// The refresh task itself: compile the cached copy first, then fetch, swap,

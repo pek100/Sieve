@@ -34,17 +34,32 @@ fn fact(bytes: &[u8]) -> String {
 /// copy away.
 pub fn load(engine_dir: &Path, pin: Option<&str>) -> (Option<Loaded>, Option<String>) {
     let mut refused = None;
-    if let Some(bytes) = data_path(engine_dir, &Kind::Resources).and_then(|p| std::fs::read(p).ok()) {
-        match load_signed_bundle(&bytes) {
+    match data_path(engine_dir, &Kind::Resources).map_or(Ok(None), |p| read_copy(&p, "signed")) {
+        Ok(Some(bytes)) => match load_signed_bundle(&bytes) {
             Ok(bundle) => return (Some(Loaded { bundle, pin: fact(&bytes) }), None),
             Err(why) => refused = Some(format!("the signed resource library was refused: {why}")),
-        }
+        },
+        Ok(None) => {}
+        Err(why) => refused = Some(why),
     }
     let Some(pin) = pin else { return (None, refused) };
-    let Ok(bytes) = std::fs::read(engine_dir.join(super::cache::FOLDER).join(PINNED_COPY)) else { return (None, refused) };
-    match load_bundle(&bytes, pin) {
-        Ok(bundle) => (Some(Loaded { bundle, pin: fact(&bytes) }), refused),
-        Err(why) => (None, Some(format!("the pinned resource library was refused: {why}"))),
+    match read_copy(&engine_dir.join(super::cache::FOLDER).join(PINNED_COPY), "pinned") {
+        Ok(Some(bytes)) => match load_bundle(&bytes, pin) {
+            Ok(bundle) => (Some(Loaded { bundle, pin: fact(&bytes) }), refused),
+            Err(why) => (None, Some(format!("the pinned resource library was refused: {why}"))),
+        },
+        Ok(None) => (None, refused),
+        Err(why) => (None, Some(why)),
+    }
+}
+
+/// A copy's bytes. Only a missing file is absence: a copy that is there and
+/// cannot be read is said, like one that is refused.
+fn read_copy(path: &Path, which: &str) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("the {which} resource library could not be read: {e}")),
     }
 }
 
@@ -73,6 +88,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (loaded, why) = load(dir.path(), Some(&sha256_hex(BUNDLE)));
         assert!(loaded.is_none() && why.is_none());
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_read_is_said_and_not_taken_for_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data_path(dir.path(), &Kind::Resources).unwrap()).unwrap();
+        put_pinned(dir.path(), BUNDLE);
+        let (loaded, why) = load(dir.path(), Some(&sha256_hex(BUNDLE)));
+        assert_eq!(loaded.unwrap().pin, fact(BUNDLE), "it falls through like a refused copy");
+        assert!(why.unwrap().contains("signed resource library could not be read"));
+
+        let pinned = dir.path().join(crate::lists::cache::FOLDER).join(PINNED_COPY);
+        std::fs::remove_file(&pinned).unwrap();
+        std::fs::create_dir_all(&pinned).unwrap();
+        let (loaded, why) = load(dir.path(), Some(&sha256_hex(BUNDLE)));
+        assert!(loaded.is_none());
+        assert!(why.unwrap().contains("pinned resource library could not be read"));
     }
 
     #[test]

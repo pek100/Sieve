@@ -78,7 +78,8 @@ pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error"
 /// kilobytes, and at this cap a full `flows` frame stays under [`MAX_FRAME`].
 pub const MAX_RULE_BYTES: usize = 256;
 /// A skipped exception line in the list report is cut to this many bytes: 200
-/// lines of each list, JSON-escaped at worst twice over, fit one frame.
+/// lines of each list, JSON-escaped at worst twice over ([`listed_line`] holds
+/// that worst case), fit one frame.
 pub const MAX_LISTED_LINE_BYTES: usize = 180;
 
 /// App to engine.
@@ -541,6 +542,14 @@ pub fn cap_text(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
+/// A list line as the report carries it: at most [`MAX_LISTED_LINE_BYTES`], with
+/// no control characters. JSON writes one of those as six bytes, which would
+/// break the frame bound for text that means nothing to a reader anyway.
+pub fn listed_line(line: &str) -> String {
+    let printable: String = line.chars().filter(|c| !c.is_control()).collect();
+    cap_text(&printable, MAX_LISTED_LINE_BYTES).to_string()
+}
+
 /// File name without directory and extension.
 fn exe_stem(path: &str) -> &str {
     let base = path.rsplit(['\\', '/']).next().unwrap_or(path);
@@ -957,22 +966,29 @@ mod tests {
     fn a_full_lists_frame_stays_under_the_frame_limit() {
         const LISTS_AT_WORST: usize = 14;
         const LISTED_LINES: usize = 200;
-        let reasons = (0..16).map(|i| (format!("network filter error: reason {i} worded at some length"), u64::MAX)).collect();
-        let list = ListStatus {
-            id: "i".repeat(32),
-            enabled: true,
-            fetched_at_ms: Some(u64::MAX),
-            refresh_s: Some(u64::MAX),
-            last_error: Some("e".repeat(256)),
-            network: u64::MAX,
-            cosmetic: u64::MAX,
-            skipped: u64::MAX,
-            skip_reasons: reasons,
-            skipped_exceptions: vec!["\"".repeat(MAX_LISTED_LINE_BYTES); LISTED_LINES],
-            skipped_exceptions_total: u64::MAX,
-        };
-        let msg = EngineMessage::Lists { lists: vec![list; LISTS_AT_WORST], compile_ms: Some(u64::MAX) };
-        assert!(encode(&msg).is_ok(), "{:?}", encode(&msg).err());
+        const RAW_LINE_BYTES: usize = 4 * MAX_LISTED_LINE_BYTES;
+        for escaped in ['"', '\\', '\n', '\u{1}'] {
+            let line: String = std::iter::repeat_n(['a', escaped], RAW_LINE_BYTES).flatten().collect();
+            let solid = escaped.to_string().repeat(RAW_LINE_BYTES);
+            for raw in [line, solid] {
+                let reasons = (0..16).map(|i| (format!("network filter error: reason {i} worded at some length"), u64::MAX)).collect();
+                let list = ListStatus {
+                    id: "i".repeat(32),
+                    enabled: true,
+                    fetched_at_ms: Some(u64::MAX),
+                    refresh_s: Some(u64::MAX),
+                    last_error: Some("e".repeat(256)),
+                    network: u64::MAX,
+                    cosmetic: u64::MAX,
+                    skipped: u64::MAX,
+                    skip_reasons: reasons,
+                    skipped_exceptions: vec![listed_line(&raw); LISTED_LINES],
+                    skipped_exceptions_total: u64::MAX,
+                };
+                let msg = EngineMessage::Lists { lists: vec![list; LISTS_AT_WORST], compile_ms: Some(u64::MAX) };
+                assert!(encode(&msg).is_ok(), "{escaped:?}: {:?}", encode(&msg).err());
+            }
+        }
     }
 
     /// Every outcome kind round trips, so the TS law sees each wire name, and
