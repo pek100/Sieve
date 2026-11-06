@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { AppShell } from "@/components/sieve/shell/app-shell";
 import { SETTING_KEYS, isAvailable, settingDef } from "@/core/settings/registry";
+import { resetPlan } from "@/core/settings/transfer";
 import { dataSwitchSummary } from "@/core/welcome";
 import { createMockEngine, type EngineScenario } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
@@ -10,7 +11,7 @@ import { createMockLock, type LockScenario } from "@/data/lock-mock";
 import { createMockSource } from "@/data/mock-source";
 import type { EnginePolicy } from "@/data/protocol";
 import { memoryBackend, type SettingsBackend } from "@/data/settings-store";
-import { createRuntime } from "@/hooks/runtime";
+import { createRuntime, type Runtime } from "@/hooks/runtime";
 
 vi.mock("next/navigation", () => ({ usePathname: () => "/" }));
 vi.setConfig({ testTimeout: 20_000 });
@@ -121,6 +122,71 @@ describe("when the guide shows", () => {
     await settle();
     expect(b.settings.get("startup.welcomeDone")).toBe(true);
     expect(shown()).toBe(false);
+  });
+
+  describe("the row's words: off shows it the next time Sieve opens", () => {
+    const open = (settings: SettingsBackend) => {
+      const rt = createRuntime({ source: createMockSource({ seed: 1 }), settings, isTauri: true });
+      const view = render(<AppShell runtime={rt}>{PAGE}</AppShell>);
+      return { rt, view };
+    };
+    const opened = async (rt: Runtime) => {
+      await act(async () => {
+        await rt.settings.ready;
+      });
+      await settle();
+    };
+
+    it("turning the flag off leaves the screen alone, and the next open shows the guide", async () => {
+      const backend = memoryBackend(DONE);
+      const first = open(backend);
+      await opened(first.rt);
+      expect(shown()).toBe(false);
+      await act(async () => {
+        await first.rt.settings.set("startup.welcomeDone", false);
+      });
+      await settle();
+      expect(shown()).toBe(false);
+      expect(screen.getByText(PAGE)).toBeInTheDocument();
+      first.view.unmount();
+
+      const second = open(backend);
+      await opened(second.rt);
+      expect(shown()).toBe(true);
+    });
+
+    it("so does turning it off after the guide was finished in this same run", async () => {
+      const first = open(memoryBackend());
+      await opened(first.rt);
+      expect(shown()).toBe(true);
+      await press("Skip");
+      await settle();
+      expect(shown()).toBe(false);
+      await act(async () => {
+        await first.rt.settings.set("startup.welcomeDone", false);
+      });
+      await settle();
+      expect(shown()).toBe(false);
+      expect(screen.getByText(PAGE)).toBeInTheDocument();
+    });
+
+    it("Reset all neither drops the person into the guide nor brings it back at the next open", async () => {
+      const backend = memoryBackend({ schema: 4, values: { "startup.welcomeDone": true, "appearance.theme": "light" } });
+      const first = open(backend);
+      await opened(first.rt);
+      await act(async () => {
+        await first.rt.settings.replace(resetPlan(first.rt.settings.doc()).next);
+      });
+      await settle();
+      expect(first.rt.settings.get("appearance.theme")).toBe("dark");
+      expect(first.rt.settings.get("startup.welcomeDone")).toBe(true);
+      expect(shown()).toBe(false);
+      first.view.unmount();
+
+      const second = open(backend);
+      await opened(second.rt);
+      expect(shown()).toBe(false);
+    });
   });
 
   // The flag was turned off or lost while a password file stayed: the guide must still let the person out.

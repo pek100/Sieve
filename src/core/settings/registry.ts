@@ -51,6 +51,8 @@ interface Base<T> {
    * available. Its code stays (see isAvailable).
    */
   unavailableUntil?: string;
+  /** A record of what happened, not a preference: "Reset every setting" leaves it. Its own row can still change it. */
+  keptByResetAll?: true;
 }
 
 /**
@@ -254,13 +256,15 @@ export const REGISTRY = {
     of: { type: "upstream" },
     unavailableUntil: ENGINE_SLICE_4,
   } satisfies ListSetting<string>,
-  // The first-run guide is finished or skipped. Off shows it again.
+  // The first-run guide is finished or skipped. Off shows it again at the next
+  // open (hooks/use-welcome decides once per run), so it never takes over mid-run.
   "startup.welcomeDone": {
     kind: "boolean",
     section: "startup",
     label: "Welcome guide finished",
     help: "Off shows the welcome guide the next time Sieve opens.",
     default: false,
+    keptByResetAll: true,
   } satisfies BooleanSetting,
   // Not a data switch: it changes no traffic. On asks Windows for permission first.
   "notifications.desktop": {

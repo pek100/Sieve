@@ -8,7 +8,7 @@ vi.mock("./registry", async (importOriginal) => {
   const real = await importOriginal<typeof import("./registry")>();
   return { ...real, isAvailable: (k: Parameters<typeof real.isAvailable>[0]) => availability.every || real.isAvailable(k) };
 });
-import { EXPORT_KIND, exportText, formatNumber, formatValue, numberChoices, planImport, resetPlan, searchSettings } from "./transfer";
+import { EXPORT_KIND, exportText, formatNumber, formatValue, numberChoices, planImport, resetAllText, resetPlan, searchSettings } from "./transfer";
 
 const changed: SettingsDoc = writeValue(writeValue(EMPTY_DOC, "appearance.theme", "light"), "apps.pinned", ["C:\\Tools\\a.exe"]);
 
@@ -97,6 +97,15 @@ describe("settings export and import", () => {
     expect(plan.changes.map((c) => c.key)).toEqual(["appearance.theme", "apps.pinned"]);
     expect(plan.next.values).toEqual({ "future.key": 1 });
     expect(resetPlan(EMPTY_DOC).changes).toEqual([]);
+  });
+
+  it("reset to defaults keeps a finished welcome guide: it is a record of what happened, not a preference", () => {
+    const doc = writeValue(writeValue(EMPTY_DOC, "startup.welcomeDone", true), "appearance.theme", "light");
+    const plan = resetPlan(doc);
+    expect(plan.next.values).toEqual({ "startup.welcomeDone": true });
+    expect(plan.changes.map((c) => c.key)).toEqual(["appearance.theme"]);
+    expect(resetPlan(EMPTY_DOC).next.values).toEqual({});
+    expect(resetAllText()).toContain(settingDef("startup.welcomeDone").label);
   });
 });
 

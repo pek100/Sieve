@@ -125,10 +125,20 @@ export function planImport(current: SettingsDoc, text: string): ImportPlan {
   return { ok: true, changes: changesBetween(current, next), refused, next };
 }
 
-/** Every known key back to its default; unknown keys (from a newer Sieve) are kept. */
+/** The keys a reset of everything leaves as they are. */
+const keptByReset = () => shownKeys().filter((key) => settingDef(key).keptByResetAll === true);
+
+/** Every known key back to its default, but for those it keeps; unknown keys (from a newer Sieve) are kept. */
 export function resetPlan(current: SettingsDoc): { changes: Change[]; next: SettingsDoc } {
-  const next = docWith(current, {});
+  const kept = Object.fromEntries(keptByReset().map((key) => [key, readValue(current, key)]));
+  const next = docWith(current, kept);
   return { changes: changesBetween(current, next), next };
+}
+
+/** What a reset of everything does, in the person's words. */
+export function resetAllText(): string {
+  const kept = keptByReset().map((key) => settingDef(key).label);
+  return `Every setting goes back to its default${kept.length > 0 ? `, except ${kept.join(", ")}` : ""}. You can undo it right after.`;
 }
 
 const sectionLabel = (id: string) => SECTIONS.find((s) => s.id === id)?.label ?? id;
