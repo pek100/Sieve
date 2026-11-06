@@ -5,9 +5,9 @@
 //! copy the current files to `*.old`, then rename the verified file over the
 //! real name with the service stopped. A complete exe stays at the ImagePath at
 //! every instant (plan 7.5 said rename aside first, which leaves a moment with
-//! none; recorded there). Rollback renames the current file to `.failed` and
-//! `.old` back to the real name, so it cannot jam on a running `sieve.exe`,
-//! which can be renamed but not replaced.
+//! none; recorded there). Rollback renames `.old` over the real name the same
+//! way. Only a file that refuses that, a running `sieve.exe` (renamed, not
+//! replaced), first moves to `.failed`, so rollback cannot jam on it.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -150,18 +150,21 @@ pub fn replace(fs: &dyn Fs, staged: &Path, target: &Path) -> Result<(), String> 
 /// Back to the set as listed in `aside`: the one primitive for both kinds.
 /// Rerunning it after an interruption finishes the job: a file whose `.old` is
 /// gone was restored already. For an `app` release a file the installer added
-/// also moves out, so the set is wholly the old one.
+/// also moves out, so the set is wholly the old one. A file stays at each name
+/// unless `.old` could not be moved even after the real file went aside and the
+/// real file could not then come back.
 pub fn rollback(fs: &dyn Fs, install: &Path, kind: &Kind, aside: &[String]) -> Result<(), String> {
     for name in aside {
         let (real, old) = (install.join(name), with_suffix(install, name, OLD_SUFFIX));
-        if !fs.exists(&old) {
+        if !fs.exists(&old) || fs.rename(&old, &real).is_ok() {
             continue;
         }
-        if fs.exists(&real) {
-            let failed = with_suffix(install, name, FAILED_SUFFIX);
-            fs.rename(&real, &failed).map_err(|e| named(&failed, &e))?;
+        let failed = with_suffix(install, name, FAILED_SUFFIX);
+        fs.rename(&real, &failed).map_err(|e| named(&failed, &e))?;
+        if let Err(e) = fs.rename(&old, &real) {
+            let _ = fs.rename(&failed, &real);
+            return Err(named(&real, &e));
         }
-        fs.rename(&old, &real).map_err(|e| named(&real, &e))?;
     }
     if *kind == Kind::App {
         let names = fs.files(install).map_err(|e| named(install, &e))?;
@@ -299,7 +302,8 @@ pub(crate) mod tests {
                 Ok::<(), &str>(())
             })();
             match done {
-                Ok(()) => assert!(!fs.fired()),
+                // A rollback whose first rename failed went on the other way.
+                Ok(()) => {}
                 Err("set aside") => {
                     assert_eq!(engine_bytes(&install), OLD_ENGINE, "the real file was not touched");
                     assert_eq!(clear_leftovers(&RealFs, &install), Ok(()));
@@ -377,12 +381,53 @@ pub(crate) mod tests {
                 rollback(&RealFs, &install, &Kind::App, &set).unwrap();
             }
             assert_eq!(real_files(&install), before, "step {k}");
-            if !failed {
-                assert!(k >= 5, "{k}");
+            if !fs.fired() {
+                assert!(!failed && k >= 4, "{k}");
                 break;
             }
             k += 1;
         }
+    }
+
+    /// Real files, except that a rename out of a `.old` always fails, as with a
+    /// scanner holding it.
+    struct OldLocked;
+
+    impl Fs for OldLocked {
+        fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
+            RealFs.copy(from, to)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            if from.to_string_lossy().ends_with(OLD_SUFFIX) { Err(io::Error::other("locked")) } else { RealFs.rename(from, to) }
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            RealFs.remove_file(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            RealFs.exists(path)
+        }
+        fn files(&self, dir: &Path) -> io::Result<Vec<String>> {
+            RealFs.files(dir)
+        }
+    }
+
+    /// With the service stopped a stopped exe is replaced at once, with no gap for
+    /// a power loss, and a locked `.old` leaves the real file for the service to
+    /// start and carry the rollback on.
+    #[test]
+    fn a_rollback_never_leaves_the_image_path_empty() {
+        let (_guard, install, staged) = engine_setup();
+        let set = vec![ENGINE_EXE.to_string()];
+        set_aside(&RealFs, &install, &set).unwrap();
+        replace(&RealFs, &staged, &install.join(ENGINE_EXE)).unwrap();
+
+        assert!(rollback(&OldLocked, &install, &Kind::Engine, &set).is_err());
+        assert_eq!(engine_bytes(&install), NEW_ENGINE, "still there, to start");
+        assert!(install.join(format!("{ENGINE_EXE}{OLD_SUFFIX}")).exists(), "and the rollback can be rerun");
+
+        rollback(&RealFs, &install, &Kind::Engine, &set).unwrap();
+        assert_eq!(engine_bytes(&install), OLD_ENGINE);
+        assert!(!install.join(format!("{ENGINE_EXE}{FAILED_SUFFIX}")).exists(), "no aside: one atomic rename");
     }
 
     /// What each part of an interrupted `app` install looks like, from a whole
