@@ -81,7 +81,7 @@ test.describe("filters", () => {
     await expect(editor).toHaveValue("! note\n||good.example^\n||ads.example.com^");
 
     await page.getByRole("textbox", { name: "Add to Allowlist" }).fill("WWW.Example.com");
-    await page.getByRole("button", { name: "Add", exact: true }).click();
+    await page.locator("[data-domain-list]", { has: page.getByRole("textbox", { name: "Add to Allowlist" }) }).getByRole("button", { name: "Add", exact: true }).click();
     const entry = page.locator('[data-domain="www.example.com"]');
     await expect(entry).toBeVisible();
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);

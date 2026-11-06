@@ -27,7 +27,7 @@ test.describe("first-run guide", () => {
       if (id !== "adguard") await page.getByRole("button", { name: "Next" }).click();
     }
     await expect(step(page, "adguard").getByRole("button", { name: "Pause AdGuard" })).toBeVisible();
-    await expect(page.getByText("Pausing AdGuard stops its Windows service")).toBeVisible();
+    await expect(page.getByText("Pausing AdGuard asks its Windows service")).toBeVisible();
     await page.getByRole("button", { name: "Finish" }).click();
 
     await expect(page.locator("[data-welcome-step]")).toHaveCount(0);
