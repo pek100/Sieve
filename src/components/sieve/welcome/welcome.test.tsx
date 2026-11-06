@@ -13,7 +13,7 @@ import type { EnginePolicy } from "@/data/protocol";
 import { memoryBackend, type SettingsBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "@/hooks/runtime";
 
-vi.mock("next/navigation", () => ({ usePathname: () => "/" }));
+vi.mock("next/navigation", () => ({ usePathname: () => "/", useRouter: () => ({ push: () => {} }) }));
 vi.setConfig({ testTimeout: 20_000 });
 
 const DONE = { schema: 4, values: { "startup.welcomeDone": true } };

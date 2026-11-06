@@ -330,6 +330,105 @@ export function parseCertStatus(raw: unknown): CertStatus {
   };
 }
 
+/** `sieve-ipc` ExclusionScope wire names, in declaration order. */
+export const EXCLUSION_SCOPES = ["browsers", "all"] as const;
+export type ExclusionScope = (typeof EXCLUSION_SCOPES)[number];
+
+/** One entry of the engine's `list:*` or `auto:*` layers (`sieve-ipc` ExclusionRow). */
+export interface ExclusionRow {
+  /** The pattern in the list grammar, with no `$app=`. */
+  line: string;
+  /** Lower-case exe file names; empty means every app. */
+  apps: string[];
+  /** A slug: `list:<id>`, `auto:pinning`, ... An unknown one still renders. */
+  reason: string;
+  /** When the engine first wrote it; null for a list's line. */
+  created_ms: number | null;
+  retries: number;
+}
+
+/** One page of `exclusions` (`sieve-ipc` EngineMessage::Exclusions). */
+export interface ExclusionsPage {
+  revision: number;
+  rows: ExclusionRow[];
+  total: number;
+  next: number | null;
+  scope: ExclusionScope;
+  /** Full paths, lower case: the exes Windows declares as browsers. */
+  browsers: string[];
+  /** Rows that could not be read. */
+  skipped: number;
+}
+
+/** One row, or null when it is broken: the rest of the list still renders. */
+function exclusionRow(raw: unknown): ExclusionRow | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.line !== "string" || r.line === "" || typeof r.reason !== "string") return null;
+  const apps = Array.isArray(r.apps) ? r.apps.filter((a): a is string => typeof a === "string") : [];
+  const created = typeof r.created_ms === "number" && Number.isSafeInteger(r.created_ms) && r.created_ms >= 0 ? r.created_ms : null;
+  const retries = typeof r.retries === "number" && Number.isSafeInteger(r.retries) && r.retries >= 0 ? r.retries : 0;
+  return { line: r.line, apps, reason: r.reason, created_ms: created, retries };
+}
+
+/**
+ * Validate an untrusted `exclusions` answer, the one normalizer of this shape: a
+ * bad row is skipped and counted, like `parseLogTail`; a wrong shape throws.
+ */
+export function parseExclusionsPage(raw: unknown): ExclusionsPage {
+  const p = rec(raw, "exclusions");
+  if (!Array.isArray(p.rows)) throw new ProtocolError("exclusions.rows must be an array");
+  const rows = p.rows.map(exclusionRow).filter((r): r is ExclusionRow => r !== null);
+  return {
+    revision: int(p.revision, "exclusions.revision"),
+    rows,
+    total: int(p.total, "exclusions.total"),
+    next: intOrNull(p.next, "exclusions.next"),
+    scope: oneOf(p.scope, EXCLUSION_SCOPES, "exclusions.scope"),
+    browsers: strings(p.browsers, "exclusions.browsers"),
+    skipped: p.rows.length - rows.length,
+  };
+}
+
+/** One group of self-healing exclusions of one app (`sieve-ipc` HealNotice). */
+export interface HealNotice {
+  id: number;
+  session: number;
+  /** The exe's file name, lower case. */
+  exe: string;
+  /** The first few hosts; `total` counts them all. */
+  hosts: string[];
+  total: number;
+  rev: number;
+}
+
+/** The `heal_notices` message. */
+export interface HealNotices {
+  revision: number;
+  exclusions_revision: number;
+  notices: HealNotice[];
+}
+
+function healNotice(raw: unknown): HealNotice | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const n = raw as Record<string, unknown>;
+  const count = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+  if (!count(n.id) || !count(n.session) || !count(n.total) || !count(n.rev) || typeof n.exe !== "string" || !Array.isArray(n.hosts)) return null;
+  const hosts = n.hosts.filter((h): h is string => typeof h === "string");
+  return hosts.length > 0 ? { id: n.id, session: n.session, exe: n.exe, hosts, total: Math.max(n.total, hosts.length), rev: n.rev } : null;
+}
+
+/** Validate an untrusted `heal_notices` answer. A bad notice is left out; a wrong shape throws. */
+export function parseHealNotices(raw: unknown): HealNotices {
+  const h = rec(raw, "heal notices");
+  if (!Array.isArray(h.notices)) throw new ProtocolError("heal.notices must be an array");
+  return {
+    revision: int(h.revision, "heal.revision"),
+    exclusions_revision: int(h.exclusions_revision, "heal.exclusions_revision"),
+    notices: h.notices.map(healNotice).filter((n): n is HealNotice => n !== null),
+  };
+}
+
 export interface EngineCounters {
   flows: number;
   attributed: number;

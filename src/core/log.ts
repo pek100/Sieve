@@ -5,6 +5,7 @@
  * (src/data/log-controller.ts).
  */
 import type { LogEntry, LogOutcome, LogRow } from "@/data/protocol";
+import { exclusionReasonWords, isExclusionReason } from "./exclusions";
 
 /** How often the engine's log tail is read while the engine routes. */
 export const LOG_POLL_MS = 1000;
@@ -91,6 +92,7 @@ export const REASON_TEXT: Readonly<Record<string, string>> = {
 
 /** A reason in words; one this build does not know shows its slug with spaces. */
 export function reasonWords(slug: string): string {
+  if (isExclusionReason(slug)) return exclusionReasonWords(slug);
   return REASON_TEXT[slug] ?? slug.replaceAll("_", " ");
 }
 

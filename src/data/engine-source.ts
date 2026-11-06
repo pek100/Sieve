@@ -12,7 +12,7 @@
  * AdGuard's service through one command Windows asks the user to approve.
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { parseCertStatus, parseDnsUpstreams, parseEngineLists, parseEngineProbe, parseEngineStatus, parseLogTail, type CertStatus, type EngineDnsUpstreams, type EngineLists, type EnginePolicy, type EngineProbe, type EngineStatus, type LogTail } from "./protocol";
+import { parseCertStatus, parseDnsUpstreams, parseEngineLists, parseEngineProbe, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseLogTail, type CertStatus, type EngineDnsUpstreams, type EngineLists, type EnginePolicy, type EngineProbe, type EngineStatus, type ExclusionsPage, type HealNotices, type LogTail } from "./protocol";
 
 export interface EngineSource {
   readonly kind: "mock" | "tauri";
@@ -44,6 +44,16 @@ export interface EngineSource {
   certStatus(): Promise<CertStatus>;
   /** The user's Reinstall: a new root and key. Rejects while `https` is off in the engine. */
   installRoot(): Promise<CertStatus>;
+  /** One page of what the engine keeps from being decrypted, from row `after`. Rejects when it did not answer. */
+  exclusions(after: number): Promise<ExclusionsPage>;
+  /**
+   * "Try decrypting again": one row (`line`, and its `app` or null), or with no
+   * line every rejected site of `app`. Only ever reaches what the engine wrote
+   * itself. Answers the first page. Rejects on a line it cannot read.
+   */
+  tryDecryptAgain(line: string | null, app: string | null): Promise<ExclusionsPage>;
+  /** What self-healing excluded since revision `after`, and the rows' revision. */
+  healNotices(after: number): Promise<HealNotices>;
 }
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -63,5 +73,8 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     logTail: async (since) => parseLogTail(await invoke<unknown>("engine_log_tail", { since })),
     certStatus: async () => parseCertStatus(await invoke<unknown>("engine_cert_status")),
     installRoot: async () => parseCertStatus(await invoke<unknown>("engine_install_root")),
+    exclusions: async (after) => parseExclusionsPage(await invoke<unknown>("engine_exclusions", { after })),
+    tryDecryptAgain: async (line, app) => parseExclusionsPage(await invoke<unknown>("engine_try_decrypt_again", { line, app })),
+    healNotices: async (after) => parseHealNotices(await invoke<unknown>("engine_heal_notices", { after })),
   };
 }

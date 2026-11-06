@@ -4,16 +4,18 @@ import { useState } from "react";
 import { PasswordBlock } from "@/components/sieve/lock/password-block";
 import { SearchField } from "@/components/sieve/primitives/search-field";
 import { StateLayer } from "@/components/sieve/primitives/state-layer";
-import { Card } from "@/components/sieve/shell/card";
+import { Card, CardBoundary } from "@/components/sieve/shell/card";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { GridRegion, LayoutGrid } from "@/components/sieve/shell/layout-grid";
 import { Page } from "@/components/sieve/shell/page";
 import { Button } from "@/components/ui/button";
 import { CERTIFICATE_ANCHOR, ENGINE_ANCHOR, ENGINE_SWITCH } from "@/core/engine";
+import { EXCLUSIONS_ANCHOR } from "@/core/exclusions";
 import { settingDef, type Section, type SettingKey } from "@/core/settings/registry";
 import { cn } from "@/lib/utils";
 import { CertificateGroup } from "./certificate-group";
 import { EngineCard } from "./engine-card";
+import { ExclusionsGroup } from "./exclusions-group";
 import { SettingRow } from "./setting-row";
 import { TransferMenu } from "./transfer-menu";
 import { useSettingsView } from "./use-settings-view";
@@ -35,7 +37,8 @@ const PASSWORD_SECTION = settingDef("password.idleMinutes").section;
  * edges. Search covers label, help, key and options; the overflow menu has
  * export, import and reset. The section that owns the engine's switch also
  * carries the engine (EngineCard, read only, anchor ENGINE_ANCHOR) with the root certificate
- * under it (CertificateGroup, anchor CERTIFICATE_ANCHOR).
+ * under it (CertificateGroup, anchor CERTIFICATE_ANCHOR) and what is not decrypted
+ * under that (ExclusionsGroup, anchor EXCLUSIONS_ANCHOR).
  */
 export function SettingsScreen() {
   const [query, setQuery] = useState("");
@@ -103,6 +106,11 @@ export function SettingsScreen() {
                       </div>
                       <div id={CERTIFICATE_ANCHOR} className="scroll-mt-[4rem]">
                         <CertificateGroup />
+                      </div>
+                      <div id={EXCLUSIONS_ANCHOR} className="scroll-mt-[4rem]">
+                        <CardBoundary title="Not decrypted">
+                          <ExclusionsGroup />
+                        </CardBoundary>
                       </div>
                     </div>
                   )}

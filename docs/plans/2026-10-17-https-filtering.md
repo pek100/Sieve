@@ -326,6 +326,8 @@ A client that rejects the leaf shows a recognisable pattern right after Sieve's 
 - **Retry.** "Try decrypting again" removes the entry. If the app still pins, the entry comes back with its history.
 - **Proactive part:** the `$app=` lines of `issues.txt` and `windows.txt` (4.2). There is no Sieve-maintained app list (S49): the hand list AdGuard ships (E3) is exactly what self-healing derives.
 
+**Note (2026-11-06, slice 7).** The numbers above could not do what the text says: a score that halves continuously gives `0.5^(gap / half life) + 1`, under 2 for any gap above zero, so `excludeAt` 2 needed two closes in one millisecond. As built, `heal/dials.rs`: `EXCLUDE_AT` is 1.5, which is exactly "the second close arrives within one half-life of the first". A used connection counts once per connection, and credit is bounded by `MAX_CREDIT` 2, so a pair that carried requests takes four quick closes (open question Q2 of `docs/tasks/2026-11-06-heal.md`). Any alert outside the table, a close during the handshake and the handshake timeout weigh +1 with no window. See that task's D1 and D3.
+
 ### 4.4 Per-app exemption: the existing Sieve/Off switch
 
 `apps.levels` Off becomes a real exemption. An Off app's flows are relayed through the stack untouched: no decryption, no network rules, no QUIC refusal. They are still counted and charted unless the app is also hidden by the existing tracking rule. Routes are per destination, so an Off app's packets still cross the userspace stack. The cost is the relay only, and slice 3 measures it. The copy changes from "Off cannot exempt an app from DNS blocking" to "Off: Sieve passes this app's traffic through untouched". That copy becomes true once slice 4 retires DNS-level blocking.
@@ -499,6 +501,8 @@ Also measured, without budgets: the attribution success rate and lag (PROBE), EC
 | Cross-host leakage over HTTP/2 coalescing | Leaf SAN is the SNI only, and 421 for other authorities (2.5). |
 | Privacy of the log | Memory only (a ring of 10,000 rows), cleared at engine restart, session-scoped, never written to disk, never sent. Counts per app go to the existing history file, without URLs. Request bodies, cookies and authorization headers are never logged. |
 | Network loss through Sieve | Fail open: adapter death removes routes, a watchdog guards against hangs, the route journal cleans up at boot, and the restore shortcut is there (1.5, 1.6). |
+| A page steering self-healing (slice 7) | A page can influence weak evidence for hosts it controls in a browser, by making connections that close unused. The most it wins is that a host it already controls skips URL rules for that browser: host-level rules still apply, nothing is decrypted that was not before, and the row and notice show it. A flood is bounded by `MAX_PAIRS`, `MAX_PER_REASON` and the group. A retry cannot touch the floor. |
+| Exclusion rows across Windows sessions (slice 7) | TENSION: rows are machine-wide because the store is, so a second signed-in user who passes the pipe's DACL could see a host another session's app rejected. The DACL admits only the enabling user, SYSTEM and Administrators, so this is the same person or an admin. Notices stay session scoped. Open question Q4 of `docs/tasks/2026-11-06-heal.md`. |
 
 ### 7.2 Verifier checklist (each item is checked with evidence: a test name, a command output, or a screenshot)
 
@@ -511,7 +515,7 @@ Also measured, without budgets: the attribution success rate and lag (PROBE), EC
 - [ ] badssl-style endpoints (expired, wrong host, self-signed, untrusted root, revoked, SHA-1 intermediate, incomplete chain, TLS 1.0, TLS 1.1, RC4, 3DES, null cipher, DH 1024) all pass through, so the browser shows its own error, and never produce a Sieve leaf.
 - [ ] A client-certificate site passes through, and the client presents its own certificate.
 - [ ] A bank from `banks.txt`, a `.gov` site and an EV site are not decrypted: the issuer seen in the browser is the real CA.
-- [ ] A pinning client (for example `curl --cacert` with the public bundle against an intercepted host) gets excluded after one failure. Its retry succeeds, and the notice appears once.
+- [ ] A pinning client (for example `curl --cacert` with the public bundle against an intercepted host) gets excluded after one failure. Its retry succeeds, and the notice appears once. Browsers first means curl is never intercepted, so this runs on a `live-scope` diagnostic build, never a release (`docs/live/engine-slice-7.md`).
 - [ ] Session-0 services are never decrypted (log over 30 min of normal use: no intercept rows with session 0).
 - [ ] `taskkill /F` on the engine: network works within 5 s, and `route print` shows no Sieve routes. A simulated hang (debug IPC `Stall`, compiled only in test builds) leads to the watchdog removing routes within `watchdog.stallMs` plus 1 s.
 - [ ] A reboot with the engine killed mid-run leaves no stale routes after boot.
@@ -604,6 +608,8 @@ Actions: "Reinstall certificate" (makes a new root) and "Remove certificate" (tu
 Floor reasons are not rows, because they cannot be removed. A short line under the list names them once.
 
 The app sheet (Apps) gains one line under its switch: "Sieve decrypts this app's HTTPS except N sites" with a link to the filtered exclusions. For an Off app the line reads "Off: Sieve passes this app's traffic through untouched".
+
+**Note (2026-11-06, slice 7).** That line would be false for every non-browser under browsers first, and for everyone with the switch off. As built (`appDecryption`, table in `docs/tasks/2026-11-06-heal.md` D8): in force and in scope it says the sentence above, or "Sieve decrypts this app's HTTPS." with no exception; in force and out of scope, "Sieve does not decrypt this app's HTTPS."; otherwise nothing. The Off line stays the switch's own (`APP_OFF_MEANS`), one owner. The group sits in the Settings Filtering section; "the B6 domain-list view" gave it its add form (`filters/domain-field.tsx`).
 
 ### 8.3 Filtering log
 
@@ -766,6 +772,7 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
   - unit tests with a fake clock: one fatal alert excludes; two silent closes within the half-life exclude; preconnects later used never do; retry removes and restores history;
   - **live:** a client using its own CA bundle (curl with a bundled cacert) gets excluded after one failure and works on retry; Discord or Steam (if installed) works after at most one failed request; one notice per app.
 - **Files:** `engine/crates/sieve-engine/src/heal/**`, `src/components/sieve/settings/exclusions-*.tsx`, `src/components/sieve/apps/app-sheet*.tsx`. **Live:** yes. **Switch:** part of `filtering.https`.
+- **Status (2026-11-06):** built and tested offline only (`docs/tasks/2026-11-06-heal.md`, branch `wf2-heal`). `filtering.https` stays unavailable, and nothing has run against a real client: the runbook is `docs/live/engine-slice-7.md`, and U1 to U3 need a `live-scope` diagnostic build. The app sheet is `apps/app-detail.tsx` with `apps/app-exclusions-line.tsx`.
 
 ### Slice 8: QUIC per-flow refusal
 

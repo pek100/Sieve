@@ -446,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_hold_the_lists_and_the_auto_layer_not_the_user_layer() {
+    fn the_user_layer_is_not_sent() {
         let slot = ExclusionSlot::new(None, &["mine.example".to_string()], NOW);
         slot.add_auto(AutoEntry::for_app("pin.example", "client.exe", AutoReason::Pinning, NOW), NOW);
         slot.add_auto(AutoEntry::host("ev.example", AutoReason::Ev, NOW, Some(NOW + DAY)), NOW);
