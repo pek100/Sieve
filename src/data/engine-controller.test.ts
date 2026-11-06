@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createPassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineUpdate } from "@/core/engine";
+import { CONTENT_SWITCH, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineUpdate } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
 import { MAX_POLICY_BYTES, settingDef, type SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
@@ -17,7 +17,7 @@ import { createSettingsStore, memoryBackend, type SettingsBackend } from "./sett
 const SWITCH = ENGINE_SWITCH as SettingKey;
 
 /** What the settings' defaults ask of the engine, at a revision and switch. */
-const policy = (revision: number, engine: boolean): EnginePolicy => ({ revision, engine, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false, user_rules: [], exclusions: [] });
+const policy = (revision: number, engine: boolean): EnginePolicy => ({ revision, engine, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false, content: false, user_rules: [], exclusions: [] });
 
 function fakeClock() {
   let now = 0;
@@ -285,6 +285,7 @@ describe("engine controller", () => {
         sieving: false,
         off_apps: ["firefox"],
         https: false,
+        content: false,
         lists: null,
         domain_lists: [
           { kind: "block", entries: ["ads.example"], enabled: true },
@@ -741,6 +742,36 @@ describe("engine controller", () => {
       const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true, [HTTPS_SWITCH]: true } }));
       await s.fc.flush();
       expect(s.fake.policies).toEqual([policy(1, true)]);
+      s.undo();
+    });
+
+    it("the unavailable content switch reads off, so the policy sends content false whatever is stored", async () => {
+      const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true, [HTTPS_SWITCH]: true, [CONTENT_SWITCH]: true } }));
+      await s.fc.flush();
+      expect(s.fake.policies).toEqual([policy(1, true)]);
+      expect(s.fake.policies[0].content).toBe(false);
+      s.undo();
+    });
+
+    it("an engine holding content on while the switch is off is told off", async () => {
+      const s = setup("idle");
+      await s.fc.flush();
+      await s.fake.source.setPolicy({ ...policy(1, false), content: true });
+      s.fake.policies.length = 0;
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(s.fake.policies.at(-1)).toMatchObject({ content: false });
+      s.undo();
+    });
+
+    it("an engine that leaves the field out, as it does while off, is not told again", async () => {
+      const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true } }));
+      await s.fc.flush();
+      const withoutContent = { ...s.fake.policies.at(-1)! };
+      delete withoutContent.content;
+      await s.fake.source.setPolicy(withoutContent);
+      s.fake.policies.length = 0;
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(s.fake.policies).toEqual([]);
       s.undo();
     });
 

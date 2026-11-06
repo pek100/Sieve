@@ -1165,6 +1165,14 @@ mod tests {
     }
 
     #[test]
+    fn the_fixtures_policy_with_content_round_trips_unchanged() {
+        let wire = fixture()["policyWithContent"].clone();
+        let parsed: ClientMessage = serde_json::from_value(wire.clone()).unwrap();
+        assert!(matches!(&parsed, ClientMessage::SetPolicy(p) if p.content));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
+    }
+
+    #[test]
     fn the_policy_without_content_loads_and_serializes_without_it() {
         let old: Policy = serde_json::from_str(r#"{"revision":4,"engine":true,"https":true}"#).unwrap();
         assert!(!old.content);

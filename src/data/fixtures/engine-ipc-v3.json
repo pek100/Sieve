@@ -9,6 +9,7 @@
   "logPerFrame": 200,
   "logUrlMax": 2048,
   "logRuleMax": 1024,
+  "policyWithContent": { "type": "set_policy", "revision": 5, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": true, "content": true, "user_rules": [], "exclusions": [] },
   "client": [
     { "type": "hello", "protocol": 3, "app_version": "0.1.0" },
     { "type": "status" },

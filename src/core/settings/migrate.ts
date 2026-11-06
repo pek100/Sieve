@@ -47,7 +47,8 @@ export function dropSystemDns(values: Values): Values {
  * on again where its checks run. Derived from the registry rather than a key
  * list, so the step and the attribute cannot disagree. Other unavailable keys
  * are kept: they hold no traffic change and read as their default while
- * unavailable. Only `filtering.https` is unavailable today; the old decoder stays.
+ * unavailable. Only `filtering.https` and `filtering.content` are today; the old
+ * decoder stays.
  */
 export function offUnavailableSwitches(values: Values): Values {
   const next: Values = { ...values };

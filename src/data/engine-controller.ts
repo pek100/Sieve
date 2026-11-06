@@ -32,7 +32,7 @@
  * Update state rides the probe: there is no separate poll.
  */
 import type { PassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, updateBanner, type EngineSlice } from "@/core/engine";
+import { CONTENT_SWITCH, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, updateBanner, type EngineSlice } from "@/core/engine";
 import type { NoticeBus } from "@/core/notices";
 import { selectedListIds } from "@/core/filter-lists";
 import { GLOBAL_SWITCH, offKeys } from "@/core/policy";
@@ -74,6 +74,7 @@ export const CRASH_LOOP_BANNER =
 
 const SWITCH = ENGINE_SWITCH as SettingKey;
 const HTTPS = HTTPS_SWITCH as SettingKey;
+const CONTENT = CONTENT_SWITCH as SettingKey;
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 type WantedPolicy = Omit<EnginePolicy, "revision">;
@@ -96,6 +97,7 @@ function wantedPolicy(settings: SettingsStore, catalogue: Pick<FilterCatalogue, 
     sieving: Boolean(settings.get(GLOBAL_SWITCH)),
     off_apps: [...offKeys(settings.get("apps.levels"))],
     https: Boolean(settings.get(HTTPS)),
+    content: Boolean(settings.get(CONTENT)),
     lists: untouched ? null : catalogue ? selectedListIds(selection, catalogue) : heldLists,
     domain_lists: [...domainList("block", settings.get("filtering.blockedDomains")), ...domainList("allow", settings.get("filtering.allowedDomains"))],
     user_rules: [...settings.get("filtering.userRules")],
@@ -109,6 +111,7 @@ function normalised(p: WantedPolicy): string {
   return JSON.stringify({
     engine: p.engine,
     https: p.https,
+    content: p.content ?? false,
     sieving: p.sieving,
     off_apps: sorted(p.off_apps),
     lists: p.lists && sorted(p.lists),
