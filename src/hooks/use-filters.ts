@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { engineLists, engineTakesPolicy } from "@/core/engine";
-import { setGroupOn, setListOn, withEngineReports } from "@/core/filter-lists";
+import { nothingLoaded, setGroupOn, setListOn, withEngineReports } from "@/core/filter-lists";
 import type { EngineLists, FilterCatalogue, FilterList, RuleProblem } from "@/data/protocol";
 import { useRuntime } from "./sieve-provider";
 import { useEngine, useSetting } from "./use-sieve";
@@ -19,6 +19,8 @@ export interface FiltersModel {
   catalogue: FilterCatalogue | null;
   /** Why the catalogue could not be read. */
   failed: string | null;
+  /** The facts say no list is in force. False while they are missing: nothing is claimed then. */
+  nothingInForce: boolean;
   selection: Readonly<Record<string, string>>;
   setList: (list: FilterList, on: boolean) => void;
   setGroup: (lists: readonly FilterList[], on: boolean) => void;
@@ -47,15 +49,19 @@ export function useFilters(): FiltersModel {
   const [catalogue, setCatalogue] = useState<FilterCatalogue | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [answered, setAnswered] = useState<EngineLists | null>(null);
+  // The probe facts the newest answer stands for.
+  const [answeredFor, setAnsweredFor] = useState<string | null>(null);
 
   // The full report is large, so it is read when the probe's small facts say it
-  // moved, not on the probe's cadence. Asked of whoever can answer; a failure
-  // leaves the lists saying nothing is loaded rather than an error of its own.
+  // moved, not on the probe's cadence. A read that failed is asked again at each
+  // next probe, with no error of its own: the probe's facts already say what is in force.
   const slice = useEngine();
   const reachable = engineTakesPolicy(slice);
-  const facts = engineLists(slice)
-    .map((l) => `${l.id}:${l.applied}:${l.skipped}`)
-    .join();
+  const lists = engineLists(slice);
+  const facts = lists.map((l) => `${l.id}:${l.applied}:${l.skipped}`).join();
+  const unanswered = answeredFor !== facts;
+  const nextTry = unanswered ? slice.probe : null;
+  const noneApplied = slice.error === null && slice.probe !== null && lists.every((l) => l.applied === 0);
 
   useEffect(() => {
     let live = true;
@@ -69,18 +75,23 @@ export function useFilters(): FiltersModel {
   }, [filterLists]);
 
   useEffect(() => {
-    if (!reachable) return;
+    if (!reachable || !unanswered) return;
     let live = true;
     engine.lists().then(
-      (l) => live && setAnswered(l),
-      () => live && setAnswered(null),
+      (l) => {
+        if (!live) return;
+        setAnswered(l);
+        setAnsweredFor(facts);
+      },
+      () => undefined,
     );
     return () => {
       live = false;
     };
-  }, [engine, reachable, facts]);
+  }, [engine, reachable, facts, unanswered, nextTry]);
 
   const reported = useMemo(() => (catalogue ? withEngineReports(catalogue, reachable ? answered : null) : null), [catalogue, reachable, answered]);
+  const nothingInForce = reported !== null && noneApplied && nothingLoaded(reported.lists);
 
   // Writers read the latest stored value at call time, so undo after other edits stays correct.
   const selectionNow = () => settings.get("filters.lists");
@@ -117,6 +128,7 @@ export function useFilters(): FiltersModel {
   return {
     catalogue: reported,
     failed,
+    nothingInForce,
     selection,
     setList: (list, on) => void writeSelection(setListOn(selectionNow(), list, on)),
     setGroup: (lists, on) => void writeSelection(setGroupOn(selectionNow(), lists, on)),

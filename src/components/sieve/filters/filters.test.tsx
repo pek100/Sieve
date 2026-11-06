@@ -76,6 +76,69 @@ describe("the engine's report", () => {
   });
 });
 
+describe("what the screen says is in force", () => {
+  /** The switch on, so the mock engine stays in the example it started in. */
+  const ROUTING = { schema: 5, values: { "filtering.engine": true } };
+  /** The next probe's facts, unchanged: a new answer with the same small facts. */
+  const nextProbe = (rt: Awaited<ReturnType<typeof setup>>) =>
+    act(async () => {
+      const e = rt.store.getState().engine;
+      rt.store.setEngine({ ...e, probe: { ...e.probe! } });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+  it("a failed report read never says nothing is in force while the probe reports rules applied, and is asked again at the next probe", async () => {
+    const mock = createMockEngine("hosts");
+    const pipe = { broken: true };
+    const lists = vi.fn(() => (pipe.broken ? Promise.reject(new Error("the pipe broke")) : mock.lists()));
+    const rt = await setup("pending", ROUTING, { ...mock, lists });
+    await settled();
+    expect(lists).toHaveBeenCalled();
+    expect(pending(), "the engine reports rules applied").toBeNull();
+    const row = (await mock.lists()).lists.find((l) => l.network > 0)!;
+    expect(list(row.id)).toHaveTextContent("Not loaded yet");
+
+    pipe.broken = false;
+    const failed = lists.mock.calls.length;
+    await nextProbe(rt);
+    await settled();
+    expect(lists).toHaveBeenCalledTimes(failed + 1);
+    expect(list(row.id)).toHaveTextContent(`${row.network.toLocaleString("en-US")} applied`);
+    await nextProbe(rt);
+    await settled();
+    expect(lists, "answered: not read on the probe's cadence").toHaveBeenCalledTimes(failed + 1);
+  });
+
+  it("says nothing before the first report arrives, or while the catalogue is out", async () => {
+    const mock = createMockEngine("hosts");
+    await setup("pending", ROUTING, { ...mock, lists: () => new Promise(() => {}) });
+    await settled();
+    expect(pending()).toBeNull();
+    cleanup();
+    await setup("error", undefined, createMockEngine("idle"));
+    await settled();
+    expect(pending()).toBeNull();
+  });
+
+  it("says nothing while the engine's state cannot be read", async () => {
+    await setup("pending", undefined, createMockEngine("error"));
+    await settled();
+    expect(pending()).toBeNull();
+  });
+
+  it("an engine that answers with no list applied, and no engine at all, do say it", async () => {
+    const idle = createMockEngine("idle");
+    const empty = await idle.lists();
+    await setup("pending", undefined, { ...idle, lists: async () => ({ ...empty, lists: [] }) });
+    await settled();
+    expect(pending()).toHaveTextContent(NOT_APPLIED_TEXT);
+    cleanup();
+    await setup("pending", undefined, createMockEngine("missing"));
+    await settled();
+    expect(pending()).toHaveTextContent(NOT_APPLIED_TEXT);
+  });
+});
+
 describe("one store for the user's rules", () => {
   it("the blocklist writes the key the engine reads", async () => {
     const rt = await setup();
@@ -205,6 +268,32 @@ describe("user rules", () => {
     expect(editor()).toHaveValue("||a.example^");
     fireEvent.change(editor(), { target: { value: "||b.example^" } });
     expect(screen.queryByRole("list", { name: "Rule problems" })).toBeNull();
+  });
+
+  it("a save in flight holds Save, so an older save can never land over a newer one", async () => {
+    const release: (() => void)[] = [];
+    const source: FilterListSource = {
+      ...createMockFilterLists("pending"),
+      checkRules: () => new Promise((r) => release.push(() => r([]))),
+    };
+    const rt = await setup(source);
+    fireEvent.change(editor(), { target: { value: "||older.example^" } });
+    await userEvent.click(save());
+    fireEvent.change(editor(), { target: { value: "||newer.example^" } });
+    expect(save(), "the older check has not answered").toBeDisabled();
+    await act(async () => {
+      release.shift()!();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(rt.settings.get("filtering.userRules")).toEqual(["||older.example^"]);
+    expect(editor(), "what was typed since stays").toHaveValue("||newer.example^");
+    await userEvent.click(save());
+    await act(async () => {
+      release.shift()!();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(rt.settings.get("filtering.userRules")).toEqual(["||newer.example^"]);
+    expect(save()).toBeDisabled();
   });
 
   it("a list the engine could not hold is refused with the reason, wherever it is added to", async () => {

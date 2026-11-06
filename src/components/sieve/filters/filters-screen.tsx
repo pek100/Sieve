@@ -3,7 +3,6 @@
 import { LockedNote } from "@/components/sieve/lock/locked-note";
 import { GridRegion, LayoutGrid } from "@/components/sieve/shell/layout-grid";
 import { Page } from "@/components/sieve/shell/page";
-import { nothingLoaded } from "@/core/filter-lists";
 import { isShut } from "@/core/lock";
 import { ALLOWLIST_TEXT } from "@/core/rules";
 import { useFilters } from "@/hooks/use-filters";
@@ -26,7 +25,7 @@ export function FiltersScreen() {
   const model = useFilters();
   const { state: lockState } = useLock();
   const shut = isShut(lockState.phase);
-  const pending = model.catalogue === null || nothingLoaded(model.catalogue.lists);
+  const pending = model.nothingInForce;
   return (
     <Page title="Filters">
       <LayoutGrid>
