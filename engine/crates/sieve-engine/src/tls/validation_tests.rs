@@ -2,9 +2,10 @@
 //! chain checks and upstream ECH, on the harness of `tls::tests`. Lists here are
 //! built in memory, so they carry no real signature (`ct` tests the real one).
 
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use clubcard_crlite::Encoding;
 use rustls::RootCertStore;
@@ -17,7 +18,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 use super::crlite::testing::filter;
 use super::crlite::{Crlite, encode_bundle};
-use super::ct::testing::{MemoryLog, USABLE, list_json};
+use super::ct::testing::{MemoryLog, USABLE, list_json, ocsp_with, ocsp_with_status, sct_list_value, status_revoked};
 use super::ct::{self, CtAnswer, LogList, MAX_LIST_AGE_MS};
 use super::ech::ECH_HANDSHAKE_TIMEOUT;
 use super::ech::testing::{FakeLookup, config_list};
@@ -152,6 +153,22 @@ async fn compliant_chain_asks_trust_once() {
     assert_eq!(count(&s.meters.https.ct_compliant), 1);
 }
 
+/// A staple with status revoked is still read, so the chain reaches trust, whose
+/// `Revoked` is the verdict that closes open flows.
+#[tokio::test]
+async fn scts_in_a_revoked_staple_count_and_trust_is_asked() {
+    let (pki, world) = (Pki::new("Test Public Root"), World::new());
+    let s = stack(pki.roots(), Some(world.list(0)), None);
+    let mut chain = chain_of(pki.leaf(HOST, GOOD).0);
+    let entry = ct::SignedEntry::X509 { leaf: chain.end_entity.as_ref() };
+    let scts = sct_list_value(&[world.logs[0].sct(world.at_ms, entry), world.logs[1].sct(world.at_ms, entry)]);
+    chain.ocsp = ocsp_with_status(&status_revoked(), false, &scts);
+    s.verifier.verify(&chain, HOST, false, wall_ms()).await;
+    assert_eq!(count(&s.meters.https.ct_compliant), 1);
+    assert_eq!(count(&s.meters.https.ct_violating), 0);
+    assert_eq!(trust_calls(&s.trust), 1);
+}
+
 #[tokio::test]
 async fn known_leaf_still_runs_local_checks_and_skips_trust() {
     let (pki, world) = (Pki::new("Test Public Root"), World::new());
@@ -240,6 +257,17 @@ async fn bench_validation_local_checks() {
         assert_eq!(checked.ct, CtAnswer::Compliant);
     }
     println!("bench_validation_local_checks: {:?} per connection, in memory, {ROUNDS} rounds", start.elapsed() / ROUNDS);
+    // The worst a server can staple: a listed log's id on signatures that fail.
+    const FLOOD: usize = 539;
+    let leaf = chain.end_entity.as_ref();
+    let forger = MemoryLog { key: rcgen::KeyPair::generate().unwrap(), id: *ct::scts_of(&X509Certificate::from_der(leaf).unwrap().1)[0].id.key_id };
+    let forged = forger.sct(NOW - 1, ct::SignedEntry::X509 { leaf });
+    let flooded = Chain { ocsp: ocsp_with(&sct_list_value(&vec![forged; FLOOD])), ..chain.clone() };
+    let start = std::time::Instant::now();
+    for _ in 0..ROUNDS {
+        assert_eq!(s.slot.check(&flooded, NOW, || s.verifier.issuer_hash(&flooded, NOW)).ct, CtAnswer::Compliant);
+    }
+    println!("bench_validation_local_checks: {:?} per connection with a {}-byte staple", start.elapsed() / ROUNDS, flooded.ocsp.len());
 }
 
 // ---- End to end, through `tls::intercept::run`.
@@ -592,52 +620,101 @@ async fn an_ech_handshake_that_ends_early_is_an_ech_failure() {
     assert!(matches!(handshake(near, HOST, Vec::new(), None).await, HandshakeEnd::Failed(UpstreamVerdict::Unavailable)), "without ECH, as slice 6");
 }
 
-// ---- Live checks: docs/live/engine-slice-11.md. Never run offline; each reads its
-// host from the environment and the counts from status.json.
+// ---- Live checks: docs/live/engine-slice-11.md. Never run offline. Decryption is
+// for browsers (`exclusions::SCOPE`), so the test process cannot be the client:
+// each reads status.json's counts around a browser step the person performs.
 
-fn live_host() -> String {
-    std::env::var("SIEVE_LIVE_HOST").expect("SIEVE_LIVE_HOST names the host (docs/live/engine-slice-11.md)")
+/// How long each wait of a live check lasts: long enough for a person to act and
+/// for several rewrites of status.json, so a correct run cannot miss one.
+const LIVE_WAIT: Duration = Duration::from_millis(4 * crate::control::STATUS_FILE_EVERY_MS);
+/// Looks per wait.
+const POLLS: u32 = 100;
+
+fn status_count(path: &Path, meter: &str) -> Option<u64> {
+    let status: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    status["https"][meter].as_u64()
 }
 
-fn live_status() -> serde_json::Value {
+fn poll_for<T>(wait: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(found) = probe() {
+            return Some(found);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(wait / POLLS);
+    }
+}
+
+/// A count before and after `browser_step`. The first is read from a rewrite that
+/// came after this began, so what happened before the step is not taken for growth.
+fn count_around(path: &Path, meter: &str, wait: Duration, browser_step: impl FnOnce()) -> Result<(u64, u64), String> {
+    let modified = || std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let written = modified();
+    let before = poll_for(wait, || modified().filter(|m| Some(*m) != written).and_then(|_| status_count(path, meter))).ok_or_else(|| format!("{} was not rewritten with {meter}: is the engine running?", path.display()))?;
+    browser_step();
+    let after = poll_for(wait, || status_count(path, meter).filter(|n| *n > before)).ok_or_else(|| format!("{meter} stayed at {before}"))?;
+    Ok((before, after))
+}
+
+fn live_count_grows(meter: &str) {
+    let host = std::env::var("SIEVE_LIVE_HOST").expect("SIEVE_LIVE_HOST names the host (docs/live/engine-slice-11.md)");
     let path = std::env::var("SIEVE_LIVE_STATUS").expect("SIEVE_LIVE_STATUS names status.json (docs/live/engine-slice-11.md)");
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    println!("Waiting for a fresh status.json, up to {LIVE_WAIT:?}.");
+    let step = || println!("Now load {host} in a browser, and nothing else, within {LIVE_WAIT:?}.");
+    let (before, after) = count_around(Path::new(&path), meter, LIVE_WAIT, step).unwrap_or_else(|why| panic!("{why}"));
+    println!("{meter} grew from {before} to {after}");
 }
 
-/// The issuer a real connection shows, through the running engine.
-async fn live_issuer(host: &str) -> String {
-    use rustls::pki_types::ServerName;
-    let stream = tokio::net::TcpStream::connect((host, 443)).await.unwrap();
-    let (config, shown) = client_tls(&["http/1.1"], None);
-    let name = ServerName::try_from(host.to_string()).unwrap();
-    let _tls = tokio_rustls::TlsConnector::from(config).connect(name, stream).await.unwrap();
-    super::tests::issuer_of(&shown.leaf())
+#[test]
+fn the_live_reader_passes_only_on_growth_after_a_rewrite() {
+    const METER: &str = "ct_violating";
+    const SHORT: Duration = Duration::from_millis(300);
+    const LONG: Duration = Duration::from_secs(60);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let write = |n: u64| {
+        let _ = std::fs::write(&path, serde_json::json!({ "https": { (METER): n } }).to_string());
+    };
+    write(3);
+    let stepped = AtomicBool::new(false);
+    let unwritten = count_around(&path, METER, SHORT, || stepped.store(true, Ordering::Relaxed));
+    assert!(unwritten.is_err(), "nothing rewrote it");
+    assert!(!stepped.load(Ordering::Relaxed), "no step without a fresh count");
+
+    let (value, stop) = (AtomicU64::new(3), AtomicBool::new(false));
+    let (flat, grew) = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                write(value.load(Ordering::Relaxed));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let flat = count_around(&path, METER, SHORT, || {});
+        let grew = count_around(&path, METER, LONG, || value.store(4, Ordering::Relaxed));
+        stop.store(true, Ordering::Relaxed);
+        (flat, grew)
+    });
+    assert!(flat.is_err(), "a count that did not grow fails the check");
+    assert_eq!(grew, Ok((3, 4)));
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "live: docs/live/engine-slice-11.md U1"]
-async fn live_ct_violating_endpoint_passes_through() {
-    let issuer = live_issuer(&live_host()).await;
-    assert!(!issuer.contains("Sieve"), "{issuer}");
-    println!("issuer {issuer}, https {}", live_status()["https"]);
+fn live_ct_violating_endpoint_passes_through() {
+    live_count_grows("ct_violating");
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "live: docs/live/engine-slice-11.md U2"]
-async fn live_crlite_revoked_passes_through() {
-    let before = live_status()["https"]["crlite_revoked"].as_u64().unwrap();
-    let issuer = live_issuer(&live_host()).await;
-    assert!(!issuer.contains("Sieve"), "{issuer}");
-    tokio::time::sleep(Duration::from_secs(6)).await;
-    assert!(live_status()["https"]["crlite_revoked"].as_u64().unwrap() > before);
+fn live_crlite_revoked_passes_through() {
+    live_count_grows("crlite_revoked");
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "live: docs/live/engine-slice-11.md U3"]
-async fn live_upstream_ech_used() {
-    let before = live_status()["https"]["ech_accepted"].as_u64().unwrap();
-    let issuer = live_issuer(&live_host()).await;
-    assert!(issuer.contains("Sieve"), "{issuer}");
-    tokio::time::sleep(Duration::from_secs(6)).await;
-    assert!(live_status()["https"]["ech_accepted"].as_u64().unwrap() > before);
+fn live_upstream_ech_used() {
+    live_count_grows("ech_accepted");
 }

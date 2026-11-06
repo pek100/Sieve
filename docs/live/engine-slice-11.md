@@ -23,7 +23,7 @@ No host is ever in it (plan 7.1), so to read one site, read the numbers, load th
 
 ## The ignored tests
 
-Each reads its host from the environment. Run from `engine/`, with the engine running and interception on:
+Each is a reader of the counts around a browser step you perform. The engine decrypts browsers only (scope `Browsers`), so a test binary's own connection would pass through before any of these checks ran; the tests make no connection at all. Run one at a time from `engine/`, with the engine running and interception on:
 
 ```powershell
 $env:SIEVE_LIVE_STATUS = 'C:\ProgramData\Sieve\engine\status.json'
@@ -33,7 +33,9 @@ cargo test -p sieve-engine --lib live_crlite_revoked_passes_through -- --ignored
 cargo test -p sieve-engine --lib live_upstream_ech_used -- --ignored --nocapture
 ```
 
-The test process has to count as an app the engine may decrypt for the last one: with scope `Browsers` a test binary is not decrypted, so prefer the browser steps of the table for U3 and treat the test as a reader of the counts.
+Each test waits for `status.json` to be rewritten, so its first count is current, and prints when to act. Then load the host in a browser, and nothing else. It polls for up to 2 minutes, four rewrites, and fails unless `ct_violating`, `crlite_revoked` or `ech_accepted` respectively grew. The issuer the browser shows is yours to read, as the table says.
+
+Load a host the engine has not judged since interception went on. A rejecting verdict is cached in the engine's memory and the next flow passes through with no check, so a second load does not grow `ct_violating` or `crlite_revoked`. Restarting the engine clears it.
 
 ## Checks
 

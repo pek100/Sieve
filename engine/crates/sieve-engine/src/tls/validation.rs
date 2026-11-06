@@ -11,7 +11,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use sieve_filter::exclusions::UpstreamVerdict;
@@ -62,12 +62,15 @@ pub struct Checked {
 #[derive(Default)]
 pub struct ValidationSlot {
     data: RwLock<Arc<ValidationData>>,
+    /// One reload at a time: `bring_up` starts two (`build_interception` and the
+    /// first wake of `refresh_exclusions`), and each reads what the last one kept.
+    reloading: Mutex<()>,
     meters: Arc<Meters>,
 }
 
 impl ValidationSlot {
     pub fn new(meters: Arc<Meters>) -> Self {
-        Self { data: RwLock::default(), meters }
+        Self { data: RwLock::default(), reloading: Mutex::default(), meters }
     }
 
     fn snapshot(&self) -> Arc<ValidationData> {
@@ -101,8 +104,10 @@ impl ValidationSlot {
     }
 
     /// Reads a file only when its time changed. A refused file's time is kept,
-    /// so it is refused and counted once.
+    /// so it is refused and counted once. Readers never wait on this: `check` takes
+    /// a snapshot, and the swap at the end is the only write.
     fn reload_now(&self, dir: &Path) {
+        let _one_at_a_time = self.reloading.lock().unwrap_or_else(|p| p.into_inner());
         let before = self.snapshot();
         let list = self.refreshed(data_path(dir, &Kind::List(KIND_LOG_LIST.into())), &before.list, |bytes| LogList::from_envelope(bytes, LOG_LIST_KEY));
         let crlite = self.refreshed(data_path(dir, &Kind::List(KIND_CRLITE.into())), &before.crlite, Crlite::from_bundle);
@@ -324,6 +329,45 @@ pub(crate) mod tests {
         for count in ["ct_compliant", "ct_violating", "ct_skipped_no_list", "ct_skipped_stale", "crlite_revoked", "validation_refused", "ech_offered", "ech_accepted", "ech_failed"] {
             assert_eq!(status[count], 0, "{count}");
         }
+    }
+
+    #[test]
+    fn concurrent_reloads_refuse_a_file_version_once() {
+        const RELOADS: usize = 8;
+        const VERSIONS: u64 = 20;
+        let dir = tempfile::tempdir().unwrap();
+        let mut tampered = envelope();
+        *tampered.last_mut().unwrap() ^= 1;
+        let path = put(dir.path(), KIND_LOG_LIST, &tampered);
+        let (slot, start) = (slot(), SystemTime::now());
+        for version in 1..=VERSIONS {
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(start + std::time::Duration::from_secs(version)).unwrap();
+            let gate = std::sync::Barrier::new(RELOADS);
+            std::thread::scope(|scope| {
+                for _ in 0..RELOADS {
+                    scope.spawn(|| {
+                        gate.wait();
+                        slot.reload_now(dir.path());
+                    });
+                }
+            });
+            assert_eq!(slot.meters.https.validation_refused.load(Ordering::Relaxed), version);
+        }
+    }
+
+    #[test]
+    fn a_leaf_x509_parser_refuses_is_no_issuer_and_no_verdict() {
+        let slot = slot();
+        slot.install(Some(LogList::from_envelope(&envelope(), LOG_LIST_KEY).unwrap()), None);
+        let refused = Chain { end_entity: CertificateDer::from(vec![0x30, 0x00]), intermediates: Vec::new(), ocsp: Vec::new() };
+        let asked = std::cell::Cell::new(false);
+        let checked = slot.check(&refused, NOW, || {
+            asked.set(true);
+            Some(issuer())
+        });
+        assert_eq!(checked, Checked { verdict: None, ct: CtAnswer::Skipped(CtSkip::NoIssuer) });
+        assert!(!asked.get(), "no path is built for it");
+        assert!(crate::tls::upstream::leaf_facts(&refused.end_entity).is_none(), "and with no facts `intercept` passes it through");
     }
 
     #[test]

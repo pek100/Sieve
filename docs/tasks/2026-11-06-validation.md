@@ -222,8 +222,9 @@ cargo test -p sieve-engine dns::
 cd ..
 pnpm typecheck; pnpm lint; pnpm test
 pnpm rust:test; pnpm rust:lint
-node scripts/check-relay-experiments.mjs 4328141e068a6e776e699196eb62802f9c8508f2
+git diff --exit-code 400f3ce HEAD -- engine/crates/sieve-engine/src/flow/relay.rs engine/crates/sieve-engine/src/tun/device.rs
 ```
+The last line is the "do not change `relay_tcp`" rule at this stream's scope: nothing in those two files moved since this branch's base. `scripts/check-relay-experiments.mjs` cannot serve here. Against its baseline it fails at its first assertion because `flow/relay.rs` changed in earlier commits, at `wf2-tls` 400f3ce as well, and its "DNS sources unchanged" assertion cannot hold while this task changes `dns/service.rs` on purpose.
 `pnpm rust:*` runs because `sieve-filter` changes and src-tauri compiles against it. The feature-flag clippy is not needed unless `stack/relay.rs` changes; it should not. `pnpm e2e` is not needed: no UI changes. Law 11 stays green with `filtering.https` hidden.
 
 ## UNVERIFIED: needs the user, live, under `docs/live/engine-slice-11.md`
@@ -263,12 +264,14 @@ Commit at each green point on `wf2-validation`, each message ending with the att
 Every D-number holds. What the build settled or added:
 
 - Step 1: `UnparsedPublicKey` takes SPKI DER for both `RSA_PKCS1_2048_8192_SHA256` and `ECDSA_P256_SHA256_ASN1`, so keys are passed as the list holds them. F1, F7 and F12 held when rerun as tests.
-- `CtSkip` has a third value, `NoIssuer`, for D5's "cannot happen by construction" case, which had no honest word among the two. It has no meter.
+- `CtSkip` has a third value, `NoIssuer`, for a chain the checks cannot name an issuer for, which had no honest word among the two. It has no meter. D5's "cannot happen by construction" is false: x509-parser can refuse a leaf webpki accepted, and that also answers `NoIssuer` (`a_leaf_x509_parser_refuses_is_no_issuer_and_no_verdict`). It is safe, because with no leaf facts `intercept` passes the flow through.
 - With no usable data the path is not built at all, so no data costs what slice 6 costs (`missing_files_mean_no_data_and_no_error`).
 - A missing file means no data, also after a good one was loaded, so deleting a file takes a bad artefact back. Only a refused file keeps what was loaded. An empty bundle is zero filters.
 - `issuer_hash_of_an_intermediate_matches_the_recorded_issuer`: the recorded issuer has no recorded root, so no path through it as an intermediate can be built. The test shows the leaf's direct issuer on a built path, and webpki's rewrap of the recorded issuer against x509-parser's bytes. Its SCTs verifying under that hash is the `ct` test.
 - Meters live behind `ValidationSlot`, which holds the engine's `Arc<Meters>`; `Engine.validation` outlives the switch, so data loaded once stays across an off and on.
 - `bench_validation_local_checks`, in memory, recorded leaf, one builder-made filter, the second path build included: 1.14 ms per connection in a release build, 15.3 ms in a debug one. D1 assumed microseconds. The checks still run inline on a worker, and this is more than half of plan section 6's 2 ms for a new connection, so U5 decides whether they move off the runtime.
+- A server chooses its staple, and D3 put no bound on it. `MAX_SCTS_CHECKED` (6, twice `SCTS_LONG`) now bounds the signatures per set; SCTs of unknown logs cost none and do not use it up. One per log would not be enough, with 89 logs in the recorded list. The bench in release, a 64822-byte staple of 539 SCTs naming a listed log, with signatures that fail: 34.1 ms per connection before, 2.03 ms after, against 1.19 ms with no staple.
+- The live tests make no connection. Scope `Browsers` means a test binary passes through before validation, so each reads `status.json`'s counts around a browser step, polling past the 30 s rewrite (`the_live_reader_passes_only_on_growth_after_a_rewrite`).
 - Step 7: `wf2-dns-extras` held no SvcParams reader on 2026-11-06 (commit 3cf9784 and its worktree), so `Message.https` and `https_rdata` land here. Whichever merges second makes one reader of the two.
 
 ## Cross-stream note

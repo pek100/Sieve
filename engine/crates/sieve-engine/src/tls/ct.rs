@@ -38,6 +38,13 @@ pub const SCTS_LONG: usize = 3;
 pub const SCTS_STAPLED: usize = 2;
 /// Distinct log operators every set needs.
 pub const MIN_OPERATORS: usize = 2;
+/// Signatures checked per set, listed logs only: twice the most any set needs.
+/// A server chooses its staple, up to what a handshake message holds, and this
+/// runs inline on a worker that also carries the relay, so a flood must not buy
+/// signature checks. One per log would not bound it: the recorded list has 89
+/// logs. An SCT past the bound does not count, so whoever floods fails CT and
+/// passes through.
+pub const MAX_SCTS_CHECKED: usize = 2 * SCTS_LONG;
 
 const SIG_LEN_BYTES: usize = 4;
 const LOG_ID_BYTES: usize = 32;
@@ -56,6 +63,9 @@ const DER_OCTET_STRING: u8 = 0x04;
 const DER_TBS_EXTENSIONS: u8 = 0xa3;
 const DER_RESPONSE_BYTES: u8 = 0xa0;
 const DER_SINGLE_EXTENSIONS: u8 = 0xa1;
+/// RFC 6960 SingleResponse: `certID` and `certStatus` come first, and `revoked [1]`
+/// has the tag of `singleExtensions`, so the search starts after them.
+const SINGLE_FIELDS_BEFORE_OPTIONALS: usize = 2;
 /// 1.3.6.1.4.1.11129.2.4.2, the embedded list, as its whole DER element.
 const OID_EMBEDDED_SCTS: [u8; 12] = [0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xd6, 0x79, 0x02, 0x04, 0x02];
 /// 1.3.6.1.4.1.11129.2.4.5, the list in an OCSP single response.
@@ -237,7 +247,7 @@ fn stapled_lists(ocsp: &[u8]) -> Option<Vec<&[u8]>> {
     let responses = children(data.body)?.into_iter().find(|t| t.tag == DER_SEQUENCE)?;
     let mut lists = Vec::new();
     for single in children(responses.body)? {
-        let Some(extensions) = children(single.body)?.into_iter().find(|t| t.tag == DER_SINGLE_EXTENSIONS) else { continue };
+        let Some(extensions) = children(single.body)?.into_iter().skip(SINGLE_FIELDS_BEFORE_OPTIONALS).find(|t| t.tag == DER_SINGLE_EXTENSIONS) else { continue };
         for extension in children(expect(extensions.body, DER_SEQUENCE)?.body)? {
             let parts = children(extension.body)?;
             if parts.first().is_some_and(|oid| oid.whole == OID_STAPLED_SCTS)
@@ -383,30 +393,40 @@ fn algorithm_of(sct: &SignedCertificateTimestamp<'_>) -> Option<&'static dyn Ver
     }
 }
 
-/// One SCT, if it counts: an unknown log, a wrong version or a bad signature
-/// means it does not, and nothing else follows from that.
-fn verify_sct(sct: &SignedCertificateTimestamp<'_>, entry: SignedEntry<'_>, delivery: Delivery, list: &LogList) -> Option<VerifiedSct> {
+/// The key and algorithm to check an SCT with: none for an unknown log, a wrong
+/// version or an algorithm this build does not take, all without a signature check.
+fn signable<'l>(sct: &SignedCertificateTimestamp<'_>, list: &'l LogList) -> Option<(&'l Log, &'static dyn VerificationAlgorithm)> {
     if sct.version.0 != SCT_VERSION_V1 {
         return None;
     }
-    let log = list.logs.get(sct.id.key_id)?;
+    Some((list.logs.get(sct.id.key_id)?, algorithm_of(sct)?))
+}
+
+/// One SCT, if it counts: one that is not [`signable`] or has a bad signature does
+/// not, and nothing else follows from that.
+fn verify_sct(sct: &SignedCertificateTimestamp<'_>, entry: SignedEntry<'_>, delivery: Delivery, list: &LogList) -> Option<VerifiedSct> {
+    let (log, algorithm) = signable(sct, list)?;
     let message = sct_message(sct.timestamp, entry, sct.extensions.0)?;
-    UnparsedPublicKey::new(algorithm_of(sct)?, &log.key).verify(&message, sct.signature.data).ok()?;
+    UnparsedPublicKey::new(algorithm, &log.key).verify(&message, sct.signature.data).ok()?;
     Some(VerifiedSct { log: *sct.id.key_id, timestamp_ms: sct.timestamp, delivery })
 }
 
-/// The SCTs of this leaf and its staple that count.
+/// The SCTs of one set that count, at most [`MAX_SCTS_CHECKED`] signatures' worth.
+fn verified_set<'a, 'b: 'a>(scts: impl Iterator<Item = &'a SignedCertificateTimestamp<'b>>, entry: SignedEntry<'_>, delivery: Delivery, list: &LogList) -> Vec<VerifiedSct> {
+    scts.filter(|sct| signable(sct, list).is_some()).take(MAX_SCTS_CHECKED).filter_map(|sct| verify_sct(sct, entry, delivery, list)).collect()
+}
+
+/// The SCTs of this leaf and its staple that count. Each set has its own bound, so
+/// a flooded staple cannot crowd out what the certificate carries.
 pub fn verified_scts(cert: &X509Certificate<'_>, leaf_der: &[u8], issuer: &SpkiHash, ocsp: &[u8], list: &LogList) -> Vec<VerifiedSct> {
     let mut out = Vec::new();
     let embedded = scts_of(cert);
     if !embedded.is_empty()
         && let Some(tbs) = precert_tbs(leaf_der)
     {
-        let entry = SignedEntry::Precert { issuer, tbs: &tbs };
-        out.extend(embedded.iter().filter_map(|sct| verify_sct(sct, entry, Delivery::Embedded, list)));
+        out = verified_set(embedded.iter().copied(), SignedEntry::Precert { issuer, tbs: &tbs }, Delivery::Embedded, list);
     }
-    let entry = SignedEntry::X509 { leaf: leaf_der };
-    out.extend(stapled_scts(ocsp).iter().filter_map(|sct| verify_sct(sct, entry, Delivery::Stapled, list)));
+    out.extend(verified_set(stapled_scts(ocsp).iter(), SignedEntry::X509 { leaf: leaf_der }, Delivery::Stapled, list));
     out
 }
 
@@ -417,8 +437,9 @@ pub fn verified_scts(cert: &X509Certificate<'_>, leaf_der: &[u8], issuer: &SpkiH
 pub enum CtSkip {
     NoList,
     StaleList,
-    /// No path to name an issuer. Eligibility passed, so it cannot happen by
-    /// construction (task D5): the trust call still runs.
+    /// No issuer to check against: x509-parser refused a leaf webpki accepted, so
+    /// `intercept` has no facts and passes it through, or no path was built here.
+    /// No verdict follows from this: the trust call still runs.
     NoIssuer,
 }
 
@@ -527,16 +548,33 @@ pub(crate) mod testing {
         der_wrap(DER_OCTET_STRING, &list)
     }
 
-    /// An OCSPResponse with one single response carrying this extension value.
+    const GENERALIZED: [u8; 17] = [0x18, 0x0f, b'2', b'0', b'2', b'6', b'1', b'1', b'0', b'5', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
+    /// RFC 6960 `good [0] IMPLICIT NULL`.
+    pub(crate) const STATUS_GOOD: [u8; 2] = [0x80, 0x00];
+    /// RFC 6960 `unknown [2] IMPLICIT UnknownInfo`.
+    pub(crate) const STATUS_UNKNOWN: [u8; 2] = [0x82, 0x00];
+
+    /// RFC 6960 `revoked [1] IMPLICIT RevokedInfo`, with a reason: constructed, so
+    /// it carries the tag of `singleExtensions`.
+    pub(crate) fn status_revoked() -> Vec<u8> {
+        const KEY_COMPROMISE: [u8; 3] = [0x0a, 0x01, 0x01];
+        der_wrap(DER_SINGLE_EXTENSIONS, &[&GENERALIZED[..], &der_wrap(0xa0, &KEY_COMPROMISE)].concat())
+    }
+
+    /// An OCSPResponse with one good single response carrying this extension value.
     pub(crate) fn ocsp_with(value: &[u8]) -> Vec<u8> {
+        ocsp_with_status(&STATUS_GOOD, false, value)
+    }
+
+    /// The same under this `certStatus`, with or without a `nextUpdate`.
+    pub(crate) fn ocsp_with_status(status: &[u8], next_update: bool, value: &[u8]) -> Vec<u8> {
         const ENUMERATED_SUCCESS: [u8; 3] = [0x0a, 0x01, 0x00];
         const OID_BASIC: [u8; 11] = [0x06, 0x09, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
-        const GENERALIZED: [u8; 17] = [0x18, 0x0f, b'2', b'0', b'2', b'6', b'1', b'1', b'0', b'5', b'0', b'0', b'0', b'0', b'0', b'0', b'Z'];
         let extension = der_wrap(DER_SEQUENCE, &[&OID_STAPLED_SCTS[..], &der_wrap(DER_OCTET_STRING, value)].concat());
         let extensions = der_wrap(DER_SINGLE_EXTENSIONS, &der_wrap(DER_SEQUENCE, &extension));
         let cert_id = der_wrap(DER_SEQUENCE, &[]);
-        let status = [0x80, 0x00];
-        let single = der_wrap(DER_SEQUENCE, &[&cert_id[..], &status, &GENERALIZED, &extensions].concat());
+        let next = if next_update { der_wrap(0xa0, &GENERALIZED) } else { Vec::new() };
+        let single = der_wrap(DER_SEQUENCE, &[&cert_id[..], status, &GENERALIZED, &next, &extensions].concat());
         let responses = der_wrap(DER_SEQUENCE, &single);
         let responder = der_wrap(0xa2, &der_wrap(DER_OCTET_STRING, &[7u8; 20]));
         let data = der_wrap(DER_SEQUENCE, &[&responder[..], &GENERALIZED, &responses].concat());
@@ -816,5 +854,56 @@ mod tests {
         assert!(verify_sct(&read[0], entry, Delivery::Stapled, &list).is_some(), "a stapled SCT signs the full certificate");
         assert!(verify_sct(&read[0], SignedEntry::X509 { leaf: &[6u8; 40] }, Delivery::Stapled, &list).is_none(), "the control");
         assert!(stapled_scts(&[]).is_empty());
+    }
+
+    #[test]
+    fn stapled_scts_are_read_under_every_cert_status() {
+        let log = MemoryLog::new();
+        let leaf = [5u8; 40];
+        let entry = SignedEntry::X509 { leaf: &leaf };
+        let value = sct_list_value(&[log.sct(T0, entry), log.sct(T0 + 1, entry)]);
+        let revoked = status_revoked();
+        let rows: [(&str, &[u8], bool); 6] = [
+            ("good", &STATUS_GOOD, false),
+            ("good, with nextUpdate", &STATUS_GOOD, true),
+            ("revoked, whose tag is that of singleExtensions", &revoked, false),
+            ("revoked, with nextUpdate", &revoked, true),
+            ("unknown", &STATUS_UNKNOWN, false),
+            ("unknown, with nextUpdate", &STATUS_UNKNOWN, true),
+        ];
+        for (name, status, next_update) in rows {
+            assert_eq!(stapled_scts(&ocsp_with_status(status, next_update, &value)).len(), 2, "{name}");
+        }
+    }
+
+    /// What fills the 64 KiB a handshake message may hold.
+    const FLOOD: usize = 539;
+
+    #[test]
+    fn a_flooded_staple_buys_a_bounded_number_of_signature_checks() {
+        let log = MemoryLog::new();
+        let list = LogList::parse(list_json("2023-11-20T00:00:00Z", &[vec![log.json(USABLE)]]).as_bytes()).unwrap();
+        let cert = leaf();
+        let one = log.sct(T0, SignedEntry::X509 { leaf: LEAF });
+        // Every one of them verifies, so what counts is what was checked.
+        let flood = ocsp_with(&sct_list_value(&vec![one.clone(); FLOOD]));
+        assert_eq!(stapled_scts(&flood).len(), FLOOD, "the flood was read");
+        assert_eq!(verified_scts(&cert, LEAF, &issuer_hash(), &flood, &list).len(), MAX_SCTS_CHECKED);
+        // SCTs that cost no signature do not use the bound up.
+        let stranger = MemoryLog::new().sct(T0, SignedEntry::X509 { leaf: LEAF });
+        let mut scts = vec![stranger; FLOOD];
+        scts.push(one);
+        assert_eq!(verified_scts(&cert, LEAF, &issuer_hash(), &ocsp_with(&sct_list_value(&scts)), &list).len(), 1);
+    }
+
+    #[test]
+    fn a_flooded_staple_does_not_crowd_out_the_embedded_set() {
+        let (list, cert) = (recorded(), leaf());
+        // A listed log's id on a signature that fails only at the last step.
+        let forger = MemoryLog { key: rcgen::KeyPair::generate().unwrap(), id: *scts_of(&cert)[0].id.key_id };
+        let flood = ocsp_with(&sct_list_value(&vec![forger.sct(LIST_AT_MS, SignedEntry::X509 { leaf: LEAF }); FLOOD]));
+        let verified = verified_scts(&cert, LEAF, &issuer_hash(), &flood, &list);
+        assert_eq!(verified.len(), 2, "the embedded two, and none of the flood");
+        assert_eq!(policy(&verified, lifetime_ms(&cert), &list, NOW), CtAnswer::Compliant);
     }
 }
