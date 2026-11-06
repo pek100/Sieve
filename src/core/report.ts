@@ -34,7 +34,7 @@ const IP_HOST = /:|(?:^|\.)(?:\d+|0x[0-9a-f]+)\.?$/i;
  * The URL a report starts from: the row's, unless its host is an address. The
  * report holds no IP, so that field starts empty and the user may type one.
  */
-export function reportUrl(row: Pick<LogRow, "url" | "kind" | "host">): string | null {
+export function reportUrl(row: Pick<LogRow, "url" | "kind" | "host" | "remote">): string | null {
   const url = rowUrl(row);
   if (url === null) return null;
   const host = urlHost(url);

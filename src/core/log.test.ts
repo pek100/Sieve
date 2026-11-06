@@ -84,18 +84,35 @@ describe("filters and search", () => {
 
 describe("what a row stands for", () => {
   it("its URL, else the host's root by protocol, else none", () => {
-    expect(rowUrl({ url: "https://a.example/x", kind: "tls", host: "a.example" })).toBe("https://a.example/x");
-    expect(rowUrl({ url: null, kind: "tls", host: "a.example" })).toBe("https://a.example/");
-    expect(rowUrl({ url: null, kind: "quic", host: "a.example" })).toBe("https://a.example/");
-    expect(rowUrl({ url: null, kind: "http", host: "a.example" })).toBe("http://a.example/");
-    expect(rowUrl({ url: null, kind: "dns", host: "a.example" })).toBeNull();
-    expect(rowUrl({ url: null, kind: "other", host: "198.51.100.25" })).toBeNull();
+    const remote = "";
+    expect(rowUrl({ url: "https://a.example/x", kind: "tls", host: "a.example", remote })).toBe("https://a.example/x");
+    expect(rowUrl({ url: null, kind: "tls", host: "a.example", remote })).toBe("https://a.example/");
+    expect(rowUrl({ url: null, kind: "quic", host: "a.example", remote })).toBe("https://a.example/");
+    expect(rowUrl({ url: null, kind: "http", host: "a.example", remote })).toBe("http://a.example/");
+    expect(rowUrl({ url: null, kind: "dns", host: "a.example", remote })).toBeNull();
+    expect(rowUrl({ url: null, kind: "other", host: "198.51.100.25", remote })).toBeNull();
+  });
+
+  it("keeps the connection's port unless it is the scheme's own", () => {
+    expect(rowUrl({ url: null, kind: "tls", host: "a.example", remote: "192.0.2.1:8443" })).toBe("https://a.example:8443/");
+    expect(rowUrl({ url: null, kind: "quic", host: "a.example", remote: "[2001:db8::1]:8443" })).toBe("https://a.example:8443/");
+    expect(rowUrl({ url: null, kind: "http", host: "a.example", remote: "192.0.2.1:8080" })).toBe("http://a.example:8080/");
+    expect(rowUrl({ url: null, kind: "tls", host: "2001:db8::1", remote: "[2001:db8::1]:8443" })).toBe("https://[2001:db8::1]:8443/");
+    expect(rowUrl({ url: null, kind: "tls", host: "a.example", remote: "192.0.2.1:443" })).toBe("https://a.example/");
+    expect(rowUrl({ url: null, kind: "http", host: "a.example", remote: "192.0.2.1:80" })).toBe("http://a.example/");
+    // Port 443 is not http's default, and port 80 is not https's.
+    expect(rowUrl({ url: null, kind: "http", host: "a.example", remote: "192.0.2.1:443" })).toBe("http://a.example:443/");
+    expect(rowUrl({ url: null, kind: "tls", host: "a.example", remote: "192.0.2.1:80" })).toBe("https://a.example:80/");
+    // An address with no port, its last group not mistaken for one.
+    expect(rowUrl({ url: null, kind: "tls", host: "a.example", remote: "2001:db8::1" })).toBe("https://a.example/");
+    expect(rowUrl({ url: "https://a.example:9/x", kind: "tls", host: "a.example", remote: "192.0.2.1:8443" }), "a row's own URL stands").toBe("https://a.example:9/x");
   });
 
   it("an IPv6 host takes brackets in its URL; a name and an IPv4 address do not", () => {
-    expect(rowUrl({ url: null, kind: "tls", host: "2001:db8::1" })).toBe("https://[2001:db8::1]/");
-    expect(rowUrl({ url: null, kind: "http", host: "2001:db8::1" })).toBe("http://[2001:db8::1]/");
-    expect(rowUrl({ url: null, kind: "quic", host: "198.51.100.25" })).toBe("https://198.51.100.25/");
+    const remote = "";
+    expect(rowUrl({ url: null, kind: "tls", host: "2001:db8::1", remote })).toBe("https://[2001:db8::1]/");
+    expect(rowUrl({ url: null, kind: "http", host: "2001:db8::1", remote })).toBe("http://[2001:db8::1]/");
+    expect(rowUrl({ url: null, kind: "quic", host: "198.51.100.25", remote })).toBe("https://198.51.100.25/");
     expect(urlFormHost("2001:db8::1")).toBe("[2001:db8::1]");
     expect(urlFormHost("a.example")).toBe("a.example");
   });

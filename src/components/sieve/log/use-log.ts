@@ -111,12 +111,18 @@ export function useRowActions() {
     try {
       if (!(await write(key, after))) return;
     } catch (err) {
-      write(key, removeLine(settings.get(key), line)).catch(() => undefined);
-      notices.push({ kind: "error", text: `Could not save ${line}: ${reason(err)}. Nothing was added.` });
+      // A save queued after this one wrote the line with it, so "nothing was added" holds only once the rollback landed.
+      const tookBack = await write(key, removeLine(settings.get(key), line)).catch(() => false);
+      notices.push({
+        kind: "error",
+        text: tookBack
+          ? `Could not save ${line}: ${reason(err)}. Nothing was added.`
+          : `Could not save ${line}: ${reason(err)}, and could not take it back. It may return when Sieve restarts.`,
+      });
       return;
     }
     notices.push({ kind: "success", text: added, action: { label: "Undo", run: () => void undo() } });
-  }, [preview, settings, notices]);
+  }, [preview, settings, notices, write]);
 
   return { run, preview, confirm, cancelPreview: () => setPreview(null), report, setReport, closeReport: () => setReport(null) };
 }

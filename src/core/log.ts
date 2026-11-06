@@ -122,16 +122,28 @@ export const urlFormHost = (host: string) => (host.includes(":") ? `[${host}]` :
 /** A row's host is an address, not a name: what a flow with no name shows. */
 export const isAddressHost = (host: string) => host.includes(":") || /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
 
+const HTTPS = { scheme: "https", port: "443" };
+/** The URL each web flow kind reads as, and the port such a URL leaves out. Kind comes from a flow's first bytes, not its port. */
+const WEB_KINDS: ReadonlyMap<string, { scheme: string; port: string }> = new Map([
+  ["tls", HTTPS],
+  ["quic", HTTPS],
+  ["http", { scheme: "http", port: "80" }],
+]);
+/** The port of `LogRow.remote`, a socket address: `192.0.2.1:8443` or `[2001:db8::1]:8443`. */
+const REMOTE_PORT = /^(?:\[[^\]]*\]|[^:]*):(\d+)$/;
+
 /**
  * The URL a row stands for: its own, else the host's root by what the flow
- * spoke. Null when the flow is not a web request (DNS, or a protocol not
- * decoded): there is no URL to copy.
+ * spoke, with the connection's port when it is not the scheme's. Null when the
+ * flow is not a web request (DNS, or a protocol not decoded): there is no URL
+ * to copy.
  */
-export function rowUrl(row: Pick<LogRow, "url" | "kind" | "host">): string | null {
+export function rowUrl(row: Pick<LogRow, "url" | "kind" | "host" | "remote">): string | null {
   if (row.url) return row.url;
-  if (!row.host) return null;
-  if (row.kind === "tls" || row.kind === "quic") return `https://${urlFormHost(row.host)}/`;
-  return row.kind === "http" ? `http://${urlFormHost(row.host)}/` : null;
+  const web = WEB_KINDS.get(row.kind);
+  if (!row.host || !web) return null;
+  const port = REMOTE_PORT.exec(row.remote)?.[1];
+  return `${web.scheme}://${urlFormHost(row.host)}${port && port !== web.port ? `:${port}` : ""}/`;
 }
 
 /** The path and query of a request-level row, for its column; null on a host-level row. */

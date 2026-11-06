@@ -136,6 +136,52 @@ describe("the log controller", () => {
     t.undo();
   });
 
+  describe("a read held open", () => {
+    /** The controller with its next read waiting for `release`. */
+    function held() {
+      const fc = fakeClock();
+      const store = createStore();
+      store.setEngine(facts("hosts"));
+      const asked: number[] = [];
+      const waiting: ((t: LogTail) => void)[] = [];
+      const engine = {
+        logTail: (since: number) => {
+          asked.push(since);
+          return new Promise<LogTail>((resolve) => waiting.push(resolve));
+        },
+      };
+      const ctl = createLogController({ engine, store, clock: fc.clock });
+      const row = (seq: number): LogTail => ({ v: LOG_TAIL_VERSION, next: seq, dropped: 0, skipped: 0, rows: [{ seq, row: ROW }] });
+      return { fc, store, ctl, undo: ctl.bind(), asked, row, release: async (t: LogTail) => (waiting.shift()!(t), settle()), log: () => store.getState().log };
+    }
+
+    it("across a pause lands nothing; resume reads those rows again", async () => {
+      const t = held();
+      await t.fc.advance(LOG_POLL_MS);
+      expect(t.asked).toEqual([0]);
+      t.ctl.pause();
+      await t.release(t.row(1));
+      expect(t.log()).toMatchObject({ paused: true, rows: [], cursor: 0 });
+      t.ctl.resume();
+      await t.fc.advance(LOG_POLL_MS);
+      expect(t.asked, "the same rows, from the same cursor").toEqual([0, 0]);
+      await t.release(t.row(1));
+      expect(t.log().rows.map((e) => e.seq)).toEqual([1]);
+      t.undo();
+    });
+
+    it("across a clear lands nothing in the emptied list, and reading goes on by itself", async () => {
+      const t = held();
+      await t.fc.advance(LOG_POLL_MS);
+      t.ctl.clear();
+      await t.release(t.row(1));
+      expect(t.log()).toMatchObject({ rows: [], cursor: 0 });
+      await t.fc.advance(LOG_POLL_MS);
+      expect(t.asked).toEqual([0, 0]);
+      t.undo();
+    });
+  });
+
   it("a malformed answer cannot rewind the cursor, so the ring is not read again", async () => {
     const t = setup();
     t.queue.push(t.tail(1, 3), parseLogTail({ v: LOG_TAIL_VERSION, rows: [] }), parseLogTail({ v: LOG_TAIL_VERSION, next: 1, rows: [] }));

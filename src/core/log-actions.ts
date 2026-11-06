@@ -26,16 +26,21 @@ export const LOG_ACTION_TEXT: Record<LogAction, string> = {
 const BLOCK_WOULD_APPLY = "no_rule";
 
 /** Which actions apply to a row, in menu order. */
-export function rowActions(row: Pick<LogRow, "url" | "kind" | "host" | "outcome" | "rule">): LogAction[] {
+export function rowActions(row: Pick<LogRow, "url" | "kind" | "host" | "remote" | "outcome" | "rule">): LogAction[] {
   const outcome = row.outcome;
   const kind = outcome?.kind;
-  // The engine matches rules against names, never a flow's address, so a rule
-  // written for an address row would stay in the list and change nothing.
-  const named = !!row.host && !isAddressHost(row.host);
+  const host = row.host ?? "";
+  // The engine matches rules against a flow's decoded name, and an HTTP Host that
+  // is an address is one (flow/http.rs), so a rule can name an address. Block needs
+  // no more: only a decoded name reports `no_rule`. A row known by its address may
+  // instead be closed for its names (every name it resolved to is blocked), and
+  // an exception for the address would change nothing there, so Unblock asks that
+  // the deciding rule names the address.
+  const unblockable = !isAddressHost(host) || row.rule?.includes(urlFormHost(host)) === true;
   const applies: Record<LogAction, boolean> = {
     copy_url: rowUrl(row) !== null,
-    unblock: named && kind === "blocked" && row.rule !== null,
-    block: named && kind === "passed" && outcome?.reason === BLOCK_WOULD_APPLY,
+    unblock: host !== "" && unblockable && kind === "blocked" && row.rule !== null,
+    block: host !== "" && kind === "passed" && outcome?.reason === BLOCK_WOULD_APPLY,
     do_not_decrypt: kind !== "not_decrypted",
     report: true,
   };

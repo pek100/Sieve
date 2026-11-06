@@ -36,6 +36,8 @@ export function createLogController({ engine, store, clock }: LogControllerDeps)
   let timer: unknown = null;
   let reading = false;
   let follow: () => void = () => {};
+  // Moved by pause and clear: a read asked before them lands nothing, and resume reads its rows again.
+  let generation = 0;
 
   const get = () => store.getState().log;
   const set = (patch: Partial<LogSlice>) => store.setLog({ ...get(), ...patch });
@@ -43,6 +45,8 @@ export function createLogController({ engine, store, clock }: LogControllerDeps)
 
   const read = async () => {
     reading = true;
+    const asked = generation;
+    const current = () => !disposed && asked === generation;
     try {
       const tail = await engine.logTail(get().cursor);
       if (disposed) return;
@@ -50,7 +54,7 @@ export function createLogController({ engine, store, clock }: LogControllerDeps)
       // Seqs only rise, so the cursor does too: a rewind would read the whole ring again as duplicates.
       const cursor = Math.max(log.cursor, tail.next);
       const changed = tail.rows.length > 0 || tail.skipped > 0 || tail.dropped > 0 || cursor !== log.cursor || log.error !== null;
-      if (changed) {
+      if (changed && current()) {
         set({
           rows: tail.rows.length > 0 ? appendRows(log.rows, tail.rows) : log.rows,
           cursor,
@@ -60,7 +64,7 @@ export function createLogController({ engine, store, clock }: LogControllerDeps)
         });
       }
     } catch (e) {
-      if (!disposed) set({ error: message(e) });
+      if (current()) set({ error: message(e) });
     } finally {
       reading = false;
     }
@@ -96,12 +100,14 @@ export function createLogController({ engine, store, clock }: LogControllerDeps)
       };
     },
     pause() {
+      generation++;
       if (!get().paused) set({ paused: true });
     },
     resume() {
       if (get().paused) set({ paused: false });
     },
     clear() {
+      generation++;
       const { cursor, paused } = get();
       store.setLog({ ...EMPTY_LOG, cursor, paused });
     },

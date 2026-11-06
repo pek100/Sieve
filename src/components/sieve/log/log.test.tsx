@@ -276,13 +276,17 @@ describe("row actions", () => {
     await vi.waitFor(() => expect(rt.settings.get("filtering.userRules")).toEqual([]));
   });
 
-  /** A backend whose saves fail while `disk.full` is true. */
+  /** A backend whose saves fail while `disk.full` is true, or for the next `disk.failNext` saves. */
   function backendThatFills() {
     const inner = memoryBackend({ schema: 5, values: { "filtering.engine": true } });
-    const disk = { full: false };
+    const disk = { full: false, failNext: 0 };
     const backend: SettingsBackend = {
       ...inner,
       save: async (doc) => {
+        if (disk.failNext > 0) {
+          disk.failNext--;
+          throw new Error("disk full");
+        }
         if (disk.full) throw new Error("disk full");
         await inner.save(doc);
       },
@@ -290,17 +294,28 @@ describe("row actions", () => {
     return { backend, disk, stored: async () => (await inner.load()) as { values: Record<string, unknown> } };
   }
 
+  it("a save that fails and a rollback that fails too never say nothing was added: a later start may read the line", async () => {
+    const { backend, disk } = backendThatFills();
+    const rt = await withRows("hosts", undefined, backend);
+    disk.full = true;
+    await pick("ads.example.com", "Unblock");
+    await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add it" }));
+    await vi.waitFor(() =>
+      expect(rt.notices.list().filter((n) => n.kind === "error").map((n) => n.text)).toEqual(["Could not save @@||ads.example.com^: disk full, and could not take it back. It may return when Sieve restarts."]),
+    );
+    expect(rt.notices.list().some((n) => n.kind === "success" || n.action)).toBe(false);
+  });
+
   it("a save that fails says so, takes the line back and offers no Undo; trying again adds it", async () => {
     const { backend, disk, stored } = backendThatFills();
     const rt = await withRows("hosts", undefined, backend);
-    disk.full = true;
+    disk.failNext = 1;
     await pick("ads.example.com", "Unblock");
     await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add it" }));
     await vi.waitFor(() => expect(rt.notices.list().filter((n) => n.kind === "error").map((n) => n.text)).toEqual(["Could not save @@||ads.example.com^: disk full. Nothing was added."]));
     await vi.waitFor(() => expect(rt.settings.get("filtering.userRules")).toEqual([]));
     expect(rt.notices.list().some((n) => n.kind === "success" || n.action)).toBe(false);
 
-    disk.full = false;
     await pick("ads.example.com", "Unblock");
     await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add it" }));
     await vi.waitFor(() => expect(rt.notices.list().some((n) => n.text === "Added @@||ads.example.com^ to your rules.")).toBe(true));
@@ -372,9 +387,13 @@ describe("row actions", () => {
     expect(pushed.mock.calls.filter(([n]) => n.action)).toHaveLength(1);
   });
 
-  it("an IPv6 row: Copy URL copies a valid URL (it offers no Block: rules match names, log-actions.test.ts)", async () => {
+  it("an IPv6 row: Block previews the bracketed rule, Copy URL copies a valid URL", async () => {
     const rt = await setup("missing");
     act(() => rt.store.setLog({ ...EMPTY_LOG, rows: [ipRow("2001:db8::1", { kind: "passed", reason: "no_rule" })] }));
+    await pick("2001:db8::1", "Block");
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.querySelector("[data-rule-preview]")).toHaveTextContent("||[2001:db8::1]^");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
     await pick("2001:db8::1", "Copy URL");
     await vi.waitFor(() => expect(clipboard).toHaveBeenCalledWith("https://[2001:db8::1]/"));
   });
