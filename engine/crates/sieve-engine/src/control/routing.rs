@@ -16,6 +16,7 @@
 //! adds or removes the routes whose plan changed. Taking down drops the DNS
 //! service, so its connections end with the routes.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -164,7 +165,7 @@ pub async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
             });
         }
         up = match (up, want) {
-            (Some(u), Some(tables)) => Some(follow(&engine, u, tables)),
+            (Some(u), Some(tables)) => Some(follow(&engine, u, tables).await),
             (Some(u), None) => {
                 take_down(&engine, u).await;
                 None
@@ -196,8 +197,8 @@ pub async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
 
 /// Removes routes that are no longer planned and adds new ones; the relay
 /// pins with the new tables.
-fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
-    sync_https(engine, &up.relay.egress);
+async fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
+    sync_https(engine, &up.relay.egress).await;
     let RoutePlan { routes, .. } = plan::plan(&tables);
     let network_moved = {
         let mut held = up.relay.tables.write().unwrap_or_else(|p| p.into_inner());
@@ -209,6 +210,7 @@ fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
         up.relay.dns.reset();
     }
     if routes == up.routes {
+        engine.routes_settled();
         return up;
     }
     let mut kept: Vec<Prefix> = Vec::new();
@@ -220,15 +222,31 @@ fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
         }
     }
     if let Some(j) = journal(engine) {
-        for p in routes.iter().filter(|p| !up.routes.contains(p)) {
-            match apply::add_route(&j, up.luid, *p) {
-                Ok(()) => kept.push(*p),
-                Err(e) => engine.route_failed(e),
-            }
-        }
+        let missing = routes.iter().copied().filter(|p| !up.routes.contains(p));
+        kept.extend(add_missing(engine, missing, |p| apply::add_route(&j, up.luid, p)));
     }
     kept.sort();
     Up { routes: kept, ..up }
+}
+
+/// Adds the routes the plan lacks and returns those that went in. A pass with no
+/// failure ends what an earlier one reported; the wake after a failure tries again.
+pub(super) fn add_missing(engine: &Engine, missing: impl Iterator<Item = Prefix>, mut add: impl FnMut(Prefix) -> Result<(), String>) -> Vec<Prefix> {
+    let mut added = Vec::new();
+    let mut settled = true;
+    for p in missing {
+        match add(p) {
+            Ok(()) => added.push(p),
+            Err(why) => {
+                engine.route_failed(why);
+                settled = false;
+            }
+        }
+    }
+    if settled {
+        engine.routes_settled();
+    }
+    added
 }
 
 /// Gives the adapter its addresses and journals and adds each route. A failed
@@ -284,6 +302,11 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     let https = engine.https.clone();
     let may_intercept = Box::new(move |name: &str| https.get().is_some_and(|i| i.may_intercept_name(name)));
     let dns = engine.start_dns_service(|endpoints| Arc::new(Service::new(endpoints, context, shared_tables.clone(), engine.names.clone(), engine.meters.clone(), usize::from(mtu), may_intercept)))?;
+    // Before the routes, so reading a large file holds up no flow: `sync_https` below
+    // then finds it read.
+    if wanted(&engine.policy()) {
+        load_validation(engine).await;
+    }
     // Before the routes, so a hang starting it cannot hold a route.
     let (etw, witness, nat) = start_attribution(engine);
     let added = match route_adapter(&journal, luid, &plan.routes) {
@@ -295,7 +318,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
         }
     };
 
-    sync_https(engine, &egress);
+    sync_https(engine, &egress).await;
     let parts = RelayParts { tables: shared_tables, egress, dns, book: engine.book.clone(), names: engine.names.clone(), meters: engine.meters.clone(), filter: engine.filter.clone(), witness, nat, https: engine.https.clone(), sink: Arc::new(TunSink::new(&tun.session, engine.meters.clone())) };
     #[cfg(not(feature = "relay-experiments"))]
     let relay = Arc::new(Relay::new(parts));
@@ -347,10 +370,6 @@ fn build_interception(engine: &Engine, egress: &Arc<Egress>) -> Result<Intercept
     let trust = Arc::new(PlatformTrust::new()?);
     let verifier = Arc::new(Verifier::new(crate::tls::public_roots(), trust, TRUST_TIMEOUT, engine.validation.clone())?);
     let lookup = super::lock(&engine.dns_service).clone().ok_or("the DNS service is not running")?;
-    if let Some(dir) = engine.dir.clone() {
-        let validation = engine.validation.clone();
-        tokio::spawn(async move { validation.reload(&dir).await });
-    }
     let ca = engine.ca();
     Ok(Interception {
         connector: egress.clone(),
@@ -370,30 +389,42 @@ fn build_interception(engine: &Engine, egress: &Arc<Egress>) -> Result<Intercept
     })
 }
 
-/// Makes the slot match the policy. Called while routes are up, so a switch
-/// turned on reaches new flows at the next wake.
-fn sync_https(engine: &Engine, egress: &Arc<Egress>) {
-    sync_https_by(engine, || build_interception(engine, egress));
+/// What a slot about to fill will judge by. A file unchanged since the last read
+/// costs one look at its time.
+async fn load_validation(engine: &Engine) {
+    if let Some(dir) = &engine.dir {
+        engine.validation.reload(dir).await;
+    }
 }
 
-/// The build takes a while, so what it made is published only if it is still wanted
-/// by then ([`Engine::publish_https`]).
-pub(super) fn sync_https_by(engine: &Engine, build: impl FnOnce() -> Result<Interception<Egress>, String>) {
+/// Makes the slot match the policy. Called while routes are up, so a switch
+/// turned on reaches new flows at the next wake.
+async fn sync_https(engine: &Engine, egress: &Arc<Egress>) {
+    sync_https_by(engine, load_validation(engine), || build_interception(engine, egress)).await;
+}
+
+/// What the build makes is published only once `load` has finished, or a flow would
+/// decrypt what the data on disk forbids, and a flow's verdict lasts as long as it
+/// does. The build takes a while, so it is published only if it is still wanted by
+/// then ([`Engine::publish_https`]).
+pub(super) async fn sync_https_by(engine: &Engine, load: impl Future<Output = ()>, build: impl FnOnce() -> Result<Interception<Egress>, String>) {
     if !wanted(&engine.policy()) {
         engine.https.set(None);
     } else if engine.https.get().is_none() {
+        load.await;
         engine.publish_https(build());
     }
 }
 
 /// While routes are up: the browsers Windows declares, the fetched exclusion
-/// lists when any is enabled, and what the update cycle left for validation. One
-/// wake an hour, as `Lists::run` (plan 6).
+/// lists when any is enabled, and what the update cycle left for the seeded lists and
+/// for validation. One wake an hour, as `Lists::run` (plan 6).
 async fn refresh_exclusions(slot: Arc<ExclusionSlot>, fetcher: HttpsFetcher, validation: Arc<ValidationSlot>, dir: Option<PathBuf>) {
     let mut every = tokio::time::interval(EXCLUSIONS_EVERY);
     loop {
         every.tick().await;
         slot.set_browsers(BrowserSet::read(&WindowsRegistry));
+        slot.reload_seeds(wall_ms());
         if slot.fetches() {
             slot.refresh(&fetcher, wall_ms()).await;
         }
@@ -450,6 +481,7 @@ async fn take_down(engine: &Engine, up: Up) {
         f.routes_up = false;
         f.up_since = None;
     });
+    engine.routes_settled();
     stop_attribution(engine, up.etw).await;
 }
 

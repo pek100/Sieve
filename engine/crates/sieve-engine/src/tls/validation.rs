@@ -62,8 +62,8 @@ pub struct Checked {
 #[derive(Default)]
 pub struct ValidationSlot {
     data: RwLock<Arc<ValidationData>>,
-    /// One reload at a time: `bring_up` starts two (`build_interception` and the
-    /// first wake of `refresh_exclusions`), and each reads what the last one kept.
+    /// One reload at a time: `control::routing` can run two (`load_validation` and a
+    /// wake of `refresh_exclusions`), and each reads what the last one kept.
     reloading: Mutex<()>,
     meters: Arc<Meters>,
 }

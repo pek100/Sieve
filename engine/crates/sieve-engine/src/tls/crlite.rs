@@ -54,9 +54,13 @@ impl Crlite {
     }
 }
 
-/// The bundle [`Crlite::from_bundle`] reads.
+/// The bundle [`Crlite::from_bundle`] reads, within the size a reader takes.
 pub fn encode_bundle(filters: &[Vec<u8>]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
+    let size: usize = filters.iter().map(|filter| LENGTH_BYTES + filter.len()).sum();
+    if size as u64 > MAX_BUNDLE_BYTES {
+        return Err(format!("{size} bytes: the engine reads a bundle of at most {MAX_BUNDLE_BYTES}"));
+    }
+    let mut out = Vec::with_capacity(size);
     for filter in filters {
         out.extend_from_slice(&u32::try_from(filter.len()).map_err(|_| "a filter too long")?.to_le_bytes());
         out.extend_from_slice(filter);
@@ -143,6 +147,15 @@ mod tests {
         assert!(!crlite.is_revoked(&ISSUER, BAD, &scts(HIGH + 1)), "a timestamp outside coverage");
         assert!(!crlite.is_revoked(&ISSUER, BAD, &[(OTHER_LOG, AT)]), "a log outside coverage");
         assert!(!crlite.is_revoked(&OTHER_ISSUER, BAD, &scts(AT)), "an issuer not in the filter");
+    }
+
+    #[test]
+    fn a_bundle_the_engine_would_refuse_is_not_made() {
+        let cap = usize::try_from(MAX_BUNDLE_BYTES).unwrap();
+        let exactly = vec![vec![0u8; cap - LENGTH_BYTES]];
+        assert_eq!(encode_bundle(&exactly).unwrap().len(), cap, "the cap itself is read");
+        let over = vec![vec![0u8; cap - 2 * LENGTH_BYTES], vec![0u8; 1]];
+        assert!(encode_bundle(&over).unwrap_err().contains(&MAX_BUNDLE_BYTES.to_string()));
     }
 
     #[test]

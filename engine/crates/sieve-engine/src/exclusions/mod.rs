@@ -1,7 +1,8 @@
 //! The exclusion store at run time (plan 4.1, task D6): three layers behind one
 //! snapshot, swapped like `domain::FilterSlot`, read once per flow.
 //! - `user`: the policy's `exclusions`, never persisted a second time;
-//! - `list:<id>`: [`lists`], replaced at each refresh;
+//! - `list:<id>`: [`lists`], replaced at each refresh, a seeded one by its signed
+//!   copy ([`ExclusionSlot::reload_seeds`]);
 //! - `auto:*`: [`auto`], `engine\exclusions.json`.
 //!
 //! The decision itself is `sieve_filter::exclusions::decrypt`. The slot adds
@@ -332,6 +333,23 @@ impl ExclusionSlot {
         }
     }
 
+    /// Rereads each seeded list from what the update cycle left: a signed copy that
+    /// differs lands in the next snapshot, without a restart. A flow already decrypted
+    /// to a newly listed host stays open until it ends. One that reads as the same
+    /// list changes nothing, not even the revision.
+    pub fn reload_seeds(&self, now_ms: u64) {
+        let seeded: Vec<(&'static str, &'static str)> = self.sources.iter().filter_map(|s| if let Origin::Seed(seed) = s.origin { Some((s.id, seed)) } else { None }).collect();
+        for (id, seed) in seeded {
+            let entries = lists::seed_entries(self.dir.as_deref(), id, seed);
+            let mut layers = lock(&self.layers);
+            let Some(slot) = layers.lists.iter_mut().find(|(have, _)| *have == id) else { continue };
+            if slot.1.as_ref() != Some(&entries) {
+                slot.1 = Some(entries);
+                self.rebuild(&layers, now_ms);
+            }
+        }
+    }
+
     /// True when anything enabled is fetched, so there is a loop worth running.
     pub fn fetches(&self) -> bool {
         self.sources.iter().any(|s| matches!(s.origin, Origin::Fetched(_)))
@@ -615,6 +633,29 @@ mod tests {
         let first_entry = include_str!("../../../sieve-filter/data/sensitive.txt").lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("//")).unwrap();
         assert_eq!(find(&slot, &format!("www.{first_entry}"), NOW), Some(Src::List("sensitive".into())));
         assert!(!slot.fetches());
+    }
+
+    #[test]
+    fn a_signed_copy_reaches_a_running_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        let host = "newly-sensitive.example";
+        assert_eq!(find(&slot, host, NOW), None);
+        let revision = slot.revision();
+        slot.reload_seeds(NOW);
+        assert_eq!(slot.revision(), revision, "nothing new, nothing rebuilt");
+
+        let path = crate::update::data_path(dir.path(), &crate::update::Kind::List("sensitive".into())).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{host}\n")).unwrap();
+        slot.reload_seeds(NOW);
+        assert_eq!(find(&slot, host, NOW), Some(Src::List("sensitive".into())), "without a restart");
+        assert!(slot.revision() > revision, "and the app hears of it");
+
+        std::fs::write(&path, "// nothing but a comment\n").unwrap();
+        slot.reload_seeds(NOW);
+        assert_eq!(find(&slot, host, NOW), None, "a broken copy is the seed again, never an empty list");
+        assert!(lock(&slot.layers).lists[0].1.as_ref().is_some_and(|entries| !entries.is_empty()));
     }
 
     #[derive(Default)]

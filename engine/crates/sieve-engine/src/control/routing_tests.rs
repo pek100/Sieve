@@ -7,10 +7,11 @@ use std::sync::{Arc, RwLock};
 use sieve_ipc::Policy;
 
 use super::Engine;
-use super::routing::sync_https_by;
+use super::routing::{add_missing, sync_https_by};
 use crate::http::hook::NoRewrite;
 use crate::ipc::Backend;
 use crate::policy::{Runs, wall_ms};
+use crate::route::prefix::Prefix;
 use crate::route::table::NetTables;
 use crate::stack::egress::Egress;
 use crate::tls::active::Active;
@@ -63,59 +64,120 @@ fn turn(engine: &Engine, change: Off) {
     engine.set_policy(next).unwrap();
 }
 
-#[test]
-fn a_switch_turned_off_while_building_publishes_nothing() {
+/// The slot's sync with nothing to load.
+async fn sync(engine: &Engine, build: impl FnOnce() -> Result<Interception<Egress>, String>) {
+    sync_https_by(engine, async {}, build).await;
+}
+
+#[tokio::test]
+async fn a_switch_turned_off_while_building_publishes_nothing() {
     for (name, off) in OFF_SWITCHES {
         let e = engine();
-        sync_https_by(&e, || {
+        sync(&e, || {
             turn(&e, off);
             Ok(built(&e))
-        });
+        })
+        .await;
         assert!(e.https.get().is_none(), "{name}: a new flow would decrypt");
     }
     // The control: the same build with the switch left on.
     let e = engine();
-    sync_https_by(&e, || Ok(built(&e)));
+    sync(&e, || Ok(built(&e))).await;
     assert!(e.https.get().is_some());
 }
 
-#[test]
-fn a_held_interception_is_not_built_again_and_off_takes_it_away() {
+/// A flow reads the slot when it arrives, and its verdict lasts as long as it does.
+#[tokio::test]
+async fn no_flow_finds_interception_before_its_validation_data() {
     let e = engine();
-    sync_https_by(&e, || Ok(built(&e)));
-    sync_https_by(&e, || panic!("the slot is full"));
-    turn(&e, |p| p.https = false);
-    assert!(e.https.get().is_none());
-    sync_https_by(&e, || panic!("the switch is off"));
+    let (loaded, read) = tokio::sync::oneshot::channel::<()>();
+    let sync = sync_https_by(
+        &e,
+        async {
+            let _ = read.await;
+        },
+        || Ok(built(&e)),
+    );
+    tokio::pin!(sync);
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut sync).await.is_err(), "it waits for the data");
+    assert!(e.https.get().is_none(), "a flow arriving now passes as with the switch off");
+    loaded.send(()).unwrap();
+    sync.await;
+    assert!(e.https.get().is_some());
 }
 
-#[test]
-fn a_failed_build_is_reported_until_a_later_one_works() {
+#[tokio::test]
+async fn a_switch_turned_off_while_loading_publishes_nothing() {
+    for (name, off) in OFF_SWITCHES {
+        let e = engine();
+        sync_https_by(&e, async { turn(&e, off) }, || Ok(built(&e))).await;
+        assert!(e.https.get().is_none(), "{name}: a new flow would decrypt");
+    }
+}
+
+#[tokio::test]
+async fn nothing_is_loaded_for_a_slot_that_needs_nothing() {
+    let e = engine();
+    sync(&e, || Ok(built(&e))).await;
+    sync_https_by(&e, async { panic!("the slot is full") }, || panic!("the slot is full")).await;
+    turn(&e, |p| p.https = false);
+    sync_https_by(&e, async { panic!("the switch is off") }, || panic!("the switch is off")).await;
+}
+
+#[tokio::test]
+async fn a_held_interception_is_not_built_again_and_off_takes_it_away() {
+    let e = engine();
+    sync(&e, || Ok(built(&e))).await;
+    sync(&e, || panic!("the slot is full")).await;
+    turn(&e, |p| p.https = false);
+    assert!(e.https.get().is_none());
+    sync(&e, || panic!("the switch is off")).await;
+}
+
+#[tokio::test]
+async fn a_failed_build_is_reported_until_a_later_one_works() {
     let e = engine();
     e.route_failed(ROUTE_FAILURE.into());
-    sync_https_by(&e, || Err("first".into()));
-    sync_https_by(&e, || Err(BUILD_FAILURE.into()));
+    sync(&e, || Err("first".into())).await;
+    sync(&e, || Err(BUILD_FAILURE.into())).await;
     let reported = e.status().last_error.unwrap();
     assert!(reported.contains(BUILD_FAILURE) && reported.contains(ROUTE_FAILURE) && !reported.contains("first"), "{reported}");
 
-    sync_https_by(&e, || Ok(built(&e)));
+    sync(&e, || Ok(built(&e))).await;
     assert_eq!(e.status().last_error.as_deref(), Some(ROUTE_FAILURE), "and no other reason goes with it");
 }
 
-#[test]
-fn a_failed_build_is_not_reported_after_the_switch_goes_off() {
+#[tokio::test]
+async fn a_failed_build_is_not_reported_after_the_switch_goes_off() {
     for (name, off) in OFF_SWITCHES {
         let e = engine();
-        sync_https_by(&e, || Err(BUILD_FAILURE.into()));
+        sync(&e, || Err(BUILD_FAILURE.into())).await;
         assert!(e.status().last_error.unwrap().contains(BUILD_FAILURE), "{name}");
         turn(&e, off);
         assert_eq!(e.status().last_error, None, "{name}: off ends it");
 
         let e = engine();
-        sync_https_by(&e, || {
+        sync(&e, || {
             turn(&e, off);
             Err(BUILD_FAILURE.into())
-        });
+        })
+        .await;
         assert_eq!(e.status().last_error, None, "{name}: off during the build");
     }
+}
+
+#[test]
+fn a_route_failure_is_reported_until_a_later_pass_adds_it() {
+    let e = engine();
+    let route: Prefix = Prefix::new("10.0.0.0".parse().unwrap(), 8).unwrap();
+    let other: Prefix = Prefix::new("172.16.0.0".parse().unwrap(), 12).unwrap();
+    e.add_error("policy.json: broken".into());
+    assert_eq!(add_missing(&e, [route, other].into_iter(), |p| if p == route { Err(ROUTE_FAILURE.into()) } else { Ok(()) }), [other]);
+    assert!(e.status().last_error.unwrap().contains(ROUTE_FAILURE));
+    assert_eq!(add_missing(&e, [route].into_iter(), |_| Ok(())), [route]);
+    assert_eq!(e.status().last_error.as_deref(), Some("policy.json: broken"), "over, and it takes no other reason with it");
+
+    add_missing(&e, [route].into_iter(), |_| Err(ROUTE_FAILURE.into()));
+    assert_eq!(add_missing(&e, std::iter::empty(), |_| panic!("nothing is missing")), []);
+    assert!(!e.status().last_error.unwrap().contains(ROUTE_FAILURE), "a route no longer planned is not failing either");
 }

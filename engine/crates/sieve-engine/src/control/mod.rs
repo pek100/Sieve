@@ -292,6 +292,11 @@ impl Engine {
         self.set_facts(|f| f.route_error = Some(reason));
     }
 
+    /// No route is still failing: what was reported is over.
+    pub fn routes_settled(&self) {
+        self.set_facts(|f| f.route_error = None);
+    }
+
     /// A routing run starts its attribution sources again: what the last run's
     /// reported is over, and is not said twice if it happens again.
     pub fn attribution_starts(&self) {

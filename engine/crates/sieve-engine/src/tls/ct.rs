@@ -267,7 +267,7 @@ fn stapled_lists(ocsp: &[u8]) -> Option<Vec<&[u8]>> {
 pub enum LogState {
     /// `qualified`, `usable` or `readonly`.
     Live,
-    /// Counts only for a set whose earliest SCT is before this.
+    /// Counts only in an embedded set, for an SCT of its own from before this.
     Retired { at_ms: u64 },
     /// `rejected`, `pending`, or a state this build does not know.
     Dead,
@@ -278,6 +278,8 @@ struct Log {
     operator: usize,
     key: Vec<u8>,
     state: LogState,
+    /// An SCT from before this was issued under an earlier operator of the log.
+    operator_since_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +307,7 @@ struct LogJson {
     log_id: String,
     key: String,
     state: Option<serde_json::Value>,
+    previous_operators: Option<serde_json::Value>,
 }
 
 fn rfc3339_ms(text: &str) -> Option<u64> {
@@ -319,6 +322,16 @@ fn state_of(state: Option<&serde_json::Value>) -> LogState {
         "retired" => body.get("timestamp").and_then(serde_json::Value::as_str).and_then(rfc3339_ms).map_or(LogState::Dead, |at_ms| LogState::Retired { at_ms }),
         _ => LogState::Dead,
     }
+}
+
+/// When a log's present operator took it over: its latest `previous_operators`
+/// `end_time`, or the epoch with none. A shape this build cannot read proves nothing
+/// about any SCT, so it gives the latest time there is, not the earliest, and the
+/// list itself stays good.
+fn operator_since_ms(previous: Option<&serde_json::Value>) -> u64 {
+    let Some(previous) = previous else { return 0 };
+    let Some(entries) = previous.as_array() else { return u64::MAX };
+    entries.iter().map(|entry| entry.get("end_time").and_then(serde_json::Value::as_str).and_then(rfc3339_ms).unwrap_or(u64::MAX)).max().unwrap_or(0)
 }
 
 impl LogList {
@@ -343,7 +356,7 @@ impl LogList {
             for log in entry.logs.iter().chain(&entry.tiled_logs) {
                 let id: LogId = STANDARD.decode(&log.log_id).ok().and_then(|id| id.try_into().ok()).ok_or("a log id")?;
                 let key = STANDARD.decode(&log.key).map_err(|_| "a log key")?;
-                logs.insert(id, Log { operator, key, state: state_of(log.state.as_ref()) });
+                logs.insert(id, Log { operator, key, state: state_of(log.state.as_ref()), operator_since_ms: operator_since_ms(log.previous_operators.as_ref()) });
             }
         }
         if !logs.values().any(|l| l.state == LogState::Live) {
@@ -451,24 +464,26 @@ pub enum CtAnswer {
 }
 
 /// One set under Chrome's rules: enough distinct logs, from enough operators,
-/// at least one still live. A retired log counts only when the set's earliest
-/// SCT is before its retirement; a future timestamp counts for nothing.
+/// at least one still live. A retired log counts only in an embedded set, and only
+/// for its own SCT from before the retirement. A log whose operator changed after
+/// its SCT counts for nothing: this list says who runs it now, and the policy asks
+/// who ran it then, so what its SCT adds to the operators is not proven (task D3). A
+/// future timestamp counts for nothing.
 fn set_complies(verified: &[VerifiedSct], delivery: Delivery, required: usize, list: &LogList, now_ms: u64) -> bool {
     let mut earliest_by_log: BTreeMap<LogId, u64> = BTreeMap::new();
     for sct in verified.iter().filter(|s| s.delivery == delivery && s.timestamp_ms <= now_ms) {
         let entry = earliest_by_log.entry(sct.log).or_insert(sct.timestamp_ms);
         *entry = (*entry).min(sct.timestamp_ms);
     }
-    let candidates: Vec<(&Log, u64)> = earliest_by_log.iter().filter_map(|(id, at)| list.logs.get(id).filter(|l| l.state != LogState::Dead).map(|l| (l, *at))).collect();
-    let Some(earliest) = candidates.iter().map(|(_, at)| *at).min() else { return false };
-    let counted: Vec<&Log> = candidates
+    let counted: Vec<&Log> = earliest_by_log
         .iter()
-        .map(|(log, _)| *log)
-        .filter(|log| match log.state {
+        .filter_map(|(id, at)| list.logs.get(id).filter(|log| *at >= log.operator_since_ms).map(|log| (log, *at)))
+        .filter(|(log, at)| match log.state {
             LogState::Live => true,
-            LogState::Retired { at_ms } => earliest < at_ms,
+            LogState::Retired { at_ms } => delivery == Delivery::Embedded && *at < at_ms,
             LogState::Dead => false,
         })
+        .map(|(log, _)| log)
         .collect();
     let operators: BTreeSet<usize> = counted.iter().map(|l| l.operator).collect();
     counted.len() >= required && operators.len() >= MIN_OPERATORS && counted.iter().any(|l| l.state == LogState::Live)
@@ -477,6 +492,11 @@ fn set_complies(verified: &[VerifiedSct], delivery: Delivery, required: usize, l
 /// Chrome's policy (task F5): the embedded set or the stapled one must comply
 /// alone. No threshold for "predates CT": no certificate that old is still in
 /// date. `temporal_interval` is not asked for by the published policy.
+///
+/// TENSION: the published policy takes OCSP SCTs only before Chrome 148, and stapled
+/// is the only non-embedded set here (task F4). So 2 live stapled SCTs pass here where
+/// a current Chrome refuses the real certificate. Dropping the arm reverses task F5 and
+/// is the user's call (F5 says so).
 pub fn policy(verified: &[VerifiedSct], lifetime_ms: u64, list: &LogList, now_ms: u64) -> CtAnswer {
     let embedded_needs = if lifetime_ms > SHORT_LIFETIME_DAYS * DAY_MS { SCTS_LONG } else { SCTS_SHORT };
     let compliant = set_complies(verified, Delivery::Embedded, embedded_needs, list, now_ms) || set_complies(verified, Delivery::Stapled, SCTS_STAPLED, list, now_ms);
@@ -783,6 +803,9 @@ mod tests {
             ("the same log twice, and a second log, is 2 not 3", vec![e(1, at), e(1, at + 1), e(4, at)], D181, NO),
             ("1 usable plus 1 retired, earliest before retirement", vec![e(1, at), e(5, at)], D180, OK),
             ("1 usable plus 1 retired, earliest after it", vec![e(1, late), e(5, late)], D180, NO),
+            ("the retired log's own SCT is after it, whatever the set's earliest", vec![e(1, at), e(5, late)], D180, NO),
+            ("the retired log's own SCT is before it, the live one's after", vec![e(1, late), e(5, at)], D180, OK),
+            ("a retired log counts for nothing in a stapled set", vec![s(1, at), s(5, at)], D180, NO),
             ("2 retired only", vec![e(5, at), e(6, at)], D180, NO),
             ("rejected counts for nothing", vec![e(1, at), e(7, at)], D180, NO),
             ("pending counts for nothing", vec![e(1, at), e(8, at)], D180, NO),
@@ -798,6 +821,30 @@ mod tests {
         for (name, verified, lifetime, want) in rows {
             assert_eq!(policy(&verified, lifetime, &list, TODAY), want, "{name}");
         }
+    }
+
+    /// Logs 1 and 2 are both A's at T0. Log 2 moved to B at T0 + 1 day, so the list
+    /// reads them as two operators.
+    #[test]
+    fn a_log_moved_to_another_operator_does_not_prove_diversity_from_before_the_move() {
+        const MOVED_AT: u64 = RETIRED_AT;
+        let moved = |previous: &str| format!(r#"{{"log_id":"{}","key":"AA==","state":{USABLE},"previous_operators":{previous}}}"#, STANDARD.encode(id(2)));
+        let list_with = |previous: &str| LogList::parse(list_json("2023-11-20T00:00:00Z", &[vec![entry(1, USABLE)], vec![moved(previous)]]).as_bytes()).unwrap();
+        let list = list_with(r#"[{"name":"A","end_time":"2023-11-15T22:13:20Z"}]"#);
+        let answer = |list: &LogList, at| policy(&[e(1, T0), e(2, at)], DAY_MS, list, TODAY);
+        assert_eq!(answer(&list, T0), CtAnswer::Violates, "one operator at issuance");
+        assert_eq!(answer(&list, MOVED_AT), CtAnswer::Compliant, "issued under its present operator");
+        let two_moves = list_with(r#"[{"name":"Z","end_time":"2023-11-14T00:00:00Z"},{"name":"A","end_time":"2023-11-15T22:13:20Z"}]"#);
+        assert_eq!(answer(&two_moves, MOVED_AT - 1), CtAnswer::Violates, "the latest move is the one that says");
+        assert_eq!(answer(&list_with("[]"), T0), CtAnswer::Compliant, "no move, no question");
+        for unreadable in [r#""soon""#, r#"[{"name":"A"}]"#, r#"[{"end_time":"yesterday"}]"#] {
+            assert_eq!(answer(&list_with(unreadable), TODAY), CtAnswer::Violates, "{unreadable}: unproven, and the list stays good");
+        }
+        assert_eq!(policy(&[e(1, T0), e(2, T0)], DAY_MS, &table_of_two(), TODAY), CtAnswer::Compliant, "the control: never moved");
+    }
+
+    fn table_of_two() -> LogList {
+        LogList::parse(list_json("2023-11-20T00:00:00Z", &[vec![entry(1, USABLE)], vec![entry(2, USABLE)]]).as_bytes()).unwrap()
     }
 
     #[test]

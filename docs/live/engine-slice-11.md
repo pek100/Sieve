@@ -52,6 +52,7 @@ Load a host the engine has not judged since interception went on. A rejecting ve
 | U9 | Check whether a real full filter in the `default` channel is V3 or V4 on the day. | The tool takes it either way; note which it was. |
 | U10 | Kill, reboot and uninstall tests of `docs/conventions.md` section 0, with all three active. | They match slice 6's result. Nothing here adds system state. |
 | U11 | Publish `list:ct-logs` and `list:crlite` through the real update cycle. | The engine picks them up within the hourly wake, `ct_list_timestamp` and `crlite_filters` say so, and `validation_refused` stays 0. |
+| U12 | A real ECH taken for GREASE: Chrome with Secure DNS on an explicit provider loads a name publishing ECH whose public name a second app has just resolved at the same address through system DNS (`Resolve-DnsName <public name>`). | Say what you saw: the failed attempt, whether the browser retried without ECH, and with which SNI. `auto:pinning` for (that browser, the public name) appears after the one refusal if its `ech_required` alert arrived (task D9 of `docs/tasks/2026-11-06-tls.md`), and the next load passes through. |
 
 ## Reading a result
 
@@ -62,4 +63,4 @@ Load a host the engine has not judged since interception went on. A rejecting ve
 
 ## Not here
 
-SCTs delivered by TLS extension (rustls does not expose them). `temporal_interval` and `previous_operators` (the published policy does not need the first, the recorded list has none of the second). Retry configs of a rejected ECH attempt (task F10). The fetch of either artefact from Google or Mozilla (task Q2).
+SCTs delivered by TLS extension (rustls does not expose them). `temporal_interval`, which the published policy does not need. `previous_operators` is read only far enough to give no credit for an SCT from before a log's move (the recorded list has none). Retry configs of a rejected ECH attempt (task F10). The fetch of either artefact from Google or Mozilla (task Q2).
