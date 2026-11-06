@@ -4,7 +4,7 @@ Run by the user, on a machine where the engine is installed and `filtering.engin
 
 `dns-status.json` beside `status.json` holds the facts these checks read, rewritten every 30 s while routes are up: per upstream its `address`, `connected`, `kx_group`, `alpn`, `answers`, `failures`, and never a queried name. `kx_group` is `null` for DoQ because quinn does not expose it.
 
-To set a list, stop the engine, write `dns.json` beside `policy.json`, and start it (the app's setting comes with the settings stream). A raised `revision` matters only for later writes through the pipe. A bad file reads as the defaults and `last_error` in `status.json` says why.
+To set a list, stop the engine, write `dns.json` beside `policy.json`, and start it (the app's setting comes with the settings stream). A raised `revision` matters only for later writes through the pipe. A bad file reads as the defaults and `last_error` in `status.json` says why. Save it as UTF-8, up to 32 KB: `Set-Content -Encoding utf8` is fine (its BOM is accepted), while `>` in Windows PowerShell writes UTF-16, which is refused by name. Setting a good list through the pipe replaces a bad file and ends its reason in `last_error`.
 
 ```json
 { "revision": 1, "upstreams": ["https://192.0.2.1/dns-query", "https://cloudflare-dns.com/dns-query"] }
@@ -26,7 +26,7 @@ Pass: every port 53 packet is to or from a LAN address, or on the Sieve interfac
 
 ## 2. Failover on the real path
 
-List `https://192.0.2.1/dns-query` first, as above (a documentation address that never answers). Run `Measure-Command { Resolve-DnsName example.com -DnsOnly -Type A }` with a name not in the cache. Pass: an answer, in under 2 s. Later lookups skip the dead upstream for 30 s at a time and take no extra second.
+List `https://192.0.2.1/dns-query` first, as above (a documentation address that never answers). Run `Measure-Command { Resolve-DnsName example.com -DnsOnly -Type A }` with a name not in the cache. First confirm the list applied: `last_error` does not mention `dns.json`, and `dns-status.json` lists `192.0.2.1`. Otherwise the defaults are answering and this check proves nothing. Pass: an answer, in under 2 s. Later lookups skip the dead upstream for 30 s at a time and take no extra second.
 
 ## 3. Post-quantum key exchange with the real resolver
 

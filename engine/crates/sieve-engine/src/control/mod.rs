@@ -44,8 +44,11 @@ pub struct Facts {
     pub split_tunnels: Vec<String>,
     /// Reasons reported once each, kept for the whole run ([`Engine::add_error`]).
     pub last_error: Option<String>,
+    /// Why `dns.json` was not used at start-up, until a list set on the pipe
+    /// replaces the file. Status reports it after `last_error`.
+    pub dns_file_error: Option<String>,
     /// The newest route failure ([`Engine::route_failed`]). Status reports it
-    /// after `last_error`.
+    /// last.
     pub route_error: Option<String>,
     /// When the routes came up (monotonic ms), for the Stall test build.
     pub up_since: Option<u64>,
@@ -104,7 +107,7 @@ impl Engine {
             policy: Mutex::new(policy),
             runs: Mutex::new(runs),
             crash_loop: Mutex::new(crash_loop),
-            facts: Mutex::new(Facts { last_error: unused_dns_file, ..Facts::default() }),
+            facts: Mutex::new(Facts { dns_file_error: unused_dns_file, ..Facts::default() }),
             dns_upstreams: Mutex::new(dns_upstreams),
             dns_service: Mutex::new(None),
             book: Arc::default(),
@@ -256,7 +259,7 @@ impl Backend for Engine {
             routes_up: f.routes_up,
             flows: u32::try_from(lock(&self.book).live()).unwrap_or(u32::MAX),
             decrypting: false,
-            last_error: beside(f.last_error, f.route_error),
+            last_error: beside(beside(f.last_error, f.dns_file_error), f.route_error),
             policy,
             blocker,
             split_tunnels: f.split_tunnels,
@@ -285,15 +288,22 @@ impl Backend for Engine {
     }
 
     fn set_dns_upstreams(&self, asked: DnsUpstreams) -> Result<DnsUpstreams, String> {
-        let mut held = lock(&self.dns_upstreams);
-        let (next, endpoints) = config::accept(&held, asked)?;
-        if let Some(dir) = &self.dir {
-            config::save(dir, &next)?;
-        }
-        *held = next.clone();
-        if let Some(service) = lock(&self.dns_service).as_ref() {
-            service.set_list(endpoints);
-        }
+        let next = {
+            let mut held = lock(&self.dns_upstreams);
+            let (next, endpoints) = config::accept(&held, asked)?;
+            if let Some(dir) = &self.dir {
+                config::save(dir, &next)?;
+            }
+            *held = next.clone();
+            if let Some(service) = lock(&self.dns_service).as_ref() {
+                service.set_list(endpoints);
+            }
+            // The file was just replaced, so its old reason no longer holds.
+            self.set_facts(|f| f.dns_file_error = None);
+            next
+        };
+        // With routing off nothing else rewrites the status file.
+        self.write_status_file();
         Ok(next)
     }
 
@@ -457,6 +467,58 @@ mod tests {
         std::fs::write(dir.path().join(config::DNS_FILE), b"{\"revision\":1,\"upstreams\":[\"udp://1.1.1.1\"]}").unwrap();
         let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
         assert_eq!(e.dns_upstreams(), config::defaults());
+        assert!(e.status().last_error.unwrap().contains("read as the defaults"));
+    }
+
+    fn engine_with_a_bad_dns_file(dir: &std::path::Path) -> Engine {
+        std::fs::write(dir.join(config::DNS_FILE), b"{\"revision\":1,\"upstreams\":[\"udp://1.1.1.1\"]}").unwrap();
+        let e = Engine::new(Some(dir.to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        assert!(e.status().last_error.unwrap().contains("read as the defaults"));
+        e
+    }
+
+    #[test]
+    fn a_good_list_set_over_a_bad_file_ends_its_reason_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine_with_a_bad_dns_file(dir.path());
+        e.add_error("policy.json: broken".into());
+        e.route_failed("route 10.0.0.0/8: code 5".into());
+        e.set_dns_upstreams(DnsUpstreams { revision: 1, upstreams: vec!["tls://dns.example".into()] }).unwrap();
+
+        let on_disk: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(STATUS_FILE)).unwrap()).unwrap();
+        for reported in [e.status().last_error.unwrap(), on_disk["last_error"].as_str().unwrap().to_string()] {
+            assert!(!reported.contains("read as the defaults"), "{reported}");
+            for held in ["policy.json: broken", "route 10.0.0.0/8: code 5"] {
+                assert!(reported.contains(held), "{held} in {reported}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_good_list_set_over_a_bad_file_leaves_no_error_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine_with_a_bad_dns_file(dir.path());
+        e.set_dns_upstreams(DnsUpstreams { revision: 1, upstreams: vec!["tls://dns.example".into()] }).unwrap();
+        assert_eq!(e.status().last_error, None);
+    }
+
+    #[test]
+    fn a_refused_list_leaves_the_bad_files_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine_with_a_bad_dns_file(dir.path());
+        e.set_dns_upstreams(DnsUpstreams { revision: 1, upstreams: vec!["udp://1.1.1.1".into()] }).unwrap_err();
+        e.set_dns_upstreams(DnsUpstreams { revision: 0, upstreams: vec!["tls://dns.example".into()] }).unwrap_err();
+        assert!(e.status().last_error.unwrap().contains("read as the defaults"));
+    }
+
+    #[test]
+    fn a_list_that_could_not_be_saved_leaves_the_bad_files_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("engine");
+        std::fs::create_dir(&held).unwrap();
+        let e = engine_with_a_bad_dns_file(&held);
+        std::fs::remove_dir_all(&held).unwrap();
+        e.set_dns_upstreams(DnsUpstreams { revision: 1, upstreams: vec!["tls://dns.example".into()] }).unwrap_err();
         assert!(e.status().last_error.unwrap().contains("read as the defaults"));
     }
 

@@ -23,6 +23,7 @@ pub mod domain;
 #[cfg(feature = "relay-experiments")]
 pub mod experiments;
 pub mod flow;
+pub mod hand_file;
 pub mod ipc;
 pub mod policy;
 pub mod route;

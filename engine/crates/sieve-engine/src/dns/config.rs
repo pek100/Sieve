@@ -1,7 +1,8 @@
 //! The resolver list as `dns.json` holds it, beside `policy.json`. The same
 //! rule as the policy: only a newer revision is taken. A missing file means the
 //! defaults; a bad one means the defaults plus a reason. An absent or broken
-//! list is never read as plain DNS, or as off.
+//! list is never read as plain DNS, or as off. A person may write the file by
+//! hand from an admin prompt, so it is read as [`crate::hand_file`] says.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -9,9 +10,13 @@ use std::path::Path;
 use sieve_ipc::DnsUpstreams;
 
 use super::upstream::{DEFAULTS, MAX_UPSTREAMS, Upstream};
+use crate::hand_file;
 use crate::policy::write_atomic;
 
 pub const DNS_FILE: &str = "dns.json";
+/// [`MAX_UPSTREAMS`] addresses of a few KB each. [`validate`] holds the saved
+/// form of a list to it, so a list the pipe accepts is one the next start reads.
+pub const FILE_MAX: u64 = 32 * 1024;
 
 /// [`DEFAULTS`], revision 0.
 pub fn defaults() -> DnsUpstreams {
@@ -27,12 +32,20 @@ pub fn validate(list: &DnsUpstreams) -> Result<Vec<Upstream>, String> {
     if list.upstreams.len() > MAX_UPSTREAMS {
         return Err(format!("the encrypted DNS list holds {}, the limit is {MAX_UPSTREAMS}", list.upstreams.len()));
     }
+    if file_form(list)?.len() as u64 > FILE_MAX {
+        return Err(format!("the encrypted DNS list is larger than {FILE_MAX} bytes"));
+    }
     let parsed = list.upstreams.iter().map(|address| address.parse::<Upstream>().map_err(|why| format!("{address}: {why}"))).collect::<Result<Vec<_>, _>>()?;
     let mut seen = HashSet::new();
     if let Some(repeat) = list.upstreams.iter().zip(&parsed).find(|(_, u)| !seen.insert(u.to_string())) {
         return Err(format!("{}: listed twice", repeat.0));
     }
     Ok(parsed)
+}
+
+/// What [`save`] writes.
+fn file_form(list: &DnsUpstreams) -> Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(list).map_err(|e| e.to_string())
 }
 
 /// `asked`, when it is newer than `current` and valid.
@@ -48,21 +61,24 @@ pub fn accept(current: &DnsUpstreams, asked: DnsUpstreams) -> Result<(DnsUpstrea
 pub fn load(dir: &Path) -> (DnsUpstreams, Option<String>) {
     let path = dir.join(DNS_FILE);
     let bad = |why: String| (defaults(), Some(format!("{}: {why}; read as the defaults", path.display())));
-    match std::fs::read(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (defaults(), None),
-        Err(e) => bad(e.to_string()),
-        Ok(bytes) => match serde_json::from_slice::<DnsUpstreams>(&bytes) {
-            Err(e) => bad(e.to_string()),
-            Ok(list) => match validate(&list) {
-                Ok(_) => (list, None),
-                Err(why) => bad(why),
-            },
+    match hand_file::read_capped(&path, FILE_MAX) {
+        Ok(None) => (defaults(), None),
+        Err(why) => bad(why),
+        Ok(Some(bytes)) => match parse(&bytes) {
+            Ok(list) => (list, None),
+            Err(why) => bad(why),
         },
     }
 }
 
+fn parse(bytes: &[u8]) -> Result<DnsUpstreams, String> {
+    let list = serde_json::from_slice(hand_file::content(bytes)?).map_err(|e| e.to_string())?;
+    validate(&list)?;
+    Ok(list)
+}
+
 pub fn save(dir: &Path, list: &DnsUpstreams) -> Result<(), String> {
-    write_atomic(&dir.join(DNS_FILE), &serde_json::to_vec_pretty(list).map_err(|e| e.to_string())?)
+    write_atomic(&dir.join(DNS_FILE), &file_form(list)?)
 }
 
 #[cfg(test)]
@@ -113,6 +129,64 @@ mod tests {
             assert_eq!(read, defaults());
             assert!(why.unwrap().contains("read as the defaults"));
         }
+    }
+
+    /// The runbook's list as Windows PowerShell 5.1 saves it: `Set-Content
+    /// -Encoding utf8` and `Out-File -Encoding utf8` write a BOM first.
+    #[test]
+    fn a_file_with_a_utf8_bom_is_the_list_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = br#"{ "revision": 1, "upstreams": ["https://192.0.2.1/dns-query", "https://cloudflare-dns.com/dns-query"] }"#;
+        std::fs::write(dir.path().join(DNS_FILE), [b"\xEF\xBB\xBF".as_slice(), held].concat()).unwrap();
+        let (read, why) = load(dir.path());
+        assert_eq!(why, None);
+        assert_eq!(read, list(1, &["https://192.0.2.1/dns-query", "https://cloudflare-dns.com/dns-query"]));
+    }
+
+    #[test]
+    fn a_utf16_file_reads_as_the_defaults_and_says_utf16() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"{"revision":1,"upstreams":["tls://dns.example"]}"#;
+        let little: Vec<u8> = [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        let big: Vec<u8> = [0xFE, 0xFF].into_iter().chain(text.encode_utf16().flat_map(u16::to_be_bytes)).collect();
+        for bytes in [little, big] {
+            std::fs::write(dir.path().join(DNS_FILE), bytes).unwrap();
+            let (read, why) = load(dir.path());
+            assert_eq!(read, defaults());
+            let why = why.unwrap();
+            assert!(why.contains("UTF-16") && why.contains(DNS_FILE) && why.contains("read as the defaults"), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_file_over_the_cap_reads_as_the_defaults_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = br#"{"revision":1,"upstreams":["tls://dns.example"]}"#.to_vec();
+        bytes.resize(FILE_MAX as usize, b' ');
+        std::fs::write(dir.path().join(DNS_FILE), &bytes).unwrap();
+        assert_eq!(load(dir.path()), (list(1, &["tls://dns.example"]), None), "exactly the cap is read");
+        bytes.push(b' ');
+        std::fs::write(dir.path().join(DNS_FILE), &bytes).unwrap();
+        let (read, why) = load(dir.path());
+        assert_eq!(read, defaults());
+        assert!(why.unwrap().contains("larger than"));
+    }
+
+    /// The cap must not turn a list the pipe accepted into a bad file at the
+    /// next start, so the pipe and the file share one limit.
+    #[test]
+    fn the_largest_list_accepted_is_one_the_next_start_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let sized = |extra: usize| {
+            let address = format!("https://dns.example/q?{}", "a".repeat(extra));
+            DnsUpstreams { revision: 1, upstreams: vec![address] }
+        };
+        let room = FILE_MAX as usize - file_form(&sized(0)).unwrap().len();
+        let largest = sized(room);
+        validate(&largest).unwrap();
+        save(dir.path(), &largest).unwrap();
+        assert_eq!(load(dir.path()), (largest, None));
+        assert!(validate(&sized(room + 1)).unwrap_err().contains("larger than"));
     }
 
     #[test]
