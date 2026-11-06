@@ -151,6 +151,56 @@ fn question_end(msg: &[u8]) -> Option<usize> {
     (pos <= msg.len()).then_some(pos)
 }
 
+/// One question's name as raw labels, any octets, leftmost first, and the
+/// position after it.
+fn raw_labels_at(msg: &[u8], mut pos: usize) -> Option<(Vec<Vec<u8>>, usize)> {
+    let mut labels = Vec::new();
+    let mut end = None;
+    let (mut jumps, mut total) = (0, 0);
+    loop {
+        let len = usize::from(*msg.get(pos)?);
+        match len & 0xc0 {
+            0 if len == 0 => return Some((labels, end.unwrap_or(pos + 1))),
+            0 => {
+                labels.push(msg.get(pos + 1..pos + 1 + len)?.to_vec());
+                pos += 1 + len;
+                total += 1 + len;
+                if total > MAX_NAME {
+                    return None;
+                }
+            }
+            0xc0 => {
+                let target = ((len & 0x3f) << 8) | usize::from(*msg.get(pos + 1)?);
+                end.get_or_insert(pos + 2);
+                jumps += 1;
+                if jumps > MAX_POINTERS || target >= pos {
+                    return None;
+                }
+                pos = target;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Every question's name as raw labels, whether or not [`parse`] would read it:
+/// a query's destination must not depend on what can be evidence. None when the
+/// question section cannot be walked.
+pub(crate) fn question_names(msg: &[u8]) -> Option<Vec<Vec<Vec<u8>>>> {
+    let count = u16::from_be_bytes([*msg.get(4)?, *msg.get(5)?]);
+    let mut pos = HEADER;
+    let mut names = Vec::new();
+    for _ in 0..count {
+        let (labels, next) = raw_labels_at(msg, pos)?;
+        pos = next + 4;
+        if pos > msg.len() {
+            return None;
+        }
+        names.push(labels);
+    }
+    Some(names)
+}
+
 /// The same header flags and question with no records; the opcode and RD of
 /// the query are kept, per RFC 1035 4.1.1.
 fn answer_without_records(msg: &[u8], flags: u16) -> Option<Vec<u8>> {

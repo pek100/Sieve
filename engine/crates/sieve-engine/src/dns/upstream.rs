@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::question_names;
 use crate::route::plan;
 use crate::route::prefix::Prefix;
 use crate::route::table::NetTables;
@@ -214,7 +215,19 @@ impl FromStr for Upstream {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitHorizon {
     suffix: String,
-    server: IpAddr,
+    /// None: the adapter's only servers cannot be reached from here, so the
+    /// suffix's names have nowhere to go but must not go public.
+    server: Option<IpAddr>,
+}
+
+/// Where one query goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitRoute {
+    /// To the encrypted upstreams: nothing in it is under a suffix.
+    Encrypted,
+    Lan(IpAddr),
+    /// Nowhere: SERVFAIL, because it may be a LAN name and has no LAN server.
+    Refused,
 }
 
 impl SplitHorizon {
@@ -227,30 +240,66 @@ impl SplitHorizon {
             IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
             IpAddr::V6(ip) => (ip.segments()[0] & 0xfe00 == 0xfc00) || (ip.segments()[0] & 0xffc0 == 0xfe80),
         };
-        (private && lan_prefixes.iter().any(|p| p.contains(server))).then_some(Self {suffix, server})
+        (private && lan_prefixes.iter().any(|p| p.contains(server))).then_some(Self { suffix, server: Some(server) })
+    }
+
+    /// A suffix whose adapter has no server this engine can reach.
+    fn unreachable(suffix: &str) -> Option<Self> {
+        Some(Self { suffix: crate::flow::sni::host_name(suffix.as_bytes())?, server: None })
+    }
+
+    /// True for the suffix itself and for complete child labels, ASCII
+    /// case-insensitive, whatever octets the other labels hold.
+    fn covers(&self, labels: &[Vec<u8>]) -> bool {
+        let suffix = self.suffix.split('.').rev();
+        suffix.clone().count() <= labels.len() && suffix.zip(labels.iter().rev()).all(|(want, label)| label.eq_ignore_ascii_case(want.as_bytes()))
     }
 }
 
-/// Match only exact suffixes or complete child labels, longest suffix first.
-/// No matching configured LAN suffix means encrypted DNS, including when
-/// every encrypted upstream is unavailable.
-pub fn split_server(name: &str, rules: &[SplitHorizon]) -> Option<IpAddr> {
-    let name = crate::flow::sni::host_name(name.as_bytes())?;
-    rules.iter().filter(|r| name == r.suffix || name.strip_suffix(&r.suffix).is_some_and(|p| p.ends_with('.')))
-        .max_by_key(|r| r.suffix.len()).map(|r| r.server)
+/// The most specific rule over a name, longest suffix first.
+fn rule_for<'a>(labels: &[Vec<u8>], rules: &'a [SplitHorizon]) -> Option<&'a SplitHorizon> {
+    rules.iter().filter(|r| r.covers(labels)).max_by_key(|r| r.suffix.len())
+}
+
+/// Where a query goes, read from the wire and not from what the evidence parser
+/// accepts. A query with no name under a suffix goes encrypted, including when
+/// every encrypted upstream is unavailable. One whose names all have the same
+/// LAN server goes there. Anything that might carry a LAN name and has no one
+/// server for it is refused: the public upstream would publish that name. With
+/// no rules at all there is no LAN name to protect, and an unreadable query goes
+/// encrypted, opaque.
+pub fn split_route(query: &[u8], rules: &[SplitHorizon]) -> SplitRoute {
+    if rules.is_empty() {
+        return SplitRoute::Encrypted;
+    }
+    let Some(names) = question_names(query) else { return SplitRoute::Refused };
+    let mut matched = names.iter().map(|labels| rule_for(labels, rules));
+    let Some(first) = matched.next() else { return SplitRoute::Encrypted };
+    if matched.any(|other| other.map(|r| r.server) != first.map(|r| r.server)) {
+        return SplitRoute::Refused;
+    }
+    match first {
+        None => SplitRoute::Encrypted,
+        Some(SplitHorizon { server: Some(server), .. }) => SplitRoute::Lan(*server),
+        Some(_) => SplitRoute::Refused,
+    }
 }
 
 /// The rules these tables imply, computed per query (few adapters, no cache):
 /// each suffix of each other up adapter, with the adapter's first server that
 /// qualifies against the route plan's holes. A link-local IPv6 server is
 /// skipped: its address has no scope, and pinning refuses a link-local source.
+/// When such servers are all the adapter has, its suffix still holds, with no
+/// server. A public server is another matter: an ISP's or a router's suffix under
+/// a public domain resolves publicly, so that suffix makes no rule.
 pub fn split_rules(tables: &NetTables) -> Vec<SplitHorizon> {
     let holes = plan::holes(tables);
     let mut rules = Vec::new();
     for adapter in tables.others() {
+        let only_link_local = !adapter.dns.is_empty() && adapter.dns.iter().all(|ip| is_v6_link_local(*ip));
         for suffix in &adapter.dns_suffixes {
-            let server = adapter.dns.iter().filter(|ip| !is_v6_link_local(**ip)).find_map(|ip| SplitHorizon::new(suffix, *ip, &holes));
-            rules.extend(server);
+            let qualifying = adapter.dns.iter().filter(|ip| !is_v6_link_local(**ip)).find_map(|ip| SplitHorizon::new(suffix, *ip, &holes));
+            rules.extend(qualifying.or_else(|| only_link_local.then(|| SplitHorizon::unreachable(suffix)).flatten()));
         }
     }
     rules
@@ -404,13 +453,14 @@ mod tests {
     #[test]
     fn split_horizon_cannot_leak_names_to_a_public_or_unrelated_server() {
         let lan = ["192.168.7.0/24".parse().unwrap()];
-        let rule = SplitHorizon::new("corp.example", "192.168.7.1".parse().unwrap(), &lan).unwrap();
+        let server: IpAddr = "192.168.7.1".parse().unwrap();
+        let rule = SplitHorizon::new("corp.example", server, &lan).unwrap();
         assert!(SplitHorizon::new("corp.example", "192.168.8.1".parse().unwrap(), &lan).is_none());
         assert!(SplitHorizon::new("corp.example", "8.8.8.8".parse().unwrap(), &["0.0.0.0/0".parse().unwrap()]).is_none());
         assert!(SplitHorizon::new("corp.example", "127.0.0.1".parse().unwrap(), &["127.0.0.0/8".parse().unwrap()]).is_none());
-        assert_eq!(split_server("host.CORP.example", std::slice::from_ref(&rule)), Some(rule.server));
-        assert_eq!(split_server("notcorp.example", std::slice::from_ref(&rule)), None);
-        assert_eq!(split_server("corp.example.attacker.test", &[rule]), None);
+        assert_eq!(route_of("host.CORP.example", std::slice::from_ref(&rule)), SplitRoute::Lan(server));
+        assert_eq!(route_of("notcorp.example", std::slice::from_ref(&rule)), SplitRoute::Encrypted);
+        assert_eq!(route_of("corp.example.attacker.test", &[rule]), SplitRoute::Encrypted);
     }
 
     #[test]
@@ -418,12 +468,53 @@ mod tests {
         let lan = ["10.0.0.0/8".parse().unwrap()];
         let broad = SplitHorizon::new("corp.example", "10.0.0.1".parse().unwrap(), &lan).unwrap();
         let narrow = SplitHorizon::new("dev.corp.example", "10.0.0.2".parse().unwrap(), &lan).unwrap();
-        assert_eq!(split_server("api.dev.corp.example", &[narrow.clone(), broad]), Some(narrow.server));
+        assert_eq!(route_of("api.dev.corp.example", &[narrow, broad]), SplitRoute::Lan("10.0.0.2".parse().unwrap()));
+    }
+
+    /// A query with these names, as raw labels.
+    fn wire_query(names: &[&[&[u8]]]) -> Vec<u8> {
+        let mut q = vec![0, 1, 1, 0, 0, names.len() as u8, 0, 0, 0, 0, 0, 0];
+        for labels in names {
+            for label in *labels {
+                q.push(label.len() as u8);
+                q.extend_from_slice(label);
+            }
+            q.extend_from_slice(&[0, 0, 1, 0, 1]);
+        }
+        q
+    }
+
+    #[test]
+    fn the_route_is_read_from_the_wire_not_from_what_the_parser_accepts() {
+        let server: IpAddr = "192.168.7.1".parse().unwrap();
+        let lan_prefix = ["192.168.7.0/24".parse().unwrap()];
+        let rules = [SplitHorizon::new("lan", server, &lan_prefix).unwrap()];
+        const NON_ASCII: &[u8] = b"\xc3\xa9";
+        let under: &[&[u8]] = &[NON_ASCII, b"LAN"];
+        let also_under: &[&[u8]] = &[b"b", b"lan"];
+        let elsewhere: &[&[u8]] = &[NON_ASCII, b"example"];
+
+        let one = wire_query(&[under]);
+        assert!(crate::dns::parse(&one).is_none(), "the parser refuses it");
+        assert_eq!(split_route(&one, &rules), SplitRoute::Lan(server), "and it stays on the LAN");
+        assert_eq!(split_route(&wire_query(&[under, also_under]), &rules), SplitRoute::Lan(server), "several questions, one server");
+        assert_eq!(split_route(&wire_query(&[elsewhere]), &rules), SplitRoute::Encrypted);
+        assert_eq!(split_route(&wire_query(&[under, elsewhere]), &rules), SplitRoute::Refused, "the questions disagree");
+        assert_eq!(split_route(&wire_query(&[]), &rules), SplitRoute::Encrypted, "no name to protect");
+
+        let mut cut = wire_query(&[under]);
+        cut.truncate(cut.len() - 6);
+        assert_eq!(split_route(&cut, &rules), SplitRoute::Refused, "it cannot be walked");
+        assert_eq!(split_route(&cut, &[]), SplitRoute::Encrypted, "with no rule there is no LAN name");
     }
 
     fn with_suffix(tables: &mut NetTables, alias: &str, suffix: &str) {
         let adapter = tables.adapters.iter_mut().find(|a| a.alias == alias).unwrap();
         adapter.dns_suffixes.push(suffix.into());
+    }
+
+    fn route_of(name: &str, rules: &[SplitHorizon]) -> SplitRoute {
+        split_route(&crate::dns::query_for(name, crate::dns::TYPE_A).unwrap(), rules)
     }
 
     #[test]
@@ -435,8 +526,8 @@ mod tests {
         assert!(split_rules(&home).is_empty(), "no suffix, no rule");
         with_suffix(&mut home, "Wi-Fi", "lan");
         let rules = split_rules(&home);
-        assert_eq!(split_server("router.lan", &rules), Some(lan));
-        assert_eq!(split_server("router.example", &rules), None);
+        assert_eq!(route_of("router.lan", &rules), SplitRoute::Lan(lan));
+        assert_eq!(route_of("router.example", &rules), SplitRoute::Encrypted);
 
         // A public server, even in a public hole, qualifies nothing.
         let mut public = load(VPN_SPLIT);
@@ -444,16 +535,25 @@ mod tests {
         vpn.dns = vec!["203.0.113.53".parse().unwrap()];
         vpn.dns_suffixes = vec!["corp.example".into()];
         assert!(plan::holes(&public).iter().any(|p| p.contains("203.0.113.53".parse().unwrap())), "it is a hole");
-        assert_eq!(split_server("a.corp.example", &split_rules(&public)), None);
+        assert_eq!(route_of("a.corp.example", &split_rules(&public)), SplitRoute::Encrypted);
 
         // A link-local IPv6 server is skipped, a later private one is taken.
+        // With nothing else, the suffix's names are refused: they never go public.
         let mut scoped = load(HOME);
         let wifi = scoped.adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap();
         wifi.dns = vec!["fe80::1".parse().unwrap()];
         wifi.dns_suffixes = vec!["lan".into()];
-        assert!(split_rules(&scoped).is_empty());
+        assert_eq!(route_of("router.lan", &split_rules(&scoped)), SplitRoute::Refused);
+        assert_eq!(route_of("router.example", &split_rules(&scoped)), SplitRoute::Encrypted);
         scoped.adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap().dns.push(lan);
-        assert_eq!(split_server("router.lan", &split_rules(&scoped)), Some(lan));
+        assert_eq!(route_of("router.lan", &split_rules(&scoped)), SplitRoute::Lan(lan));
+
+        // A link-local server beside a public one: the suffix resolves publicly.
+        let mut mixed = load(HOME);
+        let wifi = mixed.adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap();
+        wifi.dns = vec!["fe80::1".parse().unwrap(), "8.8.8.8".parse().unwrap()];
+        wifi.dns_suffixes = vec!["lan".into()];
+        assert!(split_rules(&mixed).is_empty());
 
         // A public server the plan routes does not qualify.
         let mut routed = load(HOME);
