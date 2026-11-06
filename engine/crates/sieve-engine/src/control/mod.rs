@@ -1059,7 +1059,7 @@ mod tests {
         assert_eq!((revision, notices.len()), (1, 1));
         assert_eq!(rows_revision, e.exclusions.revision());
         assert_eq!(e.exclusions().rows.iter().filter(|r| r.reason == "auto:pinning").count(), 1);
-        e.try_decrypt_again(Retry::One { pattern: sieve_filter::exclusions::Pattern::Exact("pin.example".into()), app: Some("client.exe".into()) });
+        e.try_decrypt_again(Retry::One { pattern: sieve_filter::exclusions::Pattern::Exact("pin.example".into()), app: Some("client.exe".into()), reason: sieve_filter::exclusions::AutoReason::Pinning });
         assert_eq!(e.exclusions().rows.iter().filter(|r| r.reason == "auto:pinning").count(), 0);
     }
 

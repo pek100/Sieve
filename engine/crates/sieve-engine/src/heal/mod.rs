@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rustls::AlertDescription;
-use sieve_filter::exclusions::{AutoReason, Pattern};
+use sieve_filter::exclusions::{AutoReason, Pattern, exe_file_name};
 use sieve_ipc::HealNotice;
 
 use crate::exclusions::{AutoEntry, ExclusionSlot};
@@ -28,13 +28,13 @@ use crate::stack::Meters;
 use crate::tls::intercept::{ClientWatch, Pair};
 
 use notices::Notices;
-use score::{Evidence, Ledger, exe_name};
+use score::{Evidence, Ledger};
 
 /// What "Try decrypting again" names. Only ever `auto:*` entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Retry {
-    /// One row: its pattern, and its app (None for an entry of every app).
-    One { pattern: Pattern, app: Option<String> },
+    /// One row: its pattern, its app (None for an entry of every app) and its reason.
+    One { pattern: Pattern, app: Option<String>, reason: AutoReason },
     /// Every `auto:pinning` entry of this app.
     App { app: String },
 }
@@ -71,28 +71,35 @@ impl Heal {
         // A second refusal of a held entry says nothing new, and raises no notice.
         if self.exclusions.add_auto(AutoEntry::for_app(&pair.host, exe, AutoReason::Pinning, now_ms), now_ms) {
             Meters::bump(&self.meters.https.healed);
-            state.notices.push(session, &exe_name(exe), &pair.host.to_ascii_lowercase(), now_ms);
+            state.notices.push(session, &exe_file_name(exe), &pair.host.to_ascii_lowercase(), now_ms);
         }
     }
 
     /// Takes the named entries back, and seeds each score to 1: a client that still
     /// pins with silent closes is excluded by one more, not two. After a restart
-    /// the seed is gone and it takes two, which is harmless. The answer is how many
-    /// entries were taken back.
+    /// the seed is gone and it takes two, which is harmless. The app's notice groups
+    /// close, so a refusal of what was tried is a notice of its own. The answer is how
+    /// many entries were taken back.
     pub fn try_again(&self, retry: &Retry, now_ms: u64) -> usize {
         let mut state = self.state();
         match retry {
-            Retry::One { pattern, app } => {
-                if !self.exclusions.try_again(pattern, app.as_deref(), now_ms) {
+            Retry::One { pattern, app, reason } => {
+                if !self.exclusions.try_again(pattern, app.as_deref(), *reason, now_ms) {
                     return 0;
                 }
-                if let (Pattern::Exact(host), Some(app)) = (pattern, app) {
-                    state.ledger.seed(app, host, now_ms);
+                if let Some(app) = app {
+                    state.notices.close(app);
+                    if let Pattern::Exact(host) = pattern {
+                        state.ledger.seed(app, host, now_ms);
+                    }
                 }
                 1
             }
             Retry::App { app } => {
                 let hosts = self.exclusions.try_again_app(app, AutoReason::Pinning, now_ms);
+                if !hosts.is_empty() {
+                    state.notices.close(app);
+                }
                 for pattern in &hosts {
                     if let Pattern::Exact(host) = pattern {
                         state.ledger.seed(app, host, now_ms);
@@ -158,7 +165,7 @@ mod tests {
     }
 
     fn one_row() -> Retry {
-        Retry::One { pattern: Pattern::Exact(HOST.into()), app: Some("client.exe".into()) }
+        Retry::One { pattern: Pattern::Exact(HOST.into()), app: Some("client.exe".into()), reason: AutoReason::Pinning }
     }
 
     #[test]
@@ -173,7 +180,9 @@ mod tests {
         let rows = h.exclusions.rows(NOW + 9);
         let row = rows.iter().find(|r| r.reason == "auto:pinning").unwrap();
         assert_eq!((row.created_ms, row.retries), (Some(NOW), 1), "its first date, and the try");
-        assert_eq!(h.notices(0).1[0].total, 2, "and a new notice: inside the window, the same group");
+        let notices = h.notices(0).1;
+        assert_eq!(notices.iter().map(|n| (n.id, n.total)).collect::<Vec<_>>(), [(1, 1), (2, 1)], "a new notice of one site, inside the window too; the first stands");
+        assert_eq!(notices[1].hosts, [HOST]);
     }
 
     #[test]
@@ -183,6 +192,43 @@ mod tests {
         h.try_again(&one_row(), NOW);
         h.hear(&pair(CLIENT, HOST), refused(), NOW + NOTICE_WINDOW_MS);
         assert_eq!(h.notices(0).1.len(), 2);
+    }
+
+    #[test]
+    fn trying_all_again_does_not_double_the_count() {
+        let h = heal();
+        for host in ["a.example", "b.example"] {
+            h.hear(&pair(CLIENT, host), refused(), NOW);
+        }
+        h.try_again(&Retry::App { app: "client.exe".into() }, NOW + 1);
+        for host in ["a.example", "b.example"] {
+            h.hear(&pair(CLIENT, host), refused(), NOW + 2);
+        }
+        assert_eq!(h.notices(0).1.iter().map(|n| (n.id, n.total)).collect::<Vec<_>>(), [(1, 2), (2, 2)]);
+    }
+
+    #[test]
+    fn a_try_that_took_nothing_back_leaves_the_group_open() {
+        let h = heal();
+        h.hear(&pair(CLIENT, "a.example"), refused(), NOW);
+        assert_eq!(h.try_again(&one_row(), NOW), 0);
+        assert_eq!(h.try_again(&Retry::App { app: "other.exe".into() }, NOW), 0);
+        h.hear(&pair(CLIENT, "b.example"), refused(), NOW);
+        assert_eq!(h.notices(0).1.iter().map(|n| n.total).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn a_host_evicted_from_the_store_and_refused_again_counts_once() {
+        let h = heal();
+        h.hear(&pair(CLIENT, HOST), refused(), NOW);
+        for i in 0..crate::exclusions::auto::MAX_PER_REASON {
+            h.hear(&pair(OTHER, &format!("h{i}.example")), refused(), NOW);
+        }
+        assert_eq!(found(&h, CLIENT, NOW), None, "the control: the flood evicted it");
+        h.hear(&pair(CLIENT, HOST), refused(), NOW + 1);
+        assert_eq!(found(&h, CLIENT, NOW + 1), Some(Src::Auto(AutoReason::Pinning)));
+        let notices = h.notices(0).1;
+        assert_eq!(notices.iter().find(|n| n.exe == "client.exe").unwrap().total, 1);
     }
 
     #[test]

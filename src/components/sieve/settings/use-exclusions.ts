@@ -2,7 +2,7 @@
 
 import { useCallback, useMemo, useState } from "react";
 import { httpsInForce } from "@/core/engine";
-import { EXCLUSIONS_SHOWN, exclusionLine, filterRows, groupsOf, hasRejected, mergeRows, runningApp, type ExclusionView, type ReasonGroup } from "@/core/exclusions";
+import { EXCLUSIONS_SHOWN, exclusionLine, exeFileName, filterRows, groupsOf, hasRejected, mergeRows, refusedLineWords, runningApp, type ExclusionView, type ReasonGroup } from "@/core/exclusions";
 import { addLine, removeLine } from "@/core/log-actions";
 import { groupApps } from "@/core/apps";
 import { newest, type SieveState } from "@/core/store";
@@ -75,7 +75,7 @@ export function useExclusions(): ExclusionsModel {
   const running = useMemo<RunningExe[]>(() => {
     const byFile = new Map<string, string>();
     for (const a of snapshot ? groupApps(snapshot) : []) {
-      for (const exe of a.exes) byFile.set((exe.split(/[\\/]/).pop() ?? "").toLowerCase(), a.name);
+      for (const exe of a.exes) byFile.set(exeFileName(exe), a.name);
     }
     return [...byFile].map(([file, name]) => ({ file, name })).sort((x, y) => x.name.localeCompare(y.name) || x.file.localeCompare(y.file));
   }, [snapshot]);
@@ -96,6 +96,8 @@ export function useExclusions(): ExclusionsModel {
   const add = useCallback(
     (host: string, forApp: string | null) => {
       const line = exclusionLine(host, forApp);
+      const refused = refusedLineWords(line);
+      if (refused !== null) return refused;
       if (now().includes(line)) return `${line} is already in the list.`;
       writeLines(addLine(now(), line)).catch(said);
       return null;
@@ -146,9 +148,9 @@ export function useExclusions(): ExclusionsModel {
     actionError: e.exclusionsActionError ?? null,
     add,
     remove,
-    tryAgain: (row) => void tryDecryptAgain(row.line, row.apps[0] ?? null),
+    tryAgain: (row) => void tryDecryptAgain(row.line, row.apps[0] ?? null, row.reason),
     tryAll: () => {
-      if (app !== null) void tryDecryptAgain(null, app);
+      if (app !== null) void tryDecryptAgain(null, app, null);
     },
   };
 }

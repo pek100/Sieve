@@ -10,13 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sieve_ipc::nonblocking::{read_frame, write_frame};
-use sieve_filter::exclusions::parse_line;
+use sieve_filter::exclusions::{AutoReason, exe_file_name, parse_line};
 use sieve_ipc::{CertStatus, ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, ExclusionsView, FLOWS_PER_FRAME, FlowEvent, FrameError, HealNotice, ListStatus, LogRow, Policy, answer_hello, exclusions_page, log_frames};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 
 use crate::heal::Retry;
-use crate::heal::score::exe_name;
 use crate::stack::book::{log_visible_to, notice_visible_to, visible_to};
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -30,7 +29,7 @@ pub const HELLO_WAIT: Duration = Duration::from_secs(5);
 pub const NOT_ALLOWED: &str = "only the installed Sieve app may connect to the engine";
 pub const HELLO_FIRST: &str = "send hello first";
 pub const HELLO_ONCE: &str = "hello was already sent";
-pub const RETRY_NOTHING: &str = "try again needs a line or an app";
+pub const RETRY_NOTHING: &str = "try again needs a line and its reason, or an app alone";
 
 /// What the pipe asks of the engine (the running engine is
 /// `control::Engine`; tests use a fake).
@@ -160,7 +159,7 @@ where
                 Err(message) => EngineMessage::Error { message },
             },
             Ok(ClientMessage::Exclusions { after }) => exclusions_page(&backend.exclusions(), after)?,
-            Ok(ClientMessage::TryDecryptAgain { line, app }) => match retry_of(line.as_deref(), app.as_deref()) {
+            Ok(ClientMessage::TryDecryptAgain { line, app, reason }) => match retry_of(line.as_deref(), app.as_deref(), reason.as_deref()) {
                 Ok(retry) => {
                     backend.try_decrypt_again(retry);
                     exclusions_page(&backend.exclusions(), 0)?
@@ -180,15 +179,16 @@ where
 }
 
 /// What a `try_decrypt_again` names, or why it names nothing.
-fn retry_of(line: Option<&str>, app: Option<&str>) -> Result<Retry, String> {
-    let app = app.map(exe_name);
-    match (line, app) {
-        (Some(line), app) => {
+fn retry_of(line: Option<&str>, app: Option<&str>, reason: Option<&str>) -> Result<Retry, String> {
+    let app = app.map(exe_file_name);
+    match (line, app, reason) {
+        (Some(line), app, Some(reason)) => {
             let entry = parse_line(line.trim()).map_err(|why| format!("not an exclusion line: {why:?}"))?;
-            Ok(Retry::One { pattern: entry.pattern, app })
+            let reason = AutoReason::from_slug(reason).ok_or_else(|| format!("not a reason the engine writes: {reason}"))?;
+            Ok(Retry::One { pattern: entry.pattern, app, reason })
         }
-        (None, Some(app)) => Ok(Retry::App { app }),
-        (None, None) => Err(RETRY_NOTHING.to_string()),
+        (None, Some(app), None) => Ok(Retry::App { app }),
+        _ => Err(RETRY_NOTHING.to_string()),
     }
 }
 
@@ -388,13 +388,13 @@ mod tests {
     async fn try_decrypt_again_answers_over_the_pipe() {
         let fake = Fake::new(vec![]);
         let (mut c, task) = welcomed(fake.clone(), 1).await;
-        send(&mut c, &ClientMessage::TryDecryptAgain { line: Some("\"pin.example\"".into()), app: Some(r"C:\Apps\Client.EXE".into()) }).await;
+        send(&mut c, &ClientMessage::TryDecryptAgain { line: Some("\"pin.example\"".into()), app: Some(r"C:\Apps\Client.EXE".into()), reason: Some("auto:pinning".into()) }).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Exclusions { revision: 4, rows, next: None, .. } if rows.len() == 1), "the first page");
-        send(&mut c, &ClientMessage::TryDecryptAgain { line: None, app: Some("client.exe".into()) }).await;
+        send(&mut c, &ClientMessage::TryDecryptAgain { line: None, app: Some("client.exe".into()), reason: None }).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Exclusions { .. }));
         assert_eq!(
             *fake.retries.lock().unwrap(),
-            [Retry::One { pattern: sieve_filter::exclusions::Pattern::Exact("pin.example".into()), app: Some("client.exe".into()) }, Retry::App { app: "client.exe".into() }]
+            [Retry::One { pattern: sieve_filter::exclusions::Pattern::Exact("pin.example".into()), app: Some("client.exe".into()), reason: AutoReason::Pinning }, Retry::App { app: "client.exe".into() }]
         );
         drop(c);
         task.await.unwrap().unwrap();
@@ -404,7 +404,7 @@ mod tests {
     async fn an_unparsable_line_is_an_error_and_ends_nothing() {
         let fake = Fake::new(vec![]);
         let (mut c, task) = welcomed(fake.clone(), 1).await;
-        send(&mut c, &ClientMessage::TryDecryptAgain { line: Some("not a host".into()), app: None }).await;
+        send(&mut c, &ClientMessage::TryDecryptAgain { line: Some("not a host".into()), app: None, reason: Some("auto:pinning".into()) }).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Error { .. }));
         send(&mut c, &ClientMessage::Exclusions { after: 0 }).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Exclusions { .. }), "the pipe stays");
@@ -417,8 +417,22 @@ mod tests {
     async fn both_none_is_refused() {
         let fake = Fake::new(vec![]);
         let (mut c, task) = welcomed(fake.clone(), 1).await;
-        send(&mut c, &ClientMessage::TryDecryptAgain { line: None, app: None }).await;
+        send(&mut c, &ClientMessage::TryDecryptAgain { line: None, app: None, reason: None }).await;
         assert_eq!(recv(&mut c).await, EngineMessage::Error { message: RETRY_NOTHING.into() });
+        assert!(fake.retries.lock().unwrap().is_empty());
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_row_needs_a_reason_the_engine_writes_and_the_bulk_form_takes_none() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = welcomed(fake.clone(), 1).await;
+        let line = || Some("\"pin.example\"".to_string());
+        for (line, reason) in [(line(), None), (line(), Some("list:sensitive")), (line(), Some("user")), (line(), Some("auto:someday")), (None, Some("auto:pinning"))] {
+            send(&mut c, &ClientMessage::TryDecryptAgain { line, app: Some("client.exe".into()), reason: reason.map(str::to_string) }).await;
+            assert!(matches!(recv(&mut c).await, EngineMessage::Error { .. }), "{reason:?}");
+        }
         assert!(fake.retries.lock().unwrap().is_empty());
         drop(c);
         task.await.unwrap().unwrap();

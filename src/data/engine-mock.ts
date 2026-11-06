@@ -30,8 +30,8 @@
  * "Try decrypting again" takes an `auto:*` row away, as the engine would.
  * `?heal=1` is an engine that holds `https` on: the app cannot turn it on while
  * `filtering.https` is unavailable, so this mock refuses being told off (refused
- * policies are retried at the next probe, not at once), and it reports one
- * exclusion on the first read and a second of the same group on the next.
+ * policies are retried at the next probe, not at once), and it has nothing to
+ * tell on the first read, then one exclusion, then a second of the same group.
  */
 import { hash01 } from "./prng";
 import fixture from "./fixtures/engine-probe-v3.json";
@@ -247,10 +247,10 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
       requireWelcome();
       return page(after);
     },
-    tryDecryptAgain: async (line, app) => {
+    tryDecryptAgain: async (line, app, reason) => {
       requireWelcome();
       if (line === null && app === null) throw new Error("try again needs a line or an app");
-      const named = (r: (typeof rows)[number]) => r.reason.startsWith("auto:") && (line === null ? r.reason === "auto:pinning" && r.apps.includes(app ?? "") : r.line === line && (r.apps[0] ?? null) === app);
+      const named = (r: (typeof rows)[number]) => r.reason.startsWith("auto:") && (line === null ? r.reason === "auto:pinning" && r.apps.includes(app ?? "") : r.line === line && (r.apps[0] ?? null) === app && r.reason === reason);
       if (rows.some(named)) {
         rows = rows.filter((r) => !named(r));
         rowsRevision += 1;
@@ -261,7 +261,7 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
       requireWelcome();
       if (!holdsHttps) return { revision: 0, exclusions_revision: rowsRevision, notices: [] };
       healReads += 1;
-      const rev = Math.min(healReads, first.hosts.length);
+      const rev = Math.min(healReads - 1, first.hosts.length);
       const notice = { ...first, hosts: first.hosts.slice(0, rev), total: rev, rev };
       // A cursor past the newest is from before a restart, so it reads from the start.
       return { revision: rev, exclusions_revision: rowsRevision, notices: rev > (after > rev ? 0 : after) ? [notice] : [] };

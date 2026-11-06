@@ -81,7 +81,7 @@ export function useEngine(): EngineSlice {
 }
 
 /** The engine's user actions: the AdGuard pause offer and its undo, the certificate's Reinstall, the update button, "Try decrypting again" (through the engine controller). */
-export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdguard: () => Promise<void>; installRoot: () => Promise<void>; requestUpdate: () => Promise<void>; tryDecryptAgain: (line: string | null, app: string | null) => Promise<void> } {
+export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdguard: () => Promise<void>; installRoot: () => Promise<void>; requestUpdate: () => Promise<void>; tryDecryptAgain: (line: string | null, app: string | null, reason: string | null) => Promise<void> } {
   const { engineController, lockController } = useRuntime();
   return useMemo(
     () => ({
@@ -89,7 +89,7 @@ export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdg
       startAdguard: () => lockController.guard(() => engineController.startAdguard()),
       installRoot: () => lockController.guard(() => engineController.installRoot()),
       requestUpdate: () => lockController.guard(() => engineController.requestUpdate()),
-      tryDecryptAgain: (line, app) => lockController.guard(() => engineController.tryDecryptAgain(line, app)),
+      tryDecryptAgain: (line, app, reason) => lockController.guard(() => engineController.tryDecryptAgain(line, app, reason)),
     }),
     [engineController, lockController],
   );

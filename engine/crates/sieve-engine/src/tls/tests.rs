@@ -1663,7 +1663,7 @@ async fn the_tests_dial_only_loopback() {
 fn an_auto_entry_is_taken_back_by_its_pattern() {
     let slot = ExclusionSlot::with_sources(None, &[], Vec::new(), wall_ms());
     slot.add_auto(AutoEntry::host(HOST, AutoReason::Pinning, wall_ms(), None), wall_ms());
-    assert!(slot.try_again(&Pattern::Exact(HOST.into()), None, wall_ms()));
+    assert!(slot.try_again(&Pattern::Exact(HOST.into()), None, AutoReason::Pinning, wall_ms()));
 }
 
 // ---- Self-healing, the whole path (slice 7): the real `Heal` as the watch.

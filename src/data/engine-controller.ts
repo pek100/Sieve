@@ -60,7 +60,7 @@ export interface EngineController {
   /** The update button: `RequestUpdate`, whose meaning the engine decides. */
   requestUpdate(): Promise<void>;
   /** "Try decrypting again": one row, or with no line one app's rejected sites. */
-  tryDecryptAgain(line: string | null, app: string | null): Promise<void>;
+  tryDecryptAgain(line: string | null, app: string | null, reason: string | null): Promise<void>;
 }
 
 export interface EngineControllerDeps {
@@ -157,7 +157,9 @@ export function createEngineController({ engine, store, clock, settings, checks,
   let banner: number | null = null;
   let update: { id: number; text: string } | null = null;
   let probeNow: () => Promise<void> = async () => {};
-  let healAfter = 0;
+  // Null until the first read. The engine is a service that outlives this window,
+  // so what it did before that read is not news: the rows show it, and no toast does.
+  let healAfter: number | null = null;
   let healRun = 0;
 
   const get = () => store.getState().engine;
@@ -349,10 +351,11 @@ export function createEngineController({ engine, store, clock, settings, checks,
       return;
     }
     try {
-      const answer = await engine.healNotices(healAfter);
-      if (answer.revision < healAfter) healRun += 1;
+      const answer = await engine.healNotices(healAfter ?? 0);
+      const baseline = healAfter === null;
+      if (healAfter !== null && answer.revision < healAfter) healRun += 1;
       healAfter = answer.revision;
-      if (answer.notices.length > 0) {
+      if (!baseline && answer.notices.length > 0) {
         const fresh: HealGroup[] = answer.notices.map((n) => ({ ...n, key: `${healRun}:${n.id}` }));
         const kept = (get().healNotices ?? []).filter((g) => !fresh.some((n) => n.key === g.key));
         set({ healNotices: [...kept, ...fresh].slice(-HEAL_KEPT) });
@@ -365,10 +368,10 @@ export function createEngineController({ engine, store, clock, settings, checks,
     }
   };
 
-  const tryDecryptAgain = async (line: string | null, app: string | null) => {
+  const tryDecryptAgain = async (line: string | null, app: string | null, reason: string | null) => {
     set({ exclusionsActionError: null });
     try {
-      set({ exclusions: await walkRows(await engine.tryDecryptAgain(line, app)) });
+      set({ exclusions: await walkRows(await engine.tryDecryptAgain(line, app, reason)) });
     } catch (e) {
       set({ exclusionsActionError: `Sieve could not try that again: ${message(e)}` });
     }

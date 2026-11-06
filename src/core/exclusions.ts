@@ -106,6 +106,16 @@ export function parseExclusionLine(raw: string): ParsedLine | { refused: LineRef
 /** The line a new row of the user writes: a host, and an app when one is named. */
 export const exclusionLine = (host: string, app: string | null) => (app ? `${host}$${APP_MODIFIER}${app}` : host);
 
+/** What a stored line the engine skips says in place of its reason. */
+export const REFUSED_LINE_WORDS = "Sieve cannot read this line, so it does nothing";
+
+/** Why a new line would do nothing, or null when the engine reads it. */
+export function refusedLineWords(line: string): string | null {
+  const parsed = parseExclusionLine(line);
+  if (!("refused" in parsed)) return null;
+  return parsed.refused === "BadAppName" ? "A rule cannot name this app, because of a character in its file name. Add the site for all apps instead." : `Sieve cannot read ${line}.`;
+}
+
 // ---- Reasons.
 
 const USER = "user";
@@ -193,21 +203,26 @@ export interface ExclusionView {
   reason: string;
   createdMs: number | null;
   retries: number;
+  /** A user's line the engine skips: it excludes nothing, for any app. */
+  refused: boolean;
 }
 
 const isAuto = (r: Pick<ExclusionView, "reason">) => r.reason.startsWith(AUTO);
 export const canTryAgain = isAuto;
 
-/** The user's lines first, then the engine's layers. A line the engine would skip still shows, so it can be removed. */
+/** The user's lines first, then the engine's layers. A line the engine would skip still shows, marked, so it can be removed. */
 export function mergeRows(userLines: readonly string[], engineRows: readonly ExclusionRow[]): ExclusionView[] {
   const mine = userLines.map((raw): ExclusionView => {
     const parsed = parseExclusionLine(raw);
     const refused = "refused" in parsed;
-    return { key: `${USER}|${raw}`, line: refused ? raw : raw.split("$")[0].trim(), userLine: raw, apps: refused ? [] : parsed.apps, reason: USER, createdMs: null, retries: 0 };
+    return { key: `${USER}|${raw}`, line: refused ? raw : raw.split("$")[0].trim(), userLine: raw, apps: refused ? [] : parsed.apps, reason: USER, createdMs: null, retries: 0, refused };
   });
-  const engine = engineRows.map((r, i): ExclusionView => ({ key: `${r?.reason}|${r?.line}|${(r?.apps ?? []).join("|")}|${i}`, line: r?.line ?? "", userLine: null, apps: r?.apps ?? [], reason: r?.reason ?? "", createdMs: r?.created_ms ?? null, retries: r?.retries ?? 0 }));
+  const engine = engineRows.map((r, i): ExclusionView => ({ key: `${r?.reason}|${r?.line}|${(r?.apps ?? []).join("|")}|${i}`, line: r?.line ?? "", userLine: null, apps: r?.apps ?? [], reason: r?.reason ?? "", createdMs: r?.created_ms ?? null, retries: r?.retries ?? 0, refused: false }));
   return [...mine, ...engine];
 }
+
+/** What a row says of itself: its reason, or that it does nothing. */
+export const rowReasonWords = (r: Pick<ExclusionView, "reason" | "refused">) => (r.refused ? REFUSED_LINE_WORDS : exclusionReasonWords(r.reason));
 
 /** The filter's groups: "all", then those the rows hold, in a fixed order. */
 export function groupsOf(rows: readonly Pick<ExclusionView, "reason">[]): ReasonGroup[] {
@@ -221,7 +236,8 @@ export function retryWords(retries: number): string | null {
   return retries === 1 ? "tried again 1 time" : `tried again ${retries} times`;
 }
 
-const appliesTo = (r: Pick<ExclusionView, "apps">, app: string) => r.apps.length === 0 || r.apps.includes(app);
+/** Whether a row excludes anything for an app with one of these file names. */
+const appliesTo = (r: Pick<ExclusionView, "apps" | "refused">, ...files: readonly string[]) => !r.refused && (r.apps.length === 0 || files.some((f) => r.apps.includes(f)));
 
 export interface ExclusionFilter {
   group: ReasonGroup;
@@ -235,7 +251,7 @@ export function filterRows(rows: readonly ExclusionView[], { group, query, app }
   return rows.filter((r) => {
     if (group !== "all" && reasonGroup(r.reason) !== group) return false;
     if (app !== null && !appliesTo(r, app)) return false;
-    const hay = [r.line, ...r.apps, ...r.apps.map((a) => nameOf(a) ?? ""), exclusionReasonWords(r.reason)].join(" ").toLowerCase();
+    const hay = [r.line, ...r.apps, ...r.apps.map((a) => nameOf(a) ?? ""), rowReasonWords(r)].join(" ").toLowerCase();
     return words.every((w) => hay.includes(w));
   });
 }
@@ -245,13 +261,14 @@ export const hasRejected = (rows: readonly ExclusionView[], app: string) => rows
 
 // ---- Names.
 
-const fileName = (exe: string) => (exe.split(/[\\/]/).pop() ?? "").toLowerCase();
+/** An exe path as a line names it: the file name, lower case. */
+export const exeFileName = (exe: string) => (exe.split(/[\\/]/).pop() ?? "").toLowerCase();
 
 /** A running app that has this exe file, for its name and icon. */
 export function runningApp(snapshot: Snapshot | null | undefined, exe: string): { key: string; name: string; exe: string } | null {
   if (!snapshot) return null;
   for (const app of groupApps(snapshot)) {
-    const path = app.exes.find((e) => fileName(e) === exe);
+    const path = app.exes.find((e) => exeFileName(e) === exe);
     if (path) return { key: app.key, name: app.name, exe: path };
   }
   return null;
@@ -259,8 +276,8 @@ export function runningApp(snapshot: Snapshot | null | undefined, exe: string): 
 
 // ---- The deep link.
 
-const APP_PARAM = "exclusionsApp";
-const REASON_PARAM = "exclusionsReason";
+export const APP_PARAM = "exclusionsApp";
+export const REASON_PARAM = "exclusionsReason";
 
 export function exclusionsHref(app: string | null = null, reason: ReasonGroup | null = null): string {
   const q = new URLSearchParams();
@@ -292,13 +309,13 @@ export type AppDecryption = { line: null } | { line: string; count: number; app:
  * the app is Off (the switch's own line says that), HTTPS is not in force or the
  * engine has not answered: nothing here claims what is not known.
  */
-export function appDecryption(e: EngineSlice, app: { on: boolean; exes: readonly string[] }, rows: readonly Pick<ExclusionView, "apps">[]): AppDecryption {
+export function appDecryption(e: EngineSlice, app: { on: boolean; exes: readonly string[] }, rows: readonly Pick<ExclusionView, "apps" | "refused">[]): AppDecryption {
   const facts = e.exclusions;
   if (!app.on || !httpsInForce(e) || !facts) return { line: null };
   const inScope = facts.scope === "all" || app.exes.some((x) => facts.browsers.includes(x.toLowerCase()));
   if (!inScope) return { line: DOES_NOT_DECRYPT_TEXT, count: 0, app: null };
-  const files = app.exes.map(fileName);
-  const count = rows.filter((r) => r.apps.length === 0 || files.some((f) => r.apps.includes(f))).length;
+  const files = app.exes.map(exeFileName);
+  const count = rows.filter((r) => appliesTo(r, ...files)).length;
   if (count === 0) return { line: DECRYPTS_TEXT, count, app: null };
   return { line: `Sieve decrypts this app's HTTPS except ${count.toLocaleString("en-US")} ${count === 1 ? "site" : "sites"}`, count, app: files[0] ?? null };
 }

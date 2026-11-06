@@ -122,12 +122,13 @@ pub enum ClientMessage {
     RequestUpdate {},
     /// Asks for one page of [`EngineMessage::Exclusions`], from row `after`.
     Exclusions { after: u32 },
-    /// "Try decrypting again": a `line` in the list grammar for this `app` (None
-    /// for an entry of every app), or with no `line` every `auto:pinning` entry of
-    /// `app`. Answered with the first page of [`EngineMessage::Exclusions`]; an
-    /// unparsable line or neither field is an Error. No field reaches the user or
+    /// "Try decrypting again": one row, by its `line` in the list grammar, its `app`
+    /// (None for an entry of every app) and its `reason` slug; or with neither `line`
+    /// nor `reason`, every `auto:pinning` entry of `app`. Answered with the first page
+    /// of [`EngineMessage::Exclusions`]; an unparsable line, a reason that is not
+    /// `auto:*`, or any other mix of fields is an Error. No field reaches the user or
     /// list layers (plan 4.3, S24).
-    TryDecryptAgain { line: Option<String>, app: Option<String> },
+    TryDecryptAgain { line: Option<String>, app: Option<String>, reason: Option<String> },
     /// Asks for [`EngineMessage::HealNotices`] newer than revision `after`.
     HealNotices { after: u64 },
 }

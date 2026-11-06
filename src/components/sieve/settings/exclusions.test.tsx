@@ -1,8 +1,8 @@
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { ENGINE_SWITCH, HTTPS_SWITCH, type EngineSlice } from "@/core/engine";
-import { EXCLUSIONS_SHOWN, FLOOR_LINE, NOT_IN_FORCE_LINE } from "@/core/exclusions";
+import { EXCLUSIONS_SHOWN, FLOOR_LINE, NOT_IN_FORCE_LINE, REFUSED_LINE_WORDS } from "@/core/exclusions";
 import { createMockEngine } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
 import { createMockSource } from "@/data/mock-source";
@@ -11,6 +11,7 @@ import { memoryBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { ExclusionsGroup } from "./exclusions-group";
+import { useExclusions } from "./use-exclusions";
 
 vi.setConfig({ testTimeout: 20_000 });
 
@@ -147,6 +148,28 @@ describe("Not decrypted", () => {
     expect(runtime.settings.get("filtering.exclusions")).toEqual(["mine.example"]);
   });
 
+  it("a line the engine would discard is refused, with why, and nothing is written", async () => {
+    const values = { [ENGINE_SWITCH]: false, "filtering.exclusions": [] as string[] };
+    const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend({ schema: 5, values }), engine: createMockEngine("idle") });
+    const { result } = renderHook(() => useExclusions(), { wrapper: ({ children }) => <SieveProvider runtime={runtime}>{children}</SieveProvider> });
+    await act(async () => {
+      await runtime.settings.ready;
+    });
+    expect(result.current.add("space.example", "code - insiders.exe")).toMatch(/for all apps/);
+    expect(runtime.settings.get("filtering.exclusions")).toEqual([]);
+    expect(result.current.add("space.example", "code.exe"), "the control").toBeNull();
+    await vi.waitFor(() => expect(runtime.settings.get("filtering.exclusions")).toEqual(["space.example$app=code.exe"]));
+  });
+
+  it("a line already stored that the engine discards says so, names no app, and can be removed", async () => {
+    await withRows({ lines: ["space.example$app=a b.exe"] });
+    const row = rowOf("space.example$app=a b.exe");
+    expect(row).toHaveTextContent(REFUSED_LINE_WORDS);
+    expect(row).not.toHaveTextContent("You added this");
+    expect(row).not.toHaveTextContent("All apps");
+    expect(within(row).getByRole("button", { name: "Remove space.example$app=a b.exe" })).toBeInTheDocument();
+  });
+
   it("a write the budget refuses is said, as the Filters page says it", async () => {
     const { runtime, user } = await withRows({ lines: ["mine.example"] });
     runtime.settings.set = (() => Promise.reject(new Error("over the budget"))) as never;
@@ -170,10 +193,10 @@ describe("Not decrypted", () => {
     const tryAgain = vi.spyOn(engine, "tryDecryptAgain");
     const { user } = await withRows({ engine });
     await user.click(within(rowOf('"pin.example"')).getByRole("button", { name: 'Try decrypting "pin.example" again' }));
-    expect(tryAgain).toHaveBeenCalledExactlyOnceWith('"pin.example"', "client.exe");
+    expect(tryAgain).toHaveBeenCalledExactlyOnceWith('"pin.example"', "client.exe", "auto:pinning");
     await vi.waitFor(() => expect(screen.queryByText('"pin.example"')).toBeNull());
     await user.click(within(rowOf('"ev.example"')).getByRole("button", { name: 'Try decrypting "ev.example" again' }));
-    expect(tryAgain).toHaveBeenLastCalledWith('"ev.example"', null);
+    expect(tryAgain).toHaveBeenLastCalledWith('"ev.example"', null, "auto:ev");
   });
 
   it("try all, for the app the view is filtered to", async () => {
@@ -182,7 +205,7 @@ describe("Not decrypted", () => {
     const { user } = await withRows({ engine, search: "?exclusionsApp=client.exe&exclusionsReason=pinning" });
     expect(lines()).toEqual(['"pin.example"']);
     await user.click(screen.getByRole("button", { name: "Try decrypting all again" }));
-    expect(tryAgain).toHaveBeenCalledExactlyOnceWith(null, "client.exe");
+    expect(tryAgain).toHaveBeenCalledExactlyOnceWith(null, "client.exe", null);
     await vi.waitFor(() => expect(screen.queryByText('"pin.example"')).toBeNull());
     expect(screen.queryByRole("button", { name: "Try decrypting all again" }), "nothing left to try").toBeNull();
   });

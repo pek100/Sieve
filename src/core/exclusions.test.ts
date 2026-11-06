@@ -10,6 +10,7 @@ import {
   DOES_NOT_DECRYPT_TEXT,
   FLOOR_LINE,
   FLOOR_WORDS,
+  REFUSED_LINE_WORDS,
   appDecryption,
   canTryAgain,
   exclusionLine,
@@ -22,7 +23,9 @@ import {
   mergeRows,
   noticeText,
   reasonGroup,
+  refusedLineWords,
   retryWords,
+  rowReasonWords,
 } from "./exclusions";
 
 const rows = parseExclusionsPage(ipc.engine.find((m) => m.type === "exclusions")).rows;
@@ -117,8 +120,29 @@ describe("rows", () => {
     expect(by("all", "the client")).toEqual(["shop.example", '"pin.example"']);
     expect(by("all", "rejected certificate")).toEqual(['"pin.example"']);
     expect(by("all", "nothing-like-this")).toEqual([]);
-    expect(by("all", "", "client.exe"), "what applies to it: its own and every app's").toEqual(["mine.example", "shop.example", "not a line", "bank.example", '"pin.example"', '"cert.example"', '"ev.example"']);
+    expect(by("all", "", "client.exe"), "what applies to it: its own and every app's").toEqual(["mine.example", "shop.example", "bank.example", '"pin.example"', '"cert.example"', '"ev.example"']);
     expect(by("all", "", "other.exe")).not.toContain('"pin.example"');
+  });
+
+  it("a line the engine would skip is marked, shows so it can be removed, and applies to no app", () => {
+    const skipped = "space.example$app=a b.exe";
+    const [read, refused] = mergeRows(["mine.example", skipped], []);
+    expect([read.refused, refused.refused]).toEqual([false, true]);
+    expect(merged.filter((r) => r.reason !== "user").every((r) => !r.refused)).toBe(true);
+    expect(refused.userLine).toBe(skipped);
+    expect(refused.line, "as it was written: nothing of it was read").toBe(skipped);
+    expect(rowReasonWords(read)).toBe("You added this");
+    expect(rowReasonWords(refused)).toBe(REFUSED_LINE_WORDS);
+    expect(filterRows([refused], { group: "all", query: "", app: null }, () => null), "it stays on the list").toEqual([refused]);
+    expect(filterRows([refused], { group: "all", query: "does nothing", app: null }, () => null)).toEqual([refused]);
+    expect(filterRows([refused], { group: "all", query: "", app: "a b.exe" }, () => null)).toEqual([]);
+  });
+
+  it("says why a new line would do nothing, and nothing of a line the engine reads", () => {
+    expect(refusedLineWords(exclusionLine("a.example", "x.exe"))).toBeNull();
+    expect(refusedLineWords(exclusionLine("a.example", null))).toBeNull();
+    expect(refusedLineWords(exclusionLine("a.example", "code - insiders.exe"))).toMatch(/for all apps/);
+    expect(refusedLineWords("not a host")).toMatch(/not a host/);
   });
 
   it("knows when an app has rejected sites to try again", () => {
@@ -173,6 +197,11 @@ describe("the app sheet's line", () => {
   it("another app's row does not count", () => {
     const only = mergeRows(["shop.example$app=client.exe"], []);
     expect(appDecryption(slice(true), chrome, only).line).toBe(DECRYPTS_TEXT);
+  });
+
+  it("a line the engine discards is no exception: the site is decrypted", () => {
+    const refused = mergeRows(["space.example$app=a b.exe", "not a line"], []);
+    expect(appDecryption(slice(true), chrome, refused).line).toBe(DECRYPTS_TEXT);
   });
 
   it("in force, out of scope: the words say so, and no row counts", () => {

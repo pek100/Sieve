@@ -274,10 +274,11 @@ impl ExclusionSlot {
     }
 
     /// "Try decrypting again" (plan 4.3) on one row: the entry stops excluding and
-    /// remembers the try. It can only touch this layer: not a user line, not a list
-    /// line, not a floor fact (S24). False when there is no such entry held.
-    pub fn try_again(&self, pattern: &Pattern, app: Option<&str>, now_ms: u64) -> bool {
-        !self.take_back(now_ms, |e| &e.pattern == pattern && e.app.as_deref() == app).is_empty()
+    /// remembers the try. Only that row: another reason's entry for the same pattern
+    /// and app stands. It can only touch this layer: not a user line, not a list line,
+    /// not a floor fact (S24). False when there is no such entry held.
+    pub fn try_again(&self, pattern: &Pattern, app: Option<&str>, reason: AutoReason, now_ms: u64) -> bool {
+        !self.take_back(now_ms, |e| &e.pattern == pattern && e.app.as_deref() == app && e.reason == reason).is_empty()
     }
 
     /// The bulk form, for one app's entries of one reason. The patterns taken back.
@@ -374,8 +375,8 @@ mod tests {
         let again = ExclusionSlot::new(Some(dir.path()), &[], NOW + DAY);
         assert_eq!(find(&again, "cert.example", NOW + DAY), Some(Src::Auto(AutoReason::ClientCert)));
         assert_eq!(find(&again, "pin.example", NOW + DAY), Some(Src::Auto(AutoReason::Pinning)));
-        assert!(again.try_again(&Pattern::Exact("pin.example".into()), None, NOW + DAY));
-        assert!(!again.try_again(&Pattern::Exact("pin.example".into()), None, NOW + DAY), "already taken back");
+        assert!(again.try_again(&Pattern::Exact("pin.example".into()), None, AutoReason::Pinning, NOW + DAY));
+        assert!(!again.try_again(&Pattern::Exact("pin.example".into()), None, AutoReason::Pinning, NOW + DAY), "already taken back");
         again.flush();
         let third = ExclusionSlot::new(Some(dir.path()), &[], NOW + DAY);
         assert_eq!(find(&third, "pin.example", NOW + DAY), None, "try again removed it");
@@ -386,7 +387,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
         slot.add_auto(pinned("pin.example"), NOW);
-        assert!(slot.try_again(&Pattern::Exact("pin.example".into()), None, NOW + 1));
+        assert!(slot.try_again(&Pattern::Exact("pin.example".into()), None, AutoReason::Pinning, NOW + 1));
         slot.flush();
         let again = ExclusionSlot::new(Some(dir.path()), &[], NOW + DAY);
         assert_eq!(find(&again, "pin.example", NOW + DAY), None, "not an exclusion");
@@ -402,7 +403,7 @@ mod tests {
         assert!(slot.add_auto(pinned("a.example"), NOW), "new");
         assert!(!slot.add_auto(pinned("a.example"), NOW), "held");
         assert!(slot.add_auto(AutoEntry::host("a.example", AutoReason::ClientCert, NOW, None), NOW), "another reason is another entry");
-        assert!(slot.try_again(&Pattern::Exact("a.example".into()), None, NOW));
+        assert!(slot.try_again(&Pattern::Exact("a.example".into()), None, AutoReason::Pinning, NOW));
         assert!(slot.add_auto(pinned("a.example"), NOW), "back from a retry");
     }
 
@@ -411,25 +412,39 @@ mod tests {
         use sieve_filter::exclusions::restricted_suffix;
         let slot = ExclusionSlot::new(None, &["bank.example".to_string()], NOW);
         assert_eq!(find(&slot, "bank.example", NOW), Some(Src::User));
-        assert!(!slot.try_again(&Pattern::Subdomains("bank.example".into()), None, NOW), "a user line");
+        assert!(!slot.try_again(&Pattern::Subdomains("bank.example".into()), None, AutoReason::Pinning, NOW), "a user line");
         assert_eq!(find(&slot, "bank.example", NOW), Some(Src::User));
         // The seed's own line: it names a real exclusion the test need not spell.
         let listed = slot.rows(NOW).into_iter().find(|r| r.reason == "list:sensitive").expect("the seed has rows");
         let entry = parse_line(&listed.line).unwrap();
-        assert!(!slot.try_again(&entry.pattern, None, NOW), "a list line");
+        assert!(!slot.try_again(&entry.pattern, None, AutoReason::Pinning, NOW), "a list line");
         assert_eq!(slot.rows(NOW).iter().filter(|r| r.line == listed.line).count(), 1);
-        assert!(!slot.try_again(&Pattern::Exact("service.gov.uk".into()), None, NOW), "a floor fact has no entry to take back");
+        assert!(!slot.try_again(&Pattern::Exact("service.gov.uk".into()), None, AutoReason::Pinning, NOW), "a floor fact has no entry to take back");
         assert!(restricted_suffix("service.gov.uk"), "and stands whatever the store says");
     }
 
     #[test]
     fn retry_of_nothing_is_false() {
         let slot = ExclusionSlot::new(None, &[], NOW);
-        assert!(!slot.try_again(&Pattern::Exact("pin.example".into()), None, NOW));
+        assert!(!slot.try_again(&Pattern::Exact("pin.example".into()), None, AutoReason::Pinning, NOW));
         slot.add_auto(AutoEntry::for_app("pin.example", "client.exe", AutoReason::Pinning, NOW), NOW);
-        assert!(!slot.try_again(&Pattern::Exact("pin.example".into()), Some("other.exe"), NOW), "another app's");
-        assert!(!slot.try_again(&Pattern::Exact("pin.example".into()), None, NOW), "every app's is another entry");
-        assert!(slot.try_again(&Pattern::Exact("pin.example".into()), Some("client.exe"), NOW), "the control");
+        assert!(!slot.try_again(&Pattern::Exact("pin.example".into()), Some("other.exe"), AutoReason::Pinning, NOW), "another app's");
+        assert!(!slot.try_again(&Pattern::Exact("pin.example".into()), None, AutoReason::Pinning, NOW), "every app's is another entry");
+        assert!(slot.try_again(&Pattern::Exact("pin.example".into()), Some("client.exe"), AutoReason::Pinning, NOW), "the control");
+    }
+
+    #[test]
+    fn try_again_takes_back_that_row_and_not_another_reason_on_the_same_host() {
+        let slot = ExclusionSlot::new(None, &[], NOW);
+        let host = Pattern::Exact("both.example".into());
+        slot.add_auto(AutoEntry::host("both.example", AutoReason::ClientCert, NOW, None), NOW);
+        slot.add_auto(AutoEntry::host("both.example", AutoReason::Ev, NOW, Some(NOW + DAY)), NOW);
+        assert!(!slot.try_again(&host, None, AutoReason::Pinning, NOW), "no such row");
+        assert!(slot.try_again(&host, None, AutoReason::Ev, NOW));
+        let rows = slot.rows(NOW);
+        let left: Vec<&str> = rows.iter().filter(|r| r.reason.starts_with("auto:")).map(|r| r.reason.as_str()).collect();
+        assert_eq!(left, ["auto:client-cert"]);
+        assert_eq!(find(&slot, "both.example", NOW), Some(Src::Auto(AutoReason::ClientCert)), "still excluded, by the row left");
     }
 
     #[test]
@@ -439,9 +454,9 @@ mod tests {
         slot.add_auto(pinned("a.example"), NOW);
         let added = slot.revision();
         assert!(added > start);
-        assert!(!slot.try_again(&Pattern::Exact("none.example".into()), None, NOW));
+        assert!(!slot.try_again(&Pattern::Exact("none.example".into()), None, AutoReason::Pinning, NOW));
         assert_eq!(slot.revision(), added, "nothing changed");
-        slot.try_again(&Pattern::Exact("a.example".into()), None, NOW);
+        slot.try_again(&Pattern::Exact("a.example".into()), None, AutoReason::Pinning, NOW);
         assert!(slot.revision() > added);
     }
 

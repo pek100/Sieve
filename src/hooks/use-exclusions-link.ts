@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useMemo, useSyncExternalStore } from "react";
-import { EXCLUSIONS_ANCHOR, exclusionsLink, type ReasonGroup } from "@/core/exclusions";
+import { APP_PARAM, EXCLUSIONS_ANCHOR, REASON_PARAM, exclusionsLink, type ReasonGroup } from "@/core/exclusions";
 
 /**
  * The "Not decrypted" view's filter, in the query string so a link can open it:
@@ -9,8 +9,6 @@ import { EXCLUSIONS_ANCHOR, exclusionsLink, type ReasonGroup } from "@/core/excl
  * history.replaceState, keeping every other parameter, as `useAppParam` does.
  */
 const CHANGED = "sieve:exclusions-link";
-const APP_PARAM = "exclusionsApp";
-const REASON_PARAM = "exclusionsReason";
 
 function subscribe(onChange: () => void) {
   window.addEventListener("popstate", onChange);

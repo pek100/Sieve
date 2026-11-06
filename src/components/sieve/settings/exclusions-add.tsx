@@ -5,7 +5,7 @@ import { DomainField } from "@/components/sieve/filters/domain-field";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import type { ExclusionsModel } from "./use-exclusions";
 
-/** The select's value for no app in particular: no exe file name has a space. */
+/** The select's value for no app in particular: an exe file name ends in .exe. */
 const ALL_APPS = "all apps";
 
 /** Add a site, for every app or for one that is running now (plan 8.2). */

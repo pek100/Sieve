@@ -12,6 +12,7 @@
 //! Scores live in memory only: losing one costs one more close.
 
 use rustls::AlertDescription;
+use sieve_filter::exclusions::exe_file_name;
 
 use super::dials::{EXCLUDE_AT, FATAL_ALERTS, HALF_LIFE_MS, MAX_CREDIT, MAX_PAIRS, SILENT_CLOSE_MS};
 use crate::lru::Lru;
@@ -62,18 +63,13 @@ impl Default for Ledger {
     }
 }
 
-/// `exe` as an exclusion compares it: the file name, lower case.
-pub fn exe_name(exe: &str) -> String {
-    exe.rsplit(['\\', '/']).next().unwrap_or(exe).to_ascii_lowercase()
-}
-
 impl Ledger {
     fn with_capacity(capacity: usize) -> Self {
         Self { scores: Lru::new(capacity) }
     }
 
     fn key(exe: &str, host: &str) -> Key {
-        (exe_name(exe), host.to_ascii_lowercase())
+        (exe_file_name(exe), host.to_ascii_lowercase())
     }
 
     fn get(&mut self, key: &Key) -> Score {

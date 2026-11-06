@@ -51,7 +51,7 @@ export interface EngineSource {
    * line every rejected site of `app`. Only ever reaches what the engine wrote
    * itself. Answers the first page. Rejects on a line it cannot read.
    */
-  tryDecryptAgain(line: string | null, app: string | null): Promise<ExclusionsPage>;
+  tryDecryptAgain(line: string | null, app: string | null, reason: string | null): Promise<ExclusionsPage>;
   /** What self-healing excluded since revision `after`, and the rows' revision. */
   healNotices(after: number): Promise<HealNotices>;
 }
@@ -74,7 +74,7 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     certStatus: async () => parseCertStatus(await invoke<unknown>("engine_cert_status")),
     installRoot: async () => parseCertStatus(await invoke<unknown>("engine_install_root")),
     exclusions: async (after) => parseExclusionsPage(await invoke<unknown>("engine_exclusions", { after })),
-    tryDecryptAgain: async (line, app) => parseExclusionsPage(await invoke<unknown>("engine_try_decrypt_again", { line, app })),
+    tryDecryptAgain: async (line, app, reason) => parseExclusionsPage(await invoke<unknown>("engine_try_decrypt_again", { line, app, reason })),
     healNotices: async (after) => parseHealNotices(await invoke<unknown>("engine_heal_notices", { after })),
   };
 }

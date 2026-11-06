@@ -98,11 +98,11 @@ describe("Tauri engine source", () => {
       return cmd === "engine_heal_notices" ? { revision: 3, exclusions_revision: 4, notices: [] } : page;
     }) as never);
     expect(await rows.exclusions(5)).toEqual({ ...page, skipped: 0 });
-    expect(await rows.tryDecryptAgain('"a.example"', "x.exe")).toEqual({ ...page, skipped: 0 });
+    expect(await rows.tryDecryptAgain('"a.example"', "x.exe", "auto:pinning")).toEqual({ ...page, skipped: 0 });
     expect((await rows.healNotices(2)).exclusions_revision).toBe(4);
     expect(asked).toEqual([
       ["engine_exclusions", { after: 5 }],
-      ["engine_try_decrypt_again", { line: '"a.example"', app: "x.exe" }],
+      ["engine_try_decrypt_again", { line: '"a.example"', app: "x.exe", reason: "auto:pinning" }],
       ["engine_heal_notices", { after: 2 }],
     ]);
     const bad = async <T,>(): Promise<T> => ({ state: "installed" }) as T;

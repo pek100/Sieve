@@ -93,7 +93,7 @@ function fakeEngine(start: EngineScenario) {
       rowReads++;
       return mock.exclusions(after);
     },
-    tryDecryptAgain: (line, app) => mock.tryDecryptAgain(line, app),
+    tryDecryptAgain: (line, app, reason) => mock.tryDecryptAgain(line, app, reason),
     healNotices: (after) => {
       noticeReads++;
       return mock.healNotices(after);
@@ -147,7 +147,7 @@ describe("engine controller, what is not decrypted", () => {
     await s.fc.advance(ENGINE_POLL_MS);
     expect(s.fake.noticeReads(), "notices are read every probe").toBeGreaterThan(notices);
     expect(s.fake.rowReads(), "the rows are not").toBe(1);
-    await s.controller.tryDecryptAgain('"pin.example"', "client.exe");
+    await s.controller.tryDecryptAgain('"pin.example"', "client.exe", "auto:pinning");
     expect(slice(s).exclusions?.rows.map((r) => r.reason)).toEqual(["list:sensitive", "auto:client-cert", "auto:ev"]);
     const healed = slice(s).exclusions?.revision;
     await s.fc.advance(ENGINE_POLL_MS);
@@ -202,8 +202,47 @@ describe("engine controller, what is not decrypted", () => {
     s.undo();
   });
 
+  it("the first read is a baseline: a new controller over a running engine retells none of its groups", async () => {
+    const s = await holdingOff();
+    const group = (id: number, rev: number) => ({ id, session: 1, exe: "client.exe", hosts: [`h${id}.example`], total: 1, rev });
+    const asked: number[] = [];
+    let answer = { revision: 5, exclusions_revision: 1, notices: [group(1, 2), group(2, 5)] };
+    s.fake.source.healNotices = async (after) => {
+      asked.push(after);
+      return answer;
+    };
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).healNotices ?? [], "the window was not there for these").toEqual([]);
+    expect(s.notices.list()).toEqual([]);
+    answer = { revision: 6, exclusions_revision: 1, notices: [group(3, 6)] };
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(asked).toEqual([0, 5]);
+    expect(slice(s).healNotices?.map((n) => n.id), "what comes after it is told").toEqual([3]);
+    s.undo();
+  });
+
+  it("a first read that fails is no baseline", async () => {
+    const s = await holdingOff();
+    const asked: number[] = [];
+    const works = s.fake.source.healNotices;
+    s.fake.source.healNotices = async () => {
+      throw new Error("the pipe closed");
+    };
+    await s.fc.advance(ENGINE_POLL_MS);
+    s.fake.source.healNotices = async (after) => {
+      asked.push(after);
+      return works(after);
+    };
+    await s.fc.advance(ENGINE_POLL_MS);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(asked).toEqual([0, 0]);
+    expect(slice(s).healNotices?.map((n) => n.total), "the first good read was the baseline").toEqual([1]);
+    s.undo();
+  });
+
   it("HTTPS going out of force clears what it said", async () => {
     const s = await holding();
+    await s.fc.advance(ENGINE_POLL_MS);
     expect(slice(s).healNotices?.length).toBe(1);
     s.fake.set("idle");
     await s.fc.advance(ENGINE_POLL_MS);
@@ -214,10 +253,13 @@ describe("engine controller, what is not decrypted", () => {
 
   it("a group's new revision replaces it in the slice, and a new engine run is a new group", async () => {
     const s = await holding();
+    await s.fc.advance(ENGINE_POLL_MS);
     expect(slice(s).healNotices?.map((n) => [n.key, n.total])).toEqual([["0:1", 1]]);
     await s.fc.advance(ENGINE_POLL_MS);
     expect(slice(s).healNotices?.map((n) => [n.key, n.total])).toEqual([["0:1", 2]]);
     s.fake.holdHttps();
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).healNotices?.map((n) => n.key), "a new run with nothing to say yet").toEqual(["0:1"]);
     await s.fc.advance(ENGINE_POLL_MS);
     expect(slice(s).healNotices?.map((n) => n.key)).toEqual(["0:1", "1:1"]);
     s.undo();
@@ -228,7 +270,7 @@ describe("engine controller, what is not decrypted", () => {
     s.fake.source.tryDecryptAgain = async () => {
       throw new Error("not an exclusion line");
     };
-    await s.controller.tryDecryptAgain("bad line", null);
+    await s.controller.tryDecryptAgain("bad line", null, "auto:pinning");
     expect(slice(s).exclusionsActionError).toMatch(/could not try that again.*not an exclusion line/);
     expect(slice(s).exclusions?.rows).toHaveLength(4);
     s.undo();

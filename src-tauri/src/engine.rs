@@ -19,7 +19,7 @@
 //! - `engine_cert_status() -> CertStatus`, `engine_install_root() -> CertStatus`:
 //!   the root certificate's facts, and the user's Reinstall (plan 8.1).
 //! - `engine_exclusions(after) -> ExclusionsPage`, `engine_try_decrypt_again(line,
-//!   app) -> ExclusionsPage`, `engine_heal_notices(after) -> HealNotices`: what the
+//!   app, reason) -> ExclusionsPage`, `engine_heal_notices(after) -> HealNotices`: what the
 //!   engine keeps from being decrypted, and self-healing's notices (plan 4.3, 8.2).
 //! - `engine_request_update() -> EngineStatus`: asks the engine to update; it
 //!   carries nothing, and the engine alone fetches and verifies (plan 7.5).
@@ -600,13 +600,13 @@ pub async fn engine_exclusions(_after: u32) -> Result<ExclusionsPage, String> {
 /// engine can only take back what it wrote itself. Answers the first page.
 #[cfg(windows)]
 #[tauri::command]
-pub async fn engine_try_decrypt_again(line: Option<String>, app: Option<String>) -> Result<ExclusionsPage, String> {
-    imp::exclusions(PIPE_NAME, sieve_ipc::ClientMessage::TryDecryptAgain { line, app }).await
+pub async fn engine_try_decrypt_again(line: Option<String>, app: Option<String>, reason: Option<String>) -> Result<ExclusionsPage, String> {
+    imp::exclusions(PIPE_NAME, sieve_ipc::ClientMessage::TryDecryptAgain { line, app, reason }).await
 }
 
 #[cfg(not(windows))]
 #[tauri::command]
-pub async fn engine_try_decrypt_again(_line: Option<String>, _app: Option<String>) -> Result<ExclusionsPage, String> {
+pub async fn engine_try_decrypt_again(_line: Option<String>, _app: Option<String>, _reason: Option<String>) -> Result<ExclusionsPage, String> {
     Err("the engine runs on Windows only".into())
 }
 
@@ -1049,10 +1049,10 @@ mod tests {
         let asked = ClientMessage::Exclusions { after: 0 };
         let got = one_answer("excl", asked.clone(), page.clone(), async |n| imp::exclusions(n, asked).await).await;
         assert_eq!(got, Ok(want.clone()));
-        let asked = ClientMessage::TryDecryptAgain { line: Some("\"pin.example\"".into()), app: Some("client.exe".into()) };
+        let asked = ClientMessage::TryDecryptAgain { line: Some("\"pin.example\"".into()), app: Some("client.exe".into()), reason: Some("auto:pinning".into()) };
         let got = one_answer("retry", asked.clone(), page, async |n| imp::exclusions(n, asked).await).await;
         assert_eq!(got, Ok(want));
-        let asked = ClientMessage::TryDecryptAgain { line: Some("bad line".into()), app: None };
+        let asked = ClientMessage::TryDecryptAgain { line: Some("bad line".into()), app: None, reason: Some("auto:pinning".into()) };
         let refused = EngineMessage::Error { message: "not an exclusion line".into() };
         let got = one_answer("retry-bad", asked.clone(), refused, async |n| imp::exclusions(n, asked).await).await;
         assert_eq!(got, Err("not an exclusion line".to_string()));

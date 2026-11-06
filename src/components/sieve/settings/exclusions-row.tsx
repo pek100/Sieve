@@ -5,7 +5,7 @@ import { IconButton } from "@/components/sieve/primitives/icon-button";
 import { AppIcon } from "@/components/sieve/primitives/app-icon";
 import { Monogram } from "@/components/sieve/apps/monogram";
 import { Button } from "@/components/ui/button";
-import { canTryAgain, exclusionReasonWords, retryWords, type ExclusionView } from "@/core/exclusions";
+import { canTryAgain, retryWords, rowReasonWords, type ExclusionView } from "@/core/exclusions";
 import type { ExclusionsModel } from "./use-exclusions";
 
 /** The apps a row is for: each with its icon, or "All apps". */
@@ -36,9 +36,9 @@ export function ExclusionsRow({ row, model }: { row: ExclusionView; model: Pick<
       <div className="flex min-w-0 flex-1 basis-64 flex-col gap-1">
         <span className="min-w-0 font-mono text-mono break-all text-on-surface">{row.line}</span>
         <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-          <RowApps apps={row.apps ?? []} appInfo={model.appInfo} />
+          {!row.refused && <RowApps apps={row.apps ?? []} appInfo={model.appInfo} />}
           <span className="min-w-0 text-label text-on-surface-muted">
-            {exclusionReasonWords(row.reason)}
+            {rowReasonWords(row)}
             {retried && `, ${retried}`}
           </span>
         </span>

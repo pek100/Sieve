@@ -199,9 +199,14 @@ impl Exclusion {
         if self.apps.is_empty() {
             return true;
         }
-        let name = exe.rsplit(['\\', '/']).next().unwrap_or(exe).to_ascii_lowercase();
-        self.apps.contains(&name)
+        self.apps.contains(&exe_file_name(exe))
     }
+}
+
+/// An exe (full path or file name) as an entry's `apps` names it: the file name,
+/// lower case.
+pub fn exe_file_name(exe: &str) -> String {
+    exe.rsplit(['\\', '/']).next().unwrap_or(exe).to_ascii_lowercase()
 }
 
 // ---- The one decision (plan 4.1, task D11): pure, no I/O, no clock, no Windows.
@@ -264,6 +269,12 @@ impl AutoReason {
             Self::ClientCert => "auto:client-cert",
             Self::Ev => "auto:ev",
         }
+    }
+
+    /// The reason a row's slug names; None for one the engine does not write. The
+    /// inverse of [`Self::slug`] by construction.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.slug() == slug)
     }
 }
 

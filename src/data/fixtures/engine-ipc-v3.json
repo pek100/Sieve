@@ -40,7 +40,7 @@
     { "type": "install_root" },
     { "type": "request_update" },
     { "type": "exclusions", "after": 0 },
-    { "type": "try_decrypt_again", "line": "\"pin.example\"", "app": "client.exe" },
+    { "type": "try_decrypt_again", "line": "\"pin.example\"", "app": "client.exe", "reason": "auto:pinning" },
     { "type": "heal_notices", "after": 0 }
   ],
   "engine": [

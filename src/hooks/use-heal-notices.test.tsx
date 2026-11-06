@@ -1,6 +1,8 @@
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HealGroup } from "@/core/exclusions";
+import { createMockEngine } from "@/data/engine-mock";
+import type { EngineSource } from "@/data/engine-source";
 import { createMockSource } from "@/data/mock-source";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "./runtime";
@@ -8,16 +10,15 @@ import { SieveProvider } from "./sieve-provider";
 import { useHealNotices } from "./use-heal-notices";
 
 const push = vi.fn();
-let pathname = "/";
-vi.mock("next/navigation", () => ({ useRouter: () => ({ push }), usePathname: () => pathname }));
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push }) }));
 
 function Host() {
   useHealNotices();
   return null;
 }
 
-function setup(): Runtime {
-  const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend() });
+function setup(engine?: EngineSource): Runtime {
+  const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(), engine });
   render(
     <SieveProvider runtime={runtime}>
       <Host />
@@ -34,7 +35,6 @@ const toasts = (rt: Runtime) => rt.notices.list().map((n) => n.text);
 afterEach(() => {
   cleanup();
   push.mockClear();
-  pathname = "/";
   window.history.replaceState(null, "", "/");
 });
 
@@ -89,13 +89,39 @@ describe("heal notices", () => {
   });
 
   it("from the settings page the action filters in place, where a push would change nothing the view sees", () => {
-    pathname = "/settings/";
     window.history.replaceState(null, "", "/settings/?source=mock");
     const rt = setup();
     set(rt, [group(["a.example"], 1)]);
     act(() => rt.notices.list()[0].action?.run());
     expect(push).not.toHaveBeenCalled();
     expect(window.location.search).toBe("?source=mock&exclusionsApp=client.exe&exclusionsReason=pinning");
+  });
+
+  it("the action goes by where the user is when they click, not where the toast was pushed", () => {
+    const rt = setup();
+    set(rt, [group(["a.example"], 1)]);
+    const pushedElsewhere = rt.notices.list()[0];
+    window.history.replaceState(null, "", "/settings/?source=mock");
+    act(() => pushedElsewhere.action?.run());
+    expect(push, "already on the view: a push would change nothing it sees").not.toHaveBeenCalled();
+    expect(window.location.search).toBe("?source=mock&exclusionsApp=client.exe&exclusionsReason=pinning");
+
+    set(rt, [group(["a.example"], 1), group(["b.example"], 2, "0:2", "other.exe")]);
+    const pushedOnSettings = rt.notices.list().find((n) => n.text.startsWith("other.exe"));
+    window.history.replaceState(null, "", "/logs/");
+    act(() => pushedOnSettings?.action?.run());
+    expect(push).toHaveBeenCalledExactlyOnceWith("/settings/?exclusionsApp=other.exe&exclusionsReason=pinning#not-decrypted");
+    expect(window.location.search, "and this page's query stays its own").toBe("");
+  });
+
+  it("a window opened over a running engine does not tell of what it did before", async () => {
+    const engine = createMockEngine("idle", { heal: true });
+    engine.healNotices = async () => ({ revision: 5, exclusions_revision: 1, notices: [{ id: 1, session: 1, exe: "client.exe", hosts: ["old.example"], total: 1, rev: 5 }] });
+    const rt = setup(engine);
+    await act(async () => {
+      await vi.waitFor(() => expect(rt.store.getState().engine.exclusions).not.toBeNull());
+    });
+    expect(toasts(rt)).toEqual([]);
   });
 
   it("no groups, or none yet, say nothing", () => {

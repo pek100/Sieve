@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sieve_filter::exclusions::{AutoReason, Exclusion, Pattern};
+use sieve_filter::exclusions::{AutoReason, Exclusion, Pattern, exe_file_name};
 
 use crate::policy::write_atomic;
 
@@ -57,11 +57,9 @@ impl AutoEntry {
         Self { pattern: Pattern::Exact(host.to_ascii_lowercase()), app: None, reason, created_ms, expires_ms, retries: 0, retrying: false }
     }
 
-    /// An entry for exactly this host and one app: `exe` as
-    /// `Exclusion::app_matches` compares it, the file name in lower case.
+    /// An entry for exactly this host and one app.
     pub fn for_app(host: &str, exe: &str, reason: AutoReason, created_ms: u64) -> Self {
-        let app = exe.rsplit(['\\', '/']).next().unwrap_or(exe).to_ascii_lowercase();
-        Self { app: Some(app), ..Self::host(host, reason, created_ms, None) }
+        Self { app: Some(exe_file_name(exe)), ..Self::host(host, reason, created_ms, None) }
     }
 
     /// Excludes right now: not taken back, not past its end.
