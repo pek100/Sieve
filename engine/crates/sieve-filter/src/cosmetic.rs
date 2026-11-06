@@ -801,7 +801,7 @@ sieve-test.invalid##+js(sieve-set-flag, a, b)
     /// `user_engine` never gets the bundle. A deferral, pinned so its end is seen.
     #[test]
     fn a_users_own_scriptlet_stays_inert_for_now() {
-        let p = set_with(&[&format!("other.invalid##+js(sieve-set-flag, a, b)")]).page_cosmetics(OTHER_URL);
+        let p = set_with(&["other.invalid##+js(sieve-set-flag, a, b)"]).page_cosmetics(OTHER_URL);
         assert!(p.scriptlets.is_empty(), "{p:?}");
     }
 
