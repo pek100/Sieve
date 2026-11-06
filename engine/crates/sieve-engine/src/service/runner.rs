@@ -11,8 +11,9 @@
 //!    the pipe, until Windows asks it to stop or shut down; then it takes the
 //!    routes down, records a clean stop and reports Stopped.
 //!
-//! A panic on any thread but a flow worker deletes Sieve's routes before the
-//! process dies (plan 1.6.6); a flow task's panic ends that flow only.
+//! A panic on any thread but a flow worker deletes Sieve's routes and stops
+//! the ETW session before the process dies (plan 1.6.6); a flow task's panic
+//! ends that flow only.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -115,15 +116,43 @@ fn record_failure(why: &str) {
 
 const LAST_ERROR_FILE: &str = "last-error.txt";
 
-/// The watchdog's trip: routes first (named and journalled), the reason on
-/// disk, then the process ends with [`EXIT_WATCHDOG`] (the SCM restarts it).
+/// An emergency exit waits this long for the ETW session to stop: the process
+/// must still end, or the SCM's recovery never runs.
+const SESSION_STOP_BOUND: Duration = Duration::from_secs(2);
+
+/// What both emergency exits do. Routes first, so a hang stopping the session
+/// cannot hold a route. The session goes too: if the SCM's recovery has run
+/// out, no later start stops it, and routing off means no session.
+fn emergency_cleanup(routes: impl FnOnce() -> String, session: impl FnOnce() -> Result<String, String> + Send + 'static) -> String {
+    let routes = routes();
+    format!("{routes}; {}", stop_session_within(session, SESSION_STOP_BOUND))
+}
+
+fn stop_session_within(stop: impl FnOnce() -> Result<String, String> + Send + 'static, bound: Duration) -> String {
+    let (done, wait) = std::sync::mpsc::sync_channel(1);
+    let stopper = std::thread::Builder::new().name("sieve-etw-stop".into()).spawn(move || {
+        let _ = done.send(stop());
+    });
+    if let Err(e) = stopper {
+        return format!("attribution session: FAILED, no thread to stop it: {e}");
+    }
+    match wait.recv_timeout(bound) {
+        Ok(Ok(what)) => format!("attribution session: {what}"),
+        Ok(Err(why)) => format!("attribution session: FAILED, {why}"),
+        Err(_) => format!("attribution session: FAILED, no answer within {} s", bound.as_secs()),
+    }
+}
+
+/// The watchdog's trip: routes first (named and journalled), then the ETW
+/// session, the reason on disk, then the process ends with [`EXIT_WATCHDOG`]
+/// (the SCM restarts it).
 struct ServiceTrip {
     journal: Journal,
 }
 
 impl Trip for ServiceTrip {
     fn delete_routes(&self) -> String {
-        clear_stale(&self.journal)
+        emergency_cleanup(|| clear_stale(&self.journal), stop_stale)
     }
 
     fn exit(&self, stall: &Stall, routes: &str) {
@@ -132,15 +161,16 @@ impl Trip for ServiceTrip {
     }
 }
 
-/// Deletes Sieve's routes when anything but a flow worker panics, before the
-/// default hook prints the panic (the process then unwinds or aborts).
+/// Deletes Sieve's routes and stops the ETW session when anything but a flow
+/// worker panics, before the default hook prints the panic (the process then
+/// unwinds or aborts).
 fn install_panic_cleanup(journal_dir: std::path::PathBuf) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let flow = std::thread::current().name().is_some_and(|n| n == FLOW_THREAD);
         if !flow {
-            let routes = clear_stale(&Journal::new(&journal_dir));
-            record_failure(&format!("panic: {info}; {routes}"));
+            let cleaned = emergency_cleanup(|| clear_stale(&Journal::new(&journal_dir)), stop_stale);
+            record_failure(&format!("panic: {info}; {cleaned}"));
         }
         default_hook(info);
     }));
@@ -217,4 +247,48 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
         engine.stop_clean();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn an_emergency_exit_deletes_the_routes_first_then_stops_the_session() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (routes, session) = (order.clone(), order.clone());
+        let said = emergency_cleanup(
+            move || {
+                routes.lock().unwrap().push("routes");
+                "3 routes deleted".into()
+            },
+            move || {
+                session.lock().unwrap().push("session");
+                Ok("a leftover session was stopped".into())
+            },
+        );
+        assert_eq!(*order.lock().unwrap(), ["routes", "session"]);
+        assert_eq!(said, "3 routes deleted; attribution session: a leftover session was stopped");
+    }
+
+    #[test]
+    fn a_failed_session_stop_is_on_the_record() {
+        let said = emergency_cleanup(|| "3 routes deleted".into(), || Err("Win32 error 5".into()));
+        assert_eq!(said, "3 routes deleted; attribution session: FAILED, Win32 error 5");
+    }
+
+    #[test]
+    fn a_hung_session_stop_cannot_keep_the_process_alive() {
+        let (release, hung) = std::sync::mpsc::channel::<()>();
+        let said = stop_session_within(
+            move || {
+                let _ = hung.recv();
+                Ok("too late".into())
+            },
+            Duration::from_millis(20),
+        );
+        assert!(said.starts_with("attribution session: FAILED, no answer"), "{said}");
+        drop(release);
+    }
 }

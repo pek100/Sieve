@@ -56,6 +56,7 @@ const DNS_WRITES = new RegExp(
 const ETW = "engine/crates/sieve-engine/src/flow/etw.rs";
 const NAT = "engine/crates/sieve-engine/src/flow/nat.rs";
 const NAT_OS = "engine/crates/sieve-engine/src/flow/nat/os.rs";
+const RUNNER = "engine/crates/sieve-engine/src/service/runner.rs";
 
 const ETW_CONTROL = /\b(?:StartTraceW|ControlTraceW|EnableTraceEx2)\b/;
 const WMI_QUERY = /\bExecQuery\b/;
@@ -118,6 +119,16 @@ describe("engine network law", () => {
     const session = read(ETW);
     expect(session).toContain("EVENT_TRACE_REAL_TIME_MODE");
     expect(session).not.toMatch(/EVENT_TRACE_FILE_MODE|LogFileMode = [^E]/);
+  });
+
+  it("both emergency exits stop the attribution session too: routing off means no session, even when recovery runs out", () => {
+    const src = read(RUNNER);
+    const trip = src.match(/impl Trip for ServiceTrip \{([\s\S]*?)\n\}/)?.[1] ?? "";
+    const panic = src.match(/fn install_panic_cleanup\([^)]*\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+    for (const exit of [trip, panic]) {
+      expect(exit).toMatch(/emergency_cleanup\(\s*\|\|\s*clear_stale\([^\n]*\),\s*stop_stale\s*\)/);
+      expect(exit.match(/\bclear_stale\(/g)).toHaveLength(1);
+    }
   });
 
   it("those patterns catch what they are for", () => {
