@@ -212,6 +212,12 @@ Because nothing has been sent to the client before the decision, every "do not d
 | EV | If the leaf carries the CA/B EV policy OID (2.23.140.1.1) and `https.skipEv` is on (default on, E1), pass through and record the host in the EV cache. | Browsers no longer show EV, so EV is not a validation property. It is a strong signal of banks and payment sites, and AdGuard defaults to skipping them. |
 | Revoked while connected | When a staple or OCSP answer later says revoked, active intercepted connections to that host are closed (E7). | Parity. |
 
+- **As built (slice 11, 2026-11-06, `docs/tasks/2026-11-06-validation.md`):**
+  - CRLite reads `clubcard-crlite`, not Mozilla's filter cascade. Mozilla no longer publishes cascades: a real published delta was refused by `rust_cascade` 1.5.0 with `unknown version` and read by `clubcard-crlite` 0.6, the same team's crate, the one Firefox uses. A cascade file is refused, not misread. Offline, a filter is built with the crate's own builder.
+  - Neither the log list nor the filters are fetched at runtime here: both arrive signed through `update::data_path` (task Q2). The log list also keeps Google's signature, so a leak of Sieve's update key cannot add a log. With no data, or a list past 70 days, the check is skipped, which Chrome does too.
+  - The order is eligibility, CRLite, CT, trust. A private root never reaches CT, which is "public roots only" by order. The local checks run even for a known leaf, so a filter that arrived an hour ago reaches a host visited all day. A violation is `floor:upstream-ct`, cached as an invalid chain is. SCTs by TLS extension do not count, because rustls never asks for them: such a site passes through, which is safe.
+  - No age limit on a filter: it only ever adds "revoked", and a certificate newer than it answers `NotCovered`.
+
 ### 2.7 TLS stack: rustls with aws-lc-rs
 
 Decision: rustls 0.23 with the aws-lc-rs provider, on both sides.
@@ -241,6 +247,8 @@ Schannel is rejected because it cannot mint a per-SNI server identity cheaply, i
 - **Upstream, the engine itself uses ECH** when the name's HTTPS record carries an ECHConfigList (looked up by the engine; the outer name is the server's public name). Privacy on the wire then stays where the browser had it. This lands in slice 11 with CT and CRLite; until then the upstream hello carries the real SNI, which is what the browser would have sent with ECH stripped.
 - **When a ClientHello still carries ECH** (the browser uses its own DoH and learned the config itself): the spike's decoder reports the outer name only. Network rules apply to the outer name and the IP-to-names map. The flow **passes through**. Sieve cannot decrypt ECH without the server's key, and refusing ECH would break sites. It is logged as "encrypted hello, not decrypted". The log shows how often this happens per app, so the cost is visible, not guessed.
   - **As built (slice 6, 2026-11-06):** Chrome sends a GREASE ECH extension when it has no ECH config, and the extension alone cannot tell the two apart, so a literal rule would pass every Chrome flow through. The fact is `hello.ech && the engine's DNS did not answer this SNI for this address`. If it did, the app resolved the SNI itself, so it is the real target. A wrong "GREASE" cannot leak: the client treats the answer as ECH rejected, authenticates the public name and retries without ECH under a normal decision. A browser on its own DoH leaves the fact true and passes through (open question Q2 of the task doc). Live check U3.
+
+  - **As built (slice 11, 2026-11-06):** `tls::ech` looks up the record through the engine's own `dns::Service` (encrypted, or LAN for a matched suffix), one lookup per host in flight, with a flow waiting at most 300 ms and then going on without ECH. Port 443 only. An attempt that ends any other way than done (a rejection, a reset, a 3 s timeout, a certificate request) drops the captured chain unjudged, caches no verdict, marks the host for 5 minutes and runs the plain handshake on a fresh socket. Retry configs are not used: a capturing verifier cannot authenticate the public name, so an active attacker can force the real SNI onto the wire, the same hello a browser sends with ECH stripped. No GREASE without a config. Accepted ECH is proven live only (`docs/live/engine-slice-11.md` U3): rustls has no ECH server.
 
 ### 2.10 TLS 1.3 0-RTT
 
@@ -800,6 +808,7 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
   - CRLite filter-cascade vectors from Mozilla's crate;
   - **live:** a CT-violating test endpoint passes through; a CRLite-revoked certificate passes through; Cloudflare's ECH test page reports ECH used by Sieve's upstream (log shows it).
 - **Files:** `engine/crates/sieve-engine/src/tls/{ct,crlite,ech}.rs`. **Live:** yes. **Switch:** part of `filtering.https`.
+- **Note (2026-11-06):** built offline, `docs/tasks/2026-11-06-validation.md`, with `tls/validation.rs` as the slot of both data files. The vectors come from `clubcard-crlite`'s builder, not filter cascades (2.6). The live checks are `docs/live/engine-slice-11.md`, not yet run.
 
 ### Slice 12: log details and report a broken site
 

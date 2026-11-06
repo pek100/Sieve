@@ -258,6 +258,18 @@ Commit at each green point on `wf2-validation`, each message ending with the att
 10. **Bench and full suites.** All commands above.
 11. **Report.** Evidence per checkbox, bench numbers, UNVERIFIED unchanged, every deviation named.
 
+## As built (2026-11-06)
+
+Every D-number holds. What the build settled or added:
+
+- Step 1: `UnparsedPublicKey` takes SPKI DER for both `RSA_PKCS1_2048_8192_SHA256` and `ECDSA_P256_SHA256_ASN1`, so keys are passed as the list holds them. F1, F7 and F12 held when rerun as tests.
+- `CtSkip` has a third value, `NoIssuer`, for D5's "cannot happen by construction" case, which had no honest word among the two. It has no meter.
+- With no usable data the path is not built at all, so no data costs what slice 6 costs (`missing_files_mean_no_data_and_no_error`).
+- A missing file means no data, also after a good one was loaded, so deleting a file takes a bad artefact back. Only a refused file keeps what was loaded. An empty bundle is zero filters.
+- `issuer_hash_of_an_intermediate_matches_the_recorded_issuer`: the recorded issuer has no recorded root, so no path through it as an intermediate can be built. The test shows the leaf's direct issuer on a built path, and webpki's rewrap of the recorded issuer against x509-parser's bytes. Its SCTs verifying under that hash is the `ct` test.
+- Meters live behind `ValidationSlot`, which holds the engine's `Arc<Meters>`; `Engine.validation` outlives the switch, so data loaded once stays across an off and on.
+- Step 7: `wf2-dns-extras` held no SvcParams reader on 2026-11-06 (commit 3cf9784 and its worktree), so `Message.https` and `https_rdata` land here. Whichever merges second makes one reader of the two.
+
 ## Cross-stream note
 
 `wf2-dns-extras` is expected to strip `ech` from answers (plan 1.4, 2.9) and so to read SvcParams too. Two readers of one format would break S29. Step 7 reads that branch first. If its reader exists, use its shape and add only what is missing; if not, `Message.https` lands here and the orchestrator tells that stream. Whichever merges second makes one reader of the two. This stream's lookup does not depend on stripping, and stripping does not depend on this: the engine's own query never passes through the strip, which acts on what goes back to a client.

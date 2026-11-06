@@ -11,7 +11,6 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
@@ -190,6 +189,8 @@ fn local_checks(data: &ValidationData, chain: &Chain, now_ms: u64, issuer: impl 
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::atomic::Ordering;
+
     use clubcard_crlite::Encoding;
     use rustls::pki_types::CertificateDer;
 
@@ -314,6 +315,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_status_says_what_is_held_and_names_no_host() {
+        let slot = slot();
+        let mut status = slot.meters.https.report();
+        slot.report(&mut status);
+        assert_eq!(status["ct_list_timestamp"], serde_json::Value::Null);
+        assert_eq!(status["crlite_filters"], 0);
+        for count in ["ct_compliant", "ct_violating", "ct_skipped_no_list", "ct_skipped_stale", "crlite_revoked", "validation_refused", "ech_offered", "ech_accepted", "ech_failed"] {
+            assert_eq!(status[count], 0, "{count}");
+        }
+    }
+
+    #[test]
     fn an_oversized_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = put(dir.path(), KIND_CRLITE, &[]);
@@ -328,6 +341,15 @@ pub(crate) mod tests {
         let (list_bytes, bundle) = (envelope(), encode_bundle(&[recorded_filter(true), recorded_filter(false)]).unwrap());
         assert_eq!(LogList::from_envelope(&list_bytes, LOG_LIST_KEY).unwrap().timestamp_ms, LIST_AT_MS);
         assert_eq!(Crlite::from_bundle(&bundle).unwrap().filters(), 2);
+    }
+
+    #[test]
+    fn no_list_is_skipped() {
+        let slot = slot();
+        assert_eq!(slot.check(&chain(), NOW, || Some(issuer())), Checked { verdict: None, ct: CtAnswer::Skipped(CtSkip::NoList) });
+        // A filter with no list still answers for revocation, and CT stays skipped.
+        slot.install(None, Some(Crlite::from_bundle(&encode_bundle(&[recorded_filter(true)]).unwrap()).unwrap()));
+        assert_eq!(slot.check(&chain(), NOW, || Some(issuer())), Checked { verdict: Some(UpstreamVerdict::Revoked), ct: CtAnswer::Skipped(CtSkip::NoList) });
     }
 
     #[test]

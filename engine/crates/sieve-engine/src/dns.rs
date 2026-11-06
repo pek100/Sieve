@@ -243,7 +243,7 @@ pub fn reply_answers(query: &[u8], reply: &[u8]) -> Option<Message> {
     reply_fits(query, reply).then(|| parse(reply)).flatten().filter(|m| m.response)
 }
 
-/// A message's question name and its address answers.
+/// A message's question name, its address answers and its HTTPS records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub id: u16,

@@ -1,7 +1,8 @@
 //! What upstream validation said about (host, port), so the second connect costs
 //! nothing (plan 2.6, task D5). A rejection skips the upstream handshake. An
-//! `Eligible` with the same leaf skips only the trust call: the handshake and
-//! eligibility always run, since each client connection has its own upstream.
+//! `Eligible` with the same leaf skips only the trust call: the handshake,
+//! eligibility and the local checks always run, since each client connection has
+//! its own upstream.
 //! `Unavailable` is never cached, and a late `Eligible` never replaces a
 //! revocation in date. EV and client-certificate facts live in the exclusion
 //! store (one owner per fact, S29), not here.
