@@ -278,6 +278,26 @@ impl IpStackTcpStream {
     pub fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
+
+    /// Ends the connection now with an ACK|RST, the packet `poll_read` sends when
+    /// the session times out. Bytes in flight are given up. Later reads see the end
+    /// of the stream, later writes fail, and `shutdown` returns at once, sending no FIN.
+    pub fn abort(&self) {
+        let nt = self.network_tuple();
+        {
+            let mut tcb = self.tcb.lock().unwrap();
+            if tcb.get_state() == TcpState::Closed {
+                return;
+            }
+            if let Err(err) = write_packet_to_device(&self.up_packet_sender, nt, &tcb, None, ACK | RST, None, None) {
+                log::warn!("{nt} [abort] error sending RST/ACK packet: {err}");
+            }
+            tcb.change_state(TcpState::Closed);
+        }
+        self.shutdown.lock().unwrap().ready();
+        self.read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+        self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+    }
 }
 
 impl AsyncRead for IpStackTcpStream {

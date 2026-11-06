@@ -9,11 +9,12 @@
 //! TCP with `filtering.https` on goes to `tls::intercept`; off (no slot), it
 //! uses the offline-tested `flow::relay::relay_tcp` (server bytes flow at
 //! once, client bytes are held until decoded and decided, then relayed or the
-//! flow is closed with nothing sent). UDP holds datagrams until decoded and
-//! decided; a blocked UDP flow's book entry closes and its datagrams are
-//! swallowed until idle; a flow `quic::path` refuses closes the same way and each
-//! of its datagrams is answered until idle (`quic::refuse`), with nothing sent
-//! upstream. Port 53 goes to `stack::dns_flow` instead and is never
+//! flow is reset with nothing sent). UDP holds datagrams until decoded and
+//! decided; the book entry of a blocked UDP flow, or of one `quic::path` refuses,
+//! closes at once and the task stays until idle, so a retransmit costs no new owner
+//! lookup, with nothing sent upstream. A blocked flow's client Initials are answered
+//! with Version Negotiation (`quic::answer_blocked`) and anything else is swallowed; a
+//! refused flow's datagrams with ICMP (`quic::refuse`). Port 53 goes to `stack::dns_flow` instead and is never
 //! relayed or blocked. The upstream TCP connect happens before the decision, so
 //! server-first bytes may reach an app: a decoded name beats the IP map, so
 //! the decision cannot be earlier.
@@ -24,13 +25,13 @@ use std::time::Duration;
 use ipstack::{IpStackTcpStream, IpStackUdpStream};
 use sieve_ipc::{FlowAction, FlowEvent, FlowKind, FlowProto};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpStream, UdpSocket};
 
 use super::attribution::{Attribution, HeldOwner, decide, is_own};
 use super::book::FlowBook;
 use super::dns_flow;
 use super::egress::Egress;
-use super::{DNS_PORT, Meters, close_blocked, drain_udp, kind_of, record_decision};
+use super::{DNS_PORT, Meters, close_blocked, kind_of, record_decision};
 use crate::dns::NameMap;
 use crate::dns::service::Service;
 use crate::domain::{FilterSlot, Flow};
@@ -45,6 +46,7 @@ use crate::policy::wall_ms;
 use crate::quic::{self, PacketSink, Reply, UdpPath};
 use crate::route::table::NetTables;
 use crate::tls::intercept::{FlowMeta, HttpsSlot, Who, run as run_intercepted};
+use crate::tls::splice::Abort;
 use crate::watchdog::monotonic_ms;
 
 /// A TCP flow that sends nothing this long is decided without a name.
@@ -269,6 +271,12 @@ pub(super) async fn close_app(app: &mut IpStackTcpStream) {
     let _ = tokio::time::timeout(Duration::from_secs(1), app.shutdown()).await;
 }
 
+impl Abort for IpStackTcpStream {
+    fn abort(&self) {
+        IpStackTcpStream::abort(self);
+    }
+}
+
 pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
     let flow = FiveTuple { proto: Proto::Tcp, local: app.local_addr(), remote: app.peer_addr() };
     if flow.remote.port() == DNS_PORT {
@@ -284,6 +292,11 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
             return close_app(&mut app).await;
         }
     };
+    serve_admitted(ctx, app, flow, admitted, upstream, accepted_ms).await;
+}
+
+/// An admitted flow with its SYN-time socket, to its end.
+pub(super) async fn serve_admitted(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple, admitted: Admitted, upstream: TcpStream, accepted_ms: u64) {
     let decide = |d: &Decoded| ctx.decide(&admitted, d, &flow);
     // One path per flow, chosen once (task D1): no slot is today's relay.
     if let Some(https) = ctx.https.get() {
@@ -322,6 +335,7 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
     let out = relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, decide).await;
     if out.dropped {
         close_blocked(&ctx.book, &ctx.meters, admitted.id);
+        app.abort();
     } else {
         let action = if out.upstream_write_failed { FlowAction::Failed } else { FlowAction::Relayed };
         lock(&ctx.book).close(admitted.id, action, out.bytes_up, out.bytes_down);
@@ -379,7 +393,7 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         match quic::path(action, &ctx.https, &decided, &who, id) {
             UdpPath::Drop => {
                 close_blocked(&ctx.book, &ctx.meters, id);
-                return drain_udp(&mut app, UDP_IDLE).await;
+                return quic::answer_blocked(&mut app, &held, &mut buf, UDP_IDLE, &ctx.meters.quic.blocked_replies).await;
             }
             UdpPath::Refuse(refusal) => {
                 quic::close_refused(&ctx.book, id);

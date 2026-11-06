@@ -26,7 +26,7 @@ use crate::exclusions::AutoEntry;
 use crate::exclusions::lists::{Origin, Source};
 use crate::flow::classify::{Decoded, Kind, UdpClassifier};
 use crate::flow::flows::Action;
-use crate::flow::quic::{VERSION_1, crypto_frame, seal_client_initial};
+use crate::flow::quic::{MIN_INITIAL_DATAGRAM, VERSION_1, crypto_frame, seal_client_initial};
 use crate::flow::sni::{TlsOffer, build};
 use crate::policy::wall_ms;
 use crate::tls::intercept::{HttpsSlot, Who};
@@ -399,10 +399,10 @@ fn a_cap_or_a_broken_initial_is_relayed() {
 // ---- The flow.
 
 #[derive(Default)]
-struct FakeSink {
-    sent: Mutex<Vec<Vec<u8>>>,
+pub(crate) struct FakeSink {
+    pub(crate) sent: Mutex<Vec<Vec<u8>>>,
     fails: AtomicBool,
-    tried: AtomicUsize,
+    pub(crate) tried: AtomicUsize,
 }
 
 impl PacketSink for FakeSink {
@@ -417,7 +417,7 @@ impl PacketSink for FakeSink {
 }
 
 impl FakeSink {
-    fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.sent.lock().unwrap().len()
     }
 }
@@ -586,6 +586,13 @@ async fn a_switch_off_before_the_held_datagrams_answers_none() {
     drop(flow.app);
 }
 
+#[tokio::test]
+async fn a_closed_stack_ends_the_flow_at_once() {
+    let flow = spawn_flow(Refusal::PortUnreachable, Vec::new());
+    drop(flow.app);
+    assert!(tokio::time::timeout(Duration::from_secs(5), flow.task).await.expect("ended").unwrap().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_failed_send_is_counted_and_the_flow_goes_on() {
     let mut flow = spawn_flow(Refusal::PortUnreachable, Vec::new());
@@ -602,9 +609,9 @@ async fn a_failed_send_is_counted_and_the_flow_goes_on() {
 
 // ---- Through a real stack, in memory (the device of `examples/bench.rs`).
 
-struct MemDevice {
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+pub(crate) struct MemDevice {
+    pub(crate) rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub(crate) tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 impl AsyncRead for MemDevice {
@@ -630,20 +637,26 @@ impl AsyncWrite for MemDevice {
 }
 
 /// `host`'s `h3` hello, split over two sealed Initials as a post-quantum one is.
-fn sealed_initials(host: &str) -> [Vec<u8>; 2] {
+pub(crate) fn sealed_initials(host: &str) -> [Vec<u8>; 2] {
+    sealed_initials_of(VERSION_1, &DCID, &[], host)
+}
+
+/// The same, with the version and connection IDs a test names.
+pub(crate) fn sealed_initials_of(version: u32, dcid: &[u8], scid: &[u8], host: &str) -> [Vec<u8>; 2] {
     let groups = (0x000a_u16, vec![0, 2, 0, 0x1d]);
     let versions = (0x002b_u16, vec![2, 3, 4]);
     let schemes = (0x000d_u16, vec![0, 2, 4, 3]);
     let hello = build::handshake(&[build::sni_ext(host), build::alpn_ext(&["h3"]), groups, versions, schemes, (0x0033, vec![1; 1300])]);
     let (first, second) = hello.split_at(800);
+    // Padded past the 1200-byte floor, as a real client's are.
     let mut f1 = crypto_frame(0, first);
-    f1.resize(1100, 0);
+    f1.resize(MIN_INITIAL_DATAGRAM, 0);
     let mut f2 = crypto_frame(800, second);
-    f2.resize(1100, 0);
-    [seal_client_initial(VERSION_1, &DCID, &[], 0, 1, &f1), seal_client_initial(VERSION_1, &DCID, &[], 1, 1, &f2)]
+    f2.resize(MIN_INITIAL_DATAGRAM, 0);
+    [seal_client_initial(version, dcid, scid, 0, 1, &f1), seal_client_initial(version, dcid, scid, 1, 1, &f2)]
 }
 
-fn udp_packet(local: SocketAddr, remote: SocketAddr, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn udp_packet(local: SocketAddr, remote: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     match (local, remote) {
         (SocketAddr::V4(l), SocketAddr::V4(r)) => PacketBuilder::ipv4(l.ip().octets(), r.ip().octets(), 64).udp(l.port(), r.port()).write(&mut out, payload).unwrap(),
@@ -653,7 +666,7 @@ fn udp_packet(local: SocketAddr, remote: SocketAddr, payload: &[u8]) -> Vec<u8> 
     out
 }
 
-const FLOWS: [(&str, &str); 2] = [(LOCAL, REMOTE), ("[fd00::2]:50000", "[2001:db8::1]:443")];
+pub(crate) const FLOWS: [(&str, &str); 2] = [(LOCAL, REMOTE), ("[fd00::2]:50000", "[2001:db8::1]:443")];
 
 struct StackRun {
     answer: UdpPath,

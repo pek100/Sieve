@@ -21,20 +21,17 @@ pub mod dns_flow;
 pub mod egress;
 #[cfg(windows)]
 pub mod relay;
+#[cfg(all(windows, test))]
+mod relay_tests;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use sieve_ipc::{Counters, FlowAction, FlowEvent, FlowKind, MAX_RULE_BYTES, cap_text};
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::domain::Decision;
 use crate::flow::classify::{Decoded, Kind};
 use book::FlowBook;
-
-/// Only datagram boundaries matter while draining; a smaller read loses nothing.
-const DRAIN_BUFFER: usize = 2_048;
 
 /// Counters since the engine started.
 #[derive(Debug, Default)]
@@ -173,18 +170,6 @@ pub fn close_blocked(book: &Mutex<FlowBook>, meters: &Meters, id: u64) {
     Meters::bump(&meters.blocked);
 }
 
-/// Swallows a blocked UDP flow's datagrams until it has been idle for `idle`.
-/// Ending at once would turn each QUIC retransmit into a new flow with a new
-/// owner lookup; the stack's own timeout then frees the flow.
-pub async fn drain_udp<S: AsyncRead + Unpin>(app: &mut S, idle: Duration) {
-    let mut buf = vec![0u8; DRAIN_BUFFER];
-    while let Ok(Ok(n)) = tokio::time::timeout(idle, app.read(&mut buf)).await {
-        if n == 0 {
-            return;
-        }
-    }
-}
-
 /// The wire kind of a decoded flow.
 pub fn kind_of(d: &Decoded) -> FlowKind {
     match d.kind {
@@ -215,41 +200,6 @@ mod tests {
         Meters::bump(&m.attributed);
         let c = m.counters();
         assert_eq!((c.flows, c.attributed, c.own_refused), (2, 1, 0));
-    }
-
-    /// Fake clock: a retransmit inside the idle time keeps the drain alive,
-    /// nothing is booked again, and silence ends it.
-    #[tokio::test(start_paused = true)]
-    async fn blocked_udp_drains_until_idle_and_books_one_flow() {
-        use tokio::io::AsyncWriteExt;
-        const IDLE: Duration = Duration::from_secs(30);
-        let book = Mutex::new(FlowBook::default());
-        let meters = Meters::default();
-        let id = book.lock().unwrap().open(book::tests_event(Some(1))).unwrap();
-        close_blocked(&book, &meters, id);
-        let (mut app, mut stack) = tokio::io::duplex(4096);
-        let started = tokio::time::Instant::now();
-        let drain = tokio::spawn(async move { drain_udp(&mut stack, IDLE).await });
-        for _ in 0..3 {
-            tokio::time::sleep(IDLE - Duration::from_secs(1)).await;
-            app.write_all(b"retransmit").await.unwrap();
-        }
-        assert!(!drain.is_finished(), "datagrams keep the flow alive");
-        let last = tokio::time::Instant::now();
-        drain.await.unwrap();
-        assert_eq!(tokio::time::Instant::now() - last, IDLE);
-        assert!(last - started >= IDLE * 2);
-        let batch = book.lock().unwrap().take_batch();
-        assert_eq!(batch.iter().map(|e| (e.action, e.open)).collect::<Vec<_>>(), [(FlowAction::Blocked, false)]);
-        assert_eq!(meters.counters().blocked, 1);
-        drop(app);
-    }
-
-    #[tokio::test]
-    async fn a_closed_stack_ends_the_drain_at_once() {
-        let (app, mut stack) = tokio::io::duplex(64);
-        drop(app);
-        tokio::time::timeout(Duration::from_secs(5), drain_udp(&mut stack, Duration::from_secs(3_600))).await.expect("ended");
     }
 
     #[test]

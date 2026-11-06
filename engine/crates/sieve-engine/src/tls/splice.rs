@@ -20,6 +20,12 @@ struct Meter {
     down: AtomicU64,
 }
 
+/// An app end that can be torn down at once: a browser treats a reset as final
+/// where it retries a FIN.
+pub trait Abort {
+    fn abort(&self);
+}
+
 /// The app's end. Clones share one stream: a dropped ipstack stream leaves the
 /// app waiting (live run 1), so whoever holds it last must not be the only way
 /// to close it, and `rustls`, hyper and an upgrade each want to own it.
@@ -52,6 +58,13 @@ impl<A: AsyncRead + AsyncWrite + Unpin> AppSide<A> {
     pub async fn close(&self) {
         let mut side = self.clone();
         let _ = tokio::time::timeout(CLOSE_BOUND, side.shutdown()).await;
+    }
+}
+
+impl<A: Abort> AppSide<A> {
+    /// A blocked flow's end. After it, [`Self::close`] sends nothing.
+    pub fn abort(&self) {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).abort();
     }
 }
 
