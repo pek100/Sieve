@@ -6,7 +6,7 @@ import { VM_GROUP_LABEL, VM_OFF_MEANS } from "@/core/guests";
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createMockEngine } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
-import fixture from "@/data/fixtures/engine-probe-v2.json";
+import fixture from "@/data/fixtures/engine-probe-v3.json";
 import { createMockSource } from "@/data/mock-source";
 import { parseEngineProbe } from "@/data/protocol";
 import { memoryBackend } from "@/data/settings-store";

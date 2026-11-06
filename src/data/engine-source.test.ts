@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createMockEngine, MOCK_LOG_ERROR } from "./engine-mock";
 import certFixture from "./fixtures/engine-ipc-v3.json";
-import fixture from "./fixtures/engine-probe-v2.json";
+import fixture from "./fixtures/engine-probe-v3.json";
 import logFixture from "./fixtures/engine-log-v1.json";
 import { createTauriEngine } from "./engine-source";
 import { ProtocolError } from "./protocol";
@@ -28,6 +28,21 @@ describe("Tauri engine source", () => {
     expect((await source.lists()).lists[0]).toMatchObject({ id: "adguard-dns", network: 3, skipped: 0, skipped_exceptions: [], last_error: null });
     expect((await source.listsRefresh()).compile_ms).toBe(7);
     expect(calls).toEqual(["engine_lists", "engine_lists_refresh"]);
+  });
+
+  it("reads and sends the DNS resolvers, and validates what comes back", async () => {
+    const calls: unknown[][] = [];
+    const held = { revision: 2, upstreams: ["tls://a.example"] };
+    const invoke = async <T,>(...args: unknown[]): Promise<T> => {
+      calls.push(args);
+      return held as T;
+    };
+    const source = createTauriEngine(invoke);
+    expect(await source.dnsUpstreams()).toEqual(held);
+    expect(await source.setDnsUpstreams(held)).toEqual(held);
+    expect(calls).toEqual([["engine_dns_upstreams"], ["engine_set_dns_upstreams", { list: held }]]);
+    const broken = createTauriEngine(async <T,>() => ({ revision: "x", upstreams: [] }) as T);
+    await expect(broken.dnsUpstreams()).rejects.toThrow(ProtocolError);
   });
 
   it("asks for an update with no argument at all, and validates the Status", async () => {

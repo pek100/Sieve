@@ -8,14 +8,16 @@ import { createStore } from "@/core/store";
 import { CRASH_LOOP_BANNER, createEngineController } from "./engine-controller";
 import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_CERT_ERROR, MOCK_ENGINE_ERROR, MOCK_HTTPS_OFF, type CertScenario, type EngineScenario } from "./engine-mock";
 import type { EngineSource } from "./engine-source";
+import { createMockFilterLists } from "./filter-lists-mock";
+import type { FilterListSource } from "./filter-lists-source";
 import type { Clock } from "./poller";
-import type { EnginePolicy, EngineProbe } from "./protocol";
+import type { EngineDnsUpstreams, EnginePolicy, EngineProbe } from "./protocol";
 import { createSettingsStore, memoryBackend, type SettingsBackend } from "./settings-store";
 
 const SWITCH = ENGINE_SWITCH as SettingKey;
 
 /** What the settings' defaults ask of the engine, at a revision and switch. */
-const policy = (revision: number, engine: boolean): EnginePolicy => ({ revision, engine, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false });
+const policy = (revision: number, engine: boolean): EnginePolicy => ({ revision, engine, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false, user_rules: [], exclusions: [] });
 
 function fakeClock() {
   let now = 0;
@@ -56,6 +58,7 @@ function fakeClock() {
 function fakeEngine(start: EngineScenario) {
   let mock = createMockEngine(start);
   const policies: EnginePolicy[] = [];
+  const upstreams: EngineDnsUpstreams[] = [];
   let probes = 0;
   let certReads = 0;
   const source: EngineSource = {
@@ -70,6 +73,11 @@ function fakeEngine(start: EngineScenario) {
     },
     lists: () => mock.lists(),
     listsRefresh: () => mock.listsRefresh(),
+    dnsUpstreams: () => mock.dnsUpstreams(),
+    setDnsUpstreams: (l) => {
+      upstreams.push(l);
+      return mock.setDnsUpstreams(l);
+    },
     requestUpdate: () => mock.requestUpdate(),
     stopAdguard: () => mock.stopAdguard(),
     startAdguard: () => mock.startAdguard(),
@@ -80,17 +88,17 @@ function fakeEngine(start: EngineScenario) {
     },
     installRoot: () => mock.installRoot(),
   };
-  return { source, set: (s: EngineScenario) => void (mock = createMockEngine(s)), setCert: (c: CertScenario) => void (mock = createMockEngine(start, { cert: c })), probes: () => probes, certReads: () => certReads, policies };
+  return { source, set: (s: EngineScenario) => void (mock = createMockEngine(s)), setCert: (c: CertScenario) => void (mock = createMockEngine(start, { cert: c })), probes: () => probes, certReads: () => certReads, policies, upstreams };
 }
 
-function setup(start: EngineScenario, backend: SettingsBackend = memoryBackend()) {
+function setup(start: EngineScenario, backend: SettingsBackend = memoryBackend(), filterLists: FilterListSource = createMockFilterLists()) {
   const fc = fakeClock();
   const store = createStore();
   const fake = fakeEngine(start);
   const settings = createSettingsStore(backend);
   const checks = createPassedChecks();
   const notices = createNoticeBus();
-  const controller = createEngineController({ engine: fake.source, store, clock: fc.clock, settings, checks, notices });
+  const controller = createEngineController({ engine: fake.source, store, clock: fc.clock, settings, checks, notices, filterLists });
   const undo = controller.bind();
   const phase = () => enginePhase(store.getState().engine);
   return { fc, store, fake, settings, checks, notices, controller, undo, phase };
@@ -265,6 +273,8 @@ describe("engine controller", () => {
       "apps.levels": { firefox: "off", chrome: "sieve" },
       "filtering.blockedDomains": ["ads.example"],
       "filtering.allowedDomains": ["ok.ads.example"],
+      "filtering.userRules": ["||rule.example^", "@@||ok.rule.example^"],
+      "filtering.exclusions": ["bank.example"],
     };
     const s = setup("idle", memoryBackend({ schema: 4, values }));
     await s.fc.flush();
@@ -280,6 +290,8 @@ describe("engine controller", () => {
           { kind: "block", entries: ["ads.example"], enabled: true },
           { kind: "allow", entries: ["ok.ads.example"], enabled: true },
         ],
+        user_rules: ["||rule.example^", "@@||ok.rule.example^"],
+        exclusions: ["bank.example"],
       },
     ]);
     await s.fc.advance(ENGINE_POLL_MS * 2);
@@ -310,6 +322,106 @@ describe("engine controller", () => {
     await s.fc.advance(ENGINE_POLL_MS * 2);
     expect(s.fake.policies, "order means nothing to the engine").toHaveLength(1);
     s.undo();
+  });
+
+  it("an_untouched_list_selection_stays_the_catalogues_defaults", async () => {
+    const s = setup("idle", memoryBackend({ schema: 5, values: { [ENGINE_SWITCH]: true } }));
+    await s.fc.flush();
+    expect(s.fake.policies[0].lists).toBeNull();
+    s.undo();
+  });
+
+  it("a_changed_list_selection_is_sent_as_the_ids_of_the_lists_on", async () => {
+    const { lists } = await createMockFilterLists().catalogue();
+    const on = lists.find((l) => l.default === "on")!;
+    const off = lists.find((l) => l.default === "off")!;
+    const gated = lists.find((l) => l.default === "gated")!;
+    const s = setup("idle", memoryBackend({ schema: 5, values: { [ENGINE_SWITCH]: true, "filters.lists": { [on.id]: "off", [off.id]: "on", [gated.id]: "on" } } }));
+    await s.fc.flush();
+    await s.fc.advance(ENGINE_POLL_MS);
+    const sent = s.fake.policies.at(-1)!.lists!;
+    expect(sent).toContain(off.id);
+    expect(sent).not.toContain(on.id);
+    expect(sent, "a gated list stays off whatever is stored").not.toContain(gated.id);
+    expect(sent).toEqual(lists.filter((l) => (l.default === "on" && l.id !== on.id) || l.id === off.id).map((l) => l.id));
+    const count = s.fake.policies.length;
+    await s.fc.advance(ENGINE_POLL_MS * 2);
+    expect(s.fake.policies, "the engine holds it now").toHaveLength(count);
+    await s.settings.set("filters.lists", {});
+    await s.fc.flush();
+    expect(s.fake.policies.at(-1)!.lists, "back to the defaults").toBeNull();
+    s.undo();
+  });
+
+  it("a_catalogue_that_cannot_be_read_changes_no_list_and_is_read_again", async () => {
+    const mock = createMockFilterLists();
+    const { lists } = await mock.catalogue();
+    const off = lists.find((l) => l.default === "off")!;
+    let down = true;
+    const source: FilterListSource = { ...mock, catalogue: () => (down ? Promise.reject(new Error("no")) : mock.catalogue()) };
+    const s = setup("idle", memoryBackend({ schema: 5, values: { [ENGINE_SWITCH]: true, "filters.lists": { [off.id]: "on" } } }), source);
+    await s.fc.flush();
+    expect(s.fake.policies.at(-1)!.lists, "the engine's own selection, unchanged").toBeNull();
+    expect(s.fake.policies.at(-1)!.engine, "and the rest of the policy still goes").toBe(true);
+    down = false;
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.fake.policies.at(-1)!.lists).toContain(off.id);
+    s.undo();
+  });
+
+  it("the_default_resolvers_are_the_engines_so_nothing_is_sent", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    await s.fc.advance(ENGINE_POLL_MS * 2);
+    expect(s.fake.upstreams).toEqual([]);
+    expect(s.store.getState().engine.dnsError ?? null).toBeNull();
+    s.undo();
+  });
+
+  it("the_resolver_setting_reaches_the_engine_in_its_order_and_only_once", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    const list = ["tls://b.example", "https://a.example/dns-query"];
+    await s.settings.set("filtering.upstreams", list);
+    await s.fc.flush();
+    expect(s.fake.upstreams).toEqual([{ revision: 1, upstreams: list }]);
+    await s.fc.advance(ENGINE_POLL_MS * 2);
+    expect(s.fake.upstreams, "the engine holds it").toHaveLength(1);
+    await s.settings.set("filtering.upstreams", [...list].reverse());
+    await s.fc.flush();
+    expect(s.fake.upstreams.at(-1), "the order is the order they are tried in").toEqual({ revision: 2, upstreams: [...list].reverse() });
+    s.undo();
+  });
+
+  it("a_refused_resolver_list_is_said_and_tried_again_at_the_next_probe", async () => {
+    const s = setup("idle", memoryBackend({ schema: 5, values: { "filtering.upstreams": ["tls://a.example"] } }));
+    const accepting = s.fake.source.setDnsUpstreams;
+    let refused = 0;
+    s.fake.source.setDnsUpstreams = async () => {
+      refused++;
+      throw new Error("udp://1.1.1.1 is not an encrypted upstream");
+    };
+    await s.fc.flush();
+    expect(s.store.getState().engine.dnsError).toContain("is not an encrypted upstream");
+    const first = refused;
+    await s.fc.flush();
+    expect(refused, "never in a loop").toBe(first);
+    s.fake.source.setDnsUpstreams = accepting;
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.store.getState().engine.dnsError).toBeNull();
+    s.undo();
+  });
+
+  it("an_empty_resolver_setting_sends_nothing_and_an_unreachable_engine_is_not_asked", async () => {
+    const s = setup("idle", memoryBackend({ schema: 5, values: { "filtering.upstreams": [] } }));
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.fake.upstreams).toEqual([]);
+    s.undo();
+    const absent = setup("missing", memoryBackend({ schema: 5, values: { "filtering.upstreams": ["tls://a.example"] } }));
+    await absent.fc.advance(ENGINE_POLL_MS);
+    expect(absent.fake.upstreams).toEqual([]);
+    expect(absent.store.getState().engine.dnsError ?? null).toBeNull();
+    absent.undo();
   });
 
   it("a refused policy is said and retried at the next probe, never in a loop", async () => {
@@ -443,7 +555,7 @@ describe("engine controller", () => {
         return new Promise((r) => (resolve = r));
       },
     };
-    const deps = { settings: createSettingsStore(memoryBackend()), checks: createPassedChecks(), notices: createNoticeBus() };
+    const deps = { settings: createSettingsStore(memoryBackend()), checks: createPassedChecks(), notices: createNoticeBus(), filterLists: createMockFilterLists() };
     const undo = createEngineController({ engine: slow, store, clock: fc.clock, ...deps }).bind();
     await fc.advance(ENGINE_POLL_MS * 5);
     expect(calls).toBe(1);
@@ -468,7 +580,7 @@ describe("engine controller", () => {
     const store = createStore();
     let resolve: ((p: EngineProbe) => void) | null = null;
     const mock = createMockEngine("idle");
-    const deps = { settings: createSettingsStore(memoryBackend()), checks: createPassedChecks(), notices: createNoticeBus() };
+    const deps = { settings: createSettingsStore(memoryBackend()), checks: createPassedChecks(), notices: createNoticeBus(), filterLists: createMockFilterLists() };
     const undo = createEngineController({ engine: { ...mock, probe: () => new Promise((r) => (resolve = r)) }, store, clock: fc.clock, ...deps }).bind();
     undo();
     resolve!(await mock.probe());

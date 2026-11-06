@@ -8,7 +8,7 @@
 import { describe, expect, it } from "vitest";
 import { LIST_GROUPS, listGroup } from "@/core/filter-lists";
 import { EMPTY_DOC } from "@/core/settings/document";
-import { isValidValue } from "@/core/settings/registry";
+import { isSettingKey, isValidValue } from "@/core/settings/registry";
 import { EXPORT_KIND, planImport } from "@/core/settings/transfer";
 import fixture from "@/data/fixtures/filter-lists-v1.json";
 import { hits, read, walk } from "./files";
@@ -48,6 +48,19 @@ function catalogueRows(): Row[] {
   return rows.sort((a, b) => a.at - b.at).map((r) => r.row);
 }
 
+describe("law: one store for the user's own rules", () => {
+  it("the editors' keys are the ones the engine controller sends, and no second set exists", () => {
+    for (const gone of ["filters.userRules", "filters.allowlist"]) expect(isSettingKey(gone), gone).toBe(false);
+    const hook = read("src/hooks/use-filters.ts");
+    const controller = read("src/data/engine-controller.ts");
+    for (const key of ["filtering.userRules", "filtering.allowedDomains", "filtering.blockedDomains", "filters.lists"]) {
+      expect(hook, key).toContain(key);
+      expect(controller, key).toContain(key);
+    }
+    expect(read("src/core/log-actions.ts")).toContain("filtering.userRules");
+  });
+});
+
 describe("filter list law", () => {
   const rows = catalogueRows();
 
@@ -85,34 +98,34 @@ describe("filter list law", () => {
   });
 
   it("an import cannot smuggle in a trusted scriptlet or a junk host: refused with the reason, the current value kept", () => {
-    expect(isValidValue("filters.userRules", ["##+js(trusted-x)"])).toBe(false);
-    expect(isValidValue("filters.userRules", ["example.com##+js(trusted-x)"])).toBe(false);
-    expect(isValidValue("filters.userRules", ["||a.example^", "! note"])).toBe(true);
-    expect(isValidValue("filters.userRules", [""])).toBe(false);
-    expect(isValidValue("filters.allowlist", ["a.example"])).toBe(true);
-    for (const bad of ["localhost", "1.2.3.4", "WWW.Example.com", "https://a.example/"]) expect(isValidValue("filters.allowlist", [bad]), bad).toBe(false);
+    expect(isValidValue("filtering.userRules", ["##+js(trusted-x)"])).toBe(false);
+    expect(isValidValue("filtering.userRules", ["example.com##+js(trusted-x)"])).toBe(false);
+    expect(isValidValue("filtering.userRules", ["||a.example^", "! note"])).toBe(true);
+    expect(isValidValue("filtering.userRules", [""])).toBe(false);
+    expect(isValidValue("filtering.allowedDomains", ["a.example"])).toBe(true);
+    for (const bad of ["localhost", "1.2.3.4", "WWW.Example.com", "https://a.example/"]) expect(isValidValue("filtering.allowedDomains", [bad]), bad).toBe(false);
     expect(isValidValue("filters.lists", { x: "on" })).toBe(true);
     expect(isValidValue("filters.lists", { x: "loud" })).toBe(false);
 
-    const current = { schema: EMPTY_DOC.schema, values: { "filters.userRules": ["||kept.example^"] } };
-    const plan = planImport(current, JSON.stringify({ kind: EXPORT_KIND, schema: EMPTY_DOC.schema, values: { "filters.userRules": ["##+js(trusted-x)"] } }));
+    const current = { schema: EMPTY_DOC.schema, values: { "filtering.userRules": ["||kept.example^"] } };
+    const plan = planImport(current, JSON.stringify({ kind: EXPORT_KIND, schema: EMPTY_DOC.schema, values: { "filtering.userRules": ["##+js(trusted-x)"] } }));
     expect(plan.ok).toBe(true);
     if (!plan.ok) return;
-    expect(plan.refused).toEqual([{ key: "filters.userRules", reason: expect.stringContaining("trusted scriptlet") }]);
-    expect(plan.next.values["filters.userRules"]).toEqual(["||kept.example^"]);
+    expect(plan.refused).toEqual([{ key: "filtering.userRules", reason: expect.stringContaining("trusted scriptlet") }]);
+    expect(plan.next.values["filtering.userRules"]).toEqual(["||kept.example^"]);
   });
 
   it.each(["! note\nexample.com##+js(trusted-x)", "example.com##.ad\n||evil.example^$important", "! note\r||evil.example^", "||a.example^\n"])(
     "one element is one line: an import cannot carry a second rule inside %j",
     (smuggled) => {
-      expect(isValidValue("filters.userRules", [smuggled])).toBe(false);
-      const current = { schema: EMPTY_DOC.schema, values: { "filters.userRules": ["||kept.example^"] } };
-      const plan = planImport(current, JSON.stringify({ kind: EXPORT_KIND, schema: EMPTY_DOC.schema, values: { "filters.userRules": ["||fine.example^", smuggled] } }));
+      expect(isValidValue("filtering.userRules", [smuggled])).toBe(false);
+      const current = { schema: EMPTY_DOC.schema, values: { "filtering.userRules": ["||kept.example^"] } };
+      const plan = planImport(current, JSON.stringify({ kind: EXPORT_KIND, schema: EMPTY_DOC.schema, values: { "filtering.userRules": ["||fine.example^", smuggled] } }));
       expect(plan.ok).toBe(true);
       if (!plan.ok) return;
-      expect(plan.refused).toEqual([{ key: "filters.userRules", reason: expect.stringContaining("line break") }]);
+      expect(plan.refused).toEqual([{ key: "filtering.userRules", reason: expect.stringContaining("line break") }]);
       expect(plan.changes).toEqual([]);
-      expect(plan.next.values["filters.userRules"]).toEqual(["||kept.example^"]);
+      expect(plan.next.values["filtering.userRules"]).toEqual(["||kept.example^"]);
     },
   );
 });

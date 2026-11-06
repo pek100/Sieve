@@ -81,7 +81,7 @@ describe("the parser's words", () => {
 });
 
 describe("normalizeDomain", () => {
-  it("the fixture table (Rust checks it against dns::rules::host_name)", () => {
+  it("the fixture table (Rust checks it against the engine's domain_rule)", () => {
     for (const c of cases.domains) {
       const got = normalizeDomain(c.raw);
       if (c.host === null) expect(got.ok, c.raw).toBe(false);

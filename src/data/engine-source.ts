@@ -12,7 +12,7 @@
  * AdGuard's service through one command Windows asks the user to approve.
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { parseCertStatus, parseEngineLists, parseEngineProbe, parseEngineStatus, parseLogTail, type CertStatus, type EngineLists, type EnginePolicy, type EngineProbe, type EngineStatus, type LogTail } from "./protocol";
+import { parseCertStatus, parseDnsUpstreams, parseEngineLists, parseEngineProbe, parseEngineStatus, parseLogTail, type CertStatus, type EngineDnsUpstreams, type EngineLists, type EnginePolicy, type EngineProbe, type EngineStatus, type LogTail } from "./protocol";
 
 export interface EngineSource {
   readonly kind: "mock" | "tauri";
@@ -24,6 +24,10 @@ export interface EngineSource {
   lists(): Promise<EngineLists>;
   /** Asks the engine to download every selected list now; the report as it stands. */
   listsRefresh(): Promise<EngineLists>;
+  /** The encrypted DNS resolvers the engine holds. Rejects when it did not answer. */
+  dnsUpstreams(): Promise<EngineDnsUpstreams>;
+  /** Sends `filtering.upstreams`; the list the engine then holds. Rejects when it refused this one. */
+  setDnsUpstreams(list: EngineDnsUpstreams): Promise<EngineDnsUpstreams>;
   /**
    * `RequestUpdate`: no argument, ever. The engine decides from its own state
    * whether this checks or applies the release it offers, and verifies
@@ -51,6 +55,8 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     setPolicy: async (policy) => parseEngineStatus(await invoke<unknown>("engine_set_policy", { policy })),
     lists: async () => parseEngineLists(await invoke<unknown>("engine_lists")),
     listsRefresh: async () => parseEngineLists(await invoke<unknown>("engine_lists_refresh")),
+    dnsUpstreams: async () => parseDnsUpstreams(await invoke<unknown>("engine_dns_upstreams")),
+    setDnsUpstreams: async (list) => parseDnsUpstreams(await invoke<unknown>("engine_set_dns_upstreams", { list })),
     requestUpdate: async () => parseEngineStatus(await invoke<unknown>("engine_request_update")),
     stopAdguard: async () => void (await invoke<unknown>("adguard_stop")),
     startAdguard: async () => void (await invoke<unknown>("adguard_start")),

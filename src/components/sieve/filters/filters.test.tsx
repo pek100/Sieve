@@ -1,12 +1,14 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { NoticeToaster } from "@/components/sieve/shell/notice-toaster";
 import fixture from "@/data/fixtures/filter-lists-v1.json";
 import { MOCK_LISTS_ERROR, createMockFilterLists, type FilterListScenario } from "@/data/filter-lists-mock";
 import type { FilterListSource } from "@/data/filter-lists-source";
+import { createMockEngine } from "@/data/engine-mock";
+import type { EngineSource } from "@/data/engine-source";
 import { createMockSource } from "@/data/mock-source";
-import { parseFilterCatalogue } from "@/data/protocol";
+import { parseFilterCatalogue, type EnginePolicy } from "@/data/protocol";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
@@ -15,9 +17,16 @@ import { FiltersScreen, NOT_APPLIED_TEXT } from "./filters-screen";
 vi.mock("next/navigation", () => ({ usePathname: () => "/filters/" }));
 vi.setConfig({ testTimeout: 20_000 });
 
-async function setup(lists: FilterListScenario | FilterListSource = "pending", stored?: unknown) {
+const cleanups: (() => void)[] = [];
+afterEach(() => {
+  for (const undo of cleanups.splice(0)) undo();
+});
+
+async function setup(lists: FilterListScenario | FilterListSource = "pending", stored?: unknown, engine?: EngineSource) {
   const filterLists = typeof lists === "string" ? createMockFilterLists(lists) : lists;
-  const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(stored), filterLists });
+  const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(stored), filterLists, engine });
+  const unbind = runtime.engineController.bind();
+  cleanups.push(unbind);
   render(
     <SieveProvider runtime={runtime}>
       <FiltersScreen />
@@ -36,6 +45,59 @@ const list = (id: string) => document.querySelector<HTMLElement>(`[data-list="${
 const group = (id: string) => document.querySelector<HTMLElement>(`[data-list-group="${id}"]`)!;
 const pending = () => document.querySelector("[data-filters-pending]");
 const reportedId = fixture.examples.loaded.lists.find((l) => l.report?.skipped)!.id;
+
+/** The engine's facts in the store, then whatever they caused settled. */
+const settled = () => act(async () => {
+  for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+});
+
+describe("the engine's report", () => {
+  it("each list shows the applied and skipped counts engine_lists answers, with the parser's reasons", async () => {
+    const rt = await setup("pending", undefined, createMockEngine("filtering"));
+    await settled();
+    const { lists } = await rt.engine.lists();
+    const row = lists.find((l) => l.network > 0)!;
+    expect(list(row.id)).toHaveTextContent(`${row.network.toLocaleString("en-US")} applied, ${row.skipped} skipped`);
+    expect(pending(), "a list is in force").toBeNull();
+    const fetchedNothing = lists.find((l) => l.network === 0)!;
+    expect(list(fetchedNothing.id)).toHaveTextContent("Not loaded yet");
+  });
+
+  it("an engine that cannot answer leaves what the seam gave, never an error", async () => {
+    await setup("pending", undefined, createMockEngine("missing"));
+    await settled();
+    expect(pending()).toHaveTextContent(NOT_APPLIED_TEXT);
+    const failing = { ...createMockEngine("filtering"), lists: () => Promise.reject(new Error("the pipe broke")) };
+    cleanup();
+    await setup("loaded", undefined, failing);
+    await settled();
+    expect(list(reportedId)).toHaveTextContent("applied");
+  });
+});
+
+describe("one store for the user's rules", () => {
+  it("the blocklist writes the key the engine reads", async () => {
+    const rt = await setup();
+    await userEvent.type(screen.getByRole("textbox", { name: "Add to Blocklist" }), "https://Tracker.Example/x");
+    await userEvent.click(within(screen.getByRole("textbox", { name: "Add to Blocklist" }).closest("form")!).getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(rt.settings.get("filtering.blockedDomains")).toEqual(["tracker.example"]));
+    await userEvent.click(screen.getByRole("button", { name: "Remove tracker.example" }));
+    await waitFor(() => expect(rt.settings.get("filtering.blockedDomains")).toEqual([]));
+  });
+
+  it("what the editors write reaches the engine in the next policy", async () => {
+    const sent: EnginePolicy[] = [];
+    const mock = createMockEngine("idle");
+    const rt = await setup("pending", undefined, { ...mock, setPolicy: (p) => (sent.push(p), mock.setPolicy(p)) });
+    await settled();
+    await act(async () => {
+      await rt.settings.set("filtering.userRules", ["||a.example^"]);
+      await rt.settings.set("filtering.allowedDomains", ["b.example"]);
+    });
+    await settled();
+    expect(sent.at(-1)).toMatchObject({ user_rules: ["||a.example^"], domain_lists: [{ kind: "allow", entries: ["b.example"], enabled: true }] });
+  });
+});
 
 describe("the list catalogue", () => {
   it("pending says Not loaded yet and never shows a 0, and says nothing is applied", async () => {
@@ -91,7 +153,7 @@ describe("the list catalogue", () => {
   });
 
   it("a selection with unknown ids and an old settings document render", async () => {
-    const rt = await setup("pending", { schema: 1, values: { "filters.lists": { "from-the-future": "on" }, "filters.userRules": ["##+js(trusted-x)"], "filters.allowlist": "nope" } });
+    const rt = await setup("pending", { schema: 1, values: { "filters.lists": { "from-the-future": "on" }, "filtering.userRules": ["##+js(trusted-x)"], "filtering.allowedDomains": "nope" } });
     expect(screen.getByRole("textbox", { name: "User rules" })).toHaveValue("");
     await userEvent.click(within(list("adguard-cookies")).getByRole("switch"));
     expect(rt.settings.get("filters.lists")).toEqual({ "from-the-future": "on", "adguard-cookies": "on" });
@@ -138,7 +200,7 @@ describe("user rules", () => {
     const problems = await screen.findByRole("list", { name: "Rule problems" });
     expect(within(problems).getByRole("alert")).toHaveTextContent("These rules were not saved: Sieve could not check or store them.");
     expect(within(problems).getByRole("alert")).toHaveTextContent("task 7 panicked");
-    expect(rt.settings.get("filters.userRules")).toEqual([]);
+    expect(rt.settings.get("filtering.userRules")).toEqual([]);
     expect(editor()).toHaveValue("||a.example^");
     fireEvent.change(editor(), { target: { value: "||b.example^" } });
     expect(screen.queryByRole("list", { name: "Rule problems" })).toBeNull();
@@ -153,7 +215,7 @@ describe("user rules", () => {
     expect(screen.queryByRole("alert")).toBeNull();
     expect(save()).toBeEnabled();
     await userEvent.click(save());
-    expect(rt.settings.get("filters.userRules")).toEqual(["! note", "||good.example^"]);
+    expect(rt.settings.get("filtering.userRules")).toEqual(["! note", "||good.example^"]);
     expect(editor()).toHaveValue("! note\n||good.example^");
     expect(save()).toBeDisabled();
   });
@@ -173,11 +235,11 @@ describe("user rules", () => {
     const alert = screen.getByRole("alert");
     expect(alert).toHaveTextContent("Line 3: This rule has a $ option Sieve does not know.");
     expect(alert).toHaveTextContent("network filter error: unrecognised option");
-    expect(rt.settings.get("filters.userRules")).toEqual([]);
+    expect(rt.settings.get("filtering.userRules")).toEqual([]);
   });
 
   it("Block a site appends its rule to the editor, once, and refuses junk with a sentence", async () => {
-    await setup("pending", { schema: 4, values: { "filters.userRules": ["||a.example^"] } });
+    await setup("pending", { schema: 4, values: { "filtering.userRules": ["||a.example^"] } });
     const site = screen.getByRole("textbox", { name: "Block a site" });
     await userEvent.type(site, "https://Ads.Example.com/x{Enter}");
     expect(editor()).toHaveValue("||a.example^\n||ads.example.com^");
@@ -194,18 +256,18 @@ describe("allowlist", () => {
   it("adds a normalized host; a duplicate is absorbed; a bad one is refused with a sentence", async () => {
     const rt = await setup();
     await add("https://WWW.Example.com/a?b");
-    expect(rt.settings.get("filters.allowlist")).toEqual(["www.example.com"]);
+    expect(rt.settings.get("filtering.allowedDomains")).toEqual(["www.example.com"]);
     await add("www.example.com");
-    expect(rt.settings.get("filters.allowlist")).toEqual(["www.example.com"]);
+    expect(rt.settings.get("filtering.allowedDomains")).toEqual(["www.example.com"]);
     await add("1.2.3.4");
     expect(screen.getByRole("alert")).toHaveTextContent("IP address");
   });
 
   it("removal gives an undo toast and undo restores", async () => {
-    const rt = await setup("pending", { schema: 4, values: { "filters.allowlist": ["a.example", "b.example"] } });
+    const rt = await setup("pending", { schema: 4, values: { "filtering.allowedDomains": ["a.example", "b.example"] } });
     await userEvent.click(screen.getByRole("button", { name: "Remove a.example" }));
-    expect(rt.settings.get("filters.allowlist")).toEqual(["b.example"]);
+    expect(rt.settings.get("filtering.allowedDomains")).toEqual(["b.example"]);
     await userEvent.click(await screen.findByRole("button", { name: "Undo" }));
-    expect(rt.settings.get("filters.allowlist")).toEqual(["b.example", "a.example"]);
+    expect(rt.settings.get("filtering.allowedDomains")).toEqual(["b.example", "a.example"]);
   });
 });

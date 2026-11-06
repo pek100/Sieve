@@ -2,7 +2,7 @@
 
 import type { ReactNode } from "react";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { listName, outcomeWords } from "@/core/log";
+import { listName, outcomeWords, rowOwner } from "@/core/log";
 import type { LogAction } from "@/core/log-actions";
 import type { LogRow } from "@/data/protocol";
 import { LogActions } from "./log-actions";
@@ -48,7 +48,7 @@ export function LogDetailsSheet({
               </Fact>
               <Fact label="List">{list ?? "No list"}</Fact>
               <Fact label="App" mono={row.exe != null}>
-                {row.exe ?? "Unknown app"}
+                {row.exe ?? rowOwner(row)}
               </Fact>
               {row.url && (
                 <Fact label="URL" mono>

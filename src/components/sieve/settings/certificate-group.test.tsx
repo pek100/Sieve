@@ -14,7 +14,7 @@ import { CertificateGroup } from "./certificate-group";
 
 // `filtering.https` is unavailable until slice 6, which reads it as off and so
 // sends the engine off. These tests are about the group, with the switch real:
-// law 11 holds the real registry (the same split as dns-card.test.tsx).
+// law 11 holds the real registry (the same split as settings/unavailable.test.ts).
 vi.mock("@/core/settings/registry", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/core/settings/registry")>()),
   isAvailable: () => true,

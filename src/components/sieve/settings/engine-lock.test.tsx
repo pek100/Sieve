@@ -126,6 +126,6 @@ describe("a setting the engine carries out is locked while the engine cannot tak
       await vi.waitFor(() => expect(s.phase()).toBe("routing"));
       expect(sw).toBeChecked();
     }
-    expect(s.policies).toEqual([{ revision: 1, engine: true, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false }]);
+    expect(s.policies).toEqual([{ revision: 1, engine: true, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false, user_rules: [], exclusions: [] }]);
   });
 });

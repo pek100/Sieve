@@ -21,7 +21,7 @@ test.describe("filters", () => {
     const errors = await open(page);
     await expect(page.getByRole("link", { name: "Filters" })).toHaveAttribute("aria-current", "page");
     await expect(list(page, "adguard-base")).toContainText("Not loaded yet");
-    await expect(page.locator("[data-filters-pending]")).toContainText("blocks nothing yet");
+    await expect(page.locator("[data-filters-pending]")).toContainText("No filter list is in force yet");
     await expect(page.locator("[data-list-catalogue]")).not.toContainText("0 applied");
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
     await page.screenshot({ path: `test-results/screens/filters-${info.project.name}.png`, fullPage: true });

@@ -12,13 +12,15 @@ import { DomainList } from "./domain-list";
 import { ListCatalogue } from "./list-catalogue";
 import { RulesEditor } from "./rules-editor";
 
-export const NOT_APPLIED_TEXT = "Sieve blocks nothing yet. These choices are saved, and the engine starts using them in a later version.";
+export const NOT_APPLIED_TEXT = "No filter list is in force yet: the engine has not loaded any. These choices are saved and reach the engine while it runs.";
+const BLOCKLIST_TEXT = "Connections to these sites and their subdomains are closed for every app that is on, whatever the filter lists say.";
 
 /**
- * Filters: the list catalogue beside the user's own rules and allowlist. The
- * catalogue and its counts come from the engine's table through the filter list
- * seam; the choices are settings. While the password holds, all of it stays
- * readable and no control takes a change.
+ * Filters: the list catalogue beside the user's own rules and domain lists. The
+ * catalogue comes from the engine's table through the filter list seam and its
+ * counts from the engine's report; the choices are settings, the same ones the
+ * engine is sent. While the password holds, all of it stays readable and no
+ * control takes a change.
  */
 export function FiltersScreen() {
   const model = useFilters();
@@ -44,6 +46,7 @@ export function FiltersScreen() {
         <GridRegion span={6} className="flex flex-col gap-8">
           <RulesEditor saved={model.rules} onSave={model.saveRules} disabled={shut} />
           <DomainList title="Allowlist" description={ALLOWLIST_TEXT} hosts={model.allowlist} onAdd={model.addAllowed} onRemove={model.removeAllowed} disabled={shut} />
+          <DomainList title="Blocklist" description={BLOCKLIST_TEXT} hosts={model.blocklist} onAdd={model.addBlocked} onRemove={model.removeBlocked} disabled={shut} />
         </GridRegion>
       </LayoutGrid>
     </Page>

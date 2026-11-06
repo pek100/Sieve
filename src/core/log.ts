@@ -85,6 +85,8 @@ export const REASON_TEXT: Readonly<Record<string, string>> = {
   no_rule: "no rule matched",
   exception: "exception rule",
   app_off: "app is off",
+  mixed_names: "the address also serves names no rule blocks",
+  no_name: "no name known for this address",
 };
 
 /** A reason in words; one this build does not know shows its slug with spaces. */
@@ -140,4 +142,10 @@ export function rowPath(row: Pick<LogRow, "url">): string | null {
 export function exeName(exe: string | null | undefined): string | null {
   if (!exe) return null;
   return exe.split(/[\\/]/).pop() || null;
+}
+
+/** Who a row belongs to, in words: a process's file name, a VM's name, or that it is not known. */
+export function rowOwner(row: Pick<LogRow, "exe" | "forwarded">): string {
+  if (row.forwarded) return row.forwarded.vm ?? "Unnamed virtual machine";
+  return exeName(row.exe) ?? "Unknown app";
 }

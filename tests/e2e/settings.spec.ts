@@ -26,7 +26,7 @@ test.describe("settings", () => {
     // off, my apps, the engine's switch, the blocked and allowed domains, the encrypted upstreams, your
     // rules and the sites not decrypted, desktop notifications, lists changed, user rules, allowlist,
     // lock again after. There is no Windows DNS row: Sieve never changes Windows DNS.
-    await expect(page.locator("[data-setting]")).toHaveCount(18);
+    await expect(page.locator("[data-setting]")).toHaveCount(16);
     await expect(row(page, "filtering.engine").getByRole("switch")).not.toBeChecked();
     await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(1);
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);

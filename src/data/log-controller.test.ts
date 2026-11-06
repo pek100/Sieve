@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { LOG_POLL_MS, LOG_RING } from "@/core/log";
 import { createStore } from "@/core/store";
-import fixture from "./fixtures/engine-probe-v2.json";
+import fixture from "./fixtures/engine-probe-v3.json";
 import { createLogController } from "./log-controller";
 import type { Clock } from "./poller";
 import { LOG_TAIL_VERSION, parseEngineProbe, parseLogTail, type LogEntry, type LogTail } from "./protocol";

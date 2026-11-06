@@ -3,17 +3,16 @@ import fixture from "@/data/fixtures/filter-lists-v1.json";
 import { parseFilterCatalogue, type FilterList } from "@/data/protocol";
 import {
   countText,
-  filterPolicy,
   groupState,
   isGated,
   listGroup,
   listOn,
   nothingLoaded,
+  selectedListIds,
   setGroupOn,
   setListOn,
+  withEngineReports,
 } from "./filter-lists";
-import { allowRule } from "./rules";
-import { EMPTY_DOC, writeValue } from "./settings/document";
 
 const { lists } = parseFilterCatalogue(fixture.examples.pending);
 const loaded = parseFilterCatalogue(fixture.examples.loaded).lists;
@@ -85,19 +84,52 @@ describe("counts", () => {
   });
 });
 
-describe("filterPolicy", () => {
-  it("is the lists on, the rule lines without comments, and the allow rules", () => {
+describe("selectedListIds", () => {
+  it("is the lists on, never a gated one or an id the catalogue lacks", () => {
     const off = byDefault("off");
     const on = byDefault("on");
     const gated = byDefault("gated");
-    let doc = writeValue(EMPTY_DOC, "filters.lists", { [off.id]: "on", [on.id]: "off", [gated.id]: "on" });
-    doc = writeValue(doc, "filters.userRules", ["! note", "||a.example^"]);
-    doc = writeValue(doc, "filters.allowlist", ["b.example"]);
-    const p = filterPolicy(doc, { lists });
-    expect(p.lists).toContain(off.id);
-    expect(p.lists).not.toContain(on.id);
-    expect(p.lists).not.toContain(gated.id);
-    expect(p.userRules).toEqual(["||a.example^"]);
-    expect(p.allowRules).toEqual([allowRule("b.example")]);
+    const ids = selectedListIds({ [off.id]: "on", [on.id]: "off", [gated.id]: "on", "from-the-future": "on" }, { lists });
+    expect(ids).toContain(off.id);
+    expect(ids).not.toContain(on.id);
+    expect(ids).not.toContain(gated.id);
+    expect(ids).not.toContain("from-the-future");
+  });
+});
+
+describe("withEngineReports", () => {
+  const row = (id: string, enabled: boolean, network: number, skipped = 0) => ({
+    id,
+    enabled,
+    fetched_at_ms: null,
+    refresh_s: null,
+    last_error: null,
+    network,
+    cosmetic: 0,
+    skipped,
+    skip_reasons: (skipped ? { "bad option": skipped } : {}) as Record<string, number>,
+    skipped_exceptions: [],
+    skipped_exceptions_total: 0,
+  });
+  const reportOf = (list: { lists: FilterList[] }, id: string) => list.lists.find((l) => l.id === id)?.report;
+
+  it("puts the engine's own counts on each list it reports", () => {
+    const on = byDefault("on");
+    const got = withEngineReports({ lists }, { lists: [row(on.id, true, 120, 2)], compile_ms: 5 });
+    expect(reportOf(got, on.id)).toEqual({ applied: 120, skipped: 2, reasons: { "bad option": 2 } });
+  });
+
+  it("says nothing of a list with no rules in force: absent is not zero", () => {
+    const on = byDefault("on");
+    const off = byDefault("off");
+    const got = withEngineReports({ lists: loaded }, { lists: [row(on.id, true, 0), row(off.id, false, 90)], compile_ms: null });
+    expect(reportOf(got, on.id)).toBeNull();
+    expect(reportOf(got, off.id), "turned off: a report of old counts claims nothing").toBeNull();
+  });
+
+  it("leaves what the seam gave when the engine gave no answer or no row", () => {
+    const catalogue = { lists: loaded };
+    expect(withEngineReports(catalogue, null)).toBe(catalogue);
+    expect(withEngineReports(catalogue, { lists: [], compile_ms: null }).lists).toEqual(loaded);
   });
 });

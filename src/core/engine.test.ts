@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import fixture from "@/data/fixtures/engine-probe-v2.json";
+import fixture from "@/data/fixtures/engine-probe-v3.json";
 import { parseEngineProbe, type EngineStatus, type ListFact } from "@/data/protocol";
 import {
   ADGUARD_PAUSE_TEXT,

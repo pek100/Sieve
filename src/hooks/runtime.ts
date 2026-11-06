@@ -95,6 +95,7 @@ export function createRuntime(o: RuntimeOptions): Runtime {
   const desktop = o.desktop ?? null;
   const engine = o.engine ?? createMockEngine();
   const lock = o.lock ?? createMockLock();
+  const filterLists = o.filterLists ?? createMockFilterLists();
   return {
     isTauri: o.isTauri ?? false,
     source: o.source,
@@ -108,9 +109,9 @@ export function createRuntime(o: RuntimeOptions): Runtime {
     pages: o.pages ?? browserPages(),
     safetyNet: createSafetyNet({ source: o.windowsDns ?? createMockWindowsDns(), notices, clock }),
     engine,
-    engineController: createEngineController({ engine, store, clock, settings, checks: passedChecks, notices }),
+    engineController: createEngineController({ engine, store, clock, settings, checks: passedChecks, notices, filterLists }),
     logController: createLogController({ engine, store, clock }),
-    filterLists: o.filterLists ?? createMockFilterLists(),
+    filterLists,
     lock,
     lockController: createLockController({ source: lock, clock, settings, notices }),
     welcomeOnFirstRun: o.welcomeOnFirstRun ?? o.isTauri ?? false,

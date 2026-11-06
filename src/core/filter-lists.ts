@@ -9,9 +9,7 @@
  * default are stored. A gated list stays off whatever is stored, and nothing here
  * can turn it on, so its slice's acceptance cannot be bypassed (plan D5).
  */
-import type { FilterCatalogue, FilterList, FilterReport } from "@/data/protocol";
-import { readValue, type SettingsDoc } from "./settings/document";
-import { allowRule, checkRuleLine } from "./rules";
+import type { EngineListStatus, EngineLists, FilterCatalogue, FilterList, FilterReport } from "@/data/protocol";
 
 export type ListGroupId = "tracking" | "annoyances" | "general";
 
@@ -76,21 +74,34 @@ export function countText(report: FilterReport | null): string {
 /** No list has counts yet: nothing here is in force. */
 export const nothingLoaded = (lists: readonly FilterList[]) => lists.every((l) => l.report === null);
 
-export interface FilterPolicy {
-  lists: string[];
-  userRules: string[];
-  allowRules: string[];
+/**
+ * The catalogue ids SetPolicy names for a selection the user changed: the one
+ * place "on" becomes ids. A gated list is never among them, and an id no
+ * catalogue row has (an older or newer build) is left out.
+ */
+export function selectedListIds(selection: ListSelection, catalogue: Pick<FilterCatalogue, "lists">): string[] {
+  return catalogue.lists.filter((l) => listOn(l, selection)).map((l) => l.id);
+}
+
+/** A row of the engine's report as a list's counts; null when that list has nothing in force. */
+function reportOf(row: EngineListStatus): FilterReport | null {
+  const loaded = row.enabled && row.network + row.cosmetic + row.skipped > 0;
+  return loaded ? { applied: row.network, skipped: row.skipped, reasons: row.skip_reasons } : null;
 }
 
 /**
- * What engine slice 4 will send in SetPolicy: the one place these semantics
- * live. No live caller until then; the tests hold what it means.
+ * The catalogue with the engine's own report on each list. A list the engine
+ * did not report keeps what the seam gave it, so with no answer nothing changes
+ * and nothing is claimed.
  */
-export function filterPolicy(doc: SettingsDoc, catalogue: Pick<FilterCatalogue, "lists">): FilterPolicy {
-  const selection = readValue(doc, "filters.lists");
+export function withEngineReports<C extends Pick<FilterCatalogue, "lists">>(catalogue: C, report: EngineLists | null): C {
+  if (report === null) return catalogue;
+  const rows = new Map(report.lists.map((r) => [r.id, r]));
   return {
-    lists: catalogue.lists.filter((l) => listOn(l, selection)).map((l) => l.id),
-    userRules: readValue(doc, "filters.userRules").filter((r) => checkRuleLine(r).kind !== "comment"),
-    allowRules: readValue(doc, "filters.allowlist").map(allowRule),
+    ...catalogue,
+    lists: catalogue.lists.map((l) => {
+      const row = rows.get(l.id);
+      return row ? { ...l, report: reportOf(row) } : l;
+    }),
   };
 }

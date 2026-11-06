@@ -231,24 +231,23 @@ export const REGISTRY = {
     liveCheck: "live_engine_full_route_relays_and_restores",
     needsEngine: true,
   } satisfies DataSwitchSetting,
-  // The user's own rules (B6), sent whole in the engine's policy. The engine
-  // takes host names only and counts anything else as skipped; they beat the
-  // lists both ways.
+  // The user's own rules (B6), sent whole in the engine's policy and edited on
+  // the Filters page. They beat the lists both ways.
   "filtering.blockedDomains": {
     kind: "list",
     section: "filtering",
-    label: "Blocked domains",
-    help: "Hosts the engine closes for every sieved app, with their subdomains, whatever the filter lists say.",
+    label: "Blocklist",
+    help: "Hosts the engine closes for every sieved app, with their subdomains, whatever the filter lists say. Edited under Filters.",
     default: [] as readonly string[],
-    of: { type: "string" },
+    of: { type: "domain" },
   } satisfies ListSetting<string>,
   "filtering.allowedDomains": {
     kind: "list",
     section: "filtering",
-    label: "Allowed domains",
-    help: "Hosts the engine never closes, with their subdomains, whatever the filter lists say.",
+    label: "Allowlist",
+    help: `${ALLOWLIST_TEXT} Edited under Filters.`,
     default: [] as readonly string[],
-    of: { type: "string" },
+    of: { type: "domain" },
   } satisfies ListSetting<string>,
   // The root certificate (docs/plans/2026-10-17-https-filtering.md, slice 5).
   // Hidden until interception exists: it "cannot be on without slice 6". The
@@ -274,15 +273,17 @@ export const REGISTRY = {
     default: ["https://cloudflare-dns.com/dns-query", "https://dns.quad9.net/dns-query"] as readonly string[],
     of: { type: "upstream" },
   } satisfies ListSetting<string>,
-  // Written by the log's row actions after a preview (core/log-actions).
+  // Written by the Filters page's editor and the log's row actions after a
+  // preview (core/log-actions), and sent whole in the engine's policy.
   "filtering.userRules": {
     kind: "list",
     section: "filtering",
     label: "Your rules",
-    help: "Filter rules you added from the log, in adblock syntax.",
+    help: "Rules you wrote under Filters or added from the log, in the same language as the filter lists.",
     default: [] as readonly string[],
-    of: { type: "string" },
+    of: { type: "rule" },
   } satisfies ListSetting<string>,
+  // Sent in the policy; nothing decrypts before slice 6, so nothing reads them yet.
   "filtering.exclusions": {
     kind: "list",
     section: "filtering",
@@ -311,32 +312,16 @@ export const REGISTRY = {
     desktopOnly: true,
   } satisfies BooleanSetting,
   // Only differences from a list's own default are stored (core/filter-lists).
-  // The engine reads none of these three until its slice 4.
+  // The engine controller turns them into the policy's `lists`.
   "filters.lists": {
     kind: "map",
     section: "filters",
     label: "Lists changed",
-    help: "Filter lists you changed from their default. Saved now; the engine starts using them in a later version.",
+    help: "Filter lists you changed from their default. The engine downloads and applies the ones that are on, while it runs.",
     default: {} as Readonly<Record<string, string>>,
     of: { type: "enum", options: ["on", "off"] },
     noun: "list",
   } satisfies MapSetting<string>,
-  "filters.userRules": {
-    kind: "list",
-    section: "filters",
-    label: "User rules",
-    help: "Rules you wrote, in the same language as the filter lists. Saved now; the engine starts using them in a later version.",
-    default: [] as readonly string[],
-    of: { type: "rule" },
-  } satisfies ListSetting<string>,
-  "filters.allowlist": {
-    kind: "list",
-    section: "filters",
-    label: "Allowlist",
-    help: `${ALLOWLIST_TEXT} Saved now; the engine starts using them in a later version.`,
-    default: [] as readonly string[],
-    of: { type: "domain" },
-  } satisfies ListSetting<string>,
   "password.idleMinutes": {
     kind: "number",
     section: "password",

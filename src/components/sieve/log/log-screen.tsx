@@ -2,6 +2,7 @@
 
 import { Eraser, Pause, Play } from "lucide-react";
 import { useState } from "react";
+import { LockGate } from "@/components/sieve/lock/lock-gate";
 import { IconButton } from "@/components/sieve/primitives/icon-button";
 import { CardBoundary, CardError } from "@/components/sieve/shell/card";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
@@ -19,6 +20,15 @@ import { useLogView, useRowActions } from "./use-log";
 
 const plural = (n: number, one: string, many: string) => `${n.toLocaleString("en-US")} ${n === 1 ? one : many}`;
 
+/** The log is browsing history, so a held password hides it as well as stopping changes. */
+export function LogScreen() {
+  return (
+    <LockGate title="Log">
+      <LogView />
+    </LockGate>
+  );
+}
+
 /**
  * The filtering log (plan 8.3, 8.4): what the engine did, newest first, in
  * words. Session only and in memory. Flat on the page grid: the filters and
@@ -26,7 +36,7 @@ const plural = (n: number, one: string, many: string) => `${n.toLocaleString("en
  * the same actions. The log's own failure is said above the rows and keeps
  * them; a bad row never takes the screen with it.
  */
-export function LogScreen() {
+function LogView() {
   const view = useLogView();
   const rowActions = useRowActions();
   const [open, setOpen] = useState<LogRow | null>(null);

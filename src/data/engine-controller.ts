@@ -8,13 +8,16 @@
  * What it changes, and only these:
  * - the engine's policy follows the user's settings: the switch
  *   `filtering.engine` (ENGINE_SWITCH), the global Sieving switch, the apps
- *   turned off and the domain lists. Whenever the engine answers with anything
- *   different, order aside, the whole policy is sent with the next revision
- *   (`setPolicy`): a part-filled one would clear the rest. The switch defaults
- *   off, so the engine routes nothing until the user turns it on. Nothing is
- *   sent while the engine cannot take a policy (`engineTakesPolicy`); the
- *   stored values then wait untouched. A refused send is retried at the next
- *   probe, not at once;
+ *   turned off, the filter list selection, the domain lists, the user's rules
+ *   and exclusions. Whenever the engine answers with anything different, order
+ *   aside, the whole policy is sent with the next revision (`setPolicy`): a
+ *   part-filled one would clear the rest. The switch defaults off, so the engine
+ *   routes nothing until the user turns it on. Nothing is sent while the engine
+ *   cannot take a policy (`engineTakesPolicy`); the stored values then wait
+ *   untouched. A refused send is retried at the next probe, not at once;
+ * - the encrypted DNS resolvers follow `filtering.upstreams` the same way, with
+ *   their own revision, read back once per probe. Their order is the order they
+ *   are tried in, so it counts;
  * - the root certificate, only when the user asks (`installRoot`). Its facts
  *   are read after each probe while the engine can answer, and cleared when
  *   it cannot;
@@ -29,12 +32,14 @@
 import type { PassedChecks } from "@/core/checks";
 import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, updateBanner, type EngineSlice } from "@/core/engine";
 import type { NoticeBus } from "@/core/notices";
+import { selectedListIds } from "@/core/filter-lists";
 import { GLOBAL_SWITCH, offKeys } from "@/core/policy";
 import type { SettingKey } from "@/core/settings/registry";
 import type { SieveStore } from "@/core/store";
 import type { EngineSource } from "./engine-source";
+import type { FilterListSource } from "./filter-lists-source";
 import type { Clock } from "./poller";
-import type { EngineDomainList, EnginePolicy } from "./protocol";
+import type { EngineDomainList, EnginePolicy, FilterCatalogue } from "./protocol";
 import type { SettingsStore } from "./settings-store";
 
 export interface EngineController {
@@ -57,6 +62,8 @@ export interface EngineControllerDeps {
   settings: SettingsStore;
   checks: PassedChecks;
   notices: NoticeBus;
+  /** The catalogue, which turns the stored differences into the lists selected. */
+  filterLists: Pick<FilterListSource, "catalogue">;
 }
 
 /** The Home banner of a crash loop (plan 1.6.4). Never says blocked or filtering: nothing was. */
@@ -73,15 +80,24 @@ function domainList(kind: EngineDomainList["kind"], entries: readonly string[]):
   return entries.length > 0 ? [{ kind, entries: [...entries], enabled: true }] : [];
 }
 
-/** The policy the settings ask for. List selection belongs to Settings' list view; null keeps the catalogue's defaults. */
-function wantedPolicy(settings: SettingsStore): WantedPolicy {
+/**
+ * The policy the settings ask for. An untouched selection is null, the
+ * catalogue's defaults, with no catalogue needed. A changed one needs the
+ * catalogue to name its lists; until it is read the engine keeps the selection
+ * it has (`heldLists`), so a missing read cannot turn a list on or off.
+ */
+function wantedPolicy(settings: SettingsStore, catalogue: Pick<FilterCatalogue, "lists"> | null, heldLists: string[] | null): WantedPolicy {
+  const selection = settings.get("filters.lists");
+  const untouched = Object.keys(selection).length === 0;
   return {
     engine: Boolean(settings.get(SWITCH)),
     sieving: Boolean(settings.get(GLOBAL_SWITCH)),
     off_apps: [...offKeys(settings.get("apps.levels"))],
     https: Boolean(settings.get(HTTPS)),
-    lists: null,
+    lists: untouched ? null : catalogue ? selectedListIds(selection, catalogue) : heldLists,
     domain_lists: [...domainList("block", settings.get("filtering.blockedDomains")), ...domainList("allow", settings.get("filtering.allowedDomains"))],
+    user_rules: [...settings.get("filtering.userRules")],
+    exclusions: [...settings.get("filtering.exclusions")],
   };
 }
 
@@ -98,12 +114,17 @@ function normalised(p: WantedPolicy): string {
       .filter((l) => l.enabled && l.entries.length > 0)
       .map((l) => ({ kind: l.kind, entries: sorted(l.entries) }))
       .sort((a, b) => a.kind.localeCompare(b.kind)),
+    user_rules: sorted(p.user_rules),
+    exclusions: sorted(p.exclusions),
   });
 }
 
-export function createEngineController({ engine, store, clock, settings, checks, notices }: EngineControllerDeps): EngineController {
+export function createEngineController({ engine, store, clock, settings, checks, notices, filterLists }: EngineControllerDeps): EngineController {
   let disposed = true;
   let policyInFlight = false;
+  let upstreamsInFlight = false;
+  let catalogue: Pick<FilterCatalogue, "lists"> | null = null;
+  let catalogueInFlight = false;
   // The switch is read only after the settings loaded: before that it reads as its default (off).
   let settingsReady = false;
   let banner: number | null = null;
@@ -142,7 +163,8 @@ export function createEngineController({ engine, store, clock, settings, checks,
     const e = get();
     const status = engineStatus(e);
     if (disposed || !settingsReady || policyInFlight || !engineTakesPolicy(e) || status === null) return;
-    const want = wantedPolicy(settings);
+    if (catalogue === null && Object.keys(settings.get("filters.lists")).length > 0) void readCatalogue();
+    const want = wantedPolicy(settings, catalogue, status.policy.lists);
     if (normalised(status.policy) === normalised(want)) return;
     policyInFlight = true;
     let sent = false;
@@ -158,6 +180,40 @@ export function createEngineController({ engine, store, clock, settings, checks,
     }
     // A refusal waits for the next probe: following now would send it again at once, forever.
     if (sent && !disposed) follow();
+  };
+
+  // Once it is read it stays: the catalogue is compiled into this build. A failed
+  // read tries again at the next probe, and the engine keeps what it has meanwhile.
+  const readCatalogue = async () => {
+    if (catalogueInFlight) return;
+    catalogueInFlight = true;
+    try {
+      catalogue = await filterLists.catalogue();
+    } catch {
+      catalogue = null;
+    } finally {
+      catalogueInFlight = false;
+    }
+    if (catalogue !== null) void syncPolicy();
+  };
+
+  // Compared with what the engine holds on every probe, so a list the engine lost
+  // or never had is sent again. An empty setting has no meaning for the engine,
+  // which refuses it; it keeps its list until there is one to send.
+  const syncUpstreams = async () => {
+    if (disposed || !settingsReady || upstreamsInFlight || !engineTakesPolicy(get())) return;
+    upstreamsInFlight = true;
+    try {
+      const held = await engine.dnsUpstreams();
+      const want = settings.get("filtering.upstreams");
+      const same = want.length === held.upstreams.length && want.every((u, i) => u === held.upstreams[i]);
+      if (want.length > 0 && !same) await engine.setDnsUpstreams({ revision: held.revision + 1, upstreams: [...want] });
+      if (get().dnsError) set({ dnsError: null });
+    } catch (e) {
+      set({ dnsError: `The DNS servers did not reach the engine: ${message(e)}` });
+    } finally {
+      upstreamsInFlight = false;
+    }
   };
 
   // Answered at once with the Status; the engine's work then shows through the probe.
@@ -227,6 +283,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
         }
         if (disposed) return;
         follow();
+        await syncUpstreams();
         await readCert();
       };
       probeNow = probe;
@@ -241,10 +298,14 @@ export function createEngineController({ engine, store, clock, settings, checks,
         }, ENGINE_POLL_MS);
       };
 
-      const unSettings = settings.subscribe(() => void syncPolicy());
+      const unSettings = settings.subscribe(() => {
+        void syncPolicy();
+        void syncUpstreams();
+      });
       void settings.ready.then(() => {
         settingsReady = true;
         void syncPolicy();
+        void syncUpstreams();
       });
       void cycle();
       return () => {

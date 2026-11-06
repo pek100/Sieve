@@ -73,7 +73,7 @@ export function welcomeSteps(e: EngineSlice, keepAdguard: boolean, switches: Swi
     {
       id: "what",
       title: "Sieve shows which apps talk to the network",
-      body: "It charts each app's connections on this computer. It blocks nothing yet; filter lists and rules are saved now, and the engine starts using them in a later version.",
+      body: "It charts each app's connections on this computer, and blocks nothing until you turn the engine on. The engine then closes connections to the hosts your filter lists and rules name.",
     },
     { id: "switches", ...SWITCHES_STEP[switches] },
   ];

@@ -18,6 +18,7 @@ import { createMockSource } from "@/data/mock-source";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "@/hooks/runtime";
 import { FiltersScreen } from "@/components/sieve/filters/filters-screen";
+import { LogScreen } from "@/components/sieve/log/log-screen";
 import { LockGate } from "./lock-gate";
 
 vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
@@ -265,11 +266,11 @@ describe("a toast says only what happened", () => {
 
   it("allowlist removal parked while the lock is checking, then cancelled: the host stays and nothing is said", async () => {
     const lock = slowLock();
-    const rt = await setup(<FiltersScreen />, { lock: lock.source, stored: { schema: 4, values: { "filters.allowlist": ["a.example"] } } });
+    const rt = await setup(<FiltersScreen />, { lock: lock.source, stored: { schema: 4, values: { "filtering.allowedDomains": ["a.example"] } } });
     await userEvent.click(screen.getByRole("button", { name: "Remove a.example" }));
     await lock.answer();
     await cancelPrompt();
-    expect(rt.settings.get("filters.allowlist")).toEqual(["a.example"]);
+    expect(rt.settings.get("filtering.allowedDomains")).toEqual(["a.example"]);
     expect(said(rt)).toEqual([]);
   });
 });
@@ -301,14 +302,14 @@ describe("rules typed but not saved stay in the editor", () => {
   it("locked during the check, then cancelled: not stored, still in the editor", async () => {
     const rt = await lockedDuringCheck();
     await cancelPrompt();
-    expect(rt.settings.get("filters.userRules")).toEqual([]);
+    expect(rt.settings.get("filtering.userRules")).toEqual([]);
     expect(editor()).toHaveValue(RULE);
   });
 
   it("locked during the check, then unlocked: stored, and the editor follows the store", async () => {
     const rt = await lockedDuringCheck();
     await answerRight();
-    expect(rt.settings.get("filters.userRules")).toEqual([RULE]);
+    expect(rt.settings.get("filtering.userRules")).toEqual([RULE]);
     expect(editor()).toHaveValue(RULE);
     expect(save()).toBeDisabled();
   });
@@ -321,7 +322,7 @@ describe("rules typed but not saved stay in the editor", () => {
     await settle();
     await lock.answer();
     await cancelPrompt();
-    expect(rt.settings.get("filters.userRules")).toEqual([]);
+    expect(rt.settings.get("filtering.userRules")).toEqual([]);
     expect(editor()).toHaveValue(RULE);
   });
 
@@ -333,7 +334,7 @@ describe("rules typed but not saved stay in the editor", () => {
     fireEvent.change(editor(), { target: { value: `${RULE}\n||b.example^` } });
     await check.answer();
     await settle();
-    expect(rt.settings.get("filters.userRules")).toEqual([RULE]);
+    expect(rt.settings.get("filtering.userRules")).toEqual([RULE]);
     expect(editor()).toHaveValue(`${RULE}\n||b.example^`);
   });
 });
@@ -417,7 +418,7 @@ describe("LockGate", () => {
 
   it("hides its children while locked, unreadable or still checking, and shows them unlocked or with no password", async () => {
     const shown = () => screen.queryByText(SECRET) !== null;
-    const gate = <LockGate>{SECRET}</LockGate>;
+    const gate = <LockGate title="Private">{SECRET}</LockGate>;
     const rt = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(), lock: createMockLock("set") });
     const view = render(<AppShell runtime={rt}>{gate}</AppShell>);
     expect(shown()).toBe(false);
@@ -435,8 +436,23 @@ describe("LockGate", () => {
     expect(shown()).toBe(true);
   });
 
+  it("the log is behind it: browsing history does not show while locked", async () => {
+    const rt = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend(), lock: createMockLock("set") });
+    render(<AppShell runtime={rt}><LogScreen /></AppShell>);
+    await settle();
+    expect(screen.getByRole("heading", { name: "Log" })).toBeInTheDocument();
+    expect(screen.getByText("This is locked")).toBeInTheDocument();
+    expect(screen.queryByTestId("log-count")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Log rows" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Unlock" }));
+    await answerRight();
+    expect(screen.getByTestId("log-count")).toBeInTheDocument();
+    act(() => rt.lockController.lockNow());
+    expect(screen.queryByTestId("log-count")).toBeNull();
+  });
+
   it("unreadable stays shut", async () => {
-    await setup(<LockGate>{SECRET}</LockGate>, { lock: "unreadable" });
+    await setup(<LockGate title="Private">{SECRET}</LockGate>, { lock: "unreadable" });
     expect(screen.queryByText(SECRET)).toBeNull();
   });
 });

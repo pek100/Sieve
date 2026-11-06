@@ -48,6 +48,8 @@ export interface EngineSlice {
   adguard?: AdguardAction;
   /** Why the last AdGuard stop or start, policy change or update request failed; null after a good one. */
   actionError?: string | null;
+  /** Why `filtering.upstreams` did not reach the engine; null after a good read or send. */
+  dnsError?: string | null;
   /** The root certificate as the engine last said; null while it cannot be asked. */
   cert?: CertStatus | null;
   /** Why the newest certificate read failed; null after a good one. */

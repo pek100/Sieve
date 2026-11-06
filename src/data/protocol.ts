@@ -231,7 +231,7 @@ export function parseWindowsDns(raw: unknown): WindowsDns {
 
 /**
  * `engine_probe` (Rust `engine::EngineProbe`, fixture
- * `src/data/fixtures/engine-probe-v2.json`): the filtering engine from
+ * `src/data/fixtures/engine-probe-v3.json`): the filtering engine from
  * facts. `service` is the Windows service's state ("missing" when not
  * installed); `pipe` is the engine's own answer, asked only while the service
  * runs. `status` is the engine's `sieve-ipc` Status (protocol 3, fixture
@@ -281,6 +281,24 @@ export interface EnginePolicy {
   domain_lists: EngineDomainList[];
   /** `filtering.https`: hold a root certificate. Off removes it. */
   https: boolean;
+  /** `filtering.userRules`: rule lines, compiled untrusted beside `domain_lists`. */
+  user_rules: string[];
+  /** `filtering.exclusions`: sites never decrypted. Nothing decrypts before slice 6. */
+  exclusions: string[];
+}
+
+/** The encrypted DNS resolvers the engine holds (sieve-ipc `DnsUpstreams`). */
+export interface EngineDnsUpstreams {
+  /** Raised on every change; 0 is the engine's default list. */
+  revision: number;
+  /** Tried in order. */
+  upstreams: string[];
+}
+
+/** Validate an untrusted `dns_upstreams` answer. Throws ProtocolError. */
+export function parseDnsUpstreams(raw: unknown): EngineDnsUpstreams {
+  const d = rec(raw, "dns upstreams");
+  return { revision: int(d.revision, "dns.revision"), upstreams: strings(d.upstreams, "dns.upstreams") };
 }
 
 /** `sieve-ipc` CertState and FirefoxTrust wire names, in declaration order. */
@@ -430,6 +448,8 @@ function policy(raw: unknown): EnginePolicy {
     lists: orDefault<string[] | null>(p.lists, (v) => (v === null ? null : strings(v, "policy.lists")), null),
     domain_lists: orDefault(p.domain_lists, domainLists, []),
     https: orDefault(p.https, (v) => bool(v, "policy.https"), false),
+    user_rules: orDefault(p.user_rules, (v) => strings(v, "policy.user_rules"), []),
+    exclusions: orDefault(p.exclusions, (v) => strings(v, "policy.exclusions"), []),
   };
 }
 
@@ -558,6 +578,8 @@ export interface LogRow {
   rule: string | null;
   /** A catalogue id, or "user". */
   list: string | null;
+  /** Present on a guest's flow, which has no process. `vm` null: its VM has no name. */
+  forwarded?: { vm: string | null };
 }
 
 /** A row and its place in the app's own count, which survives an engine restart. */
@@ -623,6 +645,7 @@ function logEntry(raw: unknown): LogEntry | null {
       outcome,
       rule: optStr(r.rule),
       list: optStr(r.list),
+      ...(isRec(r.forwarded) ? { forwarded: { vm: optStr(r.forwarded.vm) } } : {}),
     },
   };
 }

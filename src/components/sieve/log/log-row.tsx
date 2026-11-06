@@ -8,7 +8,7 @@ import { FloatingTooltip } from "@/components/sieve/primitives/floating-tooltip"
 import { IconButton } from "@/components/sieve/primitives/icon-button";
 import { StateLayer } from "@/components/sieve/primitives/state-layer";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { exeName, listName, outcomeWords, rowPath } from "@/core/log";
+import { listName, outcomeWords, rowOwner, rowPath } from "@/core/log";
 import type { LogAction } from "@/core/log-actions";
 import type { LogRow as Row } from "@/data/protocol";
 import { cn } from "@/lib/utils";
@@ -48,7 +48,7 @@ function PathCell({ path }: { path: string | null }) {
  */
 export function LogRowItem({ row, titles, onOpen, onAction }: { row: Row; titles: ReadonlyMap<string, string>; onOpen: () => void; onAction: (action: LogAction, row: Row) => void }) {
   const words = outcomeWords(row.outcome);
-  const name = exeName(row.exe) ?? "Unknown app";
+  const name = rowOwner(row);
   const list = listName(row.list ?? null, titles);
   return (
     <li data-testid="log-row" data-outcome={row.outcome?.kind} className="flex h-11 items-center gap-2">

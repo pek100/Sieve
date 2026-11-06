@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
 import { LOG_OUTCOMES, ProtocolError, parseLogTail, type LogEntry, type LogOutcome } from "@/data/protocol";
-import { LOG_RING, LOG_SHOWN, appendRows, exeName, listName, matchesFilter, matchesSearch, outcomeWords, reasonWords, rowPath, rowUrl, urlFormHost, visibleRows } from "./log";
+import { LOG_RING, LOG_SHOWN, appendRows, exeName, listName, matchesFilter, matchesSearch, outcomeWords, reasonWords, rowOwner, rowPath, rowUrl, urlFormHost, visibleRows } from "./log";
 
 const rows = parseLogTail(logFixture).rows;
 const NO_TITLES = new Map<string, string>();
@@ -40,6 +40,10 @@ describe("the outcome in words", () => {
 
   it("an unknown reason shows with its underscores as spaces; a missing outcome degrades", () => {
     expect(reasonWords("pinned_host")).toBe("pinned host");
+    expect(rowOwner({ exe: "C:\\x\\Tool.exe" })).toBe("Tool.exe");
+    expect(rowOwner({ exe: null })).toBe("Unknown app");
+    expect(rowOwner({ exe: null, forwarded: { vm: "DevBox" } })).toBe("DevBox");
+    expect(rowOwner({ exe: null, forwarded: { vm: null } })).toBe("Unnamed virtual machine");
     expect(outcomeWords({ kind: "passed", reason: "pinned_host" })).toBe("Passed through (pinned host)");
     expect(outcomeWords(undefined)).toBe("Unknown");
     expect(outcomeWords(null)).toBe("Unknown");

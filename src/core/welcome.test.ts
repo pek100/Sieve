@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import fixture from "@/data/fixtures/engine-probe-v2.json";
+import fixture from "@/data/fixtures/engine-probe-v3.json";
 import { parseEngineProbe } from "@/data/protocol";
 import type { EngineSlice } from "./engine";
 import { SETTING_KEYS, isAvailable, settingDef } from "./settings/registry";
@@ -26,7 +26,7 @@ describe("welcome steps", () => {
   });
 
   it("says nothing is blocked", () => {
-    expect(welcomeSteps(unknown, false, "off")[0].body).toContain("blocks nothing yet");
+    expect(welcomeSteps(unknown, false, "off")[0].body).toContain("blocks nothing until you turn the engine on");
   });
 
   it("words the switches step by what is in force", () => {

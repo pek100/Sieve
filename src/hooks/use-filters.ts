@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { setGroupOn, setListOn } from "@/core/filter-lists";
-import type { FilterCatalogue, FilterList, RuleProblem } from "@/data/protocol";
+import { useEffect, useMemo, useState } from "react";
+import { engineLists, engineTakesPolicy } from "@/core/engine";
+import { setGroupOn, setListOn, withEngineReports } from "@/core/filter-lists";
+import type { EngineLists, FilterCatalogue, FilterList, RuleProblem } from "@/data/protocol";
 import { useRuntime } from "./sieve-provider";
-import { useSetting } from "./use-sieve";
+import { useEngine, useSetting } from "./use-sieve";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -14,7 +15,7 @@ export interface RuleSave {
 }
 
 export interface FiltersModel {
-  /** Null while loading and after a failed read. */
+  /** Null while loading and after a failed read. Each list carries the engine's report, when it has one. */
   catalogue: FilterCatalogue | null;
   /** Why the catalogue could not be read. */
   failed: string | null;
@@ -27,16 +28,34 @@ export interface FiltersModel {
   allowlist: readonly string[];
   addAllowed: (host: string) => void;
   removeAllowed: (host: string) => void;
+  blocklist: readonly string[];
+  addBlocked: (host: string) => void;
+  removeBlocked: (host: string) => void;
 }
 
-/** Everything the Filters screen reads and writes. Writes go through useSetting, so through the write gate. */
+/**
+ * Everything the Filters screen reads and writes. Writes go through useSetting,
+ * so through the write gate. The rules and both domain lists are the very
+ * settings the engine controller sends in the policy: there is no second store.
+ */
 export function useFilters(): FiltersModel {
-  const { filterLists, settings, notices } = useRuntime();
+  const { filterLists, settings, notices, engine } = useRuntime();
   const [selection, writeSelection] = useSetting("filters.lists");
-  const [rules, writeRules] = useSetting("filters.userRules");
-  const [allowlist, writeAllowlist] = useSetting("filters.allowlist");
+  const [rules, writeRules] = useSetting("filtering.userRules");
+  const [allowlist, writeAllowlist] = useSetting("filtering.allowedDomains");
+  const [blocklist, writeBlocklist] = useSetting("filtering.blockedDomains");
   const [catalogue, setCatalogue] = useState<FilterCatalogue | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
+  const [answered, setAnswered] = useState<EngineLists | null>(null);
+
+  // The full report is large, so it is read when the probe's small facts say it
+  // moved, not on the probe's cadence. Asked of whoever can answer; a failure
+  // leaves the lists saying nothing is loaded rather than an error of its own.
+  const slice = useEngine();
+  const reachable = engineTakesPolicy(slice);
+  const facts = engineLists(slice)
+    .map((l) => `${l.id}:${l.applied}:${l.skipped}`)
+    .join();
 
   useEffect(() => {
     let live = true;
@@ -49,12 +68,50 @@ export function useFilters(): FiltersModel {
     };
   }, [filterLists]);
 
+  useEffect(() => {
+    if (!reachable) return;
+    let live = true;
+    engine.lists().then(
+      (l) => live && setAnswered(l),
+      () => live && setAnswered(null),
+    );
+    return () => {
+      live = false;
+    };
+  }, [engine, reachable, facts]);
+
+  const reported = useMemo(() => (catalogue ? withEngineReports(catalogue, reachable ? answered : null) : null), [catalogue, reachable, answered]);
+
   // Writers read the latest stored value at call time, so undo after other edits stays correct.
   const selectionNow = () => settings.get("filters.lists");
-  const allowedNow = () => settings.get("filters.allowlist");
+
+  const hostList = (key: "filtering.allowedDomains" | "filtering.blockedDomains", write: (v: readonly string[]) => Promise<boolean>, name: string) => {
+    const now = () => settings.get(key);
+    return {
+      add: (host: string) => {
+        if (now().includes(host)) {
+          notices.push({ kind: "info", text: `${host} is already on the ${name}` });
+          return;
+        }
+        void write([...now(), host]);
+      },
+      remove: (host: string) => {
+        void write(now().filter((h) => h !== host)).then((ran) => {
+          if (!ran) return;
+          notices.push({
+            kind: "info",
+            text: `Removed ${host} from the ${name}`,
+            action: { label: "Undo", run: () => void write(now().includes(host) ? now() : [...now(), host]) },
+          });
+        });
+      },
+    };
+  };
+  const allowed = hostList("filtering.allowedDomains", writeAllowlist, "allowlist");
+  const blocked = hostList("filtering.blockedDomains", writeBlocklist, "blocklist");
 
   return {
-    catalogue,
+    catalogue: reported,
     failed,
     selection,
     setList: (list, on) => void writeSelection(setListOn(selectionNow(), list, on)),
@@ -65,22 +122,10 @@ export function useFilters(): FiltersModel {
       return { saved: refused.length === 0 && (await writeRules(lines)), refused };
     },
     allowlist,
-    addAllowed: (host) => {
-      if (allowedNow().includes(host)) {
-        notices.push({ kind: "info", text: `${host} is already on the allowlist` });
-        return;
-      }
-      void writeAllowlist([...allowedNow(), host]);
-    },
-    removeAllowed: (host) => {
-      void writeAllowlist(allowedNow().filter((h) => h !== host)).then((ran) => {
-        if (!ran) return;
-        notices.push({
-          kind: "info",
-          text: `Removed ${host} from the allowlist`,
-          action: { label: "Undo", run: () => void writeAllowlist(allowedNow().includes(host) ? allowedNow() : [...allowedNow(), host]) },
-        });
-      });
-    },
+    addAllowed: allowed.add,
+    removeAllowed: allowed.remove,
+    blocklist,
+    addBlocked: blocked.add,
+    removeBlocked: blocked.remove,
   };
 }

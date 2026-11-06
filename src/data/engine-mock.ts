@@ -1,6 +1,6 @@
 /**
  * Mock engine: answers `probe` with one of the examples of the wire fixture
- * (src/data/fixtures/engine-probe-v2.json), so the browser, tests and e2e
+ * (src/data/fixtures/engine-probe-v3.json), so the browser, tests and e2e
  * show exactly the shapes Rust produces. Query string `?engine=<scenario>`,
  * default `missing` (a browser has no engine). `error` makes every probe
  * fail, as an unreadable service manager would.
@@ -27,13 +27,14 @@
  * `installed`, as the engine does; Reinstall is refused while `https` is off.
  */
 import { hash01 } from "./prng";
-import fixture from "./fixtures/engine-probe-v2.json";
+import fixture from "./fixtures/engine-probe-v3.json";
 import ipc from "./fixtures/engine-ipc-v3.json";
 import logFixture from "./fixtures/engine-log-v1.json";
 import type { EngineSource } from "./engine-source";
 import {
   LOG_TAIL_VERSION,
   parseCertStatus,
+  parseDnsUpstreams,
   parseEngineLists,
   parseEngineProbe,
   parseEngineStatus,
@@ -126,6 +127,7 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
       return { seq, row: { ...e.row, id: seq, t: e.row.t + (reads - 1) * 1000 } };
     });
   };
+  let upstreams = parseDnsUpstreams(ipc.engine.find((m) => m.type === "dns_upstreams"));
   let cert = options.cert ?? "not_installed";
   let https = false;
   /**
@@ -167,8 +169,18 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
       if (https && !policy.https) cert = "policy_off";
       if (!https && policy.https && (cert === "policy_off" || cert === "not_installed")) cert = "installed";
       https = policy.https;
-      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists, https: policy.https };
+      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists, https: policy.https, user_rules: policy.user_rules, exclusions: policy.exclusions };
       return echo(statusOf(scenario));
+    },
+    dnsUpstreams: async () => {
+      requireWelcome();
+      return upstreams;
+    },
+    setDnsUpstreams: async (list) => {
+      requireWelcome();
+      if (list.revision <= upstreams.revision) throw new Error(`stale list revision ${list.revision} (the engine holds ${upstreams.revision})`);
+      upstreams = list;
+      return upstreams;
     },
     requestUpdate: async () => {
       requireWelcome();

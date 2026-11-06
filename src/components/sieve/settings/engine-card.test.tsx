@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ADGUARD_PAUSE_TEXT, ADGUARD_PAUSED_TEXT, ADGUARD_START_TEXT, ENGINE_SWITCH } from "@/core/engine";
 import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_ENGINE_ERROR, type EngineScenario } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
-import fixture from "@/data/fixtures/engine-probe-v2.json";
+import fixture from "@/data/fixtures/engine-probe-v3.json";
 import { createMockSource } from "@/data/mock-source";
 import { parseEngineProbe } from "@/data/protocol";
 import { memoryBackend } from "@/data/settings-store";
@@ -180,7 +180,7 @@ describe("Engine block", () => {
       ["unknown kind", { kind: "sign", version: "9" }],
     ])("degraded update (%s): no crash, no notice, the engine's facts stand", async (_, degraded) => {
       const { parseEngineProbe } = await import("@/data/protocol");
-      const fixture = (await import("@/data/fixtures/engine-probe-v2.json")).default;
+      const fixture = (await import("@/data/fixtures/engine-probe-v3.json")).default;
       const idle = fixture.examples.idle;
       const answer = { ...idle, pipe: { ...idle.pipe, status: { ...idle.pipe.status, update: degraded } } };
       await setup({ ...createMockEngine("idle"), probe: async () => parseEngineProbe(answer) });

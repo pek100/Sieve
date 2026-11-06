@@ -10,7 +10,7 @@
 /** The most lines one rule text may hold, and the longest line. */
 export const MAX_RULE_LINES = 5000;
 export const MAX_RULE_CHARS = 4096;
-/** Agrees with MAX_NAME_LEN and MAX_LABEL_LEN in src-tauri/src/dns/rules.rs. */
+/** What DNS allows of a name and of one label. */
 export const MAX_HOST_CHARS = 253;
 export const MAX_LABEL_CHARS = 63;
 
@@ -109,9 +109,10 @@ const fail = (error: string): DomainResult => ({ ok: false, error });
 
 /**
  * A host name from what a person typed or pasted: the host of a URL, lower case,
- * no trailing dot. Same rule as Rust `dns::rules::host_name`: at most 253
- * characters, two or more labels of a-z0-9-, no leading or trailing hyphen,
- * a non-numeric top label. One sentence per failure.
+ * no trailing dot. At most 253 characters, two or more labels of a-z0-9-, no
+ * leading or trailing hyphen, a non-numeric top label: stricter than the engine's
+ * `domain_rule`, which takes what this gives (fixture `user-rules-v1.json`). One
+ * sentence per failure.
  */
 export function normalizeDomain(raw: string): DomainResult {
   const typed = raw.trim();
