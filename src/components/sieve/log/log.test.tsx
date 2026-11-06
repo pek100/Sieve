@@ -127,7 +127,7 @@ describe("the Log screen", () => {
     ["missing", /not installed on this computer/],
     ["stopped", /service is not running/],
     ["idle", /no traffic goes through it/],
-    ["adguard", /AdGuard's service runs/],
+    ["adguard", /AdGuard is filtering this computer/],
     ["vpn", /Paused while AdGuard VPN is connected/],
     ["error", /could not read the engine's state/],
   ] as [EngineScenario, RegExp][])("engine %s: the empty state says what the engine is doing, from its facts", async (scenario, body) => {

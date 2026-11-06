@@ -128,6 +128,11 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
   };
   let cert = options.cert ?? "not_installed";
   let https = false;
+  /**
+   * AdGuard's service as it stands once the engine went idle: the idle example
+   * has no AdGuard, but turning routing off does not uninstall it.
+   */
+  let adguardWhileIdle: "running" | "stopped" | null = null;
   const requireWelcome = () => {
     if (!WELCOME.includes(scenario)) throw new Error("The system cannot find the file specified. (os error 2)");
   };
@@ -144,13 +149,21 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
     probe: async () => {
       if (scenario === "error") throw new Error(MOCK_ENGINE_ERROR);
       const probe = parseEngineProbe(fixture.examples[scenario]);
-      return probe.pipe?.kind === "welcome" ? { ...probe, pipe: { ...probe.pipe, status: echo(probe.pipe.status) } } : probe;
+      const withHeld = probe.pipe?.kind === "welcome" ? { ...probe, pipe: { ...probe.pipe, status: echo(probe.pipe.status) } } : probe;
+      return adguardWhileIdle === null ? withHeld : { ...withHeld, adguard: adguardWhileIdle };
     },
     setPolicy: async (policy: EnginePolicy) => {
       requireWelcome();
-      if (!policy.engine) scenario = "idle";
-      // The update examples are the idle engine with another update state.
-      else if (scenario === "idle" || scenario === "crash_loop" || scenario.startsWith("update_")) scenario = "filtering";
+      if (!policy.engine) {
+        if (scenario === "adguard") adguardWhileIdle = "running";
+        if (scenario === "filtering" && adguardWhileIdle === null) adguardWhileIdle = "stopped";
+        scenario = "idle";
+        // The update examples are the idle engine with another update state.
+      } else if (scenario === "idle" || scenario === "crash_loop" || scenario.startsWith("update_")) {
+        // A running AdGuard keeps the engine waiting; otherwise it routes.
+        scenario = adguardWhileIdle === "running" ? "adguard" : "filtering";
+        adguardWhileIdle = null;
+      }
       if (https && !policy.https) cert = "policy_off";
       if (!https && policy.https && (cert === "policy_off" || cert === "not_installed")) cert = "installed";
       https = policy.https;
@@ -165,10 +178,18 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
     lists,
     listsRefresh: lists,
     stopAdguard: async () => {
+      if (adguardWhileIdle === "running") {
+        adguardWhileIdle = "stopped";
+        return;
+      }
       if (scenario !== "adguard") throw new Error(MOCK_ADGUARD_ERROR);
       scenario = "adguard_paused";
     },
     startAdguard: async () => {
+      if (adguardWhileIdle === "stopped") {
+        adguardWhileIdle = "running";
+        return;
+      }
       if (scenario !== "filtering" && scenario !== "hosts") throw new Error(MOCK_ADGUARD_ERROR);
       scenario = "adguard";
     },

@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { EMPTY_DOC, readValue, writeValue, type SettingsDoc } from "./document";
 import { SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef } from "./registry";
-import { EXPORT_KIND, exportText, formatNumber, formatValue, numberChoices, planImport, resetPlan, searchSettings } from "./transfer";
+
+// One test runs the import rules for a data switch as a build where one is available would.
+const availability = vi.hoisted(() => ({ every: false }));
+vi.mock("./registry", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./registry")>();
+  return { ...real, isAvailable: (k: Parameters<typeof real.isAvailable>[0]) => availability.every || real.isAvailable(k) };
+});
+import { EXPORT_KIND, exportText, formatNumber, formatValue, numberChoices, planImport, resetAllText, resetPlan, searchSettings } from "./transfer";
 
 const changed: SettingsDoc = writeValue(writeValue(EMPTY_DOC, "appearance.theme", "light"), "apps.pinned", ["C:\\Tools\\a.exe"]);
 
@@ -88,6 +95,15 @@ describe("settings export and import", () => {
     expect(plan.next.values).toEqual({ "future.key": 1 });
     expect(resetPlan(EMPTY_DOC).changes).toEqual([]);
   });
+
+  it("reset to defaults keeps a finished welcome guide: it is a record of what happened, not a preference", () => {
+    const doc = writeValue(writeValue(EMPTY_DOC, "startup.welcomeDone", true), "appearance.theme", "light");
+    const plan = resetPlan(doc);
+    expect(plan.next.values).toEqual({ "startup.welcomeDone": true });
+    expect(plan.changes.map((c) => c.key)).toEqual(["appearance.theme"]);
+    expect(resetPlan(EMPTY_DOC).next.values).toEqual({});
+    expect(resetAllText()).toContain(settingDef("startup.welcomeDone").label);
+  });
 });
 
 describe("settings search and words", () => {
@@ -98,7 +114,7 @@ describe("settings search and words", () => {
     expect(searchSettings("dns")).toEqual(["filtering.upstreams"]);
     expect(searchSettings("per-app filtering")).toEqual([]);
     expect(searchSettings("turned off")).toEqual(["apps.levels"]);
-    expect(searchSettings("startup")).toEqual(["startup.launchAtLogin"]);
+    expect(searchSettings("startup")).toEqual(["startup.launchAtLogin", "startup.welcomeDone"]);
     expect(searchSettings("sample every")).toEqual(["sampling.intervalMs"]);
     expect(searchSettings("zzzz")).toEqual([]);
   });

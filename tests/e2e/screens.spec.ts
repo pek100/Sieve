@@ -11,6 +11,7 @@ const PAGES = [
   { name: "home", url: "/?source=mock&seed=1", ready: (p: Page) => p.locator('svg[data-chart-plot] path[data-part="line"]').first() },
   { name: "apps", url: "/apps/?source=mock&seed=1", ready: (p: Page) => p.getByTestId("app-row").first() },
   { name: "settings", url: "/settings/?source=mock&seed=1", ready: (p: Page) => p.locator("[data-setting]").first() },
+  { name: "filters", url: "/filters/?source=mock&seed=1", ready: (p: Page) => p.locator("[data-list]").first() },
   // Settings > Filtering: the engine and the encrypted upstreams.
   { name: "settings-filtering", url: "/settings/?source=mock&seed=1#section-filtering", ready: (p: Page) => p.getByRole("region", { name: "Engine" }) },
   // The Log with rows (the engine filtering hosts, its switch stored on), and with no engine.

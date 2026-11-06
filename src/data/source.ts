@@ -13,6 +13,10 @@ import { createTauriSource } from "./tauri-source";
 import { CERT_SCENARIOS, createMockEngine, ENGINE_SCENARIOS, type CertScenario, type EngineScenario } from "./engine-mock";
 import { createTauriEngine, type EngineSource } from "./engine-source";
 import { createMockWindowsDns, createTauriWindowsDns, type WindowsDnsSource } from "./safety-net";
+import { FILTER_LIST_SCENARIOS, createMockFilterLists, type FilterListScenario } from "./filter-lists-mock";
+import { createTauriFilterLists, type FilterListSource } from "./filter-lists-source";
+import { LOCK_SCENARIOS, createMockLock, type LockScenario } from "./lock-mock";
+import { createTauriLock, type LockSource } from "./lock-source";
 
 export type { SourceKind };
 
@@ -50,6 +54,12 @@ export interface SourceOptions {
   logError: boolean;
   /** Mock certificate scenario (?cert=installed|expires_soon|not_installed|policy_off|error, default not_installed). */
   cert: CertScenario;
+  /** Mock filter lists (?lists=pending|loaded|empty|error, default pending). */
+  lists: FilterListScenario;
+  /** Mock settings password (?lock=none|set|unreadable, default none). */
+  lock: LockScenario;
+  /** Show the first-run guide here too (?welcome=1); the desktop app always offers it. */
+  welcome: boolean;
 }
 
 /** Read the source choice from the environment: query string and Tauri presence. */
@@ -65,7 +75,23 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   const engine = (ENGINE_SCENARIOS as readonly string[]).includes(e ?? "") ? (e as EngineScenario) : "missing";
   const c = q.get("cert");
   const cert = (CERT_SCENARIOS as readonly string[]).includes(c ?? "") ? (c as CertScenario) : "not_installed";
-  return { kind, seed, scenario, pointed: q.get("pointed") === "1", icons: q.get("icons") === "1", engine, logError: q.get("log") === "error", cert };
+  const li = q.get("lists");
+  const lists = (FILTER_LIST_SCENARIOS as readonly string[]).includes(li ?? "") ? (li as FilterListScenario) : "pending";
+  const lo = q.get("lock");
+  const lock = (LOCK_SCENARIOS as readonly string[]).includes(lo ?? "") ? (lo as LockScenario) : "none";
+  return {
+    kind,
+    seed,
+    scenario,
+    pointed: q.get("pointed") === "1",
+    icons: q.get("icons") === "1",
+    engine,
+    logError: q.get("log") === "error",
+    cert,
+    lists,
+    lock,
+    welcome: q.get("welcome") === "1",
+  };
 }
 
 /**
@@ -85,6 +111,16 @@ export function createWindowsDnsSource(o: SourceOptions): WindowsDnsSource {
 /** The engine seam follows the same choice: the Tauri command, or the mock. */
 export function createEngineSource(o: SourceOptions): EngineSource {
   return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine, { seed: o.seed, logError: o.logError, cert: o.cert });
+}
+
+/** The filter list seam follows the same choice. */
+export function createFilterListSource(o: SourceOptions): FilterListSource {
+  return o.kind === "tauri" ? createTauriFilterLists() : createMockFilterLists(o.lists);
+}
+
+/** The settings password seam follows the same choice. */
+export function createLockSource(o: SourceOptions): LockSource {
+  return o.kind === "tauri" ? createTauriLock() : createMockLock(o.lock);
 }
 
 export function isTauriWindow(): boolean {

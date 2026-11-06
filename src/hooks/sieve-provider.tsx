@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
-import { bindDesktop, bindEngine, bindLog, bindSafetyNet, bindSampling, createBrowserRuntime, type Runtime } from "./runtime";
+import { bindDesktop, bindEngine, bindLock, bindLog, bindNotifications, bindSafetyNet, bindSampling, createBrowserRuntime, type Runtime } from "./runtime";
 
 const RuntimeContext = createContext<Runtime | null>(null);
 
@@ -13,6 +13,8 @@ export function SieveProvider({ runtime, children }: { runtime?: Runtime; childr
   useEffect(() => bindSafetyNet(rt), [rt]);
   useEffect(() => bindEngine(rt), [rt]);
   useEffect(() => bindLog(rt), [rt]);
+  useEffect(() => bindLock(rt), [rt]);
+  useEffect(() => bindNotifications(rt), [rt]);
   return <RuntimeContext.Provider value={rt}>{children}</RuntimeContext.Provider>;
 }
 

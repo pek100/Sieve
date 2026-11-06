@@ -52,7 +52,12 @@ export type LogView = ReturnType<typeof useLogView>;
  * that write a setting open the preview first; Report opens its dialog.
  */
 export function useRowActions() {
-  const { settings, notices } = useRuntime();
+  const { settings, notices, lockController } = useRuntime();
+  /** The one write here, through the password's gate; undefined when it is locked. */
+  const write = useCallback(
+    (key: Parameters<typeof settings.set>[0], value: Parameters<typeof settings.set>[1]) => lockController.guard(() => settings.set(key, value).then(() => true)),
+    [settings, lockController],
+  );
   const [preview, setPreview] = useState<LinePreview | null>(null);
   const [report, setReport] = useState<ReportSeed | null>(null);
 
@@ -97,16 +102,16 @@ export function useRowActions() {
     }
     const undo = async () => {
       try {
-        await settings.set(key, removeLine(settings.get(key), line));
+        await write(key, removeLine(settings.get(key), line));
       } catch (err) {
-        settings.set(key, addLine(settings.get(key), line)).catch(() => undefined);
+        write(key, addLine(settings.get(key), line)).catch(() => undefined);
         notices.push({ kind: "error", text: `Could not undo: ${reason(err)}. ${line} stays.` });
       }
     };
     try {
-      await settings.set(key, after);
+      if (!(await write(key, after))) return;
     } catch (err) {
-      settings.set(key, removeLine(settings.get(key), line)).catch(() => undefined);
+      write(key, removeLine(settings.get(key), line)).catch(() => undefined);
       notices.push({ kind: "error", text: `Could not save ${line}: ${reason(err)}. Nothing was added.` });
       return;
     }

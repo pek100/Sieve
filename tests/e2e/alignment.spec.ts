@@ -69,7 +69,8 @@ async function gridLines(page: Page) {
     return r;
   });
   const L = title.x;
-  const R = actions;
+  // A page with no header action: the grid's own right edge is the line the top bar must meet.
+  const R = actions > -Infinity ? actions : right((await page.locator("main .layout-grid").first().boundingBox())!);
   const col = (R - L - 11 * g) / 12;
   const starts = Array.from({ length: 12 }, (_, i) => L + i * (col + g));
   const ends = starts.map((s) => s + col);
@@ -332,6 +333,23 @@ test.describe("alignment law", () => {
     }
     // One owner for the upstream servers: their registry row.
     if ((await page.getByText("Upstream DNS servers", { exact: true }).count()) > 1) failures.push("Upstream DNS servers appears more than once");
+    expect(failures, failures.join("\n")).toEqual([]);
+    expect(await noSidewaysOverflow(page)).toBeLessThanOrEqual(0);
+    expect(errors).toEqual([]);
+  });
+
+  test("Filters snaps to the grid: the catalogue on the title's line, rules and allowlist to the actions' line", async ({ page }) => {
+    const errors = collectErrors(page);
+    await page.goto("/filters/?source=mock&seed=1");
+    await expect(page.locator("[data-list]").first()).toBeVisible();
+    const { failures } = await expectOnGrid(page, {
+      lists: page.getByRole("region", { name: "Filter lists" }),
+      rules: page.getByRole("region", { name: "User rules" }),
+    });
+    for (const r of (await page.locator("[data-list]").all()).slice(0, 5)) {
+      const h = (await r.boundingBox())!.height;
+      if (h < 44) failures.push(`list row ${h}px tall`);
+    }
     expect(failures, failures.join("\n")).toEqual([]);
     expect(await noSidewaysOverflow(page)).toBeLessThanOrEqual(0);
     expect(errors).toEqual([]);

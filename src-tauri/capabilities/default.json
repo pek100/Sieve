@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: frameless window controls, settings store, file dialog, launch at startup (only when the user turns the setting on), opening a filter list's public issue page. Nothing that changes system network state.",
+"description": "Main window: frameless window controls, settings store, file dialog, launch at startup (only when the user turns the setting on), desktop notifications (same), opening a filter list's public issue page. Nothing that changes system network state.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -17,6 +17,7 @@
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "https://github.com/AdguardTeam/*" }, { "url": "https://github.com/uBlockOrigin/*" }]
-    }
+    },
+    "notification:default"
   ]
 }

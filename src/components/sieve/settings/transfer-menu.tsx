@@ -8,7 +8,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import type { SettingsDoc } from "@/core/settings/document";
 import { settingDef } from "@/core/settings/registry";
-import { exportText, formatValue, type Change, type ImportPlan, type Refused } from "@/core/settings/transfer";
+import { exportText, formatValue, resetAllText, type Change, type ImportPlan, type Refused } from "@/core/settings/transfer";
 import { useRuntime } from "@/hooks/sieve-provider";
 import type { SettingsView } from "./use-settings-view";
 
@@ -172,7 +172,7 @@ function ImportDialog({ view, onClose }: { view: SettingsView; onClose: () => vo
 function ResetDialog({ view, onClose }: { view: SettingsView; onClose: () => void }) {
   const [plan] = useState(() => view.resetAll());
   return (
-    <Sheet title="Reset every setting?" description="Every setting goes back to its default. You can undo it right after.">
+    <Sheet title="Reset every setting?" description={resetAllText()}>
       <ChangeList changes={plan.changes} />
       <div className="flex flex-wrap justify-end gap-2">
         <Button variant="ghost" onClick={onClose}>

@@ -28,7 +28,7 @@ const itemBase =
   "relative z-10 inline-flex items-center justify-center gap-2 overflow-hidden rounded-full whitespace-nowrap transition-colors duration-(--motion-base) ease-standard [&_svg]:size-4";
 /** md: navigation-sized; sm: a control that sits in a section header (the chart window). */
 const SIZES = {
-  md: "h-8 px-4 text-label max-[640px]:px-3",
+  md: "h-8 px-4 text-label max-[640px]:px-3 max-[480px]:px-2",
   sm: "h-7 px-3 text-caption",
 } as const;
 export type SegmentedSize = keyof typeof SIZES;

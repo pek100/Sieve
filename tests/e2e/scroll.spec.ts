@@ -24,6 +24,7 @@ const PAGES = [
   { name: "Settings", url: "/settings/?source=mock&seed=1" },
   { name: "Log", url: "/log/?source=mock&seed=1&engine=hosts" },
   { name: "Log", url: "/log/?source=mock&seed=1", empty: true },
+  { name: "Filters", url: "/filters/?source=mock&seed=1" },
 ];
 
 async function measure(page: Page) {
@@ -76,7 +77,7 @@ test.describe("scroll law", () => {
         } else if (p.name === "Log") {
           await expect("empty" in p ? page.getByText("Nothing to show") : page.getByTestId("log-row").first()).toBeVisible();
         } else {
-          await expect(page.locator(p.name === "Apps" ? "[data-testid=app-row]" : "[data-setting]").first()).toBeVisible();
+          await expect(page.locator(p.name === "Apps" ? "[data-testid=app-row]" : p.name === "Filters" ? "[data-list]" : "[data-setting]").first()).toBeVisible();
         }
         const failures: string[] = [];
         const m = await measure(page);

@@ -23,12 +23,16 @@ export function useSieve<T>(selector: (s: SieveState) => T): T {
   return useMemo(() => selector(state), [state, selector]);
 }
 
-/** One setting's value and its setter. */
-export function useSetting<K extends SettingKey>(key: K): [SettingValue<K>, (v: SettingValue<K>) => Promise<void>] {
-  const { settings } = useRuntime();
+/** One setting's value and its setter, which resolves to whether the write ran: anything that reports the change waits for true. */
+export function useSetting<K extends SettingKey>(key: K): [SettingValue<K>, (v: SettingValue<K>) => Promise<boolean>] {
+  const { settings, lockController } = useRuntime();
   const get = useCallback(() => settings.get(key), [settings, key]);
   const value = useSyncExternalStore(settings.subscribe, get, get);
-  const set = useCallback((v: SettingValue<K>) => settings.set(key, v), [settings, key]);
+  // The write gate: while a password holds, the write waits for it or is dropped (undefined here).
+  const set = useCallback(
+    async (v: SettingValue<K>) => (await lockController.guard(() => settings.set(key, v).then(() => true))) === true,
+    [settings, lockController, key],
+  );
   return [value, set];
 }
 
@@ -78,15 +82,15 @@ export function useEngine(): EngineSlice {
 
 /** The engine's user actions: the AdGuard pause offer and its undo, the certificate's Reinstall, the update button (through the engine controller). */
 export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdguard: () => Promise<void>; installRoot: () => Promise<void>; requestUpdate: () => Promise<void> } {
-  const { engineController } = useRuntime();
+  const { engineController, lockController } = useRuntime();
   return useMemo(
     () => ({
-      stopAdguard: () => engineController.stopAdguard(),
-      startAdguard: () => engineController.startAdguard(),
-      installRoot: () => engineController.installRoot(),
-      requestUpdate: () => engineController.requestUpdate(),
+      stopAdguard: () => lockController.guard(() => engineController.stopAdguard()),
+      startAdguard: () => lockController.guard(() => engineController.startAdguard()),
+      installRoot: () => lockController.guard(() => engineController.installRoot()),
+      requestUpdate: () => lockController.guard(() => engineController.requestUpdate()),
     }),
-    [engineController],
+    [engineController, lockController],
   );
 }
 

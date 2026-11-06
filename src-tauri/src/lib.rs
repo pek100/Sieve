@@ -15,8 +15,10 @@
 pub mod adguard;
 pub mod commands;
 pub mod engine;
+pub mod filters;
 pub mod history;
 pub mod icons;
+pub mod lock;
 pub mod netstat;
 pub mod protocol;
 pub mod tray;
@@ -31,12 +33,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(std::sync::Arc::new(engine::EngineFlows::default()))
         .manage(std::sync::Arc::new(engine::EngineLog::default()))
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             app.manage(history::HistoryState::open_at(&dir));
             app.manage(icons::IconStore::open_at(&dir));
+            app.manage(lock::LockState::open_at(&dir));
             tray::install(app)?;
             #[cfg(windows)]
             tauri::async_runtime::spawn(engine::follow_flows(
@@ -62,6 +66,12 @@ pub fn run() {
             engine::engine_install_root,
             engine::engine_request_update,
             windns::windows_dns,
+            filters::filter_catalogue,
+            filters::rule_check,
+            lock::lock_status,
+            lock::lock_verify,
+            lock::lock_set,
+            lock::lock_clear,
         ])
         .run(tauri::generate_context!());
     if let Err(e) = result {

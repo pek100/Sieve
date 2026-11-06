@@ -2,15 +2,16 @@
 
 import { Lock as LockIcon } from "lucide-react";
 import Link from "next/link";
+import { LockedNote } from "@/components/sieve/lock/locked-note";
 import { Segmented } from "@/components/sieve/primitives/segmented";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import type { RouteDef } from "@/core/routes";
-import { readValue, type SettingsDoc } from "@/core/settings/document";
+import type { SettingsDoc } from "@/core/settings/document";
 import { defaultValue, settingDef, type SettingKey } from "@/core/settings/registry";
 import { formatNumber, formatValue, numberChoices } from "@/core/settings/transfer";
-import type { Lock } from "./use-settings-view";
+import { valueInForce, type Lock } from "./use-settings-view";
 
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -20,6 +21,7 @@ const emptyDefault = (k: SettingKey) => {
 };
 
 function LockNote({ lock }: { lock: Lock }) {
+  if (lock.kind === "password") return <LockedNote phase={lock.phase} />;
   return (
     <p data-lock={lock.kind} className="flex items-start gap-2 pt-1 text-label text-on-surface-muted">
       <LockIcon aria-hidden="true" className="size-4 shrink-0 text-warning" strokeWidth={1.75} />
@@ -62,9 +64,7 @@ export function SettingRow({
   onReset: (key: SettingKey) => void;
 }) {
   const d = settingDef(k);
-  // The value in force: what the engine itself holds for a setting it carries
-  // out but cannot take now (off when it did not say), else the stored value.
-  const value = lock?.kind === "engine" ? lock.inForce === true : readValue(doc, k);
+  const value = valueInForce(k, doc, lock);
   const labelId = `setting-${k}-label`;
   const helpId = `setting-${k}-help`;
   const disabled = lock !== null;
@@ -120,6 +120,7 @@ export function SettingRow({
             <Button
               variant="ghost"
               size="sm"
+              disabled={disabled}
               onClick={() => onReset(k)}
               aria-label={`${emptyDefault(k) ? "Clear" : "Reset"} ${d.label}`}
             >
