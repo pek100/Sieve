@@ -5,19 +5,21 @@
 //! QUIC, and nothing is sent upstream for a refused flow.
 //!
 //! - [`path`]: the one gate, after the host-level decision;
-//! - [`refuse`]: a refused flow, to its idle end;
+//! - [`refuse`]: a refused flow, to its idle end, and a blocked one the same way;
 //! - [`icmp`]: the packet; [`fallback`]: the fallback-time measurement.
 //!
 //! Refused exactly when `sieve_filter::exclusions::decrypt` says `Intercept`:
 //! there is no second condition, and every "relayed for" case is a `PassReason`.
+//! A blocked flow needs none of this: it is answered with the slot empty too.
 
 pub mod fallback;
 pub mod icmp;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::net::SocketAddr;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use sieve_filter::exclusions::{Decrypt, Transport};
@@ -51,6 +53,11 @@ impl Refusal {
 /// Plan section 3: if ICMP proves no faster than a drop, this word changes.
 pub const REFUSAL: Refusal = Refusal::PortUnreachable;
 
+/// How a blocked UDP flow is told. Apart from [`REFUSAL`]: that word is flipped to
+/// measure TCP fallback, and a blocked flow has nothing to fall back to, so silence
+/// only makes the browser wait out QUIC's idle timeout.
+pub const BLOCKED_ANSWER: Refusal = Refusal::PortUnreachable;
+
 /// The log's word for a refused flow. The app shows a slug it does not know
 /// with spaces (`reasonWords` in `src/core/log.ts`), so no protocol bump.
 pub const QUIC_REFUSED: &str = "quic_refused";
@@ -63,7 +70,8 @@ pub trait PacketSink: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpPath {
-    /// A blocked name: swallowed, as a blocked TLS hello gets nothing back.
+    /// A blocked name: nothing goes upstream and each datagram is answered with
+    /// [`BLOCKED_ANSWER`] until idle.
     Drop,
     Refuse(Refusal),
     Relay,
@@ -100,13 +108,15 @@ pub fn close_refused(book: &Mutex<FlowBook>, id: u64) {
     book.lock().unwrap_or_else(|p| p.into_inner()).close(id, FlowAction::Relayed, 0, 0);
 }
 
-/// What answers one refused flow.
+/// What answers one refused or blocked flow.
 pub struct Reply<'a> {
     /// (local, remote): the app's end first.
     pub ends: (SocketAddr, SocketAddr),
     pub refusal: Refusal,
     pub sink: &'a dyn PacketSink,
     pub meters: &'a QuicMeters,
+    /// Which figure a sent answer moves: refused and blocked flows are read apart.
+    pub replies: &'a AtomicU64,
 }
 
 impl Reply<'_> {
@@ -119,7 +129,7 @@ impl Reply<'_> {
         }
         let Some(packet) = icmp::port_unreachable(self.ends.0, self.ends.1, datagram) else { return };
         match self.sink.send(&packet) {
-            Ok(()) => Meters::bump(&self.meters.replies),
+            Ok(()) => Meters::bump(self.replies),
             Err(_) => Meters::bump(&self.meters.send_failed),
         }
     }

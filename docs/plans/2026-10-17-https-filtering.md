@@ -278,7 +278,7 @@ Against the user's "decode it, don't block" intent: QUIC is never blocked wholes
 
 Exactly when QUIC is refused:
 1. The (app, host) would be intercepted over TCP: app on Sieve, host not excluded, `filtering.https` on, not a session-0 process, no auto-exclusion. The datagram is answered with an ICMP or ICMPv6 port-unreachable synthesized into the TUN, and the flow is remembered for its lifetime.
-2. The domain is blocked by a network rule for that app. The Initial is dropped, as a blocked TLS ClientHello would be (spike behaviour).
+2. The domain is blocked by a network rule for that app. Nothing goes upstream. Each datagram is answered with port unreachable (changed 2026-11-06: the spike's silent drop left browsers waiting out QUIC's idle timeout, measured on a test VM).
 
 QUIC is relayed in every other case: app Off, excluded host (sensitive list, EV cache, client certificate, pinning, user), HTTPS filtering off, not HTTP/3 (E5), unknown or draft QUIC versions (spike), or an ECH outer name.
 

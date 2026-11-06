@@ -53,7 +53,7 @@ pub fn port_unreachable(local: SocketAddr, remote: SocketAddr, datagram: &[u8]) 
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::flow::packet::{self, Proto};
     use proptest::prelude::*;
@@ -99,7 +99,7 @@ pub(super) mod tests {
 
     /// The whole answer by the witness: its checksums, its kind, who sent it to
     /// whom, and the flow its quote names. Returns the quote.
-    pub(in crate::quic) fn assert_answers(packet: &[u8], local: SocketAddr, remote: SocketAddr) -> Vec<u8> {
+    pub(crate) fn assert_answers(packet: &[u8], local: SocketAddr, remote: SocketAddr) -> Vec<u8> {
         let (quote, kind_code) = match (local.ip(), remote.ip()) {
             (IpAddr::V4(l), IpAddr::V4(r)) => {
                 assert_eq!(packet[0], 0x45);

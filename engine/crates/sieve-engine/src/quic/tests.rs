@@ -399,10 +399,10 @@ fn a_cap_or_a_broken_initial_is_relayed() {
 // ---- The flow.
 
 #[derive(Default)]
-struct FakeSink {
-    sent: Mutex<Vec<Vec<u8>>>,
+pub(crate) struct FakeSink {
+    pub(crate) sent: Mutex<Vec<Vec<u8>>>,
     fails: AtomicBool,
-    tried: AtomicUsize,
+    pub(crate) tried: AtomicUsize,
 }
 
 impl PacketSink for FakeSink {
@@ -417,7 +417,7 @@ impl PacketSink for FakeSink {
 }
 
 impl FakeSink {
-    fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.sent.lock().unwrap().len()
     }
 }
@@ -436,7 +436,7 @@ fn spawn_flow(refusal: Refusal, held: Vec<Vec<u8>>) -> FlowRig {
     let (s, m, o) = (sink.clone(), meters.clone(), on.clone());
     let task = tokio::spawn(async move {
         let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
-        let reply = Reply { ends, refusal, sink: &*s, meters: &m };
+        let reply = Reply { ends, refusal, sink: &*s, meters: &m, replies: &m.replies };
         let mut buf = vec![0u8; BUF];
         refuse(&mut stack, &reply, held, &mut buf, IDLE, || o.load(Ordering::Relaxed)).await
     });
@@ -520,7 +520,7 @@ async fn an_app_turned_off_ends_its_refused_flow_and_no_other() {
     let (sink, meters) = (FakeSink::default(), QuicMeters::default());
     let (mut app, mut stack) = tokio::io::duplex(BUF);
     let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
-    let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters };
+    let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters, replies: &meters.replies };
     let held = vec![vec![1u8; 200]];
     let mut buf = vec![0u8; BUF];
     let on = slot.clone();
@@ -555,7 +555,7 @@ async fn the_switch_going_off_ends_a_refused_flow() {
     let (sink, meters) = (FakeSink::default(), QuicMeters::default());
     let (mut app, mut stack) = tokio::io::duplex(BUF);
     let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
-    let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters };
+    let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters, replies: &meters.replies };
     let held = vec![vec![1u8; 200]];
     let mut buf = vec![0u8; BUF];
     let on = slot.clone();
@@ -586,6 +586,13 @@ async fn a_switch_off_before_the_held_datagrams_answers_none() {
     drop(flow.app);
 }
 
+#[tokio::test]
+async fn a_closed_stack_ends_the_flow_at_once() {
+    let flow = spawn_flow(Refusal::PortUnreachable, Vec::new());
+    drop(flow.app);
+    assert!(tokio::time::timeout(Duration::from_secs(5), flow.task).await.expect("ended").unwrap().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_failed_send_is_counted_and_the_flow_goes_on() {
     let mut flow = spawn_flow(Refusal::PortUnreachable, Vec::new());
@@ -602,9 +609,9 @@ async fn a_failed_send_is_counted_and_the_flow_goes_on() {
 
 // ---- Through a real stack, in memory (the device of `examples/bench.rs`).
 
-struct MemDevice {
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+pub(crate) struct MemDevice {
+    pub(crate) rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub(crate) tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 impl AsyncRead for MemDevice {
@@ -630,7 +637,7 @@ impl AsyncWrite for MemDevice {
 }
 
 /// `host`'s `h3` hello, split over two sealed Initials as a post-quantum one is.
-fn sealed_initials(host: &str) -> [Vec<u8>; 2] {
+pub(crate) fn sealed_initials(host: &str) -> [Vec<u8>; 2] {
     let groups = (0x000a_u16, vec![0, 2, 0, 0x1d]);
     let versions = (0x002b_u16, vec![2, 3, 4]);
     let schemes = (0x000d_u16, vec![0, 2, 4, 3]);
@@ -643,7 +650,7 @@ fn sealed_initials(host: &str) -> [Vec<u8>; 2] {
     [seal_client_initial(VERSION_1, &DCID, &[], 0, 1, &f1), seal_client_initial(VERSION_1, &DCID, &[], 1, 1, &f2)]
 }
 
-fn udp_packet(local: SocketAddr, remote: SocketAddr, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn udp_packet(local: SocketAddr, remote: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     match (local, remote) {
         (SocketAddr::V4(l), SocketAddr::V4(r)) => PacketBuilder::ipv4(l.ip().octets(), r.ip().octets(), 64).udp(l.port(), r.port()).write(&mut out, payload).unwrap(),
@@ -653,7 +660,7 @@ fn udp_packet(local: SocketAddr, remote: SocketAddr, payload: &[u8]) -> Vec<u8> 
     out
 }
 
-const FLOWS: [(&str, &str); 2] = [(LOCAL, REMOTE), ("[fd00::2]:50000", "[2001:db8::1]:443")];
+pub(crate) const FLOWS: [(&str, &str); 2] = [(LOCAL, REMOTE), ("[fd00::2]:50000", "[2001:db8::1]:443")];
 
 struct StackRun {
     answer: UdpPath,
@@ -695,7 +702,7 @@ async fn through_the_stack(rig: &Rig, local: SocketAddr, remote: SocketAddr) -> 
     let sink = FakeSink::default();
     if let UdpPath::Refuse(refusal) = answer {
         let meters = QuicMeters::default();
-        let reply = Reply { ends: (app.local_addr(), app.peer_addr()), refusal, sink: &sink, meters: &meters };
+        let reply = Reply { ends: (app.local_addr(), app.peer_addr()), refusal, sink: &sink, meters: &meters, replies: &meters.replies };
         assert!(refuse(&mut app, &reply, held, &mut buf, Duration::from_millis(50), || slot.refuses(BROWSER)).await.is_empty(), "it idled out");
     }
     StackRun { answer, sink, from_stack }
