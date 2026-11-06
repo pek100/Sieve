@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -32,6 +32,7 @@ use super::active::Active;
 use super::ech::EchCache;
 use super::ech::testing::FakeLookup;
 use super::intercept::{ClientWatch, Dial, DialFuture, FlowMeta, HttpsSlot, Interception, NoWatch, Outcome, Pair, run};
+use super::splice::Abort;
 use super::upstream::{Chain, PlatformTrust, TRUST_TIMEOUT, TrustAnswer, TrustVerifier, Verifier, filter_alpn, handshake, is_post_handshake_auth, rustls_error};
 use super::validation::ValidationSlot;
 use super::verdict::VerdictCache;
@@ -518,17 +519,24 @@ impl Rig {
     /// as `handle_tcp` opens it.
     pub(crate) async fn flow(&self, opts: FlowOpts) -> (DuplexStream, JoinHandle<Outcome>) {
         let (app_end, stack_end) = tokio::io::duplex(1 << 20);
+        (app_end, self.flow_on(stack_end, opts).await)
+    }
+
+    /// One flow on a given stack end.
+    async fn flow_on<A>(&self, stack_end: A, opts: FlowOpts) -> JoinHandle<Outcome>
+    where
+        A: AsyncRead + AsyncWrite + Abort + Unpin + Send + 'static,
+    {
         let id = self.open_flow();
         let upstream = self.deps.connector.open().await.expect("the SYN-time socket");
         let deps = self.deps.clone();
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let decide = move |_: &Decoded| opts.action;
             let meta = FlowMeta { id, remote: opts.remote, exe: opts.exe, session: opts.session, owner: opts.owner, names_now_ms: 0, decide: &decide };
             let out = run(&deps, stack_end, upstream, meta).await;
             deps.book.lock().unwrap().close(id, out.action, out.bytes_up, out.bytes_down);
             out
-        });
-        (app_end, task)
+        })
     }
 
     pub(crate) fn reasons(&self) -> Vec<String> {
@@ -544,6 +552,11 @@ impl Rig {
             })
             .collect()
     }
+}
+
+/// A duplex has no reset, so the rig's flows end with the close that follows.
+impl Abort for DuplexStream {
+    fn abort(&self) {}
 }
 
 #[derive(Clone, Copy)]
@@ -1195,6 +1208,74 @@ arms!(server_first_bytes_are_forwarded_and_the_flow_only_splices, |arm| async mo
     assert_eq!(task.await.unwrap().action, FlowAction::Relayed);
     assert_eq!(rig.deps.connector.count(), 1, "no second socket");
 });
+
+// ---- How a flow ends.
+
+/// A stack end that remembers being aborted.
+struct AbortSeen {
+    inner: DuplexStream,
+    aborted: Arc<AtomicBool>,
+}
+
+impl Abort for AbortSeen {
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Relaxed);
+    }
+}
+
+impl AsyncRead for AbortSeen {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for AbortSeen {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// (the action, the flow's end, whether it was aborted) with the server silent or
+/// speaking first, which are the two places `drive` can block a flow.
+async fn abort_seen(action: Action, server_first: bool) -> (FlowAction, bool) {
+    let handler = raw(move |_, mut stream| async move {
+        if server_first {
+            let _ = stream.write_all(b"220 ready\r\n").await;
+            let _ = stream.flush().await;
+        }
+        echo(stream).await;
+    });
+    let rig = Rig::new(TestDial::new(Arm::Duplex, handler), RigOpts::new(Pki::new("Test Public Root").roots()));
+    let (mut app, inner) = tokio::io::duplex(1 << 20);
+    let aborted = Arc::new(AtomicBool::new(false));
+    let task = rig.flow_on(AbortSeen { inner, aborted: aborted.clone() }, FlowOpts { action, ..flow_opts() }).await;
+    if server_first {
+        let mut banner = [0u8; 11];
+        app.read_exact(&mut banner).await.unwrap();
+    }
+    app.write_all(b"GET / HTTP/1.1\r\nHost: site.example\r\n\r\n").await.unwrap();
+    if action == Action::Pass {
+        let mut answer = [0u8; 8];
+        app.read_exact(&mut answer).await.unwrap();
+        drop(app);
+    }
+    let out = task.await.unwrap();
+    (out.action, aborted.load(Ordering::Relaxed))
+}
+
+#[tokio::test]
+async fn only_a_blocked_flow_aborts_its_app_side() {
+    for server_first in [false, true] {
+        assert_eq!(abort_seen(Action::Drop, server_first).await, (FlowAction::Blocked, true), "server first: {server_first}");
+        assert_eq!(abort_seen(Action::Pass, server_first).await, (FlowAction::Relayed, false), "server first: {server_first}");
+    }
+}
 
 // ---- Client certificate, EV.
 

@@ -35,7 +35,7 @@ use super::active::{Active, Registered};
 use super::ech::{EchCache, usable_config};
 use super::first_bytes::{First, Waits, read_first};
 use super::server::{server_config, speaks_to};
-use super::splice::{AppSide, Prefixed, splice};
+use super::splice::{Abort, AppSide, Prefixed, splice};
 use super::upstream::{HandshakeEnd, Handshaken, LeafFacts, Verifier, alert_in, filter_alpn, handshake, is_post_handshake_auth, leaf_facts, rustls_error};
 use super::verdict::{Cached, VerdictCache};
 use crate::ca::{CaError, LeafRequest, Minter};
@@ -356,14 +356,17 @@ fn count_group(meters: &[std::sync::atomic::AtomicU64; crate::stack::KX_GROUPS],
 }
 
 /// One flow, to its end. The app side is closed before this returns unless the
-/// flow ended by itself.
+/// flow ended by itself: a blocked flow with a reset, any other with a FIN.
 pub async fn run<A, C>(deps: &Interception<C>, app: A, upstream: C::Stream, flow: FlowMeta<'_>) -> Outcome
 where
-    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A: AsyncRead + AsyncWrite + Abort + Unpin + Send + 'static,
     C: Dial,
 {
     let side = AppSide::new(app);
     let action = drive(deps, side.clone(), upstream, &flow).await;
+    if action == FlowAction::Blocked {
+        side.abort();
+    }
     side.close().await;
     let (bytes_up, bytes_down) = side.counted();
     Outcome { action, bytes_up, bytes_down }

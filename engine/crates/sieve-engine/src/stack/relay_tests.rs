@@ -1,27 +1,33 @@
-//! How a blocked flow ends, through the real `handle_udp` and a real `IpStack` in
-//! memory, with `filtering.https` off (its slot empty). No test sends a real
-//! packet: answers end at [`FakeSink`], the empty route table refuses every
-//! upstream socket, and the attributor only reads this machine's owner tables.
+//! How a blocked flow ends, through the real relay and a real `IpStack` in memory,
+//! with `filtering.https` off (its slot empty). Nothing leaves this machine: answers
+//! end at [`FakeSink`], the empty route table refuses every upstream socket, a TCP
+//! flow's upstream is on loopback, and the attributor only reads the owner tables.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use etherparse::{PacketBuilder, PacketHeaders, TcpHeader, TransportHeader};
 use ipstack::{IpStack, IpStackConfig, IpStackStream};
 use sieve_filter::rules::{ListText, RuleEngine, RuleSet};
-use sieve_ipc::{FlowAction, FlowEvent, LogOutcome, Policy};
+use sieve_ipc::{FlowAction, FlowKind, FlowProto, LogOutcome, Policy};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use super::Meters;
 use super::egress::Egress;
-use super::relay::{Relay, RelayParts, handle_udp};
+use super::relay::{Relay, RelayParts, handle_udp, serve_admitted};
 use crate::dns::NameMap;
 use crate::dns::service::Service;
 use crate::domain::{DomainFilter, FilterSlot};
 use crate::flow::etw::Unwitnessed;
+use crate::flow::flows::FiveTuple;
 use crate::flow::nat::{NatTable, NoDirectory, VmDirectory};
+use crate::flow::packet::Proto;
 use crate::quic::icmp::tests::assert_answers;
 use crate::quic::tests::{FLOWS, FakeSink, MemDevice, sealed_initials, udp_packet};
 use crate::route::table::NetTables;
@@ -36,7 +42,7 @@ const NAME_TTL_S: u32 = 300;
 const WAIT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(5);
 
-pub(super) fn relay(sink: Arc<FakeSink>) -> Arc<Relay> {
+fn relay(sink: Arc<FakeSink>) -> Arc<Relay> {
     let tables: Arc<RwLock<NetTables>> = Arc::default();
     let names: Arc<Mutex<NameMap>> = Arc::default();
     let meters: Arc<Meters> = Arc::default();
@@ -50,13 +56,13 @@ pub(super) fn relay(sink: Arc<FakeSink>) -> Arc<Relay> {
     Arc::new(Relay::new(RelayParts { tables, egress, dns, book: Arc::default(), names, meters, filter, witness: Box::new(Unwitnessed), nat, https: Arc::default(), sink }))
 }
 
-pub(super) struct Wire {
-    pub(super) to_stack: mpsc::UnboundedSender<Vec<u8>>,
-    pub(super) from_stack: mpsc::UnboundedReceiver<Vec<u8>>,
-    pub(super) stack: IpStack,
+struct Wire {
+    to_stack: mpsc::UnboundedSender<Vec<u8>>,
+    from_stack: mpsc::UnboundedReceiver<Vec<u8>>,
+    stack: IpStack,
 }
 
-pub(super) fn wire() -> Wire {
+fn wire() -> Wire {
     let (to_stack, rx) = mpsc::unbounded_channel();
     let (tx, from_stack) = mpsc::unbounded_channel();
     let mut config = IpStackConfig::default();
@@ -64,7 +70,7 @@ pub(super) fn wire() -> Wire {
     Wire { to_stack, from_stack, stack: IpStack::new(config, MemDevice { rx, tx }) }
 }
 
-pub(super) fn ends(flow: (&str, &str)) -> (SocketAddr, SocketAddr) {
+fn ends(flow: (&str, &str)) -> (SocketAddr, SocketAddr) {
     (flow.0.parse().unwrap(), flow.1.parse().unwrap())
 }
 
@@ -79,7 +85,7 @@ async fn until(what: &str, done: impl Fn() -> bool) {
 
 /// The one thing the flow must have left in the book: one closed `Blocked`
 /// event and one `Blocked` log row, counted once.
-pub(super) fn assert_blocked_once(ctx: &Relay, host: &str) -> FlowEvent {
+fn assert_blocked_once(ctx: &Relay, host: &str) {
     let mut book = ctx.book.lock().unwrap();
     let batch = book.take_batch();
     assert_eq!(batch.iter().map(|e| (e.action, e.open)).collect::<Vec<_>>(), [(FlowAction::Blocked, false)]);
@@ -88,7 +94,6 @@ pub(super) fn assert_blocked_once(ctx: &Relay, host: &str) -> FlowEvent {
     assert_eq!(rows.iter().map(|r| &r.outcome).collect::<Vec<_>>(), [&LogOutcome::Blocked]);
     let counters = ctx.meters.counters();
     assert_eq!((counters.flows, counters.blocked), (1, 1), "one owner lookup, one block");
-    batch[0].clone()
 }
 
 async fn accept_udp(wire: &mut Wire) -> ipstack::IpStackUdpStream {
@@ -165,5 +170,157 @@ async fn an_allowed_flow_gets_no_answer() {
         assert_eq!(ctx.meters.counters().blocked, 0);
         let batch = ctx.book.lock().unwrap().take_batch();
         assert_eq!(batch.iter().map(|e| e.action).collect::<Vec<_>>(), [FlowAction::Failed], "no route, so nothing left");
+    }
+}
+
+// ---- TCP: a segment at a time, as the app's own stack would send them.
+
+const CLIENT_ISN: u32 = 1_000;
+const WINDOW: u16 = 64_000;
+const BANNER: &[u8] = b"220 ready\r\n";
+
+#[derive(Clone, Copy, Default)]
+struct Flags {
+    syn: bool,
+    psh: bool,
+    ack: Option<u32>,
+}
+
+fn segment(local: SocketAddr, remote: SocketAddr, seq: u32, flags: Flags, payload: &[u8]) -> Vec<u8> {
+    let ip = match (local, remote) {
+        (SocketAddr::V4(l), SocketAddr::V4(r)) => PacketBuilder::ipv4(l.ip().octets(), r.ip().octets(), 64),
+        (SocketAddr::V6(l), SocketAddr::V6(r)) => PacketBuilder::ipv6(l.ip().octets(), r.ip().octets(), 64),
+        _ => panic!("one family"),
+    };
+    let mut tcp = ip.tcp(local.port(), remote.port(), seq, WINDOW);
+    if flags.syn {
+        tcp = tcp.syn();
+    }
+    if flags.psh {
+        tcp = tcp.psh();
+    }
+    if let Some(ack) = flags.ack {
+        tcp = tcp.ack(ack);
+    }
+    let mut out = Vec::new();
+    tcp.write(&mut out, payload).unwrap();
+    out
+}
+
+/// One TCP flow in an `IpStack`, its handshake done, and its SYN-time upstream:
+/// a loopback socket whose far end the test holds.
+struct TcpBed {
+    ctx: Arc<Relay>,
+    wire: Wire,
+    local: SocketAddr,
+    remote: SocketAddr,
+    /// The next sequence number the app expects, and the next it sends.
+    server_next: u32,
+    client_next: u32,
+    server: TcpStream,
+    task: JoinHandle<()>,
+}
+
+impl TcpBed {
+    async fn new(flow: (&str, &str)) -> Self {
+        let (local, remote) = ends(flow);
+        let ctx = relay(Arc::default());
+        let mut wire = wire();
+        wire.to_stack.send(segment(local, remote, CLIENT_ISN, Flags { syn: true, ..Flags::default() }, &[])).unwrap();
+        let Ok(IpStackStream::Tcp(app)) = wire.stack.accept().await else { panic!("no TCP stream") };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (upstream, server) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+        let tuple = FiveTuple { proto: Proto::Tcp, local, remote };
+        let admitted = ctx.admit(&tuple, &ctx.attribute(tuple).await, FlowProto::Tcp, FlowKind::Other).expect("admitted");
+        let task = tokio::spawn(serve_admitted(ctx.clone(), app, tuple, admitted, upstream.unwrap(), monotonic_ms()));
+        let mut bed = Self { ctx, wire, local, remote, server_next: 0, client_next: CLIENT_ISN + 1, server: server.unwrap().0, task };
+        let syn_ack = bed.next_segment().await;
+        assert!(syn_ack.syn && syn_ack.ack, "{syn_ack:?}");
+        bed.send(&[]);
+        bed
+    }
+
+    fn send(&mut self, payload: &[u8]) {
+        let flags = Flags { psh: !payload.is_empty(), ack: Some(self.server_next), ..Flags::default() };
+        self.wire.to_stack.send(segment(self.local, self.remote, self.client_next, flags, payload)).unwrap();
+        self.client_next += u32::try_from(payload.len()).unwrap();
+    }
+
+    async fn next_segment(&mut self) -> TcpHeader {
+        let packet = tokio::time::timeout(WAIT, self.wire.from_stack.recv()).await.expect("a segment").unwrap();
+        let headers = PacketHeaders::from_ip_slice(&packet).unwrap();
+        let Some(TransportHeader::Tcp(header)) = headers.transport else { panic!("not TCP") };
+        let used = u32::try_from(headers.payload.slice().len()).unwrap() + u32::from(header.syn);
+        self.server_next = header.sequence_number.wrapping_add(used);
+        header
+    }
+
+    /// Segments up to the one that ends the flow from the stack's side.
+    async fn until_the_end(&mut self) -> TcpHeader {
+        loop {
+            let header = self.next_segment().await;
+            if header.rst || header.fin {
+                return header;
+            }
+        }
+    }
+}
+
+/// First bytes that name the host in one segment.
+fn hello(host: &str) -> Vec<u8> {
+    format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_tcp_flow_ends_with_a_reset_at_the_next_sequence() {
+    for flow in FLOWS {
+        let mut bed = TcpBed::new(flow).await;
+        let expected_seq = bed.server_next;
+        bed.send(&hello(BLOCKED));
+        let end = bed.until_the_end().await;
+        assert!(end.rst && !end.fin, "{end:?}");
+        assert_eq!((end.sequence_number, end.acknowledgment_number), (expected_seq, bed.client_next), "a reset the app's stack accepts");
+        ended(&mut bed.task).await.unwrap();
+        assert_blocked_once(&bed.ctx, BLOCKED);
+        assert!(bed.wire.from_stack.try_recv().is_err(), "nothing follows the reset");
+        let mut upstream_got = Vec::new();
+        ended(bed.server.read_to_end(&mut upstream_got)).await.unwrap();
+        assert_eq!(upstream_got, b"", "nothing went upstream");
+    }
+}
+
+/// The relay forwards server bytes before the decision: the reset's sequence
+/// number comes after them, or the app's stack would not accept it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_flow_after_server_bytes_resets_after_them() {
+    for flow in FLOWS {
+        let mut bed = TcpBed::new(flow).await;
+        bed.server.write_all(BANNER).await.unwrap();
+        let banner = bed.next_segment().await;
+        assert!(!banner.rst && !banner.fin, "{banner:?}");
+        bed.send(&hello(BLOCKED));
+        let end = bed.until_the_end().await;
+        assert!(end.rst && !end.fin, "{end:?}");
+        assert_eq!(end.sequence_number, banner.sequence_number.wrapping_add(u32::try_from(BANNER.len()).unwrap()));
+        ended(&mut bed.task).await.unwrap();
+        assert_blocked_once(&bed.ctx, BLOCKED);
+    }
+}
+
+/// The control: a flow no rule blocks still ends with a FIN when its server does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_passed_flow_still_closes_with_a_fin() {
+    for flow in FLOWS {
+        let mut bed = TcpBed::new(flow).await;
+        let hello = hello(ALLOWED);
+        bed.send(&hello);
+        let mut got = vec![0u8; hello.len()];
+        ended(bed.server.read_exact(&mut got)).await.unwrap();
+        assert_eq!(got, hello, "the flow was relayed");
+        bed.server.shutdown().await.unwrap();
+        let end = bed.until_the_end().await;
+        assert!(end.fin && !end.rst, "{end:?}");
+        assert_eq!(bed.ctx.meters.counters().blocked, 0);
+        bed.task.abort();
     }
 }

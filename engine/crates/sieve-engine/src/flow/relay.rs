@@ -13,7 +13,8 @@
 //!    drop, or a client EOF before any decision: the flow ends at once and
 //!    nothing is sent upstream.
 //!
-//! The caller closes the app side when [`Outcome::stop`] is true.
+//! The caller closes the app side when [`Outcome::stop`] is true, and resets it
+//! first when [`Outcome::dropped`] is.
 
 use std::time::Duration;
 
