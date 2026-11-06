@@ -9,6 +9,8 @@ import type { LogEntry, LogRow } from "@/data/protocol";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useEngine, useLog, useLogActions } from "@/hooks/use-sieve";
 
+const reason = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
 /** A row that opens the report dialog, or the same facts from the app sheet. */
 export interface ReportSeed {
   url: string | null;
@@ -79,7 +81,9 @@ export function useRowActions() {
 
   /**
    * Writes what the preview showed, then says so with an Undo. A line already
-   * there is not this action's to undo, so that says so and offers none.
+   * there is not this action's to undo, so that says so and offers none. The
+   * store takes a value before it saves it, so a save that fails puts the list
+   * back: what the screen and a retry read is what the disk holds.
    */
   const confirm = useCallback(async () => {
     if (!preview) return;
@@ -91,12 +95,22 @@ export function useRowActions() {
       notices.push({ kind: "info", text: already });
       return;
     }
-    await settings.set(key, after);
-    notices.push({
-      kind: "success",
-      text: added,
-      action: { label: "Undo", run: () => void settings.set(key, removeLine(settings.get(key), line)) },
-    });
+    const undo = async () => {
+      try {
+        await settings.set(key, removeLine(settings.get(key), line));
+      } catch (err) {
+        settings.set(key, addLine(settings.get(key), line)).catch(() => undefined);
+        notices.push({ kind: "error", text: `Could not undo: ${reason(err)}. ${line} stays.` });
+      }
+    };
+    try {
+      await settings.set(key, after);
+    } catch (err) {
+      settings.set(key, removeLine(settings.get(key), line)).catch(() => undefined);
+      notices.push({ kind: "error", text: `Could not save ${line}: ${reason(err)}. Nothing was added.` });
+      return;
+    }
+    notices.push({ kind: "success", text: added, action: { label: "Undo", run: () => void undo() } });
   }, [preview, settings, notices]);
 
   return { run, preview, confirm, cancelPreview: () => setPreview(null), report, setReport, closeReport: () => setReport(null) };

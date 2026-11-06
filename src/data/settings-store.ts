@@ -83,8 +83,10 @@ export function createSettingsStore(backend: SettingsBackend): SettingsStore {
     doc = next;
     emit();
     const snapshot = next;
-    saving = saving.then(() => backend.save(snapshot));
-    return saving;
+    const written = saving.then(() => backend.save(snapshot));
+    // This write's failure is its caller's; the next write still goes to the disk.
+    saving = written.catch(() => undefined);
+    return written;
   };
 
   const ready = backend.load().then((raw) => {

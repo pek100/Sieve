@@ -8,7 +8,7 @@ import type { EngineSource } from "@/data/engine-source";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
 import { createMockSource } from "@/data/mock-source";
 import { LOG_TAIL_VERSION, type LogEntry, type LogOutcome, type LogRow } from "@/data/protocol";
-import { memoryBackend } from "@/data/settings-store";
+import { memoryBackend, type SettingsBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { LogScreen } from "./log-screen";
@@ -25,10 +25,10 @@ beforeEach(() => {
 });
 
 /** The mock engine, with its first log read made at once rather than after a tick. */
-async function setup(engine: EngineSource | EngineScenario = "hosts", stored?: unknown) {
+async function setup(engine: EngineSource | EngineScenario = "hosts", stored?: unknown, settings?: SettingsBackend) {
   const runtime = createRuntime({
     source: createMockSource({ seed: 1 }),
-    settings: memoryBackend(stored ?? { schema: 5, values: { "filtering.engine": true } }),
+    settings: settings ?? memoryBackend(stored ?? { schema: 5, values: { "filtering.engine": true } }),
     engine: typeof engine === "string" ? createMockEngine(engine) : engine,
   });
   render(
@@ -44,8 +44,8 @@ async function setup(engine: EngineSource | EngineScenario = "hosts", stored?: u
 }
 
 /** Waits for the mock's first read: the ring holds every fixture row. */
-async function withRows(engine: EngineSource | EngineScenario = "hosts", stored?: unknown) {
-  const rt = await setup(engine, stored);
+async function withRows(engine: EngineSource | EngineScenario = "hosts", stored?: unknown, settings?: SettingsBackend) {
+  const rt = await setup(engine, stored, settings);
   await vi.waitFor(() => expect(screen.getAllByTestId("log-row").length).toBeGreaterThan(0), { timeout: LOG_POLL_MS * 4 });
   // Reads go on; the tests need a still list.
   act(() => rt.logController.pause());
@@ -274,6 +274,52 @@ describe("row actions", () => {
 
     undoLast(rt);
     await vi.waitFor(() => expect(rt.settings.get("filtering.userRules")).toEqual([]));
+  });
+
+  /** A backend whose saves fail while `disk.full` is true. */
+  function backendThatFills() {
+    const inner = memoryBackend({ schema: 5, values: { "filtering.engine": true } });
+    const disk = { full: false };
+    const backend: SettingsBackend = {
+      ...inner,
+      save: async (doc) => {
+        if (disk.full) throw new Error("disk full");
+        await inner.save(doc);
+      },
+    };
+    return { backend, disk, stored: async () => (await inner.load()) as { values: Record<string, unknown> } };
+  }
+
+  it("a save that fails says so, takes the line back and offers no Undo; trying again adds it", async () => {
+    const { backend, disk, stored } = backendThatFills();
+    const rt = await withRows("hosts", undefined, backend);
+    disk.full = true;
+    await pick("ads.example.com", "Unblock");
+    await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add it" }));
+    await vi.waitFor(() => expect(rt.notices.list().filter((n) => n.kind === "error").map((n) => n.text)).toEqual(["Could not save @@||ads.example.com^: disk full. Nothing was added."]));
+    await vi.waitFor(() => expect(rt.settings.get("filtering.userRules")).toEqual([]));
+    expect(rt.notices.list().some((n) => n.kind === "success" || n.action)).toBe(false);
+
+    disk.full = false;
+    await pick("ads.example.com", "Unblock");
+    await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add it" }));
+    await vi.waitFor(() => expect(rt.notices.list().some((n) => n.text === "Added @@||ads.example.com^ to your rules.")).toBe(true));
+    expect(rt.settings.get("filtering.userRules")).toEqual(["@@||ads.example.com^"]);
+    expect((await stored()).values["filtering.userRules"]).toEqual(["@@||ads.example.com^"]);
+  });
+
+  it("an Undo whose save fails says so and the line stays, as it does on disk", async () => {
+    const { backend, disk, stored } = backendThatFills();
+    const rt = await withRows("hosts", undefined, backend);
+    await pick("ads.example.com", "Unblock");
+    await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add it" }));
+    await vi.waitFor(() => expect(rt.notices.list().some((n) => n.action?.label === "Undo")).toBe(true));
+
+    disk.full = true;
+    undoLast(rt);
+    await vi.waitFor(() => expect(rt.notices.list().filter((n) => n.kind === "error").map((n) => n.text)).toEqual(["Could not undo: disk full. @@||ads.example.com^ stays."]));
+    await vi.waitFor(() => expect(rt.settings.get("filtering.userRules")).toEqual(["@@||ads.example.com^"]));
+    expect((await stored()).values["filtering.userRules"]).toEqual(["@@||ads.example.com^"]);
   });
 
   it("from the details sheet: Cancel goes back to the sheet; Add it leaves no modal over the toast", async () => {
