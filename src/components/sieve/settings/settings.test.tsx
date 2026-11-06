@@ -69,16 +69,16 @@ describe("settings view (rendered from the registry)", () => {
     const filtering = document.getElementById("section-filtering")!;
     expect(within(filtering).getByRole("region", { name: "Engine" })).toBeInTheDocument();
     expect(filtering.querySelector("#engine")).not.toBeNull();
-    // The upstream row is a summary of the defaults, no bare address, nothing to reset.
-    expect(row("filtering.upstreams")).toHaveTextContent("https://cloudflare-dns.com/dns-query, https://dns.quad9.net/dns-query");
+    // The upstream row lists the defaults, no bare address (migration dropped it), nothing to reset.
+    expect(within(row("filtering.upstreams")).getAllByRole("listitem").map((li) => li.getAttribute("data-upstream"))).toEqual(["https://cloudflare-dns.com/dns-query", "https://dns.quad9.net/dns-query"]);
     expect(row("filtering.upstreams")).not.toHaveTextContent("1.1.1.1");
-    expect(within(row("filtering.upstreams")).queryByRole("button")).toBeNull();
+    expect(within(row("filtering.upstreams")).queryByRole("button", { name: /^Reset/ })).toBeNull();
     expect(rt.passedChecks.has("filtering.dns")).toBe(false);
   });
 
   it("a migrated upstream list shows with a way back to the defaults", async () => {
     const rt = await setup({ schema: 4, values: { "filtering.upstreams": ["tls://a.example"] } });
-    expect(row("filtering.upstreams")).toHaveTextContent("tls://a.example, https://cloudflare-dns.com/dns-query");
+    expect(within(row("filtering.upstreams")).getAllByRole("listitem")[0]).toHaveTextContent("tls://a.example");
     await userEvent.click(within(row("filtering.upstreams")).getByRole("button", { name: "Reset Upstream DNS servers" }));
     expect(rt.settings.get("filtering.upstreams")).toEqual(settingDef("filtering.upstreams").default);
   });

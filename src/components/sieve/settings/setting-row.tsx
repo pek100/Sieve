@@ -11,6 +11,7 @@ import type { RouteDef } from "@/core/routes";
 import type { SettingsDoc } from "@/core/settings/document";
 import { defaultValue, settingDef, type SettingKey } from "@/core/settings/registry";
 import { formatNumber, formatValue, numberChoices } from "@/core/settings/transfer";
+import { UpstreamRow } from "./upstream-row";
 import { valueInForce, type Lock } from "./use-settings-view";
 
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
@@ -43,7 +44,8 @@ function LockNote({ lock }: { lock: Lock }) {
 /**
  * One setting, its control chosen by the registry kind: enum segmented,
  * boolean and data switch as a switch, number as a select of its steps, map
- * and list as a summary (they are edited on their own screen) with a reset.
+ * and list as a summary (they are edited on their own screen) with a reset, a
+ * list of upstreams as its editor, chosen by the element's shape.
  * A locked row shows its control disabled at the value in force, with the
  * reason under the help text (an engine lock: the engine's own value, never
  * the stored wish it could not send).
@@ -68,6 +70,40 @@ export function SettingRow({
   const labelId = `setting-${k}-label`;
   const helpId = `setting-${k}-help`;
   const disabled = lock !== null;
+  // Back to the default: "Clear" when the default is empty, "Reset" when it has entries.
+  const reset = !same(value, defaultValue(k)) && (
+    <Button
+      variant="ghost"
+      size="sm"
+      className={d.kind === "list" && d.of.type === "upstream" ? "max-[640px]:h-11" : undefined}
+      disabled={disabled}
+      onClick={() => onReset(k)}
+      aria-label={`${emptyDefault(k) ? "Clear" : "Reset"} ${d.label}`}
+    >
+      {emptyDefault(k) ? "Clear" : "Reset"}
+    </Button>
+  );
+  const head = (
+    <>
+      <p id={labelId} className="text-body-strong text-on-surface">
+        {d.label}
+      </p>
+      <p id={helpId} className="text-label text-on-surface-muted">
+        {d.help}
+      </p>
+      {lock && <LockNote lock={lock} />}
+    </>
+  );
+
+  // A list of upstreams is edited here, in order, not on a screen of its own.
+  if (d.kind === "list" && d.of.type === "upstream") {
+    return (
+      <div id={`setting-${k}`} data-setting={k} role="group" aria-labelledby={labelId} className="flex flex-col gap-3">
+        <div className="min-w-0">{head}</div>
+        <UpstreamRow label={d.label} value={value} disabled={disabled} onChange={(next) => onSet(k, next)} reset={reset} />
+      </div>
+    );
+  }
 
   let control: React.ReactNode;
   switch (d.kind) {
@@ -115,18 +151,7 @@ export function SettingRow({
       control = (
         <div className="flex min-w-0 items-center gap-2">
           <span className="min-w-0 text-label text-on-surface-muted tabular break-words">{formatValue(k, value)}</span>
-          {!same(value, defaultValue(k)) && (
-            // Back to the default: "Clear" when the default is empty, "Reset" when it has entries.
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={disabled}
-              onClick={() => onReset(k)}
-              aria-label={`${emptyDefault(k) ? "Clear" : "Reset"} ${d.label}`}
-            >
-              {emptyDefault(k) ? "Clear" : "Reset"}
-            </Button>
-          )}
+          {reset}
           {route && (
             <Button variant="secondary" size="sm" asChild>
               <Link href={route.href}>Open {route.label}</Link>
@@ -145,15 +170,7 @@ export function SettingRow({
       aria-labelledby={labelId}
       className="flex min-h-11 flex-wrap items-center justify-between gap-x-4 gap-y-2"
     >
-      <div className="min-w-0 flex-1 basis-60">
-        <p id={labelId} className="text-body-strong text-on-surface">
-          {d.label}
-        </p>
-        <p id={helpId} className="text-label text-on-surface-muted">
-          {d.help}
-        </p>
-        {lock && <LockNote lock={lock} />}
-      </div>
+      <div className="min-w-0 flex-1 basis-60">{head}</div>
       <div className="flex max-w-full min-w-0 items-center">{control}</div>
     </div>
   );

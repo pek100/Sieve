@@ -30,6 +30,8 @@ const itemBase =
 const SIZES = {
   md: "h-8 px-4 text-label max-[640px]:px-3 max-[480px]:px-2",
   sm: "h-7 px-3 text-caption",
+  /** md, and a thumb's 44 px at phone width: a control a form is pressed with. */
+  touch: "h-8 px-4 text-label max-[640px]:h-11 max-[640px]:px-3",
 } as const;
 export type SegmentedSize = keyof typeof SIZES;
 

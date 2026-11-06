@@ -244,15 +244,21 @@ export function createEngineController({ engine, store, clock, settings, checks,
 
   // Compared with what the engine holds on every probe, so a list the engine lost
   // or never had is sent again. An empty setting has no meaning for the engine,
-  // which refuses it; it keeps its list until there is one to send.
+  // which refuses it; it keeps its list until there is one to send. What it said it
+  // holds stays in the slice for the row to read back, null while it cannot be asked.
+  const keepHeld = (held: readonly string[] | null) => {
+    if (JSON.stringify(get().heldUpstreams ?? null) !== JSON.stringify(held)) set({ heldUpstreams: held });
+  };
   const syncUpstreams = async () => {
-    if (disposed || !settingsReady || upstreamsInFlight || !engineTakesPolicy(get())) return;
+    if (disposed || !settingsReady || upstreamsInFlight) return;
+    if (!engineTakesPolicy(get())) return keepHeld(null);
     upstreamsInFlight = true;
     try {
       const held = await engine.dnsUpstreams();
       const want = settings.get("filtering.upstreams");
       const same = want.length === held.upstreams.length && want.every((u, i) => u === held.upstreams[i]);
-      if (want.length > 0 && !same) await engine.setDnsUpstreams({ revision: held.revision + 1, upstreams: [...want] });
+      keepHeld(held.upstreams);
+      if (want.length > 0 && !same) keepHeld((await engine.setDnsUpstreams({ revision: held.revision + 1, upstreams: [...want] })).upstreams);
       if (get().dnsError) set({ dnsError: null });
     } catch (e) {
       set({ dnsError: `The DNS servers did not reach the engine: ${message(e)}` });
