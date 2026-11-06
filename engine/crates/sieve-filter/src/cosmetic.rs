@@ -27,9 +27,10 @@
 //! [`RuleSet::page_cosmetics`] is what a flow asks. The table holds per engine,
 //! and the user's exceptions also cut the lists' part ([`UserGates`]), so the
 //! user wins both ways: a list's `$document` never silences the user's own `##`
-//! rules. Limits: a user's own `##+js()` stays inert, since the user's engine
-//! never gets the bundle; a user's `#@#` on a list's procedural rule cuts
-//! nothing, since adblock-rust reports procedural exceptions to no caller.
+//! rules. adblock-rust reports procedural exceptions to no caller, so the user's are
+//! asked of one more private engine, which holds each such line as the rule it
+//! excepts: what it answers for a page is the JSON to cut. Limit: a user's own
+//! `##+js()` stays inert, since the user's engine never gets the bundle.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -53,6 +54,9 @@ const GENERICHIDE_OPTION: &str = "generichide";
 /// Every option that speaks about hiding and not about the network.
 const HIDE_OPTIONS: [&str; 6] = ["elemhide", "ehide", "specifichide", "shide", "generichide", "ghide"];
 const UNHIDE_SEPARATOR: &str = "#@#";
+/// What makes any cosmetic separator an exception: `#@#`, `#@?#`.
+const UNHIDE_MARK: &str = "#@";
+const SEPARATOR_START: &str = "#";
 const NEGATED_HOST: char = '~';
 const SCRIPTLET_EXTENSION: &str = ".js";
 /// adblock-rust asks with these when it matches `url_cosmetic_resources`.
@@ -103,6 +107,8 @@ struct UserGates {
     specifichide: bool,
     /// The selectors the user's `#@#` lines cut on this page.
     exceptions: HashSet<String>,
+    /// The same for procedural rules, as the JSON adblock-rust wrote for them.
+    procedural: HashSet<String>,
     no_scriptlets: bool,
 }
 
@@ -261,6 +267,7 @@ pub(crate) struct CosmeticBuilder {
     elemhide: Vec<String>,
     specifichide: Vec<String>,
     no_scriptlets: Vec<String>,
+    procedural_exceptions: Vec<String>,
 }
 
 impl CosmeticBuilder {
@@ -281,6 +288,8 @@ impl CosmeticBuilder {
         if filter.mask.contains(CosmeticFilterMask::UNHIDE) {
             if filter.mask.contains(CosmeticFilterMask::SCRIPT_INJECT) {
                 self.no_scriptlets.extend(scriptlet_exception_rules(line));
+            } else if filter.plain_css_selector().is_none() || filter.action.is_some() {
+                self.procedural_exceptions.push(line.replacen(UNHIDE_MARK, SEPARATOR_START, 1));
             }
             return None;
         }
@@ -309,10 +318,11 @@ impl CosmeticBuilder {
             generic_css: css.into(),
             generic_dropped: dropped,
             generic,
-            document: exception_engine(self.document),
-            elemhide: exception_engine(self.elemhide),
-            specifichide: exception_engine(self.specifichide),
-            no_scriptlets: exception_engine(self.no_scriptlets),
+            document: private_engine(&self.document),
+            elemhide: private_engine(&self.elemhide),
+            specifichide: private_engine(&self.specifichide),
+            no_scriptlets: private_engine(&self.no_scriptlets),
+            procedural_exceptions: private_engine(&self.procedural_exceptions),
         }
     }
 }
@@ -327,7 +337,9 @@ fn scriptlet_identifier(filter: &CosmeticFilter) -> Option<String> {
     Some(if name.ends_with(SCRIPTLET_EXTENSION) { name.to_string() } else { format!("{name}{SCRIPTLET_EXTENSION}") })
 }
 
-fn exception_engine(rules: Vec<String>) -> Engine {
+/// A small engine to ask about these lines alone, so adblock-rust's matcher is
+/// reused and no second one exists.
+pub(crate) fn private_engine(rules: &[String]) -> Engine {
     let mut set = FilterSet::new(false);
     set.add_filter_list(rules.join("\n"), ParseOptions::default());
     Engine::new_with_filter_set(set)
@@ -344,6 +356,7 @@ pub(crate) struct CosmeticIndex {
     elemhide: Engine,
     specifichide: Engine,
     no_scriptlets: Engine,
+    procedural_exceptions: Engine,
 }
 
 impl CosmeticIndex {
@@ -400,6 +413,7 @@ impl RuleEngine {
             generichide: elemhide || resources.generichide,
             specifichide: elemhide || exception_applies(&self.cosmetic.specifichide, url),
             exceptions: resources.exceptions,
+            procedural: self.cosmetic.procedural_exceptions.url_cosmetic_resources(url).procedural_actions,
             no_scriptlets: exception_applies(&self.cosmetic.no_scriptlets, url),
         })
     }
@@ -436,7 +450,7 @@ impl RuleEngine {
         for selector in specific {
             page.dropped_rules += usize::from(!push_css_rule(&mut page.specific_css, selector, HIDE_DECLARATION));
         }
-        let actions: BTreeSet<_> = resources.procedural_actions.iter().collect();
+        let actions: BTreeSet<_> = resources.procedural_actions.iter().filter(|json| !gates.procedural.contains(*json)).collect();
         for json in actions {
             // adblock-rust wrote this JSON itself at compile.
             let css = serde_json::from_str::<ProceduralOrActionFilter>(json).ok().and_then(|f| f.as_css());
@@ -763,6 +777,34 @@ sieve-test.invalid##+js(sieve-set-flag, a, b)
         assert!(!p.generic_css.contains(".generic-class"), "{p:?}");
         assert!(p.generic_css.contains("#generic-id"), "{p:?}");
         assert!(!p.specific_css.contains(".specific"), "{p:?}");
+    }
+
+    #[test]
+    fn a_users_unhide_cuts_a_lists_procedural_rule() {
+        let lists_rules = format!("{RULES}{HOST}##.other:has-text(ad)\n{HOST}##.styled:style(color: red)\n");
+        let with = |line: &str| {
+            let user = RuleEngine::compile_user_rules(std::iter::empty(), [line]);
+            RuleSet { user: Arc::new(user), lists: Arc::new(engine_with(&lists_rules, true)) }
+        };
+        let of = |p: &PageCosmetics| p.procedural.join(" ");
+        let before = with("##.unrelated").page_cosmetics(URL);
+        assert!(of(&before).contains("has-text") && of(&before).contains(".has-text") && of(&before).contains(".other"), "the control: {before:?}");
+        assert!(before.specific_css.contains(".styled"), "the control: {before:?}");
+
+        for line in [format!("{HOST}#@#.has-text:has-text(ad)"), format!("{HOST}#@?#.has-text:has-text(ad)")] {
+            let set = with(&line);
+            assert_eq!(set.user.reports()[0].cosmetic, 1, "{line}");
+            let cut = set.page_cosmetics(URL);
+            assert!(!of(&cut).contains(r#""arg":".has-text""#), "{line}: {cut:?}");
+            assert!(of(&cut).contains(".other"), "{line}: another rule stays: {cut:?}");
+            assert_eq!(cut.procedural.len(), before.procedural.len() - 1, "{line}");
+            assert_eq!(set.page_cosmetics(OTHER_URL).procedural, Vec::<String>::new(), "{line}: nothing elsewhere");
+        }
+        let styled = with(&format!("{HOST}#@#.styled:style(color: red)")).page_cosmetics(URL);
+        assert!(!styled.specific_css.contains(".styled"), "a pure style goes the same way: {styled:?}");
+        assert_eq!(styled.procedural.len(), before.procedural.len(), "{styled:?}");
+        let elsewhere = with("other.invalid#@#.has-text:has-text(ad)").page_cosmetics(URL);
+        assert_eq!(elsewhere.procedural.len(), before.procedural.len(), "another host's exception cuts nothing here");
     }
 
     /// Both engines except one selector: it is cut once, and nothing else goes.

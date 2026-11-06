@@ -29,7 +29,7 @@ use adblock::lists::{FilterSet, ParseOptions, ParsedLine, parse_filter};
 use adblock::request::Request;
 use adblock::resources::PermissionMask;
 
-use crate::cosmetic::{CosmeticBuilder, CosmeticIndex, ScriptletUse, network_half, page_exception};
+use crate::cosmetic::{CosmeticBuilder, CosmeticIndex, ScriptletUse, network_half, page_exception, private_engine};
 
 /// The synthetic host-level request (module doc).
 const SYNTHETIC_TYPE: &str = "other";
@@ -127,6 +127,8 @@ pub struct RequestQuery<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestDecision {
     pub verdict: HostVerdict,
+    /// What decided, or with `rewritten` set on a request let through, what removed
+    /// the parameter: that is what the request's log row reports.
     pub rule: Option<String>,
     pub list: Option<String>,
     /// A block's resource as a `data:` URL; None means a plain block.
@@ -156,6 +158,22 @@ pub struct RuleEngine {
     pub(crate) scriptlets: Vec<ScriptletUse>,
     /// A derived network half, by list index, to the line its list wrote.
     written: HashMap<(u32, String), String>,
+    /// Per list, parallel to `reports`.
+    strips: Vec<Strips>,
+}
+
+/// One list's `$removeparam` lines, by the parameter each names.
+type Strips = HashMap<String, Vec<String>>;
+
+/// Lines asked per rewritten request to say who removed a parameter, each a small
+/// engine of its own. Past this the row names nothing: evidence, not the removal,
+/// and a parameter few lists hold more than a few lines for.
+const MAX_STRIP_LINES_ASKED: usize = 8;
+
+/// The parameter names of a URL's query.
+fn query_keys(url: &str) -> impl Iterator<Item = &str> {
+    let query = url.split_once('?').map_or("", |(_, rest)| rest.split('#').next().unwrap_or(""));
+    query.split('&').map(|pair| pair.split('=').next().unwrap_or(pair))
 }
 
 impl std::fmt::Debug for RuleEngine {
@@ -185,11 +203,12 @@ fn rule_lines(text: &str) -> impl Iterator<Item = &str> {
 /// A compiled list's derived network lines: half to the line that says it.
 type NetworkHalves = Vec<(String, String)>;
 
-fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, ScriptletUse, NetworkHalves) {
+fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, ScriptletUse, NetworkHalves, Strips) {
     let opts = options(list.trusted);
     let mut r = ListReport { id: list.id.to_string(), ..ListReport::default() };
     let mut scriptlets = ScriptletUse::new();
     let mut halves = NetworkHalves::new();
+    let mut strips = Strips::new();
     for line in rule_lines(list.text) {
         // A skipped exception is a defect (plan 5.2): the parser refuses these
         // options, so a line it can answer through `page_exception` is applied.
@@ -204,7 +223,12 @@ fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, S
         match parse_filter(line, false, opts) {
             Ok(parsed) => {
                 match &parsed {
-                    ParsedLine::Network(_) => r.network += 1,
+                    ParsedLine::Network(filter) => {
+                        r.network += 1;
+                        if let Some(key) = filter.modifier_option.filter(|_| filter.is_removeparam()) {
+                            strips.entry(key.to_string()).or_default().push(line.to_string());
+                        }
+                    }
                     ParsedLine::Cosmetic(_) => r.cosmetic += 1,
                 }
                 if let Some(name) = cosmetic.observe(line, &parsed) {
@@ -224,7 +248,7 @@ fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, S
             }
         }
     }
-    (r, scriptlets, halves)
+    (r, scriptlets, halves, strips)
 }
 
 /// True when `text` holds at least one rule the parser accepts: a response
@@ -268,8 +292,10 @@ impl RuleEngine {
         let mut reports = Vec::with_capacity(lists.len());
         let mut scriptlets = Vec::with_capacity(lists.len());
         let mut written = HashMap::new();
+        let mut strips = Vec::with_capacity(lists.len());
         for (index, list) in lists.iter().enumerate() {
-            let (report, uses, halves) = report(list, &mut cosmetic);
+            let (report, uses, halves, list_strips) = report(list, &mut cosmetic);
+            strips.push(list_strips);
             let mut text = list.text.to_string();
             for (half, line) in halves {
                 text.push('\n');
@@ -280,7 +306,26 @@ impl RuleEngine {
             reports.push(report);
             scriptlets.push(uses);
         }
-        Self { engine: Engine::new_with_filter_set_no_optimize(set), reports, cosmetic: cosmetic.build(), scriptlets, written }
+        Self { engine: Engine::new_with_filter_set_no_optimize(set), reports, cosmetic: cosmetic.build(), scriptlets, written, strips }
+    }
+
+    /// Which line removed a parameter from this request, and its list. adblock-rust
+    /// says only that one was removed, so the lines naming a parameter of this URL are
+    /// asked one at a time, in list order, and the first that removes one has it.
+    fn strip_credit(&self, url: &str, request: &Request) -> (Option<String>, Option<String>) {
+        let lines = self.reports.iter().zip(&self.strips).flat_map(|(report, strips)| query_keys(url).filter_map(|key| strips.get(key)).flatten().map(move |line| (report, line)));
+        for (report, line) in lines.take(MAX_STRIP_LINES_ASKED) {
+            if private_engine(std::slice::from_ref(line)).check_network_request_subset(request, false, false).rewritten_url.is_some() {
+                return (Some(line.clone()), Some(report.id.clone()));
+            }
+        }
+        (None, None)
+    }
+
+    /// A request let on: what `decided` it, or with parameters removed, what did that.
+    fn passing(&self, verdict: HostVerdict, decided: Option<adblock::sourcemap::FilterRuleDebugInfo>, rewritten: Option<String>, query: &RequestQuery<'_>, request: &Request) -> RequestDecision {
+        let (rule, list) = if rewritten.is_some() { self.strip_credit(query.url, request) } else { self.rule_text(decided) };
+        RequestDecision { verdict, rule, list, redirect: None, rewritten }
     }
 
     /// The rule's text as its list wrote it, and the list.
@@ -422,18 +467,14 @@ impl RuleEngine {
                 && let Ok(document) = Request::new(page, "", DOCUMENT_TYPE, SYNTHETIC_METHOD)
                 && let Some(exception) = self.engine.check_network_request_subset(&document, true, true).exception
             {
-                let (rule, list) = self.rule_text(Some(exception));
-                return RequestDecision { verdict: HostVerdict::Allow, rule, list, redirect: None, rewritten };
+                return self.passing(HostVerdict::Allow, Some(exception), rewritten, query, &request);
             }
             let redirect = result.redirect;
             let (rule, list) = self.rule_text(result.filter);
             return RequestDecision { verdict: HostVerdict::Block, rule, list, redirect, rewritten: None };
         }
-        if result.exception.is_some() {
-            let (rule, list) = self.rule_text(result.exception);
-            return RequestDecision { verdict: HostVerdict::Allow, rule, list, redirect: None, rewritten };
-        }
-        RequestDecision { rewritten, ..RequestDecision::default() }
+        let verdict = if result.exception.is_some() { HostVerdict::Allow } else { HostVerdict::None };
+        self.passing(verdict, result.exception, rewritten, query, &request)
     }
 
     /// A full-URL verdict alone (the benchmark measures this).
@@ -470,7 +511,8 @@ impl RuleSet {
 
     /// The user's engine first: its verdict decides. Otherwise the lists are
     /// asked about the URL as the user's engine left it, and a parameter
-    /// either removed stays removed.
+    /// either removed stays removed. The last engine that removed one has the
+    /// credit, unless the lists blocked the request.
     pub fn check_request(&self, query: &RequestQuery<'_>) -> RequestDecision {
         let user = self.user.check_request(query);
         if user.verdict != HostVerdict::None {
@@ -478,6 +520,9 @@ impl RuleSet {
         }
         let asked = user.rewritten.as_deref().unwrap_or(query.url);
         let lists = self.lists.check_request(&RequestQuery { url: asked, ..*query });
+        if lists.rewritten.is_none() && user.rewritten.is_some() && lists.verdict != HostVerdict::Block {
+            return RequestDecision { verdict: lists.verdict, ..user };
+        }
         RequestDecision { rewritten: lists.rewritten.clone().or(user.rewritten), ..lists }
     }
 }
@@ -610,6 +655,61 @@ example.invalid##+js(set-constant, adsAllowed, true)
         assert_eq!(set.check_request(&query("https://ads.example/x", "https://b.example/", "script")).verdict, HostVerdict::Allow, "the user's allow beats a list's block");
         let both = set.check_request(&query("https://news.example/a?one=1&two=2&id=3", "", "document"));
         assert_eq!(both.rewritten.as_deref(), Some("https://news.example/a?id=3"), "the lists are asked on what the user's engine left");
+    }
+
+    fn lists(texts: &[(&'static str, &'static str)]) -> RuleEngine {
+        let lists: Vec<ListText<'_>> = texts.iter().map(|(id, text)| ListText { id, text, trusted: false }).collect();
+        RuleEngine::compile(&lists)
+    }
+
+    const STRIPPABLE: &str = "https://site.example/a?utm_source=x&id=1";
+
+    #[test]
+    fn a_removed_parameter_is_credited_to_the_list_and_line_that_removed_it() {
+        let credit = |e: &RuleEngine| {
+            let d = e.check_request(&query(STRIPPABLE, "", "document"));
+            assert_eq!(d.rewritten.as_deref(), Some("https://site.example/a?id=1"));
+            (d.rule, d.list)
+        };
+        let want = |rule: &str, list: &str| (Some(rule.to_string()), Some(list.to_string()));
+        for line in ["$removeparam=utm_source", "||site.example^$removeparam=utm_source"] {
+            let text: &'static str = Box::leak(format!("{line}\n").into_boxed_str());
+            assert_eq!(credit(&lists(&[("strip", text)])), want(line, "strip"));
+        }
+        let e = lists(&[("other", "||other.example^$removeparam=utm_source\n"), ("strip", "||site.example^$removeparam=utm_source\n")]);
+        assert_eq!(credit(&e), want("||site.example^$removeparam=utm_source", "strip"), "not the first line naming the parameter");
+        let e = lists(&[("first", "$removeparam=utm_source\n"), ("second", "||site.example^$removeparam=utm_source\n")]);
+        assert_eq!(credit(&e), want("$removeparam=utm_source", "first"), "list order, as the matcher reads them");
+    }
+
+    #[test]
+    fn an_exception_does_not_take_a_strips_credit() {
+        let e = lists(&[("exc", "@@||site.example^\n"), ("strip", "||site.example^$removeparam=utm_source\n")]);
+        let d = e.check_request(&query(STRIPPABLE, "", "document"));
+        assert_eq!(d.verdict, HostVerdict::Allow, "it still lets the request on");
+        assert_eq!((d.rule.as_deref(), d.list.as_deref()), (Some("||site.example^$removeparam=utm_source"), Some("strip")));
+        let plain = e.check_request(&query("https://site.example/a?id=1", "", "document"));
+        assert_eq!((plain.rule.as_deref(), plain.list.as_deref()), (Some("@@||site.example^"), Some("exc")), "the control: nothing removed");
+    }
+
+    #[test]
+    fn a_users_strip_keeps_its_credit_when_the_lists_add_none() {
+        let user = RuleEngine::compile_user_rules(std::iter::empty(), ["||site.example^$removeparam=utm_source"]);
+        let both = set(user, "||site.example/other^\n");
+        let d = both.check_request(&query(STRIPPABLE, "", "document"));
+        assert_eq!((d.rule.as_deref(), d.list.as_deref()), (Some("||site.example^$removeparam=utm_source"), Some(USER_LIST)));
+        assert_eq!(d.rewritten.as_deref(), Some("https://site.example/a?id=1"));
+        let blocked = both.check_request(&query("https://site.example/other?utm_source=x", "https://b.example/", "script"));
+        assert_eq!((blocked.verdict, blocked.rule.as_deref()), (HostVerdict::Block, Some("||site.example/other^")), "a block is the block's");
+    }
+
+    #[test]
+    fn past_the_bound_a_strip_goes_uncredited_and_still_strips() {
+        let text: String = (0..=MAX_STRIP_LINES_ASKED).map(|n| if n == MAX_STRIP_LINES_ASKED { "||site.example^$removeparam=utm_source\n".to_string() } else { format!("||h{n}.example^$removeparam=utm_source\n") }).collect();
+        let text: &'static str = Box::leak(text.into_boxed_str());
+        let d = lists(&[("many", text)]).check_request(&query(STRIPPABLE, "", "document"));
+        assert_eq!(d.rewritten.as_deref(), Some("https://site.example/a?id=1"));
+        assert_eq!((d.rule, d.list), (None, None));
     }
 
     /// Pinned so a change of the library is seen.
