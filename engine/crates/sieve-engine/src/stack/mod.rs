@@ -9,6 +9,7 @@
 //! - [`Meters`]: the engine's own counters (attribution is read from them);
 //! - `relay` (Windows): the per-flow tasks.
 
+pub mod attribution;
 pub mod book;
 #[cfg(feature = "attribution-diagnostics")]
 pub mod diagnostics;
@@ -42,6 +43,11 @@ pub struct Meters {
     pub packets_out: AtomicU64,
     pub not_unicast: AtomicU64,
     pub blocked: AtomicU64,
+    pub forwarded: AtomicU64,
+    pub forwarded_named: AtomicU64,
+    pub etw_found: AtomicU64,
+    pub etw_disagreed: AtomicU64,
+    pub etw_dropped: AtomicU64,
 }
 
 impl Meters {
@@ -60,6 +66,11 @@ impl Meters {
             packets_out: l(&self.packets_out),
             not_unicast: l(&self.not_unicast),
             blocked: l(&self.blocked),
+            forwarded: l(&self.forwarded),
+            forwarded_named: l(&self.forwarded_named),
+            etw_found: l(&self.etw_found),
+            etw_disagreed: l(&self.etw_disagreed),
+            etw_dropped: l(&self.etw_dropped),
         }
     }
 }

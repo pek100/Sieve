@@ -3,13 +3,17 @@
 import { useMemo } from "react";
 import { listApps, offAll, pin, setAppState, sieveAll, sievedCount, unpin, type AppEntry } from "@/core/apps-actions";
 import { exeStem } from "@/core/apps";
+import { engineStatus } from "@/core/engine";
+import { guestRows, type GuestRow } from "@/core/guests";
 import { isAppOn } from "@/core/policy";
 import { newest, phase, type Phase } from "@/core/store";
 import { useRuntime } from "@/hooks/sieve-provider";
-import { useSetting, useSieve, useTracking } from "@/hooks/use-sieve";
+import { useEngine, useSetting, useSieve, useTracking } from "@/hooks/use-sieve";
 
 export interface AppsModel {
   apps: AppEntry[];
+  /** "Virtual machines and WSL": empty until the engine saw forwarded traffic. */
+  guests: GuestRow[];
   phase: Phase;
   error: string | null;
   /** The global Sieving switch. */
@@ -41,6 +45,8 @@ export function useApps(): AppsModel {
 
   // The list is the whole snapshot (an app turned off must stay listed to be turned back on).
   const apps = useMemo(() => listApps(snapshot, pinned), [snapshot, pinned]);
+  const engineGuests = engineStatus(useEngine())?.guests;
+  const guests = useMemo(() => guestRows(engineGuests), [engineGuests]);
   const sievedNow = useMemo(() => sievedCount(snapshot, states, globalOn), [snapshot, states, globalOn]);
 
   // Writers read the latest stored value at call time, so undo after other edits stays correct.
@@ -51,6 +57,7 @@ export function useApps(): AppsModel {
 
   return {
     apps,
+    guests,
     phase: p,
     error,
     globalOn,
@@ -64,7 +71,7 @@ export function useApps(): AppsModel {
     },
     offAll: () => {
       const before = statesNow();
-      void writeStates(offAll(before, apps.map((a) => a.key)));
+      void writeStates(offAll(before, [...apps, ...guests].map((a) => a.key)));
       undoStates("Every app is off", before);
     },
     pin: (path) => {

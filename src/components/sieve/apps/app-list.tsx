@@ -68,6 +68,42 @@ export function AppRow({ app, actions }: { app: AppEntry; actions: RowActions })
   );
 }
 
+/** A group's collapsible label and its count; the group renders its rows under it. */
+export function SectionHeader({
+  id,
+  label,
+  count,
+  open,
+  onToggle,
+}: {
+  id: string;
+  label: string;
+  count: number;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <h3 id={`${id}-title`} className="text-label text-on-surface-muted">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={id}
+        onClick={onToggle}
+        className="relative flex h-9 w-full items-center gap-2 overflow-hidden rounded-sm text-left"
+      >
+        <ChevronDown
+          className={cn("size-4 transition-transform duration-(--motion-base) ease-standard", !open && "-rotate-90")}
+          strokeWidth={1.75}
+          aria-hidden="true"
+        />
+        <span className="flex-1">{label}</span>
+        <span className="tabular text-on-surface-faint">{count}</span>
+        <StateLayer />
+      </button>
+    </h3>
+  );
+}
+
 export function AppSectionView({
   section,
   actions,
@@ -84,24 +120,7 @@ export function AppSectionView({
   const id = `apps-section-${category}`;
   return (
     <section aria-labelledby={`${id}-title`} className="flex flex-col">
-      <h3 id={`${id}-title`} className="text-label text-on-surface-muted">
-        <button
-          type="button"
-          aria-expanded={open}
-          aria-controls={id}
-          onClick={() => setOpen((o) => !o)}
-          className="relative flex h-9 w-full items-center gap-2 overflow-hidden rounded-sm text-left"
-        >
-          <ChevronDown
-            className={cn("size-4 transition-transform duration-(--motion-base) ease-standard", !open && "-rotate-90")}
-            strokeWidth={1.75}
-            aria-hidden="true"
-          />
-          <span className="flex-1">{CATEGORY_LABEL[category]}</span>
-          <span className="tabular text-on-surface-faint">{apps.length}</span>
-          <StateLayer />
-        </button>
-      </h3>
+      <SectionHeader id={id} label={CATEGORY_LABEL[category]} count={apps.length} open={open} onToggle={() => setOpen((o) => !o)} />
       {open && (
         <div id={id}>
           {apps.length === 0 ? (

@@ -14,12 +14,14 @@ import { AppSearch } from "./app-search";
 import { BulkMenu } from "./bulk-menu";
 import { useAppParam } from "./use-app-param";
 import { useApps } from "./use-apps";
+import { VmGroup } from "./vm-group";
 
 /**
  * The Apps screen: every app grouped by derived category, on or off per app,
  * the detail sheet deep-linked by ?app=<key>, add and remove, bulk actions.
  * Flat on the page grid (no card): the count beside the title, the search,
- * then the groups, edge to edge of the page container.
+ * then the groups, edge to edge of the page container. Virtual machines come
+ * first, once the engine has seen their traffic.
  */
 export function AppsScreen() {
   const model = useApps();
@@ -28,6 +30,7 @@ export function AppsScreen() {
 
   const visible = useMemo(() => model.apps.filter((a) => matchesQuery(a, query)), [model.apps, query]);
   const grouped = useMemo(() => sections(visible), [visible]);
+  const visibleGuests = useMemo(() => model.guests.filter((g) => matchesQuery(g, query)), [model.guests, query]);
   const filtered = query.trim() !== "";
   const waiting = model.phase === "starting" && model.apps.length === 0;
 
@@ -78,10 +81,11 @@ export function AppsScreen() {
           <GridRegion span={12}>
             <section aria-label="All apps" aria-busy={state.kind === "loading" || undefined} className="flex flex-col">
               <CardBody state={state}>
-                {filtered && visible.length === 0 ? (
+                {filtered && visible.length === 0 && visibleGuests.length === 0 ? (
                   <EmptyState line="Nothing by that name" body={`No app or path matches "${query.trim()}".`} />
                 ) : (
                   <div className="flex flex-col gap-6">
+                    <VmGroup rows={visibleGuests} actions={actions} />
                     {grouped.map((s) => (
                       <AppSectionView key={s.category} section={s} actions={actions} filtered={filtered} />
                     ))}

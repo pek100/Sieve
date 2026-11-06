@@ -78,6 +78,8 @@ impl TunDevice {
                 beats.tun.begin(monotonic_ms());
                 let bytes = p.bytes();
                 Meters::bump(&m.packets_in);
+                #[cfg(feature = "attribution-diagnostics")]
+                super::record_fingerprint(bytes, &m);
                 let admitted = packet::dst_ip(bytes).is_some_and(admit);
                 let sent = if admitted { tx.blocking_send(bytes.to_vec()).is_ok() } else { true };
                 if !admitted {

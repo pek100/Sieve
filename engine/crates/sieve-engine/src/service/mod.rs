@@ -15,7 +15,7 @@
 //!   name, wherever its registered image is), delete `ProgramData\Sieve`.
 //!   Every step runs even when one fails, and rerunning it is safe;
 //! - `restore`: the emergency off. Delete every route on an interface named
-//!   "Sieve" and stop the service; nothing else.
+//!   "Sieve", stop the service and its ETW session; nothing else.
 //!
 //! The service runs the same `image` check at every start and refuses to run
 //! (exit code [`EXIT_UNSAFE_FOLDER`], reason in `last-error.txt`) when it
@@ -53,7 +53,10 @@ pub const FAILURE_RESET: Duration = Duration::from_secs(3_600);
 /// loads Wintun's driver on first use (SetupAPI and the driver store: load
 /// driver, backup and restore). UNVERIFIED until the live check: an adapter
 /// that cannot be created is a Setup blocker (the network stays as it was)
-/// and its reason shows in the Engine block.
+/// and its reason shows in the Engine block. The attribution ETW session runs
+/// under this same list. UNVERIFIED until live proof L2: a session that cannot
+/// start goes to `last_error`, routing continues, and a privilege decision
+/// follows.
 pub const REQUIRED_PRIVILEGES: &[&str] =
     &["SeChangeNotifyPrivilege", "SeLoadDriverPrivilege", "SeBackupPrivilege", "SeRestorePrivilege"];
 

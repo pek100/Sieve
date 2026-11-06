@@ -103,6 +103,9 @@ try {
   $delta = Counter-Delta ([pscustomobject]@{ flows = 100; attributed = 90 }) ([pscustomobject]@{ flows = 120; attributed = 109 })
   Assert ($delta.flows -eq 20 -and $delta.attributed -eq 19) "attribution subtracts THIS run baseline"
   Must-Throw { Counter-Delta ([pscustomobject]@{ flows = 100 }) ([pscustomobject]@{ flows = 1 }) } "counter reset rejected"
+  $split = [pscustomobject]@{ flows = 100; attributed = 95; forwarded = 10; forwarded_named = 5 }
+  Assert ((Host-Rate $split) -eq 1) "host-only rate leaves forwarded flows out of both sides"
+  Assert ((Host-Rate ([pscustomobject]@{ flows = 10; attributed = 6; forwarded = 10; forwarded_named = 6 })) -eq "n/a") "host-only rate of nothing but forwarded flows divides by nothing"
 
   $script:Calls = New-Object 'System.Collections.Generic.List[string]'
   [IO.File]::WriteAllText($PolicyFile, '{"revision":0,"engine":false}', $Utf8)

@@ -347,6 +347,13 @@ function Check-Network([string]$tag) {
   Check "lookup plus HTTPS works ($tag)" $n.Ok $n.Detail
 }
 
+# Attribution of host flows only, reported beside the gate (which covers all flows).
+function Host-Rate($counters) {
+  $hostFlows = [decimal]$counters.flows - [decimal]$counters.forwarded
+  if ($hostFlows -le 0) { return "n/a" }
+  return ([decimal]$counters.attributed - [decimal]$counters.forwarded_named) / $hostFlows
+}
+
 function Counter-Delta($baseline, $current) {
   $delta = [ordered]@{}
   foreach ($p in $baseline.PSObject.Properties) {
@@ -504,7 +511,7 @@ function Run-Auto {
     Save "route-soak-status.json" ($s | ConvertTo-Json)
     Save "route-soak-deltas.json" ($delta | ConvertTo-Json)
     $rate = if ($delta.flows -gt 0) { $delta.attributed / $delta.flows } else { 0 }
-    Check "attribution of at least 0.95 from the engine's counters" ($delta.flows -gt 0 -and $rate -ge $AttributionMinimum) "$($delta.attributed) / $($delta.flows) since on = $rate"
+    Check "attribution of at least 0.95 from the engine's counters" ($delta.flows -gt 0 -and $rate -ge $AttributionMinimum) "$($delta.attributed) / $($delta.flows) since on = $rate; host only = $(Host-Rate $delta); forwarded $($delta.forwarded), named $($delta.forwarded_named)"
     Check "the engine refused none of its own flows" ($delta.own_refused -eq 0) "delta $($delta.own_refused)"
     Check "DNS was answered on the TUN" ($delta.dns_answers -gt 0) "delta $($delta.dns_answers)"
     Record "SKIP" "30 minutes of normal use without a failure" "sampled engine/network checks cannot certify a person's video call or game launcher"

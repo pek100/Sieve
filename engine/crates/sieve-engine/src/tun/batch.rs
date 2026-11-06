@@ -38,6 +38,8 @@ impl Batch {
 
     fn push(&mut self, bytes: &[u8], meters: &Meters) {
         Meters::bump(&meters.packets_in);
+        #[cfg(feature = "attribution-diagnostics")]
+        super::record_fingerprint(bytes, meters);
         if !packet::dst_ip(bytes).is_some_and(super::admit) {
             Meters::bump(&meters.not_unicast);
             return;

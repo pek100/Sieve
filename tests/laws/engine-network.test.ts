@@ -53,6 +53,19 @@ const DNS_WRITES = new RegExp(
   "i",
 );
 
+const ETW = "engine/crates/sieve-engine/src/flow/etw.rs";
+const NAT = "engine/crates/sieve-engine/src/flow/nat.rs";
+const NAT_OS = "engine/crates/sieve-engine/src/flow/nat/os.rs";
+const RUNNER = "engine/crates/sieve-engine/src/service/runner.rs";
+
+const ETW_CONTROL = /\b(?:StartTraceW|ControlTraceW|EnableTraceEx2)\b/;
+const WMI_QUERY = /\bExecQuery\b/;
+/** What would make attribution change the system or outlive the engine. */
+const ATTRIBUTION_WRITES = /Autologger|EVENT_TRACE_FILE_MODE|ExecMethod|PutInstance|New-NetNat|Add-NetNat|Remove-NetNat/i;
+
+const STRING_LITERAL = /"(?:[^"\\\n]|\\.)*"/g;
+const HARDCODED_VM = /wsl|ubuntu|cowork|hyper-v/i;
+
 /** Comment lines say what is banned; only code counts. */
 const code = (lines: string[]) => lines.filter((h) => !/^\S+:\d+: (\/\/|\*|\/\*)/.test(h));
 
@@ -92,6 +105,56 @@ describe("engine network law", () => {
     for (const ok of ["DeleteIpForwardEntry2(&row)", "GetIpForwardTable2(AF_UNSPEC, &mut t)", "FirstDnsServerAddress", "Resolve-DnsName example.com"]) {
       expect(ROUTE_WRITES.test(ok) || DNS_WRITES.test(ok), ok).toBe(false);
     }
+  });
+
+  it("attribution only reads the system: its session lives in flow/etw.rs, its queries in flow/nat/os.rs, and nothing persists", () => {
+    const owner = (pattern: RegExp, file: string) => {
+      const found = code(product().flatMap((f) => hits(f, pattern)));
+      expect(found.length, String(pattern)).toBeGreaterThan(0);
+      expect(found.map((h) => h.split(":")[0]).filter((f) => f !== file), String(pattern)).toEqual([]);
+    };
+    owner(ETW_CONTROL, ETW);
+    owner(WMI_QUERY, NAT_OS);
+    expect(code(engineSources().flatMap((f) => hits(f, ATTRIBUTION_WRITES)))).toEqual([]);
+    const session = read(ETW);
+    expect(session).toContain("EVENT_TRACE_REAL_TIME_MODE");
+    expect(session).not.toMatch(/EVENT_TRACE_FILE_MODE|LogFileMode = [^E]/);
+  });
+
+  it("both emergency exits stop the attribution session too: routing off means no session, even when recovery runs out", () => {
+    const src = read(RUNNER);
+    const trip = src.match(/impl Trip for ServiceTrip \{([\s\S]*?)\n\}/)?.[1] ?? "";
+    const panic = src.match(/fn install_panic_cleanup\([^)]*\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+    for (const exit of [trip, panic]) {
+      expect(exit).toMatch(/emergency_cleanup\(\s*\|\|\s*clear_stale\([^\n]*\),\s*stop_stale\s*\)/);
+      expect(exit.match(/\bclear_stale\(/g)).toHaveLength(1);
+    }
+  });
+
+  it("those patterns catch what they are for", () => {
+    for (const bad of ["StartTraceW(&mut h, name, p)", "ControlTraceW(h, name, p, c)", "EnableTraceEx2(h, &g, 1, 5, 0, 0, 0, None)"]) expect(ETW_CONTROL.test(bad), bad).toBe(true);
+    expect(WMI_QUERY.test("services.ExecQuery(&wql, &q, flags, None)")).toBe(true);
+    for (const bad of [
+      r`HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\X`,
+      "EVENT_TRACE_FILE_MODE_SEQUENTIAL",
+      "services.ExecMethod(&path, &m, 0, None, None)",
+      "services.PutInstance(&o, 0, None)",
+      "New-NetNat -Name x",
+      "Add-NetNatStaticMapping",
+      "Remove-NetNat -Name x",
+    ]) {
+      expect(ATTRIBUTION_WRITES.test(bad), bad).toBe(true);
+    }
+    for (const ok of ["ProcessTrace(&[t], None, None)", "SELECT * FROM MSFT_NetNatSession", "EVENT_TRACE_REAL_TIME_MODE"]) expect(ATTRIBUTION_WRITES.test(ok), ok).toBe(false);
+  });
+
+  it("no VM is named in the engine's attribution source: a name comes from the system", () => {
+    const files = [ETW, NAT, NAT_OS, "engine/crates/sieve-engine/src/stack/attribution.rs", "engine/crates/sieve-engine/src/stack/book.rs"];
+    for (const f of files) expect(read(f).length, f).toBeGreaterThan(0);
+    const named = files.flatMap((f) => [...read(f).matchAll(STRING_LITERAL)].map((m) => m[0]).filter((s) => HARDCODED_VM.test(s)).map((s) => `${f}: ${s}`));
+    expect(named).toEqual([]);
+    for (const bad of ['"WSL"', '"wslhost.exe"', '"Ubuntu-24.04"', '"Cowork VM"', '"Hyper-V"']) expect(HARDCODED_VM.test(bad), bad).toBe(true);
+    expect(HARDCODED_VM.test('"DevBox"')).toBe(false);
   });
 
   it("the bundle builds the engine binary only, never the probe", () => {

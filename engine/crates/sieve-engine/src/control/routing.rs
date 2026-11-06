@@ -23,6 +23,9 @@ use tokio::task::JoinHandle;
 
 use super::Engine;
 use crate::coexist::{self, Coexistence};
+use crate::flow::etw::os::{self as etw_os, EtwSession};
+use crate::flow::etw::{RingWitness, Sinks, Unwitnessed};
+use crate::flow::nat::{NatTable, os as nat_os};
 use crate::flow::tasks::FlowTasks;
 use crate::lists::https::HttpsFetcher;
 use crate::route::apply::{self, SieveLuid};
@@ -31,7 +34,7 @@ use crate::route::plan::{self, RoutePlan};
 use crate::route::prefix::Prefix;
 use crate::route::table::{NetTables, read};
 use crate::route::watch::{RouteWatch, watch as watch_routes};
-use crate::stack::relay::{Relay, UDP_IDLE, handle_tcp, handle_udp};
+use crate::stack::relay::{Relay, UDP_IDLE, Witness, handle_tcp, handle_udp};
 use crate::tun::device::{Tun, TunDevice};
 #[cfg(not(feature = "relay-experiments"))]
 use crate::tun::MTU;
@@ -54,10 +57,45 @@ struct Up {
     accept: JoinHandle<()>,
     batches: JoinHandle<()>,
     lists: JoinHandle<()>,
+    /// Lives exactly as long as the routes; None when it could not start.
+    etw: Option<EtwSession>,
 }
 
 fn journal(engine: &Engine) -> Option<Journal> {
     engine.dir.as_deref().map(Journal::new)
+}
+
+/// The attribution sources of one routing run. Starting them is not a Setup
+/// blocker: a failed session, or a consumer that ends later, goes to
+/// `last_error` and routing continues with the owner tables alone (fail-open).
+fn start_attribution(engine: &Arc<Engine>) -> (Option<EtwSession>, Witness, Arc<NatTable>) {
+    let sinks = Sinks::new(std::process::id(), engine.meters.clone());
+    let winnat = sinks.winnat.clone();
+    let ring = sinks.ring.clone();
+    let reporter = engine.clone();
+    let report = move |why| reporter.set_facts(|f| f.last_error = Some(why));
+    let (session, witness): (Option<EtwSession>, Witness) = match etw_os::start(sinks, report) {
+        Ok(session) => {
+            if let Some(why) = &session.winnat_error {
+                engine.set_facts(|f| f.last_error = Some(why.clone()));
+            }
+            (Some(session), Box::new(RingWitness { ring, flush: etw_os::flusher(engine.meters.clone()) }))
+        }
+        Err(why) => {
+            engine.set_facts(|f| f.last_error = Some(format!("attribution without ETW: {why}")));
+            (None, Box::new(Unwitnessed))
+        }
+    };
+    (session, witness, Arc::new(NatTable::spawn(move || nat_os::reader_sources(winnat))))
+}
+
+/// Ends the session without holding the runtime, bounded by [`TASKS_BOUND`].
+async fn stop_attribution(engine: &Engine, session: Option<EtwSession>) {
+    let Some(session) = session else { return };
+    let stopped = tokio::task::spawn_blocking(move || session.stop(TASKS_BOUND)).await;
+    if let Ok(Err(why)) = stopped {
+        engine.set_facts(|f| f.last_error = Some(why));
+    }
 }
 
 /// The machine's tables and what may run beside the engine, now.
@@ -180,6 +218,8 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     if plan.routes.iter().any(|p| !p.is_ipv4()) {
         apply::add_address(luid, TUN_V6.into())?;
     }
+    // Before the routes, so a hang starting it cannot hold a route.
+    let (etw, witness, nat) = start_attribution(engine);
     let mut added = Vec::new();
     for p in &plan.routes {
         if let Err(e) = apply::add_route(&journal, luid, *p) {
@@ -187,16 +227,17 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
                 let _ = apply::delete_route(luid.value(), *a);
             }
             let _ = journal.truncate();
+            stop_attribution(engine, etw).await;
             return Err(e);
         }
         added.push(*p);
     }
 
     #[cfg(not(feature = "relay-experiments"))]
-    let relay = Arc::new(Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone(), engine.filter.clone()));
+    let relay = Arc::new(Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone(), engine.filter.clone(), witness, nat));
     #[cfg(feature = "relay-experiments")]
     let relay = {
-        let mut relay = Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone(), engine.filter.clone());
+        let mut relay = Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone(), engine.filter.clone(), witness, nat);
         relay.experiments = engine.experiments.settings.clone();
         Arc::new(relay)
     };
@@ -231,7 +272,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     engine.beats.relay.end();
     engine.beats.tun.end();
     engine.arm.set(true);
-    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists })
+    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, etw })
 }
 
 async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiver<()>) {
@@ -254,7 +295,8 @@ async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiv
 
 /// The order that keeps the network: disarm, close the session (the reader
 /// returns), cancel the flows while the runtime runs, delete the routes,
-/// empty the journal, close the adapter (Wintun removes it).
+/// empty the journal, close the adapter (Wintun removes it). The ETW session
+/// stops only after that, so a hang there cannot hold a route.
 async fn take_down(engine: &Engine, up: Up) {
     engine.arm.set(false);
     let _ = up.tun.session.shutdown();
@@ -276,6 +318,7 @@ async fn take_down(engine: &Engine, up: Up) {
         f.routes_up = false;
         f.up_since = None;
     });
+    stop_attribution(engine, up.etw).await;
 }
 
 /// The relay heartbeat's answer to the watchdog's pings, on the runtime.

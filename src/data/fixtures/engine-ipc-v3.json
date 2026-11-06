@@ -46,8 +46,17 @@
         "packets_in": 9000,
         "packets_out": 8800,
         "not_unicast": 12,
-        "blocked": 5
-      }
+        "blocked": 5,
+        "forwarded": 6,
+        "forwarded_named": 4,
+        "etw_found": 3,
+        "etw_disagreed": 1,
+        "etw_dropped": 0
+      },
+      "guests": [
+        { "key": "vm:devbox", "vm": "DevBox", "seen": 4, "open": 1 },
+        { "key": "vm:unidentified", "vm": null, "seen": 2, "open": 1 }
+      ]
     },
     { "type": "error", "message": "send hello first" },
     {
@@ -69,7 +78,8 @@
           "open": true,
           "reason": "named_no_rule",
           "rule": null,
-          "list": null
+          "list": null,
+          "forwarded": null
         },
         {
           "id": 8,
@@ -87,7 +97,8 @@
           "open": false,
           "reason": "dns",
           "rule": null,
-          "list": null
+          "list": null,
+          "forwarded": null
         },
         {
           "id": 9,
@@ -105,7 +116,8 @@
           "open": true,
           "reason": "app_exempt",
           "rule": null,
-          "list": null
+          "list": null,
+          "forwarded": null
         },
         {
           "id": 10,
@@ -123,7 +135,8 @@
           "open": false,
           "reason": null,
           "rule": null,
-          "list": null
+          "list": null,
+          "forwarded": null
         },
         {
           "id": 11,
@@ -141,7 +154,8 @@
           "open": true,
           "reason": "unknown_domain",
           "rule": null,
-          "list": null
+          "list": null,
+          "forwarded": null
         },
         {
           "id": 12,
@@ -159,7 +173,46 @@
           "open": false,
           "reason": "named_block",
           "rule": "||ads.example^",
-          "list": "adguard-dns"
+          "list": "adguard-dns",
+          "forwarded": null
+        },
+        {
+          "id": 13,
+          "pid": null,
+          "exe": null,
+          "session": null,
+          "proto": "udp",
+          "local": "198.18.0.1:62049",
+          "remote": "185.125.190.57:123",
+          "kind": "other",
+          "host": null,
+          "action": "relayed",
+          "bytes_up": 76,
+          "bytes_down": 76,
+          "open": true,
+          "reason": "unknown_domain",
+          "rule": null,
+          "list": null,
+          "forwarded": { "vm": "DevBox" }
+        },
+        {
+          "id": 14,
+          "pid": null,
+          "exe": null,
+          "session": null,
+          "proto": "tcp",
+          "local": "198.18.0.1:62050",
+          "remote": "93.184.215.14:443",
+          "kind": "tls",
+          "host": "example.com",
+          "action": "relayed",
+          "bytes_up": 512,
+          "bytes_down": 1024,
+          "open": true,
+          "reason": "named_no_rule",
+          "rule": null,
+          "list": null,
+          "forwarded": { "vm": null }
         }
       ]
     },

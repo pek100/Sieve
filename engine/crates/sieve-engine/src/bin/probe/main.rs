@@ -253,7 +253,7 @@ mod live {
         let shared = Arc::new(Shared {
             start: Instant::now(),
             own_pid: std::process::id(),
-            attributor: Mutex::new(Attributor::new(IpHelper)),
+            attributor: Mutex::new(Attributor::new(IpHelper, sieve_engine::flow::etw::Unwitnessed)),
             exes: Mutex::new(ExeCache::new(sieve_engine::flow::flows::os::exe_path as fn(u32) -> Option<String>)),
             filter,
             policy,

@@ -13,9 +13,13 @@
 //! - [`classify`]: one flow's first client bytes in, one decision out.
 //! - [`relay`]: the TCP relay between the app side and the upstream.
 //! - [`tasks`]: flow tasks with a bounded shutdown.
+//! - [`etw`]: a second exact PID source, the Kernel-Network ETW provider.
+//! - [`nat`]: a guest's flow, proven by an exact match of NAT state.
 pub mod classify;
+pub mod etw;
 pub mod flows;
 pub mod http;
+pub mod nat;
 pub mod packet;
 pub mod quic;
 pub mod relay;

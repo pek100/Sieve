@@ -42,6 +42,8 @@ pub struct Packet<'a> {
     pub seq: u32,
     /// TCP flags byte (0 for UDP).
     pub tcp_flags: u8,
+    /// The transport header, options included.
+    pub header: &'a [u8],
     pub payload: &'a [u8],
 }
 
@@ -125,16 +127,56 @@ fn transport(proto: Proto, src: IpAddr, dst: IpAddr, seg: &[u8]) -> Option<Packe
                 return None;
             }
             let seq = u32::from_be_bytes([seg[4], seg[5], seg[6], seg[7]]);
-            Some(Packet { proto, src, dst, src_port, dst_port, seq, tcp_flags: seg[13], payload: &seg[offset..] })
+            Some(Packet { proto, src, dst, src_port, dst_port, seq, tcp_flags: seg[13], header: &seg[..offset], payload: &seg[offset..] })
         }
         Proto::Udp => {
             let len = usize::from(u16::from_be_bytes([*seg.get(4)?, *seg.get(5)?]));
             if len < 8 || len > seg.len() {
                 return None;
             }
-            Some(Packet { proto, src, dst, src_port, dst_port, seq: 0, tcp_flags: 0, payload: &seg[8..len] })
+            Some(Packet { proto, src, dst, src_port, dst_port, seq: 0, tcp_flags: 0, header: &seg[..8], payload: &seg[8..len] })
         }
     }
+}
+
+/// What a SYN's headers said, raw (A1, diagnostic builds). Recorded and never
+/// read by any decision: any host program can set its own TTL.
+#[cfg(feature = "attribution-diagnostics")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SynFingerprint {
+    /// IPv4 TTL or IPv6 hop limit.
+    pub ttl: u8,
+    pub window: u16,
+    /// The TCP option kinds, in order.
+    pub option_kinds: Vec<u8>,
+}
+
+/// The fingerprint of a TCP SYN without ACK; None for anything else.
+#[cfg(feature = "attribution-diagnostics")]
+pub fn syn_fingerprint(ip: &[u8]) -> Option<SynFingerprint> {
+    let parsed = parse(ip)?;
+    if parsed.proto != Proto::Tcp || parsed.tcp_flags & (TCP_SYN | TCP_ACK) != TCP_SYN {
+        return None;
+    }
+    let ttl = *ip.get(if ip.first()? >> 4 == 4 { 8 } else { 7 })?;
+    let window = u16::from_be_bytes([*parsed.header.get(14)?, *parsed.header.get(15)?]);
+    let mut option_kinds = Vec::new();
+    let mut options = parsed.header.get(20..)?;
+    while let Some(&kind) = options.first() {
+        option_kinds.push(kind);
+        match kind {
+            0 => break,
+            1 => options = &options[1..],
+            _ => {
+                let len = usize::from(*options.get(1)?);
+                if len < 2 || len > options.len() {
+                    break;
+                }
+                options = &options[len..];
+            }
+        }
+    }
+    Some(SynFingerprint { ttl, window, option_kinds })
 }
 
 /// Packet builders for tests and the benchmark (checksums left zero: the
@@ -245,6 +287,59 @@ mod tests {
         assert_eq!(dst_ip(&icmp), Some(v4("2.2.2.2")));
         assert_eq!(dst_ip(&[0x45, 0, 0]), None);
         assert_eq!(dst_ip(&[]), None);
+    }
+
+    /// A SYN with options: MSS, SACK permitted, timestamps, NOP, window scale.
+    #[cfg(feature = "attribution-diagnostics")]
+    fn with_syn_options(mut p: Vec<u8>, tcp_at: usize, window: u16) -> Vec<u8> {
+        let options: [u8; 20] = [2, 4, 5, 0xb4, 4, 2, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3, 3, 8];
+        p[tcp_at + 12] = 0xa0; // 40 byte header
+        p[tcp_at + 13] = TCP_SYN;
+        p[tcp_at + 14..tcp_at + 16].copy_from_slice(&window.to_be_bytes());
+        p.splice(tcp_at + 20..tcp_at + 20, options);
+        p
+    }
+
+    #[cfg(feature = "attribution-diagnostics")]
+    #[test]
+    fn syn_fingerprint_reads_ttl_hop_window_and_option_order() {
+        let kinds = vec![2, 4, 8, 1, 3];
+        let mut ipv4 = build::ip(Proto::Tcp, v4("198.18.0.1"), v4("1.1.1.1"), 5000, 443, 0, b"");
+        ipv4[8] = 127;
+        let mut ipv4 = with_syn_options(ipv4, 20, 64240);
+        ipv4[2..4].copy_from_slice(&60u16.to_be_bytes());
+        assert_eq!(syn_fingerprint(&ipv4), Some(SynFingerprint { ttl: 127, window: 64240, option_kinds: kinds.clone() }));
+
+        let mut ipv6 = build::ip(Proto::Tcp, v4("fd53::1"), v4("2606:4700::1"), 5000, 443, 0, b"");
+        ipv6[7] = 63;
+        let mut ipv6 = with_syn_options(ipv6, 40, 65535);
+        ipv6[4..6].copy_from_slice(&40u16.to_be_bytes());
+        assert_eq!(syn_fingerprint(&ipv6), Some(SynFingerprint { ttl: 63, window: 65535, option_kinds: kinds }));
+    }
+
+    #[cfg(feature = "attribution-diagnostics")]
+    #[test]
+    fn a_non_syn_has_no_fingerprint() {
+        let data = build::ip(Proto::Tcp, v4("198.18.0.1"), v4("1.1.1.1"), 5000, 443, 0, b"x");
+        assert_eq!(syn_fingerprint(&data), None, "ACK+PSH");
+        let mut syn_ack = data.clone();
+        syn_ack[33] = TCP_SYN | TCP_ACK;
+        assert_eq!(syn_fingerprint(&syn_ack), None);
+        let udp = build::ip(Proto::Udp, v4("198.18.0.1"), v4("1.1.1.1"), 5000, 443, 0, b"x");
+        assert_eq!(syn_fingerprint(&udp), None);
+        let mut bare = data;
+        bare[33] = TCP_SYN;
+        assert_eq!(syn_fingerprint(&bare).unwrap().option_kinds, Vec::<u8>::new());
+    }
+
+    #[cfg(feature = "attribution-diagnostics")]
+    proptest! {
+        #[test]
+        fn syn_fingerprint_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..120), v in prop_oneof![Just(4u8), Just(6u8)]) {
+            let mut b = bytes;
+            if let Some(f) = b.first_mut() { *f = (v << 4) | (*f & 0x0f); }
+            let _ = syn_fingerprint(&b);
+        }
     }
 
     proptest! {

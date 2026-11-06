@@ -213,17 +213,23 @@ impl Backend for Engine {
         } else {
             f.blocker
         };
+        // Read under one lock, released before the literal below.
+        let (live, guests) = {
+            let book = lock(&self.book);
+            (book.live(), book.guests())
+        };
         EngineStatus {
             filtering: f.routes_up,
             routes_up: f.routes_up,
             blocking: f.routes_up && self.filter.get().blocks_anything(),
-            flows: u32::try_from(lock(&self.book).live()).unwrap_or(u32::MAX),
+            flows: u32::try_from(live).unwrap_or(u32::MAX),
             decrypting: false,
             last_error: f.last_error.or_else(|| self.lists.compile_error()),
             policy,
             blocker,
             split_tunnels: f.split_tunnels,
             counters: self.meters.counters(),
+            guests,
         }
     }
 
@@ -458,6 +464,22 @@ mod tests {
         let s = e.status();
         assert!(s.routes_up && s.filtering && !s.decrypting);
         assert_eq!(s.split_tunnels, ["Corp VPN"]);
+    }
+
+    #[test]
+    fn the_status_carries_the_books_guests() {
+        let e = engine(Policy::default(), None);
+        assert!(e.status().guests.is_empty(), "no forwarded traffic, no group");
+        let guest = sieve_ipc::FlowEvent {
+            pid: None,
+            exe: None,
+            forwarded: Some(sieve_ipc::Forwarded { vm: Some("DevBox".into()) }),
+            ..crate::stack::book::tests_event(None)
+        };
+        e.book.lock().unwrap().open(guest).unwrap();
+        let s = e.status();
+        assert_eq!(s.flows, 1);
+        assert_eq!(s.guests.iter().map(|g| (g.key.as_str(), g.open)).collect::<Vec<_>>(), [("vm:devbox", 1)]);
     }
 
     #[test]

@@ -12,7 +12,8 @@
 //!   change; [`ClientMessage::Subscribe`] turns the connection into an event
 //!   stream of [`EngineMessage::Flows`] batches, every [`FLOWS_BATCH_MS`].
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
-//!   commit (v3, slice 4: blocked flows, the grown policy, the list report).
+//!   commit (v3, the wave after slice 3: blocked flows, the grown policy, the
+//!   list report, forwarded flows and guests, and the streams after them).
 //!
 //! There is no operation that signs anything, exports a key or names a
 //! certificate to mint (plan 7.2), and there never will be.
@@ -35,6 +36,21 @@ pub const FLOWS_BATCH_MS: u64 = 250;
 /// At most this many flow events per `flows` frame; a larger batch is split,
 /// so a frame stays far under [`MAX_FRAME`] (an event is a few hundred bytes).
 pub const FLOWS_PER_FRAME: usize = 500;
+/// At most this many rows in [`EngineStatus::guests`]: past it a new VM name
+/// folds into the unidentified row, so the status stays bounded.
+pub const MAX_GUESTS: usize = 32;
+/// A VM name is at most this many characters on the wire.
+pub const VM_NAME_MAX: usize = 64;
+/// The word after `vm:` in the key of traffic whose VM has no name.
+pub const VM_UNIDENTIFIED: &str = "unidentified";
+
+/// The `apps.levels` key of a VM row, the one owner of its spelling (`:`
+/// cannot occur in a Windows file name, so no exe stem collides). A VM
+/// literally named "unidentified" is treated as unnamed, so two rows can never
+/// share a key.
+pub fn vm_key(vm: Option<&str>) -> String {
+    format!("vm:{}", vm.map_or_else(|| VM_UNIDENTIFIED.to_string(), str::to_lowercase))
+}
 
 /// The `type` names of [`ClientMessage`], in declaration order.
 pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh"];
@@ -46,10 +62,6 @@ pub const MAX_RULE_BYTES: usize = 256;
 /// A skipped exception line in the list report is cut to this many bytes: 200
 /// lines of each list, JSON-escaped at worst twice over, fit one frame.
 pub const MAX_LISTED_LINE_BYTES: usize = 180;
-/// The key of a guest's own row in `off_apps`, for a VM whose name is known
-/// (`vm:<name>`) or not ([`VM_UNIDENTIFIED`]).
-pub const VM_PREFIX: &str = "vm:";
-pub const VM_UNIDENTIFIED: &str = "vm:unidentified";
 
 /// App to engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,14 +189,15 @@ pub enum Blocker {
     Setup { message: String },
 }
 
-/// The engine's own counters since it started (attribution is
-/// `attributed / flows`, plan 6).
+/// The engine's own counters since it started. Attribution of all flows, the
+/// gate, is `attributed / flows` (plan 6); host only is
+/// `(attributed - forwarded_named) / (flows - forwarded)`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Counters {
     /// Flows the stack accepted (the engine's own refused ones excluded).
     pub flows: u64,
-    /// Of those, flows whose process was found.
+    /// Of those, flows whose process was found or whose VM an exact NAT match named.
     pub attributed: u64,
     /// Flows owned by the engine itself, refused (loop guard).
     pub own_refused: u64,
@@ -197,6 +210,31 @@ pub struct Counters {
     pub not_unicast: u64,
     /// Flows closed by a block decision.
     pub blocked: u64,
+    /// Flows that matched a NAT session exactly: traffic of a VM or WSL.
+    pub forwarded: u64,
+    /// Of those, flows whose VM was named.
+    pub forwarded_named: u64,
+    /// Flows whose PID only the ETW witness gave.
+    pub etw_found: u64,
+    /// Flows left unknown because ETW and the owner tables disagreed.
+    pub etw_disagreed: u64,
+    /// ETW entries evicted from the ring plus events the session lost.
+    pub etw_dropped: u64,
+}
+
+/// One row of "Virtual machines and WSL": what the engine has seen of one VM
+/// since it started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Guest {
+    /// [`vm_key`], its key in `apps.levels`.
+    pub key: String,
+    /// Named by an exact NAT match; None is the unidentified row.
+    pub vm: Option<String>,
+    /// Flows seen since the engine started.
+    pub seen: u64,
+    /// Flows open now.
+    pub open: u32,
 }
 
 /// What the engine is doing, from facts it holds (the `status` message).
@@ -222,6 +260,18 @@ pub struct EngineStatus {
     /// Sieve, which the app states (plan 1.7).
     pub split_tunnels: Vec<String>,
     pub counters: Counters,
+    /// VMs whose traffic was seen since the engine started: named rows by
+    /// key, then the unidentified row.
+    pub guests: Vec<Guest>,
+}
+
+/// A flow that matched a NAT session exactly on its whole tuple: a guest's,
+/// which has no Windows socket and so no process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forwarded {
+    /// The VM that match named; None when it could not be named.
+    pub vm: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +357,9 @@ pub struct FlowEvent {
     pub rule: Option<String>,
     /// The id of the list holding that rule.
     pub list: Option<String>,
+    /// Some for a guest's flow ("Virtual machines and WSL"). `pid` Some is a
+    /// host flow, this Some is a guest's, both None is unknown.
+    pub forwarded: Option<Forwarded>,
 }
 
 /// `text` cut to at most `max` bytes, on a character boundary.
@@ -663,9 +716,50 @@ mod tests {
             reason: Some(FlowReason::AllResolvedNamesBlocked),
             rule: Some("\"".repeat(MAX_RULE_BYTES)),
             list: Some("l".repeat(32)),
+            forwarded: Some(Forwarded { vm: Some("v".repeat(VM_NAME_MAX)) }),
         };
         let msg = EngineMessage::Flows { flows: vec![ev; FLOWS_PER_FRAME] };
         assert!(encode(&msg).is_ok());
+    }
+
+    #[test]
+    fn a_status_with_max_guests_fits() {
+        // A name of VM_NAME_MAX four-byte characters, the longest there is.
+        let name = "\u{10FFFF}".repeat(VM_NAME_MAX);
+        let guests = vec![Guest { key: vm_key(Some(&name)), vm: Some(name), seen: u64::MAX, open: u32::MAX }; MAX_GUESTS];
+        let msg = EngineMessage::Status(EngineStatus { guests, ..EngineStatus::default() });
+        assert!(encode(&msg).unwrap().len() < MAX_FRAME / 16, "the status stays small");
+    }
+
+    #[test]
+    fn vm_keys_are_lower_case_and_the_unnamed_key_is_one() {
+        assert_eq!(vm_key(Some("Ubuntu Box")), "vm:ubuntu box");
+        assert_eq!(vm_key(None), "vm:unidentified");
+        assert_eq!(vm_key(Some("Unidentified")), vm_key(None), "the name cannot make a second row of that key");
+    }
+
+    /// The illegal fourth state of a flow event has no example.
+    #[test]
+    fn no_fixture_flow_is_both_a_process_and_a_guest() {
+        let f = fixture();
+        let flows = f["engine"].as_array().unwrap().iter().find(|m| m["type"] == "flows").unwrap();
+        let events: Vec<FlowEvent> = serde_json::from_value(flows["flows"].clone()).unwrap();
+        assert!(events.iter().any(|e| e.forwarded.as_ref().is_some_and(|g| g.vm.is_some())));
+        assert!(events.iter().any(|e| e.forwarded.as_ref().is_some_and(|g| g.vm.is_none())));
+        for e in &events {
+            assert!(e.pid.is_none() || e.forwarded.is_none(), "flow {}", e.id);
+        }
+    }
+
+    #[test]
+    fn the_fixtures_guests_use_the_one_key() {
+        let f = fixture();
+        let status = f["engine"].as_array().unwrap().iter().find(|m| m["type"] == "status").unwrap();
+        let guests: Vec<Guest> = serde_json::from_value(status["guests"].clone()).unwrap();
+        assert!(guests.len() >= 2);
+        for g in &guests {
+            assert_eq!(g.key, vm_key(g.vm.as_deref()));
+        }
     }
 
     #[test]
@@ -674,7 +768,7 @@ mod tests {
             answer_hello(PROTOCOL, "0.1.0", 3),
             EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 3 }
         );
-        for v in [0, 1, 2, 4, u32::MAX] {
+        for v in [0, 1, PROTOCOL - 1, PROTOCOL + 1, u32::MAX] {
             assert_eq!(answer_hello(v, "0.1.0", 3), EngineMessage::Incompatible { supported: SUPPORTED }, "v{v}");
         }
     }

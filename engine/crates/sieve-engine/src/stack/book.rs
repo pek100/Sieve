@@ -7,17 +7,19 @@
 //! Bytes are reported when a flow closes (the relay counts them then); an
 //! open flow's event says 0 until its last event.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use sieve_ipc::{FlowAction, FlowEvent};
+use sieve_ipc::{FlowAction, FlowEvent, Forwarded, Guest, MAX_GUESTS, vm_key};
 
 /// The flows the engine holds at most (plan 6, flow caps): past it a new
 /// flow is closed at once and counted.
 pub const MAX_FLOWS: usize = 10_000;
 
-/// Who a client is: its Windows session (plan 1.3, session scoping).
+/// Who a client is: its Windows session (plan 1.3, session scoping). A guest's
+/// flow belongs to the machine, as a service's does (the pipe's DACL already
+/// limits clients to the owner and admins); an unknown flow could be anyone's.
 pub fn visible_to(event: &FlowEvent, session: u32) -> bool {
-    matches!(event.session, Some(s) if s == session || s == 0)
+    event.forwarded.is_some() || matches!(event.session, Some(s) if s == session || s == 0)
 }
 
 #[derive(Debug, Default)]
@@ -28,13 +30,38 @@ pub struct FlowBook {
     changed: BTreeSet<u64>,
     /// Last events of flows that closed since the last batch.
     closed: HashMap<u64, FlowEvent>,
+    /// VMs seen since the engine started, by key.
+    guests: BTreeMap<String, Guest>,
 }
 
 impl FlowBook {
+    /// The row a guest's flow counts in. Past [`MAX_GUESTS`] a new name folds
+    /// into the unidentified row (one slot stays reserved for it), and since
+    /// rows are never removed, a folded name folds for this whole run.
+    fn guest_mut(&mut self, forwarded: &Forwarded) -> &mut Guest {
+        let named = vm_key(forwarded.vm.as_deref());
+        let room = self.guests.keys().filter(|k| **k != vm_key(None)).count() < MAX_GUESTS - 1;
+        let vm = if self.guests.contains_key(&named) || room { forwarded.vm.as_deref() } else { None };
+        let key = vm_key(vm);
+        self.guests.entry(key.clone()).or_insert_with(|| Guest { key, vm: vm.map(str::to_string), seen: 0, open: 0 })
+    }
+
+    /// Named rows by key, then the unidentified row.
+    pub fn guests(&self) -> Vec<Guest> {
+        let (unnamed, mut rows): (Vec<Guest>, Vec<Guest>) = self.guests.values().cloned().partition(|g| g.vm.is_none());
+        rows.extend(unnamed);
+        rows
+    }
+
     /// Registers a new flow (its `id` is set here); None at the cap.
     pub fn open(&mut self, mut event: FlowEvent) -> Option<u64> {
         if self.open.len() >= MAX_FLOWS {
             return None;
+        }
+        if let Some(forwarded) = &event.forwarded {
+            let guest = self.guest_mut(forwarded);
+            guest.seen += 1;
+            guest.open = guest.open.saturating_add(1);
         }
         self.next_id += 1;
         event.id = self.next_id;
@@ -55,6 +82,10 @@ impl FlowBook {
     /// The flow ended with these totals.
     pub fn close(&mut self, id: u64, action: FlowAction, bytes_up: u64, bytes_down: u64) {
         if let Some(mut e) = self.open.remove(&id) {
+            if let Some(forwarded) = &e.forwarded {
+                let guest = self.guest_mut(forwarded);
+                guest.open = guest.open.saturating_sub(1);
+            }
             e.open = false;
             e.action = action;
             e.bytes_up = bytes_up;
@@ -121,7 +152,74 @@ mod tests {
             reason: None,
             rule: None,
             list: None,
+            forwarded: None,
         }
+    }
+
+    fn guest_event(vm: Option<&str>) -> FlowEvent {
+        FlowEvent { pid: None, exe: None, session: None, forwarded: Some(Forwarded { vm: vm.map(str::to_string) }), ..event(None) }
+    }
+
+    #[test]
+    fn a_host_flow_makes_no_guest() {
+        let mut b = FlowBook::default();
+        b.open(event(Some(1))).unwrap();
+        assert!(b.guests().is_empty());
+    }
+
+    #[test]
+    fn guests_appear_on_first_sight_and_stay_after_close() {
+        let mut b = FlowBook::default();
+        let id = b.open(guest_event(Some("DevBox"))).unwrap();
+        b.open(guest_event(None)).unwrap();
+        b.open(guest_event(Some("alpha"))).unwrap();
+        let keys: Vec<String> = b.guests().into_iter().map(|g| g.key).collect();
+        assert_eq!(keys, ["vm:alpha", "vm:devbox", "vm:unidentified"], "named rows first, the unidentified row last");
+        b.close(id, FlowAction::Relayed, 1, 1);
+        let dev = b.guests().into_iter().find(|g| g.key == "vm:devbox").unwrap();
+        assert_eq!((dev.vm.as_deref(), dev.seen, dev.open), (Some("DevBox"), 1, 0), "seen since the engine started");
+    }
+
+    #[test]
+    fn open_counts_follow_open_and_close_all() {
+        let mut b = FlowBook::default();
+        let id = b.open(guest_event(Some("DevBox"))).unwrap();
+        b.open(guest_event(Some("DevBox"))).unwrap();
+        b.open(guest_event(None)).unwrap();
+        assert_eq!(b.guests()[0].open, 2);
+        b.close(id, FlowAction::Relayed, 0, 0);
+        assert_eq!(b.guests()[0].open, 1);
+        b.close_all();
+        assert!(b.guests().iter().all(|g| g.open == 0));
+        assert_eq!(b.guests()[0].seen, 2);
+    }
+
+    #[test]
+    fn guests_are_capped_into_the_unidentified_row() {
+        let mut b = FlowBook::default();
+        let mut ids = Vec::new();
+        for i in 0..MAX_GUESTS + 5 {
+            ids.push(b.open(guest_event(Some(&format!("vm{i:02}")))).unwrap());
+        }
+        let rows = b.guests();
+        assert_eq!(rows.len(), MAX_GUESTS);
+        let last = rows.last().unwrap();
+        assert_eq!((last.key.as_str(), last.vm.as_deref(), last.seen, last.open), ("vm:unidentified", None, 6, 6));
+        // A name already held keeps its row; a folded flow closes in the row it opened in.
+        b.open(guest_event(Some("vm00"))).unwrap();
+        assert_eq!(b.guests()[0].seen, 2);
+        for id in ids {
+            b.close(id, FlowAction::Relayed, 0, 0);
+        }
+        assert_eq!(b.guests().last().unwrap().open, 0);
+    }
+
+    #[test]
+    fn a_client_sees_forwarded_flows_but_not_unknown_ones() {
+        assert!(visible_to(&guest_event(Some("DevBox")), 1));
+        assert!(visible_to(&guest_event(None), 7), "a VM belongs to the machine");
+        let unknown = FlowEvent { pid: None, exe: None, ..event(None) };
+        assert!(!visible_to(&unknown, 1));
     }
 
     #[test]

@@ -23,6 +23,7 @@ use super::{
     DESCRIPTION, DISPLAY_NAME, FAILURE_RESET, FOLDER_STEP, REQUIRED_PRIVILEGES, RESTART_DELAY, RESTARTS, SERVICE_NAME,
     STOP_WAIT, Step, image_exe,
 };
+use crate::flow::etw::os::stop_stale;
 use crate::route::apply::clear_stale;
 use crate::route::journal::Journal;
 
@@ -235,13 +236,14 @@ pub fn uninstall() -> Vec<Step> {
     vec![
         Step::run("routes", routes),
         Step::run("stop", stop),
+        Step::run("attribution session", stop_stale),
         Step::run("delete service", delete),
         Step::run("program data", remove_program_data),
     ]
 }
 
 pub fn restore() -> Vec<Step> {
-    vec![Step::run("routes", routes), Step::run("stop", stop)]
+    vec![Step::run("routes", routes), Step::run("stop", stop), Step::run("attribution session", stop_stale)]
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub use sieve_ipc::FlowReason as Reason;
 use sieve_filter::rules::{DomainKind, HostDecision, HostVerdict, RuleEngine, RuleSet};
-use sieve_ipc::{DomainListKind, Policy, VM_PREFIX, VM_UNIDENTIFIED};
+use sieve_ipc::{DomainListKind, Policy, vm_key};
 
 use crate::dns::NameMap;
 use crate::flow::classify::Decoded;
@@ -123,8 +123,7 @@ impl DomainFilter {
     fn is_off(&self, owner: Owner<'_>) -> bool {
         match owner {
             Owner::App { key } => self.off.contains(&key.to_lowercase()),
-            Owner::Forwarded { vm: Some(name) } => self.off.contains(&format!("{VM_PREFIX}{}", name.to_lowercase())),
-            Owner::Forwarded { vm: None } => self.off.contains(VM_UNIDENTIFIED),
+            Owner::Forwarded { vm } => self.off.contains(&vm_key(vm)),
             Owner::Unknown => false,
         }
     }
@@ -353,7 +352,7 @@ mod tests {
         assert_eq!(named(Some(BLOCKED), Owner::Forwarded { vm: Some("Guest Off") }).reason, Reason::AppExempt);
         assert_eq!(named(Some(BLOCKED), Owner::Forwarded { vm: Some("other guest") }).action, Action::Drop);
         assert_eq!(named(Some(BLOCKED), Owner::App { key: "vm:guest off" }).reason, Reason::AppExempt, "only a literal row matches a key");
-        let unidentified = Policy { sieving: true, off_apps: vec![VM_UNIDENTIFIED.to_string()], ..Policy::default() };
+        let unidentified = Policy { sieving: true, off_apps: vec![vm_key(None)], ..Policy::default() };
         let f = DomainFilter::new(&unidentified, rules());
         let flow = |vm| Flow { dns: false, name: Some(BLOCKED), remote: remote(), owner: Owner::Forwarded { vm } };
         assert_eq!(f.decide(flow(None), &names(), 0).reason, Reason::AppExempt);

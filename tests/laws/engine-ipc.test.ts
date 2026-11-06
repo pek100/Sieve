@@ -63,6 +63,18 @@ describe("engine IPC law", () => {
     expect(() => parseEngineLists({ lists: [{ id: "x", enabled: true, skipped_exceptions: [1] }] })).toThrow(/skipped_exceptions/);
   });
 
+  it("a VM row's key is the crate's vm_key, and a flow is a process's or a guest's, never both", () => {
+    const body = RUST.match(/pub fn vm_key\(vm: Option<&str>\) -> String \{([\s\S]*?)\n\}/)?.[1] ?? "";
+    expect(body).toContain('format!("vm:{}"');
+    expect(body).toContain("to_lowercase");
+    expect(rustConst("VM_UNIDENTIFIED")).toBe('"unidentified"');
+    const status = fixture.engine.find((m) => m.type === "status")! as unknown as { guests: { key: string; vm: string | null }[] };
+    expect(status.guests.length).toBeGreaterThan(1);
+    for (const g of status.guests) expect(g.key).toBe(`vm:${(g.vm ?? "unidentified").toLowerCase()}`);
+    const flows = fixture.engine.find((m) => m.type === "flows")! as unknown as { flows: { pid: number | null; forwarded: unknown }[] };
+    for (const f of flows.flows) expect(f.pid === null || f.forwarded === null).toBe(true);
+  });
+
   it("no message can sign, export or mint", () => {
     for (const name of [...rustNames("CLIENT_TYPES"), ...rustNames("ENGINE_TYPES")]) {
       expect(name).not.toMatch(/sign|export|mint|key/);

@@ -1,0 +1,37 @@
+{
+  "source": "Hand-built from the local Microsoft-Windows-Kernel-Network manifest (Get-WinEvent -ListProvider, 2026-11-05), because recording needs an elevated session. Live proof L1 records real events; the tests must then pass on those too.",
+  "events": [
+    {
+      "id": 12,
+      "pid": 4242,
+      "proto": "tcp",
+      "local": "198.18.0.1:50112",
+      "remote": "93.184.215.14:443",
+      "payload_hex": "92100000000000005db8d70ec612000101bbc3c0b4050100000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": 28,
+      "pid": 4243,
+      "proto": "tcp",
+      "local": "[fd53:6965:7665:1::1]:50113",
+      "remote": "[2606:4700::6810:84e5]:443",
+      "payload_hex": "9310000000000000260647000000000000000000681084e5fd536965766500010000000000000001 01bbc3c1b4050100000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": 42,
+      "pid": 1880,
+      "proto": "udp",
+      "local": "198.18.0.1:53001",
+      "remote": "192.168.7.1:53",
+      "payload_hex": "580700001d000000c0a80701c61200010035cf0900000000 00000000"
+    },
+    {
+      "id": 58,
+      "pid": 1881,
+      "proto": "udp",
+      "local": "[fd53:6965:7665:1::1]:61000",
+      "remote": "[2606:4700::6810:84e5]:443",
+      "payload_hex": "59070000b0040000260647000000000000000000681084e5fd536965766500010000000000000001 01bbee4800000000 00000000"
+    }
+  ]
+}

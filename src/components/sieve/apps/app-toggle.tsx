@@ -17,11 +17,14 @@ export function AppToggle({
   appName,
   on,
   onChange,
+  offMeans = APP_OFF_MEANS,
   className,
 }: {
   appName: string;
   on: boolean;
   onChange: (on: boolean) => void;
+  /** What Off does here, said once as the tooltip and accessible description. */
+  offMeans?: string;
   className?: string;
 }) {
   return (
@@ -29,8 +32,8 @@ export function AppToggle({
       checked={on}
       onCheckedChange={onChange}
       aria-label={`Sieve ${appName}`}
-      aria-description={APP_OFF_MEANS}
-      title={APP_OFF_MEANS}
+      aria-description={offMeans}
+      title={offMeans}
       data-app-on={on ? "" : undefined}
       className={cn("shrink-0", className)}
     />
