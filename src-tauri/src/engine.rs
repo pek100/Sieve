@@ -18,6 +18,9 @@
 //!   controller keeps them equal to `filtering.upstreams`).
 //! - `engine_cert_status() -> CertStatus`, `engine_install_root() -> CertStatus`:
 //!   the root certificate's facts, and the user's Reinstall (plan 8.1).
+//! - `engine_exclusions(after) -> ExclusionsPage`, `engine_try_decrypt_again(line,
+//!   app, reason) -> ExclusionsPage`, `engine_heal_notices(after) -> HealNotices`: what the
+//!   engine keeps from being decrypted, and self-healing's notices (plan 4.3, 8.2).
 //! - `engine_request_update() -> EngineStatus`: asks the engine to update; it
 //!   carries nothing, and the engine alone fetches and verifies (plan 7.5).
 //! - [`EngineFlows`]: while the engine routes, a subscription to its `Flows`
@@ -38,7 +41,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sieve_ipc::{CertStatus, DnsUpstreams, EngineStatus, FlowEvent, FlowProto, ListStatus, LogRow, PIPE_NAME, PROTOCOL, Policy};
+use sieve_ipc::{CertStatus, DnsUpstreams, EngineStatus, ExclusionRow, ExclusionScope, FlowEvent, FlowProto, HealNotice, ListStatus, LogRow, PIPE_NAME, PROTOCOL, Policy};
 
 use crate::protocol::{Endpoint, Family, Flow, FlowState, Proto};
 
@@ -373,6 +376,39 @@ mod imp {
         tokio::time::timeout(PROBE_TIMEOUT, ask).await.unwrap_or_else(|_| Err(format!("no answer in {} s", PROBE_TIMEOUT.as_secs())))
     }
 
+    /// One question on its own connection: the engine's answer, or why there is none.
+    async fn ask(name: &str, msg: ClientMessage) -> Result<EngineMessage, String> {
+        let ask = async {
+            let (mut pipe, _, _) = hello(name).await?.map_err(|fact| match fact {
+                PipeFact::Refused { message } | PipeFact::Unreachable { message } => message,
+                PipeFact::Incompatible { supported } => format!("the engine speaks protocol {} to {}", supported[0], supported[1]),
+                PipeFact::Welcome { .. } => "unexpected welcome".to_string(),
+            })?;
+            write_frame(&mut pipe, &msg).await.map_err(|e| e.to_string())?;
+            read_frame(&mut pipe).await.map_err(|e| e.to_string())
+        };
+        tokio::time::timeout(PROBE_TIMEOUT, ask).await.unwrap_or_else(|_| Err(format!("no answer in {} s", PROBE_TIMEOUT.as_secs())))
+    }
+
+    /// A question about what is not decrypted (`Exclusions`, `TryDecryptAgain`):
+    /// one page of rows, or the refusal.
+    pub async fn exclusions(name: &str, msg: ClientMessage) -> Result<ExclusionsPage, String> {
+        match ask(name, msg).await? {
+            EngineMessage::Exclusions { revision, rows, total, next, scope, browsers } => Ok(ExclusionsPage { revision, rows, total, next, scope, browsers }),
+            EngineMessage::Error { message } => Err(message),
+            other => Err(format!("unexpected answer: {other:?}")),
+        }
+    }
+
+    /// The notices newer than `after`, of this client's session.
+    pub async fn heal_notices(name: &str, after: u64) -> Result<HealNotices, String> {
+        match ask(name, ClientMessage::HealNotices { after }).await? {
+            EngineMessage::HealNotices { run, revision, exclusions_revision, notices } => Ok(HealNotices { run, revision, exclusions_revision, notices }),
+            EngineMessage::Error { message } => Err(message),
+            other => Err(format!("unexpected answer: {other:?}")),
+        }
+    }
+
     /// A resolver request (`DnsUpstreams`, `SetDnsUpstreams`): the list the engine
     /// then holds, or its refusal.
     pub async fn dns_upstreams(name: &str, msg: ClientMessage) -> Result<DnsUpstreams, String> {
@@ -408,7 +444,7 @@ mod imp {
             match read_frame::<_, EngineMessage>(&mut pipe).await {
                 Ok(EngineMessage::Flows { flows: batch }) => flows.apply(batch),
                 Ok(EngineMessage::Log { rows }) => log.push(rows),
-                Ok(EngineMessage::Welcome { .. } | EngineMessage::Incompatible { .. } | EngineMessage::Status(_) | EngineMessage::Error { .. } | EngineMessage::Lists { .. } | EngineMessage::DnsUpstreams(_) | EngineMessage::CertStatus(_)) => {}
+                Ok(EngineMessage::Welcome { .. } | EngineMessage::Incompatible { .. } | EngineMessage::Status(_) | EngineMessage::Error { .. } | EngineMessage::Lists { .. } | EngineMessage::DnsUpstreams(_) | EngineMessage::CertStatus(_) | EngineMessage::Exclusions { .. } | EngineMessage::HealNotices { .. }) => {}
                 Err(sieve_ipc::FrameError::Closed) => break Ok(()),
                 Err(e) => break Err(e.to_string()),
             }
@@ -525,6 +561,66 @@ pub async fn engine_set_dns_upstreams(list: DnsUpstreams) -> Result<DnsUpstreams
 #[cfg(not(windows))]
 #[tauri::command]
 pub async fn engine_set_dns_upstreams(_list: DnsUpstreams) -> Result<DnsUpstreams, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// One page of `EngineMessage::Exclusions`, for the window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExclusionsPage {
+    pub revision: u64,
+    pub rows: Vec<ExclusionRow>,
+    pub total: u32,
+    pub next: Option<u32>,
+    pub scope: ExclusionScope,
+    pub browsers: Vec<String>,
+}
+
+/// `EngineMessage::HealNotices`, for the window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HealNotices {
+    pub run: u64,
+    pub revision: u64,
+    pub exclusions_revision: u64,
+    pub notices: Vec<HealNotice>,
+}
+
+/// Command: one page of what the engine keeps from being decrypted.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_exclusions(after: u32) -> Result<ExclusionsPage, String> {
+    imp::exclusions(PIPE_NAME, sieve_ipc::ClientMessage::Exclusions { after }).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_exclusions(_after: u32) -> Result<ExclusionsPage, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// Command: "Try decrypting again", on one row or on one app's rejected sites. The
+/// engine can only take back what it wrote itself. Answers the first page.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_try_decrypt_again(line: Option<String>, app: Option<String>, reason: Option<String>) -> Result<ExclusionsPage, String> {
+    imp::exclusions(PIPE_NAME, sieve_ipc::ClientMessage::TryDecryptAgain { line, app, reason }).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_try_decrypt_again(_line: Option<String>, _app: Option<String>, _reason: Option<String>) -> Result<ExclusionsPage, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// Command: what self-healing excluded since `after`, and whether the rows moved.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_heal_notices(after: u64) -> Result<HealNotices, String> {
+    imp::heal_notices(PIPE_NAME, after).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_heal_notices(_after: u64) -> Result<HealNotices, String> {
     Err("the engine runs on Windows only".into())
 }
 
@@ -916,6 +1012,65 @@ mod tests {
         let got = imp::cert(&name, msg).await;
         engine.await.unwrap();
         got
+    }
+
+    /// A stand-in engine that answers one request after Hello, and what the app heard.
+    #[cfg(windows)]
+    async fn one_answer<T, F>(tag: &str, want: sieve_ipc::ClientMessage, then: sieve_ipc::EngineMessage, ask: F) -> Result<T, String>
+    where
+        F: AsyncFnOnce(&str) -> Result<T, String>,
+    {
+        use sieve_ipc::nonblocking::{read_frame, write_frame};
+        use sieve_ipc::{ClientMessage, EngineMessage};
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let name = test_pipe(tag);
+        let mut server = ServerOptions::new().first_pipe_instance(true).create(&name).unwrap();
+        let engine = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let _: ClientMessage = read_frame(&mut server).await.unwrap();
+            let welcome = EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 };
+            write_frame(&mut server, &welcome).await.unwrap();
+            let asked: ClientMessage = read_frame(&mut server).await.unwrap();
+            write_frame(&mut server, &then).await.unwrap();
+            assert_eq!(asked, want);
+        });
+        let got = ask(&name).await;
+        engine.await.unwrap();
+        got
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_exclusion_commands_read_a_page_or_the_refusal() {
+        use sieve_ipc::{ClientMessage, EngineMessage};
+        let row = ExclusionRow { line: "\"pin.example\"".into(), apps: vec!["client.exe".into()], reason: "auto:pinning".into(), created_ms: Some(5), retries: 1 };
+        let page = EngineMessage::Exclusions { revision: 3, rows: vec![row.clone()], total: 1, next: None, scope: ExclusionScope::Browsers, browsers: vec![] };
+        let want = ExclusionsPage { revision: 3, rows: vec![row], total: 1, next: None, scope: ExclusionScope::Browsers, browsers: vec![] };
+        let asked = ClientMessage::Exclusions { after: 0 };
+        let got = one_answer("excl", asked.clone(), page.clone(), async |n| imp::exclusions(n, asked).await).await;
+        assert_eq!(got, Ok(want.clone()));
+        let asked = ClientMessage::TryDecryptAgain { line: Some("\"pin.example\"".into()), app: Some("client.exe".into()), reason: Some("auto:pinning".into()) };
+        let got = one_answer("retry", asked.clone(), page, async |n| imp::exclusions(n, asked).await).await;
+        assert_eq!(got, Ok(want));
+        let asked = ClientMessage::TryDecryptAgain { line: Some("bad line".into()), app: None, reason: Some("auto:pinning".into()) };
+        let refused = EngineMessage::Error { message: "not an exclusion line".into() };
+        let got = one_answer("retry-bad", asked.clone(), refused, async |n| imp::exclusions(n, asked).await).await;
+        assert_eq!(got, Err("not an exclusion line".to_string()));
+        assert!(imp::exclusions(&test_pipe("nobody-excl"), ClientMessage::Exclusions { after: 0 }).await.is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_notices_command_reads_the_notices_or_the_refusal() {
+        use sieve_ipc::{ClientMessage, EngineMessage};
+        let notice = HealNotice { id: 1, session: 1, exe: "client.exe".into(), hosts: vec!["pin.example".into()], total: 1, rev: 1 };
+        let answer = EngineMessage::HealNotices { run: 9, revision: 1, exclusions_revision: 2, notices: vec![notice.clone()] };
+        let got = one_answer("notices", ClientMessage::HealNotices { after: 0 }, answer, async |n| imp::heal_notices(n, 0).await).await;
+        assert_eq!(got, Ok(HealNotices { run: 9, revision: 1, exclusions_revision: 2, notices: vec![notice] }));
+        let old = EngineMessage::Error { message: "unknown variant".into() };
+        let got = one_answer("notices-old", ClientMessage::HealNotices { after: 9 }, old, async |n| imp::heal_notices(n, 9).await).await;
+        assert_eq!(got, Err("unknown variant".to_string()));
     }
 
     #[cfg(windows)]

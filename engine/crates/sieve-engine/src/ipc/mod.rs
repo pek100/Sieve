@@ -10,11 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sieve_ipc::nonblocking::{read_frame, write_frame};
-use sieve_ipc::{CertStatus, ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, ListStatus, LogRow, Policy, answer_hello, log_frames};
+use sieve_filter::exclusions::{AutoReason, exe_file_name, parse_line};
+use sieve_ipc::{CertStatus, ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, ExclusionsView, FLOWS_PER_FRAME, FlowEvent, FrameError, HealNotice, ListStatus, LogRow, Policy, answer_hello, exclusions_page, log_frames};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 
-use crate::stack::book::{log_visible_to, visible_to};
+use crate::heal::Retry;
+use crate::stack::book::{log_visible_to, notice_visible_to, visible_to};
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The app's executable as the installer lays it out: Tauri's main binary,
@@ -27,6 +29,7 @@ pub const HELLO_WAIT: Duration = Duration::from_secs(5);
 pub const NOT_ALLOWED: &str = "only the installed Sieve app may connect to the engine";
 pub const HELLO_FIRST: &str = "send hello first";
 pub const HELLO_ONCE: &str = "hello was already sent";
+pub const RETRY_NOTHING: &str = "try again needs a line and its reason, or an app alone";
 
 /// What the pipe asks of the engine (the running engine is
 /// `control::Engine`; tests use a fake).
@@ -55,6 +58,27 @@ pub trait Backend: Send + Sync + 'static {
     /// the engine's own state, answered at once with the Status. An error when
     /// asked again inside the cooldown.
     fn request_update(&self) -> Result<EngineStatus, String>;
+    /// What is not decrypted, from the lists and the auto layer.
+    ///
+    /// TENSION: rows are machine-wide because the store is, so a second signed-in
+    /// user who passes the pipe's DACL could see a host another session's app
+    /// rejected. The DACL (plan 7.1) admits only the enabling user, SYSTEM and
+    /// Administrators, so this is the same person or an admin. Notices stay session
+    /// scoped (task Q4).
+    fn exclusions(&self) -> ExclusionsView;
+    /// "Try decrypting again". Only ever reaches `auto:*` entries.
+    fn try_decrypt_again(&self, retry: Retry);
+    /// This run's self-healing notices newer than `after`, of every session.
+    fn heal_notices(&self, after: u64) -> HealAnswer;
+}
+
+/// What [`Backend::heal_notices`] answers; the fields of `EngineMessage::HealNotices`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealAnswer {
+    pub run: u64,
+    pub revision: u64,
+    pub exclusions_revision: u64,
+    pub notices: Vec<HealNotice>,
 }
 
 pub struct Subscription {
@@ -142,11 +166,37 @@ where
                 Ok(status) => EngineMessage::CertStatus(status),
                 Err(message) => EngineMessage::Error { message },
             },
+            Ok(ClientMessage::Exclusions { after }) => exclusions_page(&backend.exclusions(), after)?,
+            Ok(ClientMessage::TryDecryptAgain { line, app, reason }) => match retry_of(line.as_deref(), app.as_deref(), reason.as_deref()) {
+                Ok(retry) => {
+                    backend.try_decrypt_again(retry);
+                    exclusions_page(&backend.exclusions(), 0)?
+                }
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::HealNotices { after }) => {
+                let HealAnswer { run, revision, exclusions_revision, notices } = backend.heal_notices(after);
+                EngineMessage::HealNotices { run, revision, exclusions_revision, notices: notices.into_iter().filter(|n| notice_visible_to(n, session_id)).collect() }
+            }
             Ok(ClientMessage::Hello { .. }) => return refuse(stream, HELLO_ONCE).await,
             Err(FrameError::Closed) => return Ok(()),
             Err(e) => return refuse(stream, &e.to_string()).await,
         };
         write_frame(stream, &reply).await?;
+    }
+}
+
+/// What a `try_decrypt_again` names, or why it names nothing.
+fn retry_of(line: Option<&str>, app: Option<&str>, reason: Option<&str>) -> Result<Retry, String> {
+    let app = app.map(exe_file_name);
+    match (line, app, reason) {
+        (Some(line), app, Some(reason)) => {
+            let entry = parse_line(line.trim()).map_err(|why| format!("not an exclusion line: {why:?}"))?;
+            let reason = AutoReason::from_slug(reason).ok_or_else(|| format!("not a reason the engine writes: {reason}"))?;
+            Ok(Retry::One { pattern: entry.pattern, app, reason })
+        }
+        (None, Some(app), None) => Ok(Retry::App { app }),
+        _ => Err(RETRY_NOTHING.to_string()),
     }
 }
 
@@ -268,12 +318,14 @@ mod tests {
         routes: tokio::sync::watch::Sender<bool>,
         refreshes: Mutex<u64>,
         update_requests: Mutex<u32>,
+        retries: Mutex<Vec<Retry>>,
+        notices: Mutex<Vec<HealNotice>>,
     }
 
     impl Fake {
         fn new(open: Vec<FlowEvent>) -> Arc<Self> {
             let routes = tokio::sync::watch::channel(true).0;
-            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, log: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0) })
+            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, log: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0), retries: Mutex::default(), notices: Mutex::default() })
         }
     }
 
@@ -316,6 +368,100 @@ mod tests {
             }
             Ok(EngineStatus { update: sieve_ipc::UpdateStatus::Checking, ..EngineStatus::default() })
         }
+        fn exclusions(&self) -> ExclusionsView {
+            let row = sieve_ipc::ExclusionRow { line: "\"pin.example\"".into(), apps: vec!["client.exe".into()], reason: "auto:pinning".into(), created_ms: Some(1), retries: 0 };
+            ExclusionsView { revision: 4, rows: vec![row], ..ExclusionsView::default() }
+        }
+        fn try_decrypt_again(&self, retry: Retry) {
+            self.retries.lock().unwrap().push(retry);
+        }
+        fn heal_notices(&self, after: u64) -> HealAnswer {
+            let notices = self.notices.lock().unwrap();
+            HealAnswer { run: 7, revision: notices.iter().map(|n| n.rev).max().unwrap_or(0), exclusions_revision: 4, notices: notices.iter().filter(|n| n.rev > after).cloned().collect() }
+        }
+    }
+
+    fn notice(id: u64, session: u32) -> HealNotice {
+        HealNotice { id, session, exe: "client.exe".into(), hosts: vec!["pin.example".into()], total: 1, rev: id }
+    }
+
+    async fn welcomed(fake: Arc<Fake>, session: u32) -> (DuplexStream, tokio::task::JoinHandle<Result<(), FrameError>>) {
+        let (mut c, task) = start_with(session, fake);
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        (c, task)
+    }
+
+    #[tokio::test]
+    async fn try_decrypt_again_answers_over_the_pipe() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = welcomed(fake.clone(), 1).await;
+        send(&mut c, &ClientMessage::TryDecryptAgain { line: Some("\"pin.example\"".into()), app: Some(r"C:\Apps\Client.EXE".into()), reason: Some("auto:pinning".into()) }).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Exclusions { revision: 4, rows, next: None, .. } if rows.len() == 1), "the first page");
+        send(&mut c, &ClientMessage::TryDecryptAgain { line: None, app: Some("client.exe".into()), reason: None }).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Exclusions { .. }));
+        assert_eq!(
+            *fake.retries.lock().unwrap(),
+            [Retry::One { pattern: sieve_filter::exclusions::Pattern::Exact("pin.example".into()), app: Some("client.exe".into()), reason: AutoReason::Pinning }, Retry::App { app: "client.exe".into() }]
+        );
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_line_is_an_error_and_ends_nothing() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = welcomed(fake.clone(), 1).await;
+        send(&mut c, &ClientMessage::TryDecryptAgain { line: Some("not a host".into()), app: None, reason: Some("auto:pinning".into()) }).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Error { .. }));
+        send(&mut c, &ClientMessage::Exclusions { after: 0 }).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Exclusions { .. }), "the pipe stays");
+        assert!(fake.retries.lock().unwrap().is_empty());
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn both_none_is_refused() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = welcomed(fake.clone(), 1).await;
+        send(&mut c, &ClientMessage::TryDecryptAgain { line: None, app: None, reason: None }).await;
+        assert_eq!(recv(&mut c).await, EngineMessage::Error { message: RETRY_NOTHING.into() });
+        assert!(fake.retries.lock().unwrap().is_empty());
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_row_needs_a_reason_the_engine_writes_and_the_bulk_form_takes_none() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = welcomed(fake.clone(), 1).await;
+        let line = || Some("\"pin.example\"".to_string());
+        for (line, reason) in [(line(), None), (line(), Some("list:sensitive")), (line(), Some("user")), (line(), Some("auto:someday")), (None, Some("auto:pinning"))] {
+            send(&mut c, &ClientMessage::TryDecryptAgain { line, app: Some("client.exe".into()), reason: reason.map(str::to_string) }).await;
+            assert!(matches!(recv(&mut c).await, EngineMessage::Error { .. }), "{reason:?}");
+        }
+        assert!(fake.retries.lock().unwrap().is_empty());
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn other_session_sees_nothing() {
+        let fake = Fake::new(vec![]);
+        fake.notices.lock().unwrap().extend([notice(1, 1), notice(2, 2)]);
+        let (mut c, task) = welcomed(fake.clone(), 1).await;
+        send(&mut c, &ClientMessage::HealNotices { after: 0 }).await;
+        let EngineMessage::HealNotices { run, revision, exclusions_revision, notices } = recv(&mut c).await else { panic!("not notices") };
+        assert_eq!((run, revision, exclusions_revision), (7, 2, 4));
+        assert_eq!(notices, [notice(1, 1)], "its own session's");
+        drop(c);
+        task.await.unwrap().unwrap();
+        let (mut c, task) = welcomed(fake, 3).await;
+        send(&mut c, &ClientMessage::HealNotices { after: 0 }).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::HealNotices { notices, .. } if notices.is_empty()), "the control's other side");
+        drop(c);
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

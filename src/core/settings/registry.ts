@@ -316,12 +316,12 @@ export const REGISTRY = {
     default: [] as readonly string[],
     of: { type: "rule" },
   } satisfies ListSetting<string>,
-  // Sent in the policy; the engine's exclusion store reads them while `filtering.https` is on.
+  // Sent in the policy, the `user` layer of the engine's exclusion store; read while `filtering.https` is on.
   "filtering.exclusions": {
     kind: "list",
     section: "filtering",
     label: "Sites not decrypted",
-    help: "Sites you chose from the log that Sieve leaves encrypted.",
+    help: "Sites you added here or from the log that Sieve leaves encrypted. The list is under Not decrypted, below.",
     default: [] as readonly string[],
     of: { type: "string" },
   } satisfies ListSetting<string>,

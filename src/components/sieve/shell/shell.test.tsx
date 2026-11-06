@@ -9,7 +9,7 @@ import { AppShell } from "./app-shell";
 import { Card } from "./card";
 import MARK from "./sieve-mark.json";
 
-vi.mock("next/navigation", () => ({ usePathname: () => "/" }));
+vi.mock("next/navigation", () => ({ usePathname: () => "/", useRouter: () => ({ push: () => {} }) }));
 
 function setup() {
   const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend() });

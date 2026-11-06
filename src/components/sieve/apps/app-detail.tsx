@@ -13,6 +13,7 @@ import { iconExe, isActiveFlow } from "@/core/apps";
 import type { AppEntry } from "@/core/apps-actions";
 import { canTurnOff } from "@/core/policy";
 import type { Flow } from "@/data/protocol";
+import { AppExclusionsLine } from "./app-exclusions-line";
 import { CATEGORY_LABEL, type RowActions } from "./app-list";
 import { AppToggle, APP_OFF_MEANS } from "./app-toggle";
 import { Monogram } from "./monogram";
@@ -147,6 +148,9 @@ function Detail({ app, actions }: { app: AppEntry; actions: RowActions }) {
             <p className="text-label text-on-surface-muted" data-testid="app-off-means">
               {APP_OFF_MEANS}
             </p>
+            <CardBoundary title="HTTPS">
+              <AppExclusionsLine on={on} exes={app.exes} />
+            </CardBoundary>
           </>
         ) : (
           <p className="text-body text-on-surface-muted" data-testid="app-no-off">

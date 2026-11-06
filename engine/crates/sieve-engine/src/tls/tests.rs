@@ -42,6 +42,7 @@ use crate::exclusions::browsers::{BrowserRegistry, BrowserSet};
 use crate::exclusions::{AutoEntry, ExclusionSlot};
 use crate::flow::classify::Decoded;
 use crate::flow::flows::Action;
+use crate::heal::Heal;
 use crate::http::hook::{NoRewrite, ResponseHook};
 use crate::policy::wall_ms;
 use crate::stack::Meters;
@@ -376,6 +377,8 @@ pub(crate) struct Rig {
     pub(crate) deps: Arc<Interception<TestDial>>,
     pub(crate) minter: Arc<Minter>,
     pub(crate) trust: Arc<FakeTrust>,
+    /// With `RigOpts::heals`: the watch, on this rig's store and meters.
+    pub(crate) heal: Option<Arc<Heal>>,
     _ca: Arc<Ca>,
     _dirs: Vec<tempfile::TempDir>,
 }
@@ -390,12 +393,14 @@ pub(crate) struct RigOpts {
     pub(crate) skip_ev: bool,
     pub(crate) ca_made_ms: u64,
     pub(crate) watch: Arc<dyn ClientWatch>,
+    /// The real `heal::Heal` as the watch, in place of `watch`.
+    pub(crate) heals: bool,
     pub(crate) clock: fn() -> u64,
 }
 
 impl RigOpts {
     pub(crate) fn new(roots: Arc<RootCertStore>) -> Self {
-        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), clock: wall_ms }
+        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, clock: wall_ms }
     }
 }
 
@@ -415,9 +420,13 @@ impl Rig {
         slot.set_browsers(BrowserSet::read(&FakeBrowsers));
         let policy = Policy { sieving: true, https: true, ..Policy::default() };
         let minted = (ca.clone(), opts.minter);
+        let slot = Arc::new(slot);
+        let meters = Arc::new(Meters::default());
+        let heal = opts.heals.then(|| Arc::new(Heal::new(slot.clone(), meters.clone())));
+        let watch: Arc<dyn ClientWatch> = heal.clone().map_or(opts.watch, |h| h);
         let deps = Interception {
             connector: Arc::new(dial),
-            exclusions: Arc::new(slot),
+            exclusions: slot,
             verifier: Arc::new(Verifier::new(opts.roots, opts.trust.clone(), opts.trust_timeout).unwrap()),
             verdicts: VerdictCache::default(),
             active: Active::default(),
@@ -425,12 +434,12 @@ impl Rig {
             filter: Arc::new(FilterSlot::new(DomainFilter::new(&policy, opts.rules))),
             names: Arc::new(Mutex::new(NameMap::default())),
             book: Arc::new(Mutex::new(FlowBook::default())),
-            meters: Arc::new(Meters::default()),
-            watch: opts.watch,
+            meters,
+            watch,
             hook: opts.hook,
             clock: opts.clock,
         };
-        Rig { deps: Arc::new(deps), minter, trust: opts.trust, _ca: ca, _dirs: vec![ca_dir, store_dir] }
+        Rig { deps: Arc::new(deps), minter, trust: opts.trust, heal, _ca: ca, _dirs: vec![ca_dir, store_dir] }
     }
 
     /// An open flow in the book, as `admit` makes it.
@@ -1651,10 +1660,292 @@ async fn the_tests_dial_only_loopback() {
 }
 
 #[test]
-fn an_auto_entry_is_removed_by_its_pattern() {
+fn an_auto_entry_is_taken_back_by_its_pattern() {
     let slot = ExclusionSlot::with_sources(None, &[], Vec::new(), wall_ms());
     slot.add_auto(AutoEntry::host(HOST, AutoReason::Pinning, wall_ms(), None), wall_ms());
-    assert!(slot.remove_auto(&Pattern::Exact(HOST.into()), None));
+    assert!(slot.try_again(&Pattern::Exact(HOST.into()), None, AutoReason::Pinning, wall_ms()));
+}
+
+// ---- Self-healing, the whole path (slice 7): the real `Heal` as the watch.
+
+/// A rig whose watch is the real `Heal` on the rig's own store and meters.
+fn healing_rig(arm: Arm, alpn: &[&str]) -> (Rig, Arc<Heal>, Vec<u8>) {
+    let pki = Pki::new("Test Public Root");
+    let chain = pki.leaf(HOST, GOOD);
+    let upstream_leaf = chain.0[0].to_vec();
+    let handler = tls_server(vec![server_tls(chain, alpn, None)], Arc::default(), |_, tls| echo(tls));
+    let rig = Rig::new(TestDial::new(arm, handler), RigOpts { heals: true, ..RigOpts::new(pki.roots()) });
+    let heal = rig.heal.clone().expect("heals");
+    (rig, heal, upstream_leaf)
+}
+
+async fn pinned_client_fails(rig: &Rig) {
+    let (app, task) = rig.flow(flow_opts()).await;
+    let pinned = super::client_config(Pki::new("Its Own Bundle").roots(), &[]).unwrap();
+    assert!(tokio_rustls::TlsConnector::from(Arc::new(pinned)).connect(ServerName::try_from(HOST).unwrap(), app).await.is_err());
+    assert_eq!(task.await.unwrap().action, FlowAction::Failed);
+}
+
+/// A connection that passes through: the client judges the upstream's own chain,
+/// byte for byte.
+async fn passes_untouched(rig: &Rig, upstream_leaf: &[u8]) {
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert_eq!(shown.leaf(), upstream_leaf, "the upstream's chain unchanged");
+    round_trip(&mut tls).await;
+    drop(tls);
+    task.await.unwrap();
+    assert!(rig.reasons().contains(&"auto:pinning".to_string()));
+}
+
+arms!(a_client_with_its_own_bundle_is_excluded_after_one_failure_and_its_retry_passes_through, |arm| async move {
+    let (rig, heal, upstream_leaf) = healing_rig(arm, &[]);
+    pinned_client_fails(&rig).await;
+    passes_untouched(&rig, &upstream_leaf).await;
+    assert_eq!(heal.notices(0).1.len(), 1, "one notice");
+    assert_eq!(rig.deps.meters.https.healed.load(Ordering::Relaxed), 1);
+});
+
+/// A client that handshakes and leaves without a word.
+async fn silent_client(rig: &Rig, alpn: &[&str]) {
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(alpn, None);
+    let tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert!(shown_is_sieves(&shown, rig), "still decrypted");
+    drop(tls);
+    task.await.unwrap();
+}
+
+arms!(two_silent_clients_exclude_and_the_third_passes_through, |arm| async move {
+    let (rig, _heal, upstream_leaf) = healing_rig(arm, &[]);
+    silent_client(&rig, &[]).await;
+    silent_client(&rig, &[]).await;
+    passes_untouched(&rig, &upstream_leaf).await;
+});
+
+/// One GET over the negotiated protocol, and the client closes.
+async fn used_client(rig: &Rig, alpn: &str) {
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[alpn], None);
+    let tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert!(shown_is_sieves(&shown, rig), "still decrypted");
+    let uri = format!("https://{HOST}/");
+    let request = |_: ()| hyper::Request::builder().uri(uri.clone()).header("host", HOST).body(http_body_util::Empty::<bytes::Bytes>::new()).unwrap();
+    let io = hyper_util::rt::TokioIo::new(tls);
+    if alpn == "h2" {
+        let (mut sender, connection) = hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let _ = sender.send_request(request(())).await;
+        drop(sender);
+        driver.abort();
+    } else {
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let _ = sender.send_request(request(())).await;
+        drop(sender);
+        driver.abort();
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+}
+
+/// An upstream that answers every request with an empty 200, on its protocol.
+fn answering_rig(arm: Arm, alpn: &str) -> (Rig, Arc<Heal>) {
+    let pki = Pki::new("Test Public Root");
+    let handler = tls_server(vec![server_tls(pki.leaf(HOST, GOOD), &[alpn], None)], Arc::default(), move |_, tls| async move {
+        let service = hyper::service::service_fn(|_: hyper::Request<hyper::body::Incoming>| async { Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Empty::<bytes::Bytes>::new())) });
+        let io = hyper_util::rt::TokioIo::new(tls);
+        if tls_is_h2(&io) {
+            let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new()).serve_connection(io, service).await;
+        } else {
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        }
+    });
+    let rig = Rig::new(TestDial::new(arm, handler), RigOpts { heals: true, ..RigOpts::new(pki.roots()) });
+    let heal = rig.heal.clone().expect("heals");
+    (rig, heal)
+}
+
+fn tls_is_h2(io: &hyper_util::rt::TokioIo<tokio_rustls::server::TlsStream<BoxStream>>) -> bool {
+    io.inner().get_ref().1.alpn_protocol() == Some(b"h2")
+}
+
+arms!(a_used_connection_between_silent_closes_stays_decrypted, |arm| async move {
+    for alpn in ["h2", "http/1.1"] {
+        let (rig, heal) = answering_rig(arm, alpn);
+        silent_client(&rig, &[alpn]).await;
+        used_client(&rig, alpn).await;
+        silent_client(&rig, &[alpn]).await;
+        assert!(heal.notices(0).1.is_empty(), "{alpn}");
+        // The control: without the used connection, the same closes exclude it.
+        let (bare, bare_heal) = answering_rig(arm, alpn);
+        silent_client(&bare, &[alpn]).await;
+        silent_client(&bare, &[alpn]).await;
+        assert_eq!(bare_heal.notices(0).1.len(), 1, "{alpn}: the control");
+    }
+});
+
+arms!(many_requests_on_one_connection_buy_one_credit, |arm| async move {
+    let watched = Arc::new(Watched::default());
+    let pki = Pki::new("Test Public Root");
+    let handler = tls_server(vec![server_tls(pki.leaf(HOST, GOOD), &["h2"], None)], Arc::default(), |_, tls| async move {
+        let service = hyper::service::service_fn(|_: hyper::Request<hyper::body::Incoming>| async { Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Empty::<bytes::Bytes>::new())) });
+        let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new()).serve_connection(hyper_util::rt::TokioIo::new(tls), service).await;
+    });
+    let rig = Rig::new(TestDial::new(arm, handler), RigOpts { watch: watched.clone(), ..RigOpts::new(pki.roots()) });
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, _) = client_tls(&["h2"], None);
+    let tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    let (mut sender, connection) = hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), hyper_util::rt::TokioIo::new(tls)).await.unwrap();
+    let driver = tokio::spawn(connection);
+    for _ in 0..5 {
+        let request = hyper::Request::builder().uri(format!("https://{HOST}/")).body(http_body_util::Empty::<bytes::Bytes>::new()).unwrap();
+        assert_eq!(sender.send_request(request).await.unwrap().status(), 200);
+    }
+    drop(sender);
+    driver.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    assert_eq!(watched.requests.load(Ordering::Relaxed), 1, "one connection, however many requests");
+});
+
+/// A TLS 1.3 record of type `alert`, sealed under the client's traffic secret:
+/// rustls has no call that sends a fatal alert after the handshake.
+fn sealed_alert(conn: rustls::ClientConnection, alert: rustls::AlertDescription) -> Vec<u8> {
+    use ::aws_lc_rs::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+    const FATAL: u8 = 2;
+    const INNER_ALERT: u8 = 21;
+    const APPLICATION_DATA: u8 = 23;
+    const TAG: usize = 16;
+    let secrets = conn.dangerous_extract_secrets().expect("the config allows it");
+    let (seq, secret) = secrets.tx;
+    let rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv } = secret else { panic!("the client's only suite is AES-128-GCM") };
+    let mut plain = vec![FATAL, u8::from(alert), INNER_ALERT];
+    let len = u16::try_from(plain.len() + TAG).unwrap();
+    let header = [APPLICATION_DATA, 3, 3, (len >> 8) as u8, len as u8];
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(iv.as_ref());
+    for (byte, seq_byte) in nonce[4..].iter_mut().zip(seq.to_be_bytes()) {
+        *byte ^= seq_byte;
+    }
+    let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, key.as_ref()).unwrap());
+    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(header), &mut plain).unwrap();
+    [header.as_slice(), plain.as_slice()].concat()
+}
+
+/// A client that finishes the handshake on AES-128-GCM, then sends `alert`.
+async fn alert_after_handshake(rig: &Rig, alpn: &str, alert: rustls::AlertDescription) {
+    let (app, task) = rig.flow(flow_opts()).await;
+    let shown = Arc::<Shown>::default();
+    let suites = vec![aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256];
+    let provider = Arc::new(CryptoProvider { cipher_suites: suites, kx_groups: super::kx_groups(), ..aws_lc_rs::default_provider() });
+    let verifier = Arc::new(ClientAccepts { shown: shown.clone(), provider: provider.clone() });
+    let mut config = ClientConfig::builder_with_provider(provider).with_protocol_versions(&[&rustls::version::TLS13]).unwrap().dangerous().with_custom_certificate_verifier(verifier).with_no_client_auth();
+    config.alpn_protocols = vec![alpn.as_bytes().to_vec()];
+    config.enable_secret_extraction = true;
+    let tls = connect(app, Arc::new(config), HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert!(shown_is_sieves(&shown, rig));
+    let (mut io, conn) = tls.into_inner();
+    let record = sealed_alert(conn, alert);
+    io.write_all(&record).await.unwrap();
+    io.flush().await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), task).await.expect("the flow ends on the alert");
+    drop(io);
+}
+
+arms!(an_alert_right_after_the_handshake_is_strong_evidence, |arm| async move {
+    for alpn in ["h2", "http/1.1"] {
+        let (rig, heal, upstream_leaf) = healing_rig(arm, &[alpn]);
+        alert_after_handshake(&rig, alpn, rustls::AlertDescription::BadCertificate).await;
+        assert_eq!(heal.notices(0).1.len(), 1, "{alpn}: one alert excludes");
+        // No ALPN in this client: its retry just passes through.
+        passes_untouched(&rig, &upstream_leaf).await;
+        // The control: another alert is one failed attempt, not an exclusion.
+        let (rig, heal, _) = healing_rig(arm, &[alpn]);
+        alert_after_handshake(&rig, alpn, rustls::AlertDescription::HandshakeFailure).await;
+        assert!(heal.notices(0).1.is_empty(), "{alpn}: weak evidence");
+    }
+});
+
+arms!(bytes_that_do_not_parse_are_not_a_silent_close, |arm| async move {
+    for alpn in ["h2", "http/1.1"] {
+        let watched = Arc::new(Watched::default());
+        let rig = watched_rig(arm, alpn, true, watched.clone());
+        let (mut tls, task) = intercepted(&rig, alpn).await;
+        tls.write_all(b"\x00\x01 this is not a request\r\n\r\n").await.unwrap();
+        tls.flush().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(10), &mut { task }).await;
+        drop(tls);
+        assert_eq!(watched.silent.load(Ordering::Relaxed), 0, "{alpn}: it spoke");
+        // The control: the same flow, no bytes.
+        let watched = Arc::new(Watched::default());
+        let rig = watched_rig(arm, alpn, true, watched.clone());
+        let (tls, task) = intercepted(&rig, alpn).await;
+        drop(tls);
+        task.await.unwrap();
+        assert_eq!(watched.silent.load(Ordering::Relaxed), 1, "{alpn}: the control");
+    }
+});
+
+arms!(forwarded_flows_never_reach_the_watch, |arm| async move {
+    let pki = Pki::new("Test Public Root");
+    let watched = Arc::new(Watched::default());
+    let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let rig = Rig::new(dial, RigOpts { watch: watched.clone(), ..RigOpts::new(pki.roots()) });
+    let (app, task) = rig.flow(FlowOpts { may_decrypt: false, exe: None, session: None, ..flow_opts() }).await;
+    let pinned = super::client_config(Pki::new("Its Own Bundle").roots(), &[]).unwrap();
+    assert!(tokio_rustls::TlsConnector::from(Arc::new(pinned)).connect(ServerName::try_from(HOST).unwrap(), app).await.is_err());
+    task.await.unwrap();
+    assert!(watched.refused.lock().unwrap().is_empty(), "a refusal of the real certificate is not about us");
+    assert_eq!(watched.silent.load(Ordering::Relaxed), 0);
+    assert_eq!(rig.reasons(), ["floor:forwarded"]);
+    // The control: the same client, intercepted.
+    let (app, task) = rig.flow(flow_opts()).await;
+    let pinned = super::client_config(Pki::new("Its Own Bundle").roots(), &[]).unwrap();
+    assert!(tokio_rustls::TlsConnector::from(Arc::new(pinned)).connect(ServerName::try_from(HOST).unwrap(), app).await.is_err());
+    task.await.unwrap();
+    assert_eq!(watched.refused.lock().unwrap().len(), 1);
+});
+
+#[test]
+fn switch_off_touches_no_heal_code() {
+    // No `Interception` without the switch, and heal has no other way in.
+    let slot = HttpsSlot::<TestDial>::default();
+    assert!(slot.get().is_none());
+    let relay = include_str!("../stack/relay.rs");
+    assert!(!relay.contains("heal"), "the relay does not name it");
+    let source = include_str!("../http/serve.rs");
+    assert!(!source.contains("crate::heal"), "and neither does the request path");
+    let routing = include_str!("../control/routing.rs");
+    let sync = routing.find("fn sync_https").unwrap();
+    let branch = routing[sync..].find("if !wanted(&engine.policy())").unwrap();
+    assert!(routing[sync + branch..].contains("engine.https.set(None);"), "off empties the slot");
+    assert_eq!(routing.matches("engine.heal").count(), 1, "the one use is inside the interception built with it on");
+}
+
+arms!(a_flood_of_pinning_hosts_stays_bounded_and_one_group, |_arm| async move {
+    use crate::heal::dials::NOTICE_HOSTS_MAX;
+    use crate::heal::score::Evidence;
+    use crate::exclusions::auto::MAX_PER_REASON;
+    let slot = Arc::new(ExclusionSlot::with_sources(None, &[], Vec::new(), wall_ms()));
+    let heal = Heal::new(slot.clone(), Arc::default());
+    let now = wall_ms();
+    let flood = 3 * MAX_PER_REASON;
+    for i in 0..flood {
+        let pair = Pair { exe: Some(CHROME.into()), host: format!("h{i}.flood.example"), session: Some(1) };
+        heal.hear(&pair, Evidence::Refused(Some(rustls::AlertDescription::UnknownCA)), now);
+    }
+    let (_, notices) = heal.notices(0);
+    assert_eq!(notices.len(), 1, "one group");
+    assert_eq!((notices[0].hosts.len(), notices[0].total as usize), (NOTICE_HOSTS_MAX, flood));
+    assert_eq!(slot.rows(now).iter().filter(|r| r.reason == "auto:pinning").count(), MAX_PER_REASON);
+});
+
+/// Slice 7's live check (`docs/live/engine-slice-7.md`), run by the user: U1 to U8.
+/// Offline it cannot pass and claims nothing.
+#[test]
+#[ignore = "live: docs/live/engine-slice-7.md, run by the user on a live-scope build"]
+fn live_self_healing_excludes_a_pinning_client() {
+    panic!("this check is the runbook: docs/live/engine-slice-7.md");
 }
 
 /// Slice 6's live check (`docs/live/engine-slice-6.md`), run by the user: U1 to

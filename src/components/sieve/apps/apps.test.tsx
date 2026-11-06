@@ -1,7 +1,7 @@
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ENGINE_SWITCH } from "@/core/engine";
+import { ENGINE_SWITCH, type EngineSlice } from "@/core/engine";
 import { VM_GROUP_LABEL, VM_OFF_MEANS } from "@/core/guests";
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createMockEngine } from "@/data/engine-mock";
@@ -11,11 +11,13 @@ import { createMockSource } from "@/data/mock-source";
 import { parseEngineProbe } from "@/data/protocol";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "@/hooks/runtime";
+import { SieveProvider } from "@/hooks/sieve-provider";
 import { AppShell } from "@/components/sieve/shell/app-shell";
+import { AppExclusionsLine } from "./app-exclusions-line";
 import { APP_OFF_MEANS } from "./app-toggle";
 import { AppsScreen } from "./apps-screen";
 
-vi.mock("next/navigation", () => ({ usePathname: () => "/apps/" }));
+vi.mock("next/navigation", () => ({ usePathname: () => "/apps/", useRouter: () => ({ push: () => {} }) }));
 
 // jsdom has no pointer capture; sonner's toast calls it when the toast is pressed.
 for (const m of ["setPointerCapture", "releasePointerCapture"] as const) {
@@ -74,6 +76,70 @@ describe("apps screen", () => {
     // No Watch level and no locked per-app filtering anywhere.
     expect(document.body.textContent).not.toMatch(/Watch|network driver|Per-app filtering/);
     expect(screen.queryAllByRole("radio")).toHaveLength(0);
+  });
+
+  describe("the HTTPS line in the app sheet", () => {
+    const CHROME_PATH = String.raw`c:\program files\google\chrome\application\chrome.exe`;
+    const rowFor = (line: string, apps: string[] = []) => ({ line, apps, reason: "list:x", created_ms: null, retries: 0 });
+
+    async function sheet(patch: Partial<EngineSlice> | null, stored?: Record<string, unknown>) {
+      const set = await setup(stored);
+      const { runtime, user } = set;
+      await user.click(within(row(CHROME)).getByRole("button", { name: /Open details/ }));
+      await screen.findByTestId("app-off-means");
+      if (patch) {
+        const welcome = parseEngineProbe(fixture.examples.idle);
+        if (welcome.pipe?.kind !== "welcome") throw new Error("the example answers");
+        const probe = { ...welcome, pipe: { ...welcome.pipe, status: { ...welcome.pipe.status, policy: { ...welcome.pipe.status.policy, https: true } } } };
+        act(() => runtime.store.setEngine({ ...runtime.store.getState().engine, probe, ...patch }));
+      }
+      return screen.queryByTestId("app-https");
+    }
+
+    it("in force, in scope, nothing excepted", async () => {
+      expect(await sheet({ exclusions: { revision: 1, rows: [], scope: "browsers", browsers: [CHROME_PATH], skipped: 0 } })).toHaveTextContent(/^Sieve decrypts this app's HTTPS\.$/);
+    });
+
+    it("in force, in scope, N excepted, with the link to the filtered view", async () => {
+      const line = await sheet({ exclusions: { revision: 1, rows: [rowFor("a.example"), rowFor("b.example", ["chrome.exe"]), rowFor("c.example", ["other.exe"])], scope: "browsers", browsers: [CHROME_PATH], skipped: 0 } });
+      expect(line).toHaveTextContent("Sieve decrypts this app's HTTPS except 2 sites");
+      // The build's trailing slash is next.config's, which this test does not load.
+      expect(within(line!).getByRole("link").getAttribute("href")).toMatch(/^\/settings\/?\?exclusionsApp=chrome\.exe#not-decrypted$/);
+    });
+
+    it("an app of several files links to all of them, so the view holds the row it counted", async () => {
+      const { runtime } = await setup();
+      const welcome = parseEngineProbe(fixture.examples.idle);
+      if (welcome.pipe?.kind !== "welcome") throw new Error("the example answers");
+      const probe = { ...welcome, pipe: { ...welcome.pipe, status: { ...welcome.pipe.status, policy: { ...welcome.pipe.status.policy, https: true } } } };
+      act(() => runtime.store.setEngine({ ...runtime.store.getState().engine, probe, exclusions: { revision: 1, rows: [rowFor('"pin.example"', ["firefox.exe"])], scope: "all", browsers: [], skipped: 0 } }));
+      render(
+        <SieveProvider runtime={runtime}>
+          <AppExclusionsLine on exes={[String.raw`C:\ff\default-browser-agent.exe`, String.raw`C:\ff\firefox.exe`]} />
+        </SieveProvider>,
+      );
+      const line = screen.getByTestId("app-https");
+      expect(line).toHaveTextContent("except 1 site");
+      expect(within(line).getByRole("link").getAttribute("href")).toMatch(/^\/settings\/?\?exclusionsApp=default-browser-agent\.exe&exclusionsApp=firefox\.exe#not-decrypted$/);
+    });
+
+    it("in force, out of scope", async () => {
+      expect(await sheet({ exclusions: { revision: 1, rows: [rowFor("a.example")], scope: "browsers", browsers: [], skipped: 0 } })).toHaveTextContent("Sieve does not decrypt this app's HTTPS.");
+    });
+
+    it("none with HTTPS not in force", async () => {
+      expect(await sheet(null)).toBeNull();
+    });
+
+    it("none while the engine has not answered", async () => {
+      expect(await sheet({ exclusions: null })).toBeNull();
+    });
+
+    it("none for an Off app, whose own line stands", async () => {
+      const line = await sheet({ exclusions: { revision: 1, rows: [], scope: "all", browsers: [], skipped: 0 } }, { "apps.levels": { [CHROME]: "off" } });
+      expect(line).toBeNull();
+      expect(screen.getByTestId("app-off-means")).toHaveTextContent(APP_OFF_MEANS);
+    });
   });
 
   it("the app sheet opens the report dialog for that app, with no URL yet", async () => {

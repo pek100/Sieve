@@ -61,6 +61,8 @@ function fakeEngine(start: EngineScenario) {
   const upstreams: EngineDnsUpstreams[] = [];
   let probes = 0;
   let certReads = 0;
+  let rowReads = 0;
+  let noticeReads = 0;
   const source: EngineSource = {
     kind: "mock",
     probe: () => {
@@ -87,9 +89,221 @@ function fakeEngine(start: EngineScenario) {
       return mock.certStatus();
     },
     installRoot: () => mock.installRoot(),
+    exclusions: (after) => {
+      rowReads++;
+      return mock.exclusions(after);
+    },
+    tryDecryptAgain: (line, app, reason) => mock.tryDecryptAgain(line, app, reason),
+    healNotices: (after) => {
+      noticeReads++;
+      return mock.healNotices(after);
+    },
   };
-  return { source, set: (s: EngineScenario) => void (mock = createMockEngine(s)), setCert: (c: CertScenario) => void (mock = createMockEngine(start, { cert: c })), probes: () => probes, certReads: () => certReads, policies, upstreams };
+  return {
+    source,
+    set: (s: EngineScenario) => void (mock = createMockEngine(s)),
+    setCert: (c: CertScenario) => void (mock = createMockEngine(start, { cert: c })),
+    holdHttps: (run?: number) => void (mock = createMockEngine(start, { heal: true, run })),
+    probes: () => probes,
+    certReads: () => certReads,
+    rowReads: () => rowReads,
+    noticeReads: () => noticeReads,
+    policies,
+    upstreams,
+  };
 }
+
+describe("engine controller, what is not decrypted", () => {
+  /** An engine holding HTTPS on, one probe in. */
+  async function holdingOff() {
+    const s = setup("idle");
+    await s.fc.flush();
+    s.fake.holdHttps();
+    return s;
+  }
+  async function holding() {
+    const s = await holdingOff();
+    await s.fc.advance(ENGINE_POLL_MS);
+    return s;
+  }
+  const slice = (s: ReturnType<typeof setup>) => s.store.getState().engine;
+
+  it("reads nothing while HTTPS is not in force", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.fake.probes()).toBeGreaterThan(0);
+    expect([s.fake.noticeReads(), s.fake.rowReads()]).toEqual([0, 0]);
+    expect(slice(s).exclusions ?? null).toBeNull();
+    s.undo();
+  });
+
+  it("reads the rows once, and again only when their revision moved", async () => {
+    const s = await holding();
+    expect(s.fake.rowReads()).toBe(1);
+    expect(slice(s).exclusions?.rows.map((r) => r.reason)).toEqual(["list:sensitive", "auto:pinning", "auto:client-cert", "auto:ev"]);
+    expect(slice(s).exclusions?.scope).toBe("browsers");
+    const notices = s.fake.noticeReads();
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.fake.noticeReads(), "notices are read every probe").toBeGreaterThan(notices);
+    expect(s.fake.rowReads(), "the rows are not").toBe(1);
+    await s.controller.tryDecryptAgain('"pin.example"', "client.exe", "auto:pinning");
+    expect(slice(s).exclusions?.rows.map((r) => r.reason)).toEqual(["list:sensitive", "auto:client-cert", "auto:ev"]);
+    const healed = slice(s).exclusions?.revision;
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.fake.rowReads(), "the answer carried the revision").toBe(1);
+    expect(slice(s).exclusions?.revision).toBe(healed);
+    s.undo();
+  });
+
+  it("walks every page", async () => {
+    const s = await holdingOff();
+    const row = (i: number) => ({ line: `h${i}.example`, apps: [], reason: "list:x", created_ms: null, retries: 0 });
+    const page = (rows: number[], next: number | null) => ({ revision: 9, rows: rows.map(row), total: 3, next, scope: "all" as const, browsers: [], skipped: 1 });
+    s.fake.source.exclusions = async (after) => (after === 0 ? page([0, 1], 2) : page([2], null));
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).exclusions?.rows.map((r) => r.line)).toEqual(["h0.example", "h1.example", "h2.example"]);
+    expect(slice(s).exclusions?.skipped).toBe(2);
+    s.undo();
+  });
+
+  it("a cursor that does not move on is an error, not a hang", async () => {
+    const s = await holdingOff();
+    s.fake.source.exclusions = async () => ({ revision: 9, rows: [], total: 3, next: 1, scope: "all", browsers: [], skipped: 0 });
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).exclusionsError).toMatch(/does not move on/);
+    s.undo();
+  });
+
+  it("a failed read keeps the rows and says why; the next good one clears it", async () => {
+    const s = await holding();
+    const rows = slice(s).exclusions?.rows;
+    const works = s.fake.source.healNotices;
+    s.fake.source.healNotices = async () => {
+      throw new Error("the pipe closed");
+    };
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).exclusionsError).toBe("the pipe closed");
+    expect(slice(s).exclusions?.rows).toBe(rows);
+    s.fake.source.healNotices = works;
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).exclusionsError).toBeNull();
+    s.undo();
+  });
+
+  it("an old engine answering an error degrades the same way", async () => {
+    const s = await holdingOff();
+    s.fake.source.healNotices = async () => {
+      throw new Error("unknown variant `heal_notices`");
+    };
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).exclusionsError).toMatch(/unknown variant/);
+    expect(slice(s).exclusions ?? null).toBeNull();
+    s.undo();
+  });
+
+  it("the first read is a baseline: a new controller over a running engine retells none of its groups", async () => {
+    const s = await holdingOff();
+    const group = (id: number, rev: number) => ({ id, session: 1, exe: "client.exe", hosts: [`h${id}.example`], total: 1, rev });
+    const asked: number[] = [];
+    let answer = { run: 1, revision: 5, exclusions_revision: 1, notices: [group(1, 2), group(2, 5)] };
+    s.fake.source.healNotices = async (after) => {
+      asked.push(after);
+      return answer;
+    };
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).healNotices ?? [], "the window was not there for these").toEqual([]);
+    expect(s.notices.list()).toEqual([]);
+    answer = { run: 1, revision: 6, exclusions_revision: 1, notices: [group(3, 6)] };
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(asked).toEqual([0, 5]);
+    expect(slice(s).healNotices?.map((n) => n.id), "what comes after it is told").toEqual([3]);
+    s.undo();
+  });
+
+  it("a first read that fails is no baseline", async () => {
+    const s = await holdingOff();
+    const asked: number[] = [];
+    const works = s.fake.source.healNotices;
+    s.fake.source.healNotices = async () => {
+      throw new Error("the pipe closed");
+    };
+    await s.fc.advance(ENGINE_POLL_MS);
+    s.fake.source.healNotices = async (after) => {
+      asked.push(after);
+      return works(after);
+    };
+    await s.fc.advance(ENGINE_POLL_MS);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(asked).toEqual([0, 0]);
+    expect(slice(s).healNotices?.map((n) => n.total), "the first good read was the baseline").toEqual([1]);
+    s.undo();
+  });
+
+  it("HTTPS going out of force clears what it said", async () => {
+    const s = await holding();
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).healNotices?.length).toBe(1);
+    s.fake.set("idle");
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).exclusions).toBeNull();
+    expect(slice(s).healNotices).toEqual([]);
+    s.undo();
+  });
+
+  it("a group's new revision replaces it in the slice, and a new engine run is a new group", async () => {
+    const s = await holding();
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).healNotices?.map((n) => [n.key, n.total])).toEqual([["1:1", 1]]);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).healNotices?.map((n) => [n.key, n.total])).toEqual([["1:1", 2]]);
+    s.fake.holdHttps(2);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).healNotices?.map((n) => n.key)).toEqual(["1:1", "2:1"]);
+    s.undo();
+  });
+
+  // The new run's first group can sit at or past the old cursor before the next poll:
+  // no revision comparison can tell, and at the same revision `after` holds nothing.
+  it.each([
+    ["behind the old cursor", 2, 1],
+    ["at the old cursor", 2, 2],
+    ["past the old cursor", 2, 3],
+  ])("a new engine run whose revision is %s has its first group told", async (_, cursor, revision) => {
+    const s = await holdingOff();
+    const asked: number[] = [];
+    const group = (rev: number) => ({ id: 1, session: 1, exe: "client.exe", hosts: ["h.example"], total: 1, rev });
+    let held = { run: 10, revision: cursor, exclusions_revision: 1, notices: [group(cursor)] };
+    s.fake.source.healNotices = async (after) => {
+      asked.push(after);
+      return { ...held, notices: held.notices.filter((n) => n.rev > after) };
+    };
+    await s.fc.advance(ENGINE_POLL_MS);
+    held = { ...held, revision: cursor + 1, notices: [group(cursor + 1)] };
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).healNotices?.map((n) => n.key), "the control: told in the old run").toEqual(["10:1"]);
+    held = { run: 11, revision, exclusions_revision: 1, notices: [group(revision)] };
+    asked.length = 0;
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(asked, "the old cursor means nothing to the new run").toEqual([cursor + 1, 0]);
+    expect(slice(s).healNotices?.map((n) => n.key)).toEqual(["10:1", "11:1"]);
+    asked.length = 0;
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(asked, "and its own cursor holds from here").toEqual([revision]);
+    s.undo();
+  });
+
+  it("a refused try again is said, and the rows stand", async () => {
+    const s = await holding();
+    s.fake.source.tryDecryptAgain = async () => {
+      throw new Error("not an exclusion line");
+    };
+    await s.controller.tryDecryptAgain("bad line", null, "auto:pinning");
+    expect(slice(s).exclusionsActionError).toMatch(/could not try that again.*not an exclusion line/);
+    expect(slice(s).exclusions?.rows).toHaveLength(4);
+    s.undo();
+  });
+});
 
 function setup(start: EngineScenario, backend: SettingsBackend = memoryBackend(), filterLists: FilterListSource = createMockFilterLists()) {
   const fc = fakeClock();

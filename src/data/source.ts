@@ -60,6 +60,8 @@ export interface SourceOptions {
   lock: LockScenario;
   /** Show the first-run guide here too (?welcome=1); the desktop app always offers it. */
   welcome: boolean;
+  /** Mock: an engine holding HTTPS on, with self-healing notices (?heal=1). */
+  heal: boolean;
 }
 
 /** Read the source choice from the environment: query string and Tauri presence. */
@@ -91,6 +93,7 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
     lists,
     lock,
     welcome: q.get("welcome") === "1",
+    heal: q.get("heal") === "1",
   };
 }
 
@@ -110,7 +113,7 @@ export function createWindowsDnsSource(o: SourceOptions): WindowsDnsSource {
 
 /** The engine seam follows the same choice: the Tauri command, or the mock. */
 export function createEngineSource(o: SourceOptions): EngineSource {
-  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine, { seed: o.seed, logError: o.logError, cert: o.cert });
+  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine, { seed: o.seed, logError: o.logError, cert: o.cert, heal: o.heal });
 }
 
 /** The filter list seam follows the same choice. */

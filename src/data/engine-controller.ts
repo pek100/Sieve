@@ -23,6 +23,9 @@
  * - the root certificate, only when the user asks (`installRoot`). Its facts
  *   are read after each probe while the engine can answer, and cleared when
  *   it cannot;
+ * - "Try decrypting again", only when the user asks (`tryDecryptAgain`). Self-healing's
+ *   notices are read after each probe while the engine holds HTTPS on, and the rows
+ *   only when their revision moved. A failed read keeps the rows and says why;
  * - AdGuard's service, stopped or started only when the user clicks the
  *   pause offer (`stopAdguard`, `startAdguard`; Windows asks the user first).
  *
@@ -32,7 +35,8 @@
  * Update state rides the probe: there is no separate poll.
  */
 import type { PassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, updateBanner, type EngineSlice } from "@/core/engine";
+import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, httpsInForce, updateBanner, type EngineSlice } from "@/core/engine";
+import type { ExclusionsFacts, HealGroup } from "@/core/exclusions";
 import type { NoticeBus } from "@/core/notices";
 import { selectedListIds } from "@/core/filter-lists";
 import { GLOBAL_SWITCH, offKeys } from "@/core/policy";
@@ -41,7 +45,7 @@ import type { SieveStore } from "@/core/store";
 import type { EngineSource } from "./engine-source";
 import type { FilterListSource } from "./filter-lists-source";
 import type { Clock } from "./poller";
-import type { EngineDomainList, EnginePolicy, FilterCatalogue } from "./protocol";
+import { ProtocolError, type EngineDomainList, type EnginePolicy, type ExclusionsPage, type FilterCatalogue } from "./protocol";
 import type { SettingsStore } from "./settings-store";
 
 export interface EngineController {
@@ -55,6 +59,10 @@ export interface EngineController {
   installRoot(): Promise<void>;
   /** The update button: `RequestUpdate`, whose meaning the engine decides. */
   requestUpdate(): Promise<void>;
+  /** "Try decrypting again": one row, or with no line one app's rejected sites. */
+  tryDecryptAgain(line: string | null, app: string | null, reason: string | null): Promise<void>;
+  /** "Try decrypting all again" for an app: every one of its files named. */
+  tryDecryptAllAgain(apps: readonly string[]): Promise<void>;
 }
 
 export interface EngineControllerDeps {
@@ -75,6 +83,9 @@ export const CRASH_LOOP_BANNER =
 const SWITCH = ENGINE_SWITCH as SettingKey;
 const HTTPS = HTTPS_SWITCH as SettingKey;
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** Notices the window keeps for the toast hook: far more than one person reads, as the engine's own ring. */
+const HEAL_KEPT = 64;
 
 type WantedPolicy = Omit<EnginePolicy, "revision">;
 
@@ -148,6 +159,9 @@ export function createEngineController({ engine, store, clock, settings, checks,
   let banner: number | null = null;
   let update: { id: number; text: string } | null = null;
   let probeNow: () => Promise<void> = async () => {};
+  // Null until the first read. The engine is a service that outlives this window,
+  // so what it did before that read is not news: the rows show it, and no toast does.
+  let healCursor: { run: number; after: number } | null = null;
 
   const get = () => store.getState().engine;
   const set = (patch: Partial<EngineSlice>) => {
@@ -314,6 +328,69 @@ export function createEngineController({ engine, store, clock, settings, checks,
     await probeNow();
   };
 
+  // The rest of the rows after `first`. The revision of the first page is the one
+  // kept, so a change during the walk shows at the next probe as a moved revision.
+  const walkRows = async (first: ExclusionsPage): Promise<ExclusionsFacts> => {
+    const rows = [...first.rows];
+    let skipped = first.skipped;
+    let next = first.next;
+    while (next !== null) {
+      const page = await engine.exclusions(next);
+      if (page.next !== null && page.next <= next) throw new ProtocolError("exclusions.next does not move on");
+      rows.push(...page.rows);
+      skipped += page.skipped;
+      next = page.next;
+    }
+    return { revision: first.revision, rows, scope: first.scope, browsers: first.browsers, skipped };
+  };
+
+  // Cheap, so per probe; the rows are read only when their revision moved. A new
+  // engine run starts its revisions and ids over, so a cursor means nothing outside
+  // its run: everything the new run holds is read from the start, and told.
+  const readHeal = async () => {
+    if (!httpsInForce(get())) {
+      if (get().exclusions || get().exclusionsError || (get().healNotices?.length ?? 0) > 0) set({ exclusions: null, exclusionsError: null, healNotices: [] });
+      return;
+    }
+    try {
+      const baseline = healCursor === null;
+      let answer = await engine.healNotices(healCursor?.after ?? 0);
+      if (healCursor !== null && answer.run !== healCursor.run) answer = await engine.healNotices(0);
+      const { run } = answer;
+      healCursor = { run, after: answer.revision };
+      if (!baseline && answer.notices.length > 0) {
+        const fresh: HealGroup[] = answer.notices.map((n) => ({ ...n, key: `${run}:${n.id}` }));
+        const kept = (get().healNotices ?? []).filter((g) => !fresh.some((n) => n.key === g.key));
+        set({ healNotices: [...kept, ...fresh].slice(-HEAL_KEPT) });
+      }
+      const held = get().exclusions;
+      const rows = held && held.revision === answer.exclusions_revision ? held : await walkRows(await engine.exclusions(0));
+      set({ exclusions: rows, exclusionsError: null });
+    } catch (e) {
+      set({ exclusionsError: message(e) });
+    }
+  };
+
+  const tryDecryptAgain = async (line: string | null, app: string | null, reason: string | null) => {
+    set({ exclusionsActionError: null });
+    try {
+      set({ exclusions: await walkRows(await engine.tryDecryptAgain(line, app, reason)) });
+    } catch (e) {
+      set({ exclusionsActionError: `Sieve could not try that again: ${message(e)}` });
+    }
+  };
+
+  // One error for the whole try: a later success must not wipe an earlier refusal.
+  // Stops there, and each answer's rows show what was taken back so far.
+  const tryDecryptAllAgain = async (apps: readonly string[]) => {
+    set({ exclusionsActionError: null });
+    try {
+      for (const app of apps) set({ exclusions: await walkRows(await engine.tryDecryptAgain(null, app, null)) });
+    } catch (e) {
+      set({ exclusionsActionError: `Sieve could not try that again: ${message(e)}` });
+    }
+  };
+
   return {
     bind() {
       disposed = false;
@@ -330,6 +407,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
         follow();
         await syncUpstreams();
         await readCert();
+        await readHeal();
       };
       probeNow = probe;
 
@@ -369,5 +447,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
     stopAdguard: () => adguard("stopping", () => engine.stopAdguard()),
     startAdguard: () => adguard("starting", () => engine.startAdguard()),
     installRoot,
+    tryDecryptAgain,
+    tryDecryptAllAgain,
   };
 }

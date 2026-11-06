@@ -11,7 +11,7 @@ import { REASON_TEXT } from "@/core/log";
 import { MAX_POLICY_BYTES } from "@/core/settings/registry";
 import fixture from "@/data/fixtures/engine-ipc-v3.json";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
-import { BLOCKER_KINDS, CERT_STATES, FIREFOX_TRUST, LOG_OUTCOMES, parseCertStatus, parseEngineLists, parseEngineStatus, parseLogTail, UPDATE_KINDS } from "@/data/protocol";
+import { BLOCKER_KINDS, CERT_STATES, EXCLUSION_SCOPES, FIREFOX_TRUST, LOG_OUTCOMES, parseCertStatus, parseEngineLists, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseLogTail, UPDATE_KINDS } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -102,6 +102,28 @@ describe("engine IPC law", () => {
     expect(snake).toEqual([...UPDATE_KINDS]);
     expect(fixture.updates.map((u) => u.kind)).toEqual([...UPDATE_KINDS]);
     for (const u of fixture.updates) expect(parseEngineStatus({ ...body, update: u }).update).toEqual(u);
+  });
+
+  it("the app reads what is not decrypted and the notices, and the scope's names are the crate's", () => {
+    const body = (type: string) => Object.fromEntries(Object.entries(fixture.engine.find((m) => m.type === type)!).filter(([k]) => k !== "type"));
+    expect(parseExclusionsPage(body("exclusions"))).toEqual({ ...body("exclusions"), skipped: 0 });
+    expect(parseHealNotices(body("heal_notices"))).toEqual(body("heal_notices"));
+    const scopes = ((RUST.match(/pub enum ExclusionScope \{([\s\S]*?)\n\}/)?.[1] ?? "").match(/^\s{4}([A-Z]\w+),/gm) ?? []).map((v) => v.trim().replace(",", "").toLowerCase());
+    expect(scopes).toEqual([...EXCLUSION_SCOPES]);
+  });
+
+  it("a bad exclusion row or notice is left out and counted; a wrong shape throws", () => {
+    const body = Object.fromEntries(Object.entries(fixture.engine.find((m) => m.type === "exclusions")!).filter(([k]) => k !== "type"));
+    const page = parseExclusionsPage({ ...body, rows: [null, 7, { line: "" , reason: "x" }, { reason: "x" }, { line: "a.example", reason: "user" }] });
+    expect(page.skipped).toBe(4);
+    expect(page.rows).toEqual([{ line: "a.example", apps: [], reason: "user", created_ms: null, retries: 0 }]);
+    expect(() => parseExclusionsPage({ ...body, rows: null })).toThrow(/rows/);
+    expect(() => parseExclusionsPage({ ...body, scope: "some" })).toThrow(/scope/);
+    expect(() => parseExclusionsPage(null)).toThrow();
+    expect(() => parseHealNotices({ revision: 1, exclusions_revision: 1, notices: [] }), "a run names the cursor's meaning").toThrow(/heal\.run/);
+    const notices = parseHealNotices({ run: 1, revision: 1, exclusions_revision: 1, notices: [null, { id: 1 }, { id: 1, session: 1, exe: "a.exe", hosts: [], total: 0, rev: 1 }, { id: 2, session: 1, exe: "a.exe", hosts: ["a.example"], total: 0, rev: 1 }] });
+    expect(notices.notices).toEqual([{ id: 2, session: 1, exe: "a.exe", hosts: ["a.example"], total: 1, rev: 1 }]);
+    expect(() => parseHealNotices({ revision: 1, exclusions_revision: 1 })).toThrow(/notices/);
   });
 
   it("fixture names every message type of the crate, in order", () => {

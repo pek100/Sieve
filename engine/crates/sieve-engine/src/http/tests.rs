@@ -387,7 +387,7 @@ async fn the_engine_timing_out_a_head_is_not_a_client_close() {
     let rig = Rig::new(origin_dial(Arm::Duplex, &pki, &[H1], Origin::default()), RigOpts::new(pki.roots()));
     let run = |client| {
         let (far, upstream) = tokio::io::duplex(1024);
-        let pair = crate::tls::intercept::Pair { exe: None, host: HOST.to_string() };
+        let pair = crate::tls::intercept::Pair { exe: None, host: HOST.to_string(), session: None };
         let ctx = Arc::new(Serve::new(rig.deps.filter.clone(), rig.deps.book.clone(), Arc::new(NoRewrite), Arc::new(NoWatch), 0, pair, HOST.to_string(), 443, wall_ms));
         async move {
             let ended = serve(ctx, client, upstream, Proto::H1).await;

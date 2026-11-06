@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sieve_filter::exclusions::{AutoReason, Exclusion, Pattern};
+use sieve_filter::exclusions::{AutoReason, Exclusion, Pattern, exe_file_name};
 
 use crate::policy::write_atomic;
 
@@ -38,14 +38,33 @@ pub struct AutoEntry {
     pub reason: AutoReason,
     pub created_ms: u64,
     /// `auto:ev` goes with its certificate; the others stay until [`cap`]
-    /// evicts them.
+    /// evicts them or "Try decrypting again" takes them back.
     pub expires_ms: Option<u64>,
+    /// How many times "Try decrypting again" was used. Defaulted, like `retrying`:
+    /// a file from before slice 7 loads, version unchanged (S39).
+    #[serde(default)]
+    pub retries: u32,
+    /// Taken back by the user, so no exclusion; if the client refuses again the
+    /// entry returns with its first date and this count (plan 4.3). Counts toward
+    /// [`cap`], so the file stays bounded; an evicted one just loses its history.
+    #[serde(default)]
+    pub retrying: bool,
 }
 
 impl AutoEntry {
     /// An entry for exactly this host and every app.
     pub fn host(host: &str, reason: AutoReason, created_ms: u64, expires_ms: Option<u64>) -> Self {
-        Self { pattern: Pattern::Exact(host.to_ascii_lowercase()), app: None, reason, created_ms, expires_ms }
+        Self { pattern: Pattern::Exact(host.to_ascii_lowercase()), app: None, reason, created_ms, expires_ms, retries: 0, retrying: false }
+    }
+
+    /// An entry for exactly this host and one app.
+    pub fn for_app(host: &str, exe: &str, reason: AutoReason, created_ms: u64) -> Self {
+        Self { app: Some(exe_file_name(exe)), ..Self::host(host, reason, created_ms, None) }
+    }
+
+    /// Excludes right now: not taken back, not past its end.
+    pub fn is_held(&self, now_ms: u64) -> bool {
+        !self.retrying && !self.expired(now_ms)
     }
 
     pub fn expired(&self, now_ms: u64) -> bool {
@@ -347,5 +366,46 @@ mod tests {
         let all: Vec<AutoEntry> = (0..MAX_PER_REASON + 3).map(|i| AutoEntry::host(&format!("h{i}.example"), AutoReason::ClientCert, NOW, None)).collect();
         save(dir.path(), &all).unwrap();
         assert_eq!(load(dir.path()).unwrap().len(), MAX_PER_REASON);
+    }
+
+    /// S39: both ways, so a rollback of the engine reads a new file too.
+    #[test]
+    fn a_file_without_the_new_fields_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(path(dir.path()), r#"{"v":1,"entries":[{"pattern":{"Exact":"a.example"},"app":null,"reason":"pinning","created_ms":5,"expires_ms":null}]}"#).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded, [AutoEntry::host("a.example", AutoReason::Pinning, 5, None)]);
+        assert_eq!((loaded[0].retries, loaded[0].retrying), (0, false));
+    }
+
+    #[test]
+    fn a_file_with_them_loads_in_the_old_shape() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldEntry {
+            pattern: Pattern,
+            app: Option<String>,
+            reason: AutoReason,
+            created_ms: u64,
+            expires_ms: Option<u64>,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        #[serde(deny_unknown_fields)]
+        struct OldFile {
+            v: u32,
+            entries: Vec<OldEntry>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let entry = AutoEntry { retries: 3, retrying: true, ..AutoEntry::for_app("a.example", r"C:\x\Client.exe", AutoReason::Pinning, 5) };
+        save(dir.path(), &[entry]).unwrap();
+        let old: OldFile = serde_json::from_slice(&std::fs::read(path(dir.path())).unwrap()).unwrap();
+        assert_eq!(old.entries.len(), 1);
+    }
+
+    #[test]
+    fn for_app_names_the_file_in_lower_case() {
+        let e = AutoEntry::for_app("A.Example", r"C:\Apps\Client.EXE", AutoReason::Pinning, NOW);
+        assert_eq!((e.pattern, e.app.as_deref()), (Pattern::Exact("a.example".into()), Some("client.exe")));
     }
 }

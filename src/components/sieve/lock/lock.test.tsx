@@ -21,7 +21,7 @@ import { FiltersScreen } from "@/components/sieve/filters/filters-screen";
 import { LogScreen } from "@/components/sieve/log/log-screen";
 import { LockGate } from "./lock-gate";
 
-vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
+vi.mock("next/navigation", () => ({ usePathname: () => "/settings/", useRouter: () => ({ push: () => {} }) }));
 vi.mock("next/link", () => ({ default: ({ href, children, ...rest }: { href: string; children: ReactNode }) => <a href={href} {...rest}>{children}</a> }));
 vi.setConfig({ testTimeout: 30_000 });
 

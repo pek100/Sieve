@@ -20,6 +20,7 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use rustls::AlertDescription;
 use sieve_ipc::LogOutcome;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
@@ -31,6 +32,7 @@ use super::upgrade::{AbortOnDrop, is_upgrade, splice, strip_hop_by_hop};
 use crate::domain::FilterSlot;
 use crate::stack::book::{FlowBook, RequestRow};
 use crate::tls::intercept::{ClientWatch, Pair};
+use crate::tls::upstream::rustls_error;
 
 pub type BodyError = Box<dyn std::error::Error + Send + Sync>;
 pub type ResponseBody = UnsyncBoxBody<Bytes, BodyError>;
@@ -106,14 +108,29 @@ pub struct Ended {
     /// What ended the upstream, when something did. `tls::intercept` looks in
     /// it for a post-handshake certificate request.
     pub upstream_error: Option<hyper::Error>,
-    /// The client's side ended first, and not by the engine's timeout. What
-    /// `ClientWatch` may read as evidence about the client.
+    /// The client's side ended first, and not by the engine's timeout nor on bytes
+    /// that did not parse, which are not silence. What `ClientWatch` may read as
+    /// evidence about the client.
     pub client_ended: bool,
+    /// The fatal alert it ended with, when it sent one (plan 4.3's "right after").
+    pub client_alert: Option<AlertDescription>,
 }
 
 impl Ended {
     pub fn without_error(client_ended: bool) -> Self {
-        Self { upstream_error: None, client_ended }
+        Self { upstream_error: None, client_ended, client_alert: None }
+    }
+
+    /// The server future's result, when it ended first.
+    fn by_client(served: Result<(), hyper::Error>) -> Self {
+        let Err(error) = served else { return Self::without_error(true) };
+        // h1 calls bad bytes a parse error; on h2 the library goes away over them.
+        let spoke = error.is_parse() || std::error::Error::source(&error).and_then(|e| e.downcast_ref::<h2::Error>()).is_some_and(h2::Error::is_library);
+        let client_alert = match rustls_error(&error) {
+            Some(rustls::Error::AlertReceived(alert)) => Some(*alert),
+            _ => None,
+        };
+        Self { upstream_error: None, client_ended: !error.is_timeout() && (client_alert.is_some() || !spoke), client_alert }
     }
 }
 
@@ -262,8 +279,10 @@ fn with_path_of(uri: &Uri, url: &str) -> Option<Uri> {
 /// which a client retries by itself (hyper resets with the reason in the error);
 /// anything else that cannot be answered is a 502.
 async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incoming>) -> Result<Response<ResponseBody>, BodyError> {
-    ctx.seen.store(true, Ordering::Relaxed);
-    ctx.watch.request_seen(&ctx.pair);
+    // Once per connection: a busy h2 connection must not buy unbounded credit.
+    if !ctx.seen.swap(true, Ordering::Relaxed) {
+        ctx.watch.request_seen(&ctx.pair);
+    }
     let authority = facts::authority_of(&req);
     if misdirected(authority.as_deref(), &ctx.sni, ctx.port) {
         let f = facts::of(&req, authority.as_deref().unwrap_or(&ctx.sni));
@@ -325,8 +344,7 @@ where
             let server = $server(service);
             tokio::pin!(server);
             let ended = tokio::select! {
-                // hyper's own header timeout ends the server too; the client is still there.
-                served = &mut server => Ended::without_error(!served.is_err_and(|e: hyper::Error| e.is_timeout())),
+                served = &mut server => Ended::by_client(served),
                 result = &mut connection.0 => {
                     let upstream_error = result.ok().and_then(Result::err);
                     // The client hears it, and what the origin accepted runs on:
@@ -336,7 +354,7 @@ where
                         _ = &mut server => {}
                         () = ctx.settled() => {}
                     }
-                    Ended { upstream_error, client_ended: false }
+                    Ended { upstream_error, client_ended: false, client_alert: None }
                 }
             };
             let upgraded = ctx.splice.lock().unwrap_or_else(|p| p.into_inner()).take();

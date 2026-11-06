@@ -17,6 +17,12 @@ export function NoticeToaster() {
   const shown = useRef(new Set<number>());
 
   useEffect(() => {
+    // A notice that left the bus takes its toast with it: a group's new text replaces the old.
+    for (const id of shown.current) {
+      if (list.some((n) => n.id === id)) continue;
+      toast.dismiss(id);
+      shown.current.delete(id);
+    }
     for (const n of list) {
       if (n.surface !== "toast" || shown.current.has(n.id)) continue;
       shown.current.add(n.id);

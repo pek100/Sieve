@@ -25,6 +25,13 @@
  * `?cert=<scenario>` (default `not_installed`); `error` makes each read fail.
  * Turning `https` off leaves `policy_off`, and on or Reinstall leaves
  * `installed`, as the engine does; Reinstall is refused while `https` is off.
+ *
+ * What is not decrypted answers the `exclusions` example of the IPC fixture;
+ * "Try decrypting again" takes an `auto:*` row away, as the engine would.
+ * `?heal=1` is an engine that holds `https` on: the app cannot turn it on while
+ * `filtering.https` is unavailable, so this mock refuses being told off (refused
+ * policies are retried at the next probe, not at once), and it has nothing to
+ * tell on the first read, then one exclusion, then a second of the same group.
  */
 import { hash01 } from "./prng";
 import fixture from "./fixtures/engine-probe-v3.json";
@@ -38,6 +45,8 @@ import {
   parseEngineLists,
   parseEngineProbe,
   parseEngineStatus,
+  parseExclusionsPage,
+  parseHealNotices,
   parseLogTail,
   type CertStatus,
   type EngineLists,
@@ -82,6 +91,9 @@ export const MOCK_ADGUARD_ERROR = "Adguard Service: the service is not in a stat
 export const MOCK_CERT_ERROR = "unexpected answer: the engine did not say";
 export const MOCK_HTTPS_OFF = "HTTPS filtering is off, so there is no certificate to reinstall";
 
+/** A mock engine that holds `https` on says this when told off (`?heal=1`). */
+export const MOCK_HOLDS_HTTPS = "this mock engine holds HTTPS on";
+
 /** The message of a failed log read (?log=error). */
 export const MOCK_LOG_ERROR = "the engine's log could not be read";
 
@@ -109,10 +121,14 @@ function statusOf(scenario: EngineScenario): EngineStatus {
   return parseEngineStatus((example.pipe as { status: unknown }).status);
 }
 
-export function createMockEngine(start: EngineScenario = "missing", options: { seed?: number; logError?: boolean; cert?: CertScenario } = {}): EngineSource {
+export function createMockEngine(start: EngineScenario = "missing", options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean; run?: number } = {}): EngineSource {
   let scenario = start;
   let held: Omit<EnginePolicy, "revision" | "engine"> | null = null;
-  const echo = (status: EngineStatus): EngineStatus => (held ? { ...status, policy: { ...status.policy, ...held } } : status);
+  const holdsHttps = options.heal === true;
+  const echo = (status: EngineStatus): EngineStatus => {
+    const policy = held ? { ...status.policy, ...held } : status.policy;
+    return { ...status, policy: holdsHttps ? { ...policy, https: true } : policy };
+  };
   const seed = options.seed ?? 1;
   const all = parseLogTail(logFixture).rows;
   const hostLevel = all.filter((e) => e.row.url === null);
@@ -146,6 +162,12 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
     if (cert === "error") throw new Error(MOCK_CERT_ERROR);
     return parseCertStatus(ipc.certStatuses[cert]);
   };
+  const excluded = parseExclusionsPage(ipc.engine.find((m) => m.type === "exclusions"));
+  let rows = excluded.rows;
+  let rowsRevision = excluded.revision;
+  const page = (after: number) => ({ ...excluded, revision: rowsRevision, rows: rows.slice(after), total: rows.length });
+  let healReads = 0;
+  const first = parseHealNotices(ipc.engine.find((m) => m.type === "heal_notices")).notices[0];
   return {
     kind: "mock",
     probe: async () => {
@@ -156,6 +178,7 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
     },
     setPolicy: async (policy: EnginePolicy) => {
       requireWelcome();
+      if (holdsHttps && !policy.https) throw new Error(MOCK_HOLDS_HTTPS);
       if (!policy.engine) {
         if (scenario === "adguard") adguardWhileIdle = "running";
         if (scenario === "filtering" && adguardWhileIdle === null) adguardWhileIdle = "stopped";
@@ -219,6 +242,29 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
       if (!https) throw new Error(MOCK_HTTPS_OFF);
       cert = "installed";
       return certAnswer();
+    },
+    exclusions: async (after) => {
+      requireWelcome();
+      return page(after);
+    },
+    tryDecryptAgain: async (line, app, reason) => {
+      requireWelcome();
+      if (line === null && app === null) throw new Error("try again needs a line or an app");
+      const named = (r: (typeof rows)[number]) => r.reason.startsWith("auto:") && (line === null ? r.reason === "auto:pinning" && r.apps.includes(app ?? "") : r.line === line && (r.apps[0] ?? null) === app && r.reason === reason);
+      if (rows.some(named)) {
+        rows = rows.filter((r) => !named(r));
+        rowsRevision += 1;
+      }
+      return page(0);
+    },
+    healNotices: async (after) => {
+      requireWelcome();
+      const run = options.run ?? 1;
+      if (!holdsHttps) return { run, revision: 0, exclusions_revision: rowsRevision, notices: [] };
+      healReads += 1;
+      const rev = Math.min(healReads - 1, first.hosts.length);
+      const notice = { ...first, hosts: first.hosts.slice(0, rev), total: rev, rev };
+      return { run, revision: rev, exclusions_revision: rowsRevision, notices: rev > after ? [notice] : [] };
     },
   };
 }

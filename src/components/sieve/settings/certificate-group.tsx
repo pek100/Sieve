@@ -13,17 +13,11 @@ import {
   HTTPS_SWITCH,
   certInstalled,
   engineLockReason,
+  factDay,
   httpsInForce,
 } from "@/core/engine";
 import { useEngine, useEngineActions, useSetting } from "@/hooks/use-sieve";
 import { useRuntime } from "@/hooks/sieve-provider";
-
-/** The day of a fact the engine gave, or null when it is not one. */
-function day(ms: number | null | undefined): string | null {
-  if (typeof ms !== "number" || !Number.isFinite(ms)) return null;
-  const date = new Date(ms);
-  return Number.isNaN(date.getTime()) ? null : date.toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
-}
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -77,8 +71,8 @@ export function CertificateGroup() {
   const installed = certInstalled(cert);
   const state = unanswered ? CERT_STATE_UNKNOWN : cert ? (CERT_STATE_TEXT[cert.state] ?? CERT_STATE_UNKNOWN) : "Checking";
   const problem = lock === null && e.certError ? `Sieve could not read the certificate: ${e.certError}` : (cert?.last_error ?? null);
-  const validUntil = installed ? day(cert?.valid_until_ms) : null;
-  const rotated = installed ? day(cert?.last_rotation_ms) : null;
+  const validUntil = installed ? factDay(cert?.valid_until_ms) : null;
+  const rotated = installed ? factDay(cert?.last_rotation_ms) : null;
   // Beside an installed root, this is the one a pending removal has not reached.
   const thumbprint = cert?.thumbprint ?? null;
   const firefox = installed && cert ? (FIREFOX_TEXT[cert.firefox] ?? null) : null;

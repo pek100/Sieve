@@ -14,9 +14,17 @@
  * The slice has one writer, the engine controller (src/data/engine-controller.ts).
  */
 import type { CertState, CertStatus, EngineBlocker, EngineProbe, EngineStatus, EngineUpdate, FirefoxTrust, ListFact } from "@/data/protocol";
+import type { ExclusionsFacts, HealGroup } from "./exclusions";
 
 /** An update state that says nothing: no answer, or a missing or broken one. */
 export const NO_UPDATE_NEWS: EngineUpdate = { kind: "not_configured" };
+
+/** The day of a fact the engine gave, or null when it is not one. */
+export function factDay(ms: number | null | undefined): string | null {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return null;
+  const date = new Date(ms);
+  return Number.isNaN(date.getTime()) ? null : date.toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
+}
 
 /** How often the engine is asked while Sieve is open (plan 1.6.5). */
 export const ENGINE_POLL_MS = 2000;
@@ -58,6 +66,14 @@ export interface EngineSlice {
   certActionError?: string | null;
   /** An update request on its way to the engine. */
   requestingUpdate?: boolean;
+  /** What the engine keeps from being decrypted; null while HTTPS is not in force. Read through `useExclusionRows`. */
+  exclusions?: ExclusionsFacts | null;
+  /** Why the newest read of those failed; null after a good one. The rows stay. */
+  exclusionsError?: string | null;
+  /** Why the user's last "Try decrypting again" failed; null after a good one. */
+  exclusionsActionError?: string | null;
+  /** What self-healing excluded in this window's life, oldest first. */
+  healNotices?: readonly HealGroup[];
 }
 
 export const EMPTY_ENGINE: EngineSlice = { probe: null, error: null, adguard: null, actionError: null, cert: null, certError: null, certActionError: null };
