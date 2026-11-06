@@ -68,6 +68,11 @@ impl FromStr for Upstream {
         if input.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\') {
             return Err("resolver address contains whitespace or a backslash".into());
         }
+        // The same repair: `https:x` and `https:///x` both parse to the host `x`.
+        let authority = input.split_once(':').and_then(|(_, rest)| rest.strip_prefix("//"));
+        if authority.is_none_or(|rest| rest.starts_with('/')) {
+            return Err("resolver address must name its host right after ://".into());
+        }
         let url = url::Url::parse(input).map_err(|_| "invalid resolver URL")?;
         let kind = match url.scheme() {
             "https" => Kind::Https,

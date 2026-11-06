@@ -38,9 +38,15 @@ describe("parseUpstream: the three encrypted kinds", () => {
     }
   });
 
-  it("refuses a port out of range, a path on DoT and DoQ, and a DoH form with no path or with a query", () => {
-    for (const bad of ["tls://dns.example:0", "tls://dns.example:65536", "tls://dns.example/x", "quic://dns.example/x", "https://dns.example", "https://dns.example/q?a=1", "https://dns.example/q#f"]) {
+  it("refuses a port out of range, a path or query on DoT and DoQ, and a fragment", () => {
+    for (const bad of ["tls://dns.example:0", "tls://dns.example:65536", "tls://dns.example/x", "quic://dns.example/x", "quic://dns.example?x=1", "https://dns.example/q#f"]) {
       expect(parseUpstream(bad), bad).toBeNull();
     }
+  });
+
+  it("keeps a DoH query in the request target, and reads a bare host as the path /, as the engine does", () => {
+    expect(parseUpstream("https://dns.example/q?a=1")).toEqual({ kind: "doh", host: "dns.example", port: null, path: "/q?a=1" });
+    expect(parseUpstream("https://dns.example")).toEqual({ kind: "doh", host: "dns.example", port: null, path: "/" });
+    expect(parseUpstream("tls://dns.example/")).toEqual({ kind: "dot", host: "dns.example", port: null, path: null });
   });
 });
