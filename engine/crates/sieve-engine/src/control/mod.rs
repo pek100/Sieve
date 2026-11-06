@@ -60,6 +60,10 @@ pub struct Facts {
     /// What went wrong with attribution's sources in the latest routing run
     /// ([`Engine::attribution_failed`]). Status reports it after `route_error`.
     pub attribution_error: Option<String>,
+    /// Why the policy in force is not on disk, until a later save works. Its
+    /// own field, as a full disk fails on every SetPolicy and `add_error` would
+    /// grow the Status with each one. Status reports it after `attribution_error`.
+    pub policy_save_error: Option<String>,
     /// When the routes came up (monotonic ms), for the Stall test build.
     pub up_since: Option<u64>,
 }
@@ -348,7 +352,7 @@ impl Backend for Engine {
             blocking: f.routes_up && self.filter.get().blocks_anything(),
             flows: u32::try_from(live).unwrap_or(u32::MAX),
             decrypting: false,
-            last_error: beside(beside(beside(beside(f.last_error, f.dns_file_error), f.route_error), f.attribution_error), self.lists.compile_error()),
+            last_error: [f.dns_file_error, f.route_error, f.attribution_error, f.policy_save_error, self.lists.compile_error()].into_iter().fold(f.last_error, beside),
             policy,
             blocker,
             split_tunnels: f.split_tunnels,
@@ -359,13 +363,15 @@ impl Backend for Engine {
         }
     }
 
+    /// The policy takes effect whether or not it reaches the disk: a file that
+    /// cannot be written must not keep the engine routing after the user said
+    /// off (fail-open). A failed save is reported, and the file keeps the last
+    /// good one for the next start. It is saved under the lock, so the file
+    /// never ends on an older policy than the engine holds.
     fn set_policy(&self, asked: Policy) -> Result<EngineStatus, String> {
-        {
+        let saved = {
             let mut current = lock(&self.policy);
             let next = policy::accept(&current, asked)?;
-            if let Some(dir) = &self.dir {
-                policy::save(dir, &next)?;
-            }
             if next.engine && !current.engine && lock(&self.crash_loop).take().is_some() {
                 let mut runs = lock(&self.runs);
                 runs.forgive();
@@ -374,8 +380,11 @@ impl Backend for Engine {
                 }
             }
             self.apply_to_filter(&current, &next);
+            let saved = self.dir.as_ref().map_or(Ok(()), |dir| policy::save(dir, &next));
             *current = next;
-        }
+            saved
+        };
+        self.set_facts(|f| f.policy_save_error = saved.err().map(|why| format!("the policy holds until a restart, which reads the last one saved: {why}")));
         self.wake.notify_one();
         self.ca_wake.notify_one();
         Ok(self.status())
@@ -782,6 +791,91 @@ mod tests {
         assert!(!e.policy().engine);
         let s = e.set_policy(switches(3, true)).unwrap();
         assert_eq!(s.policy, switches(3, true));
+    }
+
+    /// An engine that routes and blocks, whose `policy.json` cannot be written:
+    /// a directory sits where `policy::save` puts its temporary file, as a held
+    /// or refused file would. Removing that directory lets the save work again.
+    fn engine_that_cannot_save(dir: &std::path::Path) -> Engine {
+        let on = saved_on();
+        policy::save(dir, &on).unwrap();
+        std::fs::create_dir(dir.join(policy::POLICY_FILE).with_extension("tmp")).unwrap();
+        policy::save(dir, &on).unwrap_err();
+        let e = Engine::new(Some(dir.to_path_buf()), PathBuf::new(), on, Runs::default(), None);
+        e.set_facts(|f| f.routes_up = true);
+        assert!(e.status().blocking);
+        assert_eq!(e.status().last_error, None);
+        e
+    }
+
+    fn saved_on() -> Policy {
+        use sieve_ipc::{DomainList, DomainListKind};
+        let user = vec![DomainList { kind: DomainListKind::Block, entries: vec!["ads.example".into()], enabled: true }];
+        Policy { revision: 1, engine: true, sieving: true, domain_lists: user, ..Policy::default() }
+    }
+
+    /// Fail-open: a full disk or a locked file must not keep the engine routing
+    /// after the user said off. What ends routing is `run`'s own read of the
+    /// policy on the wake (`control/routing.rs`, Windows, and it touches routes,
+    /// so it does not run here): the wake and the switch it reads are pinned.
+    #[tokio::test]
+    async fn the_engine_switch_ends_routing_when_the_policy_cannot_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine_that_cannot_save(dir.path());
+        let answered = e.set_policy(Policy { revision: 2, engine: false, ..saved_on() }).expect("an off switch is never refused for a file");
+        assert!(!answered.policy.engine, "the answer says what the engine now holds");
+        assert!(!e.policy().engine, "the routing loop reads this on the wake");
+        tokio::time::timeout(std::time::Duration::from_secs(5), e.wake.notified()).await.expect("the routing loop is woken");
+        let reported = answered.last_error.expect("the failed save is reported");
+        assert!(reported.contains("policy.tmp"), "the reason names the file: {reported}");
+        assert!(reported.contains("restart"), "and what it costs: {reported}");
+    }
+
+    #[test]
+    fn sieving_off_and_an_apps_off_reach_the_decision_when_the_policy_cannot_be_saved() {
+        use crate::flow::flows::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine_that_cannot_save(dir.path());
+        assert_eq!(sees(&e, "ads.example", "browser"), Action::Drop);
+        e.set_policy(Policy { revision: 2, off_apps: vec!["browser".into()], ..saved_on() }).unwrap();
+        assert_eq!(sees(&e, "ads.example", "browser"), Action::Pass);
+        assert_eq!(sees(&e, "ads.example", "other"), Action::Drop);
+        e.set_policy(Policy { revision: 3, sieving: false, ..saved_on() }).unwrap();
+        assert_eq!(sees(&e, "ads.example", "other"), Action::Pass);
+    }
+
+    /// Only the newest failure stands: the text travels in every Status, so a
+    /// failure per click on a full disk must not grow it.
+    #[test]
+    fn a_failed_save_replaces_itself_hides_no_other_reason_and_ends_with_the_next_good_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine_that_cannot_save(dir.path());
+        e.add_error("policy.json: broken".into());
+        e.set_policy(Policy { revision: 2, engine: false, ..saved_on() }).unwrap();
+        let once = e.status().last_error.unwrap();
+        e.set_policy(Policy { revision: 3, engine: false, ..saved_on() }).unwrap();
+        assert_eq!(e.status().last_error.unwrap(), once, "the same failure, said once");
+        assert!(once.contains("policy.json: broken"), "{once}");
+        assert_eq!(policy::load(dir.path()).0, saved_on(), "the file still holds the last good save");
+
+        std::fs::remove_dir(dir.path().join(policy::POLICY_FILE).with_extension("tmp")).unwrap();
+        let newest = Policy { revision: 4, engine: false, ..saved_on() };
+        e.set_policy(newest.clone()).unwrap();
+        assert_eq!(e.status().last_error.as_deref(), Some("policy.json: broken"), "that save worked: its reason is over");
+        assert_eq!(policy::load(dir.path()), (newest, None));
+    }
+
+    /// What is refused is still refused, and changes nothing, whatever the file.
+    #[test]
+    fn a_stale_or_oversized_policy_is_still_refused_when_the_policy_cannot_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine_that_cannot_save(dir.path());
+        let stale = Policy { revision: 1, engine: false, ..saved_on() };
+        assert!(e.set_policy(stale).unwrap_err().contains("stale"));
+        let big = Policy { revision: 2, engine: false, off_apps: vec!["a".repeat(policy::MAX_POLICY_BYTES)], ..saved_on() };
+        assert!(e.set_policy(big).unwrap_err().contains("over the"));
+        assert_eq!(e.policy(), saved_on());
+        assert_eq!(e.status().last_error, None, "nothing was attempted");
     }
 
     fn sees(e: &Engine, host: &str, key: &str) -> crate::flow::flows::Action {
