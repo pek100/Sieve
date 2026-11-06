@@ -1,0 +1,6 @@
+# The engine loads DLLs from System32 only and runs on machines that may have no Visual C++
+# redistributable: a clean Windows Server has no vcruntime140.dll, and the engine then exits
+# 0xC0000135 before it can say why (live on GCP, 2026-11-06). Link the C runtime statically.
+# Here at the repo root, because `pnpm engine:build` runs cargo from the root.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
