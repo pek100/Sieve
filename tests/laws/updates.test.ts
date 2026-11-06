@@ -26,17 +26,23 @@ const MIN_FILES = 300;
 
 const b64 = (text: string) => Buffer.from(text, "latin1").toString("base64");
 
-/** Every secret-key witness: the box line, the header, and both inside Tauri's base64 wrapper. */
-const PATTERNS: readonly RegExp[] = [
-  ...BOX_PREFIXES.map((p) => new RegExp(`${p}[A-Za-z0-9+/=]{${MIN_BOX_BASE64},}`)),
-  ...HEADERS.map((h) => new RegExp(`untrusted comment: ${h}`, "i")),
-  // A base64 wrapper shifts by the text's offset, so each of the three alignments is checked.
-  ...HEADERS.flatMap((h) => [0, 1, 2].map((shift) => new RegExp(b64("x".repeat(shift) + `untrusted comment: ${h}`).slice(shift === 0 ? 0 : 4, -4).replace(/[+/]/g, "\\$&")))),
-];
+const headerLine = (h: string) => `untrusted comment: ${h}`;
+
+/** Every secret-key witness: the box line and the header. */
+const PATTERNS: readonly RegExp[] = [...BOX_PREFIXES.map((p) => new RegExp(`${p}[A-Za-z0-9+/=]{${MIN_BOX_BASE64},}`)), ...HEADERS.map((h) => new RegExp(headerLine(h), "i"))];
+
+/** A base64 run long enough to hold the shortest witness whole: nothing shorter can wrap one. */
+const WRAPPED_RUN = new RegExp(`[A-Za-z0-9+/]{${b64(HEADERS.map(headerLine).sort((a, b) => a.length - b.length)[0]).length - 4},}`, "g");
+/** A run can start anywhere in its four-character groups, when something base64-like sits right before it. */
+const GROUP_SHIFTS = [0, 1, 2, 3];
+
+/** The text inside every long base64 run (Tauri wraps its key files whole). */
+const unwrapped = (text: string) => [...text.matchAll(WRAPPED_RUN)].flatMap(([run]) => GROUP_SHIFTS.map((shift) => Buffer.from(run.slice(shift), "base64").toString("latin1"))).join("\n");
 
 function secretIn(bytes: Buffer): RegExp | undefined {
   const text = bytes.toString("latin1");
-  return PATTERNS.find((p) => p.test(text));
+  const inner = unwrapped(text);
+  return PATTERNS.find((p) => p.test(text) || p.test(inner));
 }
 
 const repoFiles = () =>
@@ -54,6 +60,10 @@ describe("updates law", () => {
       for (const prefix of BOX_PREFIXES) {
         const key = `untrusted comment: test\n${prefix}${body}\n`;
         expect(secretIn(Buffer.from(key)), prefix).toBeDefined();
+        for (const lead of ["", "x", "xy"]) {
+          expect(secretIn(Buffer.from(b64(lead + key))), `wrapped after ${JSON.stringify(lead)}: ${prefix}`).toBeDefined();
+          expect(secretIn(Buffer.from(`abc${b64(lead + key)}`)), `wrapped, run shifted: ${prefix}`).toBeDefined();
+        }
       }
       for (const header of HEADERS) {
         const key = `untrusted comment: ${header}\nAAAA\n`;
@@ -65,6 +75,7 @@ describe("updates law", () => {
       // A public key and an ordinary signature are no secret key.
       expect(secretIn(Buffer.from("untrusted comment: minisign public key 1234\nRWQxyz\n"))).toBeUndefined();
       expect(secretIn(Buffer.from(`RWQAAEIy${"A".repeat(MIN_BOX_BASE64 - 1)}`))).toBeUndefined();
+      expect(secretIn(Buffer.from(b64("untrusted comment: minisign public key 1234\nRWQxyz\n")))).toBeUndefined();
     });
 
     it("no tracked or untracked file holds one, or is named like one", () => {
