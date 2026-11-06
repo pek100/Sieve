@@ -80,7 +80,6 @@ test.describe("settings", () => {
     }
 
     await page.reload();
-    await editor.scrollIntoViewIfNeeded();
     await expect(editor.locator("[data-upstream]").first()).toHaveAttribute("data-upstream", "tls://dns.example");
     await expect(editor.locator("[data-upstream]")).toHaveCount(4);
   });

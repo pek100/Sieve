@@ -33,4 +33,4 @@ Traffic really goes through the engine during this check. Do it when nothing els
 
 ## Not here
 
-Certificate Transparency, CRLite and upstream ECH are slice 11. Self-healing is slice 7: a client that pins will fail once with no automatic exclusion until then. Content rewriting is slice 9. ECH stripping from DNS answers belongs to the DNS stream.
+Certificate Transparency, CRLite and upstream ECH are slice 11. Self-healing is slice 7: a client that pins will fail once with no automatic exclusion until then. Content rewriting is slice 9. ECH stripping from DNS answers has its own check: run steps 1 to 5 of `dns-extras.md` once this one passes.

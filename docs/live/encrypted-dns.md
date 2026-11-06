@@ -2,13 +2,13 @@
 
 Run by the user, on a machine where the engine is installed and `filtering.engine` is on. Nothing here was run by the implementing stream: every automated test binds loopback only. Commands are for an admin PowerShell prompt. The engine folder below is `C:\ProgramData\Sieve\engine`.
 
-`dns-status.json` beside `status.json` holds the facts these checks read, rewritten every 30 s while routes are up: per upstream its `address`, `connected`, `kx_group`, `alpn`, `answers`, `failures`, and never a queried name. `kx_group` is `null` for DoQ because quinn does not expose it.
+`dns-status.json` beside `status.json` holds the facts these checks read, rewritten every 30 s while routes are up: per upstream its `address`, `connected`, `kx_group`, `alpn`, `answers`, `failures`, and never a queried name. `kx_group` is `null` for DoQ because quinn does not expose it. Its `answers` counts belong to `docs/live/dns-extras.md`.
 
 **The setting owns the list.** While the app runs, `filtering.upstreams` wins over `dns.json`: at the first probe, and at every probe after, the app reads the engine's list back and overwrites it, and so `dns.json`, if it differs. The setting's default is not empty, so an untouched app does this too. A list written by hand lasts only while the app is closed.
 
 To set a list, use one of these two ways.
 
-- **Through the setting, with the app open.** The row in Settings has no editor, so use the settings menu: export, change `filtering.upstreams` in the file, and import it. Change only that key: an import replaces, and a known key the file does not carry goes back to its default, the engine switch included.
+- **Through the setting, with the app open.** Edit the Upstream DNS servers row in Settings: add, remove, and move up and down. The row reads back what the engine holds.
 - **By hand, with the app quit.** Quit Sieve, and keep it closed for the whole check, because opening it puts the setting's list back. Stop the engine, write `dns.json` beside `policy.json`, and start it. A raised `revision` matters only for later writes through the pipe.
 
 A bad file reads as the defaults and `last_error` in `status.json` says why. Save it as UTF-8, up to 32 KB: `Set-Content -Encoding utf8` is fine (its BOM is accepted), while `>` in Windows PowerShell writes UTF-16, which is refused by name. Setting a good list through the pipe, which the app also does, replaces a bad file and ends its reason in `last_error`.
