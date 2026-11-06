@@ -1,10 +1,11 @@
 /**
  * Law 11, unavailable settings. `unavailableUntil` stays as a mechanism (its
- * behaviour is pinned in src/core/settings/unavailable.test.ts, with one real
- * key mocked unavailable), and today no key carries it: the DNS filter's keys
- * waited for engine slice 4, which retired `filtering.dns` and brought
- * `filtering.upstreams` back. Real registry here, never mocked. A key that
- * becomes unavailable must name a plan that exists and names it.
+ * behaviour is pinned in src/core/settings/unavailable.test.ts, with real keys
+ * mocked unavailable), and today only the HTTPS switch carries it. The DNS
+ * filter's keys waited for engine slice 4, which retired `filtering.dns` and
+ * brought `filtering.upstreams` back. Real registry here, never mocked. An
+ * unavailable key must name a plan that exists and names it, and no available
+ * key may require it.
  */
 import { describe, expect, it } from "vitest";
 import { HTTPS_SWITCH } from "@/core/engine";
@@ -24,13 +25,20 @@ describe("unavailable settings law", () => {
     expect(unavailable).toEqual([HTTPS_SWITCH]);
   });
 
-  it("every unavailable key would name a plan step whose plan exists and names the key", () => {
+  it("every unavailable key names a plan step whose plan exists and names the key", () => {
     for (const k of unavailable) {
       const until = settingDef(k).unavailableUntil ?? "";
       const path = until.match(/docs\/[\w./-]+\.md/)?.[0];
       expect(path, k).toBeDefined();
       expect(existsSync(join(ROOT, path!)), `${k}: ${path}`).toBe(true);
       expect(read(path!), `${path} names ${k}`).toContain(k);
+    }
+  });
+
+  it("no available setting requires an unavailable one", () => {
+    for (const k of SETTING_KEYS.filter(isAvailable)) {
+      const req = settingDef(k).requires;
+      if (req) expect(unavailable as string[], k).not.toContain(req);
     }
   });
 

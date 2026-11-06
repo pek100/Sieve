@@ -1,8 +1,8 @@
 /**
- * What `unavailableUntil` does, with one real key mocked unavailable (no key
- * carries it today, so a loop over the real registry would pass vacuously; law
- * 11 holds that list). An unavailable key has no row, search, export, import
- * or reset, reads as its default and takes no other value.
+ * What `unavailableUntil` does, with two real keys mocked unavailable, a switch
+ * and a list (the real registry's list is one switch, so a loop over it would
+ * never see a list; law 11 holds that list). An unavailable key has no row,
+ * search, export, import or reset, reads as its default and takes no other value.
  */
 import { describe, expect, it, vi } from "vitest";
 
