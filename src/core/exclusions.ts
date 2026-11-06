@@ -10,7 +10,7 @@
  */
 import type { ExclusionRow, ExclusionScope, HealNotice, Snapshot } from "@/data/protocol";
 import { groupApps } from "./apps";
-import { factDay, httpsInForce, type EngineSlice } from "./engine";
+import { engineStatus, factDay, type EngineSlice } from "./engine";
 
 /** The "Not decrypted" group's anchor in Settings. */
 export const EXCLUSIONS_ANCHOR = "not-decrypted";
@@ -155,7 +155,7 @@ export const FLOOR_WORDS: Readonly<Record<string, string>> = {
   "floor:upstream-invalid": "sites whose certificate is not valid",
   "floor:upstream-revoked": "sites whose certificate was revoked",
   "floor:upstream-unavailable": "sites whose certificate could not be checked",
-  "floor:upstream-ct": "sites whose certificate is not publicly logged",
+  "floor:upstream-ct": "sites whose certificate a current log list shows is not publicly logged",
 };
 
 /** The one line that names the floor, under the list. */
@@ -322,12 +322,14 @@ export type AppDecryption = { line: null } | { line: string; count: number; apps
 
 /**
  * The one line under an app's switch, true for what the engine does. None while
- * the app is Off (the switch's own line says that), HTTPS is not in force or the
- * engine has not answered: nothing here claims what is not known.
+ * the app is Off (the switch's own line says that), the engine reports it is not
+ * decrypting, whatever its switch says, or it has not answered: nothing here claims
+ * what is not known. The report is the whole engine's: a flow can still end at a
+ * floor, as the Settings floor line says.
  */
 export function appDecryption(e: EngineSlice, app: { on: boolean; exes: readonly string[] }, rows: readonly Pick<ExclusionView, "apps" | "refused">[]): AppDecryption {
   const facts = e.exclusions;
-  if (!app.on || !httpsInForce(e) || !facts) return { line: null };
+  if (!app.on || engineStatus(e)?.decrypting !== true || !facts) return { line: null };
   const inScope = facts.scope === "all" || app.exes.some((x) => facts.browsers.includes(asciiLower(x)));
   if (!inScope) return { line: DOES_NOT_DECRYPT_TEXT, count: 0, apps: [] };
   const files = [...new Set(app.exes.map(exeFileName))];

@@ -33,15 +33,16 @@ import {
 const rows = parseExclusionsPage(ipc.engine.find((m) => m.type === "exclusions")).rows;
 const CHROME = String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`;
 
-function welcome(https: boolean): EngineProbe {
+/** An engine that answered: `https` is the switch it holds, `decrypting` what it reports doing. */
+function welcome(https: boolean, decrypting = https): EngineProbe {
   const p = parseEngineProbe(probe.examples.idle);
   if (p.pipe?.kind !== "welcome") throw new Error("the example answers");
-  return { ...p, pipe: { ...p.pipe, status: { ...p.pipe.status, policy: { ...p.pipe.status.policy, https } } } };
+  return { ...p, pipe: { ...p.pipe, status: { ...p.pipe.status, decrypting, policy: { ...p.pipe.status.policy, https } } } };
 }
 
-const slice = (https: boolean, scope: "browsers" | "all" = "browsers", browsers = [CHROME.toLowerCase()]): EngineSlice => ({
+const slice = (https: boolean, scope: "browsers" | "all" = "browsers", browsers = [CHROME.toLowerCase()], decrypting = https): EngineSlice => ({
   ...EMPTY_ENGINE,
-  probe: welcome(https),
+  probe: welcome(https, decrypting),
   exclusions: { revision: 1, rows: [], scope, browsers, skipped: 0 },
 });
 
@@ -65,6 +66,10 @@ describe("reason words", () => {
     expect(exclusionReasonWords("auto:someday")).toBe("auto:someday");
     expect(reasonGroup("auto:someday")).toBe("other");
     expect(reasonGroup("nonsense")).toBe("other");
+  });
+
+  it("the floor's certificate log words state their condition: with no current log list, no site is judged by them", () => {
+    expect(FLOOR_WORDS["floor:upstream-ct"]).toBe("sites whose certificate a current log list shows is not publicly logged");
   });
 
   it("the log hands these slugs here (task F13) and keeps its own", () => {
@@ -202,6 +207,13 @@ describe("the app sheet's line", () => {
     expect(appDecryption(slice(false), chrome, merged).line).toBeNull();
     expect(appDecryption({ ...EMPTY_ENGINE, probe: welcome(true) }, chrome, merged).line, "no rows yet").toBeNull();
     expect(appDecryption(EMPTY_ENGINE, chrome, merged).line).toBeNull();
+  });
+
+  it("none while the switch is on and the engine says it is not decrypting: routing or sieving off, a blocker, a build that failed", () => {
+    const heldNotDoing = slice(true, "browsers", [CHROME.toLowerCase()], false);
+    expect(appDecryption(heldNotDoing, chrome, []).line).toBeNull();
+    expect(appDecryption(heldNotDoing, chrome, merged).line).toBeNull();
+    expect(appDecryption(heldNotDoing, other, merged).line, "nor that it does not, of an app out of scope").toBeNull();
   });
 
   it("in force and in scope, no exception", () => {

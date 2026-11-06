@@ -127,7 +127,9 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
   const holdsHttps = options.heal === true;
   const echo = (status: EngineStatus): EngineStatus => {
     const policy = held ? { ...status.policy, ...held } : status.policy;
-    return { ...status, policy: holdsHttps ? { ...policy, https: true } : policy };
+    if (!holdsHttps) return { ...status, policy };
+    // As the engine: its switch alone decrypts nothing, with routes down or sieving off.
+    return { ...status, decrypting: status.routes_up && policy.sieving, policy: { ...policy, https: true } };
   };
   const seed = options.seed ?? 1;
   const all = parseLogTail(logFixture).rows;

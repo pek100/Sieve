@@ -134,6 +134,32 @@ async fn a_held_interception_is_not_built_again_and_off_takes_it_away() {
     sync(&e, || panic!("the switch is off")).await;
 }
 
+/// The Status says what new flows get, not what the switch asks for: wanted but
+/// unbuilt, or built and then any switch off, is no decrypting (task D8).
+#[tokio::test]
+async fn the_status_reports_decrypting_only_while_the_slot_holds_it() {
+    let e = engine();
+    assert!(e.policy().https && !e.status().decrypting, "wanted, not built yet");
+    sync(&e, || Ok(built(&e))).await;
+    assert!(e.status().decrypting, "built");
+    // What `take_down` does, for the engine switch and for a blocker.
+    e.https.set(None);
+    assert!(!e.status().decrypting, "routes down");
+    for (name, off) in [OFF_SWITCHES[0], OFF_SWITCHES[1]] {
+        let e = engine();
+        sync(&e, || Ok(built(&e))).await;
+        turn(&e, off);
+        assert!(!e.status().decrypting, "{name}: off");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_build_says_nothing_is_decrypting() {
+    let e = engine();
+    sync(&e, || Err(BUILD_FAILURE.to_string())).await;
+    assert!(!e.status().decrypting);
+}
+
 #[tokio::test]
 async fn a_failed_build_is_reported_until_a_later_one_works() {
     let e = engine();

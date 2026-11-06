@@ -423,6 +423,19 @@ impl Engine {
         }
     }
 
+    /// Whether a new flow can be decrypted: the slot, which the policy and the
+    /// routing loop empty (`wanted`, `take_down`), and not the switch. A floor can
+    /// still refuse any one flow, so this says nothing of a given site.
+    #[cfg(windows)]
+    fn decrypting(&self) -> bool {
+        self.https.get().is_some()
+    }
+
+    #[cfg(not(windows))]
+    fn decrypting(&self) -> bool {
+        false
+    }
+
     /// The Status, with the update state it reports. Only an answer on the pipe
     /// tells a person about a release, so the file writers pass the plain state.
     fn status_saying(&self, update: sieve_ipc::UpdateStatus) -> EngineStatus {
@@ -445,7 +458,7 @@ impl Engine {
             routes_up: f.routes_up,
             blocking: f.routes_up && self.filter.get().blocks_anything(),
             flows: u32::try_from(live).unwrap_or(u32::MAX),
-            decrypting: false,
+            decrypting: self.decrypting(),
             last_error: [f.dns_file_error, f.route_error, f.https_error, f.attribution_error, f.policy_save_error, self.lists.compile_error()].into_iter().fold(f.last_error, beside),
             policy,
             blocker,

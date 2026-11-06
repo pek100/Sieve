@@ -90,7 +90,7 @@ describe("apps screen", () => {
       if (patch) {
         const welcome = parseEngineProbe(fixture.examples.idle);
         if (welcome.pipe?.kind !== "welcome") throw new Error("the example answers");
-        const probe = { ...welcome, pipe: { ...welcome.pipe, status: { ...welcome.pipe.status, policy: { ...welcome.pipe.status.policy, https: true } } } };
+        const probe = { ...welcome, pipe: { ...welcome.pipe, status: { ...welcome.pipe.status, decrypting: true, policy: { ...welcome.pipe.status.policy, https: true } } } };
         act(() => runtime.store.setEngine({ ...runtime.store.getState().engine, probe, ...patch }));
       }
       return screen.queryByTestId("app-https");
@@ -111,7 +111,7 @@ describe("apps screen", () => {
       const { runtime } = await setup();
       const welcome = parseEngineProbe(fixture.examples.idle);
       if (welcome.pipe?.kind !== "welcome") throw new Error("the example answers");
-      const probe = { ...welcome, pipe: { ...welcome.pipe, status: { ...welcome.pipe.status, policy: { ...welcome.pipe.status.policy, https: true } } } };
+      const probe = { ...welcome, pipe: { ...welcome.pipe, status: { ...welcome.pipe.status, decrypting: true, policy: { ...welcome.pipe.status.policy, https: true } } } };
       act(() => runtime.store.setEngine({ ...runtime.store.getState().engine, probe, exclusions: { revision: 1, rows: [rowFor('"pin.example"', ["firefox.exe"])], scope: "all", browsers: [], skipped: 0 } }));
       render(
         <SieveProvider runtime={runtime}>
