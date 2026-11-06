@@ -75,10 +75,10 @@ function isIpv6(s: string): boolean {
   if (v4 && !isIpv4(tail)) return false;
   const head = v4 ? s.slice(0, lastColon + 1) + "0:0" : s;
   const compressed = head.includes("::");
-  const groups = head.split(":").filter((g) => g !== "");
+  // Only `::` may stand for no groups: a stray colon beside it leaves an empty one.
+  const groups = head.split("::").flatMap((side) => (side === "" ? [] : side.split(":")));
   const groupOk = groups.every((g) => /^[0-9a-fA-F]{1,4}$/.test(g));
-  const edges = compressed || (!head.startsWith(":") && !head.endsWith(":"));
-  return groupOk && edges && (compressed ? groups.length < 8 : groups.length === 8);
+  return groupOk && (compressed ? groups.length < 8 : groups.length === 8);
 }
 
 /** One line as the engine would read it, or why it would skip it. A comment or a blank line is not a line. */

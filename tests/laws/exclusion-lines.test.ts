@@ -24,6 +24,10 @@ describe("exclusion line law", () => {
     }
   });
 
+  it("an address form both parsers take reads as an address, though the engine writes it shorter", () => {
+    for (const line of table.ipForms) expect(parseExclusionLine(line), line).toEqual({ kind: "ip", value: line, apps: [] });
+  });
+
   it("the Rust test reads the same table", () => {
     expect(read("engine/crates/sieve-filter/tests/exclusion_lines.rs")).toContain("exclusion-lines.json");
     expect(read("engine/crates/sieve-engine/src/exclusions/browsers.rs")).toContain("exclusion-lines.json");

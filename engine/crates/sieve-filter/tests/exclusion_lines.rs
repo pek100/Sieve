@@ -16,6 +16,19 @@ fn every_exe_of_the_shared_table_folds_as_it_says() {
     }
 }
 
+/// Their text is not the address's canonical form, so `lines` cannot hold them.
+#[test]
+fn every_address_form_of_the_shared_table_reads_as_an_address() {
+    let table: Value = serde_json::from_str(TABLE).unwrap();
+    let forms = table["ipForms"].as_array().unwrap();
+    assert!(!forms.is_empty());
+    for form in forms {
+        let line = form.as_str().unwrap();
+        let entry = parse_line(line).unwrap_or_else(|why| panic!("{line}: {why:?}"));
+        assert!(matches!(entry.pattern, Pattern::Ip(_)), "{line}");
+    }
+}
+
 #[test]
 fn every_line_of_the_shared_table_reads_as_it_says() {
     let table: Value = serde_json::from_str(TABLE).unwrap();
