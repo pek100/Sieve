@@ -1,5 +1,5 @@
 //! sieve-engine.exe: the Windows service (no argument) and its verbs
-//! `install`, `uninstall`, `restore` (see `sieve_engine::service`).
+//! `install`, `uninstall`, `restore`, `update-finish` (see `sieve_engine::service`).
 
 #[cfg(not(windows))]
 fn main() {
@@ -10,6 +10,7 @@ fn main() {
 #[cfg(windows)]
 fn main() {
     use sieve_engine::service::{USAGE, Verb, parse_verb, report, runner, scm};
+    use sieve_engine::update;
 
     let verb = match parse_verb(std::env::args().skip(1)) {
         Ok(v) => v,
@@ -25,6 +26,10 @@ fn main() {
                 std::process::exit(2);
             }
             return;
+        }
+        Verb::UpdateFinish => {
+            runner::system32_only();
+            std::process::exit(update::win::finish_verb());
         }
         Verb::Install => ("install", scm::install()),
         Verb::Uninstall => ("uninstall", scm::uninstall()),

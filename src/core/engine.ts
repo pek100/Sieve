@@ -13,7 +13,10 @@
  *
  * The slice has one writer, the engine controller (src/data/engine-controller.ts).
  */
-import type { CertState, CertStatus, EngineBlocker, EngineProbe, EngineStatus, FirefoxTrust, ListFact } from "@/data/protocol";
+import type { CertState, CertStatus, EngineBlocker, EngineProbe, EngineStatus, EngineUpdate, FirefoxTrust, ListFact } from "@/data/protocol";
+
+/** An update state that says nothing: no answer, or a missing or broken one. */
+export const NO_UPDATE_NEWS: EngineUpdate = { kind: "not_configured" };
 
 /** How often the engine is asked while Sieve is open (plan 1.6.5). */
 export const ENGINE_POLL_MS = 2000;
@@ -43,7 +46,7 @@ export interface EngineSlice {
   error: string | null;
   /** An AdGuard stop or start the user asked for, while Windows runs it. */
   adguard?: AdguardAction;
-  /** Why the last AdGuard stop or start, or policy change, failed; null after a good one. */
+  /** Why the last AdGuard stop or start, policy change or update request failed; null after a good one. */
   actionError?: string | null;
   /** The root certificate as the engine last said; null while it cannot be asked. */
   cert?: CertStatus | null;
@@ -51,6 +54,8 @@ export interface EngineSlice {
   certError?: string | null;
   /** Why the user's last Reinstall failed; null after a good one. */
   certActionError?: string | null;
+  /** An update request on its way to the engine. */
+  requestingUpdate?: boolean;
 }
 
 export const EMPTY_ENGINE: EngineSlice = { probe: null, error: null, adguard: null, actionError: null, cert: null, certError: null, certActionError: null };
@@ -318,6 +323,58 @@ export function certInstalled(cert: CertStatus | null | undefined): boolean {
 /** The engine holds `filtering.https` on (its Status's policy), so it can take a Reinstall. */
 export function httpsInForce(e: EngineSlice): boolean {
   return engineStatus(e)?.policy.https === true;
+}
+
+/** Where signed updates stand; nothing to say when the engine did not answer or said nothing. */
+export function engineUpdate(e: EngineSlice): EngineUpdate {
+  return engineStatus(e)?.update ?? NO_UPDATE_NEWS;
+}
+
+/** What the Engine block shows about updates. */
+export interface UpdateNotice {
+  text: string;
+  /** Read as a problem. */
+  problem: boolean;
+  /** The one button, when one is offered: `RequestUpdate` means this in this state. */
+  action: string | null;
+}
+
+export const CHECK_AGAIN = "Check again";
+export const INSTALL_UPDATE = "Install update";
+
+/** What is said about updates, or null for the states that show nothing. Never installs unasked. */
+export function updateNotice(update: EngineUpdate): UpdateNotice | null {
+  switch (update.kind) {
+    case "current":
+      return { text: "Sieve is up to date.", problem: false, action: CHECK_AGAIN };
+    case "available":
+      return {
+        text: `Sieve ${update.version} is available. Installing it stops the engine for a few seconds and may close this window. Your network works as usual.`,
+        problem: false,
+        action: INSTALL_UPDATE,
+      };
+    case "applying":
+      return { text: `Installing Sieve ${update.version}. The engine restarts by itself; your network works as usual.`, problem: false, action: null };
+    case "stale":
+      return { text: "The update host's list of versions has expired, so Sieve did not use it. Nothing was changed.", problem: true, action: CHECK_AGAIN };
+    case "failed":
+      return { text: `Sieve could not check for updates: ${update.message}`, problem: false, action: CHECK_AGAIN };
+    case "refused":
+      return { text: `Sieve refused an update and changed nothing: ${update.message}`, problem: true, action: CHECK_AGAIN };
+    case "rolled_back":
+      return { text: `Sieve ${update.version} did not start, so the previous version is back. Your network works as usual.`, problem: true, action: CHECK_AGAIN };
+    case "not_configured":
+    case "idle":
+    case "checking":
+      return null;
+  }
+}
+
+/** The Home banner, for what the user should know without opening Settings. */
+export function updateBanner(update: EngineUpdate): string | null {
+  if (update.kind === "available") return `Sieve ${update.version} is available. Install it in Settings > Filtering.`;
+  if (update.kind === "rolled_back") return `Sieve ${update.version} did not start, so the previous version is back. Your network works as usual.`;
+  return null;
 }
 
 /** The engine's version, when it said it. */

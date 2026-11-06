@@ -7,6 +7,10 @@
 //! `scripts/resources/assemble-ubo.mjs` (docs/tasks/2026-11-02-content.md, D1):
 //! adblock-rust's own assembler cannot read a current uBlock Origin, panics on
 //! bad input and gives every scriptlet the default permission.
+//!
+//! From slice 13 the engine also receives the bundle as a signed update
+//! (`updates\resources`, `sieve_engine::update`); the pin retires once a loader
+//! here reads that file.
 
 use std::collections::HashSet;
 

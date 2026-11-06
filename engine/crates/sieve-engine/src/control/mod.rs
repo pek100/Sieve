@@ -28,6 +28,7 @@ use crate::lists::Lists;
 use crate::policy::{self, Runs};
 use crate::stack::Meters;
 use crate::stack::book::FlowBook;
+use crate::update::cycle::UpdateControl;
 use crate::watchdog::{Arm, Beats};
 
 /// Batches a slow client may fall behind by before it is disconnected (it
@@ -98,6 +99,8 @@ pub struct Engine {
     pub ca_wake: Notify,
     /// The user asked for a new root; the certificate loop takes it.
     reinstall: AtomicBool,
+    /// Signed updates: `not_configured` until the service attaches its worker.
+    pub updates: Arc<UpdateControl>,
 }
 
 /// `install_root`'s refusal while the switch is off (plan 7.3: no root
@@ -151,6 +154,7 @@ impl Engine {
             ca: OnceLock::new(),
             ca_wake: Notify::new(),
             reinstall: AtomicBool::new(false),
+            updates: Arc::default(),
         }
     }
 
@@ -327,6 +331,7 @@ impl Backend for Engine {
             counters: self.meters.counters(),
             guests,
             filter: None,
+            update: self.updates.status(),
         }
     }
 
@@ -400,6 +405,11 @@ impl Backend for Engine {
         self.reinstall.store(true, Ordering::SeqCst);
         self.ca_wake.notify_one();
         Ok(self.cert_status())
+    }
+
+    fn request_update(&self) -> Result<EngineStatus, String> {
+        self.updates.request(crate::watchdog::monotonic_ms())?;
+        Ok(self.status())
     }
 }
 
@@ -772,6 +782,14 @@ mod tests {
         e.set_policy(switches(3, true)).unwrap();
         assert_eq!(e.crash_loop(), None);
         assert_eq!(e.status().blocker, None);
+    }
+
+    /// A build with no worker: nothing to report and nothing queued.
+    #[test]
+    fn an_engine_without_an_updater_answers_not_configured() {
+        let e = engine(Policy::default(), None);
+        assert_eq!(e.status().update, sieve_ipc::UpdateStatus::NotConfigured);
+        assert_eq!(e.request_update().unwrap().update, sieve_ipc::UpdateStatus::NotConfigured);
     }
 
     #[test]

@@ -49,6 +49,10 @@ pub trait Backend: Send + Sync + 'static {
     /// Asks for a new root (refused unless `policy.https` is on) and answers
     /// the status as it stands; the certificate loop does the work.
     fn install_root(&self) -> Result<CertStatus, String>;
+    /// `RequestUpdate`: a check, or applying the release on offer, decided from
+    /// the engine's own state, answered at once with the Status. An error when
+    /// asked again inside the cooldown.
+    fn request_update(&self) -> Result<EngineStatus, String>;
 }
 
 pub struct Subscription {
@@ -116,6 +120,10 @@ where
             },
             Ok(ClientMessage::SetDnsUpstreams(list)) => match backend.set_dns_upstreams(list) {
                 Ok(held) => EngineMessage::DnsUpstreams(held),
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::RequestUpdate {}) => match backend.request_update() {
+                Ok(status) => EngineMessage::Status(status),
                 Err(message) => EngineMessage::Error { message },
             },
             Ok(ClientMessage::Subscribe) => return stream_flows(stream, session_id, backend).await,
@@ -239,12 +247,13 @@ mod tests {
         flows: broadcast::Sender<Arc<Vec<FlowEvent>>>,
         routes: tokio::sync::watch::Sender<bool>,
         refreshes: Mutex<u64>,
+        update_requests: Mutex<u32>,
     }
 
     impl Fake {
         fn new(open: Vec<FlowEvent>) -> Arc<Self> {
             let routes = tokio::sync::watch::channel(true).0;
-            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, routes, refreshes: Mutex::default() })
+            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0) })
         }
     }
 
@@ -276,6 +285,44 @@ mod tests {
         fn install_root(&self) -> Result<CertStatus, String> {
             if self.policy.lock().unwrap().https { Ok(self.cert_status()) } else { Err("https is off".into()) }
         }
+        fn request_update(&self) -> Result<EngineStatus, String> {
+            let mut asked = self.update_requests.lock().unwrap();
+            *asked += 1;
+            if *asked > 1 {
+                return Err("too soon".into());
+            }
+            Ok(EngineStatus { update: sieve_ipc::UpdateStatus::Checking, ..EngineStatus::default() })
+        }
+    }
+
+    #[tokio::test]
+    async fn request_update_answers_status() {
+        let (mut c, task) = start(1);
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::RequestUpdate {}).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.update == sieve_ipc::UpdateStatus::Checking));
+        send(&mut c, &ClientMessage::RequestUpdate {}).await;
+        assert_eq!(recv(&mut c).await, EngineMessage::Error { message: "too soon".into() }, "over the limit: an error, and the pipe stays");
+        send(&mut c, &ClientMessage::Status).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Status(_)));
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_update_with_any_field_is_refused() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = start_with(1, fake.clone());
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        let body = br#"{"type":"request_update","url":"https://elsewhere.example/x.exe"}"#;
+        let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(body);
+        c.write_all(&frame).await.unwrap();
+        assert!(matches!(recv(&mut c).await, EngineMessage::Error { .. }));
+        task.await.unwrap().unwrap();
+        assert_eq!(*fake.update_requests.lock().unwrap(), 0, "the engine never saw a request");
     }
 
     async fn send(s: &mut DuplexStream, m: &ClientMessage) {

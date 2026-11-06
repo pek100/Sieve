@@ -15,6 +15,8 @@
 //!   the per-list report; the second also asks for a download of every list.
 //! - `engine_cert_status() -> CertStatus`, `engine_install_root() -> CertStatus`:
 //!   the root certificate's facts, and the user's Reinstall (plan 8.1).
+//! - `engine_request_update() -> EngineStatus`: asks the engine to update; it
+//!   carries nothing, and the engine alone fetches and verifies (plan 7.5).
 //! - [`EngineFlows`]: while the engine routes, a subscription to its `Flows`
 //!   events; `net_snapshot` then builds the snapshot from them instead of
 //!   the connection tables (whose rows would show every flow twice: the
@@ -308,7 +310,17 @@ mod imp {
 
     /// Sends the policy; the engine's Status after it, or why not.
     pub async fn set_policy(name: &str, policy: Policy) -> Result<EngineStatus, String> {
-        match tokio::time::timeout(PROBE_TIMEOUT, request(name, ClientMessage::SetPolicy(policy))).await {
+        status_of(name, ClientMessage::SetPolicy(policy)).await
+    }
+
+    /// `RequestUpdate`; the engine's Status, or why it refused (asked too soon).
+    pub async fn request_update(name: &str) -> Result<EngineStatus, String> {
+        status_of(name, ClientMessage::RequestUpdate {}).await
+    }
+
+    /// One request answered with a Status, or the reason it was not.
+    async fn status_of(name: &str, msg: ClientMessage) -> Result<EngineStatus, String> {
+        match tokio::time::timeout(PROBE_TIMEOUT, request(name, msg)).await {
             Ok(Ok(PipeFact::Welcome { status, .. })) => Ok(*status),
             Ok(Ok(PipeFact::Refused { message } | PipeFact::Unreachable { message })) => Err(message),
             Ok(Ok(PipeFact::Incompatible { supported })) => Err(format!("the engine speaks protocol {} to {}", supported[0], supported[1])),
@@ -494,6 +506,21 @@ pub async fn engine_install_root() -> Result<CertStatus, String> {
     Err("the engine runs on Windows only".into())
 }
 
+/// Command: the update button. No argument: the engine alone decides what this
+/// means, where it fetches from and what it verifies (plan 7.5). The engine's
+/// Status, or its refusal.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_request_update() -> Result<EngineStatus, String> {
+    imp::request_update(PIPE_NAME).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_request_update() -> Result<EngineStatus, String> {
+    Err("the engine runs on Windows only".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,13 +684,17 @@ mod tests {
                 None
             }
         });
+        let welcome = |status| PipeFact::Welcome { engine_version: String::new(), session_id: 0, status: Box::new(status) };
         let fact = match ask.clone() {
             ClientAsk::Status => Ok(imp::pipe_fact(name).await),
-            ClientAsk::Policy(p) => imp::set_policy(name, p).await.map(|status| PipeFact::Welcome { engine_version: String::new(), session_id: 0, status: Box::new(status) }),
+            ClientAsk::Policy(p) => imp::set_policy(name, p).await.map(welcome),
+            ClientAsk::Update => imp::request_update(name).await.map(welcome),
         };
         let asked = engine.await.unwrap();
-        if let (Some(asked), ClientAsk::Policy(p)) = (asked, ask) {
-            assert_eq!(asked, ClientMessage::SetPolicy(p));
+        match (asked, ask) {
+            (Some(asked), ClientAsk::Policy(p)) => assert_eq!(asked, ClientMessage::SetPolicy(p)),
+            (Some(asked), ClientAsk::Update) => assert_eq!(asked, ClientMessage::RequestUpdate {}),
+            _ => {}
         }
         fact
     }
@@ -673,6 +704,7 @@ mod tests {
     enum ClientAsk {
         Status,
         Policy(Policy),
+        Update,
     }
 
     #[cfg(windows)]
@@ -813,6 +845,19 @@ mod tests {
         let off = EngineMessage::Error { message: "HTTPS filtering is off".into() };
         assert_eq!(cert_engine("off", ClientMessage::InstallRoot, off).await, Err("HTTPS filtering is off".to_string()));
         assert!(imp::cert(&test_pipe("nobody-cert"), ClientMessage::CertStatus).await.is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn request_update_sends_the_one_message_and_returns_the_status_or_its_refusal() {
+        use sieve_ipc::{EngineMessage, UpdateStatus};
+        let welcome = || EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 };
+        let after = EngineStatus { update: UpdateStatus::Checking, ..EngineStatus::default() };
+        let got = fake_engine(&test_pipe("update"), welcome(), EngineMessage::Status(after.clone()), ClientAsk::Update).await;
+        assert!(matches!(got, Ok(PipeFact::Welcome { status, .. }) if *status == after));
+        let soon = EngineMessage::Error { message: "try again in a few minutes".into() };
+        let got = fake_engine(&test_pipe("update-soon"), welcome(), soon, ClientAsk::Update).await;
+        assert_eq!(got, Err("try again in a few minutes".into()));
     }
 
     #[cfg(windows)]

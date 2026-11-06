@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createPassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase } from "@/core/engine";
+import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineUpdate } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
 import type { SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
@@ -70,6 +70,7 @@ function fakeEngine(start: EngineScenario) {
     },
     lists: () => mock.lists(),
     listsRefresh: () => mock.listsRefresh(),
+    requestUpdate: () => mock.requestUpdate(),
     stopAdguard: () => mock.stopAdguard(),
     startAdguard: () => mock.startAdguard(),
     logTail: (since) => mock.logTail(since),
@@ -94,6 +95,75 @@ function setup(start: EngineScenario, backend: SettingsBackend = memoryBackend()
   const phase = () => enginePhase(store.getState().engine);
   return { fc, store, fake, settings, checks, notices, controller, undo, phase };
 }
+
+describe("engine controller, updates", () => {
+  const banners = (s: ReturnType<typeof setup>) => s.notices.list().filter((n) => n.surface === "banner").map((n) => n.text);
+  const update = (s: ReturnType<typeof setup>) => engineUpdate(s.store.getState().engine);
+
+  it("the update button sends the one request and the answer shows at once", async () => {
+    const s = setup("update_available");
+    await s.fc.flush();
+    await s.controller.requestUpdate();
+    expect(update(s)).toEqual({ kind: "applying", version: "0.2.0" });
+    expect(s.store.getState().engine.actionError).toBeNull();
+    s.undo();
+  });
+
+  it("a request the engine refuses is said, and the state stands", async () => {
+    const s = setup("update_current");
+    await s.fc.flush();
+    s.fake.source.requestUpdate = async () => {
+      throw new Error("an update check ran moments ago; try again in a few minutes");
+    };
+    await s.controller.requestUpdate();
+    expect(s.store.getState().engine.actionError).toMatch(/did not go through.*moments ago/);
+    expect(s.store.getState().engine.requestingUpdate).toBe(false);
+    expect(update(s)).toEqual({ kind: "current" });
+    s.undo();
+  });
+
+  it("a second click while the first is in flight sends nothing", async () => {
+    const s = setup("update_available");
+    await s.fc.flush();
+    let asked = 0;
+    let finish = () => {};
+    const status = await s.fake.source.requestUpdate();
+    s.fake.source.requestUpdate = () => {
+      asked++;
+      return new Promise((resolve) => {
+        finish = () => resolve(status);
+      });
+    };
+    const first = s.controller.requestUpdate();
+    await s.controller.requestUpdate();
+    finish();
+    await first;
+    expect(asked).toBe(1);
+    s.undo();
+  });
+
+  it("one Home banner for an offered release, replaced when it is rolled back, gone when it is over", async () => {
+    const s = setup("update_available");
+    await s.fc.flush();
+    expect(banners(s)).toEqual(["Sieve 0.2.0 is available. Install it in Settings > Filtering."]);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(banners(s)).toHaveLength(1);
+    s.fake.set("update_rolled_back");
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(banners(s)).toEqual(["Sieve 0.2.0 did not start, so the previous version is back. Your network works as usual."]);
+    s.fake.set("update_current");
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(banners(s)).toEqual([]);
+    s.undo();
+  });
+
+  it("the banner goes with the controller", async () => {
+    const s = setup("update_available");
+    await s.fc.flush();
+    s.undo();
+    expect(banners(s)).toEqual([]);
+  });
+});
 
 describe("engine controller", () => {
   it("probes at bind and writes the facts to the store", async () => {

@@ -130,6 +130,20 @@ describe("bundle law", () => {
     expect(macro("NSIS_HOOK_POSTUNINSTALL")).toContain('Delete "${SIEVE_RESTORE_LINK}"');
   });
 
+  it("removes what a signed update can leave, or the folder stays behind on uninstall", () => {
+    const swap = read("engine/crates/sieve-engine/src/update/swap.rs");
+    const post = macro("NSIS_HOOK_POSTUNINSTALL");
+    const staging = swap.match(/pub const STAGING_DIR: &str = "([^"]+)";/)?.[1];
+    const old = swap.match(/pub const OLD_SUFFIX: &str = "([^"]+)";/)?.[1];
+    const failed = swap.match(/pub const FAILED_SUFFIX: &str = "([^"]+)";/)?.[1];
+    expect([staging, old, failed].every(Boolean)).toBe(true);
+    const leftovers = [`RMDir /r "$INSTDIR\\${staging}"`, `Delete "$INSTDIR\\*${old}"`, `Delete "$INSTDIR\\*${failed}"`];
+    for (const line of leftovers) {
+      expect(post).toContain(line);
+      expect(post.indexOf(line)).toBeLessThan(post.indexOf('RMDir "$INSTDIR"'));
+    }
+  });
+
   it("names the engine's marker and refusal exit code", () => {
     const marker = hooks.match(/!define SIEVE_MARKER "([^"]+)"/)?.[1];
     expect(engineImage).toContain(`pub const MARKER_FILE: &str = "${marker}";`);

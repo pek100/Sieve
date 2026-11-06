@@ -33,7 +33,8 @@
       "upstreams": ["https://cloudflare-dns.com/dns-query", "tls://dns.quad9.net", "quic://dns.example:8853"]
     },
     { "type": "cert_status" },
-    { "type": "install_root" }
+    { "type": "install_root" },
+    { "type": "request_update" }
   ],
   "engine": [
     { "type": "welcome", "protocol": 3, "engine_version": "0.1.0", "session_id": 1 },
@@ -49,6 +50,7 @@
       "policy": { "revision": 3, "engine": true, "sieving": true, "off_apps": ["firefox"], "lists": ["adguard-dns"], "domain_lists": [], "https": false },
       "blocker": null,
       "split_tunnels": ["Corp VPN"],
+      "update": { "kind": "current" },
       "counters": {
         "flows": 120,
         "attributed": 118,
@@ -361,6 +363,18 @@
       "last_error": null
     }
   },
+  "updates": [
+    { "kind": "not_configured" },
+    { "kind": "idle" },
+    { "kind": "checking" },
+    { "kind": "current" },
+    { "kind": "available", "version": "0.2.0" },
+    { "kind": "applying", "version": "0.2.0" },
+    { "kind": "stale" },
+    { "kind": "failed", "message": "could not reach the update host" },
+    { "kind": "refused", "message": "the signature does not verify" },
+    { "kind": "rolled_back", "version": "0.2.0" }
+  ],
   "blockers": [
     { "kind": "adguard", "service": "Adguard Service" },
     { "kind": "vpn", "adapter": "AdGuard VPN" },

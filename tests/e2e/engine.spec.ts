@@ -17,6 +17,32 @@ const noHorizontalScroll = (page: Page) => page.evaluate(() => document.document
 const switchedOn = (page: Page) =>
   page.addInitScript(() => window.localStorage.setItem("sieve.settings", JSON.stringify({ schema: 4, values: { "filtering.engine": true } })));
 
+test.describe("engine updates", () => {
+  test("an offered release: plain text and one button; installing it shows it applying", async ({ page }, info) => {
+    const { block, errors } = await openEngine(page, "update_available");
+    const update = block.locator("[data-engine-update]");
+    await expect(update).toHaveAttribute("data-engine-update", "available");
+    await expect(update).toContainText("Sieve 0.2.0 is available.");
+    await update.scrollIntoViewIfNeeded();
+    expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
+    await block.screenshot({ path: `test-results/screens/engine-update-available-${info.project.name}.png` });
+    await update.getByRole("button", { name: "Install update" }).click();
+    await expect(update).toHaveAttribute("data-engine-update", "applying");
+    await expect(update.getByRole("button")).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+
+  test("a rolled back release is said as a problem, with the network still normal", async ({ page }, info) => {
+    const { block, errors } = await openEngine(page, "update_rolled_back");
+    const update = block.locator("[data-engine-update]");
+    await expect(update).toHaveAttribute("data-engine-update", "rolled_back");
+    await expect(update.getByRole("alert")).toContainText("did not start, so the previous version is back. Your network works as usual.");
+    await expect(update.getByRole("button", { name: "Check again" })).toBeVisible();
+    await block.screenshot({ path: `test-results/screens/engine-update-rolled-back-${info.project.name}.png` });
+    expect(errors).toEqual([]);
+  });
+});
+
 test.describe("engine", () => {
   test("a refused copy locks the switch, explains where to open Sieve, and leaves its stored wish alone", async ({ page }) => {
     await switchedOn(page);

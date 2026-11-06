@@ -16,9 +16,11 @@ import {
   enginePhase,
   engineRoutes,
   engineStatus,
+  engineUpdate,
   engineVersion,
   hostAttribution,
   splitTunnelText,
+  updateNotice,
 } from "@/core/engine";
 import { useEngine, useEngineActions } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
@@ -39,10 +41,14 @@ const ADGUARD_OFFER_TEXT = { pause: ADGUARD_PAUSE_TEXT, start: ADGUARD_START_TEX
  * exactly what it does (it asks that service to stop; Windows asks first).
  * After a pause the service stays stopping, so the block says how to resume it
  * and has no button; "Start AdGuard again" is for a service really stopped.
+ * Updates are plain text and one button: the button only sends `RequestUpdate`,
+ * and the engine fetches and verifies.
  */
 export function EngineCard() {
   const e = useEngine();
-  const { stopAdguard, startAdguard } = useEngineActions();
+  const { stopAdguard, startAdguard, requestUpdate } = useEngineActions();
+  const update = engineUpdate(e);
+  const notice = updateNotice(update);
   const phase = enginePhase(e);
   const version = engineVersion(e);
   const offer = adguardOffer(e);
@@ -113,6 +119,18 @@ export function EngineCard() {
             {offer === "start" && (
               <Button variant="secondary" disabled={busy !== null} onClick={() => void startAdguard()}>
                 {busy === "starting" ? "Starting AdGuard" : "Start AdGuard again"}
+              </Button>
+            )}
+          </div>
+        )}
+        {notice && (
+          <div className="flex flex-col items-start gap-2" data-engine-update={update.kind}>
+            <p role={notice.problem ? "alert" : undefined} className={cn("text-label break-words", notice.problem ? "text-blocked" : "text-on-surface-muted")}>
+              {notice.text}
+            </p>
+            {notice.action && (
+              <Button variant="secondary" disabled={e.requestingUpdate === true} onClick={() => void requestUpdate()}>
+                {notice.action}
               </Button>
             )}
           </div>

@@ -10,7 +10,8 @@
  * pausing AdGuard lets a waiting engine route with AdGuard's service left
  * stopping (`adguard_paused`, as the real AdGuard does); starting a service
  * that is really stopped (the `filtering` example) makes the engine wait, and
- * a stopping one cannot be started. The rest of a sent policy is held and
+ * a stopping one cannot be started; requesting an update while one is on offer
+ * starts applying it, and any other request answers the state as it is. The rest of a sent policy is held and
  * echoed, as the engine would, so the controller sees it in force. Nothing
  * else is invented.
  *
@@ -60,6 +61,13 @@ export const ENGINE_SCENARIOS = [
   "refused",
   "unreachable",
   "error",
+  "update_current",
+  "update_available",
+  "update_applying",
+  "update_stale",
+  "update_failed",
+  "update_refused",
+  "update_rolled_back",
 ] as const;
 export type EngineScenario = (typeof ENGINE_SCENARIOS)[number];
 
@@ -76,7 +84,23 @@ export const MOCK_HTTPS_OFF = "HTTPS filtering is off, so there is no certificat
 /** The message of a failed log read (?log=error). */
 export const MOCK_LOG_ERROR = "the engine's log could not be read";
 
-const WELCOME: readonly EngineScenario[] = ["idle", "filtering", "hosts", "adguard", "adguard_paused", "vpn", "crash_loop", "setup"];
+const WELCOME: readonly EngineScenario[] = [
+  "idle",
+  "filtering",
+  "hosts",
+  "adguard",
+  "adguard_paused",
+  "vpn",
+  "crash_loop",
+  "setup",
+  "update_current",
+  "update_available",
+  "update_applying",
+  "update_stale",
+  "update_failed",
+  "update_refused",
+  "update_rolled_back",
+];
 const ROUTES: readonly EngineScenario[] = ["filtering", "hosts", "adguard_paused"];
 
 function statusOf(scenario: EngineScenario): EngineStatus {
@@ -125,11 +149,17 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
     setPolicy: async (policy: EnginePolicy) => {
       requireWelcome();
       if (!policy.engine) scenario = "idle";
-      else if (scenario === "idle" || scenario === "crash_loop") scenario = "filtering";
+      // The update examples are the idle engine with another update state.
+      else if (scenario === "idle" || scenario === "crash_loop" || scenario.startsWith("update_")) scenario = "filtering";
       if (https && !policy.https) cert = "policy_off";
       if (!https && policy.https && (cert === "policy_off" || cert === "not_installed")) cert = "installed";
       https = policy.https;
       held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists, https: policy.https };
+      return echo(statusOf(scenario));
+    },
+    requestUpdate: async () => {
+      requireWelcome();
+      if (scenario === "update_available") scenario = "update_applying";
       return echo(statusOf(scenario));
     },
     lists,

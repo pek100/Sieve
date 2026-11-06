@@ -30,8 +30,21 @@ describe("Tauri engine source", () => {
     expect(calls).toEqual(["engine_lists", "engine_lists_refresh"]);
   });
 
+  it("asks for an update with no argument at all, and validates the Status", async () => {
+    const calls: unknown[][] = [];
+    const status = (fixture.examples.update_available.pipe as { status: unknown }).status;
+    const invoke = async <T,>(...args: unknown[]): Promise<T> => {
+      calls.push(args);
+      return status as T;
+    };
+    const got = await createTauriEngine(invoke).requestUpdate();
+    expect(got.update).toEqual({ kind: "available", version: "0.2.0" });
+    expect(calls).toEqual([["engine_request_update"]]);
+    await expect(createTauriEngine(async <T,>() => ({}) as T).requestUpdate()).rejects.toThrow(ProtocolError);
+  });
+
   it("a malformed answer and a failed command reject, never become a fake state", async () => {
-    const bad = async <T,>(): Promise<T> => ({ v: 2, service: "running", pipe: { kind: "welcome" } }) as T;
+    const bad = async <T,>(): Promise<T> => ({ v: 3, service: "running", pipe: { kind: "welcome" } }) as T;
     await expect(createTauriEngine(bad).probe()).rejects.toThrow(ProtocolError);
     const failed = async <T,>(): Promise<T> => {
       throw new Error("service manager: Access is denied.");

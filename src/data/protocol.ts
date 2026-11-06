@@ -4,6 +4,7 @@
  * which sockets they own. Changing the shape bumps PROTOCOL_VERSION and the
  * fixture (src/data/fixtures/snapshot-v1.json) in the same commit.
  */
+import { NO_UPDATE_NEWS } from "@/core/engine";
 import { GRAIN_NAMES, type GrainName } from "@/core/history";
 
 export const PROTOCOL_VERSION = 1 as const;
@@ -245,6 +246,14 @@ export type ServiceFact = (typeof SERVICE_FACTS)[number];
 export const PIPE_KINDS = ["welcome", "incompatible", "refused", "unreachable"] as const;
 /** `sieve-ipc` Blocker kinds, in declaration order. */
 export const BLOCKER_KINDS = ["adguard", "vpn", "crash_loop", "setup"] as const;
+/** `sieve-ipc` UpdateStatus kinds, in declaration order. */
+export const UPDATE_KINDS = ["not_configured", "idle", "checking", "current", "available", "applying", "stale", "failed", "refused", "rolled_back"] as const;
+
+/** Where signed updates stand, as the engine says it (plan 7.5). `version` is for reading only. */
+export type EngineUpdate =
+  | { kind: "not_configured" | "idle" | "checking" | "current" | "stale" }
+  | { kind: "available" | "applying" | "rolled_back"; version: string }
+  | { kind: "failed" | "refused"; message: string };
 
 export type EngineBlocker =
   | { kind: "adguard"; service: string }
@@ -344,6 +353,7 @@ export interface EngineStatus {
   guests: EngineGuest[];
   /** Absent until the engine holds compiled lists, and from an older engine. */
   filter?: FilterFacts;
+  update: EngineUpdate;
 }
 
 /** One filter list as the engine compiled it (sieve-ipc `ListFact`; the catalogue stays in Rust). */
@@ -459,6 +469,33 @@ function filterFacts(raw: unknown): FilterFacts {
   };
 }
 
+/**
+ * The update state. Unlike the rest of the Status it never refuses the
+ * answer: updates are news, and a missing, partial or unknown one must not
+ * take the Engine block's facts down with it. It reads as nothing to say.
+ */
+function engineUpdate(raw: unknown): EngineUpdate {
+  if (!isRec(raw)) return NO_UPDATE_NEWS;
+  const { kind, version, message } = raw;
+  switch (kind) {
+    case "idle":
+    case "checking":
+    case "current":
+    case "stale":
+    case "not_configured":
+      return { kind };
+    case "available":
+    case "applying":
+    case "rolled_back":
+      return typeof version === "string" ? { kind, version } : NO_UPDATE_NEWS;
+    case "failed":
+    case "refused":
+      return typeof message === "string" ? { kind, message } : NO_UPDATE_NEWS;
+    default:
+      return NO_UPDATE_NEWS;
+  }
+}
+
 /** Validate an untrusted engine Status (sieve-ipc). Throws ProtocolError. */
 export function parseEngineStatus(raw: unknown): EngineStatus {
   const s = rec(raw, "status");
@@ -479,6 +516,7 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
     },
     guests: guests(s.guests),
     ...(s.filter === undefined || s.filter === null ? {} : { filter: filterFacts(s.filter) }),
+    update: engineUpdate(s.update),
   };
 }
 

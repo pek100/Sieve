@@ -22,6 +22,7 @@
           "policy": { "revision": 0, "engine": false, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
           "blocker": null,
           "split_tunnels": [],
+          "update": { "kind": "idle" },
           "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
           "guests": []
         }
@@ -45,6 +46,7 @@
           "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
           "blocker": null,
           "split_tunnels": ["Corp VPN"],
+          "update": { "kind": "idle" },
           "counters": { "flows": 1200, "attributed": 1188, "own_refused": 0, "dns_answers": 310, "packets_in": 90000, "packets_out": 88000, "not_unicast": 51, "blocked": 0, "forwarded": 6, "forwarded_named": 4, "etw_found": 3, "etw_disagreed": 1, "etw_dropped": 0 },
           "guests": [
             { "key": "vm:devbox", "vm": "DevBox", "seen": 4, "open": 1 },
@@ -71,6 +73,7 @@
           "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
           "blocker": null,
           "split_tunnels": [],
+          "update": { "kind": "idle" },
           "counters": { "flows": 1200, "attributed": 1188, "own_refused": 0, "dns_answers": 310, "packets_in": 90000, "packets_out": 88000, "not_unicast": 51, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
           "guests": [],
           "filter": {
@@ -101,6 +104,7 @@
           "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
           "blocker": { "kind": "adguard", "service": "Adguard Service" },
           "split_tunnels": [],
+          "update": { "kind": "idle" },
           "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
           "guests": []
         }
@@ -124,6 +128,7 @@
           "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
           "blocker": null,
           "split_tunnels": [],
+          "update": { "kind": "idle" },
           "counters": { "flows": 120, "attributed": 118, "own_refused": 0, "dns_answers": 30, "packets_in": 9000, "packets_out": 8800, "not_unicast": 5, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
           "guests": []
         }
@@ -147,6 +152,7 @@
           "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
           "blocker": { "kind": "vpn", "adapter": "AdGuard VPN" },
           "split_tunnels": [],
+          "update": { "kind": "idle" },
           "counters": { "flows": 300, "attributed": 297, "own_refused": 0, "dns_answers": 80, "packets_in": 20000, "packets_out": 19000, "not_unicast": 4, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
           "guests": []
         }
@@ -170,6 +176,7 @@
           "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
           "blocker": { "kind": "crash_loop", "starts": 3 },
           "split_tunnels": [],
+          "update": { "kind": "idle" },
           "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
           "guests": []
         }
@@ -193,6 +200,7 @@
           "policy": { "revision": 2, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
           "blocker": { "kind": "setup", "message": "wintun.dll: SHA-256 does not match the pinned 0.14.1 build" },
           "split_tunnels": [],
+          "update": { "kind": "idle" },
           "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
           "guests": []
         }
@@ -210,6 +218,174 @@
       "service": "running",
       "adguard": "missing",
       "pipe": { "kind": "unreachable", "message": "The system cannot find the file specified. (os error 2)" }
+    },
+    "update_current": {
+      "v": 3,
+      "service": "running",
+      "adguard": "missing",
+      "pipe": {
+        "kind": "welcome",
+        "engine_version": "0.1.0",
+        "session_id": 1,
+        "status": {
+          "filtering": false,
+          "routes_up": false,
+          "blocking": false,
+          "flows": 0,
+          "decrypting": false,
+          "last_error": null,
+          "policy": { "revision": 0, "engine": false, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
+          "blocker": null,
+          "split_tunnels": [],
+          "guests": [],
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "update": { "kind": "current" }
+        }
+      }
+    },
+    "update_available": {
+      "v": 3,
+      "service": "running",
+      "adguard": "missing",
+      "pipe": {
+        "kind": "welcome",
+        "engine_version": "0.1.0",
+        "session_id": 1,
+        "status": {
+          "filtering": false,
+          "routes_up": false,
+          "blocking": false,
+          "flows": 0,
+          "decrypting": false,
+          "last_error": null,
+          "policy": { "revision": 0, "engine": false, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
+          "blocker": null,
+          "split_tunnels": [],
+          "guests": [],
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "update": { "kind": "available", "version": "0.2.0" }
+        }
+      }
+    },
+    "update_applying": {
+      "v": 3,
+      "service": "running",
+      "adguard": "missing",
+      "pipe": {
+        "kind": "welcome",
+        "engine_version": "0.1.0",
+        "session_id": 1,
+        "status": {
+          "filtering": false,
+          "routes_up": false,
+          "blocking": false,
+          "flows": 0,
+          "decrypting": false,
+          "last_error": null,
+          "policy": { "revision": 0, "engine": false, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
+          "blocker": null,
+          "split_tunnels": [],
+          "guests": [],
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "update": { "kind": "applying", "version": "0.2.0" }
+        }
+      }
+    },
+    "update_stale": {
+      "v": 3,
+      "service": "running",
+      "adguard": "missing",
+      "pipe": {
+        "kind": "welcome",
+        "engine_version": "0.1.0",
+        "session_id": 1,
+        "status": {
+          "filtering": false,
+          "routes_up": false,
+          "blocking": false,
+          "flows": 0,
+          "decrypting": false,
+          "last_error": null,
+          "policy": { "revision": 0, "engine": false, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
+          "blocker": null,
+          "split_tunnels": [],
+          "guests": [],
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "update": { "kind": "stale" }
+        }
+      }
+    },
+    "update_failed": {
+      "v": 3,
+      "service": "running",
+      "adguard": "missing",
+      "pipe": {
+        "kind": "welcome",
+        "engine_version": "0.1.0",
+        "session_id": 1,
+        "status": {
+          "filtering": false,
+          "routes_up": false,
+          "blocking": false,
+          "flows": 0,
+          "decrypting": false,
+          "last_error": null,
+          "policy": { "revision": 0, "engine": false, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
+          "blocker": null,
+          "split_tunnels": [],
+          "guests": [],
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "update": { "kind": "failed", "message": "could not reach the update host" }
+        }
+      }
+    },
+    "update_refused": {
+      "v": 3,
+      "service": "running",
+      "adguard": "missing",
+      "pipe": {
+        "kind": "welcome",
+        "engine_version": "0.1.0",
+        "session_id": 1,
+        "status": {
+          "filtering": false,
+          "routes_up": false,
+          "blocking": false,
+          "flows": 0,
+          "decrypting": false,
+          "last_error": null,
+          "policy": { "revision": 0, "engine": false, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
+          "blocker": null,
+          "split_tunnels": [],
+          "guests": [],
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "update": { "kind": "refused", "message": "the signature does not verify" }
+        }
+      }
+    },
+    "update_rolled_back": {
+      "v": 3,
+      "service": "running",
+      "adguard": "missing",
+      "pipe": {
+        "kind": "welcome",
+        "engine_version": "0.1.0",
+        "session_id": 1,
+        "status": {
+          "filtering": false,
+          "routes_up": false,
+          "blocking": false,
+          "flows": 0,
+          "decrypting": false,
+          "last_error": null,
+          "policy": { "revision": 0, "engine": false, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false },
+          "blocker": null,
+          "split_tunnels": [],
+          "guests": [],
+          "counters": { "flows": 0, "attributed": 0, "own_refused": 0, "dns_answers": 0, "packets_in": 0, "packets_out": 0, "not_unicast": 0, "blocked": 0, "forwarded": 0, "forwarded_named": 0, "etw_found": 0, "etw_disagreed": 0, "etw_dropped": 0 },
+          "update": { "kind": "rolled_back", "version": "0.2.0" }
+        }
+      }
     }
   }
 }

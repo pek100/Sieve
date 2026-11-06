@@ -11,6 +11,7 @@
 //!   answers read into the IP-to-names map (slices 3, 4);
 //! - [`tls`]: the one owner of how the engine speaks TLS (plan 2.7);
 //! - [`coexist`]: AdGuard and VPN detection, read only (slice 3);
+//! - [`update`]: signed updates, the service as the only updater (slice 13);
 //! - [`watchdog`], [`policy`]: hang and crash-loop safety (slice 3);
 //! - [`control`]: the running engine's facts and its routing loop;
 //! - [`domain`]: the one per-flow decision (slice 4);
@@ -38,6 +39,7 @@ pub mod service;
 pub mod stack;
 pub mod tls;
 pub mod tun;
+pub mod update;
 pub mod watchdog;
 
 #[cfg(test)]

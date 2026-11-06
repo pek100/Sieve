@@ -3,13 +3,14 @@
 //!    is later loaded by absolute path after its hash check (`tun`).
 //! 2. It checks who can change its files (`image`, the same check as
 //!    `install`) and refuses to run when users can.
-//! 3. Before anything else touches the network: every route on an interface
+//! 3. It settles a signed update in flight (`update::state::on_service_start`).
+//! 4. Before anything else touches the network: every route on an interface
 //!    named "Sieve" and every journalled route is deleted (plan 1.6.3).
-//! 4. The run is recorded (`runs.json`); the third restart within an hour is
+//! 5. The run is recorded (`runs.json`); the third restart within an hour is
 //!    a crash loop and routes nothing (plan 1.6.4).
-//! 5. It reports Running, starts the watchdog thread, the routing loop and
-//!    the pipe, until Windows asks it to stop or shut down; then it takes the
-//!    routes down, records a clean stop and reports Stopped.
+//! 6. It reports Running, starts the watchdog thread, the updater's thread, the
+//!    routing loop and the pipe, until Windows asks it to stop or shut down; then
+//!    it takes the routes down, records a clean stop and reports Stopped.
 //!
 //! A panic on any thread but a flow worker deletes Sieve's routes and stops
 //! the ETW session before the process dies (plan 1.6.6); a flow task's panic
@@ -23,6 +24,7 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sieve_ipc::PIPE_NAME;
 use tokio::sync::{mpsc, watch};
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
@@ -42,6 +44,9 @@ use crate::ipc::server;
 use crate::policy::{self, crash_loop};
 use crate::route::apply::clear_stale;
 use crate::route::journal::Journal;
+use crate::update;
+use crate::update::state::{FileLog, Log};
+use crate::update::trust::OWN_RELEASE;
 use crate::watchdog::{self, Stall, Trip, monotonic_ms};
 
 /// Bound for the runtime's own shutdown after the pipe stops.
@@ -64,7 +69,8 @@ pub fn run() -> Result<(), windows_service::Error> {
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
 }
 
-fn system32_only() {
+/// Also for the `update-finish` verb, which runs from the staging folder.
+pub fn system32_only() {
     use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories};
     // SAFETY: a process-wide setting with a valid flag.
     let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
@@ -218,6 +224,9 @@ fn report_start_problems(engine: &Engine, policy_error: Option<String>, cleaned:
 /// failure code, so the SCM's recovery restarts it.
 fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
     let dir = state::engine_dir(&state::program_data()?);
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let install = exe.parent().ok_or_else(|| format!("{} has no folder", exe.display()))?;
+    let release = update::state::on_service_start(&dir, install, OWN_RELEASE, &FileLog::new(&dir));
     let journal = Journal::new(&dir);
     let cleaned = clear_stale(&journal);
     // A real-time session outlives a killed controller; nothing routes yet.
@@ -233,6 +242,7 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
     let sddl = pipe_sddl(owner.as_deref())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let engine = Arc::new(Engine::new(Some(dir.clone()), exe, policy, runs, crash));
+    update::win::start_worker(&engine.updates, &dir, &engine.exe);
     report_start_problems(&engine, policy_error, &cleaned);
     let ca = match real_ca(&dir) {
         Ok(ca) => {
@@ -284,6 +294,15 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
             tokio::spawn(certs::run(engine.clone(), ca, halt_rx.clone()));
         }
         let routing = tokio::spawn(routing::run(engine.clone(), halt_rx));
+        if let Some(pending) = release {
+            let dir = dir.clone();
+            tokio::spawn(async move {
+                // No report: the supervisor's deadline decides, and rolls back.
+                if let Err(why) = update::health::report(PIPE_NAME, &dir, &pending).await {
+                    FileLog::new(&dir).line(&format!("no health report: {why}"));
+                }
+            });
+        }
         let served = server::serve(&sddl, engine.clone(), stop).await;
         // The pipe ended (a stop, or a pipe error): the routes go down either way.
         let _ = halt_tx.send(true);

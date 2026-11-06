@@ -139,6 +139,57 @@ describe("Engine block", () => {
     expect(block().querySelector("[data-engine-action-error]")).toHaveTextContent("AdGuard was not paused");
   });
 
+  describe("updates", () => {
+    const update = () => block().querySelector("[data-engine-update]");
+
+    it("offered: plain text and one button; installing sends the request and shows it applying", async () => {
+      await setup(createMockEngine("update_available"));
+      await vi.waitFor(() => expect(update()?.getAttribute("data-engine-update")).toBe("available"));
+      expect(update()).toHaveTextContent("Sieve 0.2.0 is available. Installing it stops the engine");
+      await act(async () => screen.getByRole("button", { name: "Install update" }).click());
+      await vi.waitFor(() => expect(update()?.getAttribute("data-engine-update")).toBe("applying"));
+      expect(screen.queryByRole("button", { name: "Install update" })).toBeNull();
+    });
+
+    it("a refusal and a rollback read as problems with their reason; current is one quiet line", async () => {
+      await setup(createMockEngine("update_refused"));
+      await vi.waitFor(() => expect(update()).toHaveTextContent("the signature does not verify"));
+      expect(update()!.querySelector("p")!.getAttribute("role")).toBe("alert");
+      expect(screen.getByRole("button", { name: "Check again" })).toBeEnabled();
+    });
+
+    it("current says so quietly and is no alert", async () => {
+      await setup(createMockEngine("update_current"));
+      await vi.waitFor(() => expect(update()).toHaveTextContent("Sieve is up to date."));
+      expect(update()!.querySelector("p")!.getAttribute("role")).toBeNull();
+    });
+
+    it.each(["idle", "missing", "refused"] as const)("%s: nothing about updates", async (scenario) => {
+      await setup(createMockEngine(scenario));
+      await vi.waitFor(() => expect(phase()).not.toBe("checking"));
+      expect(update()).toBeNull();
+    });
+
+    /** frontend-resilience, step 6: what an older or broken engine could send. */
+    it.each([
+      ["missing", undefined],
+      ["null", null],
+      ["partial", { kind: "available" }],
+      ["partial message", { kind: "refused" }],
+      ["wrong type", "available"],
+      ["unknown kind", { kind: "sign", version: "9" }],
+    ])("degraded update (%s): no crash, no notice, the engine's facts stand", async (_, degraded) => {
+      const { parseEngineProbe } = await import("@/data/protocol");
+      const fixture = (await import("@/data/fixtures/engine-probe-v2.json")).default;
+      const idle = fixture.examples.idle;
+      const answer = { ...idle, pipe: { ...idle.pipe, status: { ...idle.pipe.status, update: degraded } } };
+      await setup({ ...createMockEngine("idle"), probe: async () => parseEngineProbe(answer) });
+      await vi.waitFor(() => expect(phase()).toBe("idle"));
+      expect(update()).toBeNull();
+      expect(state()).toBe("Installed, not routing");
+    });
+  });
+
   it("shows the engine's version only when the engine said it", async () => {
     await setup(createMockEngine("idle"));
     await vi.waitFor(() => expect(block()).toHaveTextContent("Engine version 0.1.0"));

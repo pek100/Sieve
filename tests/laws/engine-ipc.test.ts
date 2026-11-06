@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { REASON_TEXT } from "@/core/log";
 import fixture from "@/data/fixtures/engine-ipc-v3.json";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
-import { BLOCKER_KINDS, CERT_STATES, FIREFOX_TRUST, LOG_OUTCOMES, parseCertStatus, parseEngineLists, parseEngineStatus, parseLogTail } from "@/data/protocol";
+import { BLOCKER_KINDS, CERT_STATES, FIREFOX_TRUST, LOG_OUTCOMES, parseCertStatus, parseEngineLists, parseEngineStatus, parseLogTail, UPDATE_KINDS } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -78,6 +78,16 @@ describe("engine IPC law", () => {
       );
     expect(variants("CertState")).toEqual([...CERT_STATES]);
     expect(variants("FirefoxTrust")).toEqual([...FIREFOX_TRUST]);
+  });
+
+  it("the app reads every update state the crate declares, unchanged", () => {
+    const status = fixture.engine.find((m) => m.type === "status")!;
+    const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
+    const crate = (RUST.match(/pub enum UpdateStatus \{([\s\S]*?)\n\}/)?.[1] ?? "").match(/^\s{4}(?!#|\/)(\w+)\b/gm) ?? [];
+    const snake = crate.map((v) => v.trim().replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()));
+    expect(snake).toEqual([...UPDATE_KINDS]);
+    expect(fixture.updates.map((u) => u.kind)).toEqual([...UPDATE_KINDS]);
+    for (const u of fixture.updates) expect(parseEngineStatus({ ...body, update: u }).update).toEqual(u);
   });
 
   it("fixture names every message type of the crate, in order", () => {

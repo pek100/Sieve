@@ -17,7 +17,7 @@ use windows_service::service::{
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::acl::{PROGRAM_DATA_SDDL, set_dir_security, token_user_sid};
-use super::image::check_this_exe;
+use super::image::{SYSTEM, check_this_exe};
 use super::state::{self, State};
 use super::{
     DESCRIPTION, DISPLAY_NAME, FAILURE_RESET, FOLDER_STEP, REQUIRED_PRIVILEGES, RESTART_DELAY, RESTARTS, SERVICE_NAME,
@@ -140,10 +140,19 @@ fn program_data() -> Result<String, String> {
 }
 
 fn record_owner() -> Result<String, String> {
-    let sid = token_user_sid()?;
-    let engine = state::engine_dir(&state::program_data()?);
-    state::write(&engine, &State { owner_sid: Some(sid.clone()) })?;
-    Ok(format!("pipe user {sid}"))
+    write_owner(&state::engine_dir(&state::program_data()?), &token_user_sid()?)
+}
+
+/// The pipe's one non-admin user is the person who installed. SYSTEM is nobody's
+/// person: it is here because an `app` release runs the installer from the
+/// service, and the DACL admits it anyway, so what is recorded stays.
+fn write_owner(engine: &std::path::Path, token_sid: &str) -> Result<String, String> {
+    if token_sid == SYSTEM {
+        let kept = state::read(engine)?.owner_sid;
+        return Ok(kept.map_or_else(|| "no pipe user: installed as SYSTEM".to_string(), |sid| format!("pipe user {sid} kept")));
+    }
+    state::write(engine, &State { owner_sid: Some(token_sid.to_string()) })?;
+    Ok(format!("pipe user {token_sid}"))
 }
 
 fn wait_for(service: &Service, want: ServiceState) -> Result<(), String> {
@@ -160,7 +169,7 @@ fn wait_for(service: &Service, want: ServiceState) -> Result<(), String> {
     }
 }
 
-fn start() -> Result<String, String> {
+pub(crate) fn start() -> Result<String, String> {
     let service = open(ServiceAccess::QUERY_STATUS | ServiceAccess::START)?.ok_or("not installed")?;
     if service.query_status().map_err(|e| e.to_string())?.current_state == ServiceState::Running {
         return Ok("already running".into());
@@ -170,7 +179,7 @@ fn start() -> Result<String, String> {
     Ok("running".into())
 }
 
-fn stop() -> Result<String, String> {
+pub(crate) fn stop() -> Result<String, String> {
     let Some(service) = open(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)? else {
         return Ok("not installed".into());
     };
@@ -334,6 +343,26 @@ mod tests {
         assert_eq!(super::super::report("install", &steps).1, super::super::EXIT_UNSAFE_FOLDER);
         let steps = install_steps(|| Ok("fine".into()), || vec![Step::run("service", || Ok("created".into()))]);
         assert_eq!(steps.iter().map(|s| s.name).collect::<Vec<_>>(), [FOLDER_STEP, "service"]);
+    }
+
+    /// An `app` release runs the installer, and so this verb, as SYSTEM. That
+    /// must not take the pipe away from the user who installed Sieve.
+    #[test]
+    fn an_install_as_system_keeps_the_recorded_pipe_user() {
+        const USER: &str = "S-1-5-21-1-2-3-1001";
+        const OTHER: &str = "S-1-5-21-1-2-3-1002";
+        let dir = tempfile::tempdir().unwrap();
+        let owner = || state::read(dir.path()).unwrap().owner_sid;
+
+        write_owner(dir.path(), SYSTEM).unwrap();
+        assert_eq!(owner(), None, "a first install as SYSTEM admits only what the DACL always admits");
+        write_owner(dir.path(), USER).unwrap();
+        assert_eq!(owner().as_deref(), Some(USER));
+        let said = write_owner(dir.path(), SYSTEM).unwrap();
+        assert_eq!(owner().as_deref(), Some(USER));
+        assert!(said.contains(USER), "{said}");
+        write_owner(dir.path(), OTHER).unwrap();
+        assert_eq!(owner().as_deref(), Some(OTHER), "a person installing again takes it over");
     }
 
     /// Read only: this test binary sits in the user's own target folder, so

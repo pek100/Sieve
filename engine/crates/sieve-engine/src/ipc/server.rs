@@ -62,7 +62,7 @@ pub async fn serve<B: Backend>(pipe_sddl: &str, backend: Arc<B>, stop: watch::Re
 /// Serves the pipe `name` until `stop` turns true. Fails when the first
 /// instance cannot be created (another process holds the name, or the DACL
 /// is bad).
-async fn serve_named<B: Backend>(name: &str, pipe_sddl: &str, backend: Arc<B>, mut stop: watch::Receiver<bool>) -> Result<(), String> {
+pub(crate) async fn serve_named<B: Backend>(name: &str, pipe_sddl: &str, backend: Arc<B>, mut stop: watch::Receiver<bool>) -> Result<(), String> {
     let sd = SecurityDescriptor::from_sddl(pipe_sddl)?;
     let engine_exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
     let mut server = create(name, &sd, true).map_err(|e| format!("cannot create {name}: {e}"))?;

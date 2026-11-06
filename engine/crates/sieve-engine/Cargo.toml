@@ -65,6 +65,9 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2.workspace = true
 
+# Signed updates (plan 7.5): verifies minisign signatures, no dependencies of
+# its own. Signing exists only in tests (dev-dependency `minisign`).
+minisign-verify = "0.2.5"
 # The default lists' download (lists/https.rs only): rustls on aws-lc-rs with
 # X25519MLKEM768 preferred, hyper for chunked HTTP/1.1, webpki-roots as the
 # trust store (never the Windows store a local filter can write to). The same
@@ -144,10 +147,13 @@ windows = { workspace = true, features = [
 windows-service = "0.8.1"
 
 [dev-dependencies]
+# Tests sign with the real tool, with a key pair generated in memory (update::testing).
+minisign = "0.8.0"
 proptest.workspace = true
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
-# Loopback resolvers for the encrypted DNS tests (`dns::testing`).
+# Loopback resolvers for the encrypted DNS tests (`dns::testing`) and a CA the
+# update client does not trust (`update::https`).
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 hyper = { version = "1", features = ["server"] }
 # Benchmark only: craft packets for ipstack (same version ipstack uses).

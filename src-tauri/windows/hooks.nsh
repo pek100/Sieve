@@ -231,6 +231,11 @@ FunctionEnd
     Delete "$INSTDIR\${SIEVE_WINTUN_LICENSE}"
     Delete "${SIEVE_RESTORE_LINK}"
     Delete "$INSTDIR\${SIEVE_MARKER}"
+    ; What a signed update can leave (engine: update::swap); the folder only
+    ; goes when empty.
+    RMDir /r "$INSTDIR\update-staging"
+    Delete "$INSTDIR\*.old"
+    Delete "$INSTDIR\*.failed"
     RMDir "$INSTDIR"
   ${EndIf}
 !macroend
