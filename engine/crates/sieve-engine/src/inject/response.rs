@@ -5,7 +5,7 @@
 //! injection would corrupt). The document/subdocument classification is the
 //! caller's (plan 5.2).
 
-use http::header::{ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderName};
+use http::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderName};
 use http::{HeaderMap, Method, StatusCode};
 use lol_html::AsciiCompatibleEncoding;
 
@@ -13,6 +13,7 @@ use super::decode::ContentEncoding;
 
 const HTML_MEDIA_TYPE: &str = "text/html";
 const CHARSET_PARAMETER: &str = "charset";
+const INLINE_DISPOSITION: &str = "inline";
 /// Headers a rewritten body falsifies. `Content-Digest` and `Repr-Digest` have
 /// no constant in the `http` crate.
 const FALSIFIED_NAMES: [&str; 2] = ["content-digest", "repr-digest"];
@@ -68,9 +69,20 @@ fn html_charset(content_type: &str) -> Option<AsciiCompatibleEncoding> {
     }
 }
 
+/// Whether the browser shows this response rather than saving it. A saved file
+/// must keep its bytes. Only a missing header or the `inline` type says "shown":
+/// RFC 6266 has an unknown type handled as `attachment`.
+fn displayed_inline(headers: &HeaderMap) -> bool {
+    match single_value(headers, &CONTENT_DISPOSITION) {
+        Ok(None) => true,
+        Ok(Some(value)) => value.split(';').next().is_some_and(|kind| kind.trim().eq_ignore_ascii_case(INLINE_DISPOSITION)),
+        Err(()) => false,
+    }
+}
+
 /// How to read this response if it may be rewritten, from its head alone.
 pub fn body_format(request: &PageRequest<'_>, status: StatusCode, headers: &HeaderMap) -> Option<BodyFormat> {
-    if !request.is_document || *request.method == Method::HEAD || !rewritable_status(status) {
+    if !request.is_document || *request.method == Method::HEAD || !rewritable_status(status) || !displayed_inline(headers) {
         return None;
     }
     let charset = html_charset(single_value(headers, &CONTENT_TYPE).ok()??)?;
@@ -213,6 +225,38 @@ mod tests {
         let get = Method::GET;
         let subresource = PageRequest { url: URL, method: &get, is_document: false };
         assert_passes_through(&subresource, &rules(), 200, &[HTML], b"");
+    }
+
+    #[test]
+    fn a_download_passes_through() {
+        let engine = rules();
+        let get = Method::GET;
+        for value in [
+            "attachment",
+            "ATTACHMENT",
+            "attachment; filename=\"report.html\"",
+            "attachment ; filename=report.html",
+            "attachment;filename*=UTF-8''report.html",
+            "x-unknown-type; filename=report.html",
+        ] {
+            let value: &'static str = value;
+            assert_passes_through(&request(&get), &engine, 200, &[HTML, ("content-disposition", value)], b"");
+        }
+        assert_passes_through(&request(&get), &engine, 200, &[HTML, ("content-disposition", "inline"), ("content-disposition", "attachment")], b"");
+
+        let mut not_text = headers_of(&[HTML]);
+        not_text.insert(CONTENT_DISPOSITION, HeaderValue::from_bytes(b"attachment; filename=\"\xff.html\"").unwrap());
+        let before = not_text.clone();
+        assert!(begin(&engine, &request(&get), StatusCode::OK, &mut not_text, b"", &InjectLimits::default()).is_none());
+        assert_eq!(not_text, before, "headers must not change");
+    }
+
+    #[test]
+    fn an_inline_disposition_is_rewritten() {
+        for value in ["inline", "INLINE", "inline; filename=\"report.html\"", " inline ;filename=report.html"] {
+            let value: &'static str = value;
+            assert!(attempt(&request(&Method::GET), &rules(), 200, &[HTML, ("content-disposition", value)], b"").0, "{value}");
+        }
     }
 
     #[test]
