@@ -382,6 +382,14 @@
       "firefox": "not_installed",
       "last_rotation_ms": null,
       "last_error": null
+    },
+    "removal_pending": {
+      "state": "removal_pending",
+      "valid_until_ms": null,
+      "thumbprint": "a9993e364706816aba3e25717850c26c9cd0d89d",
+      "firefox": "not_installed",
+      "last_rotation_ms": null,
+      "last_error": "CertDeleteCertificateFromStore: access denied"
     }
   },
   "updates": [

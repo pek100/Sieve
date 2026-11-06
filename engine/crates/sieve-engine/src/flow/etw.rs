@@ -154,21 +154,27 @@ impl EtwRing {
         Self { own_pid, entries: HashMap::new(), order: VecDeque::new(), evictions: 0 }
     }
 
-    /// Stores one event; true when it evicted an older tuple. The engine's
-    /// own events are dropped here: every upstream UDP send would be one. So
-    /// is PID 0, which names no owner: stored, it could conflict with a real
-    /// PID on the tuple or replace it.
-    pub fn insert(&mut self, e: &EtwEvent, now_ms: u64) -> bool {
+    /// Stores one event that happened at `at_ms`, which delivery may have made
+    /// old; true when it evicted an older tuple. The engine's own events are
+    /// dropped here: every upstream UDP send would be one. So is PID 0, which names
+    /// no owner: stored, it could conflict with a real PID on the tuple or replace it.
+    pub fn insert(&mut self, e: &EtwEvent, at_ms: u64) -> bool {
         if e.pid == self.own_pid || e.pid == NO_OWNER_PID {
             return false;
         }
         let key = (e.proto, e.local, e.remote);
         if let Some(entry) = self.entries.get_mut(&key) {
-            let recent = now_ms.saturating_sub(entry.at_ms) <= ETW_MATCH_WINDOW_MS;
+            let recent = at_ms.abs_diff(entry.at_ms) <= ETW_MATCH_WINDOW_MS;
+            let late = at_ms < entry.at_ms;
+            if late && !recent {
+                return false;
+            }
             // An older entry on this tuple is port reuse: replaced, not a conflict.
             entry.conflict = recent && (entry.conflict || entry.pid != e.pid);
-            entry.pid = e.pid;
-            entry.at_ms = now_ms;
+            if !late {
+                entry.pid = e.pid;
+                entry.at_ms = at_ms;
+            }
             return false;
         }
         let evicted = self.entries.len() >= ETW_RING_CAP;
@@ -177,7 +183,7 @@ impl EtwRing {
             self.evictions += 1;
         }
         self.order.push_back(key);
-        self.entries.insert(key, Entry { pid: e.pid, at_ms: now_ms, conflict: false });
+        self.entries.insert(key, Entry { pid: e.pid, at_ms, conflict: false });
         evicted
     }
 
@@ -209,6 +215,16 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// FILETIME's tick is 100 ns.
+const FILETIME_TICKS_PER_MS: i64 = 10_000;
+
+/// When an event happened on the monotonic clock: its age, from two FILETIMEs,
+/// taken off now. An event dated ahead of now has no age.
+pub fn occurred_at_ms(now_ms: u64, now_filetime: i64, event_filetime: i64) -> u64 {
+    let age_ms = now_filetime.saturating_sub(event_filetime).max(0) / FILETIME_TICKS_PER_MS;
+    now_ms.saturating_sub(age_ms.unsigned_abs())
+}
+
 /// Where the session's events go. Never panics: it runs in an ETW callback.
 #[derive(Debug, Clone)]
 pub struct Sinks {
@@ -222,16 +238,17 @@ impl Sinks {
         Self { ring: Arc::new(Mutex::new(EtwRing::new(own_pid))), winnat: Arc::default(), meters }
     }
 
-    pub fn ingest(&self, provider: u128, id: u16, payload: &[u8], now_ms: u64) {
+    /// `at_ms`: when the event happened, not when it was delivered.
+    pub fn ingest(&self, provider: u128, id: u16, payload: &[u8], at_ms: u64) {
         #[cfg(feature = "attribution-diagnostics")]
-        lock(&self.meters.attribution).record_raw_event(provider, id, payload, now_ms);
+        lock(&self.meters.attribution).record_raw_event(provider, id, payload, at_ms);
         if provider == crate::flow::nat::WINNAT {
             if let Some(event) = crate::flow::nat::decode_winnat(id, payload) {
                 lock(&self.winnat).apply(event);
             }
         } else if provider == KERNEL_NETWORK
             && let Some(event) = decode(id, payload)
-            && lock(&self.ring).insert(&event, now_ms)
+            && lock(&self.ring).insert(&event, at_ms)
         {
             Meters::bump(&self.meters.etw_dropped);
         }
@@ -327,7 +344,7 @@ pub mod os {
     };
     use windows::core::{GUID, PCWSTR, PWSTR};
 
-    use super::{CONSUMER_OPEN_BOUND, KERNEL_NETWORK, KERNEL_NETWORK_EVENTS, KERNEL_NETWORK_KEYWORDS, Sinks, consumer_failure, event_id_filter, spawn_consumer};
+    use super::{CONSUMER_OPEN_BOUND, KERNEL_NETWORK, KERNEL_NETWORK_EVENTS, KERNEL_NETWORK_KEYWORDS, Sinks, consumer_failure, event_id_filter, occurred_at_ms, spawn_consumer};
     use crate::flow::nat::{WINNAT, WINNAT_EVENTS};
     use crate::stack::Meters;
     use crate::watchdog::monotonic_ms;
@@ -394,6 +411,19 @@ pub mod os {
         meters.etw_dropped.fetch_add(lost.saturating_sub(before), Ordering::Relaxed);
     }
 
+    /// FILETIME's epoch, 1601, before the Unix one, in FILETIME ticks.
+    const UNIX_EPOCH_FILETIME: i64 = 116_444_736_000_000_000;
+    const FILETIME_TICKS_PER_S: i64 = 10_000_000;
+
+    /// The wall clock as a FILETIME, the form `ProcessTrace` converts every
+    /// `EventHeader.TimeStamp` to (the consumer does not ask for
+    /// `PROCESS_TRACE_MODE_RAW_TIMESTAMP`). Live proof L2 reads the result.
+    fn now_filetime() -> i64 {
+        let since_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let seconds = i64::try_from(since_unix.as_secs()).unwrap_or(i64::MAX / FILETIME_TICKS_PER_S);
+        UNIX_EPOCH_FILETIME + seconds * FILETIME_TICKS_PER_S + i64::from(since_unix.subsec_nanos() / 100)
+    }
+
     /// Runs on the consumer thread for every event of the session.
     unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         // SAFETY: Windows hands a record valid for this call; UserContext is
@@ -405,7 +435,8 @@ pub mod os {
             // SAFETY: UserData holds UserDataLength bytes for this call.
             unsafe { std::slice::from_raw_parts(r.UserData.cast::<u8>(), usize::from(r.UserDataLength)) }
         };
-        sinks.ingest(r.EventHeader.ProviderId.to_u128(), r.EventHeader.EventDescriptor.Id, payload, monotonic_ms());
+        let at_ms = occurred_at_ms(monotonic_ms(), now_filetime(), r.EventHeader.TimeStamp);
+        sinks.ingest(r.EventHeader.ProviderId.to_u128(), r.EventHeader.EventDescriptor.Id, payload, at_ms);
     }
 
     fn enable(handle: CONTROLTRACE_HANDLE, provider: u128, keywords: u64, ids: &[u16]) -> WIN32_ERROR {
@@ -682,6 +713,36 @@ mod tests {
         ring.insert(&event(8, Proto::Udp, L, R), ETW_MATCH_WINDOW_MS + 1);
         assert_eq!(ring.answer(&flow(Proto::Udp, L, R), ETW_MATCH_WINDOW_MS + 1), Witnessed::Pid(8));
         assert_eq!(ring.len(), 1);
+    }
+
+    /// Delivered now, but it happened long ago: it says nothing about a flow now.
+    #[test]
+    fn a_late_event_is_as_old_as_when_it_happened() {
+        const NOW: u64 = 100_000;
+        const NOW_FILETIME: i64 = 133_000_000_000_000_000;
+        const TICKS_PER_MS: i64 = 10_000;
+        let happened = |ago_ms: i64| occurred_at_ms(NOW, NOW_FILETIME, NOW_FILETIME - ago_ms * TICKS_PER_MS);
+        assert_eq!(happened(0), NOW);
+        assert_eq!(happened(30_000), NOW - 30_000);
+        assert_eq!(happened(-500), NOW, "dated ahead of now: no age");
+        assert_eq!(happened(i64::MAX / TICKS_PER_MS / 2), 0, "older than this clock");
+
+        let mut ring = EtwRing::new(OWN);
+        ring.insert(&event(7, Proto::Udp, L, R), happened(30_000));
+        assert_eq!(ring.answer(&flow(Proto::Udp, L, R), NOW), Witnessed::Nothing);
+    }
+
+    /// Delivery can run behind: an older event neither replaces a newer one nor,
+    /// from outside the window, marks it.
+    #[test]
+    fn an_event_delivered_out_of_order_does_not_rewrite_a_newer_one() {
+        const AT: u64 = 10 * ETW_MATCH_WINDOW_MS;
+        let mut ring = EtwRing::new(OWN);
+        ring.insert(&event(8, Proto::Udp, L, R), AT);
+        ring.insert(&event(7, Proto::Udp, L, R), AT - ETW_MATCH_WINDOW_MS - 1);
+        assert_eq!(ring.answer(&flow(Proto::Udp, L, R), AT), Witnessed::Pid(8), "the tuple's earlier owner");
+        ring.insert(&event(7, Proto::Udp, L, R), AT - 1);
+        assert_eq!(ring.answer(&flow(Proto::Udp, L, R), AT), Witnessed::Conflict, "inside the window: two owners");
     }
 
     #[test]

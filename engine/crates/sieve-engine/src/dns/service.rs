@@ -3,9 +3,10 @@
 //! and books.
 //!
 //! - A QUERY goes to the adapter's LAN server when its name is under that
-//!   adapter's suffix, else to the encrypted upstreams. A matched name whose
-//!   server fails gets SERVFAIL: the public upstream would publish a corporate
-//!   name.
+//!   adapter's suffix, else to the encrypted upstreams. The suffix check reads
+//!   the wire, so a name the evidence parser refuses is still checked. A matched
+//!   name whose server fails, or that has none, gets SERVFAIL: the public
+//!   upstream would publish a corporate name.
 //! - Other opcodes (Windows' dynamic DNS UPDATE carries the host name) are
 //!   answered NOTIMP here and nothing leaves.
 //! - When nothing answers, the client gets SERVFAIL at the deadline. No path
@@ -21,7 +22,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use super::pool::{Context, Pool, UpstreamReport};
-use super::upstream::{self, Health, REQUEST_BUDGET, Upstream, split_rules, split_server};
+use super::upstream::{self, Health, REQUEST_BUDGET, SplitRoute, Upstream, split_route, split_rules};
 use super::{FLAG_OPCODE, FLAG_QR, MAX_MESSAGE, NameMap, flags_of, lan, notimp, parse, reply_answers, servfail, truncated, udp_limit};
 use crate::route::table::NetTables;
 use crate::stack::Meters;
@@ -142,17 +143,14 @@ impl Service {
     }
 
     async fn resolve(&self, query: &[u8]) -> Result<Vec<u8>, String> {
-        let server = parse(query).and_then(|m| {
-            let name = m.question?;
-            let tables = self.tables.read().unwrap_or_else(|p| p.into_inner());
-            split_server(&name, &split_rules(&tables))
-        });
-        match server {
-            Some(server) => match tokio::time::timeout(REQUEST_BUDGET, lan::exchange(self.context.connector.as_ref(), server, query)).await {
+        let route = split_route(query, &split_rules(&self.tables.read().unwrap_or_else(|p| p.into_inner())));
+        match route {
+            SplitRoute::Lan(server) => match tokio::time::timeout(REQUEST_BUDGET, lan::exchange(self.context.connector.as_ref(), server, query)).await {
                 Ok(reply) => reply,
                 Err(_) => Err(format!("{server} did not answer in time")),
             },
-            None => {
+            SplitRoute::Refused => Err("it may be a LAN name, and no LAN server can take it".to_string()),
+            SplitRoute::Encrypted => {
                 let active = self.active();
                 upstream::resolve(&active.endpoints, query, &active.pool, &active.health).await
             }
@@ -224,7 +222,9 @@ where
                 let Ok(Some(answered)) = done else { continue };
                 totals.resolved += u64::from(answered.resolved);
                 let Some(wire) = on_the_wire(answered.reply, transport) else { continue };
-                if stream.write_all(&wire).await.is_err() {
+                // Bounded: while this waits nothing else in the select is polled,
+                // so a client that stopped reading would hold the flow for good.
+                if !matches!(tokio::time::timeout(DNS_IDLE, stream.write_all(&wire)).await, Ok(Ok(()))) {
                     break;
                 }
                 totals.bytes_down += wire.len() as u64;
@@ -384,6 +384,66 @@ mod tests {
         assert_eq!((id_of(&answered.reply), answered.resolved), (Some(7), true));
         assert_eq!(doh.seen().len(), 1);
         assert_eq!(b.meters.dns_answers.load(std::sync::atomic::Ordering::Relaxed), 0, "no evidence");
+    }
+
+    #[tokio::test]
+    async fn a_name_the_parser_refuses_stays_under_its_suffix() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let echo: Script = Arc::new(|query| {
+            let mut reply = query.to_vec();
+            reply[2] |= 0x80;
+            Step::Answer(reply)
+        });
+        let router = Plain::start(echo.clone(), echo).await;
+        let b = bed(&ca, &[doh.url()], Some("lan"), connector_with(&router));
+        const UTF8_LABEL: &[u8] = b"\xc3\xa9";
+        let mut query = vec![0, 7, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.push(UTF8_LABEL.len() as u8);
+        query.extend_from_slice(UTF8_LABEL);
+        query.extend_from_slice(b"\x03lan\0\0\x01\0\x01");
+        let answered = b.ask(&query, Transport::Datagram).await;
+        assert_eq!((id_of(&answered.reply), answered.resolved), (Some(7), true));
+        assert_eq!(b.connector.udp_recorded(), [lan_target()]);
+        assert!(doh.seen().is_empty(), "nothing went public");
+
+        let mut two = query.clone();
+        two[5] = 2;
+        two.extend_from_slice(b"\x01a\x07example\0\0\x01\0\x01");
+        let answered = b.ask(&two, Transport::Datagram).await;
+        assert_eq!((rcode(&answered.reply), answered.resolved), (2, false), "the questions disagree");
+        assert!(doh.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_suffix_whose_only_server_is_link_local_is_servfail_not_public() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let b = bed(&ca, &[doh.url()], Some("corp.example"), Arc::new(Loopback::default()));
+        b.service.tables.write().unwrap().adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap().dns = vec!["fe80::1".parse().unwrap()];
+        let answered = b.ask(&client_query(9, "payroll.corp.example"), Transport::Datagram).await;
+        assert_eq!((rcode(&answered.reply), answered.resolved), (2, false));
+        assert!(doh.seen().is_empty(), "never the public upstream");
+        assert!(b.connector.udp_recorded().is_empty());
+        let answered = b.ask(&client_query(9, "www.example"), Transport::Datagram).await;
+        assert_eq!(rcode(&answered.reply), 0, "other names are untouched");
+    }
+
+    /// A client that sends a query and never reads: the flow ends by itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_stops_reading_does_not_hold_its_flow() {
+        const SMALLER_THAN_A_REPLY: usize = 4;
+        let ca = Ca::new();
+        let b = bed(&ca, &["tls://127.0.0.1:1".to_string()], None, Arc::new(Loopback::default()));
+        let (mut client, mut flow) = tokio::io::duplex(SMALLER_THAN_A_REPLY);
+        let service = b.service.clone();
+        let task = tokio::spawn(async move { serve_tcp(&service, &mut flow, |_| {}).await });
+        let mut update = client_query(5, "host.example");
+        update[2] = 0x28; // opcode 5, UPDATE: answered here, with no upstream
+        client.write_all(&framed(&update)).await.unwrap();
+        let ended = tokio::time::timeout(PATIENT, task).await;
+        assert!(ended.is_ok(), "the flow outlived its idle time with its client open");
+        drop(client);
     }
 
     #[tokio::test]

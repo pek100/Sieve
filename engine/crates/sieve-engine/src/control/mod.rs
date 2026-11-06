@@ -312,8 +312,10 @@ impl Engine {
     }
 
     /// The Status plus what stays local: the key exchange evidence (task D18).
+    /// Only an answer on the pipe tells a person about a release, so this holds
+    /// the plain update state.
     fn status_value(&self) -> Result<serde_json::Value, serde_json::Error> {
-        let mut status = serde_json::to_value(self.status())?;
+        let mut status = serde_json::to_value(self.status_saying(self.updates.status()))?;
         status["https"] = self.meters.https.report();
         Ok(status)
     }
@@ -329,7 +331,7 @@ impl Engine {
         let Some(dir) = &self.dir else { return };
         let upstreams = lock(&self.dns_service).as_ref().map(|s| s.report()).unwrap_or_default();
         if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({ "upstreams": upstreams })) {
-            let _ = policy::write_atomic(&dir.join(DNS_STATUS_FILE), &json);
+            let _ = policy::write_report(&dir.join(DNS_STATUS_FILE), &json);
         }
     }
 
@@ -364,10 +366,10 @@ impl Engine {
             let _ = self.log.send(Arc::new(rows));
         }
     }
-}
 
-impl Backend for Engine {
-    fn status(&self) -> EngineStatus {
+    /// The Status, with the update state it reports. Only an answer on the pipe
+    /// tells a person about a release, so the file writers pass the plain state.
+    fn status_saying(&self, update: sieve_ipc::UpdateStatus) -> EngineStatus {
         let f = self.facts();
         let policy = self.policy();
         let blocker = if !policy.engine {
@@ -395,17 +397,25 @@ impl Backend for Engine {
             counters: self.meters.counters(),
             guests,
             filter: self.lists.facts(),
-            update: self.updates.status(),
+            update,
         }
+    }
+}
+
+impl Backend for Engine {
+    fn status(&self) -> EngineStatus {
+        self.status_saying(self.updates.status_for_client())
     }
 
     /// The policy takes effect whether or not it reaches the disk: a file that
     /// cannot be written must not keep the engine routing after the user said
     /// off (fail-open). A failed save is reported, and the file keeps the last
     /// good one for the next start. It is saved under the lock, so the file
-    /// never ends on an older policy than the engine holds.
+    /// never ends on an older policy than the engine holds, and its result is
+    /// published under the lock, so the warning describes the policy in force
+    /// and not whichever request finished last.
     fn set_policy(&self, asked: Policy) -> Result<EngineStatus, String> {
-        let saved = {
+        {
             let mut current = lock(&self.policy);
             let next = policy::accept(&current, asked)?;
             if next.engine && !current.engine && lock(&self.crash_loop).take().is_some() {
@@ -418,9 +428,8 @@ impl Backend for Engine {
             self.apply_to_filter(&current, &next);
             let saved = self.dir.as_ref().map_or(Ok(()), |dir| policy::save(dir, &next));
             *current = next;
-            saved
-        };
-        self.set_facts(|f| f.policy_save_error = saved.err().map(|why| format!("the policy holds until a restart, which reads the last one saved: {why}")));
+            self.set_facts(|f| f.policy_save_error = saved.err().map(|why| format!("the policy holds until a restart, which reads the last one saved: {why}")));
+        }
         self.wake.notify_one();
         self.ca_wake.notify_one();
         Ok(self.status())
@@ -1106,6 +1115,24 @@ mod tests {
         let e = engine(Policy::default(), None);
         assert_eq!(e.status().update, sieve_ipc::UpdateStatus::NotConfigured);
         assert_eq!(e.request_update().unwrap().update, sieve_ipc::UpdateStatus::NotConfigured);
+    }
+
+    /// `status.json` tells no one on the app's screen: only an answer on the pipe
+    /// makes a release one the next request may install.
+    #[test]
+    fn only_an_answer_on_the_pipe_shows_a_release_to_the_user() {
+        let e = engine(Policy::default(), None);
+        let (jobs, queued) = std::sync::mpsc::channel();
+        e.updates.attach(jobs);
+        let available = sieve_ipc::UpdateStatus::Available { version: "0.2.0".into() };
+        e.updates.set_status(available.clone());
+
+        e.write_status_file();
+        assert_eq!(e.request_update().unwrap().update, available, "unasked: the answer shows it");
+        assert!(queued.try_recv().is_err(), "and nothing was queued");
+
+        e.request_update().unwrap();
+        assert_eq!(queued.try_recv(), Ok(crate::update::cycle::Job::Apply { shown: "0.2.0".into() }), "the answer above told the user");
     }
 
     #[test]

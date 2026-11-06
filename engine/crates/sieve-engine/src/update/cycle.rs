@@ -2,12 +2,13 @@
 //!
 //! The daily check applies data kinds and only reports a release. `RequestUpdate`
 //! carries no field and takes its meaning from the state: while a release is
-//! `available` it applies that one, otherwise it runs a check, so neither "check
-//! again" nor a host publishing between the check and the click can install
-//! something the user was not shown.
+//! `available`, and a client has been told so, it applies that one, otherwise it
+//! runs a check, so neither "check again" nor a host publishing between the check
+//! and the click can install something the user was not shown.
 //!
-//! Every refusal leaves both trees as they were: staged files go, and nothing is
-//! recorded, the accepted index version included, until a cycle had no refusal.
+//! Every refusal leaves both trees as they were: every due data file is fetched
+//! and verified before any is installed, staged files go, and nothing is recorded,
+//! the accepted index version included, until a cycle had no refusal.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -57,6 +58,9 @@ pub enum Job {
 #[derive(Default)]
 pub struct UpdateControl {
     status: Mutex<UpdateStatus>,
+    /// The release the pipe last told a client is available, if that is what it
+    /// last said. A release is installed only once it has been on a screen.
+    reported: Mutex<Option<String>>,
     last_request_ms: Mutex<Option<u64>>,
     jobs: Mutex<Option<mpsc::Sender<Job>>>,
 }
@@ -70,6 +74,17 @@ impl UpdateControl {
         lock(&self.status).clone()
     }
 
+    /// The status as an answer on the pipe, which is the only way a person learns
+    /// of a release.
+    pub fn status_for_client(&self) -> UpdateStatus {
+        let status = lock(&self.status);
+        *lock(&self.reported) = match &*status {
+            UpdateStatus::Available { version } => Some(version.clone()),
+            _ => None,
+        };
+        status.clone()
+    }
+
     pub fn set_status(&self, status: UpdateStatus) {
         *lock(&self.status) = status;
     }
@@ -79,11 +94,14 @@ impl UpdateControl {
         *lock(&self.jobs) = Some(jobs);
     }
 
-    /// `RequestUpdate`: decided from the state alone.
+    /// `RequestUpdate`: decided from the state alone. A release no client has been
+    /// told of arrived after the click was aimed at something else ("Check
+    /// again"), so it is not applied: the answer shows it instead.
     pub fn request(&self, now_ms: u64) -> Result<(), String> {
         let mut status = lock(&self.status);
         let (job, next) = match &*status {
             UpdateStatus::NotConfigured | UpdateStatus::Checking | UpdateStatus::Applying { .. } => return Ok(()),
+            UpdateStatus::Available { version } if lock(&self.reported).as_ref() != Some(version) => return Ok(()),
             UpdateStatus::Available { version } => (Job::Apply { shown: version.clone() }, UpdateStatus::Applying { version: version.clone() }),
             _ => {
                 let mut last = lock(&self.last_request_ms);
@@ -369,31 +387,31 @@ impl Updater {
         Ok(dest)
     }
 
-    /// Data kinds apply here: one atomic rename, then the record.
-    fn apply_data(&self, anchor: &TrustAnchor, record: &mut Record, kind: &Kind, entry: &Entry) -> Result<(), Stop> {
-        let dest = super::data_path(&self.engine_dir, kind).ok_or_else(|| format!("{kind} is not a data kind"))?;
-        let staging = self.data_staging()?;
-        let staged = self.fetch_verified(anchor, kind, entry, installed(kind, record, self.own), &staging.dir)?;
-        swap::replace(&RealFs, &staged, &dest)?;
-        record.versions.insert(kind.to_string(), entry.version);
-        state::save_record(&self.engine_dir, record)?;
-        Ok(())
+    /// Every due data kind fetched and verified. One refusal stops them all, so a
+    /// refused cycle installed nothing. Two entries cannot share a staged file: a
+    /// signature names one kind, so one of the two fails its check.
+    fn stage_data<'a>(&self, anchor: &TrustAnchor, index: &'a Index, record: &Record, staging: &Staging) -> Result<Vec<(&'a Kind, &'a Entry, PathBuf)>, Stop> {
+        index
+            .data()
+            .filter(|(kind, entry)| entry.version > installed(kind, record, self.own))
+            .map(|(kind, entry)| Ok((kind, entry, self.fetch_verified(anchor, kind, entry, installed(kind, record, self.own), &staging.dir)?)))
+            .collect()
     }
 
     fn check(&self, anchor: &TrustAnchor, now_unix: u64) -> Result<UpdateStatus, Stop> {
         let mut record = state::load_record(&self.engine_dir)?;
         let index = self.read_index(anchor, &record, now_unix)?;
-        let mut first_stop = None;
-        for (kind, entry) in index.data() {
-            if entry.version > installed(kind, &record, self.own)
-                && let Err(stop) = self.apply_data(anchor, &mut record, kind, entry)
-            {
-                first_stop.get_or_insert(stop);
+        let staging = self.data_staging()?;
+        for (kind, entry, staged) in self.stage_data(anchor, &index, &record, &staging)? {
+            let dest = super::data_path(&self.engine_dir, kind).ok_or_else(|| format!("{kind} is not a data kind"))?;
+            if let Err(why) = swap::replace(&RealFs, &staged, &dest) {
+                // Not a refusal: what did land stays recorded, and the rest comes next time.
+                state::save_record(&self.engine_dir, &record)?;
+                return Err(why.into());
             }
+            record.versions.insert(kind.to_string(), entry.version);
         }
-        if let Some(stop) = first_stop {
-            return Err(stop);
-        }
+        drop(staging);
         record.index_version = index.version;
         state::save_record(&self.engine_dir, &record)?;
         Ok(self.outcome(&index, &record))
@@ -724,6 +742,50 @@ mod tests {
         }
     }
 
+    /// Either order: a valid artefact beside a refused one is not installed, so
+    /// "refused and changed nothing" is true. Resources sort before lists.
+    #[test]
+    fn one_refused_data_file_keeps_the_other_out_too() {
+        let list = Kind::List("sensitive".into());
+        for tampered in ["l.txt", "res.bin"] {
+            let w = World::new();
+            w.publish(7, &[(resources(), 3, "res.bin", DATA_BYTES), (list.clone(), 2, "l.txt", b"list")]);
+            w.host.put(tampered, b"tampered".to_vec());
+            let before = w.trees();
+            assert!(matches!(w.run(Job::Check), UpdateStatus::Refused { .. }), "{tampered}");
+            assert_eq!(w.trees(), before, "{tampered}");
+            assert!(w.record().versions.is_empty(), "{tampered}");
+        }
+    }
+
+    /// The scheduled check lands between two probes: the button on screen says
+    /// "Check again", and a click must not install what it never showed.
+    #[test]
+    fn a_release_no_client_was_told_of_is_not_applied() {
+        let c = UpdateControl::default();
+        let (tx, rx) = mpsc::channel();
+        c.attach(tx);
+        c.set_status(UpdateStatus::Current);
+        assert_eq!(c.status_for_client(), UpdateStatus::Current);
+        c.set_status(UpdateStatus::Available { version: "0.2.0".into() });
+
+        c.request(0).unwrap();
+        assert!(rx.try_recv().is_err(), "nothing queued");
+        assert_eq!(c.status(), UpdateStatus::Available { version: "0.2.0".into() }, "the answer shows it");
+        assert_eq!(c.status(), UpdateStatus::Available { version: "0.2.0".into() }, "a read that is not an answer tells nobody");
+        c.request(0).unwrap();
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(c.status_for_client(), UpdateStatus::Available { version: "0.2.0".into() });
+        c.set_status(UpdateStatus::Available { version: "0.2.1".into() });
+        c.request(0).unwrap();
+        assert!(rx.try_recv().is_err(), "shown 0.2.0, the state says 0.2.1: not this one either");
+
+        assert_eq!(c.status_for_client(), UpdateStatus::Available { version: "0.2.1".into() });
+        c.request(0).unwrap();
+        assert_eq!(rx.try_recv(), Ok(Job::Apply { shown: "0.2.1".into() }));
+    }
+
     #[test]
     fn a_refused_cycle_on_a_fresh_machine_leaves_no_folder_behind() {
         let w = World::new();
@@ -807,6 +869,7 @@ mod tests {
         w.updater.run(Job::Check, NOW);
         assert_eq!(state::load_pending(w.engine_dir()).unwrap(), None, "a check installs nothing");
 
+        w.updater.control.status_for_client();
         w.updater.control.request(1).unwrap();
         assert_eq!(w.updater.control.status(), UpdateStatus::Applying { version: "0.2.0".into() });
         assert_eq!(rx.try_recv(), Ok(apply_next()), "available and inside the cooldown: applying is not a check");
@@ -849,6 +912,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         c.attach(tx);
         c.set_status(UpdateStatus::Available { version: "0.2.0".into() });
+        c.status_for_client();
         c.request(0).unwrap();
         c.set_status(UpdateStatus::Available { version: "0.2.1".into() });
         assert_eq!(rx.try_recv(), Ok(apply_next()));

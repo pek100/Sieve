@@ -224,6 +224,7 @@ describe("the AdGuard offer", () => {
       ["adguard", "stopped", "start"],
       ["idle", "stopped", "start"],
       ["adguard_paused", "stopping", "paused"],
+      ["hosts", "stopping", "paused"], // rules applied: the check cleared it as much as plain routing does
       ["vpn", "stopping", "paused"], // AdGuard wins over a VPN, so a VPN blocker means it is not intercepting
       ["idle", "stopping", null], // the switch is off: the engine gave no verdict
       ["adguard", "stopping", null], // still intercepting: the detail line says Sieve re-checks
@@ -238,6 +239,18 @@ describe("the AdGuard offer", () => {
     expect(adguardOffer({ ...starting, probe: { ...starting.probe!, adguard: "stopping" } }), "starting stopping").toBeNull();
     for (const service of ["missing", "starting", "other"] as const) {
       for (const name of ALL) expect(adguardOffer(withService(name, service)), `${name} ${service}`).toBeNull();
+    }
+  });
+
+  it("while routes come down, the blocker already published decides: the paused claim is not made against it", () => {
+    for (const name of ["hosts", "adguard_paused"] as const) {
+      const s = withService(name, "stopping");
+      const pipe = s.probe!.pipe!;
+      if (pipe.kind !== "welcome") throw new Error(`${name} is a welcome`);
+      const blocked = (blocker: EngineStatus["blocker"]): EngineSlice => ({ ...s, probe: { ...s.probe!, pipe: { ...pipe, status: { ...pipe.status, filtering: true, blocker } } } });
+      expect(adguardOffer(blocked({ kind: "adguard", service: "Adguard Service" })), `${name} adguard`).toBeNull();
+      expect(adguardOffer(blocked({ kind: "setup", message: "no adapter" })), `${name} setup`).toBeNull();
+      expect(adguardOffer(blocked({ kind: "vpn", adapter: "Corp VPN" })), `${name} vpn`).toBe("paused");
     }
   });
 

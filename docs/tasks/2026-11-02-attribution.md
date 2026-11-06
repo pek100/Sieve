@@ -94,7 +94,7 @@ The loop guard comes before this table. It asks the raw owner answer (`stack::at
 
 *The window:* 2000 ms is the 1 s minimum `FlushTimer` plus margin. It is a declared constant (S25), and L2 measures the real latency.
 
-**D8. Delivery latency is the main risk to A2, and it has a fix.** Real-time ETW delivers when a buffer fills or at `FlushTimer` (1 s minimum), which is far past the 250 ms give-up. For a low-rate one-shot UDP socket, the ETW answer would arrive after the decision. So while a flow is pending, the attributor nudges its witness, which calls `ControlTraceW(EVENT_TRACE_CONTROL_FLUSH)` at most every `ETW_FLUSH_MIN_MS` (50). `GIVE_UP_MS` stays 250. Agreement is checked with what the ring holds at decision time, because waiting for ETW on a table hit would add latency to every flow. A later contradiction is not re-judged. The diagnostics count it.
+**D8. Delivery latency is the main risk to A2, and it has a fix.** Real-time ETW delivers when a buffer fills or at `FlushTimer` (1 s minimum), which is far past the 250 ms give-up. For a low-rate one-shot UDP socket, the ETW answer would arrive after the decision. So while a flow is pending, the attributor nudges its witness, which calls `ControlTraceW(EVENT_TRACE_CONTROL_FLUSH)` at most every `ETW_FLUSH_MIN_MS` (50). `GIVE_UP_MS` stays 250. Agreement is checked with what the ring holds at decision time, because waiting for ETW on a table hit would add latency to every flow. A later contradiction is not re-judged, and nothing counts it: `etw_disagreed` covers only disagreement present at decision time. *(Corrected 2026-11-06: this said the diagnostics count it, and no code does.)*
 
 **D9. Wire shape: one nullable field, no redundant enum.**
 

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { LogOutcome, LogRow } from "@/data/protocol";
 import { addLine, blockRule, previewOf, removeLine, rowActions, unblockRule } from "./log-actions";
 
-const row = (outcome: LogOutcome, over: Partial<LogRow> = {}) => ({ url: null, kind: "tls", host: "a.example", outcome, rule: null, ...over });
+const row = (outcome: LogOutcome, over: Partial<LogRow> = {}) => ({ url: null, kind: "tls", host: "a.example", remote: "", outcome, rule: null, ...over });
 
 describe("row actions per outcome", () => {
   it("Unblock only on Blocked with a rule", () => {
@@ -21,10 +21,19 @@ describe("row actions per outcome", () => {
     }
   });
 
-  it("No Unblock or Block on an address row: the engine matches rules against names, so the rule would change nothing", () => {
+  it("An address an HTTP request named can be blocked and unblocked: the engine matches a decoded literal", () => {
+    for (const [host, rule] of [["192.168.1.1", "||192.168.1.1^"], ["2001:db8::1", "||[2001:db8::1]^"]]) {
+      expect(rowActions(row({ kind: "passed", reason: "no_rule" }, { kind: "http", host })), host).toContain("block");
+      expect(rowActions(row({ kind: "blocked" }, { kind: "http", host, rule })), host).toContain("unblock");
+    }
+  });
+
+  it("No Unblock or Block where an address rule would change nothing: closed for its names, or no name at all", () => {
     for (const host of ["198.51.100.25", "2001:db8::1"]) {
       expect(rowActions(row({ kind: "blocked" }, { host, rule: "||a.example^" })), host).not.toContain("unblock");
-      expect(rowActions(row({ kind: "passed", reason: "no_rule" }, { host })), host).not.toContain("block");
+      for (const reason of ["no_name", "mixed_names"]) {
+        expect(rowActions(row({ kind: "passed", reason }, { host })), `${host} ${reason}`).not.toContain("block");
+      }
     }
   });
 

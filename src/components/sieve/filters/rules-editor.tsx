@@ -17,6 +17,8 @@ export function RulesEditor({ saved, onSave, disabled }: { saved: readonly strin
   const [refused, setRefused] = useState<RuleProblem[]>([]);
   // Why the last save failed: the parser could not be asked, or the write did not land.
   const [saveFailed, setSaveFailed] = useState<string | null>(null);
+  // Checks run in parallel and finish in any order, so one save at a time keeps the last click the last write.
+  const [saving, setSaving] = useState(false);
   const [site, setSite] = useState("");
   const [siteError, setSiteError] = useState<string | null>(null);
   const text = draft ?? savedText;
@@ -43,12 +45,15 @@ export function RulesEditor({ saved, onSave, disabled }: { saved: readonly strin
 
   const save = async () => {
     setSaveFailed(null);
+    setSaving(true);
     let result: RuleSave;
     try {
       result = await onSave(check.stored);
     } catch (e) {
       setSaveFailed(e instanceof Error ? e.message : String(e));
       return;
+    } finally {
+      setSaving(false);
     }
     // The parser counts stored lines; the person reads the editor's, blanks included.
     const editorLines = check.lines.filter((l) => l.check.kind !== "blank");
@@ -115,7 +120,7 @@ export function RulesEditor({ saved, onSave, disabled }: { saved: readonly strin
           </ul>
         )}
         <div className="flex justify-end">
-          <Button disabled={disabled || !dirty || !check.canSave} onClick={() => void save()}>
+          <Button disabled={disabled || saving || !dirty || !check.canSave} onClick={() => void save()}>
             Save rules
           </Button>
         </div>

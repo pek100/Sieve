@@ -53,24 +53,30 @@ describe("rulesForPage", () => {
 
 describe("reportUrl: the URL a report starts from", () => {
   it("is the row's own URL, else the host's root", () => {
-    expect(reportUrl({ url: "https://a.example/x?y=1", kind: "tls", host: "a.example" })).toBe("https://a.example/x?y=1");
-    expect(reportUrl({ url: null, kind: "tls", host: "a.example" })).toBe("https://a.example/");
-    expect(reportUrl({ url: null, kind: "dns", host: "a.example" })).toBeNull();
+    const remote = "192.0.2.1:443";
+    expect(reportUrl({ url: "https://a.example/x?y=1", kind: "tls", host: "a.example", remote })).toBe("https://a.example/x?y=1");
+    expect(reportUrl({ url: null, kind: "tls", host: "a.example", remote })).toBe("https://a.example/");
+    expect(reportUrl({ url: null, kind: "dns", host: "a.example", remote })).toBeNull();
+  });
+
+  it("keeps the page's port, never the address the connection went to", () => {
+    expect(reportUrl({ url: null, kind: "tls", host: "a.example", remote: "192.0.2.1:8443" })).toBe("https://a.example:8443/");
+    expect(reportUrl({ url: null, kind: "tls", host: "198.51.100.25", remote: "198.51.100.25:8443" })).toBeNull();
   });
 
   it.each([
-    ["an IPv4 host-level row", { url: null, kind: "tls", host: "198.51.100.25" }],
-    ["an IPv6 host-level row", { url: null, kind: "quic", host: "2001:db8::1" }],
-    ["an HTTP row by IP", { url: null, kind: "http", host: "198.51.100.25" }],
-    ["a request to an IPv4 URL", { url: "http://198.51.100.25:8080/admin", kind: "http", host: "198.51.100.25" }],
-    ["a request to an IPv6 URL", { url: "https://[2001:db8::1]/a", kind: "tls", host: "2001:db8::1" }],
-    ["a request to a numeric IPv4 URL", { url: "http://3325256729/", kind: "http", host: "3325256729" }],
+    ["an IPv4 host-level row", { url: null, kind: "tls", host: "198.51.100.25", remote: "" }],
+    ["an IPv6 host-level row", { url: null, kind: "quic", host: "2001:db8::1", remote: "" }],
+    ["an HTTP row by IP", { url: null, kind: "http", host: "198.51.100.25", remote: "" }],
+    ["a request to an IPv4 URL", { url: "http://198.51.100.25:8080/admin", kind: "http", host: "198.51.100.25", remote: "" }],
+    ["a request to an IPv6 URL", { url: "https://[2001:db8::1]/a", kind: "tls", host: "2001:db8::1", remote: "" }],
+    ["a request to a numeric IPv4 URL", { url: "http://3325256729/", kind: "http", host: "3325256729", remote: "" }],
   ])("holds no address for %s: the field starts empty", (_, row) => {
     expect(reportUrl(row)).toBeNull();
   });
 
   it("keeps a name that only looks numeric in part", () => {
-    expect(reportUrl({ url: null, kind: "tls", host: "1.2.3.example" })).toBe("https://1.2.3.example/");
+    expect(reportUrl({ url: null, kind: "tls", host: "1.2.3.example", remote: "" })).toBe("https://1.2.3.example/");
   });
 });
 

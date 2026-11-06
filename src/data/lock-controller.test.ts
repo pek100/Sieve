@@ -143,6 +143,44 @@ describe("the write gate", () => {
     expect(fn).not.toHaveBeenCalled();
   });
 
+  it("Cancel during the check closes the prompt for good: a right answer opens nothing, a wrong one says nothing", async () => {
+    const mock = createMockLock("set");
+    const verdicts: (() => void)[] = [];
+    const source: LockSource = {
+      ...mock,
+      verify: async (p) => {
+        await new Promise<void>((r) => verdicts.push(r));
+        return mock.verify(p);
+      },
+    };
+    const { c } = await setup(source);
+    await flush();
+    c.ask();
+    const right = c.unlock(MOCK_PASSWORD);
+    await flush();
+    c.cancel();
+    expect(c.state()).toMatchObject({ asking: false, busy: false });
+    verdicts.shift()!();
+    await right;
+    expect(c.state()).toMatchObject({ phase: "locked", asking: false, busy: false, error: null });
+
+    c.ask();
+    const wrong = c.unlock("wrong one");
+    await flush();
+    c.cancel();
+    c.ask();
+    verdicts.shift()!();
+    await wrong;
+    expect(c.state(), "the prompt opened again is not the one answered").toMatchObject({ phase: "locked", asking: true, error: null });
+
+    // A prompt opened since takes its own answer, while the old check still runs.
+    const again = c.unlock(MOCK_PASSWORD);
+    await flush();
+    verdicts.shift()!();
+    await again;
+    expect(c.state().phase).toBe("unlocked");
+  });
+
   it("checking parks instead of dropping: no password runs it, a password asks", async () => {
     const heldNone = heldSource("none");
     const none = await setup(heldNone.source);

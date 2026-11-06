@@ -4,7 +4,7 @@ Run by the user, on a machine where the engine is installed and `filtering.engin
 
 `dns-status.json` beside `status.json` holds the facts these checks read, rewritten every 30 s while routes are up: per upstream its `address`, `connected`, `kx_group`, `alpn`, `answers`, `failures`, and never a queried name. `kx_group` is `null` for DoQ because quinn does not expose it.
 
-**The setting owns the list.** While the app runs, `filtering.upstreams` wins over `dns.json`: at the first probe, and at every probe after, the app reads the engine's list back and overwrites it, and so `dns.json`, if it differs. The setting's default is not empty, so an untouched app does this too. A list written by hand lasts only while the app is closed.
+**The setting owns the list.** While the app runs, `filtering.upstreams` wins over `dns.json`: at the first probe, and at every probe after, the app reads the engine's list back and overwrites it, and so `dns.json`, if it differs. The setting is never empty, so an untouched app does this too: the default has servers, an import refuses an empty list, and an empty list stored by hand reads as the default. A list written by hand lasts only while the app is closed.
 
 To set a list, use one of these two ways.
 

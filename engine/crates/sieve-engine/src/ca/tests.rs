@@ -23,6 +23,7 @@ const LIVE_CA_CHECKS: &[&str] = &[
     "the root has Server Authentication only",
     "the store property is Server Authentication",
     "the key is a machine CNG key of the software provider",
+    "an admin is refused the key",
     "the key is not exportable and its DACL lists SYSTEM only",
     "no file in ProgramData holds key material",
     "the Firefox policy follows the record",
@@ -325,7 +326,15 @@ fn a_failed_removal_keeps_its_record_and_retries() {
         assert_eq!(rig.saved().retiring.len(), 1, "{op}");
         assert!(ca.minter().is_none(), "{op}: off stops the minter whatever else fails");
         assert!(ca.holding(), "{op}: the loop keeps its timer for the retry");
-        assert!(ca.status(T0 + MIN).last_error.unwrap().contains(op));
+        let status = ca.status(T0 + MIN);
+        assert!(status.last_error.unwrap().contains(op));
+        if op == "store remove" {
+            let recorded = rig.saved().retiring[0].thumbprint.clone();
+            assert!(rig.roots().contains(recorded.as_ref().unwrap()), "Windows still trusts it");
+            assert_eq!((status.state, status.thumbprint), (CertState::RemovalPending, recorded), "and the status says so");
+        } else {
+            assert_eq!((status.state, status.thumbprint), (CertState::NotInstalled, None), "the root is gone, only its key is left");
+        }
         rig.faults.clear();
         rig.ca().reconcile(false, T0 + 2 * MIN).unwrap();
         assert!(rig.roots().is_empty() && rig.keys.names().is_empty(), "{op}");

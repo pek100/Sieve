@@ -17,7 +17,9 @@ use crate::domain::{Decision, Reason};
 /// flow is closed at once and counted.
 pub const MAX_FLOWS: usize = 10_000;
 /// Log rows held between two batches at most; a burst past it loses the excess,
-/// never a flow. Rows are per flow, so this is far above any real 250 ms.
+/// never a flow, and the row ids count through the loss, so it shows as a gap.
+/// Rows are per flow, so this takes about 16,000 new flows a second; the number
+/// is a design, not a measurement.
 pub const MAX_PENDING_LOG: usize = 4_000;
 
 /// Who a client is: its Windows session (plan 1.3, session scoping). A guest's
@@ -73,13 +75,18 @@ pub struct FlowBook {
 }
 
 impl FlowBook {
-    /// The row a guest's flow counts in. Past [`MAX_GUESTS`] a new name folds
-    /// into the unidentified row (one slot stays reserved for it), and since
-    /// rows are never removed, a folded name folds for this whole run.
-    fn guest_mut(&mut self, forwarded: &Forwarded) -> &mut Guest {
+    /// The VM name of the row a guest's flow counts in, which is also the row
+    /// whose Off applies to it. Past [`MAX_GUESTS`] a new name folds into the
+    /// unidentified row (one slot stays reserved for it), and since rows are never
+    /// removed, a folded name folds for this whole run.
+    pub fn guest_row<'a>(&self, forwarded: &'a Forwarded) -> Option<&'a str> {
         let named = vm_key(forwarded.vm.as_deref());
         let room = self.guests.keys().filter(|k| **k != vm_key(None)).count() < MAX_GUESTS - 1;
-        let vm = if self.guests.contains_key(&named) || room { forwarded.vm.as_deref() } else { None };
+        if self.guests.contains_key(&named) || room { forwarded.vm.as_deref() } else { None }
+    }
+
+    fn guest_mut(&mut self, forwarded: &Forwarded) -> &mut Guest {
+        let vm = self.guest_row(forwarded);
         let key = vm_key(vm);
         self.guests.entry(key.clone()).or_insert_with(|| Guest { key, vm: vm.map(str::to_string), seen: 0, open: 0 })
     }
@@ -121,6 +128,7 @@ impl FlowBook {
     fn push_row(&mut self, id: u64, t: u64, request: Option<(&str, &str)>, outcome: LogOutcome, rule: Option<&str>, list: Option<&str>) {
         let Some(e) = self.open.get(&id) else { return };
         if self.log.len() >= MAX_PENDING_LOG {
+            self.next_log_id += 1;
             return;
         }
         let ip = || e.remote.parse::<std::net::SocketAddr>().map_or_else(|_| e.remote.clone(), |a| a.ip().to_string());
@@ -321,6 +329,8 @@ mod tests {
         }
         assert_eq!(b.take_log().len(), MAX_PENDING_LOG);
         assert_eq!(b.live(), 1);
+        b.log_decision(id, &decided(Reason::NamedNoRule, None, None), 1);
+        assert_eq!(b.take_log()[0].id, MAX_PENDING_LOG as u64 + 6, "the five lost rows are a gap in the ids");
     }
 
     #[test]

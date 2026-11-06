@@ -1,4 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
+import { MAX_RULE_LINES } from "../../src/core/rules";
+import { POLICY_BUDGETS, budgetBytes, defaultValue } from "../../src/core/settings/registry";
 
 const FILTERS = "/filters/?source=mock&seed=1";
 
@@ -98,8 +100,12 @@ test.describe("filters", () => {
   test("rules the engine could not hold are refused where they are saved, with the reason, and stay in the editor", async ({ page }) => {
     await open(page);
     const editor = page.getByRole("textbox", { name: "User rules" });
-    // Under the editor's own line limit, over what one policy can carry.
-    const lines = Array.from({ length: 4_900 }, (_, i) => `||a-long-enough-host-name-for-a-rule-number-${i}.tracker.for-a-rule-that-takes-room.example.com^`);
+    // Over the rules budget and under the editor's own line limit, both derived: a change to either that leaves no such paste fails here, by name.
+    const rule = (i: number) => `||a-long-enough-host-name-for-a-rule-number-${i}.tracker.for-a-rule-that-takes-room.example.com^`;
+    const rulesBudget = POLICY_BUDGETS.find((b) => b.keys.includes("filtering.userRules"))!;
+    const lines = Array.from({ length: Math.ceil(rulesBudget.bytes / rule(0).length) + 1 }, (_, i) => rule(i));
+    expect(lines.length).toBeLessThanOrEqual(MAX_RULE_LINES);
+    expect(budgetBytes(rulesBudget, (key) => (key === "filtering.userRules" ? lines : defaultValue(key)))).toBeGreaterThan(rulesBudget.bytes);
     // As a paste lands: fill() inserts text through the editing path, too slow for half a megabyte.
     await editor.evaluate((el, text) => {
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(el, text);

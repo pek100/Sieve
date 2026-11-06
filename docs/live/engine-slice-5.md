@@ -6,7 +6,7 @@ What slice 5 changes: while `policy.https` is on, one CNG key (`Sieve root <16 h
 
 ## Why the script drives the switch
 
-`filtering.https` stays hidden until slice 6 builds interception (decision 17 of `docs/tasks/2026-11-02-root-ca.md`), so the app reads it as off and sends `https: false` whenever it runs. The script therefore works with the app closed: elevated, it stops the service, writes `policy.json` with `https: true` and a higher revision, and starts it. No new verb, build or production surface. Opening the app while the root is installed removes it, which is check 4 by another path.
+`filtering.https` stays hidden until slice 6 builds interception (decision 17 of `docs/tasks/2026-11-02-root-ca.md`), so the app reads it as off and sends `https: false` whenever it runs. The script therefore works with the app closed: elevated, it stops the service, changes only `https` and the revision in `policy.json`, leaving every other switch as it was, and starts it. No new verb, build or production surface. Opening the app while the root is installed removes it, which is check 4 by another path.
 
 ## Before you start
 
@@ -20,7 +20,7 @@ What slice 5 changes: while `policy.https` is on, one CNG key (`Sieve root <16 h
 1. **`-Step before`**. Saves the root store, the key listing and the Firefox value.
 2. **`-Step on`**. Turns the switch on through `policy.json`, waits for `ca.json` to record a root, then checks items 1 to 3 of plan 7.2:
    - the root is in the store under its recorded thumbprint, CA true, path length 0, Server Authentication only, and the store's property is Server Authentication only;
-   - the key is a machine key of the Microsoft Software Key Storage Provider, not exportable, DACL SYSTEM only. Read `key-detail.txt`: decision 11 assumes an elevated admin is refused this key, and that is a claim only this run can settle. Say what you saw;
+   - the key is a machine key of the Microsoft Software Key Storage Provider. An elevated admin is refused it (decision 11, a claim only this run can settle: `key-detail.txt` holds what certutil said). Its export policy and DACL are read as SYSTEM, the one account that can open it, by a one-shot scheduled task the script creates and deletes (`key-facts.json`): the policy must be `None` and every entry of the DACL SYSTEM's. No answer from that task is a FAIL, not a pass;
    - no file under `ProgramData\Sieve` holds key material;
    - the Firefox value matches what `ca.json` says Sieve did.
 3. **Firefox, by hand, if it is installed.** Open `about:certificate` or Settings > Certificates > View Certificates > Authorities: the root is listed. Say whether Firefox showed it before the policy value too (whether current Firefox honours enterprise roots by default, plan 2.3, is open). A per-user Firefox install may not be seen by SYSTEM's detection; say which kind you have.

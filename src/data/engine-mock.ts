@@ -72,7 +72,7 @@ export const ENGINE_SCENARIOS = [
 ] as const;
 export type EngineScenario = (typeof ENGINE_SCENARIOS)[number];
 
-export const CERT_SCENARIOS = ["installed", "expires_soon", "not_installed", "policy_off", "error"] as const;
+export const CERT_SCENARIOS = ["installed", "expires_soon", "not_installed", "policy_off", "removal_pending", "error"] as const;
 export type CertScenario = (typeof CERT_SCENARIOS)[number];
 
 export const MOCK_ENGINE_ERROR = "service manager: Access is denied. (os error 5)";

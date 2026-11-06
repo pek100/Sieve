@@ -405,7 +405,11 @@ impl Ca {
         let withdrawn = recorded.is_some_and(|s| s.withdrawn).then(|| WITHDRAWN.to_string());
         let last_error = held.last_error.clone().or(withdrawn);
         let Some(root) = &held.root else {
-            return CertStatus { last_rotation_ms, last_error, ..CertStatus::default() };
+            // Retiring with its thumbprint still recorded: its removal has not
+            // happened yet, so Windows may still trust it.
+            let trusted = recorded.and_then(|s| s.retiring.iter().find_map(|entry| entry.thumbprint.clone()));
+            let state = if trusted.is_some() { CertState::RemovalPending } else { CertState::NotInstalled };
+            return CertStatus { state, thumbprint: trusted, last_rotation_ms, last_error, ..CertStatus::default() };
         };
         let state = if now_ms >= root.not_after_ms.saturating_sub(ROTATE_BEFORE_MS) {
             CertState::ExpiresSoon

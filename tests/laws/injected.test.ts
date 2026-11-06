@@ -14,6 +14,17 @@ import { APPLIER_OUTPUT, APPLIER_SOURCE, transpileApplier } from "../../scripts/
 import { ROOT, hits, read, walk } from "./files";
 
 const PINNED_SHA256 = "85a6545f0138127eb86bd5a9ac1d5c852c3c74f34b75d9414c153b199de97c6b";
+/** Sieve's edits to the pinned file (engine/injected/README.md), as [ours, theirs]. */
+const PATCHES: [string, string][] = [
+  [
+    "  const regexEnd = regexText.lastIndexOf('/')\n  const regexPattern = regexEnd > 0 ? regexText.slice(1, regexEnd) : regexText.slice(1)\n  const regexArgs = regexEnd > 0 ? regexText.slice(regexEnd + 1) : ''\n",
+    "  const regexParts = regexText.split('/')\n  const regexPattern = regexParts[1]!\n  const regexArgs = regexParts[2]\n",
+  ],
+  [
+    "  const children = Array.from(element.parentNode.children)\n  const siblings = children.slice(children.indexOf(element) + 1)\n",
+    "  const siblings = Array.from(element.parentNode.children)\n",
+  ],
+];
 const MPL_HEADER = "This Source Code Form is subject to the terms of the Mozilla Public";
 const OBSERVER_SETTLE_MS = 250;
 
@@ -47,8 +58,13 @@ const element = (id: string) => document.getElementById(id) as HTMLElement;
 const hidden = (id: string) => element(id).style.getPropertyValue("display") === "none" && element(id).style.getPropertyPriority("display") === "important";
 
 describe("the vendored applier", () => {
-  it("hashes to its pin, byte for byte", () => {
-    expect(createHash("sha256").update(readFileSync(APPLIER_SOURCE)).digest("hex")).toBe(PINNED_SHA256);
+  it("is its pin, byte for byte, plus the listed patches and nothing else", () => {
+    let source = readFileSync(APPLIER_SOURCE, "utf8");
+    for (const [ours, theirs] of PATCHES) {
+      expect(source.split(ours).length, ours).toBe(2);
+      source = source.replace(ours, () => theirs);
+    }
+    expect(createHash("sha256").update(source).digest("hex")).toBe(PINNED_SHA256);
   });
 
   it("rebuilds to the checked-in output", () => {
@@ -151,6 +167,54 @@ describe("the bootstrap under jsdom", () => {
     for (const type of ["matches-css-before", "matches-css-after"]) {
       expect(() => run({ selector: [css("#keep"), { type, arg: "content: none" }] })).not.toThrow();
     }
+  });
+
+  it("the ~ combinator selects only the siblings after the element, as CSS does", () => {
+    document.body.innerHTML = `<div class="box" id="before"></div><div class="anchor" id="anchor"></div><div class="box" id="after"></div>`;
+    run({ selector: [css(".anchor"), { type: "has-text", arg: "" }, css(" ~ .box")] });
+    expect(hidden("after")).toBe(true);
+    expect(hidden("before")).toBe(false);
+    expect(hidden("anchor")).toBe(false);
+  });
+
+  it("a regex may hold an escaped slash", () => {
+    document.body.innerHTML = `<div class="box" id="slashed">foo/bar</div><div class="box" id="plain">foo</div>`;
+    run({ selector: [css(".box"), { type: "has-text", arg: "/foo\\/bar/" }] });
+    expect(hidden("slashed")).toBe(true);
+    expect(hidden("plain")).toBe(false);
+  });
+
+  it("a text that opens with a slash and never closes it is all pattern, not flags", () => {
+    document.body.innerHTML = `<div class="box" id="slashed">see /shorts here</div><div class="box" id="plain">other</div>`;
+    run({ selector: [css(".box"), { type: "has-text", arg: "/shorts" }] });
+    expect(hidden("slashed")).toBe(true);
+    expect(hidden("plain")).toBe(false);
+  });
+
+  it("a regex keeps its flags after an escaped slash", () => {
+    document.body.innerHTML = `<div class="box" id="slashed">FOO/BAR</div>`;
+    run({ selector: [css(".box"), { type: "has-text", arg: "/foo\\/bar/i" }] });
+    expect(hidden("slashed")).toBe(true);
+  });
+
+  it("a style the page overrode is put back, and a pass with nothing to do writes nothing", async () => {
+    run({ selector: [css("#action-style")], action: { type: "style", arg: "color: blue !important; width: 1px" } });
+    const { style } = element("action-style");
+    expect(style.getPropertyValue("color")).toBe("blue");
+    expect(style.getPropertyPriority("color")).toBe("important");
+    expect(style.getPropertyValue("width")).toBe("1px");
+    // Not red: observers of earlier tests live on, and one of them looks for red.
+    style.setProperty("color", "green");
+    const written = vi.spyOn(style, "setProperty");
+    document.body.append(document.createElement("p"));
+    await new Promise((resolve) => setTimeout(resolve, OBSERVER_SETTLE_MS));
+    expect(style.getPropertyValue("color")).toBe("blue");
+    expect(style.getPropertyPriority("color")).toBe("important");
+    expect(written).toHaveBeenCalledTimes(1);
+    written.mockClear();
+    document.body.append(document.createElement("p"));
+    await new Promise((resolve) => setTimeout(resolve, OBSERVER_SETTLE_MS));
+    expect(written).not.toHaveBeenCalled();
   });
 
   it("runs every action", () => {

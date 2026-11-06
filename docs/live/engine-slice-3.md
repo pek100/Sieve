@@ -96,14 +96,16 @@ Also unmeasured: a network that answers documentation addresses (the engine woul
 
 ## A row's Off: live proof (added 2026-11-06, nobody has run it)
 
-The engine keys a process hidden from the app by the name the app shows for it (`AppKeys::of_pid` in `engine/crates/sieve-engine/src/flow/flows.rs`). Offline tests use a constructed machine. Two facts only a real machine can settle: that the account rule matches what the unelevated app can read, and that the service list reads the same as SYSTEM and as the user.
+The engine keys a process hidden from the app by the name the app shows for it (`AppKeys::of_pid` in `engine/crates/sieve-engine/src/flow/flows.rs`). Offline tests use a constructed machine. Whether a process is hidden is asked of Windows, as the console's user (`console_user_can_open`), because the account a process runs as does not settle it: a read-only probe on 2026-11-06 at medium integrity found `remoting_host.exe` (SYSTEM, Chrome Remote Desktop) and AnyDesk readable. The account rule stands in only while no user can be asked. That impersonation needs SYSTEM, so nobody has run it. Two facts only a real machine can settle: that the answer matches what the unelevated app can read, and that the service list reads the same as SYSTEM and as the user.
 
 With the switch on and the rule `||example.com^` under Filters:
 
 1. Turn **Microsoft Windows Operating System** off under Apps. From a program the row covers, such as a Windows tool in your own session, `example.com` loads. A service host keeps its row reading sieved, and its connections to a blocked host are still closed.
 2. Turn that row on again and turn off a row named after services, such as **DHCP Client and 3 more**. In the log, the flows of that host read as exempt.
 
-If step 2 does not exempt, the app and the engine disagree on that row's name: a service the user may not query. That row then stays sieved, the safe side, and its Off does not do what the setting's help says. Record which row.
+3. If a remote desktop tool is installed (Chrome Remote Desktop, AnyDesk), turn its row off. In the log its flows read as exempt.
+
+If step 2 or 3 does not exempt, the app and the engine disagree on that row's name: a service the user may not query, or a process the two judge differently. That row then stays sieved, the safe side, and its Off does not do what the setting's help says. Record which row.
 
 ## Emergency: getting the network back by hand
 

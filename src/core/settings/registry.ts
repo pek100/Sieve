@@ -432,6 +432,8 @@ export function isValidValue(key: SettingKey, value: unknown): boolean {
         Object.values(value).every((v) => isValidElement(def.of, v))
       );
     case "list":
+      // The engine refuses an empty resolver list: it never falls back to plain DNS, so an empty one means nothing.
+      if (def.of.type === "upstream" && Array.isArray(value) && value.length === 0) return false;
       return Array.isArray(value) && value.every((v) => isValidElement(def.of, v));
   }
 }

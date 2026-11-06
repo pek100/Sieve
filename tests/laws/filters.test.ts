@@ -114,6 +114,20 @@ describe("law: what the engine could not hold is refused where it is saved", () 
     expect(plan.next.values["filtering.userRules"]).toEqual(["||kept.example^"]);
     expect(plan.next.values["appearance.theme"]).toBe("light");
   });
+
+  it("an import is measured with its refused values back: a refused member and a large accepted one never yield a document over the budget", () => {
+    const held = Array.from({ length: 100 }, (_, i) => `! ${String(i).padEnd(4_000, "x")}`);
+    const current = { schema: EMPTY_DOC.schema, values: { "filtering.userRules": held } };
+    const exclusions = Array.from({ length: 6_000 }, (_, i) => `a-long-enough-name-to-take-room-${i}.example`);
+    const plan = planImport(current, JSON.stringify({ kind: EXPORT_KIND, schema: EMPTY_DOC.schema, values: { "filtering.userRules": ["##+js(trusted-x)"], "filtering.exclusions": exclusions } }));
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.refused.map((r) => r.key).sort()).toEqual(["filtering.exclusions", "filtering.userRules"]);
+    expect(plan.refused.find((r) => r.key === "filtering.exclusions")?.reason).toMatch(/not saved/);
+    expect(plan.changes.map((c) => c.key), "the preview promises neither").not.toContain("filtering.exclusions");
+    expect(budgetBytes(rulesBudget, (k) => readValue(plan.next, k))).toBeLessThanOrEqual(rulesBudget.bytes);
+    expect(plan.next.values["filtering.userRules"]).toEqual(held);
+  });
 });
 
 describe("filter list law", () => {

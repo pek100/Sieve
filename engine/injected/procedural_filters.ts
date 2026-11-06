@@ -62,9 +62,9 @@ const _asHTMLElement = (node: Node): HTMLElement | null => {
 }
 
 const _compileRegEx = (regexText: string): RegExp => {
-  const regexParts = regexText.split('/')
-  const regexPattern = regexParts[1]!
-  const regexArgs = regexParts[2]
+  const regexEnd = regexText.lastIndexOf('/')
+  const regexPattern = regexEnd > 0 ? regexText.slice(1, regexEnd) : regexText.slice(1)
+  const regexArgs = regexEnd > 0 ? regexText.slice(regexEnd + 1) : ''
   const regex = new W.RegExp(regexPattern, regexArgs)
   return regex
 }
@@ -210,7 +210,8 @@ const _allOtherSiblings = (element: HTMLElement): HTMLElement[] => {
   if (!element.parentNode) {
     return []
   }
-  const siblings = Array.from(element.parentNode.children)
+  const children = Array.from(element.parentNode.children)
+  const siblings = children.slice(children.indexOf(element) + 1)
   const otherHTMLElements = []
   for (const sib of siblings) {
     if (sib === element) {

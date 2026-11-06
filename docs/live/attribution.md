@@ -26,8 +26,8 @@ The run also answers these questions:
 ## L2: ETW
 
 1. Does the session start, and can its consumer open it, under the trimmed `REQUIRED_PRIVILEGES` token? If either fails, or the consumer ends later on its own, `last_error` says `attribution without ETW`, no session is left running, routing continues, and a privilege decision follows.
-2. Measure real delivery latency with the flush nudge, against the 2000 ms `ETW_MATCH_WINDOW_MS`. Do one-shot UDP sockets now get a PID before the 250 ms give-up?
-3. `etw_found` is above 0, and `etw_disagreed` is 0 or explained. Do PIDs for svchost-hosted DNS agree with the owner tables?
+2. Measure real delivery latency with the flush nudge, against the 2000 ms `ETW_MATCH_WINDOW_MS`. Do one-shot UDP sockets now get a PID before the 250 ms give-up? An entry is aged from the event's own `TimeStamp`, read as a FILETIME because the consumer does not ask for raw timestamps (`etw::occurred_at_ms`). If `etw_found` stays 0 here while events arrive, suspect that reading first.
+3. `etw_found` is above 0, and `etw_disagreed` is 0 or explained. It counts only disagreement present at decision time: a contradiction delivered after the decision is not counted anywhere, and most arrive after it, so a 0 here says nothing about svchost-hosted DNS. To answer whether its PIDs agree with the owner tables, read `raw_events` from a diagnostic build against the tables by hand.
 4. `logman query -ets` shows no `SieveEngineAttribution` after each of: a stop, a kill plus restart, `restore`, `uninstall`, and a watchdog trip (the `stall` build) with SCM recovery used up, so the service stays stopped. `last-error.txt` then names the session stop after the routes. A hard kill with recovery used up runs no code: its session stays until `restore` or a reboot, with routing off and no effect on the network.
 5. A kill recovers the network as before.
 

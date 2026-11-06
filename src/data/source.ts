@@ -52,7 +52,7 @@ export interface SourceOptions {
   engine: EngineScenario;
   /** Mock: every read of the engine's log fails (?log=error). */
   logError: boolean;
-  /** Mock certificate scenario (?cert=installed|expires_soon|not_installed|policy_off|error, default not_installed). */
+  /** Mock certificate scenario (?cert=installed|expires_soon|not_installed|policy_off|removal_pending|error, default not_installed). */
   cert: CertScenario;
   /** Mock filter lists (?lists=pending|loaded|empty|error, default pending). */
   lists: FilterListScenario;

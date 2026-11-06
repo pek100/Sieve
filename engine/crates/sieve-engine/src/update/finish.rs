@@ -667,9 +667,15 @@ mod tests {
         }
 
         fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            // The real file is held open: it can be neither replaced nor moved
+            // aside. One rollback try is both renames, counted at the second.
             let held = self.locked_tries.get();
-            if held > 0 && to.to_string_lossy().ends_with(FAILED_SUFFIX) {
-                self.locked_tries.set(held - 1);
+            let over_it = from.to_string_lossy().ends_with(OLD_SUFFIX);
+            let moving_it = to.to_string_lossy().ends_with(FAILED_SUFFIX);
+            if held > 0 && (over_it || moving_it) {
+                if moving_it {
+                    self.locked_tries.set(held - 1);
+                }
                 return Err(std::io::Error::other("sharing violation"));
             }
             RealFs.rename(from, to)

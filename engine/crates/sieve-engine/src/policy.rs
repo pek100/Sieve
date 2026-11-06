@@ -10,6 +10,7 @@
 //!   The service manager's recovery (restart twice, then stay stopped) is
 //!   the other half; this half holds across reboots and manual starts.
 
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -43,7 +44,27 @@ pub fn save(dir: &Path, policy: &Policy) -> Result<(), String> {
     write_atomic(&dir.join(POLICY_FILE), &serde_json::to_vec_pretty(policy).map_err(|e| e.to_string())?)
 }
 
+/// A record that outlives a power loss: on disk before it returns, because what
+/// comes next may depend on it (`ca.json` guards the trust write that follows).
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_durably(path, bytes, &std::fs::File::sync_all)
+}
+
+/// The bytes first, then the rename, then the rename itself: a rename reaching
+/// the disk ahead of its data would leave a damaged file behind.
+fn write_durably(path: &Path, bytes: &[u8], flush: &dyn Fn(&std::fs::File) -> std::io::Result<()>) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    let named = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let mut file = std::fs::File::create(&tmp).map_err(|e| named(&tmp, e))?;
+    file.write_all(bytes).and_then(|()| flush(&file)).map_err(|e| named(&tmp, e))?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|e| named(path, e))?;
+    std::fs::OpenOptions::new().write(true).open(path).and_then(|renamed| flush(&renamed)).map_err(|e| named(path, e))
+}
+
+/// A report rewritten every few seconds and read by a person: atomic, and not
+/// worth a flush.
+pub(crate) fn write_report(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
@@ -146,6 +167,29 @@ mod tests {
         let (p, why) = load(dir.path());
         assert_eq!(p, Policy::default());
         assert!(why.unwrap().contains("read as off"));
+    }
+
+    /// What is on disk at each flush: the old file while the new bytes go down,
+    /// the new one when the rename goes down. No power-loss run proves more.
+    #[test]
+    fn a_durable_write_flushes_the_bytes_before_the_rename_and_the_rename_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.json");
+        std::fs::write(&path, b"old").unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        write_durably(&path, b"new!", &|file| {
+            seen.borrow_mut().push((file.metadata()?.len(), std::fs::read(&path)?));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*seen.borrow(), [(4, b"old".to_vec()), (4, b"new!".to_vec())]);
+
+        let failed = write_durably(&path, b"newer", &|_| Err(std::io::Error::other("disk gone")));
+        assert!(failed.unwrap_err().contains("disk gone"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new!", "a failed flush renames nothing");
+
+        write_atomic(&path, b"real").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"real");
     }
 
     #[test]
