@@ -1,0 +1,4 @@
+# Pinned or embedded bytes: a CRLF checkout must not change them.
+engine/injected/** -text
+engine/crates/sieve-filter/testdata/** -text
+tests/fixtures/ubo-tree/** -text

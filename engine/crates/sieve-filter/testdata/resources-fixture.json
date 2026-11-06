@@ -1,0 +1,55 @@
+[
+ {
+  "name": "sieve-flag-name.fn",
+  "aliases": [],
+  "kind": {
+   "mime": "fn/javascript"
+  },
+  "content": "ZnVuY3Rpb24gc2lldmVGbGFnTmFtZShuYW1lKSB7CiAgcmV0dXJuIGBzaWV2ZUZpeHR1cmVfJHtuYW1lfWA7Cn0="
+ },
+ {
+  "name": "sieve-noop.js",
+  "aliases": [
+   "sieve-noopjs"
+  ],
+  "kind": {
+   "mime": "application/javascript"
+  },
+  "content": "KGZ1bmN0aW9uICgpIHt9KSgpOwo="
+ },
+ {
+  "name": "sieve-pixel.gif",
+  "aliases": [
+   "sieve-1x1.gif"
+  ],
+  "kind": {
+   "mime": "image/gif"
+  },
+  "content": "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+ },
+ {
+  "name": "sieve-set-flag.js",
+  "aliases": [
+   "ssf.js"
+  ],
+  "kind": {
+   "mime": "application/javascript"
+  },
+  "content": "ZnVuY3Rpb24gc2lldmVTZXRGbGFnKG5hbWUgPSAiIiwgdmFsdWUgPSAiIikgewogIGdsb2JhbFRoaXNbc2lldmVGbGFnTmFtZShuYW1lKV0gPSB2YWx1ZTsKfQ==",
+  "dependencies": [
+   "sieve-flag-name.fn"
+  ]
+ },
+ {
+  "name": "trusted-sieve-flag.js",
+  "aliases": [],
+  "kind": {
+   "mime": "application/javascript"
+  },
+  "content": "ZnVuY3Rpb24gc2lldmVUcnVzdGVkRmxhZyhuYW1lID0gIiIpIHsKICBnbG9iYWxUaGlzW3NpZXZlRmxhZ05hbWUobmFtZSldID0gInRydXN0ZWQiOwp9",
+  "dependencies": [
+   "sieve-flag-name.fn"
+  ],
+  "permission": 1
+ }
+]

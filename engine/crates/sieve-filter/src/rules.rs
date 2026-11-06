@@ -29,6 +29,8 @@ use adblock::lists::{FilterSet, ParseOptions, ParsedLine, parse_filter};
 use adblock::request::Request;
 use adblock::resources::PermissionMask;
 
+use crate::cosmetic::{CosmeticBuilder, CosmeticIndex, ScriptletUse, page_exception};
+
 /// The synthetic host-level request (module doc).
 const SYNTHETIC_TYPE: &str = "other";
 const SYNTHETIC_METHOD: &str = "GET";
@@ -77,6 +79,9 @@ pub struct ListReport {
     /// exception over-blocks, so each is named (plan 5.2).
     pub skipped_exceptions: Vec<String>,
     pub skipped_exceptions_total: usize,
+    /// Rules naming a scriptlet the loaded bundle lacks ("N rules need a newer
+    /// resource library", plan 5.5). `None` until a bundle is loaded.
+    pub missing_scriptlets: Option<usize>,
 }
 
 /// The engine's answer for a host.
@@ -111,8 +116,11 @@ pub enum DomainKind {
 }
 
 pub struct RuleEngine {
-    engine: Engine,
-    reports: Vec<ListReport>,
+    pub(crate) engine: Engine,
+    pub(crate) reports: Vec<ListReport>,
+    pub(crate) cosmetic: CosmeticIndex,
+    /// Per list, parallel to `reports`.
+    pub(crate) scriptlets: Vec<ScriptletUse>,
 }
 
 impl std::fmt::Debug for RuleEngine {
@@ -139,12 +147,29 @@ fn rule_lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines().map(str::trim).filter(|l| !l.is_empty() && !is_comment(l))
 }
 
-fn report(list: &ListText<'_>) -> ListReport {
+fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, ScriptletUse) {
+    let opts = options(list.trusted);
     let mut r = ListReport { id: list.id.to_string(), ..ListReport::default() };
+    let mut scriptlets = ScriptletUse::new();
     for line in rule_lines(list.text) {
-        match parse_filter(line, false, options(list.trusted)) {
-            Ok(ParsedLine::Network(_)) => r.network += 1,
-            Ok(ParsedLine::Cosmetic(_)) => r.cosmetic += 1,
+        // A skipped exception is a defect (plan 5.2): the parser refuses these
+        // options, so a line it can answer through `page_exception` is applied.
+        let exception = page_exception(line).filter(|e| parse_filter(e.rule(), false, opts).is_ok());
+        let answered = exception.is_some();
+        if let Some(exception) = exception {
+            cosmetic.add_exception(exception);
+        }
+        match parse_filter(line, false, opts) {
+            Ok(parsed) => {
+                match &parsed {
+                    ParsedLine::Network(_) => r.network += 1,
+                    ParsedLine::Cosmetic(_) => r.cosmetic += 1,
+                }
+                if let Some(name) = cosmetic.observe(&parsed) {
+                    *scriptlets.entry(name).or_default() += 1;
+                }
+            }
+            Err(_) if answered => r.network += 1,
             Err(e) => {
                 r.skipped += 1;
                 *r.skip_reasons.entry(e.to_string()).or_default() += 1;
@@ -157,7 +182,7 @@ fn report(list: &ListText<'_>) -> ListReport {
             }
         }
     }
-    r
+    (r, scriptlets)
 }
 
 /// True when `text` holds at least one rule the parser accepts: a response
@@ -201,14 +226,15 @@ impl RuleEngine {
     /// skipped and counted in [`RuleEngine::reports`].
     pub fn compile(lists: &[ListText<'_>]) -> Self {
         let mut set = FilterSet::new(true);
-        let reports = lists
+        let mut cosmetic = CosmeticBuilder::default();
+        let (reports, scriptlets) = lists
             .iter()
             .map(|list| {
                 set.add_filter_list(list.text.to_string(), options(list.trusted));
-                report(list)
+                report(list, &mut cosmetic)
             })
-            .collect();
-        Self { engine: Engine::new_with_filter_set_no_optimize(set), reports }
+            .unzip();
+        Self { engine: Engine::new_with_filter_set_no_optimize(set), reports, cosmetic: cosmetic.build(), scriptlets }
     }
 
     /// An engine with no rules: it answers None for everything.
@@ -597,10 +623,10 @@ example.invalid##+js(set-constant, adsAllowed, true)
             ("@@||host.example^$ghide", Network),
             // Finding 4: the exception modifiers adblock-rust does not have.
             ("||host.example^$denyallow=a.example", Skip),
-            ("@@||host.example^$elemhide", Skip),
-            ("@@||host.example^$ehide", Skip),
-            ("@@||host.example^$specifichide", Skip),
-            ("@@||host.example^$shide", Skip),
+            ("@@||host.example^$elemhide", Network),
+            ("@@||host.example^$ehide", Network),
+            ("@@||host.example^$specifichide", Network),
+            ("@@||host.example^$shide", Network),
             ("@@||host.example^$genericblock", Skip),
             ("@@||host.example^$removeparam=utm", Skip),
             ("host.example##.banner", Cosmetic),
@@ -648,19 +674,20 @@ example.invalid##+js(set-constant, adsAllowed, true)
 
     #[test]
     fn every_skipped_exception_is_listed_with_its_line() {
-        let forms = ["@@||a.example^$elemhide", "@@||a.example^$ehide", "@@||a.example^$specifichide", "@@||a.example^$shide", "@@||a.example^$genericblock", "@@||a.example^$removeparam=x"];
+        // $elemhide, $ehide, $specifichide and $shide are answered by page_exception, so they are not here.
+        let forms = ["@@||a.example^$genericblock", "@@||a.example^$removeparam=x"];
         let text = forms.join("\n");
         let e = engine(&text);
         let r = &e.reports()[0];
         assert_eq!(r.skipped_exceptions, forms);
         assert_eq!(r.skipped_exceptions_total, forms.len());
 
-        let many: String = (0..MAX_LISTED_EXCEPTIONS + 5).map(|i| format!("@@||a{i}.example^$elemhide\n")).collect();
+        let many: String = (0..MAX_LISTED_EXCEPTIONS + 5).map(|i| format!("@@||a{i}.example^$genericblock\n")).collect();
         let e = engine(&many);
         let r = &e.reports()[0];
         assert_eq!(r.skipped_exceptions.len(), MAX_LISTED_EXCEPTIONS);
         assert_eq!(r.skipped_exceptions_total, MAX_LISTED_EXCEPTIONS + 5);
-        assert_eq!(r.skipped_exceptions[0], "@@||a0.example^$elemhide");
+        assert_eq!(r.skipped_exceptions[0], "@@||a0.example^$genericblock");
 
         let blocks = engine("||a.example^$popup\n");
         assert!(blocks.reports()[0].skipped_exceptions.is_empty(), "a skipped block rule only under-blocks");

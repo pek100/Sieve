@@ -15,7 +15,8 @@
 //! - [`control`]: the running engine's facts and its routing loop;
 //! - [`domain`]: the one per-flow decision (slice 4);
 //! - [`lists`]: the default lists' download, cache and compile (slice 4);
-//! - [`ca`]: the root CA, its removal paths and the leaf API (slice 5).
+//! - [`ca`]: the root CA, its removal paths and the leaf API (slice 5);
+//! - [`inject`]: the content injection library (slice 9), not yet wired to traffic.
 //!
 //! Traffic goes through the engine only while the user's `filtering.engine`
 //! switch is on; off, killed or crashed is a normal network.
@@ -28,6 +29,7 @@ pub mod domain;
 pub mod experiments;
 pub mod flow;
 pub mod hand_file;
+pub mod inject;
 pub mod ipc;
 pub mod lists;
 pub mod policy;
