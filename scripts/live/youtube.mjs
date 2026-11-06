@@ -5,7 +5,7 @@
 // and its videos file only, never in the product (engine/tests/no_site_names.rs).
 //
 // A run is inconclusive, never pass, when it cannot show the engine was in the path
-// doing the work: see runVerdict.
+// doing the work with the arm's lists, or a check could not run: see runVerdict.
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -34,6 +34,7 @@ const START_TIMEOUT_MS = 30_000;
 const NEXT_VIDEO_TIMEOUT_MS = 30_000;
 const SEEK_BY_S = 30;
 const LOWER_QUALITY = "small";
+const DAY_CHECKS = ["seek", "quality", "autoplay"];
 
 const PLAYER_STATE = `(() => {
   const video = document.querySelector("video.html5-main-video") ?? document.querySelector("video");
@@ -87,21 +88,39 @@ export function videoVerdict(samples) {
   return { verdict: "pass", reason: "advancing and clean" };
 }
 
-/** What a run can claim. Without the engine in the path or a scriptlet served, an
- *  ad-free video says nothing about Sieve, so that is inconclusive before any fail. */
-export function runVerdict(videos, day = {}) {
+/** The ids the engine reports holding; null, not none, when the status does not say. */
+export function heldLists(status) {
+  return status?.filter?.lists?.map((list) => list.id) ?? null;
+}
+
+function sameLists(wanted, held) {
+  return held !== null && held.length === wanted.length && wanted.every((id) => held.includes(id));
+}
+
+/** What a run can claim. Without the engine in the path, the arm's lists held from
+ *  start to end, and a scriptlet served, an ad-free video says nothing about Sieve or
+ *  this arm, so that is inconclusive before any fail. A failure seen comes next. Then
+ *  whatever is unknown keeps it from a pass: a check that could not run is not clean. */
+export function runVerdict(videos, day, lists) {
   const reasons = [];
   if (videos.some((v) => v.issuer !== SIEVE_ISSUER)) reasons.push("a document's issuer is not Sieve's");
   if (videos.some((v) => v.protocol === "h3")) reasons.push("a document came over HTTP/3, which is never decrypted");
   if (videos.some((v) => v.verdict !== "unplayed" && !v.scriptletPayload)) reasons.push("no scriptlet payload in a served document");
+  for (const moment of ["start", "end"]) {
+    if (!sameLists(lists.wanted, lists[moment])) reasons.push(`at the ${moment} the engine held ${lists[moment]?.join(", ") ?? "an unknown set"}, not this arm's ${lists.wanted.join(", ")}`);
+  }
   if (reasons.length > 0) return { verdict: "inconclusive", reasons };
+
   const failed = videos.filter((v) => v.verdict === "fail").map((v) => `${v.id}: ${v.reason}`);
   if (day.homeAds > 0) failed.push(`${day.homeAds} ad element(s) on the home page`);
-  for (const check of ["seek", "quality", "autoplay"]) if (day[check] === false) failed.push(`${check} did not work`);
+  for (const check of DAY_CHECKS) if (day[check] === false) failed.push(`${check} did not work`);
   if (failed.length > 0) return { verdict: "fail", reasons: failed };
+
   const played = videos.filter((v) => v.verdict === "pass").length;
-  if (played < VIDEOS_REQUIRED) return { verdict: "inconclusive", reasons: [`${played} of ${VIDEOS_REQUIRED} videos played`] };
-  return { verdict: "pass", reasons: [] };
+  if (played < VIDEOS_REQUIRED) reasons.push(`${played} of ${VIDEOS_REQUIRED} videos played`);
+  if (typeof day.homeAds !== "number") reasons.push("the home page could not be checked");
+  for (const check of DAY_CHECKS) if (typeof day[check] !== "boolean") reasons.push(`${check} could not be checked`);
+  return reasons.length > 0 ? { verdict: "inconclusive", reasons } : { verdict: "pass", reasons };
 }
 
 /** True when the first script of a page is the engine's and holds scriptlets, not
@@ -134,6 +153,9 @@ function readStatus() {
     return null;
   }
 }
+
+/** What a driver knows of the page's document before its response is seen. */
+const NO_DOCUMENT = { issuer: null, protocol: null };
 
 /** One JSON-RPC connection, as CDP and BiDi both speak it. */
 class Rpc {
@@ -182,9 +204,12 @@ class Rpc {
 }
 
 /** Chrome and Edge. */
-class CdpDriver {
-  static async start(executable, profile) {
-    const child = spawn(executable, [`--user-data-dir=${profile}`, "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check", "--autoplay-policy=no-user-gesture-required", "about:blank"], { stdio: "ignore" });
+export class CdpDriver {
+  static launch(executable, profile) {
+    return spawn(executable, [`--user-data-dir=${profile}`, "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check", "--autoplay-policy=no-user-gesture-required", "about:blank"], { stdio: "ignore" });
+  }
+
+  static async connect(child, profile) {
     const portFile = join(profile, "DevToolsActivePort");
     const started = Date.now();
     while (!existsSync(portFile)) {
@@ -193,13 +218,14 @@ class CdpDriver {
     }
     const [port, path] = readFileSync(portFile, "utf8").split("\n");
     const driver = new CdpDriver();
-    driver.child = child;
-    driver.document = { issuer: null, protocol: null };
+    driver.document = NO_DOCUMENT;
     driver.rpc = await Rpc.open(`ws://127.0.0.1:${port.trim()}${path.trim()}`, (event) => driver.onEvent(event));
     const { targetId } = await driver.rpc.call("Target.createTarget", { url: "about:blank" });
     const { sessionId } = await driver.rpc.call("Target.attachToTarget", { targetId, flatten: true });
     driver.session = sessionId;
     await driver.page("Page.enable");
+    const { frameTree } = await driver.page("Page.getFrameTree");
+    driver.mainFrame = frameTree.frame.id;
     await driver.page("Runtime.enable");
     await driver.page("Network.enable");
     return driver;
@@ -210,12 +236,13 @@ class CdpDriver {
   }
 
   onEvent({ method, params }) {
-    if (method === "Network.responseReceived" && params.type === "Document") {
+    if (method === "Network.responseReceived" && params.type === "Document" && params.frameId === this.mainFrame) {
       this.document = { issuer: params.response.securityDetails?.issuer ?? null, protocol: normalProtocol(params.response.protocol) };
     }
   }
 
   async navigate(url) {
+    this.document = NO_DOCUMENT;
     await this.page("Page.navigate", { url });
     await sleep(SETTLE_MS);
   }
@@ -238,9 +265,12 @@ class CdpDriver {
 
 /** Firefox has no CDP. BiDi reports no certificate, so the issuer is witnessed by the
  *  engine's own script being in the page: nothing else can have put it there. */
-class BidiDriver {
-  static async start(executable, profile) {
-    const child = spawn(executable, ["--profile", profile, "--no-remote", "--remote-debugging-port=0", "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+export class BidiDriver {
+  static launch(executable, profile) {
+    return spawn(executable, ["--profile", profile, "--no-remote", "--remote-debugging-port=0", "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+  }
+
+  static async connect(child) {
     const url = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("the browser opened no BiDi port")), START_TIMEOUT_MS);
       let seen = "";
@@ -254,8 +284,7 @@ class BidiDriver {
       });
     });
     const driver = new BidiDriver();
-    driver.child = child;
-    driver.document = { protocol: null };
+    driver.document = NO_DOCUMENT;
     driver.rpc = await Rpc.open(`${url}/session`, (event) => driver.onEvent(event));
     await driver.rpc.call("session.new", { capabilities: {} });
     await driver.rpc.call("session.subscribe", { events: ["network.responseCompleted"] });
@@ -265,12 +294,13 @@ class BidiDriver {
   }
 
   onEvent({ method, params }) {
-    if (method === "network.responseCompleted" && params.navigation) {
-      this.document = { protocol: normalProtocol(params.response.protocol) };
+    if (method === "network.responseCompleted" && params.navigation && params.context === this.context) {
+      this.document = { issuer: null, protocol: normalProtocol(params.response.protocol) };
     }
   }
 
   async navigate(url) {
+    this.document = NO_DOCUMENT;
     await this.rpc.call("browsingContext.navigate", { context: this.context, url, wait: "complete" });
     await sleep(SETTLE_MS);
   }
@@ -305,13 +335,27 @@ function findExecutable(browser) {
   return found;
 }
 
-/** Runs a check; a page that refuses it answers false, and a thrown error is recorded. */
+/** Starts a browser and gives its driver to `work`. Whatever throws, from the spawn on,
+ *  the process tree ends, since a browser that never answers is a browser still running. */
+export async function withBrowser(Driver, executable, profile, work) {
+  const child = Driver.launch(executable, profile);
+  let driver = null;
+  try {
+    driver = await Driver.connect(child, profile);
+    return await work(driver);
+  } finally {
+    driver?.rpc.close();
+    if (child.pid) spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+  }
+}
+
+/** Runs a check. A check that throws did not run: null, never its false or its zero. */
 async function attempt(label, errors, check) {
   try {
     return await check();
   } catch (error) {
     errors.push(`${label}: ${error.message}`);
-    return false;
+    return null;
   }
 }
 
@@ -355,7 +399,7 @@ async function dayOneChecks(driver, videos, errors) {
     }
     return false;
   });
-  return { homeAds: typeof homeAds === "number" ? homeAds : null, seek, quality, autoplay };
+  return { homeAds, seek, quality, autoplay };
 }
 
 async function main() {
@@ -369,31 +413,32 @@ async function main() {
   const before = readStatus();
   const profile = mkdtempSync(join(tmpdir(), "sieve-youtube-"));
   const errors = [];
-  let driver = null;
   try {
     const Driver = args.browser === "firefox" ? BidiDriver : CdpDriver;
-    driver = await Driver.start(findExecutable(args.browser), profile);
-    const played = [];
-    for (const video of videos) played.push(await watch(driver, video, args.out, errors));
-    const day = await dayOneChecks(driver, videos, errors);
-    const after = readStatus();
-    const result = {
-      browser: args.browser,
-      arm: args.arm,
-      lists,
-      listsHeld: after?.filter?.lists?.map((l) => l.id) ?? null,
-      listHits: hitsDelta(before?.content?.list_hits ?? null, after?.content?.list_hits ?? null),
-      day,
-      videos: played,
-      errors,
-      ...runVerdict(played, day),
-    };
-    writeFileSync(join(args.out, `youtube-${args.browser}-${args.arm}.json`), JSON.stringify(result, null, 2));
-    console.log(`${result.verdict}: ${result.reasons.join("; ") || "every check held"}`);
-    process.exitCode = result.verdict === "pass" ? 0 : 1;
+    await withBrowser(Driver, findExecutable(args.browser), profile, async (driver) => {
+      const played = [];
+      for (const video of videos) played.push(await watch(driver, video, args.out, errors));
+      const day = await dayOneChecks(driver, videos, errors);
+      const after = readStatus();
+      const start = heldLists(before);
+      const end = heldLists(after);
+      const result = {
+        browser: args.browser,
+        arm: args.arm,
+        lists,
+        listsHeldAtStart: start,
+        listsHeld: end,
+        listHits: hitsDelta(before?.content?.list_hits ?? null, after?.content?.list_hits ?? null),
+        day,
+        videos: played,
+        errors,
+        ...runVerdict(played, day, { wanted: lists, start, end }),
+      };
+      writeFileSync(join(args.out, `youtube-${args.browser}-${args.arm}.json`), JSON.stringify(result, null, 2));
+      console.log(`${result.verdict}: ${result.reasons.join("; ") || "every check held"}`);
+      process.exitCode = result.verdict === "pass" ? 0 : 1;
+    });
   } finally {
-    driver?.rpc?.close();
-    if (driver?.child?.pid) spawnSync("taskkill", ["/PID", String(driver.child.pid), "/T", "/F"], { stdio: "ignore" });
     rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
   }
 }

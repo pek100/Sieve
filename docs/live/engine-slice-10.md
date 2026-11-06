@@ -13,7 +13,7 @@ All of these must be true, or a run says nothing:
 
 ## Running one arm
 
-The script prints the list ids an arm needs. Give them to `engine-content.ps1`, which puts them in `policy.json` with the app closed:
+The script prints the list ids an arm needs. Give them to `engine-content.ps1`, which puts them in `policy.json` with the app closed. Then wait until `status.json` shows those lists under `filter.lists`, since a list with no downloaded copy is not held: the script reads that before the first video and after the last, and if it differs from the arm at either end, or the file cannot be read, the run is inconclusive.
 
 ```
 powershell -ExecutionPolicy Bypass -File scripts\live\engine-content.ps1 -Step on -Lists adguard-base,adguard-tracking,adguard-url-tracking,adguard-dns
@@ -28,11 +28,11 @@ The script opens the browser with a temporary profile, watches each video for 30
 
 `youtube-<browser>-<arm>.json` holds the verdict, each video's samples and document facts, and the day-one items. Failure screenshots sit beside it.
 
-- **pass:** 10 played, no ad state, no enforcement message, the engine's issuer, a scriptlet in every served document.
+- **pass:** 10 played, no ad state, no enforcement message, the engine's issuer, a scriptlet in every served document, the arm's lists held at both ends, and every day-one item checked and working.
 - **fail:** an ad or a broken player. Read the Log screen for that page's rows, since rule text is there and not in the file.
-- **inconclusive:** the run could not show Sieve was doing the work. The reasons say why. It is never a pass and never evidence against a list.
+- **inconclusive:** the run could not show Sieve was doing the work with this arm's lists, or a check could not run. The reasons say why, and `errors` holds what each failed check threw. It is never a pass. A wrong arm, a missing issuer or a missing scriptlet hides any failure too, since that is no evidence against a list; a day-one item that could not run does not hide a failure that was seen.
 
-`listHits` counts requests each list acted on during the run, from `status.json`: it needs the script to run elevated, and is `null`, not 0, when it cannot read the file. This is by design: plan 7.1 keeps the log in memory and the pipe admits only `sieve.exe`, so per-rule text stays on the Log screen (plan 5.7, as built). On Firefox the certificate cannot be read through BiDi, so the engine's script in the page is the witness for the issuer.
+The script needs an elevated prompt: without `status.json` it cannot say which lists were held. `listHits` counts the connections and decrypted requests each list blocked, redirected or stripped during the run: everything on the machine in that time, not only this browser. It is `null`, not 0, when the file cannot be read. A lookup is never counted, because DNS is not a blocking decision (`domain.rs`). This is by design: plan 7.1 keeps the log in memory and the pipe admits only `sieve.exe`, so per-rule text stays on the Log screen (plan 5.7, as built). On Firefox the certificate cannot be read through BiDi, so the engine's script in the page is the witness for the issuer.
 
 ## After both arms
 

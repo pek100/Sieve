@@ -1,27 +1,36 @@
 /**
- * The pure parts of scripts/live/youtube.mjs. The script itself is the user's to
- * run (docs/live/engine-slice-10.md); this holds what it decides from what it sees,
- * and that importing it starts nothing. Its two drivers have never run.
+ * What scripts/live/youtube.mjs decides from what it sees, that importing it starts
+ * nothing, and that a browser dies whatever goes wrong. The script itself is the
+ * user's to run (docs/live/engine-slice-10.md): its drivers meet a fake socket here
+ * and have never met a browser.
  */
-import { describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fixture from "@/data/fixtures/filter-lists-v1.json";
 import { read } from "./files";
 
-const started = vi.hoisted(() => ({ spawn: 0, spawnSync: 0 }));
+const started = vi.hoisted(() => ({ spawn: 0, spawnSync: [] as string[][], child: null as unknown }));
 vi.mock("node:child_process", () => ({
   spawn: () => {
     started.spawn++;
-    throw new Error("spawned");
+    if (!started.child) throw new Error("spawned");
+    return started.child;
   },
-  spawnSync: () => {
-    started.spawnSync++;
-    throw new Error("spawned");
+  spawnSync: (_: string, args: string[]) => {
+    started.spawnSync.push(args);
+    if (!started.child) throw new Error("spawned");
+    return { status: 0 };
   },
 }));
 
 import * as script from "../../scripts/live/youtube.mjs";
 
-const { SIEVE_ISSUER, VIDEOS_REQUIRED, armLists, hitsDelta, normalProtocol, parseArgs, runVerdict, scriptletPayload, videoVerdict } = script;
+const startedAtImport = { spawn: started.spawn, spawnSync: started.spawnSync.length };
+
+const { BidiDriver, CdpDriver, SIEVE_ISSUER, VIDEOS_REQUIRED, armLists, heldLists, hitsDelta, normalProtocol, parseArgs, runVerdict, scriptletPayload, videoVerdict, withBrowser } = script;
 const SCRIPT = "scripts/live/youtube.mjs";
 
 const sample = (currentTime: number | null, extra = {}) => ({ currentTime, adShowing: false, enforcement: false, ...extra });
@@ -29,10 +38,13 @@ const advancing = [sample(1), sample(5), sample(9)];
 
 const video = (extra = {}) => ({ id: "v", verdict: "pass", reason: "", issuer: SIEVE_ISSUER, protocol: "h2", scriptletPayload: true, ...extra });
 const tenPasses = () => Array.from({ length: VIDEOS_REQUIRED }, () => video());
+const cleanDay = { homeAds: 0, seek: true, quality: true, autoplay: true };
+const WANTED = ["a", "b"];
+const armHeld = { wanted: WANTED, start: WANTED, end: WANTED };
 
 describe("the video site live script", () => {
   it("importing it starts nothing", () => {
-    expect(started).toEqual({ spawn: 0, spawnSync: 0 });
+    expect(startedAtImport).toEqual({ spawn: 0, spawnSync: 0 });
   });
 
   it("the arms are the fixture's rows: the defaults, or the defaults and every gated row", () => {
@@ -55,10 +67,10 @@ describe("the video site live script", () => {
   });
 
   it("a run passes only with ten played, through the engine, with a scriptlet served", () => {
-    expect(runVerdict(tenPasses()).verdict).toBe("pass");
-    expect(runVerdict(tenPasses().slice(1)).verdict).toBe("inconclusive");
+    expect(runVerdict(tenPasses(), cleanDay, armHeld).verdict).toBe("pass");
+    expect(runVerdict(tenPasses().slice(1), cleanDay, armHeld).verdict).toBe("inconclusive");
     const withUnplayed = [...tenPasses().slice(1), video({ verdict: "unplayed", scriptletPayload: false })];
-    expect(runVerdict(withUnplayed).verdict).toBe("inconclusive");
+    expect(runVerdict(withUnplayed, cleanDay, armHeld).verdict).toBe("inconclusive");
   });
 
   it.each([
@@ -67,14 +79,58 @@ describe("the video site live script", () => {
     ["http/3", { protocol: "h3" }],
     ["no scriptlet payload", { scriptletPayload: false }],
   ])("a run with %s is inconclusive, never pass, and never a fail either", (_, extra) => {
-    expect(runVerdict([...tenPasses().slice(1), video(extra)]).verdict).toBe("inconclusive");
-    expect(runVerdict([...tenPasses().slice(1), video({ verdict: "fail", ...extra })]).verdict).toBe("inconclusive");
+    expect(runVerdict([...tenPasses().slice(1), video(extra)], cleanDay, armHeld).verdict).toBe("inconclusive");
+    expect(runVerdict([...tenPasses().slice(1), video({ verdict: "fail", ...extra })], cleanDay, armHeld).verdict).toBe("inconclusive");
+  });
+
+  it.each([
+    ["no lists at the end", { start: WANTED, end: [] }],
+    ["unreadable status at the end", { start: WANTED, end: null }],
+    ["unreadable status at the start", { start: null, end: WANTED }],
+    ["one list short", { start: WANTED, end: ["a"] }],
+    ["one list too many", { start: WANTED, end: ["a", "b", "c"] }],
+    ["another arm's lists", { start: ["x", "y"], end: ["x", "y"] }],
+    ["the lists swapped during the run", { start: ["x", "y"], end: WANTED }],
+  ])("a run with %s is not evidence about the arm: inconclusive, never pass, never a fail", (_, held) => {
+    const lists = { wanted: WANTED, ...held };
+    expect(runVerdict(tenPasses(), cleanDay, lists).verdict).toBe("inconclusive");
+    expect(runVerdict([...tenPasses().slice(1), video({ verdict: "fail" })], cleanDay, lists).verdict).toBe("inconclusive");
+  });
+
+  it("the lists the engine holds may come in any order", () => {
+    expect(runVerdict(tenPasses(), cleanDay, { wanted: WANTED, start: ["b", "a"], end: ["b", "a"] }).verdict).toBe("pass");
+  });
+
+  it("the held lists are read from the shape the engine writes; absent is unknown, not none", () => {
+    expect(heldLists({ filter: { lists: [{ id: "a" }, { id: "b" }] } })).toEqual(["a", "b"]);
+    expect(heldLists({ filter: { lists: [] } })).toEqual([]);
+    expect(heldLists({ filter: null })).toBeNull();
+    expect(heldLists({})).toBeNull();
+    expect(heldLists(null)).toBeNull();
+    const ipc = read("engine/crates/sieve-ipc/src/lib.rs");
+    expect(ipc).toContain("pub filter: Option<FilterFacts>");
+    expect(ipc).toContain("pub lists: Vec<ListFact>");
   });
 
   it("a video or a day-one item that fails fails the run", () => {
-    expect(runVerdict([...tenPasses().slice(1), video({ verdict: "fail" })]).verdict).toBe("fail");
-    for (const day of [{ homeAds: 1 }, { seek: false }, { quality: false }, { autoplay: false }]) expect(runVerdict(tenPasses(), day).verdict).toBe("fail");
-    expect(runVerdict(tenPasses(), { homeAds: 0, seek: true, quality: true, autoplay: true }).verdict).toBe("pass");
+    expect(runVerdict([...tenPasses().slice(1), video({ verdict: "fail" })], cleanDay, armHeld).verdict).toBe("fail");
+    for (const day of [{ homeAds: 1 }, { seek: false }, { quality: false }, { autoplay: false }]) expect(runVerdict(tenPasses(), { ...cleanDay, ...day }, armHeld).verdict).toBe("fail");
+    expect(runVerdict(tenPasses(), cleanDay, armHeld).verdict).toBe("pass");
+  });
+
+  it.each([
+    ["the home page", { homeAds: null }],
+    ["seek", { seek: null }],
+    ["quality", { quality: null }],
+    ["autoplay", { autoplay: null }],
+  ])("a day-one check of %s that could not run is unknown: inconclusive, never clean", (_, unknown) => {
+    expect(runVerdict(tenPasses(), { ...cleanDay, ...unknown }, armHeld).verdict).toBe("inconclusive");
+  });
+
+  it("a day with no checks at all is unknown, and what was seen to fail still fails beside an unknown", () => {
+    expect(runVerdict(tenPasses(), {}, armHeld).verdict).toBe("inconclusive");
+    expect(runVerdict(tenPasses(), { ...cleanDay, homeAds: null, seek: false }, armHeld).verdict).toBe("fail");
+    expect(runVerdict([...tenPasses().slice(1), video({ verdict: "fail" })], { ...cleanDay, homeAds: null }, armHeld).verdict).toBe("fail");
   });
 
   it("parseArgs refuses an unknown browser, arm or flag", () => {
@@ -120,5 +176,189 @@ describe("the video site live script", () => {
     expect(engineFiles.filter((f) => !["\"status.json\"", "\"youtube-videos.json\"", "\"filter-lists-v1.json\""].includes(f))).toEqual([]);
     expect(source).toContain('"Sieve", "engine", "status.json"');
     expect(source.match(/"engine"/g)).toHaveLength(1);
+  });
+});
+
+/** Speaks JSON-RPC from a table: a method's answer, or an Error for a refused call. */
+class FakeSocket {
+  static answers: Record<string, unknown> = {};
+  static refuse = false;
+  static last: FakeSocket;
+  private listeners = new Map<string, ((event: unknown) => void)[]>();
+
+  constructor() {
+    FakeSocket.last = this;
+    queueMicrotask(() => this.fire(FakeSocket.refuse ? "error" : "open", {}));
+  }
+
+  addEventListener(type: string, listener: (event: unknown) => void) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  send(text: string) {
+    const { id, method } = JSON.parse(text);
+    const answer = FakeSocket.answers[method] ?? {};
+    this.deliver(answer instanceof Error ? { id, error: { message: answer.message } } : { id, result: answer });
+  }
+
+  close() {}
+
+  deliver(message: unknown) {
+    this.fire("message", { data: JSON.stringify(message) });
+  }
+
+  private fire(type: string, event: unknown) {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
+
+const CDP_ANSWERS = {
+  "Target.createTarget": { targetId: "t" },
+  "Target.attachToTarget": { sessionId: "s" },
+  "Page.getFrameTree": { frameTree: { frame: { id: "main" } } },
+};
+const BIDI_ANSWERS = {
+  "browsingContext.getTree": { contexts: [{ context: "top" }] },
+  "script.evaluate": { type: "success", result: { value: JSON.stringify("(function(){\nx") } },
+};
+const PID = 4242;
+const KILLED = [["/PID", String(PID), "/T", "/F"]];
+const BIDI_LINE = "WebDriver BiDi listening on ws://127.0.0.1:1\n";
+
+describe("the script's drivers, against a fake socket", () => {
+  let profile: string;
+  let child: { pid: number; stderr: EventEmitter };
+  const work = () => "worked";
+
+  beforeEach(() => {
+    profile = mkdtempSync(join(tmpdir(), "sieve-youtube-law-"));
+    child = { pid: PID, stderr: new EventEmitter() };
+    started.child = child;
+    started.spawnSync.length = 0;
+    FakeSocket.answers = {};
+    FakeSocket.refuse = false;
+    vi.stubGlobal("WebSocket", FakeSocket);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    started.child = null;
+    rmSync(profile, { recursive: true, force: true });
+  });
+
+  const portFile = () => writeFileSync(join(profile, "DevToolsActivePort"), "1\n/devtools/browser/x");
+
+  it("a browser that ran is killed by process tree at the end", async () => {
+    portFile();
+    FakeSocket.answers = CDP_ANSWERS;
+    await expect(withBrowser(CdpDriver, "chrome.exe", profile, work)).resolves.toBe("worked");
+    expect(started.spawnSync).toEqual(KILLED);
+  });
+
+  it("a browser whose run throws is killed", async () => {
+    portFile();
+    FakeSocket.answers = CDP_ANSWERS;
+    const thrower = () => Promise.reject(new Error("in the run"));
+    await expect(withBrowser(CdpDriver, "chrome.exe", profile, thrower)).rejects.toThrow("in the run");
+    expect(started.spawnSync).toEqual(KILLED);
+  });
+
+  it("chrome: no debugging port, and the browser is killed", async () => {
+    vi.useFakeTimers();
+    const run = expect(withBrowser(CdpDriver, "chrome.exe", profile, work)).rejects.toThrow(/debugging port/);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await run;
+    expect(started.spawnSync).toEqual(KILLED);
+  });
+
+  it("chrome: the socket refuses, and the browser is killed", async () => {
+    portFile();
+    FakeSocket.refuse = true;
+    await expect(withBrowser(CdpDriver, "chrome.exe", profile, work)).rejects.toThrow(/cannot open/);
+    expect(started.spawnSync).toEqual(KILLED);
+  });
+
+  it.each(["Target.createTarget", "Page.getFrameTree", "Network.enable"])("chrome: %s fails, and the browser is killed", async (method) => {
+    portFile();
+    FakeSocket.answers = { ...CDP_ANSWERS, [method]: new Error("refused") };
+    await expect(withBrowser(CdpDriver, "chrome.exe", profile, work)).rejects.toThrow(/refused/);
+    expect(started.spawnSync).toEqual(KILLED);
+  });
+
+  it("firefox: no BiDi line, and the browser is killed", async () => {
+    vi.useFakeTimers();
+    const run = expect(withBrowser(BidiDriver, "firefox.exe", profile, work)).rejects.toThrow(/BiDi port/);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await run;
+    expect(started.spawnSync).toEqual(KILLED);
+  });
+
+  it("firefox: the socket refuses, and the browser is killed", async () => {
+    FakeSocket.refuse = true;
+    const run = withBrowser(BidiDriver, "firefox.exe", profile, work);
+    child.stderr.emit("data", BIDI_LINE);
+    await expect(run).rejects.toThrow(/cannot open/);
+    expect(started.spawnSync).toEqual(KILLED);
+  });
+
+  it("firefox: a BiDi call fails, and the browser is killed", async () => {
+    FakeSocket.answers = { ...BIDI_ANSWERS, "session.subscribe": new Error("refused") };
+    const run = withBrowser(BidiDriver, "firefox.exe", profile, work);
+    child.stderr.emit("data", BIDI_LINE);
+    await expect(run).rejects.toThrow(/refused/);
+    expect(started.spawnSync).toEqual(KILLED);
+  });
+
+  const cdpDocument = (frameId: string, issuer: string, protocol = "h2") => ({
+    method: "Network.responseReceived",
+    params: { type: "Document", frameId, response: { protocol, securityDetails: { issuer } } },
+  });
+
+  async function cdpDriver() {
+    portFile();
+    FakeSocket.answers = CDP_ANSWERS;
+    return CdpDriver.connect(child, profile);
+  }
+
+  it("chrome: a subframe's response says nothing about the page, either way round", async () => {
+    const driver = await cdpDriver();
+    FakeSocket.last.deliver(cdpDocument("main", SIEVE_ISSUER));
+    FakeSocket.last.deliver(cdpDocument("an-iframe", "A Public CA", "h3"));
+    expect(driver.documentFacts()).toEqual({ issuer: SIEVE_ISSUER, protocol: "h2" });
+    FakeSocket.last.deliver(cdpDocument("main", "A Public CA"));
+    FakeSocket.last.deliver(cdpDocument("an-iframe", SIEVE_ISSUER));
+    expect(driver.documentFacts()).toEqual({ issuer: "A Public CA", protocol: "h2" });
+  });
+
+  it("chrome: a navigation with no document seen knows nothing, and keeps nothing from the last page", async () => {
+    const driver = await cdpDriver();
+    FakeSocket.last.deliver(cdpDocument("main", SIEVE_ISSUER));
+    vi.useFakeTimers();
+    const navigated = driver.navigate("https://x.example/");
+    await vi.advanceTimersByTimeAsync(60_000);
+    await navigated;
+    expect(driver.documentFacts()).toEqual({ issuer: null, protocol: null });
+  });
+
+  const bidiDocument = (context: string, protocol: string) => ({
+    method: "network.responseCompleted",
+    params: { context, navigation: "n", response: { protocol } },
+  });
+
+  it("firefox: a subframe's response says nothing about the page, and a navigation forgets the last", async () => {
+    FakeSocket.answers = BIDI_ANSWERS;
+    const connecting = BidiDriver.connect(child);
+    child.stderr.emit("data", BIDI_LINE);
+    const driver = await connecting;
+    FakeSocket.last.deliver(bidiDocument("top", "h3"));
+    FakeSocket.last.deliver(bidiDocument("an-iframe", "h2"));
+    expect(await driver.documentFacts()).toEqual({ issuer: SIEVE_ISSUER, protocol: "h3" });
+    vi.useFakeTimers();
+    const navigated = driver.navigate("https://x.example/");
+    await vi.advanceTimersByTimeAsync(60_000);
+    await navigated;
+    vi.useRealTimers();
+    expect((await driver.documentFacts()).protocol).toBeNull();
   });
 });

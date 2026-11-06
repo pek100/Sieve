@@ -21,7 +21,7 @@ param(
   [ValidateSet("before", "on", "arm", "off")]
   [string]$Step,
   [string]$Out = (Join-Path $env:PUBLIC "sieve-engine-live"),
-  # With -Step on: the catalogue ids to hold, for an arm of slice 10.
+  # With -Step on: the catalogue ids to hold, comma separated, for an arm of slice 10.
   [string[]]$Lists
 )
 
@@ -34,6 +34,7 @@ $StatusFile = Join-Path $EngineDir "status.json"
 $TestRule = "example.com##h1"
 $WaitSeconds = 20
 . (Join-Path $PSScriptRoot 'live-lease.ps1')
+. (Join-Path $PSScriptRoot 'engine-content-checks.ps1')
 $liveLease = Enter-SieveLiveLease
 try {
 
@@ -75,7 +76,7 @@ switch ($Step) {
     $policy | Add-Member -Force -NotePropertyName https -NotePropertyValue $true
     $policy | Add-Member -Force -NotePropertyName content -NotePropertyValue $true
     $policy | Add-Member -Force -NotePropertyName user_rules -NotePropertyValue @(@($policy.user_rules) + $TestRule | Where-Object { $_ } | Select-Object -Unique)
-    if ($Lists) { $policy | Add-Member -Force -NotePropertyName lists -NotePropertyValue @($Lists) }
+    if ($Lists) { Set-PolicyLists $policy $Lists }
     Write-Policy $policy
     Write-Host "Content is on with the rule $TestRule. Run -Step arm, then load the page."
   }

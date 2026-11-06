@@ -246,7 +246,9 @@ Where the build differs from the design above, and why.
 - **Under the user's `$generichide` alone, a selector a list holds both generic and specific is dropped too:** the library's mix cannot be told apart from outside. The page is changed less, never more.
 - **`write_status_file` keeps main's plain update state** when merging main (O1): `status_value` calls `status_saying(self.updates.status())`, not `status()`, so a file writer never says a release is available.
 - **Laws beyond the list:** `a_selector_both_engines_except_is_cut_once` (a dedupe a cut's slicing depends on), `list_hits_count_acted_requests_by_list`, `runVerdict`'s day-one items, and the issuer and payload shape read against engine source in `youtube-live.test.ts`.
-- **`engine-content.ps1 -Step on` takes `-Lists`,** so an arm of slice 10 goes through the same one script. `exclusions/mod.rs` 381 reads its host from the shipped seed instead of `.example`, since a seed entry is its subject.
+- **`engine-content.ps1 -Step on` takes `-Lists`,** so an arm of slice 10 goes through the same one script. `exclusions/mod.rs` 381 reads its host from the shipped seed instead of `.example`, since a seed entry is its subject. The ids are split in `engine-content-checks.ps1`, because `powershell -File` binds a comma list as one string.
+- **`list_hits` also counts connections a list blocked (`log_decision`),** not only the requests D11 names: a plain `||host^` block at the name never reaches `log_request`, so D11's count would under-report what a list did.
+- **`runVerdict` goes beyond D12's list:** it is also inconclusive when the engine's lists differ from the arm at the start or the end of a run, or a day-one check could not run (null, never false or 0). A day-one unknown does not hide a failure seen; a wrong arm does.
 
 Not a change, a fact for slice 10's reader: `check_request` re-asks a block as a `document` request of the initiator, and the library matches any exception on such a request (pinned in `other_constraints_on_a_host_rule`). So `@@||x^$elemhide,script` opens more than scripts on `x`'s own pages, exactly as a plain `@@||x^$script` already does there.
 
