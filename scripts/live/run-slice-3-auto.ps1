@@ -158,7 +158,7 @@ function Write-Policy([bool]$on) {
   # accept() requires strictly increasing revisions; successor is the smallest valid one.
   $revision++
   $json = '{"revision":' + $revision.ToString([Globalization.CultureInfo]::InvariantCulture) +
-    ',"engine":' + $on.ToString().ToLowerInvariant() + '}'
+    ',"engine":' + $on.ToString().ToLowerInvariant() + ',"sieving":true}'
   $tmp = "$PolicyFile.auto-$([guid]::NewGuid().ToString('N')).tmp"
   try {
     [IO.File]::WriteAllText($tmp, $json, $Utf8)

@@ -88,11 +88,11 @@ try {
   [IO.File]::WriteAllText($StatusFile, '{"policy":{"revision":9007199254740995,"engine":false}}', $Utf8)
   Write-Policy $true
   $text = [IO.File]::ReadAllText($PolicyFile)
-  Assert ($text -ceq '{"revision":9007199254740996,"engine":true}') "atomic policy uses exact successor of maximum disk/status revision"
+  Assert ($text -ceq '{"revision":9007199254740996,"engine":true,"sieving":true}') "atomic policy uses exact successor of maximum disk/status revision"
   $bytes = [IO.File]::ReadAllBytes($PolicyFile)
   Assert ($bytes[0] -eq [byte][char]'{') "policy is UTF-8 without BOM"
   Write-Policy $false
-  Assert ([IO.File]::ReadAllText($PolicyFile) -ceq '{"revision":9007199254740997,"engine":false}') "OFF is boolean with an increasing revision"
+  Assert ([IO.File]::ReadAllText($PolicyFile) -ceq '{"revision":9007199254740997,"engine":false,"sieving":true}') "OFF is boolean with an increasing revision"
   Assert (@(Get-ChildItem -LiteralPath $scratch -Filter '*.tmp').Count -eq 0) "atomic write removes temporary files"
   [IO.File]::WriteAllText($PolicyFile, '{"revision":18446744073709551615,"engine":false}', $Utf8)
   Must-Throw { Write-Policy $true } "u64 overflow refuses to write"
