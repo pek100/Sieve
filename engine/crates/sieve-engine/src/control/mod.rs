@@ -9,6 +9,8 @@
 pub mod certs;
 #[cfg(windows)]
 pub mod routing;
+#[cfg(all(test, windows))]
+mod routing_tests;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
