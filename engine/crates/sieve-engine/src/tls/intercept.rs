@@ -36,7 +36,7 @@ use super::ech::{EchCache, usable_config};
 use super::first_bytes::{First, read_first};
 use super::server::{server_config, speaks_to};
 use super::splice::{AppSide, Prefixed, splice};
-use super::upstream::{HandshakeEnd, Handshaken, LeafFacts, Verifier, filter_alpn, handshake, is_post_handshake_auth, leaf_facts, rustls_error};
+use super::upstream::{HandshakeEnd, Handshaken, LeafFacts, Verifier, alert_in, filter_alpn, handshake, is_post_handshake_auth, leaf_facts, rustls_error};
 use super::verdict::{Cached, VerdictCache};
 use crate::ca::{CaError, LeafRequest, Minter};
 use crate::dns::NameMap;
@@ -347,14 +347,6 @@ fn count_group(meters: &[std::sync::atomic::AtomicU64; crate::stack::KX_GROUPS],
     meters[slot].fetch_add(1, Ordering::Relaxed);
 }
 
-/// The alert a client's refusal carried, if it sent one.
-fn client_alert(error: &std::io::Error) -> Option<AlertDescription> {
-    match rustls_error(error) {
-        Some(rustls::Error::AlertReceived(alert)) => Some(*alert),
-        _ => None,
-    }
-}
-
 /// One flow, to its end. The app side is closed before this returns unless the
 /// flow ended by itself.
 pub async fn run<A, C>(deps: &Interception<C>, app: A, upstream: C::Stream, flow: FlowMeta<'_>) -> Outcome
@@ -375,7 +367,7 @@ where
     C: Dial,
 {
     let (decoded, held) = match read_first(&mut app, &mut upstream, FIRST_BYTES_WAIT).await {
-        First::ClientGone => return FlowAction::Relayed,
+        First::ClientGone { .. } => return FlowAction::Relayed,
         First::ServerSpoke { server, held } => return server_first(app, upstream, server, held, flow).await,
         First::Decoded { decoded, held } => (decoded, held),
     };
@@ -524,7 +516,7 @@ where
     let client = match accepted {
         Ok(Ok(client)) => client,
         Ok(Err(e)) => {
-            deps.watch.handshake_failed(&pair, client_alert(&e));
+            deps.watch.handshake_failed(&pair, alert_in(&e));
             return FlowAction::Failed;
         }
         Err(_) => {
@@ -568,7 +560,7 @@ where
         Some(HTTP1) => serve(ctx, client, upstream, Proto::H1).await,
         Some(_) => Ended::without_error(false),
         None => match read_first(&mut client, &mut upstream, FIRST_BYTES_WAIT).await {
-            First::ClientGone => Ended::without_error(true),
+            First::ClientGone { alert } => Ended { client_alert: alert, ..Ended::without_error(true) },
             First::Decoded { decoded, held } if decoded.kind == Some(Kind::Http) && decoded.domain.is_some() => serve(ctx, Prefixed::new(held, client), upstream, Proto::H1).await,
             First::Decoded { held, .. } => {
                 let _ = splice(&mut client, upstream, &held).await;

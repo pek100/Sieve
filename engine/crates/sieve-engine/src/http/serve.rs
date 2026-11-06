@@ -32,7 +32,7 @@ use super::upgrade::{AbortOnDrop, is_upgrade, splice, strip_hop_by_hop};
 use crate::domain::FilterSlot;
 use crate::stack::book::{FlowBook, RequestRow};
 use crate::tls::intercept::{ClientWatch, Pair};
-use crate::tls::upstream::rustls_error;
+use crate::tls::upstream::alert_in;
 
 pub type BodyError = Box<dyn std::error::Error + Send + Sync>;
 pub type ResponseBody = UnsyncBoxBody<Bytes, BodyError>;
@@ -126,10 +126,7 @@ impl Ended {
         let Err(error) = served else { return Self::without_error(true) };
         // h1 calls bad bytes a parse error; on h2 the library goes away over them.
         let spoke = error.is_parse() || std::error::Error::source(&error).and_then(|e| e.downcast_ref::<h2::Error>()).is_some_and(h2::Error::is_library);
-        let client_alert = match rustls_error(&error) {
-            Some(rustls::Error::AlertReceived(alert)) => Some(*alert),
-            _ => None,
-        };
+        let client_alert = alert_in(&error);
         Self { upstream_error: None, client_ended: !error.is_timeout() && (client_alert.is_some() || !spoke), client_alert }
     }
 }

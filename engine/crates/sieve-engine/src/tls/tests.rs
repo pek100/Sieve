@@ -1967,14 +1967,14 @@ fn sealed_alert(conn: rustls::ClientConnection, alert: rustls::AlertDescription)
 }
 
 /// A client that finishes the handshake on AES-128-GCM, then sends `alert`.
-async fn alert_after_handshake(rig: &Rig, alpn: &str, alert: rustls::AlertDescription) {
+async fn alert_after_handshake(rig: &Rig, alpn: &[&str], alert: rustls::AlertDescription) {
     let (app, task) = rig.flow(flow_opts()).await;
     let shown = Arc::<Shown>::default();
     let suites = vec![aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256];
     let provider = Arc::new(CryptoProvider { cipher_suites: suites, kx_groups: super::kx_groups(), ..aws_lc_rs::default_provider() });
     let verifier = Arc::new(ClientAccepts { shown: shown.clone(), provider: provider.clone() });
     let mut config = ClientConfig::builder_with_provider(provider).with_protocol_versions(&[&rustls::version::TLS13]).unwrap().dangerous().with_custom_certificate_verifier(verifier).with_no_client_auth();
-    config.alpn_protocols = vec![alpn.as_bytes().to_vec()];
+    config.alpn_protocols = alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
     config.enable_secret_extraction = true;
     let tls = connect(app, Arc::new(config), HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
     assert!(shown_is_sieves(&shown, rig));
@@ -1987,16 +1987,17 @@ async fn alert_after_handshake(rig: &Rig, alpn: &str, alert: rustls::AlertDescri
 }
 
 arms!(an_alert_right_after_the_handshake_is_strong_evidence, |arm| async move {
-    for alpn in ["h2", "http/1.1"] {
-        let (rig, heal, upstream_leaf) = healing_rig(arm, &[alpn]);
+    // The empty one: no ALPN at all, where the first decrypted read meets the alert.
+    for alpn in [&["h2"][..], &["http/1.1"], &[]] {
+        let (rig, heal, upstream_leaf) = healing_rig(arm, alpn);
         alert_after_handshake(&rig, alpn, rustls::AlertDescription::BadCertificate).await;
-        assert_eq!(heal.notices(0).1.len(), 1, "{alpn}: one alert excludes");
+        assert_eq!(heal.notices(0).1.len(), 1, "{alpn:?}: one alert excludes");
         // No ALPN in this client: its retry just passes through.
         passes_untouched(&rig, &upstream_leaf).await;
         // The control: another alert is one failed attempt, not an exclusion.
-        let (rig, heal, _) = healing_rig(arm, &[alpn]);
+        let (rig, heal, _) = healing_rig(arm, alpn);
         alert_after_handshake(&rig, alpn, rustls::AlertDescription::HandshakeFailure).await;
-        assert!(heal.notices(0).1.is_empty(), "{alpn}: weak evidence");
+        assert!(heal.notices(0).1.is_empty(), "{alpn:?}: weak evidence");
     }
 });
 

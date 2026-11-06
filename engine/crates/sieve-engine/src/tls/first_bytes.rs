@@ -6,8 +6,10 @@
 
 use std::time::Duration;
 
+use rustls::AlertDescription;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
+use super::upstream::alert_in;
 use crate::flow::classify::{Decoded, TcpClassifier};
 use crate::flow::relay::CLASSIFIER_READ;
 
@@ -18,8 +20,9 @@ pub enum First {
     Decoded { decoded: Decoded, held: Vec<u8> },
     /// The server spoke, or closed, while `held` is what the client said so far.
     ServerSpoke { server: Vec<u8>, held: Vec<u8> },
-    /// The client closed before any answer.
-    ClientGone,
+    /// The client closed before any answer, with the fatal alert it ended on: only
+    /// a decrypted client can send one, so a plain flow has none.
+    ClientGone { alert: Option<AlertDescription> },
 }
 
 /// A read that fills `buf` from whichever side has bytes.
@@ -42,7 +45,8 @@ where
             Err(_) => return First::Decoded { decoded: Decoded { failure: Some("no client bytes in time"), ..Decoded::default() }, held: classifier.take_held() },
             Ok((false, Ok(n))) => return First::ServerSpoke { server: server[..n].to_vec(), held: classifier.take_held() },
             Ok((false, Err(_))) => return First::ServerSpoke { server: Vec::new(), held: classifier.take_held() },
-            Ok((true, Ok(0) | Err(_))) => return First::ClientGone,
+            Ok((true, Ok(0))) => return First::ClientGone { alert: None },
+            Ok((true, Err(e))) => return First::ClientGone { alert: alert_in(&e) },
             Ok((true, Ok(n))) => {
                 let before = classifier.held().len();
                 if let Some(decoded) = classifier.push(&client[..n]) {
@@ -113,6 +117,6 @@ mod tests {
         let (client, mut app) = tokio::io::duplex(1024);
         let (_server, mut up) = tokio::io::duplex(1024);
         drop(client);
-        assert_eq!(read_first(&mut app, &mut up, WAIT).await, First::ClientGone);
+        assert_eq!(read_first(&mut app, &mut up, WAIT).await, First::ClientGone { alert: None });
     }
 }

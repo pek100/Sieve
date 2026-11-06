@@ -344,6 +344,14 @@ pub fn is_post_handshake_auth(error: &TlsError) -> bool {
     matches!(error, TlsError::InappropriateHandshakeMessage { got_type: rustls::HandshakeType::CertificateRequest, .. })
 }
 
+/// The fatal alert behind a hyper or I/O error, when the peer sent one.
+pub fn alert_in(error: &(dyn std::error::Error + 'static)) -> Option<rustls::AlertDescription> {
+    match rustls_error(error) {
+        Some(TlsError::AlertReceived(alert)) => Some(*alert),
+        _ => None,
+    }
+}
+
 /// Finds the rustls error behind a hyper or I/O error.
 pub fn rustls_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a TlsError> {
     let mut current = Some(error);
