@@ -437,7 +437,7 @@ arms!(forwarded_flow_runs_no_validation_and_no_ech_lookup, |arm| async move {
     let lookup = FakeLookup::with_config(config_list(PUBLIC_NAME));
     let (rig, _) = config_rig(arm, vec![server_tls(world.violating(&pki), &[], None)], &pki, lookup.clone());
     rig.validation.install(Some(world.list(0)), None);
-    let (app, task) = rig.flow(super::tests::FlowOpts { may_decrypt: false, ..flow_opts() }).await;
+    let (app, task) = rig.flow(super::tests::FlowOpts { owner: crate::domain::Owner::Forwarded { vm: None }, ..flow_opts() }).await;
     let (client, shown) = client_tls(&[], None);
     let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
     expect_real(&shown, &rig);

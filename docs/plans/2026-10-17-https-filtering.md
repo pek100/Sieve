@@ -345,6 +345,8 @@ A client that rejects the leaf shows a recognisable pattern right after Sieve's 
 
 `apps.levels` Off becomes a real exemption. An Off app's flows are relayed through the stack untouched: no decryption, no network rules, no QUIC refusal. They are still counted and charted unless the app is also hidden by the existing tracking rule. Routes are per destination, so an Off app's packets still cross the userspace stack. The cost is the relay only, and slice 3 measures it. The copy changes from "Off cannot exempt an app from DNS blocking" to "Off: Sieve passes this app's traffic through untouched". That copy becomes true once slice 4 retires DNS-level blocking.
 
+**As built (2026-11-06):** Off holds for flows already running. A decrypted connection of the app ends when its row turns Off, so a reload cannot reuse it; a flow still on its way to decryption reads the row again after the upstream handshake and passes through; a refused QUIC flow asks per datagram and ends. Every one reads the filter snapshot, so nothing holds a second copy of the Off set. The running engine's proof is the live check of `filtering.https`.
+
 ### 4.5 Per-domain user exclusions
 
 The user adds host patterns, optionally limited to one app, from Settings or from a log row ("Do not decrypt this site"). These are B6 domain-list entries (`kind: exclude, scope: https`), edited through IPC. Import and export reuse B6.

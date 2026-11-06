@@ -40,7 +40,7 @@ use crate::ca::key::MemoryKeyStore;
 use crate::ca::trust::{FakeFirefox, FakeRootStore};
 use crate::ca::{Ca, Minter, Seams};
 use crate::dns::NameMap;
-use crate::domain::{DomainFilter, FilterSlot};
+use crate::domain::{DomainFilter, FilterSlot, Owner};
 use crate::exclusions::browsers::{BrowserRegistry, BrowserSet};
 use crate::exclusions::{AutoEntry, ExclusionSlot};
 use crate::flow::classify::Decoded;
@@ -53,6 +53,9 @@ use crate::stack::book::FlowBook;
 
 pub(crate) const HOST: &str = "site.example";
 pub(crate) const CHROME: &str = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+pub(crate) const BROWSER_KEY: &str = "browser";
+pub(crate) const BROWSER: Owner<'static> = Owner::App { key: BROWSER_KEY };
+const GUEST: Owner<'static> = Owner::Forwarded { vm: None };
 const DAY_S: i64 = 86_400;
 const LIMIT: Duration = Duration::from_secs(60);
 const SHORT: Duration = Duration::from_millis(50);
@@ -520,7 +523,7 @@ impl Rig {
         let deps = self.deps.clone();
         let task = tokio::spawn(async move {
             let decide = move |_: &Decoded| opts.action;
-            let meta = FlowMeta { id, remote: opts.remote, exe: opts.exe, session: opts.session, may_decrypt: opts.may_decrypt, app_off: opts.app_off, names_now_ms: 0, decide: &decide };
+            let meta = FlowMeta { id, remote: opts.remote, exe: opts.exe, session: opts.session, owner: opts.owner, names_now_ms: 0, decide: &decide };
             let out = run(&deps, stack_end, upstream, meta).await;
             deps.book.lock().unwrap().close(id, out.action, out.bytes_up, out.bytes_down);
             out
@@ -548,13 +551,18 @@ pub(crate) struct FlowOpts {
     pub(crate) remote: SocketAddr,
     pub(crate) exe: Option<&'static str>,
     pub(crate) session: Option<u32>,
-    pub(crate) may_decrypt: bool,
-    pub(crate) app_off: bool,
+    pub(crate) owner: Owner<'static>,
     pub(crate) action: Action,
 }
 
 pub(crate) fn flow_opts() -> FlowOpts {
-    FlowOpts { remote: "192.0.2.1:443".parse().unwrap(), exe: Some(CHROME), session: Some(1), may_decrypt: true, app_off: false, action: Action::Pass }
+    FlowOpts { remote: "192.0.2.1:443".parse().unwrap(), exe: Some(CHROME), session: Some(1), owner: BROWSER, action: Action::Pass }
+}
+
+/// The rig's filter, with only `key` turned Off, as `set_policy` swaps it.
+pub(crate) fn turn_off(rig: &Rig, key: &str) {
+    let policy = Policy { sieving: true, https: true, off_apps: vec![key.to_string()], ..Policy::default() };
+    rig.deps.filter.update(|f| DomainFilter::new(&policy, f.rules.clone()));
 }
 
 // ---- The client: accepts anything, and remembers what it was shown.
@@ -1044,7 +1052,8 @@ arms!(a_late_trusted_answer_does_not_replace_a_revoked_verdict, |arm| async move
     assert_eq!(rig.reasons(), ["floor:upstream-revoked"; 3]);
 });
 
-arms!(off_during_the_client_handshake_closes_it_without_blaming_the_client, |arm| async move {
+/// A flow held inside the client's handshake; `during` runs while it is there.
+async fn close_during_the_client_handshake(arm: Arm, during: impl FnOnce(&Rig)) {
     let pki = Pki::new("Test Public Root");
     let watched = Arc::new(Watched::default());
     let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
@@ -1058,11 +1067,41 @@ arms!(off_during_the_client_handshake_closes_it_without_blaming_the_client, |arm
     app.write_all(&hello).await.unwrap();
     let mut answer = [0u8; 1];
     app.read_exact(&mut answer).await.unwrap();
-    rig.deps.active.close_all();
+    during(&rig);
     tokio::time::timeout(LIMIT, task).await.expect("closed").unwrap();
     let mut rest = Vec::new();
     let _ = app.read_to_end(&mut rest).await;
     assert!(watched.refused.lock().unwrap().is_empty(), "the engine closed it: not evidence about the client");
+}
+
+arms!(off_during_the_client_handshake_closes_it_without_blaming_the_client, |arm| async move {
+    close_during_the_client_handshake(arm, |rig| rig.deps.active.close_all()).await;
+});
+
+arms!(an_app_turned_off_during_the_client_handshake_closes_it_without_blaming_the_client, |arm| async move {
+    close_during_the_client_handshake(arm, |rig| turn_off(rig, BROWSER_KEY)).await;
+});
+
+arms!(an_app_turned_off_during_the_trust_call_passes_through_as_app_off, |arm| async move {
+    close_during_the_trust_call(arm, |rig| turn_off(rig, BROWSER_KEY), "app_off").await;
+});
+
+arms!(an_app_turned_off_while_its_first_bytes_are_awaited_passes_through, |arm| async move {
+    let pki = Pki::new("Test Public Root");
+    let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let rig = Rig::new(dial, RigOpts::new(pki.roots()));
+    let (app, task) = rig.flow(flow_opts()).await;
+    // The flow task is running by now, waiting for a hello that has not come.
+    tokio::time::sleep(SHORT).await;
+    turn_off(&rig, BROWSER_KEY);
+    let (client, shown) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    expect_real(&shown, &rig);
+    round_trip(&mut tls).await;
+    assert_eq!(rig.deps.meters.https.intercepted.load(Ordering::Relaxed), 0);
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(rig.reasons(), ["app_off"]);
 });
 
 arms!(dns_hears_the_same_switches_a_flow_is_judged_by, |arm| async move {
@@ -1506,8 +1545,12 @@ fn watched_rig(arm: Arm, alpn: &str, holds: bool, watched: Arc<Watched>) -> Rig 
 
 /// A flow past the local handshake, its client still open.
 async fn intercepted(rig: &Rig, alpn: &str) -> (ClientTls, JoinHandle<Outcome>) {
+    intercepted_of(rig, alpn, BROWSER).await
+}
+
+async fn intercepted_of(rig: &Rig, alpn: &str, owner: Owner<'static>) -> (ClientTls, JoinHandle<Outcome>) {
     let before = rig.deps.meters.https.intercepted.load(Ordering::Relaxed);
-    let (app, task) = rig.flow(flow_opts()).await;
+    let (app, task) = rig.flow(FlowOpts { owner, ..flow_opts() }).await;
     let (client, shown) = client_tls(&[alpn], None);
     let tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
     assert!(shown_is_sieves(&shown, rig));
@@ -1541,6 +1584,36 @@ arms!(only_a_close_by_the_client_counts_as_a_silent_client, |arm| async move {
         drop(tls);
         task.await.unwrap();
         assert_eq!(watched.silent.load(Ordering::Relaxed), 1, "{alpn}: closed by the client");
+    }
+});
+
+// The browser holds an h2 connection, the user turns it Off and reloads: the
+// reload must not reuse a decrypted connection (plan 4.4).
+arms!(an_app_turned_off_loses_its_decrypted_connections_and_its_next_one_passes_through, |arm| async move {
+    for alpn in ["h2", "http/1.1"] {
+        let watched = Arc::new(Watched::default());
+        let rig = watched_rig(arm, alpn, true, watched.clone());
+        let (off_tls, off_task) = intercepted(&rig, alpn).await;
+        let (other_tls, mut other_task) = intercepted_of(&rig, alpn, Owner::App { key: "other" }).await;
+        let (unknown_tls, mut unknown_task) = intercepted_of(&rig, alpn, Owner::Unknown).await;
+        turn_off(&rig, BROWSER_KEY);
+        tokio::time::timeout(LIMIT, off_task).await.expect("closed").unwrap();
+        assert!(tokio::time::timeout(SHORT, &mut other_task).await.is_err(), "{alpn}: another app stays decrypted");
+        assert!(tokio::time::timeout(SHORT, &mut unknown_task).await.is_err(), "{alpn}: and an unattributed flow");
+        assert_eq!(watched.silent.load(Ordering::Relaxed), 0, "{alpn}: closed by the engine");
+        drop(off_tls);
+
+        let (app, task) = rig.flow(flow_opts()).await;
+        let (client, shown) = client_tls(&[alpn], None);
+        let tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+        expect_real(&shown, &rig);
+        assert_eq!(rig.reasons(), ["app_off"], "{alpn}");
+        drop(tls);
+        task.await.unwrap();
+        for (tls, task) in [(other_tls, other_task), (unknown_tls, unknown_task)] {
+            drop(tls);
+            task.await.unwrap();
+        }
     }
 });
 
@@ -1612,7 +1685,7 @@ arms!(forwarded_flow_hello_reaches_upstream_unchanged_with_no_handshake_of_ours,
     let pki = Pki::new("Test Public Root");
     let (dial, shaken) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
     let rig = Rig::new(dial, RigOpts::new(pki.roots()));
-    let (app, task) = rig.flow(FlowOpts { may_decrypt: false, exe: None, session: None, ..flow_opts() }).await;
+    let (app, task) = rig.flow(FlowOpts { owner: GUEST, exe: None, session: None, ..flow_opts() }).await;
     let (client, shown) = client_tls(&[], None);
     let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
     expect_real(&shown, &rig);
@@ -1952,7 +2025,7 @@ arms!(forwarded_flows_never_reach_the_watch, |arm| async move {
     let watched = Arc::new(Watched::default());
     let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
     let rig = Rig::new(dial, RigOpts { watch: watched.clone(), ..RigOpts::new(pki.roots()) });
-    let (app, task) = rig.flow(FlowOpts { may_decrypt: false, exe: None, session: None, ..flow_opts() }).await;
+    let (app, task) = rig.flow(FlowOpts { owner: GUEST, exe: None, session: None, ..flow_opts() }).await;
     let pinned = super::client_config(Pki::new("Its Own Bundle").roots(), &[]).unwrap();
     assert!(tokio_rustls::TlsConnector::from(Arc::new(pinned)).connect(ServerName::try_from(HOST).unwrap(), app).await.is_err());
     task.await.unwrap();

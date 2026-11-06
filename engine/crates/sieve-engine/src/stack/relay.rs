@@ -287,7 +287,6 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
     let decide = |d: &Decoded| ctx.decide(&admitted, d, &flow);
     // One path per flow, chosen once (task D1): no slot is today's relay.
     if let Some(https) = ctx.https.get() {
-        let owner = admitted.owner.as_owner();
         let event = lock(&ctx.book).snapshot_of(admitted.id);
         let pid = event.as_ref().and_then(|e| e.pid);
         let decide = |d: &Decoded| {
@@ -301,8 +300,7 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
             remote: flow.remote,
             exe: event.as_ref().and_then(|e| e.exe.as_deref()),
             session: event.as_ref().and_then(|e| e.session),
-            may_decrypt: owner.may_decrypt(),
-            app_off: ctx.filter.get().is_off(owner),
+            owner: admitted.owner.as_owner(),
             names_now_ms: monotonic_ms(),
             decide: &decide,
         };
@@ -387,7 +385,7 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
                 ctx.meters.quic.refused(pid, host, first);
             }
             let reply = Reply { ends: (flow.local, flow.remote), refusal, sink: &*ctx.sink, meters: &ctx.meters.quic };
-            return quic::refuse(&mut app, &reply, &held, &mut buf, UDP_IDLE, || ctx.https.is_on()).await;
+            return quic::refuse(&mut app, &reply, &held, &mut buf, UDP_IDLE, || ctx.https.refuses(owner)).await;
         }
         UdpPath::Relay => {}
     }

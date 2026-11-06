@@ -40,7 +40,7 @@ use super::upstream::{HandshakeEnd, Handshaken, LeafFacts, Verifier, filter_alpn
 use super::verdict::{Cached, VerdictCache};
 use crate::ca::{CaError, LeafRequest, Minter};
 use crate::dns::NameMap;
-use crate::domain::FilterSlot;
+use crate::domain::{FilterSlot, Owner};
 use crate::exclusions::{AutoEntry, ExclusionSlot};
 use crate::flow::classify::{Decoded, Kind};
 use crate::flow::flows::Action;
@@ -125,10 +125,9 @@ pub struct FlowMeta<'a> {
     pub remote: SocketAddr,
     pub exe: Option<&'a str>,
     pub session: Option<u32>,
-    /// `domain::Owner::may_decrypt`.
-    pub may_decrypt: bool,
-    /// The app's row is Off (`DomainFilter::is_off`).
-    pub app_off: bool,
+    /// Whose flow. Its row can turn Off while the flow waits, so every judgment
+    /// asks the snapshot of that moment and nothing here holds the answer.
+    pub owner: Owner<'a>,
     /// Monotonic ms of the name map's clock.
     pub names_now_ms: u64,
     /// The host-level decision: called exactly once.
@@ -147,8 +146,9 @@ pub struct Who<'a> {
 }
 
 impl FlowMeta<'_> {
-    pub fn who(&self) -> Who<'_> {
-        Who { remote: self.remote, exe: self.exe, session: self.session, may_decrypt: self.may_decrypt, app_off: self.app_off, names_now_ms: self.names_now_ms }
+    /// This flow as `filter` reads it now.
+    pub fn who(&self, filter: &FilterSlot) -> Who<'_> {
+        Who { remote: self.remote, exe: self.exe, session: self.session, may_decrypt: self.owner.may_decrypt(), app_off: filter.get().is_off(self.owner), names_now_ms: self.names_now_ms }
     }
 }
 
@@ -183,10 +183,10 @@ impl<C> HttpsSlot<C> {
         }
     }
 
-    /// True while new flows would be judged with the switch on. A refused QUIC
-    /// flow asks this per datagram.
-    pub fn is_on(&self) -> bool {
-        self.get().is_some_and(|https| !https.active.is_closed())
+    /// True while this owner's QUIC flow stays refused: the switch is on and the
+    /// app is not Off (plan 4.4). A refused flow asks this per datagram.
+    pub fn refuses(&self, owner: Owner<'_>) -> bool {
+        self.get().is_some_and(|https| !https.active.is_closed() && !https.filter.get().is_off(owner))
     }
 }
 
@@ -209,6 +209,18 @@ impl<C> Interception<C> {
     fn switches(&self) -> Switches {
         // A closed set means the switch went off after this flow took the slot.
         self.exclusions.switches(!self.active.is_closed(), (self.minter)().is_some())
+    }
+
+    /// Resolves when a flow being decrypted must end: its host or the switch closed
+    /// it ([`Active`]), or its app turned Off (plan 4.4). The app's next connection
+    /// is a new flow, which passes through. Off is the filter snapshot's fact, not
+    /// a close: it says nothing about the host, so `Active` does not hear of it and
+    /// a flow still judging reads it as the app's row and not as a revocation.
+    async fn must_end(&self, registered: &Registered, owner: Owner<'_>) {
+        tokio::select! {
+            () = registered.closed() => {}
+            () = self.filter.until_off(owner) => {}
+        }
     }
 
     /// True when a flow to this name may be decrypted, for DNS to ask before a
@@ -374,7 +386,7 @@ where
         return if splice(&mut app, upstream, &held).await { FlowAction::Relayed } else { FlowAction::Failed };
     }
     let host = decoded.domain.as_deref();
-    let facts = deps.facts_for(Transport::Tcp, &decoded, &flow.who());
+    let facts = deps.facts_for(Transport::Tcp, &decoded, &flow.who(&deps.filter));
     // Before the cache is read: see `active`, no close can fall in the gap.
     let registered = host.map(|h| deps.active.register(h));
     let cached = host.and_then(|h| deps.verdicts.get(h, flow.remote.port(), (deps.clock)()));
@@ -435,7 +447,8 @@ where
     }
     // Another flow found this host revoked while this one was asking.
     let verdict = if verdict == UpstreamVerdict::Eligible && registered.is_closed() { UpstreamVerdict::Revoked } else { verdict };
-    let after = FlowFacts { upstream: Some(verdict), ..facts };
+    // The handshake and the trust call took seconds: the app's row may have changed.
+    let after = FlowFacts { upstream: Some(verdict), app_off: deps.filter.get().is_off(flow.owner), ..facts };
     let judged = deps.says(&after);
     let (shaken, leaf) = match (judged, shaken) {
         (Decrypt::Intercept, Some((shaken, Some(leaf)))) => (shaken, leaf),
@@ -505,7 +518,7 @@ where
     // says nothing about the client, so the watch does not hear of it.
     let accepted = tokio::select! {
         biased;
-        () = registered.closed() => return FlowAction::Relayed,
+        () = deps.must_end(&registered, flow.owner) => return FlowAction::Relayed,
         accepted = tokio::time::timeout(CLIENT_HANDSHAKE_TIMEOUT, TlsAcceptor::from(config).accept(Prefixed::new(held, app))) => accepted,
     };
     let client = match accepted {
@@ -527,7 +540,7 @@ where
     let ctx = Arc::new(Serve::new(deps.filter.clone(), deps.book.clone(), deps.hook.clone(), deps.watch.clone(), flow.id, pair.clone(), host.to_string(), flow.remote.port(), deps.clock));
     let ended = tokio::select! {
         biased;
-        () = registered.closed() => Ended::without_error(false),
+        () = deps.must_end(&registered, flow.owner) => Ended::without_error(false),
         ended = run_protocol(ctx.clone(), client, shaken.tls, shaken.alpn.as_deref()) => ended,
     };
     deps.after_serve(host, ended.upstream_error.as_ref());

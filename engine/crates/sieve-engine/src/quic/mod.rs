@@ -127,8 +127,9 @@ impl Reply<'_> {
 
 /// Answers the held datagrams and each later one until the flow has been idle
 /// for `idle`, so a retransmit costs no new attribution. `still_on` is asked per
-/// datagram: with the switch off the task ends, and the next datagram is a new
-/// flow on today's path. An idle flow costs nothing and needs no wake.
+/// datagram: with the switch off or the app Off the task ends, and the next
+/// datagram is a new flow, judged as such. An idle flow costs nothing and needs
+/// no wake.
 pub async fn refuse<A: AsyncRead + Unpin>(app: &mut A, reply: &Reply<'_>, held: &[Vec<u8>], buf: &mut [u8], idle: Duration, still_on: impl Fn() -> bool) {
     for datagram in held {
         if !still_on() {

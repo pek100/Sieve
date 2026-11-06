@@ -981,6 +981,20 @@ mod tests {
         assert_eq!(sees(&e, "ads.example", "other"), Action::Pass, "the rule went with the list");
     }
 
+    /// What ends a decrypted flow of an app turned Off is `FilterSlot::until_off`
+    /// (`tls/tests.rs`): `SetPolicy` is what reaches it, also on a full disk.
+    #[tokio::test]
+    async fn set_policy_reaches_what_a_decrypted_flow_waits_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine_that_cannot_save(dir.path());
+        let browser = crate::domain::Owner::App { key: "browser" };
+        let mut waiting = Box::pin(e.filter.until_off(browser));
+        let wait = std::time::Duration::from_millis(20);
+        assert!(tokio::time::timeout(wait, &mut waiting).await.is_err());
+        e.set_policy(Policy { revision: 2, off_apps: vec!["browser".into()], ..saved_on() }).unwrap();
+        tokio::time::timeout(wait, &mut waiting).await.expect("the row turned Off");
+    }
+
     /// C2: the rules the log's actions and the Filters editor write reach the
     /// decision through SetPolicy, and a change to them recompiles the user's
     /// engine. Exclusions go to the store and compile nothing.

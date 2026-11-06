@@ -11,11 +11,12 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 pub use sieve_ipc::FlowReason as Reason;
 use sieve_filter::rules::{DomainKind, HostDecision, HostVerdict, RuleEngine, RuleSet};
 use sieve_ipc::{DomainListKind, Policy, vm_key};
+use tokio::sync::watch;
 
 use crate::dns::NameMap;
 use crate::flow::classify::Decoded;
@@ -172,24 +173,31 @@ impl DomainFilter {
 }
 
 /// The current snapshot, read once per flow and swapped atomically: flows
-/// already decided keep their decision. A lock, not an ArcSwap, because the
-/// read is per flow and not per packet, and no new dependency is needed.
+/// already decided keep their decision. A watch, not an ArcSwap, because the
+/// read is per flow and not per packet, no new dependency is needed, and a
+/// decrypted flow has to hear its app turn Off ([`Self::until_off`]).
 #[derive(Debug)]
-pub struct FilterSlot(RwLock<Arc<DomainFilter>>);
+pub struct FilterSlot(watch::Sender<Arc<DomainFilter>>);
 
 impl FilterSlot {
     pub fn new(filter: DomainFilter) -> Self {
-        Self(RwLock::new(Arc::new(filter)))
+        Self(watch::channel(Arc::new(filter)).0)
     }
 
     pub fn get(&self) -> Arc<DomainFilter> {
-        self.0.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.0.borrow().clone()
     }
 
     /// Replaces the snapshot with what `f` makes of the current one.
     pub fn update(&self, f: impl FnOnce(&DomainFilter) -> DomainFilter) {
-        let mut slot = self.0.write().unwrap_or_else(|p| p.into_inner());
-        *slot = Arc::new(f(&slot));
+        self.0.send_modify(|slot| *slot = Arc::new(f(slot)));
+    }
+
+    /// Resolves once the snapshot says this owner is Off, at once if it does
+    /// now. So no swap can fall between a look at the snapshot and this wait.
+    pub async fn until_off(&self, owner: Owner<'_>) {
+        // It can only fail with the sender gone, and `self` holds the sender.
+        let _ = self.0.subscribe().wait_for(|filter| filter.is_off(owner)).await;
     }
 }
 
@@ -421,5 +429,27 @@ mod tests {
         let flow = Flow { dns: false, name: Some(BLOCKED), remote: remote(), owner: Owner::App { key: BROWSER } };
         assert_eq!(before.decide(flow, &names(), 0).action, Action::Drop, "a held snapshot keeps its decision");
         assert_eq!(after.decide(flow, &names(), 0).action, Action::Pass);
+    }
+
+    #[tokio::test]
+    async fn a_wait_on_an_app_ends_when_it_turns_off_and_on_nothing_else() {
+        const WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+        let slot = FilterSlot::new(filter());
+        let browser = Owner::App { key: BROWSER };
+        let waits = |owner| tokio::time::timeout(WAIT, slot.until_off(owner));
+        waits(Owner::App { key: OFF_APP }).await.expect("already Off: at once");
+        waits(Owner::Forwarded { vm: Some("Guest Off") }).await.expect("a guest's row too");
+
+        let mut waiting = Box::pin(slot.until_off(browser));
+        assert!(tokio::time::timeout(WAIT, &mut waiting).await.is_err(), "not Off");
+        slot.update(|f| f.with_lists(Arc::new(RuleEngine::empty())));
+        assert!(tokio::time::timeout(WAIT, &mut waiting).await.is_err(), "a swap that leaves it on");
+        let other = Policy { sieving: true, off_apps: vec!["other".to_string()], ..Policy::default() };
+        slot.update(|f| DomainFilter::new(&other, f.rules.clone()));
+        assert!(tokio::time::timeout(WAIT, &mut waiting).await.is_err(), "another app's Off");
+        let off = Policy { sieving: true, off_apps: vec![BROWSER.to_string()], ..Policy::default() };
+        slot.update(|f| DomainFilter::new(&off, f.rules.clone()));
+        tokio::time::timeout(WAIT, &mut waiting).await.expect("its own Off");
+        assert!(waits(Owner::Unknown).await.is_err(), "an unattributed flow has no row to turn Off");
     }
 }

@@ -30,7 +30,7 @@ use crate::flow::quic::{VERSION_1, crypto_frame, seal_client_initial};
 use crate::flow::sni::{TlsOffer, build};
 use crate::policy::wall_ms;
 use crate::tls::intercept::{HttpsSlot, Who};
-use crate::tls::tests::{Arm, CHROME, HOST, Pki, Rig, RigOpts, TestDial, echo, flow_opts, raw};
+use crate::tls::tests::{Arm, BROWSER, BROWSER_KEY, CHROME, HOST, Pki, Rig, RigOpts, TestDial, echo, flow_opts, raw, turn_off};
 
 const REMOTE: &str = "192.0.2.1:443";
 const CURL: &str = r"C:\Tools\curl.exe";
@@ -322,7 +322,7 @@ fn no_slot_relays_and_asks_nothing() {
     assert_eq!(path(Action::Pass, &empty, &case.decoded, &case.who(), id), UdpPath::Relay);
     assert_eq!(CLOCK_CALLS.load(Ordering::Relaxed), 0, "nothing was asked");
     assert_eq!(rig.reasons(), Vec::<String>::new());
-    assert!(!empty.is_on());
+    assert!(!empty.refuses(BROWSER));
     // The control: the same flow with the slot there reads the clock.
     assert_eq!(path(Action::Pass, &slot_of(&rig), &case.decoded, &case.who(), id), UdpPath::Refuse(REFUSAL));
     assert!(CLOCK_CALLS.load(Ordering::Relaxed) > 0);
@@ -512,11 +512,9 @@ async fn a_retransmit_keeps_it_and_is_answered() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_switch_going_off_ends_a_refused_flow() {
-    // Through the real slot: emptied, it reads as off for a flow on its way.
+async fn an_app_turned_off_ends_its_refused_flow_and_no_other() {
     let rig = rig();
     let slot = Arc::new(slot_of(&rig));
-    assert!(slot.is_on());
     let (sink, meters) = (FakeSink::default(), QuicMeters::default());
     let (mut app, mut stack) = tokio::io::duplex(BUF);
     let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
@@ -524,7 +522,39 @@ async fn the_switch_going_off_ends_a_refused_flow() {
     let held = [vec![1u8; 200]];
     let mut buf = vec![0u8; BUF];
     let on = slot.clone();
-    let flow = refuse(&mut stack, &reply, &held, &mut buf, IDLE, move || on.is_on());
+    let flow = refuse(&mut stack, &reply, &held, &mut buf, IDLE, move || on.refuses(BROWSER));
+    tokio::pin!(flow);
+    tokio::select! {
+        () = &mut flow => panic!("not Off: the flow goes on"),
+        () = tokio::time::sleep(Duration::from_millis(1)) => {}
+    }
+    assert_eq!(sink.count(), 1);
+    turn_off(&rig, BROWSER_KEY);
+    assert!(!slot.refuses(BROWSER));
+    assert!(slot.refuses(crate::domain::Owner::App { key: "other" }), "another app's flow stays refused");
+    assert!(slot.refuses(crate::domain::Owner::Unknown), "and an unattributed one");
+    assert!(!rig.deps.active.is_closed(), "the switch itself stayed on");
+    app.write_all(&[2; 200]).await.unwrap();
+    let started = tokio::time::Instant::now();
+    flow.await;
+    assert_eq!(tokio::time::Instant::now(), started, "ended on that datagram, not by idling");
+    assert_eq!(sink.count(), 1, "and no reply went");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_switch_going_off_ends_a_refused_flow() {
+    // Through the real slot: emptied, it reads as off for a flow on its way.
+    let rig = rig();
+    let slot = Arc::new(slot_of(&rig));
+    assert!(slot.refuses(BROWSER));
+    let (sink, meters) = (FakeSink::default(), QuicMeters::default());
+    let (mut app, mut stack) = tokio::io::duplex(BUF);
+    let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
+    let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters };
+    let held = [vec![1u8; 200]];
+    let mut buf = vec![0u8; BUF];
+    let on = slot.clone();
+    let flow = refuse(&mut stack, &reply, &held, &mut buf, IDLE, move || on.refuses(BROWSER));
     tokio::pin!(flow);
     tokio::select! {
         () = &mut flow => panic!("still on: the flow goes on"),
@@ -532,7 +562,7 @@ async fn the_switch_going_off_ends_a_refused_flow() {
     }
     assert_eq!(sink.count(), 1);
     slot.set(None);
-    assert!(!slot.is_on());
+    assert!(!slot.refuses(BROWSER));
     assert!(rig.deps.active.is_closed(), "the closed set says so too (F9)");
     app.write_all(&[2; 200]).await.unwrap();
     let started = tokio::time::Instant::now();
@@ -660,7 +690,7 @@ async fn through_the_stack(rig: &Rig, local: SocketAddr, remote: SocketAddr) -> 
     if let UdpPath::Refuse(refusal) = answer {
         let meters = QuicMeters::default();
         let reply = Reply { ends: (app.local_addr(), app.peer_addr()), refusal, sink: &sink, meters: &meters };
-        refuse(&mut app, &reply, &held, &mut buf, Duration::from_millis(50), || slot.is_on()).await;
+        refuse(&mut app, &reply, &held, &mut buf, Duration::from_millis(50), || slot.refuses(BROWSER)).await;
     }
     StackRun { answer, sink, from_stack }
 }
