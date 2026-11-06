@@ -23,6 +23,13 @@
 //!
 //! Limit: a proxy has no frame tree, so `$document` on a subdocument is judged
 //! on that frame's own URL, not on its parent's.
+//!
+//! [`RuleSet::page_cosmetics`] is what a flow asks. The table holds per engine,
+//! and the user's exceptions also cut the lists' part ([`UserGates`]), so the
+//! user wins both ways: a list's `$document` never silences the user's own `##`
+//! rules. Limits: a user's own `##+js()` stays inert, since the user's engine
+//! never gets the bundle; a user's `#@#` on a list's procedural rule cuts
+//! nothing, since adblock-rust reports procedural exceptions to no caller.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -32,16 +39,21 @@ use std::sync::Arc;
 use adblock::Engine;
 use adblock::cosmetic_filter_cache::ProceduralOrActionFilter;
 use adblock::filters::cosmetic::{CosmeticFilter, CosmeticFilterMask};
-use adblock::lists::{FilterSet, ParseOptions, ParsedLine};
+use adblock::filters::network::NetworkFilterMask;
+use adblock::lists::{FilterSet, ParseOptions, ParsedLine, parse_filter};
 use adblock::request::Request;
 
 use crate::resources::ResourceBundle;
-use crate::rules::RuleEngine;
+use crate::rules::{RuleEngine, RuleSet};
 
 const HIDE_DECLARATION: &str = "display:none!important";
 const EXCEPTION_PREFIX: &str = "@@";
 const OPTIONS_SEPARATOR: char = '$';
 const GENERICHIDE_OPTION: &str = "generichide";
+/// Every option that speaks about hiding and not about the network.
+const HIDE_OPTIONS: [&str; 6] = ["elemhide", "ehide", "specifichide", "shide", "generichide", "ghide"];
+const UNHIDE_SEPARATOR: &str = "#@#";
+const NEGATED_HOST: char = '~';
 const SCRIPTLET_EXTENSION: &str = ".js";
 /// adblock-rust asks with these when it matches `url_cosmetic_resources`.
 const DOCUMENT_TYPE: &str = "document";
@@ -67,6 +79,31 @@ impl PageCosmetics {
     pub fn is_empty(&self) -> bool {
         self.generic_css.is_empty() && self.specific_css.is_empty() && self.procedural.is_empty() && self.scriptlets.is_empty()
     }
+
+    /// `self` with `other`'s work added. Generic CSS stays the shared stylesheet
+    /// unless both parts hold some.
+    fn merged_with(mut self, other: Self) -> Self {
+        self.generic_css = match (self.generic_css.is_empty(), other.generic_css.is_empty()) {
+            (_, true) => self.generic_css,
+            (true, false) => other.generic_css,
+            (false, false) => format!("{}{}", self.generic_css, other.generic_css).into(),
+        };
+        self.specific_css.push_str(&other.specific_css);
+        self.procedural.extend(other.procedural);
+        self.scriptlets.push_str(&other.scriptlets);
+        self.dropped_rules += other.dropped_rules;
+        self
+    }
+}
+
+/// What the user's engine says about one page, applied to the lists' part.
+#[derive(Debug, Default)]
+struct UserGates {
+    generichide: bool,
+    specifichide: bool,
+    /// The selectors the user's `#@#` lines cut on this page.
+    exceptions: HashSet<String>,
+    no_scriptlets: bool,
 }
 
 /// Makes text safe inside a `<style>` element and valid in any ASCII-compatible
@@ -179,6 +216,43 @@ pub(crate) fn page_exception(line: &str) -> Option<PageException> {
     Some(exception)
 }
 
+/// The request types a parsed line matches.
+fn type_mask(line: &str, options: ParseOptions) -> Option<NetworkFilterMask> {
+    match parse_filter(line, false, options).ok()? {
+        ParsedLine::Network(filter) => Some(filter.mask & NetworkFilterMask::FROM_ALL_TYPES),
+        ParsedLine::Cosmetic(_) => None,
+    }
+}
+
+/// What an exception line naming a hide option says about the network: the line
+/// without those options, when what is left still constrains the request type
+/// (`$document`, `$script`). `@@||x^$elemhide` has no such half, so a hide
+/// exception can never open the network. The parser's own mask decides, read
+/// against the pattern alone, and not a second list of type names.
+pub(crate) fn network_half(line: &str, options: ParseOptions) -> Option<String> {
+    if !line.starts_with(EXCEPTION_PREFIX) {
+        return None;
+    }
+    let (pattern, raw_options) = line.rsplit_once(OPTIONS_SEPARATOR)?;
+    let named: Vec<&str> = raw_options.split(',').collect();
+    let kept: Vec<&str> = named.iter().copied().filter(|option| !HIDE_OPTIONS.contains(option)).collect();
+    if kept.is_empty() || kept.len() == named.len() {
+        return None;
+    }
+    let half = format!("{pattern}{OPTIONS_SEPARATOR}{}", kept.join(","));
+    (type_mask(&half, options)? != type_mask(pattern, options)?).then_some(half)
+}
+
+/// The hosts of a `host,other#@#+js(...)` line, each as a `$generichide` line for
+/// the private engine that says "a user's scriptlet exception holds here". It
+/// stops all list scriptlets on such a page: adblock-rust assembles them into
+/// one string, so a named one cannot be cut. Over-broad in the safe direction,
+/// since the page is changed less. A negated host names no page.
+fn scriptlet_exception_rules(line: &str) -> impl Iterator<Item = String> + '_ {
+    let hosts = line.split_once(UNHIDE_SEPARATOR).map_or("", |(hosts, _)| hosts);
+    hosts.split(',').filter(|host| !host.is_empty() && !host.starts_with(NEGATED_HOST)).map(|host| format!("{EXCEPTION_PREFIX}||{host}^{OPTIONS_SEPARATOR}{GENERICHIDE_OPTION}"))
+}
+
 /// The cosmetic facts `RuleEngine::compile` collects from the parsed lines.
 #[derive(Default)]
 pub(crate) struct CosmeticBuilder {
@@ -186,6 +260,7 @@ pub(crate) struct CosmeticBuilder {
     document: Vec<String>,
     elemhide: Vec<String>,
     specifichide: Vec<String>,
+    no_scriptlets: Vec<String>,
 }
 
 impl CosmeticBuilder {
@@ -199,11 +274,14 @@ impl CosmeticBuilder {
     }
 
     /// Files a parsed line and returns the scriptlet it names, if any.
-    pub(crate) fn observe(&mut self, parsed: &ParsedLine<'_>) -> Option<String> {
+    pub(crate) fn observe(&mut self, line: &str, parsed: &ParsedLine<'_>) -> Option<String> {
         let ParsedLine::Cosmetic(filter) = parsed else {
             return None;
         };
         if filter.mask.contains(CosmeticFilterMask::UNHIDE) {
+            if filter.mask.contains(CosmeticFilterMask::SCRIPT_INJECT) {
+                self.no_scriptlets.extend(scriptlet_exception_rules(line));
+            }
             return None;
         }
         if filter.mask.contains(CosmeticFilterMask::SCRIPT_INJECT) {
@@ -234,6 +312,7 @@ impl CosmeticBuilder {
             document: exception_engine(self.document),
             elemhide: exception_engine(self.elemhide),
             specifichide: exception_engine(self.specifichide),
+            no_scriptlets: exception_engine(self.no_scriptlets),
         }
     }
 }
@@ -264,6 +343,7 @@ pub(crate) struct CosmeticIndex {
     document: Engine,
     elemhide: Engine,
     specifichide: Engine,
+    no_scriptlets: Engine,
 }
 
 impl CosmeticIndex {
@@ -302,18 +382,43 @@ impl RuleEngine {
         }
     }
 
-    /// What the page at `url` gets (module doc). A URL adblock-rust cannot
-    /// parse has no page context and gets nothing.
+    /// What the page at `url` gets from this engine alone (module doc). A URL
+    /// adblock-rust cannot parse has no page context and gets nothing.
     pub fn page_cosmetics(&self, url: &str) -> PageCosmetics {
+        self.page_cosmetics_under(url, &UserGates::default())
+    }
+
+    /// What this engine's page-level exceptions say, for the other engine to obey.
+    /// `None` when `$document` holds, or for a URL with no page context.
+    fn user_gates(&self, url: &str) -> Option<UserGates> {
+        if Request::new(url, url, DOCUMENT_TYPE, DOCUMENT_METHOD).is_err() || exception_applies(&self.cosmetic.document, url) {
+            return None;
+        }
+        let elemhide = exception_applies(&self.cosmetic.elemhide, url);
+        let resources = self.engine.url_cosmetic_resources(url);
+        Some(UserGates {
+            generichide: elemhide || resources.generichide,
+            specifichide: elemhide || exception_applies(&self.cosmetic.specifichide, url),
+            exceptions: resources.exceptions,
+            no_scriptlets: exception_applies(&self.cosmetic.no_scriptlets, url),
+        })
+    }
+
+    fn page_cosmetics_under(&self, url: &str, gates: &UserGates) -> PageCosmetics {
         if Request::new(url, url, DOCUMENT_TYPE, DOCUMENT_METHOD).is_err() || exception_applies(&self.cosmetic.document, url) {
             return PageCosmetics::default();
         }
         let elemhide = exception_applies(&self.cosmetic.elemhide, url);
-        let specifichide = elemhide || exception_applies(&self.cosmetic.specifichide, url);
-        let resources = self.engine.url_cosmetic_resources(url);
-        let generichide = elemhide || resources.generichide;
+        let specifichide = elemhide || gates.specifichide || exception_applies(&self.cosmetic.specifichide, url);
+        let mut resources = self.engine.url_cosmetic_resources(url);
+        let generichide = elemhide || gates.generichide || resources.generichide;
+        // A set, so a selector both engines except is cut once.
+        resources.exceptions.extend(gates.exceptions.iter().cloned());
 
-        let mut page = PageCosmetics { scriptlets: resources.injected_script, ..PageCosmetics::default() };
+        let mut page = PageCosmetics::default();
+        if !gates.no_scriptlets {
+            page.scriptlets = std::mem::take(&mut resources.injected_script);
+        }
         if !generichide {
             page.generic_css = self.cosmetic.generic_for_page(&resources.exceptions);
             page.dropped_rules = self.cosmetic.generic_dropped;
@@ -323,8 +428,10 @@ impl RuleEngine {
         }
 
         // Without `$generichide`, adblock-rust mixes generic selectors into
-        // `hide_selectors`. The generic stylesheet already holds them.
-        let is_specific = |selector: &String| resources.generichide || !self.cosmetic.generic.contains_key(selector);
+        // `hide_selectors`. The generic stylesheet already holds them. Under the
+        // user's `$generichide` alone the mix is still there, so a selector a
+        // list holds both ways goes too: the page is changed less, never more.
+        let is_specific = |selector: &String| !gates.exceptions.contains(selector) && (resources.generichide || !self.cosmetic.generic.contains_key(selector));
         let specific: BTreeSet<_> = resources.hide_selectors.iter().filter(|s| is_specific(s)).collect();
         for selector in specific {
             page.dropped_rules += usize::from(!push_css_rule(&mut page.specific_css, selector, HIDE_DECLARATION));
@@ -339,6 +446,18 @@ impl RuleEngine {
             }
         }
         page
+    }
+}
+
+impl RuleSet {
+    /// What the page at `url` gets from both engines (module doc). The user's
+    /// `$document` empties the page, the user's own rules included, as the table
+    /// has it for one engine.
+    pub fn page_cosmetics(&self, url: &str) -> PageCosmetics {
+        let Some(gates) = self.user.user_gates(url) else {
+            return PageCosmetics::default();
+        };
+        self.lists.page_cosmetics_under(url, &gates).merged_with(self.user.page_cosmetics(url))
     }
 }
 
@@ -598,6 +717,105 @@ sieve-test.invalid##+js(sieve-set-flag, a, b)
             assert!(!p.specific_css.contains(".y"), "{poison}: {p:?}");
             assert_eq!(p.dropped_rules, 1, "{poison}: {p:?}");
         }
+    }
+
+    /// `RULES` as the lists, `lines` as the user's own, as a flow asks.
+    fn set_with(lines: &[&str]) -> RuleSet {
+        RuleSet { user: Arc::new(RuleEngine::compile_user_rules(std::iter::empty(), lines.iter().copied())), lists: Arc::new(engine_with(RULES, true)) }
+    }
+
+    #[test]
+    fn a_users_hide_rule_reaches_the_page() {
+        let p = set_with(&[&format!("{HOST}##.mine"), "##.mine-everywhere"]).page_cosmetics(URL);
+        assert!(p.specific_css.contains(".mine{display:none!important}"), "{p:?}");
+        assert!(p.specific_css.contains(".specific{display:none!important}"), "the lists' part stays: {p:?}");
+        assert!(p.generic_css.contains(".generic-class"), "{p:?}");
+        assert!(p.generic_css.contains(".mine-everywhere{display:none!important}"), "{p:?}");
+    }
+
+    #[test]
+    fn a_users_document_exception_empties_the_page() {
+        for line in ["document", "doc", "document,elemhide"] {
+            let p = set_with(&[&format!("@@||{HOST}^${line}"), &format!("{HOST}##.mine")]).page_cosmetics(URL);
+            assert!(p.is_empty(), "{line}: {p:?}");
+        }
+        assert!(!set_with(&[&format!("@@||{HOST}^$document")]).page_cosmetics(OTHER_URL).is_empty(), "another page");
+    }
+
+    #[test]
+    fn a_users_elemhide_cuts_the_lists_css_and_keeps_scriptlets() {
+        let p = set_with(&[&format!("@@||{HOST}^$elemhide")]).page_cosmetics(URL);
+        assert_eq!(row(&p), (false, false, false, true), "{p:?}");
+    }
+
+    #[test]
+    fn a_users_generichide_and_specifichide_cut_their_part_of_the_lists() {
+        let p = set_with(&[&format!("@@||{HOST}^$generichide")]).page_cosmetics(URL);
+        assert_eq!(row(&p), (true, false, true, true), "{p:?}");
+        assert!(!p.specific_css.contains("data-generic"), "{p:?}");
+        let p = set_with(&[&format!("@@||{HOST}^$specifichide")]).page_cosmetics(URL);
+        assert_eq!(row(&p), (false, true, false, true), "{p:?}");
+    }
+
+    #[test]
+    fn a_users_unhide_cuts_a_lists_selector_generic_and_specific() {
+        let p = set_with(&[&format!("{HOST}#@#.generic-class"), &format!("{HOST}#@#.specific")]).page_cosmetics(URL);
+        assert!(!p.generic_css.contains(".generic-class"), "{p:?}");
+        assert!(p.generic_css.contains("#generic-id"), "{p:?}");
+        assert!(!p.specific_css.contains(".specific"), "{p:?}");
+    }
+
+    /// Both engines except one selector: it is cut once, and nothing else goes.
+    #[test]
+    fn a_selector_both_engines_except_is_cut_once() {
+        let lists = RuleEngine::compile(&[ListText { id: "l", text: &format!("##.a\n##.b\n{HOST}#@#.a\n"), trusted: true }]);
+        let user = RuleEngine::compile_user_rules(std::iter::empty(), [format!("{HOST}#@#.a").as_str()]);
+        let p = RuleSet { user: Arc::new(user), lists: Arc::new(lists) }.page_cosmetics(URL);
+        assert_eq!(&*p.generic_css, ".b{display:none!important}");
+    }
+
+    #[test]
+    fn a_lists_document_exception_keeps_the_users_rules() {
+        let lists = engine_with(&format!("{RULES}@@||{HOST}^$document\n"), true);
+        let user = RuleEngine::compile_user_rules(std::iter::empty(), [format!("{HOST}##.mine").as_str(), "##.anywhere"]);
+        let p = RuleSet { user: Arc::new(user), lists: Arc::new(lists) }.page_cosmetics(URL);
+        assert_eq!(p.specific_css, ".mine{display:none!important}", "{p:?}");
+        assert_eq!(&*p.generic_css, ".anywhere{display:none!important}", "{p:?}");
+        assert!(p.scriptlets.is_empty() && p.procedural.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn a_users_scriptlet_exception_drops_the_lists_scriptlets_there_only() {
+        for line in [format!("{HOST}#@#+js(sieve-set-flag, a, b)"), format!("{HOST}#@#+js()"), format!("other.invalid,{HOST}#@#+js()"), "sieve-test.*#@#+js()".to_string()] {
+            let set = set_with(&[&line]);
+            let p = set.page_cosmetics(URL);
+            assert_eq!(row(&p), (true, true, true, false), "{line}: {p:?}");
+        }
+        let lists = engine_with(&format!("{RULES}other.invalid##+js(sieve-set-flag, a, b)\n"), true);
+        let user = RuleEngine::compile_user_rules(std::iter::empty(), [format!("{HOST}#@#+js()").as_str()]);
+        assert!(!RuleSet { user: Arc::new(user), lists: Arc::new(lists) }.page_cosmetics(OTHER_URL).scriptlets.is_empty(), "another page keeps them");
+        let negated = set_with(&[&format!("~{HOST},other.invalid#@#+js()")]);
+        assert!(!negated.page_cosmetics(URL).scriptlets.is_empty(), "a negated host names no page");
+    }
+
+    /// `user_engine` never gets the bundle. A deferral, pinned so its end is seen.
+    #[test]
+    fn a_users_own_scriptlet_stays_inert_for_now() {
+        let p = set_with(&[&format!("other.invalid##+js(sieve-set-flag, a, b)")]).page_cosmetics(OTHER_URL);
+        assert!(p.scriptlets.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn no_user_rules_shares_the_lists_stylesheet() {
+        let set = set_with(&[]);
+        let shared = set.lists.page_cosmetics(URL).generic_css;
+        assert!(Arc::ptr_eq(&set.page_cosmetics(URL).generic_css, &shared));
+        let specific_only = set_with(&[&format!("{HOST}##.mine")]);
+        let shared = specific_only.lists.page_cosmetics(URL).generic_css;
+        assert!(Arc::ptr_eq(&specific_only.page_cosmetics(URL).generic_css, &shared), "the user's part holds no generic CSS");
+        let generic_too = set_with(&["##.mine"]);
+        let shared = generic_too.lists.page_cosmetics(URL).generic_css;
+        assert!(!Arc::ptr_eq(&generic_too.page_cosmetics(URL).generic_css, &shared), "the control: both parts hold some");
     }
 
     #[test]

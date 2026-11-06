@@ -20,7 +20,7 @@
 //! (plan 5.3). The library's source location then gives the list directly.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use adblock::Engine;
@@ -29,7 +29,7 @@ use adblock::lists::{FilterSet, ParseOptions, ParsedLine, parse_filter};
 use adblock::request::Request;
 use adblock::resources::PermissionMask;
 
-use crate::cosmetic::{CosmeticBuilder, CosmeticIndex, ScriptletUse, page_exception};
+use crate::cosmetic::{CosmeticBuilder, CosmeticIndex, ScriptletUse, network_half, page_exception};
 
 /// The synthetic host-level request (module doc).
 const SYNTHETIC_TYPE: &str = "other";
@@ -73,7 +73,8 @@ pub struct ListReport {
     /// `$removeparam` rules cannot decide a bare host; they decide decrypted
     /// requests (`check_request`), while `filtering.https` is on.
     pub network: usize,
-    /// Cosmetic rules parsed. They have no effect until slice 9.
+    /// Cosmetic rules parsed. They have an effect only on a decrypted page, while
+    /// `filtering.content` is on.
     pub cosmetic: usize,
     pub skipped: usize,
     /// Skip reason (the parser's own words) to count.
@@ -153,6 +154,8 @@ pub struct RuleEngine {
     pub(crate) cosmetic: CosmeticIndex,
     /// Per list, parallel to `reports`.
     pub(crate) scriptlets: Vec<ScriptletUse>,
+    /// A derived network half, by list index, to the line its list wrote.
+    written: HashMap<(u32, String), String>,
 }
 
 impl std::fmt::Debug for RuleEngine {
@@ -179,10 +182,14 @@ fn rule_lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines().map(str::trim).filter(|l| !l.is_empty() && !is_comment(l))
 }
 
-fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, ScriptletUse) {
+/// A compiled list's derived network lines: half to the line that says it.
+type NetworkHalves = Vec<(String, String)>;
+
+fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, ScriptletUse, NetworkHalves) {
     let opts = options(list.trusted);
     let mut r = ListReport { id: list.id.to_string(), ..ListReport::default() };
     let mut scriptlets = ScriptletUse::new();
+    let mut halves = NetworkHalves::new();
     for line in rule_lines(list.text) {
         // A skipped exception is a defect (plan 5.2): the parser refuses these
         // options, so a line it can answer through `page_exception` is applied.
@@ -191,13 +198,16 @@ fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, S
         if let Some(exception) = exception {
             cosmetic.add_exception(exception);
         }
+        if let Some(half) = network_half(line, opts) {
+            halves.push((half, line.to_string()));
+        }
         match parse_filter(line, false, opts) {
             Ok(parsed) => {
                 match &parsed {
                     ParsedLine::Network(_) => r.network += 1,
                     ParsedLine::Cosmetic(_) => r.cosmetic += 1,
                 }
-                if let Some(name) = cosmetic.observe(&parsed) {
+                if let Some(name) = cosmetic.observe(line, &parsed) {
                     *scriptlets.entry(name).or_default() += 1;
                 }
             }
@@ -214,7 +224,7 @@ fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, S
             }
         }
     }
-    (r, scriptlets)
+    (r, scriptlets, halves)
 }
 
 /// True when `text` holds at least one rule the parser accepts: a response
@@ -247,26 +257,39 @@ pub fn domain_rule(entry: &str, kind: DomainKind) -> Option<String> {
     })
 }
 
-fn rule_text(result: Option<adblock::sourcemap::FilterRuleDebugInfo>, lists: &[ListReport]) -> (Option<String>, Option<String>) {
-    let Some(info) = result else { return (None, None) };
-    let list = info.source_location.and_then(|l| lists.get(l.source_index as usize)).map(|r| r.id.clone());
-    (info.raw_line, list)
-}
-
 impl RuleEngine {
     /// Compiles every list into one engine. Rules the parser refuses are
-    /// skipped and counted in [`RuleEngine::reports`].
+    /// skipped and counted in [`RuleEngine::reports`]. A line's network half goes
+    /// in with its own list's text, after it, so its list stays right and no
+    /// later list's index moves.
     pub fn compile(lists: &[ListText<'_>]) -> Self {
         let mut set = FilterSet::new(true);
         let mut cosmetic = CosmeticBuilder::default();
-        let (reports, scriptlets) = lists
-            .iter()
-            .map(|list| {
-                set.add_filter_list(list.text.to_string(), options(list.trusted));
-                report(list, &mut cosmetic)
-            })
-            .unzip();
-        Self { engine: Engine::new_with_filter_set_no_optimize(set), reports, cosmetic: cosmetic.build(), scriptlets }
+        let mut reports = Vec::with_capacity(lists.len());
+        let mut scriptlets = Vec::with_capacity(lists.len());
+        let mut written = HashMap::new();
+        for (index, list) in lists.iter().enumerate() {
+            let (report, uses, halves) = report(list, &mut cosmetic);
+            let mut text = list.text.to_string();
+            for (half, line) in halves {
+                text.push('\n');
+                text.push_str(&half);
+                written.entry((index as u32, half)).or_insert(line);
+            }
+            set.add_filter_list(text, options(list.trusted));
+            reports.push(report);
+            scriptlets.push(uses);
+        }
+        Self { engine: Engine::new_with_filter_set_no_optimize(set), reports, cosmetic: cosmetic.build(), scriptlets, written }
+    }
+
+    /// The rule's text as its list wrote it, and the list.
+    fn rule_text(&self, result: Option<adblock::sourcemap::FilterRuleDebugInfo>) -> (Option<String>, Option<String>) {
+        let Some(info) = result else { return (None, None) };
+        let Some(location) = info.source_location else { return (info.raw_line, None) };
+        let list = self.reports.get(location.source_index as usize).map(|r| r.id.clone());
+        let written = info.raw_line.as_ref().and_then(|raw| self.written.get(&(location.source_index, raw.clone()))).cloned();
+        (written.or(info.raw_line), list)
     }
 
     /// An engine with no rules: it answers None for everything.
@@ -318,7 +341,7 @@ impl RuleEngine {
     }
 
     fn decision(&self, verdict: HostVerdict, result: Option<adblock::sourcemap::FilterRuleDebugInfo>) -> HostDecision {
-        let (rule, list) = rule_text(result, &self.reports);
+        let (rule, list) = self.rule_text(result);
         HostDecision { verdict, rule, list }
     }
 
@@ -399,15 +422,15 @@ impl RuleEngine {
                 && let Ok(document) = Request::new(page, "", DOCUMENT_TYPE, SYNTHETIC_METHOD)
                 && let Some(exception) = self.engine.check_network_request_subset(&document, true, true).exception
             {
-                let (rule, list) = rule_text(Some(exception), &self.reports);
+                let (rule, list) = self.rule_text(Some(exception));
                 return RequestDecision { verdict: HostVerdict::Allow, rule, list, redirect: None, rewritten };
             }
             let redirect = result.redirect;
-            let (rule, list) = rule_text(result.filter, &self.reports);
+            let (rule, list) = self.rule_text(result.filter);
             return RequestDecision { verdict: HostVerdict::Block, rule, list, redirect, rewritten: None };
         }
         if result.exception.is_some() {
-            let (rule, list) = rule_text(result.exception, &self.reports);
+            let (rule, list) = self.rule_text(result.exception);
             return RequestDecision { verdict: HostVerdict::Allow, rule, list, redirect: None, rewritten };
         }
         RequestDecision { rewritten, ..RequestDecision::default() }
@@ -870,6 +893,85 @@ example.invalid##+js(set-constant, adsAllowed, true)
         assert!(has_a_rule(FIXTURE));
         assert!(!has_a_rule(""));
         assert!(!has_a_rule("! only\n[Adblock Plus 2.0]\n# note\n\n"));
+    }
+
+    /// `@@||x^$document,elemhide` says two things. The parser refuses the line
+    /// or holds it as a hide exception alone, and the network half was lost.
+    #[test]
+    fn document_with_a_hide_option_keeps_its_network_exception() {
+        const AD: &str = "https://ads.example/a.js";
+        const PAGE: &str = "https://site.example/";
+        for option in ["document,elemhide", "doc,ehide", "document,generichide", "document,specifichide", "shide,doc"] {
+            let line = format!("@@||site.example^${option}");
+            let e = engine(&format!("||site.example^\n||ads.example^\n{line}\n"));
+            let host = e.check_host("site.example");
+            assert_eq!((host.verdict, host.rule.as_deref()), (HostVerdict::Allow, Some(line.as_str())), "{option}");
+            let request = e.check_request(&query(AD, PAGE, "script"));
+            assert_eq!((request.verdict, request.rule.as_deref()), (HostVerdict::Allow, Some(line.as_str())), "{option}: by initiator");
+            assert_eq!(e.check_request(&query(AD, "https://other.example/", "script")).verdict, HostVerdict::Block, "{option}: another page");
+
+            let important = engine(&format!("||site.example^$important\n||ads.example^$important\n{line}\n"));
+            assert_eq!(verdict(&important, "site.example"), HostVerdict::Block, "{option}: $important stands");
+            assert_eq!(important.check_request(&query(AD, PAGE, "script")).verdict, HostVerdict::Block, "{option}: $important stands");
+        }
+    }
+
+    #[test]
+    fn a_hide_option_with_a_type_keeps_that_type_only() {
+        let e = engine("||x.example^\n@@||x.example^$elemhide,script\n");
+        let ask = |url, kind| e.check_request(&query(url, "https://news.example/", kind)).verdict;
+        assert_eq!(ask("https://x.example/a.js", "script"), HostVerdict::Allow);
+        assert_eq!(ask("https://x.example/a.png", "image"), HostVerdict::Block);
+        let negated = engine("||x.example^\n@@||x.example^$~script,ehide\n");
+        let ask = |url, kind| negated.check_request(&query(url, "https://news.example/", kind)).verdict;
+        assert_eq!(ask("https://x.example/a.js", "script"), HostVerdict::Block);
+        assert_eq!(ask("https://x.example/a.png", "image"), HostVerdict::Allow);
+    }
+
+    /// A hide exception never opens the network, whatever else it says.
+    #[test]
+    fn a_hide_exception_alone_opens_no_network() {
+        for option in ["elemhide", "ehide", "specifichide", "shide", "generichide", "ghide", "elemhide,domain=news.example", "elemhide,third-party", "shide,ghide"] {
+            let e = engine(&format!("||x.example^\n@@||x.example^${option}\n"));
+            assert_eq!(verdict(&e, "x.example"), HostVerdict::Block, "{option}");
+            assert_eq!(e.check_request(&query("https://x.example/a.js", "https://news.example/", "script")).verdict, HostVerdict::Block, "{option}");
+        }
+    }
+
+    #[test]
+    fn network_halves_keep_their_list_and_their_written_text() {
+        let e = RuleEngine::compile(&[
+            ListText { id: "first", text: "||x.example^\n", trusted: true },
+            ListText { id: "second", text: "! a note\n@@||x.example^$document,elemhide", trusted: true },
+        ]);
+        let d = e.check_host("x.example");
+        assert_eq!((d.verdict, d.rule.as_deref(), d.list.as_deref()), (HostVerdict::Allow, Some("@@||x.example^$document,elemhide"), Some("second")));
+    }
+
+    /// The same half written by two lists: each row says what its own list wrote.
+    #[test]
+    fn a_plain_line_in_another_list_keeps_its_own_text() {
+        let e = RuleEngine::compile(&[ListText { id: "plain", text: "||x.example^\n@@||x.example^$document\n", trusted: true }, ListText { id: "both", text: "@@||x.example^$document,elemhide\n", trusted: true }]);
+        let d = e.check_host("x.example");
+        let written = if d.list.as_deref() == Some("plain") { "@@||x.example^$document" } else { "@@||x.example^$document,elemhide" };
+        assert_eq!(d.rule.as_deref(), Some(written), "{d:?}");
+    }
+
+    #[test]
+    fn network_halves_do_not_shift_a_later_lists_provenance() {
+        let e = RuleEngine::compile(&[
+            ListText { id: "first", text: "@@||y.example^$document,elemhide\n@@||z.example^$elemhide,script\n", trusted: true },
+            ListText { id: "second", text: "||x.example^\n", trusted: true },
+        ]);
+        let d = e.check_host("x.example");
+        assert_eq!((d.rule.as_deref(), d.list.as_deref()), (Some("||x.example^"), Some("second")));
+    }
+
+    #[test]
+    fn page_exception_lines_count_once() {
+        let e = engine("@@||a.example^$document,elemhide\n@@||b.example^$document,generichide\n@@||c.example^$elemhide,script\n");
+        let r = &e.reports()[0];
+        assert_eq!((r.network, r.cosmetic, r.skipped), (3, 0, 0), "{r:?}");
     }
 
     proptest! {
