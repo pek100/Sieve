@@ -99,8 +99,12 @@ test.describe("filters", () => {
     await open(page);
     const editor = page.getByRole("textbox", { name: "User rules" });
     // Under the editor's own line limit, over what one policy can carry.
-    const lines = Array.from({ length: 4_500 }, (_, i) => `||a-long-enough-host-name-for-a-rule-number-${i}.tracker.example.com^$third-party,domain=shop.example.com`);
-    await editor.fill(lines.join("\n"));
+    const lines = Array.from({ length: 4_900 }, (_, i) => `||a-long-enough-host-name-for-a-rule-number-${i}.tracker.for-a-rule-that-takes-room.example.com^`);
+    // As a paste lands: fill() inserts text through the editing path, too slow for half a megabyte.
+    await editor.evaluate((el, text) => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(el, text);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }, lines.join("\n"));
     await page.getByRole("button", { name: "Save rules" }).click();
     await expect(page.getByRole("list", { name: "Rule problems" }).getByRole("alert")).toContainText("the engine can hold, so this was not saved");
     await expect(editor).toHaveValue(new RegExp(`number-${lines.length - 1}\\.`));
