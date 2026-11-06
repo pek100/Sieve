@@ -221,6 +221,7 @@ Decision: rustls 0.23 with the aws-lc-rs provider, on both sides.
 - **What it needs is there.** `ResolvesServerCert` for per-SNI leaves, ALPN on both sides, control over early data, a client-certificate hook (to detect the request), and ECH on the client side (HPKE comes from aws-lc-rs; ring has no HPKE).
 - **Fit.** hyper, tokio and ipstack already speak tokio-rustls.
 - **Post-quantum key exchange (the user's decision).** The key exchange groups are, in order of preference, X25519MLKEM768 (the standardized hybrid of X25519 and ML-KEM-768), then X25519, then secp256r1, on every TLS session the engine makes or answers: the client-facing side of interception, the upstream side, and the DoH, DoT and DoQ upstream (1.4). On the client side the engine picks X25519MLKEM768 whenever the client offers it, so a browser that offers it (Chrome does) keeps it through Sieve; anything else would be weaker than the browser. rustls with aws-lc-rs supports the group (the ring provider does not, another reason for aws-lc-rs). This protects the key exchange against record-now-decrypt-later; certificates and signatures stay classical (7.1).
+  - **Note (2026-11-06, slice 6):** rustls's server takes the first group in the client's own order that it supports, so a client that lists X25519 before X25519MLKEM768 keeps X25519. That is the client's preference, not weaker than the browser; Chrome lists the hybrid first. Pinned by `client_listing_x25519_first_keeps_its_preference`.
 - **Known cost: the TLS fingerprint.** The upstream ClientHello looks like rustls, not like the user's browser. Sites with fingerprint-based bot scoring (some Cloudflare and Akamai configurations) may challenge more often. AdGuard's own `issues.txt` lists a bot-detector false positive. Measured in slice 6 on a fixed site set (challenge pages seen with and without Sieve). Risk R5.
 - **Build cost.** aws-lc-sys needs CMake and NASM on Windows, or its prebuilt NASM objects. The slice 6 build notes must say which.
 
@@ -232,12 +233,14 @@ Schannel is rejected because it cannot mint a per-SNI server identity cheaply, i
 - If the client offers ALPN values and none is `h2` or `http/1.1` (for example `acme-tls/1`, `imap`, or custom protocols), the flow passes through. With no ALPN at all, the flow is intercepted only when its destination port is 443 or 8443, and after decryption the first bytes must parse as HTTP. Otherwise the two TLS sessions are relayed as plain bytes, with no filtering.
 - hyper 1.x serves the client side (`http1` or `http2` per ALPN). On the upstream side, one upstream connection is paired to each client connection. There is no shared pool, so coalescing, connection-level settings and errors stay one-to-one.
 - WebSockets (HTTP/1.1 `Upgrade` and HTTP/2 extended CONNECT) are spliced after the upgrade without filtering inside, as AdGuard does (E8). gRPC and trailers pass through hyper unchanged.
+  - **As built (slice 6, 2026-11-06):** extended CONNECT is not advertised. Without knowing the upstream's setting, which hyper exposes only after its SETTINGS arrive, advertising it breaks sites that work without Sieve (nginx lacks it). An RFC 8441 client then opens an HTTP/1.1 connection for the WebSocket, which is spliced. Live check U13.
 
 ### 2.9 ECH
 
 - **Default path: ECH is not offered to the browser for names Sieve would intercept.** The engine is the DNS resolver on the TUN and strips `ech` from HTTPS/SVCB answers for those names (1.4), so the browser sends a ClientHello with the real SNI.
 - **Upstream, the engine itself uses ECH** when the name's HTTPS record carries an ECHConfigList (looked up by the engine; the outer name is the server's public name). Privacy on the wire then stays where the browser had it. This lands in slice 11 with CT and CRLite; until then the upstream hello carries the real SNI, which is what the browser would have sent with ECH stripped.
 - **When a ClientHello still carries ECH** (the browser uses its own DoH and learned the config itself): the spike's decoder reports the outer name only. Network rules apply to the outer name and the IP-to-names map. The flow **passes through**. Sieve cannot decrypt ECH without the server's key, and refusing ECH would break sites. It is logged as "encrypted hello, not decrypted". The log shows how often this happens per app, so the cost is visible, not guessed.
+  - **As built (slice 6, 2026-11-06):** Chrome sends a GREASE ECH extension when it has no ECH config, and the extension alone cannot tell the two apart, so a literal rule would pass every Chrome flow through. The fact is `hello.ech && the engine's DNS did not answer this SNI for this address`. If it did, the app resolved the SNI itself, so it is the real target. A wrong "GREASE" cannot leak: the client treats the answer as ECH rejected, authenticates the public name and retries without ECH under a normal decision. A browser on its own DoH leaves the fact true and passes through (open question Q2 of the task doc). Live check U3.
 
 ### 2.10 TLS 1.3 0-RTT
 
@@ -290,7 +293,7 @@ Every "do not decrypt" fact is an entry in one exclusion store, and one pure fun
 **Floor (not stored, part of the function):**
 - `floor:service`: a process in session 0 (Windows services) is never decrypted. Services pin, update and license themselves. This is derived from the session id, not a list. Their flows still get host-level network rules, as the DNS filter applies to them today.
 - `floor:non-public-root`, `floor:upstream-invalid`, `floor:protocol` (2.6, 2.7).
-- `floor:ech`, `floor:no-sni` (no SNI, so no meaningful leaf).
+- `floor:ech` (as built: a real ECH cannot be ruled out, see 2.9), `floor:no-sni` (no SNI, so no meaningful leaf).
 - `floor:alpn` (2.8).
 - `floor:restricted-suffix`: registrable suffixes reserved for vetted institutions are never decrypted: `.gov`, `.mil`, `.bank`, `.insurance`, and public-suffix entries whose label before the TLD is one of the government labels in the declared table `exclusions.governmentLabels` (`gov, gouv, gob, govt, go, gv`). The table lives in config with a comment on what it covers (S25, S49), not in code.
 - `floor:no-exclusion-list`: until the HttpsExclusions lists have been fetched once, nothing is decrypted.
@@ -752,6 +755,7 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
   - a rustls test client offering X25519MLKEM768 first negotiates X25519MLKEM768 with the intercepting side, and a client offering only X25519 still connects with X25519;
   - **live `live_https_intercepts_public_and_passes_floor`:** a public site shows Sieve's issuer in Edge, Chrome and Firefox; Chrome's security panel shows X25519MLKEM768 for an intercepted site, and the engine's log shows X25519MLKEM768 on its upstream handshake to `cloudflare.com`; the 7.2 badssl items pass through; a `banks.txt` site shows its real issuer; budgets for TLS from section 6; the bot-challenge count on a fixed 20-site set, with and without Sieve, reported (R5).
 - **Files:** `engine/crates/sieve-engine/src/{tls,http,exclusions}/**`, `engine/crates/sieve-filter/src/exclusions.rs`. **Live:** yes. **Switch:** `filtering.https`.
+- **Status (2026-11-06):** built and tested offline only (`docs/tasks/2026-11-06-tls.md`, branch `wf2-tls`). `filtering.https` stays unavailable, and nothing has run against a real browser or site: the runbook is `docs/live/engine-slice-6.md`. The decision table holds over this slice's text: Sieve's own `sensitive` list decides, and the HttpsExclusions fetch is built, tested and `enabled: false` until the user answers Q1 of the task doc. Browsers first is the floor fact `floor:app-scope`.
 
 ### Slice 7: self-healing pinning exclusion, exclusions UI
 
