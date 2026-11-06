@@ -197,8 +197,8 @@ pub struct Policy {
     /// untrusted beside `domain_lists`.
     #[serde(default)]
     pub user_rules: Vec<String>,
-    /// `filtering.exclusions`: sites never decrypted (plan 4.5). Held here so
-    /// the interception of slice 6 finds them; nothing decrypts yet.
+    /// `filtering.exclusions`: sites never decrypted (plan 4.5). The `user`
+    /// layer of the exclusion store (`sieve_engine::exclusions`).
     #[serde(default)]
     pub exclusions: Vec<String>,
 }

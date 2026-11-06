@@ -125,7 +125,7 @@ impl DomainFilter {
         self.enabled && (any(&self.rules.user) || any(&self.rules.lists))
     }
 
-    fn is_off(&self, owner: Owner<'_>) -> bool {
+    pub fn is_off(&self, owner: Owner<'_>) -> bool {
         match owner {
             Owner::App { key } => self.off.contains(&key.to_lowercase()),
             Owner::Forwarded { vm } => self.off.contains(&vm_key(vm)),

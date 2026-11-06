@@ -1,8 +1,7 @@
-//! Leaf certificates (plan 2.5), the API slice 6 calls. One [`Minter`] per
-//! root, holding the cache, so a rotation replaces the cache with no
-//! invalidation logic. `rustls` stays out until slice 6: these are bytes.
+//! Leaf certificates (plan 2.5), the API `tls::intercept` calls. One [`Minter`]
+//! per root, holding the cache, so a rotation replaces the cache with no
+//! invalidation logic. `rustls` stays out of here: these are bytes.
 
-use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
@@ -14,6 +13,7 @@ use rustls_pki_types::CertificateDer;
 use super::key::RootKey;
 use super::root::{random_serial, time_of};
 use super::{CLOCK_SKEW_MS, CaError, LEAF_CACHE_SIZE, LEAF_MAX_LIFETIME_MS};
+use crate::lru::Lru;
 
 /// RFC 1035's limits on a name and a label.
 const HOST_MAX: usize = 253;
@@ -33,7 +33,7 @@ pub struct Leaf {
 }
 
 /// A host as a certificate may name it: lowercase, a valid DNS name. An IP,
-/// a wildcard or an empty name is an error, which slice 6 treats as
+/// a wildcard or an empty name is an error, which `tls::intercept` treats as
 /// pass-through.
 fn leaf_host(host: &str) -> Result<String, CaError> {
     let refuse = |why: &str| Err(CaError::Host(format!("{host:?}: {why}")));
@@ -61,58 +61,15 @@ fn leaf_host(host: &str) -> Result<String, CaError> {
     Ok(name)
 }
 
-/// Least recently used: `used` orders the hosts by the tick of their last
-/// use, so the oldest is its first entry.
-struct Lru {
-    capacity: usize,
-    tick: u64,
-    leaves: HashMap<String, (Arc<Leaf>, u64)>,
-    used: BTreeMap<u64, String>,
-}
-
-impl Lru {
-    fn new(capacity: usize) -> Self {
-        Self { capacity, tick: 0, leaves: HashMap::new(), used: BTreeMap::new() }
-    }
-
-    fn touch(&mut self, host: &str, old_tick: u64) -> u64 {
-        self.used.remove(&old_tick);
-        self.tick += 1;
-        self.used.insert(self.tick, host.to_string());
-        self.tick
-    }
-
-    /// The leaf for `host` that `accept` takes, marked as just used.
-    fn get(&mut self, host: &str, accept: impl Fn(&Leaf) -> bool) -> Option<Arc<Leaf>> {
-        let (leaf, old_tick) = self.leaves.get(host).map(|(l, t)| (l.clone(), *t))?;
-        if !accept(&leaf) {
-            return None;
-        }
-        let tick = self.touch(host, old_tick);
-        self.leaves.insert(host.to_string(), (leaf.clone(), tick));
-        Some(leaf)
-    }
-
-    fn insert(&mut self, host: &str, leaf: Arc<Leaf>) {
-        let old_tick = self.leaves.get(host).map_or(0, |(_, t)| *t);
-        let tick = self.touch(host, old_tick);
-        self.leaves.insert(host.to_string(), (leaf, tick));
-        while self.leaves.len() > self.capacity {
-            let Some((_, oldest)) = self.used.pop_first() else { return };
-            self.leaves.remove(&oldest);
-        }
-    }
-}
-
 /// Mints leaves under one root. `None` from `Ca::minter` means no installed,
-/// in-date root: slice 6 passes through.
+/// in-date root: the flow passes through (`tls::intercept`).
 pub struct Minter {
     root_der: Vec<u8>,
     thumbprint: String,
     root_not_after_ms: u64,
     issuer: Issuer<'static, RootKey>,
     leaf_key: Arc<KeyPair>,
-    cache: Mutex<Lru>,
+    cache: Mutex<Lru<String, Arc<Leaf>>>,
 }
 
 impl Minter {
@@ -168,17 +125,17 @@ impl Minter {
         if not_after_ms <= now_ms {
             return Err(CaError::Expired(format!("{host}: no validity left")));
         }
-        let cached = |l: &Leaf| l.not_after_ms > now_ms && l.not_after_ms <= cap;
-        if let Some(leaf) = self.lock_cache().get(&host, cached) {
+        let cached = |l: &Arc<Leaf>| l.not_after_ms > now_ms && l.not_after_ms <= cap;
+        if let Some(leaf) = self.lock_cache().get(host.as_str(), cached) {
             return Ok(leaf);
         }
         let leaf = Arc::new(Leaf { der: self.mint(&host, now_ms, not_after_ms)?, not_after_ms });
         // Signed outside the lock; two racing mints of a host are harmless.
-        self.lock_cache().insert(&host, leaf.clone());
+        self.lock_cache().insert(host, leaf.clone());
         Ok(leaf)
     }
 
-    fn lock_cache(&self) -> std::sync::MutexGuard<'_, Lru> {
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, Lru<String, Arc<Leaf>>> {
         self.cache.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -369,7 +326,7 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &m.leaf(req("a.example"), NOW).unwrap()), "a stayed");
         assert!(!Arc::ptr_eq(&b, &m.leaf(req("b.example"), NOW).unwrap()), "b, the oldest, went");
         let cache = m.lock_cache();
-        assert_eq!((cache.leaves.len(), cache.used.len()), (2, 2));
+        assert_eq!((cache.len(), cache.index_len()), (2, 2));
     }
 
     #[test]

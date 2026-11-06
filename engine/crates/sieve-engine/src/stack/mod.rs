@@ -54,6 +54,37 @@ pub struct Meters {
     pub etw_found: AtomicU64,
     pub etw_disagreed: AtomicU64,
     pub etw_dropped: AtomicU64,
+    pub https: HttpsMeters,
+}
+
+/// The key exchange groups the engine speaks, in `tls::kx_groups` order.
+pub const KX_GROUPS: usize = 3;
+const KX_GROUP_NAMES: [&str; KX_GROUPS] = ["X25519MLKEM768", "X25519", "secp256r1"];
+
+/// Evidence of interception without a disk log (task D18): plan 7.1 keeps the
+/// log in memory only, so no host goes in `status.json`, only these counts. The
+/// live check reads their delta around one site. Not on the pipe.
+#[derive(Debug, Default)]
+pub struct HttpsMeters {
+    pub intercepted: AtomicU64,
+    pub passed: AtomicU64,
+    pub upstream_groups: [AtomicU64; KX_GROUPS],
+    pub client_groups: [AtomicU64; KX_GROUPS],
+}
+
+impl HttpsMeters {
+    /// The `https` section of `status.json`.
+    pub fn report(&self) -> serde_json::Value {
+        let groups = |counts: &[AtomicU64; KX_GROUPS]| -> serde_json::Map<String, serde_json::Value> {
+            KX_GROUP_NAMES.iter().zip(counts).map(|(name, count)| ((*name).to_string(), count.load(Ordering::Relaxed).into())).collect()
+        };
+        serde_json::json!({
+            "intercepted": self.intercepted.load(Ordering::Relaxed),
+            "passed": self.passed.load(Ordering::Relaxed),
+            "upstream_groups": groups(&self.upstream_groups),
+            "client_groups": groups(&self.client_groups),
+        })
+    }
 }
 
 impl Meters {

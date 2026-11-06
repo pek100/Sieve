@@ -47,6 +47,14 @@ impl Egress {
     }
 }
 
+impl crate::tls::intercept::Dial for Egress {
+    type Stream = TcpStream;
+
+    fn dial(&self, target: SocketAddr) -> crate::tls::intercept::DialFuture<'_, TcpStream> {
+        Box::pin(self.connect(target))
+    }
+}
+
 impl Connector for Egress {
     fn tcp(&self, target: SocketAddr) -> BoxFuture<'_, Result<TcpStream, String>> {
         Box::pin(self.connect(target))

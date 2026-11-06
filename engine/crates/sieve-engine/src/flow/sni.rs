@@ -35,6 +35,8 @@ const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_ALPN: u16 = 0x0010;
 const EXT_ECH: u16 = 0xfe0d;
+const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
+const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 
 /// What a ClientHello says about where it is going.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,6 +47,19 @@ pub struct Hello {
     pub alpn: Vec<String>,
     /// The client offered Encrypted Client Hello; `sni` is the outer name.
     pub ech: bool,
+    /// What it can speak, so a client rustls cannot serve is known before it
+    /// is answered (task D10).
+    pub offer: TlsOffer,
+}
+
+/// A ClientHello's versions, cipher suites and key exchange groups, as their
+/// wire numbers (GREASE values included: they simply match nothing).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsOffer {
+    /// `supported_versions`, else the legacy version alone.
+    pub versions: Vec<u16>,
+    pub suites: Vec<u16>,
+    pub groups: Vec<u16>,
 }
 
 /// Parses the start of a client's TCP byte stream as TLS records carrying a
@@ -156,6 +171,8 @@ fn client_hello_body(body: &[u8]) -> Result<Hello, &'static str> {
         return Err("no compression methods");
     }
     let mut hello = Hello::default();
+    hello.offer.versions = vec![legacy_version];
+    hello.offer.suites = wire_numbers(suites);
     if r.is_empty() {
         // Extensions are optional in the grammar (pre TLS 1.3 clients).
         return Ok(hello);
@@ -179,10 +196,18 @@ fn client_hello_body(body: &[u8]) -> Result<Hello, &'static str> {
             }
             EXT_ALPN => hello.alpn = alpn(data)?,
             EXT_ECH => hello.ech = true,
+            EXT_SUPPORTED_VERSIONS => hello.offer.versions = Reader::new(data).vec(1).map(wire_numbers).unwrap_or_default(),
+            EXT_SUPPORTED_GROUPS => hello.offer.groups = Reader::new(data).vec(2).map(wire_numbers).unwrap_or_default(),
             _ => {}
         }
     }
     Ok(hello)
+}
+
+/// A list of big-endian u16 values. A trailing odd byte is ignored: this only
+/// ever asks "is a value rustls speaks here", and no match is a pass-through.
+fn wire_numbers(list: &[u8]) -> Vec<u16> {
+    list.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect()
 }
 
 /// The first host_name in a server_name extension, validated.
@@ -395,7 +420,20 @@ mod tests {
         body.truncate(body.len() - 2); // drop the empty extensions block
         let mut msg = vec![1, 0, 0, body.len() as u8];
         msg.extend(body);
-        assert_eq!(parse_handshake(&msg), Progress::Done(Hello::default()));
+        let hello = done(parse_handshake(&msg));
+        assert_eq!((hello.sni, hello.alpn, hello.ech), (None, vec![], false));
+        assert_eq!(hello.offer.versions, [0x0303], "no supported_versions: the legacy version alone");
+        assert!(hello.offer.groups.is_empty());
+    }
+
+    #[test]
+    fn a_hello_says_what_it_offers() {
+        let groups = (0x000a_u16, vec![0, 4, 0x11, 0xec, 0, 0x1d]);
+        let versions = (0x002b_u16, vec![4, 3, 4, 3, 3]);
+        let hello = done(parse_handshake(&handshake(&[groups, versions])));
+        assert_eq!(hello.offer.groups, [0x11ec, 0x001d]);
+        assert_eq!(hello.offer.versions, [0x0304, 0x0303], "supported_versions replaces the legacy version");
+        assert_eq!(hello.offer.suites, [0x1301, 0x1302, 0x0a0a], "in order, GREASE included");
     }
 
     #[test]
@@ -531,7 +569,8 @@ mod tests {
         #[test]
         fn any_valid_name_round_trips(name in "[a-z0-9]{1,20}(\\.[a-z0-9-]{1,20}){1,4}", chunk in 1usize..400) {
             let stream = records(&handshake(&[grease_ext(5), sni_ext(&name)]), chunk);
-            prop_assert_eq!(parse_tls_stream(&stream), Progress::Done(Hello { sni: Some(name), alpn: vec![], ech: false }));
+            let hello = done(parse_tls_stream(&stream));
+            prop_assert_eq!((hello.sni, hello.alpn, hello.ech), (Some(name), vec![], false));
         }
     }
 }

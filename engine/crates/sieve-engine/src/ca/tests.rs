@@ -626,14 +626,6 @@ fn live_root_ca_trust_and_removal() {
     assert_eq!(live_ca_failures(&results), Vec::<&str>::new(), "required checks without a PASS");
 }
 
-/// The registry's `liveCheck` of `filtering.https`. Interception does not
-/// exist yet, so this cannot pass and claims nothing.
-#[test]
-#[ignore = "live: slice 6 builds what this checks"]
-fn live_https_intercepts_public_and_passes_floor() {
-    panic!("slice 6 is not built");
-}
-
 #[test]
 fn every_required_live_check_is_one_the_script_makes() {
     let script = include_str!("../../../../../scripts/live/engine-ca.ps1");
