@@ -6,7 +6,9 @@
 //! 2. The host-level decision, as on the plain path. A drop closes.
 //! 3. `decrypt` with the cached verdict. PassThrough: the held bytes on the
 //!    unused SYN-time socket, then splice.
-//! 4. The upstream handshake on that socket, then its validation.
+//! 4. The upstream handshake on that socket, with ECH when the name's record has
+//!    a config (a failure of that retries plain on a fresh socket), then its
+//!    validation.
 //! 5. `decrypt` with the verdict. PassThrough: a fresh TCP, replay, splice.
 //! 6. Intercept: a minted leaf, the local handshake over the held bytes, then
 //!    `http::serve`.
@@ -30,6 +32,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 
 use super::active::{Active, Registered};
+use super::ech::{EchCache, usable_config};
 use super::first_bytes::{First, read_first};
 use super::server::{server_config, speaks_to};
 use super::splice::{AppSide, Prefixed, splice};
@@ -96,6 +99,8 @@ pub struct Interception<C> {
     pub exclusions: Arc<ExclusionSlot>,
     pub verifier: Arc<Verifier>,
     pub verdicts: VerdictCache,
+    /// The upstream hello's ECH configs (plan 2.9).
+    pub ech: Arc<EchCache>,
     pub active: Active,
     /// The CA's minter now; None while no installed, in-date root exists.
     pub minter: Box<dyn Fn() -> Option<Arc<Minter>> + Send + Sync>,
@@ -203,6 +208,32 @@ impl<C: Dial> Interception<C> {
         if splice(app, fresh, held).await { FlowAction::Relayed } else { FlowAction::Failed }
     }
 
+    /// Step 4's handshake. A config rustls cannot use is no config. Any failure of
+    /// an attempt with ECH leaves no verdict, marks the host and dials a fresh
+    /// socket for the plain handshake; a failed dial is `Unavailable`, which ends
+    /// in `fresh_splice`.
+    async fn shake(&self, upstream: C::Stream, host: &str, remote: SocketAddr, alpn: Vec<Vec<u8>>) -> HandshakeEnd<C::Stream> {
+        let now = (self.clock)();
+        let config = self.ech.config_for(host, remote.port(), now).await.and_then(|list| usable_config(&list));
+        let Some(config) = config else { return handshake(upstream, host, alpn, None).await };
+        let meters = &self.meters.https;
+        Meters::bump(&meters.ech_offered);
+        match handshake(upstream, host, alpn.clone(), Some(config)).await {
+            HandshakeEnd::EchFailed => {
+                Meters::bump(&meters.ech_failed);
+                self.ech.mark_negative(host, now);
+                let Ok(fresh) = self.connector.dial(remote).await else { return HandshakeEnd::Failed(UpstreamVerdict::Unavailable) };
+                handshake(fresh, host, alpn, None).await
+            }
+            end => {
+                if matches!(end, HandshakeEnd::Done(_)) {
+                    Meters::bump(&meters.ech_accepted);
+                }
+                end
+            }
+        }
+    }
+
     /// The rest of the path once an intercepted connection ended.
     fn after_serve(&self, host: &str, upstream_error: Option<&hyper::Error>) {
         let auth = upstream_error.and_then(|e| rustls_error(e)).is_some_and(is_post_handshake_auth);
@@ -294,12 +325,12 @@ where
     // `decrypt` said a name is there, or it would have been `floor:no-sni`.
     let (Some(host), Some(registered)) = (host, registered) else { return FlowAction::Relayed };
 
-    let (shaken, verdict) = match handshake(upstream, host, filter_alpn(&decoded.alpn)).await {
+    let (shaken, verdict) = match deps.shake(upstream, host, flow.remote, filter_alpn(&decoded.alpn)).await {
         // Written down only if the chain is good: anyone can ask, and the rest
         // stay in the bounded verdict cache. No trust call: the flow passes
         // through either way.
         HandshakeEnd::ClientCertificate(chain) => {
-            let verdict = deps.verifier.verify(&chain, host, true).await;
+            let verdict = deps.verifier.verify(&chain, host, true, (deps.clock)()).await;
             if verdict == UpstreamVerdict::Eligible {
                 deps.exclude(host, AutoReason::ClientCert, None);
             } else {
@@ -312,11 +343,13 @@ where
             deps.verdicts.put(host, flow.remote.port(), verdict, None, None, (deps.clock)());
             (None, verdict)
         }
+        // `shake` retries it, and the retry offers no ECH: this cannot come back.
+        HandshakeEnd::EchFailed => (None, UpstreamVerdict::Unavailable),
         HandshakeEnd::Done(shaken) => {
             let facts_of_leaf = leaf_facts(&shaken.chain.end_entity);
             let leaf = facts_of_leaf.map(|l| l.hash);
             let known = cached.is_some_and(|c| c.verdict == UpstreamVerdict::Eligible && c.leaf.is_some() && c.leaf == leaf);
-            let verdict = deps.verifier.verify(&shaken.chain, host, known).await;
+            let verdict = deps.verifier.verify(&shaken.chain, host, known, (deps.clock)()).await;
             // Whoever closed this flow knows better than its `Eligible`, which
             // is then not a fact to keep. A known leaf keeps its expiry: the 24 h
             // run from the trust call that was really made, or a visited host

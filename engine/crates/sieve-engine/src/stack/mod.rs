@@ -70,6 +70,16 @@ pub struct HttpsMeters {
     pub passed: AtomicU64,
     pub upstream_groups: [AtomicU64; KX_GROUPS],
     pub client_groups: [AtomicU64; KX_GROUPS],
+    // Slice 11 (task D11), counts only.
+    pub ct_compliant: AtomicU64,
+    pub ct_violating: AtomicU64,
+    pub ct_skipped_no_list: AtomicU64,
+    pub ct_skipped_stale: AtomicU64,
+    pub crlite_revoked: AtomicU64,
+    pub validation_refused: AtomicU64,
+    pub ech_offered: AtomicU64,
+    pub ech_accepted: AtomicU64,
+    pub ech_failed: AtomicU64,
 }
 
 impl HttpsMeters {
@@ -83,6 +93,15 @@ impl HttpsMeters {
             "passed": self.passed.load(Ordering::Relaxed),
             "upstream_groups": groups(&self.upstream_groups),
             "client_groups": groups(&self.client_groups),
+            "ct_compliant": self.ct_compliant.load(Ordering::Relaxed),
+            "ct_violating": self.ct_violating.load(Ordering::Relaxed),
+            "ct_skipped_no_list": self.ct_skipped_no_list.load(Ordering::Relaxed),
+            "ct_skipped_stale": self.ct_skipped_stale.load(Ordering::Relaxed),
+            "crlite_revoked": self.crlite_revoked.load(Ordering::Relaxed),
+            "validation_refused": self.validation_refused.load(Ordering::Relaxed),
+            "ech_offered": self.ech_offered.load(Ordering::Relaxed),
+            "ech_accepted": self.ech_accepted.load(Ordering::Relaxed),
+            "ech_failed": self.ech_failed.load(Ordering::Relaxed),
         })
     }
 }

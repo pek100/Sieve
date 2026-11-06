@@ -5,7 +5,11 @@
 //! 1. eligibility: the public root set, inline, no OS, no network. Sieve's root
 //!    and any other interceptor's are not in that set, so "must not anchor in
 //!    Sieve's own root" needs no check of its own (S52);
-//! 2. trust: [`TrustVerifier`], the Windows chain engine in production, on a
+//! 2. the local checks: CRLite, then Certificate Transparency ([`ValidationSlot`],
+//!    slice 11), inline, even for a known leaf, since a filter that arrived an
+//!    hour ago must reach a host visited all day. A private root never gets here,
+//!    which is plan 2.6's "public roots only" by order, with no second test;
+//! 3. trust: [`TrustVerifier`], the Windows chain engine in production, on a
 //!    blocking thread behind a semaphore and a timeout, because CryptoAPI can
 //!    wait seconds on a fetch and rustls's verifier runs inside the handshake
 //!    poll, on a worker that also carries the relay.
@@ -19,7 +23,7 @@ use std::time::Duration;
 
 use aws_lc_rs::digest::{SHA256, digest};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::client::{ResolvesClientCert, Resumption, WebPkiServerVerifier};
+use rustls::client::{EchConfig, EchMode, ResolvesClientCert, Resumption, WebPkiServerVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::sign::CertifiedKey;
@@ -31,7 +35,10 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use x509_parser::prelude::{FromDer, ParsedExtension, X509Certificate};
 
+use super::ct::{SpkiHash, anchor_spki_hash, spki_hash};
+use super::ech::ECH_HANDSHAKE_TIMEOUT;
 use super::provider;
+use super::validation::ValidationSlot;
 use super::verdict::LeafHash;
 
 /// How long the upstream handshake may take before the flow passes through.
@@ -122,13 +129,22 @@ pub enum HandshakeEnd<S> {
     /// `Protocol` (it needs less than rustls offers) or `Unavailable` (a timeout
     /// or a dropped connection).
     Failed(UpstreamVerdict),
+    /// A handshake that offered ECH ended any other way than `Done`: a rejection,
+    /// a reset, a timeout or a certificate request. The chain, if any, was for
+    /// the public name, so it is dropped unjudged and no verdict follows (task D10).
+    EchFailed,
 }
 
-pub(super) fn client_config(capture: &Arc<Capture>, alpn: Vec<Vec<u8>>) -> Result<ClientConfig, String> {
+pub(super) fn client_config(capture: &Arc<Capture>, alpn: Vec<Vec<u8>>, ech: Option<&EchConfig>) -> Result<ClientConfig, String> {
     let provider = provider();
     let verifier = Arc::new(CapturingVerifier { capture: capture.clone(), provider: provider.clone() });
-    let mut config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+    let builder = ClientConfig::builder_with_provider(provider);
+    // TLS 1.3 only with ECH, which any server publishing a config speaks.
+    let builder = match ech {
+        Some(config) => builder.with_ech(EchMode::Enable(config.clone())),
+        None => builder.with_safe_default_protocol_versions(),
+    };
+    let mut config = builder
         .map_err(|e| format!("TLS versions: {e}"))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -139,16 +155,22 @@ pub(super) fn client_config(capture: &Arc<Capture>, alpn: Vec<Vec<u8>>) -> Resul
     Ok(config)
 }
 
-/// The handshake on `stream`, with the client's SNI and filtered ALPN.
-pub async fn handshake<S>(stream: S, sni: &str, alpn: Vec<Vec<u8>>) -> HandshakeEnd<S>
+/// The handshake on `stream`, with the client's SNI and filtered ALPN, and ECH
+/// when a usable config is given.
+pub async fn handshake<S>(stream: S, sni: &str, alpn: Vec<Vec<u8>>, ech: Option<EchConfig>) -> HandshakeEnd<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let capture = Arc::new(Capture::default());
-    let Ok(config) = client_config(&capture, alpn) else { return HandshakeEnd::Failed(UpstreamVerdict::Protocol) };
+    let offered = ech.is_some();
+    let Ok(config) = client_config(&capture, alpn, ech.as_ref()) else { return if offered { HandshakeEnd::EchFailed } else { HandshakeEnd::Failed(UpstreamVerdict::Protocol) } };
     let Ok(name) = ServerName::try_from(sni.to_string()) else { return HandshakeEnd::Failed(UpstreamVerdict::Protocol) };
     let connect = TlsConnector::from(Arc::new(config)).connect(name, stream);
-    let answer = tokio::time::timeout(UPSTREAM_HANDSHAKE_TIMEOUT, connect).await;
+    let limit = if offered { ECH_HANDSHAKE_TIMEOUT } else { UPSTREAM_HANDSHAKE_TIMEOUT };
+    let answer = tokio::time::timeout(limit, connect).await;
+    if offered && (!matches!(answer, Ok(Ok(_))) || capture.asked_for_certificate.load(Ordering::Relaxed)) {
+        return HandshakeEnd::EchFailed;
+    }
     let chain = capture.chain.lock().unwrap_or_else(|p| p.into_inner()).take();
     // An ask with no chain proves nothing about the server: it ends like any
     // other handshake that did not finish.
@@ -229,9 +251,11 @@ impl TrustVerifier for PlatformTrust {
     }
 }
 
-/// The two checks, with the dials of the second.
+/// The three checks, with the dials of the last.
 pub struct Verifier {
     eligibility: Arc<WebPkiServerVerifier>,
+    roots: Arc<RootCertStore>,
+    validation: Arc<ValidationSlot>,
     trust: Arc<dyn TrustVerifier>,
     permits: Arc<Semaphore>,
     timeout: Duration,
@@ -239,9 +263,9 @@ pub struct Verifier {
 
 impl Verifier {
     /// `roots` is `tls::public_roots()` in production, a test's own in tests.
-    pub fn new(roots: Arc<RootCertStore>, trust: Arc<dyn TrustVerifier>, timeout: Duration) -> Result<Self, String> {
-        let eligibility = WebPkiServerVerifier::builder_with_provider(roots, provider()).build().map_err(|e| format!("the public roots: {e}"))?;
-        Ok(Self { eligibility, trust, permits: Arc::new(Semaphore::new(TRUST_CONCURRENCY)), timeout })
+    pub fn new(roots: Arc<RootCertStore>, trust: Arc<dyn TrustVerifier>, timeout: Duration, validation: Arc<ValidationSlot>) -> Result<Self, String> {
+        let eligibility = WebPkiServerVerifier::builder_with_provider(roots.clone(), provider()).build().map_err(|e| format!("the public roots: {e}"))?;
+        Ok(Self { eligibility, roots, validation, trust, permits: Arc::new(Semaphore::new(TRUST_CONCURRENCY)), timeout })
     }
 
     /// Eligibility: inline, no OS. An unknown issuer is a private root; anything
@@ -252,6 +276,26 @@ impl Verifier {
             Err(TlsError::InvalidCertificate(CertificateError::UnknownIssuer)) => UpstreamVerdict::NonPublicRoot,
             Err(_) => UpstreamVerdict::Invalid,
         }
+    }
+
+    /// The issuer's key hash, from the path eligibility accepts (task D5).
+    ///
+    /// TENSION (S51): the path is built twice per new connection, because
+    /// `WebPkiServerVerifier` does not hand it over. Rebuilding eligibility on
+    /// `webpki` directly would remove the second build and rewrite slice 6's tested
+    /// error mapping; not worth it without a measured cost, which
+    /// `bench_validation_local_checks` reports.
+    pub(crate) fn issuer_hash(&self, chain: &Chain, now_ms: u64) -> Option<SpkiHash> {
+        let leaf = webpki::EndEntityCert::try_from(&chain.end_entity).ok()?;
+        let now = UnixTime::since_unix_epoch(Duration::from_millis(now_ms));
+        let algorithms = provider().signature_verification_algorithms.all;
+        let path = leaf.verify_for_usage(algorithms, &self.roots.roots, &chain.intermediates, now, webpki::KeyUsage::server_auth(), None, None).ok()?;
+        // The first intermediate is the one that signed the leaf (test
+        // `issuer_hash_of_an_intermediate_matches_the_recorded_issuer`).
+        Some(match path.intermediate_certificates().next() {
+            Some(issuer) => spki_hash(issuer.subject_public_key_info().as_ref()),
+            None => anchor_spki_hash(path.anchor().subject_public_key_info.as_ref()),
+        })
     }
 
     /// Trust, off the runtime. The permit goes with the blocking call, so a
@@ -276,12 +320,18 @@ impl Verifier {
         }
     }
 
-    /// Both, in order. `trust_known` means this same leaf was already trusted,
-    /// so only eligibility runs.
-    pub async fn verify(&self, chain: &Chain, sni: &str, trust_known: bool) -> UpstreamVerdict {
+    /// All three, in order. `trust_known` means this same leaf was already trusted,
+    /// so the trust call does not run; the local checks always do.
+    pub async fn verify(&self, chain: &Chain, sni: &str, trust_known: bool, now_ms: u64) -> UpstreamVerdict {
         let Ok(host) = ServerName::try_from(sni.to_string()) else { return UpstreamVerdict::Invalid };
         let eligible = self.eligibility(chain, &host);
-        if eligible != UpstreamVerdict::Eligible || trust_known {
+        if eligible != UpstreamVerdict::Eligible {
+            return eligible;
+        }
+        if let Some(verdict) = self.validation.check(chain, now_ms, || self.issuer_hash(chain, now_ms)).verdict {
+            return verdict;
+        }
+        if trust_known {
             return eligible;
         }
         self.trust(chain.clone(), host).await

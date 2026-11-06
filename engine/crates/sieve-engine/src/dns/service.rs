@@ -22,7 +22,7 @@ use tokio::time::Instant;
 
 use super::pool::{Context, Pool, UpstreamReport};
 use super::upstream::{self, Health, REQUEST_BUDGET, Upstream, split_rules, split_server};
-use super::{FLAG_OPCODE, FLAG_QR, MAX_MESSAGE, NameMap, flags_of, lan, notimp, parse, reply_answers, servfail, truncated, udp_limit};
+use super::{FLAG_OPCODE, FLAG_QR, HttpsRecord, MAX_MESSAGE, NameMap, TYPE_HTTPS, flags_of, lan, notimp, parse, query_for, reply_answers, servfail, truncated, udp_limit, with_id};
 use crate::route::table::NetTables;
 use crate::stack::Meters;
 use crate::watchdog::monotonic_ms;
@@ -139,6 +139,19 @@ impl Service {
         }
         let over = transport == Transport::Datagram && reply.len() > udp_limit(query, self.mtu);
         Some(Answered { reply: if over { truncated(&reply)? } else { reply }, resolved: true })
+    }
+
+    /// The engine's own HTTPS lookup, for its upstream hello (task D9). The same
+    /// `resolve`: encrypted, or LAN for a matched suffix, and never plain beyond
+    /// that. It takes no permit a client is waiting for: past the bound it fails,
+    /// and the flow goes on without ECH.
+    pub async fn https_records(&self, name: &str) -> Result<Vec<HttpsRecord>, String> {
+        let _permit = self.try_permit().ok_or("too many queries in flight")?;
+        let mut id = [0u8; 2];
+        getrandom::fill(&mut id).map_err(|e| e.to_string())?;
+        let query = with_id(&query_for(name, TYPE_HTTPS).ok_or("a name that cannot be sent")?, u16::from_be_bytes(id));
+        let reply = self.resolve(&query).await?;
+        Ok(reply_answers(&query, &reply).ok_or("an answer to another question")?.https)
     }
 
     async fn resolve(&self, query: &[u8]) -> Result<Vec<u8>, String> {
@@ -352,6 +365,37 @@ mod tests {
         let configured: Vec<u16> = vec![doh.port, dot.port];
         assert!(b.connector.tcp_recorded().iter().all(|t| configured.contains(&t.port())), "TCP only to the configured upstreams");
         assert_eq!(trap.udp_queries.load(std::sync::atomic::Ordering::SeqCst) + trap.tcp_queries.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn lookup_goes_through_the_encrypted_upstream() {
+        const CONFIG: [u8; 3] = [9, 8, 7];
+        let ca = Ca::new();
+        // The record for whatever was asked: compressed owner, as resolvers send.
+        let script: Script = Arc::new(|query| {
+            let mut reply = answer_to(query);
+            reply[6..8].copy_from_slice(&1u16.to_be_bytes());
+            reply.extend_from_slice(&[0xc0, 0x0c]);
+            reply.extend_from_slice(&TYPE_HTTPS.to_be_bytes());
+            reply.extend_from_slice(&1u16.to_be_bytes());
+            reply.extend_from_slice(&300u32.to_be_bytes());
+            let mut data = vec![0, 1, 0, 0, 5];
+            data.extend_from_slice(&u16::try_from(CONFIG.len()).unwrap().to_be_bytes());
+            data.extend_from_slice(&CONFIG);
+            reply.extend_from_slice(&u16::try_from(data.len()).unwrap().to_be_bytes());
+            reply.extend_from_slice(&data);
+            Step::Answer(reply)
+        });
+        let doh = Server::start(Kind::Https, &ca, Options { script, ..Options::default() }).await;
+        let trap = Plain::start(answering(), answering()).await;
+        let b = bed(&ca, &[doh.url()], None, connector_with(&trap));
+        let records = tokio::time::timeout(PATIENT, b.service.https_records("www.example")).await.unwrap().unwrap();
+        assert_eq!(records, [HttpsRecord { priority: 1, ech: Some(CONFIG.to_vec()), ttl: 300 }]);
+        let asked = parse(&doh.seen()[0].message).unwrap();
+        assert_eq!((asked.question.as_deref(), asked.question_type), (Some("www.example"), TYPE_HTTPS));
+        assert!(b.connector.udp_recorded().is_empty(), "the plain path untouched");
+        assert_eq!(trap.udp_queries.load(std::sync::atomic::Ordering::SeqCst) + trap.tcp_queries.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(b.connector.tcp_recorded().iter().all(|t| t.port() == doh.port), "TCP only to the configured upstream");
     }
 
     #[tokio::test]

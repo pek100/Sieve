@@ -15,8 +15,9 @@
 //! connector's pinning and the tests' recording cover every socket.
 //!
 //! The parser reads only what the map needs: the question name, and A and
-//! AAAA answers with their TTL (compressed names, RFC 1035 4.1.4). Anything
-//! malformed is None, never a guess.
+//! AAAA answers with their TTL (compressed names, RFC 1035 4.1.4); and what the
+//! engine's own upstream hello needs: HTTPS records with their `ech` parameter.
+//! Anything malformed is None, never a guess.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -40,10 +41,14 @@ pub mod upstream;
 
 pub(crate) const TYPE_A: u16 = 1;
 pub(crate) const TYPE_AAAA: u16 = 28;
+/// RFC 9460: the service binding record, where an ECH config lives.
+pub(crate) const TYPE_HTTPS: u16 = 65;
 const TYPE_CNAME: u16 = 5;
 /// EDNS's pseudo-record (RFC 6891).
 const TYPE_OPT: u16 = 41;
 const CLASS_IN: u16 = 1;
+/// RFC 9460 14.3.2: SvcParamKey `ech`.
+const SVC_PARAM_ECH: u16 = 5;
 /// Pointer hops allowed in one name (a loop guard).
 const MAX_POINTERS: usize = 16;
 /// The longest name (RFC 1035 3.1).
@@ -247,6 +252,58 @@ pub struct Message {
     pub question_type: u16,
     /// (address, TTL in seconds).
     pub answers: Vec<(IpAddr, u32)>,
+    /// The HTTPS records of the question's chain.
+    pub https: Vec<HttpsRecord>,
+}
+
+/// One HTTPS record, as the engine's upstream hello reads it (plan 2.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpsRecord {
+    pub priority: u16,
+    /// The `ech` parameter's ECHConfigList. AliasMode (priority 0) gives none
+    /// and is not followed.
+    pub ech: Option<Vec<u8>>,
+    pub ttl: u32,
+}
+
+/// The config to use: the lowest priority that has one.
+pub fn best_ech(records: &[HttpsRecord]) -> Option<&HttpsRecord> {
+    records.iter().filter(|r| r.ech.is_some()).min_by_key(|r| r.priority)
+}
+
+/// Priority and `ech` of an HTTPS record's RDATA (RFC 9460 2.2). The target is
+/// never compressed and the keys strictly ascend. None when malformed, which
+/// costs that record only.
+fn https_rdata(data: &[u8]) -> Option<(u16, Option<Vec<u8>>)> {
+    let (priority, mut rest) = data.split_first_chunk::<2>()?;
+    loop {
+        let (&length, after) = rest.split_first()?;
+        if length & 0xc0 != 0 {
+            return None;
+        }
+        rest = after.get(usize::from(length)..)?;
+        if length == 0 {
+            break;
+        }
+    }
+    let mut last_key = None;
+    let mut ech = None;
+    while !rest.is_empty() {
+        let (head, after) = rest.split_first_chunk::<4>()?;
+        let key = u16::from_be_bytes([head[0], head[1]]);
+        let length = usize::from(u16::from_be_bytes([head[2], head[3]]));
+        let value = after.get(..length)?;
+        if last_key.is_some_and(|last| key <= last) {
+            return None;
+        }
+        last_key = Some(key);
+        if key == SVC_PARAM_ECH && !value.is_empty() {
+            ech = Some(value.to_vec());
+        }
+        rest = &after[length..];
+    }
+    let priority = u16::from_be_bytes(*priority);
+    Some((priority, ech.filter(|_| priority != 0)))
 }
 
 fn name_at(msg: &[u8], mut pos: usize) -> Option<(String, usize)> {
@@ -317,6 +374,7 @@ pub fn parse(msg: &[u8]) -> Option<Message> {
         return None;
     }
     let mut addresses = Vec::new();
+    let mut services = Vec::new();
     let mut aliases: HashMap<String, (String, u32)> = HashMap::new();
     for _ in 0..an {
         let (owner, next) = name_at(msg, pos)?;
@@ -334,6 +392,11 @@ pub fn parse(msg: &[u8]) -> Option<Message> {
                 let mut b = [0u8; 16];
                 b.copy_from_slice(data);
                 addresses.push((owner, IpAddr::V6(Ipv6Addr::from(b)), ttl));
+            }
+            (TYPE_HTTPS, CLASS_IN, _) => {
+                if let Some((priority, ech)) = https_rdata(data) {
+                    services.push((owner, HttpsRecord { priority, ech, ttl }));
+                }
             }
             (TYPE_CNAME, CLASS_IN, _) => {
                 let (target, end) = name_at(msg, next + 10)?;
@@ -354,6 +417,7 @@ pub fn parse(msg: &[u8]) -> Option<Message> {
     }
     let response = flags & FLAG_QR != 0;
     let mut answers = Vec::new();
+    let mut https = Vec::new();
     // Error and truncated packets are not evidence that an address belongs
     // to a name. Only the question owner and its CNAME chain are evidence;
     // unrelated records in the answer section must not poison the IP map.
@@ -372,6 +436,7 @@ pub fn parse(msg: &[u8]) -> Option<Message> {
                         .filter(|(name, _, _)| name == owner)
                         .map(|(_, ip, ttl)| (*ip, (*ttl).min(ttl_cap))),
                 );
+                https.extend(services.iter().filter(|(name, _)| name == owner).map(|(_, record)| HttpsRecord { ttl: record.ttl.min(ttl_cap), ..record.clone() }));
                 break;
             }
         }
@@ -382,6 +447,7 @@ pub fn parse(msg: &[u8]) -> Option<Message> {
         question: Some(question),
         question_type: qtype,
         answers,
+        https,
     })
 }
 
@@ -742,6 +808,84 @@ mod tests {
         msg.extend_from_slice(&ttl.to_be_bytes());
         msg.extend_from_slice(&(data.len() as u16).to_be_bytes());
         msg.extend_from_slice(data);
+    }
+
+    /// RDATA of an HTTPS record with these SvcParams.
+    fn https_data(priority: u16, target: &str, params: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut data = priority.to_be_bytes().to_vec();
+        data.extend(if target.is_empty() { vec![0] } else { wire_name(target) });
+        for (key, value) in params {
+            data.extend_from_slice(&key.to_be_bytes());
+            data.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            data.extend_from_slice(value);
+        }
+        data
+    }
+
+    /// A reply to an HTTPS question for `name` holding these records.
+    fn https_reply(name: &str, flags: u16, records: &[(&str, u16, u32, Vec<u8>)]) -> Vec<u8> {
+        let mut msg = build::response(1, name, &[]);
+        msg[2..4].copy_from_slice(&flags.to_be_bytes());
+        msg[6..8].copy_from_slice(&(records.len() as u16).to_be_bytes());
+        let end = msg.len();
+        msg[end - 4..end - 2].copy_from_slice(&TYPE_HTTPS.to_be_bytes());
+        for (owner, ty, ttl, data) in records {
+            append_rr(&mut msg, owner, *ty, *ttl, data);
+        }
+        msg
+    }
+
+    #[test]
+    fn https_record_table() {
+        const OK: u16 = 0x8180;
+        const ALPN: (u16, &[u8]) = (1, b"\x02h2");
+        const PORT: (u16, &[u8]) = (3, &[1, 187]);
+        const ECH: u16 = 5;
+        const NEXT: (u16, &[u8]) = (6, &[192, 0, 2, 1]);
+        let config = |c: u8| vec![c; 4];
+        let service = |priority: u16, c: u8| (priority, config(c));
+        let with = |(priority, ech): (u16, Vec<u8>)| https_data(priority, "", &[(ECH, &ech)]);
+        let row = |name: &str, want: Option<Vec<u8>>, msg: Vec<u8>| {
+            let parsed = parse(&msg).unwrap_or_else(|| panic!("{name}: the message still parses"));
+            assert_eq!(best_ech(&parsed.https).and_then(|r| r.ech.clone()), want, "{name}");
+        };
+        let host = "site.example";
+        row("a service record with ech", Some(config(1)), https_reply(host, OK, &[(host, TYPE_HTTPS, 300, with(service(1, 1)))]));
+        row(
+            "the lowest priority with a config wins",
+            Some(config(2)),
+            https_reply(host, OK, &[(host, TYPE_HTTPS, 300, with(service(3, 3))), (host, TYPE_HTTPS, 300, https_data(1, "", &[ALPN])), (host, TYPE_HTTPS, 300, with(service(2, 2)))]),
+        );
+        row("AliasMode gives none", None, https_reply(host, OK, &[(host, TYPE_HTTPS, 300, https_data(0, "alias.example", &[(ECH, &config(1))]))]));
+        let chain = https_reply(host, OK, &[(host, TYPE_CNAME, 50, wire_name("cdn.example")), ("cdn.example", TYPE_HTTPS, 300, with(service(1, 4)))]);
+        row("a record on the CNAME chain counts", Some(config(4)), chain.clone());
+        assert_eq!(parse(&chain).unwrap().https[0].ttl, 50, "with the chain's shortest TTL");
+        row("a record on an unrelated owner does not", None, https_reply(host, OK, &[("unrelated.example", TYPE_HTTPS, 300, with(service(1, 5)))]));
+        let ech = config(6);
+        row("other params around key 5", Some(config(6)), https_reply(host, OK, &[(host, TYPE_HTTPS, 300, https_data(1, "svc.example", &[ALPN, PORT, (ECH, &ech), NEXT]))]));
+        row("an error reply gives none", None, https_reply(host, 0x8182, &[(host, TYPE_HTTPS, 300, with(service(1, 7)))]));
+        row("a truncated reply gives none", None, https_reply(host, 0x8380, &[(host, TYPE_HTTPS, 300, with(service(1, 8)))]));
+        // A malformed record costs that record, and only that record.
+        let mut cut = with(service(1, 9));
+        cut.truncate(cut.len() - 1);
+        let out_of_order = https_data(1, "", &[NEXT, (ECH, &ech)]);
+        let compressed = vec![0, 1, 0xc0, 0x0c];
+        row("malformed records beside a good one", Some(config(1)), https_reply(host, OK, &[(host, TYPE_HTTPS, 300, cut), (host, TYPE_HTTPS, 300, out_of_order), (host, TYPE_HTTPS, 300, compressed), (host, TYPE_HTTPS, 300, with(service(2, 1)))]));
+        // The address path is unchanged by any of this.
+        let mut both = https_reply(host, OK, &[(host, TYPE_HTTPS, 300, with(service(1, 1)))]);
+        both[6..8].copy_from_slice(&2u16.to_be_bytes());
+        append_rr(&mut both, host, TYPE_A, 60, &[192, 0, 2, 1]);
+        assert_eq!(parse(&both).unwrap().answers, vec![(ip("192.0.2.1"), 60)]);
+    }
+
+    proptest! {
+        #[test]
+        fn https_record_parse_refuses_hostile_bytes(data in proptest::collection::vec(any::<u8>(), 0..512), whole in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let _ = https_rdata(&data);
+            let reply = https_reply("site.example", 0x8180, &[("site.example", TYPE_HTTPS, 300, data)]);
+            prop_assert!(parse(&reply).is_some(), "bad RDATA never costs the message");
+            let _ = parse(&whole);
+        }
     }
 
     #[test]
