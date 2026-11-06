@@ -154,7 +154,7 @@ describe("protocol law", () => {
     expect(() => parseEngineProbe(withStatus(v1))).toThrow(/counters/);
     // Protocol 3's additions degrade to their defaults when absent; a wrong type still throws.
     const noBlocking = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "blocking"));
-    const old = { ...noBlocking, policy: { revision: 3, engine: true }, counters: { flows: 1, attributed: 1, own_refused: 0, dns_answers: 0, packets_in: 0, packets_out: 0, not_unicast: 0 } };
+    const old = { ...noBlocking, policy: { revision: 3, engine: true }, counters: { flows: 1, attributed: 1, own_refused: 0, dns_answers: 0, packets_in: 0, packets_out: 0, not_unicast: 0, forwarded: 0, forwarded_named: 0, etw_found: 0, etw_disagreed: 0, etw_dropped: 0 } };
     const pipe = parseEngineProbe(withStatus(old)).pipe;
     if (pipe?.kind !== "welcome") throw new Error("expected welcome");
     expect(pipe.status.blocking).toBe(false);
