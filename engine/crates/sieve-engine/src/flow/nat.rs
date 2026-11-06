@@ -7,10 +7,10 @@
 //! - [`NatSource`]: where sessions come from; every source is asked.
 //! - [`VmDirectory`]: internal IP to the system's own name for the VM. If any
 //!   link fails the name is None, and the flow takes the unidentified row.
-//! - [`NatTable`]: the index of the last read. All reads run on one thread
-//!   ([`NatTable::spawn`]), which owns whatever its sources need (a COM
-//!   apartment), so a flow task waits on a reply and never blocks a runtime
-//!   worker. Reads are rate limited and flows share them, so a flow's wait is
+//! - [`NatTable`]: the index of each source's last finished answer. All reads
+//!   run on one thread ([`NatTable::spawn`]), which owns whatever its sources
+//!   need (a COM apartment), so a flow task waits on a reply and never blocks a
+//!   runtime worker. Reads are rate limited and flows share them, so a flow's wait is
 //!   bounded whatever the flows around it do; a timeout adds no new match.
 //!
 //! A failed read costs attribution only, never routing. No timer: a machine
@@ -172,26 +172,28 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn read_all(sources: &mut [Box<dyn NatSource>], directory: &mut dyn VmDirectory, shared: &Shared) {
+/// A source and its last finished answer.
+struct HeldSource {
+    source: Box<dyn NatSource>,
+    last: Vec<NatSession>,
+}
+
+/// A source's failed read leaves its last answer standing, whatever the other
+/// sources say: only that source can retire its sessions. There is no TTL (D4),
+/// so a source that never answers again keeps what it last said.
+fn read_all(sources: &mut [HeldSource], directory: &mut dyn VmDirectory, shared: &Shared) {
     shared.reads.fetch_add(1, Ordering::Relaxed);
-    let mut sessions = Vec::new();
-    let mut answered = false;
-    for source in sources {
-        match source.read() {
-            Ok(mut s) => {
-                answered = true;
-                sessions.append(&mut s);
-            }
+    for held in sources.iter_mut() {
+        match held.source.read() {
+            Ok(sessions) => held.last = sessions,
             Err(_) => {
                 shared.read_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
-    // When nothing answered, the sessions of the last read still stand.
-    if answered {
-        let index = index_sessions(&sessions, directory);
-        *lock(&shared.index) = index;
-    }
+    let sessions: Vec<NatSession> = sources.iter().flat_map(|held| held.last.iter().copied()).collect();
+    let index = index_sessions(&sessions, directory);
+    *lock(&shared.index) = index;
 }
 
 /// The reads asked of the thread, numbered from 1 in the order it runs them.
@@ -226,7 +228,8 @@ impl NatTable {
         let (ended, finished) = watch::channel(0);
         let thread_shared = shared.clone();
         let _ = std::thread::Builder::new().name("sieve-nat".into()).spawn(move || {
-            let (mut sources, mut directory) = make();
+            let (sources, mut directory) = make();
+            let mut sources: Vec<HeldSource> = sources.into_iter().map(|source| HeldSource { source, last: Vec::new() }).collect();
             while let Ok(read) = queue.recv() {
                 read_all(&mut sources, directory.as_mut(), &thread_shared);
                 let _ = ended.send(read);
@@ -693,6 +696,40 @@ mod tests {
         assert!(t.fresh_match(&udp_flow(SRC, DST), 1_000).await.is_some(), "a match in the second source counts");
         assert_eq!((first.load(Ordering::Relaxed), second.load(Ordering::Relaxed)), (1, 1));
         assert_eq!(t.stats().read_errors, 1);
+    }
+
+    type Answer = Result<Vec<NatSession>, String>;
+
+    /// Gives each answer once, in order.
+    struct Scripted(VecDeque<Answer>);
+
+    impl NatSource for Scripted {
+        fn read(&mut self) -> Answer {
+            self.0.pop_front().expect("the script covers every read")
+        }
+    }
+
+    fn scripted(sources: Vec<Vec<Answer>>) -> NatTable {
+        NatTable::spawn(move || (sources.into_iter().map(|s| Box::new(Scripted(s.into())) as Box<dyn NatSource>).collect(), Box::new(NoDirectory)))
+    }
+
+    /// What production runs: WMI, which can fail, beside the event table, which
+    /// always answers and is usually empty.
+    #[tokio::test]
+    async fn a_failed_source_keeps_its_last_answer() {
+        let t = scripted(vec![vec![Ok(vec![the_session()]), Err("denied".into())], vec![Ok(Vec::new()), Ok(Vec::new())]]);
+        assert!(t.fresh_match(&udp_flow(SRC, DST), 1_000).await.is_some());
+        assert!(t.fresh_match(&udp_flow(SRC, DST), 2_000).await.is_some(), "the other source's empty answer does not retire it");
+        assert!(t.held_match(&udp_flow(SRC, DST)).is_some());
+        assert_eq!(t.stats(), NatStats { reads: 2, read_errors: 1, timeouts: 0 });
+    }
+
+    #[tokio::test]
+    async fn only_the_source_that_held_a_session_can_retire_it() {
+        let t = scripted(vec![vec![Ok(vec![the_session()]), Err("denied".into()), Ok(Vec::new())]]);
+        assert!(t.fresh_match(&udp_flow(SRC, DST), 1_000).await.is_some());
+        assert!(t.fresh_match(&udp_flow(SRC, DST), 2_000).await.is_some(), "no source answered: it stands");
+        assert_eq!(t.fresh_match(&udp_flow(SRC, DST), 3_000).await, None, "its finished answer no longer has it");
     }
 
     fn winnat_events() -> Vec<(u16, u64, Vec<u8>)> {

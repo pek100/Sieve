@@ -57,6 +57,7 @@ The four sum to `flows`, and a law checks it.
 - All reads run on one dedicated thread, which owns its COM apartment. Flow tasks wait on a reply channel and never block a runtime worker.
 - Flows share reads: a flow joins the last read asked for if that read started no earlier than its own first lookup, otherwise it asks for a new one, and a read queued but not started serves every flow behind it. The timeout covers a flow's whole wait, so a slow read costs a counted timeout per flow and never a growing queue.
 - A machine with no VMs issues a WMI query only for its rare unknown flows, so no timer is added and idle CPU is unaffected.
+- A source that fails, a WMI `Next` outlasting its own wait included (`WBEM_S_TIMEDOUT`; only `WBEM_S_FALSE` ends a read), counts in `read_errors` and keeps its last finished answer. Another source's answer never retires its sessions. With no TTL, a source that stays failed keeps its sessions until it next answers, and a later flow on that exact tuple reads as forwarded, or as unknown when a host owner also answers (D5).
 
 **D5. Precedence: both answering is a conflict, and a conflict is unknown.**
 

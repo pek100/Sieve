@@ -27,7 +27,7 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows::Win32::System::Variant::{VARIANT, VT_BSTR, VT_I4, VariantClear};
 use windows::Win32::System::Wmi::{
-    IEnumWbemClassObject, IWbemClassObject, IWbemLocator, IWbemServices, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WbemLocator,
+    IEnumWbemClassObject, IWbemClassObject, IWbemLocator, IWbemServices, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_S_FALSE, WbemLocator,
 };
 use windows::core::{BSTR, GUID, HRESULT, PCSTR, PCWSTR, PWSTR};
 
@@ -43,6 +43,8 @@ const NAT_QUERY: &str = "SELECT Protocol, InternalSourceAddress, InternalSourceP
 ExternalDestinationAddress, ExternalDestinationPort FROM MSFT_NetNatSession";
 /// Next() waits this long per row: the reader's own bound.
 const ROW_WAIT_MS: i32 = 900;
+/// What Next() returns once no row is left.
+const ROWS_FINISHED: HRESULT = HRESULT(WBEM_S_FALSE.0);
 /// How long HCS may take to list compute systems.
 const HCS_WAIT_MS: u32 = 900;
 /// The directory re-reads HCN and HCS at most this often.
@@ -102,17 +104,29 @@ impl Wmi {
             self.services.ExecQuery(&BSTR::from("WQL"), &BSTR::from(wql), WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, None)
         }
         .map_err(text)?;
-        let mut out = Vec::new();
-        loop {
+        drain_rows(|| {
             let mut slot = [None];
             let mut returned = 0u32;
             // SAFETY: `slot` holds one row and `returned` is a live out pointer.
             let hr = unsafe { rows.Next(ROW_WAIT_MS, &mut slot, &mut returned) };
-            hr.ok().map_err(text)?;
-            match slot[0].take() {
-                Some(row) if returned > 0 => out.push(row),
-                _ => return Ok(out),
-            }
+            let [row] = slot;
+            (hr, row.filter(|_| returned > 0))
+        })
+    }
+}
+
+/// Every row of an enumerator, from `next`'s status and row per call. Only
+/// `WBEM_S_FALSE` says the rows are finished. `WBEM_S_TIMEDOUT` is a success
+/// HRESULT with no row, so a test of success alone reads a stall as the end and
+/// hands back a partial list as if it were the whole answer.
+fn drain_rows<T>(mut next: impl FnMut() -> (HRESULT, Option<T>)) -> Result<Vec<T>, String> {
+    let mut out = Vec::new();
+    loop {
+        match next() {
+            (hr, _) if hr.is_err() => return Err(format!("WMI query: {hr:?}")),
+            (_, Some(row)) => out.push(row),
+            (ROWS_FINISHED, None) => return Ok(out),
+            (hr, None) => return Err(format!("WMI query stopped before its last row: {hr:?}")),
         }
     }
 }
@@ -179,7 +193,7 @@ impl NatSource for WmiNat {
         }
         let rows = self.wmi.as_ref().ok_or("no WMI connection")?.query(NAT_QUERY);
         if rows.is_err() {
-            // A dead connection is not retried on a stale proxy: the next read reconnects.
+            // A dead or stalled connection is not retried on a stale proxy: the next read reconnects.
             self.wmi = None;
         }
         Ok(rows?.iter().filter_map(session_of_row).collect())
@@ -391,4 +405,47 @@ pub fn operating_system_caption() -> Result<String, String> {
     let wmi = Wmi::connect(NAMESPACE_CIM)?;
     let rows = wmi.query("SELECT Caption FROM Win32_OperatingSystem")?;
     rows.first().and_then(|r| text_of(r, "Caption")).ok_or_else(|| "no Win32_OperatingSystem row".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::E_ACCESSDENIED;
+    use windows::Win32::System::Wmi::{WBEM_S_NO_ERROR, WBEM_S_TIMEDOUT};
+
+    const MORE: HRESULT = HRESULT(WBEM_S_NO_ERROR.0);
+    const STALLED: HRESULT = HRESULT(WBEM_S_TIMEDOUT.0);
+
+    fn drained(script: Vec<(HRESULT, Option<u32>)>) -> Result<Vec<u32>, String> {
+        let mut script = script.into_iter();
+        drain_rows(|| script.next().expect("the loop stopped at the end of the script"))
+    }
+
+    #[test]
+    fn only_the_finished_status_ends_a_read() {
+        assert_eq!(drained(vec![(ROWS_FINISHED, None)]), Ok(vec![]));
+        assert_eq!(drained(vec![(MORE, Some(1)), (MORE, Some(2)), (ROWS_FINISHED, None)]), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn a_stalled_read_is_an_error_never_a_short_list() {
+        assert!(STALLED.is_ok(), "the trap: a timeout passes any test of success");
+        assert!(drained(vec![(STALLED, None)]).is_err(), "nothing read yet");
+        assert!(drained(vec![(MORE, Some(1)), (STALLED, None)]).is_err(), "some rows read");
+    }
+
+    #[test]
+    fn a_row_keeps_the_read_going_whatever_status_it_came_with() {
+        assert_eq!(drained(vec![(STALLED, Some(1)), (ROWS_FINISHED, None)]), Ok(vec![1]));
+    }
+
+    #[test]
+    fn no_row_and_no_end_is_an_error() {
+        assert!(drained(vec![(MORE, None)]).is_err());
+    }
+
+    #[test]
+    fn a_failed_call_is_an_error_even_after_rows() {
+        assert!(drained(vec![(MORE, Some(1)), (E_ACCESSDENIED, None)]).is_err());
+    }
 }
