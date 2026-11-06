@@ -21,6 +21,13 @@ describe("row actions per outcome", () => {
     }
   });
 
+  it("No Unblock or Block on an address row: the engine matches rules against names, so the rule would change nothing", () => {
+    for (const host of ["198.51.100.25", "2001:db8::1"]) {
+      expect(rowActions(row({ kind: "blocked" }, { host, rule: "||a.example^" })), host).not.toContain("unblock");
+      expect(rowActions(row({ kind: "passed", reason: "no_rule" }, { host })), host).not.toContain("block");
+    }
+  });
+
   it("Do not decrypt on everything but Not decrypted", () => {
     expect(rowActions(row({ kind: "not_decrypted", reason: "x" }))).not.toContain("do_not_decrypt");
     expect(rowActions(row({ kind: "blocked" }))).toContain("do_not_decrypt");

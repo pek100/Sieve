@@ -119,6 +119,9 @@ export function outcomeWords(outcome: LogOutcome | null | undefined): string {
 /** A row's host as a URL or a filter rule writes it: an IPv6 address (`LogRow.host` has it bare) takes brackets. */
 export const urlFormHost = (host: string) => (host.includes(":") ? `[${host}]` : host);
 
+/** A row's host is an address, not a name: what a flow with no name shows. */
+export const isAddressHost = (host: string) => host.includes(":") || /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+
 /**
  * The URL a row stands for: its own, else the host's root by what the flow
  * spoke. Null when the flow is not a web request (DNS, or a protocol not

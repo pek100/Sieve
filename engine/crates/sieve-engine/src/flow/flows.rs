@@ -384,6 +384,9 @@ impl<F: Fn(&str) -> Option<String>, H: Fn(u32) -> Option<String>> AppKeys<F, H> 
             _ => {}
         }
         match (self.hidden_name)(pid) {
+            // A pid is not a name: the same number is another process after a
+            // reboot, so a stored Off must never reach it. The flow stays sieved.
+            Some(name) if name == format!("pid {pid}") => None,
             Some(name) => Some(app_key(None, None, &name)),
             None => exe.map(|exe| self.key(exe)),
         }
@@ -1095,13 +1098,14 @@ mod tests {
         AppKeys::new(|_: &str| Some(WINDOWS_PRODUCT.to_string()), move |pid| names.name(pid, 0))
     }
 
-    /// The key is the row's: the app shows the host under its services and the
-    /// worker under its pid, and only the readable exe under the product name.
+    /// The key is the row's: the app shows the host under its services and only
+    /// the readable exe under the product name. The worker shows under its pid,
+    /// which is no identity: it has no key, so no stored Off can exempt it.
     #[test]
     fn a_process_hidden_from_the_app_has_the_key_of_the_row_the_app_shows_it_in() {
         let keys = machine_keys();
         assert_eq!(keys.of_pid(HOST, Some(SVCHOST)).as_deref(), Some("dhcp client and 1 more"));
-        assert_eq!(keys.of_pid(WORKER, Some(SVCHOST)).as_deref(), Some("pid 3300"));
+        assert_eq!(keys.of_pid(WORKER, Some(SVCHOST)), None);
         assert_eq!(keys.of_pid(SHELL, Some(EXPLORER)).as_deref(), Some("microsoft windows operating system"));
     }
 
@@ -1117,7 +1121,7 @@ mod tests {
         let rules = RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(lists) };
         let off = |key: &str| DomainFilter::new(&sieve_ipc::Policy { sieving: true, off_apps: vec![key.to_string()], ..Default::default() }, rules.clone());
         let exempt = |filter: &DomainFilter, pid: u32, exe: &str| {
-            let key = keys.of_pid(pid, Some(exe)).unwrap();
+            let Some(key) = keys.of_pid(pid, Some(exe)) else { return false };
             let flow = Flow { dns: false, name: Some("ads.example"), remote: "192.0.2.1".parse().unwrap(), owner: FlowOwner::App { key: &key } };
             filter.decide(flow, &Mutex::default(), 0).reason == Reason::AppExempt
         };
@@ -1130,6 +1134,9 @@ mod tests {
         let service_row = off("dhcp client and 1 more");
         assert!(exempt(&service_row, HOST, SVCHOST), "their traffic is relayed untouched, as the setting says");
         assert!(!exempt(&service_row, SHELL, EXPLORER));
+
+        let stored_pid = off(&format!("pid {WORKER}"));
+        assert!(!exempt(&stored_pid, WORKER, SVCHOST), "a stored pid is no identity: it exempts nothing");
     }
 
     #[test]

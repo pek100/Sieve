@@ -4,7 +4,7 @@
  * engine has it in force is the engine's to say, so nothing here claims it.
  */
 import type { LogRow } from "@/data/protocol";
-import { rowUrl, urlFormHost } from "./log";
+import { isAddressHost, rowUrl, urlFormHost } from "./log";
 import type { SettingKey } from "./settings/registry";
 
 export const LOG_ACTIONS = ["copy_url", "unblock", "block", "do_not_decrypt", "report"] as const;
@@ -29,10 +29,13 @@ const BLOCK_WOULD_APPLY = "no_rule";
 export function rowActions(row: Pick<LogRow, "url" | "kind" | "host" | "outcome" | "rule">): LogAction[] {
   const outcome = row.outcome;
   const kind = outcome?.kind;
+  // The engine matches rules against names, never a flow's address, so a rule
+  // written for an address row would stay in the list and change nothing.
+  const named = !!row.host && !isAddressHost(row.host);
   const applies: Record<LogAction, boolean> = {
     copy_url: rowUrl(row) !== null,
-    unblock: kind === "blocked" && row.rule !== null,
-    block: kind === "passed" && outcome?.reason === BLOCK_WOULD_APPLY,
+    unblock: named && kind === "blocked" && row.rule !== null,
+    block: named && kind === "passed" && outcome?.reason === BLOCK_WOULD_APPLY,
     do_not_decrypt: kind !== "not_decrypted",
     report: true,
   };

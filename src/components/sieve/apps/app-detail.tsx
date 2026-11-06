@@ -11,6 +11,7 @@ import { StateLayer } from "@/components/sieve/primitives/state-layer";
 import { AppIcon } from "@/components/sieve/primitives/app-icon";
 import { iconExe, isActiveFlow } from "@/core/apps";
 import type { AppEntry } from "@/core/apps-actions";
+import { canTurnOff } from "@/core/policy";
 import type { Flow } from "@/data/protocol";
 import { CATEGORY_LABEL, type RowActions } from "./app-list";
 import { AppToggle, APP_OFF_MEANS } from "./app-toggle";
@@ -137,13 +138,21 @@ function Detail({ app, actions }: { app: AppEntry; actions: RowActions }) {
   return (
     <div className="flex flex-col gap-6 overflow-y-auto px-5 pb-6">
       <Section title="Sieve">
-        <div className="flex items-center gap-3">
-          <AppToggle appName={app.name} on={on} onChange={(v) => actions.setOn(app.key, v)} />
-          <span className="text-body text-on-surface">{on ? "On" : "Off"}</span>
-        </div>
-        <p className="text-label text-on-surface-muted" data-testid="app-off-means">
-          {APP_OFF_MEANS}
-        </p>
+        {canTurnOff(app.key) ? (
+          <>
+            <div className="flex items-center gap-3">
+              <AppToggle appName={app.name} on={on} onChange={(v) => actions.setOn(app.key, v)} />
+              <span className="text-body text-on-surface">{on ? "On" : "Off"}</span>
+            </div>
+            <p className="text-label text-on-surface-muted" data-testid="app-off-means">
+              {APP_OFF_MEANS}
+            </p>
+          </>
+        ) : (
+          <p className="text-body text-on-surface-muted" data-testid="app-no-off">
+            Always on. Windows gives this process no name, only a number that another process can have later.
+          </p>
+        )}
       </Section>
 
       <Section title={app.exes.length === 1 ? "Path" : "Paths"}>

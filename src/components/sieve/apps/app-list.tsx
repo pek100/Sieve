@@ -7,6 +7,7 @@ import { StateLayer } from "@/components/sieve/primitives/state-layer";
 import { AppIcon } from "@/components/sieve/primitives/app-icon";
 import { iconExe, type Category } from "@/core/apps";
 import type { AppEntry, AppSection } from "@/core/apps-actions";
+import { canTurnOff } from "@/core/policy";
 import { cn } from "@/lib/utils";
 import { AppToggle } from "./app-toggle";
 import { Monogram } from "./monogram";
@@ -63,7 +64,7 @@ export function AppRow({ app, actions }: { app: AppEntry; actions: RowActions })
           <X strokeWidth={1.75} />
         </IconButton>
       )}
-      <AppToggle appName={app.name} on={on} onChange={(v) => actions.setOn(app.key, v)} />
+      {canTurnOff(app.key) && <AppToggle appName={app.name} on={on} onChange={(v) => actions.setOn(app.key, v)} />}
     </li>
   );
 }

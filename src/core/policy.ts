@@ -25,8 +25,15 @@ export const GLOBAL_SWITCH = "sampling.enabled" satisfies SettingKey;
 /** Stored per-app choices (settings `apps.levels`): only apps turned off are listed. */
 export type AppStates = Readonly<Record<string, AppState>>;
 
+/**
+ * A row named only by its pid cannot be turned off: the number is another
+ * process after a reboot, so a stored Off would exempt the wrong one. The
+ * engine gives such a process no key either (`AppKeys::of_pid`).
+ */
+export const canTurnOff = (appKey: string) => !/^pid \d+$/.test(appKey);
+
 export function appState(states: AppStates, appKey: string): AppState {
-  return states[appKey] ?? DEFAULT_APP_STATE;
+  return canTurnOff(appKey) ? (states[appKey] ?? DEFAULT_APP_STATE) : DEFAULT_APP_STATE;
 }
 
 /** The user has not turned this app off. */
@@ -41,5 +48,5 @@ export function effectiveOn(globalOn: boolean, states: AppStates, appKey: string
 
 /** Keys of the apps the user turned off (left out of charts, counts and history). */
 export function offKeys(states: AppStates): ReadonlySet<string> {
-  return new Set(Object.entries(states).filter(([, s]) => s === "off").map(([k]) => k));
+  return new Set(Object.entries(states).filter(([k, s]) => s === "off" && canTurnOff(k)).map(([k]) => k));
 }

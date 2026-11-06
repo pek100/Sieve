@@ -372,13 +372,9 @@ describe("row actions", () => {
     expect(pushed.mock.calls.filter(([n]) => n.action)).toHaveLength(1);
   });
 
-  it("an IPv6 row: Block previews the bracketed rule, Copy URL copies a valid URL", async () => {
+  it("an IPv6 row: Copy URL copies a valid URL (it offers no Block: rules match names, log-actions.test.ts)", async () => {
     const rt = await setup("missing");
     act(() => rt.store.setLog({ ...EMPTY_LOG, rows: [ipRow("2001:db8::1", { kind: "passed", reason: "no_rule" })] }));
-    await pick("2001:db8::1", "Block");
-    const dialog = await screen.findByRole("dialog");
-    expect(dialog.querySelector("[data-rule-preview]")).toHaveTextContent("||[2001:db8::1]^");
-    await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
     await pick("2001:db8::1", "Copy URL");
     await vi.waitFor(() => expect(clipboard).toHaveBeenCalledWith("https://[2001:db8::1]/"));
   });

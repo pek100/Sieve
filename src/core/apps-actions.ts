@@ -5,14 +5,14 @@
  */
 import type { Snapshot } from "@/data/protocol";
 import { appIdentity, category, exeStem, groupApps, isActiveFlow, isSieved, trackedSnapshot, type AppGroup, type Category } from "./apps";
-import { DEFAULT_APP_STATE, effectiveOn, offKeys, type AppState, type AppStates } from "./policy";
+import { DEFAULT_APP_STATE, canTurnOff, effectiveOn, offKeys, type AppState, type AppStates } from "./policy";
 
 export type Pinned = readonly string[];
 
 /** Set one app on or off. Only "off" is stored, so "on" and "never touched" read the same. */
 export function setAppState(states: AppStates, key: string, state: AppState): AppStates {
   const next: Record<string, AppState> = { ...states };
-  if (state === DEFAULT_APP_STATE) delete next[key];
+  if (state === DEFAULT_APP_STATE || !canTurnOff(key)) delete next[key];
   else next[key] = state;
   return next;
 }
