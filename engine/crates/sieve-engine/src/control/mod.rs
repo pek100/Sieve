@@ -15,14 +15,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use sieve_filter::rules::{RuleEngine, RuleSet};
-use sieve_ipc::{Blocker, CertStatus, DnsUpstreams, EngineStatus, FlowEvent, ListStatus, Policy};
+use sieve_ipc::{Blocker, CertStatus, DnsUpstreams, EngineStatus, FlowEvent, ListStatus, LogRow, Policy};
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::ca::Ca;
 use crate::dns::service::Service;
 use crate::dns::upstream::Upstream;
 use crate::dns::{NameMap, config};
-use crate::domain::{DomainFilter, FilterSlot, user_engine};
+use crate::domain::{DomainFilter, FilterSlot, user_engine, user_rules_changed};
 use crate::ipc::{Backend, Subscription};
 use crate::lists::Lists;
 use crate::policy::{self, Runs};
@@ -85,6 +85,8 @@ pub struct Engine {
     /// The default lists: download state, cache and compile.
     pub lists: Arc<Lists>,
     pub flows: broadcast::Sender<Arc<Vec<FlowEvent>>>,
+    /// What the filter did, on the same cadence (plan 8.3).
+    pub log: broadcast::Sender<Arc<Vec<LogRow>>>,
     /// Whether routes are up, for subscriptions (they end when it turns false).
     routes_up: watch::Sender<bool>,
     /// Wakes the routing loop: a policy change or a route change.
@@ -147,6 +149,7 @@ impl Engine {
             filter,
             lists,
             flows: broadcast::channel(FLOWS_BACKLOG).0,
+            log: broadcast::channel(FLOWS_BACKLOG).0,
             routes_up: watch::channel(false).0,
             wake: Arc::default(),
             beats: Arc::default(),
@@ -176,7 +179,7 @@ impl Engine {
     /// recompiles nothing, the user's rules recompile their small engine, and
     /// a new list selection wakes the refresh task.
     fn apply_to_filter(&self, before: &Policy, now: &Policy) {
-        let user = (before.domain_lists != now.domain_lists).then(|| Arc::new(user_engine(now)));
+        let user = user_rules_changed(before, now).then(|| Arc::new(user_engine(now)));
         self.filter.update(|f| {
             let rules = RuleSet { user: user.unwrap_or_else(|| f.rules.user.clone()), lists: f.rules.lists.clone() };
             DomainFilter::new(now, rules)
@@ -293,11 +296,17 @@ impl Engine {
         serde_json::to_vec_pretty(&status)
     }
 
-    /// The next batch of changed flows, sent to every subscriber.
+    /// The next batch of changed flows and log rows, sent to every subscriber.
     pub fn publish_batch(&self) {
-        let batch = lock(&self.book).take_batch();
+        let (batch, rows) = {
+            let mut book = lock(&self.book);
+            (book.take_batch(), book.take_log())
+        };
         if !batch.is_empty() {
             let _ = self.flows.send(Arc::new(batch));
+        }
+        if !rows.is_empty() {
+            let _ = self.log.send(Arc::new(rows));
         }
     }
 }
@@ -330,7 +339,7 @@ impl Backend for Engine {
             split_tunnels: f.split_tunnels,
             counters: self.meters.counters(),
             guests,
-            filter: None,
+            filter: self.lists.facts(),
             update: self.updates.status(),
         }
     }
@@ -377,10 +386,14 @@ impl Backend for Engine {
         Ok(next)
     }
 
+    fn dns_upstreams(&self) -> DnsUpstreams {
+        Engine::dns_upstreams(self)
+    }
+
     fn subscribe(&self) -> Subscription {
         let book = lock(&self.book);
         // Subscribed under the book's lock: no batch slips between the two.
-        Subscription { open: book.snapshot(), batches: self.flows.subscribe(), routes_up: self.routes_up.subscribe() }
+        Subscription { open: book.snapshot(), batches: self.flows.subscribe(), log: self.log.subscribe(), routes_up: self.routes_up.subscribe() }
     }
 
     fn lists(&self) -> (Vec<ListStatus>, Option<u64>) {
@@ -750,6 +763,76 @@ mod tests {
         assert_eq!(sees(&e, "ads.example", "other"), Action::Pass, "the rule went with the list");
     }
 
+    /// C2: the rules the log's actions and the Filters editor write reach the
+    /// decision through SetPolicy, and a change to them recompiles the user's
+    /// engine. Exclusions are held for slice 6 and compile nothing.
+    #[test]
+    fn user_rules_and_exclusions_travel_in_the_policy() {
+        use crate::flow::flows::Action;
+        let ruled = |revision, rules: &[&str]| Policy { revision, sieving: true, user_rules: rules.iter().map(|r| r.to_string()).collect(), ..Policy::default() };
+        let e = engine(ruled(1, &["||ads.example^", "@@||ok.ads.example^"]), None);
+        assert_eq!(sees(&e, "ads.example", "browser"), Action::Drop, "from the file, at start");
+        assert_eq!(sees(&e, "ok.ads.example", "browser"), Action::Pass);
+        let compiled = e.filter.get().rules.user.clone();
+        let excluded = Policy { exclusions: vec!["bank.example".into()], ..ruled(2, &["||ads.example^", "@@||ok.ads.example^"]) };
+        let answered = e.set_policy(excluded.clone()).unwrap();
+        assert_eq!(answered.policy, excluded, "held and answered back");
+        assert!(Arc::ptr_eq(&compiled, &e.filter.get().rules.user), "an exclusion compiles nothing");
+        e.set_policy(ruled(3, &["||other.example^"])).unwrap();
+        assert_eq!(sees(&e, "other.example", "browser"), Action::Drop);
+        assert_eq!(sees(&e, "ads.example", "browser"), Action::Pass, "the old rule went");
+        assert_eq!(sees(&e, "other.example", "off"), Action::Drop);
+        e.set_policy(Policy { off_apps: vec!["off".into()], ..ruled(4, &["||other.example^"]) }).unwrap();
+        assert_eq!(sees(&e, "other.example", "off"), Action::Pass, "off apps win over the user's rules");
+    }
+
+    #[test]
+    fn a_policy_file_with_rules_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = Policy { revision: 1, sieving: true, user_rules: vec!["||ads.example^".into()], exclusions: vec!["bank.example".into()], ..Policy::default() };
+        Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None).set_policy(on_disk.clone()).unwrap();
+        assert_eq!(policy::load(dir.path()), (on_disk, None));
+    }
+
+    /// C1: one batch carries flows and rows to subscribers, and a decision made
+    /// with the switch off leaves no row.
+    #[test]
+    fn a_subscriber_gets_log_rows_with_the_batch() {
+        use crate::domain::{Decision, Reason};
+        use crate::flow::flows::Action;
+        let e = engine(Policy::default(), None);
+        let Subscription { log: mut rows, .. } = e.subscribe();
+        let id = e.book.lock().unwrap().open(crate::stack::book::tests_event(Some(1))).unwrap();
+        let decided = Decision { action: Action::Drop, reason: Reason::NamedBlock, rule: Some("||ads.example^".into()), list: Some("user".into()) };
+        e.book.lock().unwrap().log_decision(id, &decided, 5);
+        e.publish_batch();
+        let batch = rows.try_recv().unwrap();
+        assert_eq!(batch.iter().map(|r| (r.flow_id, r.t, r.list.as_deref())).collect::<Vec<_>>(), [(id, 5, Some("user"))]);
+        e.publish_batch();
+        assert!(rows.try_recv().is_err(), "no empty batch");
+    }
+
+    /// C1: what the Engine block and the report read. Nothing until the lists
+    /// compiled, then each selected list with its counts, and what the app reads
+    /// back through `lists` stays the same counts.
+    #[tokio::test]
+    async fn the_status_says_what_the_engine_filters_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy { revision: 1, sieving: true, lists: Some(vec!["adguard-dns".into()]), ..Policy::default() }, Runs::default(), None);
+        assert_eq!(e.status().filter, None, "no compile yet: no facts");
+        crate::lists::cache::Cache::new(dir.path()).write_text("adguard-dns", "! Version: 2026.11.1\n||ads.example^\n||b.example^\nnot/a/$bad-option\n").unwrap();
+        e.lists.compile_and_swap().await;
+        let facts = e.status().filter.unwrap();
+        assert_eq!(facts.resource_pin, None, "no bundle in this folder");
+        let [fact] = facts.lists.as_slice() else { panic!("{facts:?}") };
+        assert_eq!((fact.id.as_str(), fact.version.as_deref(), fact.applied), ("adguard-dns", Some("2026.11.1"), 2));
+        assert_eq!(fact.title, sieve_filter::catalogue::find("adguard-dns").unwrap().title);
+        assert_eq!(fact.homepage, sieve_filter::catalogue::find("adguard-dns").unwrap().homepage);
+        let (rows, _) = Backend::lists(&e);
+        let row = rows.iter().find(|r| r.id == fact.id).unwrap();
+        assert_eq!((row.network, row.skipped), (fact.applied, fact.skipped));
+    }
+
     #[test]
     fn blocking_is_its_own_fact_and_routing_alone_does_not_claim_it() {
         use sieve_ipc::{DomainList, DomainListKind};
@@ -824,7 +907,7 @@ mod tests {
     fn a_subscriber_gets_the_open_flows_then_every_batch() {
         let e = engine(Policy::default(), None);
         let first = e.book.lock().unwrap().open(crate::stack::book::tests_event(Some(1))).unwrap();
-        let Subscription { open, batches: mut rx, routes_up } = e.subscribe();
+        let Subscription { open, batches: mut rx, routes_up, .. } = e.subscribe();
         assert!(!*routes_up.borrow());
         e.set_facts(|f| f.routes_up = true);
         assert!(*routes_up.borrow(), "subscribers see the routes come up");

@@ -371,10 +371,10 @@ impl Updater {
 
     /// Data kinds apply here: one atomic rename, then the record.
     fn apply_data(&self, anchor: &TrustAnchor, record: &mut Record, kind: &Kind, entry: &Entry) -> Result<(), Stop> {
-        let name = kind.data_file().ok_or_else(|| format!("{kind} is not a data kind"))?;
+        let dest = super::data_path(&self.engine_dir, kind).ok_or_else(|| format!("{kind} is not a data kind"))?;
         let staging = self.data_staging()?;
         let staged = self.fetch_verified(anchor, kind, entry, installed(kind, record, self.own), &staging.dir)?;
-        swap::replace(&RealFs, &staged, &self.engine_dir.join(DATA_DIR).join(name))?;
+        swap::replace(&RealFs, &staged, &dest)?;
         record.versions.insert(kind.to_string(), entry.version);
         state::save_record(&self.engine_dir, record)?;
         Ok(())

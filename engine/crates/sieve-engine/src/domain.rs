@@ -89,14 +89,19 @@ fn off_keys(policy: &Policy) -> HashSet<String> {
     policy.off_apps.iter().map(|k| k.to_lowercase()).collect()
 }
 
-/// The user's enabled domain lists as one engine (B6).
+/// The user's enabled domain lists and own rule lines as one engine (B6).
 pub fn user_engine(policy: &Policy) -> RuleEngine {
     let kind = |k| match k {
         DomainListKind::Block => DomainKind::Block,
         DomainListKind::Allow => DomainKind::Allow,
     };
     let enabled = policy.domain_lists.iter().filter(|l| l.enabled);
-    RuleEngine::compile_user(enabled.flat_map(|l| l.entries.iter().map(move |e| (kind(l.kind), e.as_str()))))
+    RuleEngine::compile_user_rules(enabled.flat_map(|l| l.entries.iter().map(move |e| (kind(l.kind), e.as_str()))), policy.user_rules.iter().map(String::as_str))
+}
+
+/// Whether going from `before` to `now` changes what [`user_engine`] compiles.
+pub fn user_rules_changed(before: &Policy, now: &Policy) -> bool {
+    before.domain_lists != now.domain_lists || before.user_rules != now.user_rules
 }
 
 impl DomainFilter {

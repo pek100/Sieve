@@ -41,7 +41,7 @@ use crate::route::prefix::Prefix;
 use crate::route::table::{NetTables, read};
 use crate::route::watch::{RouteWatch, watch as watch_routes};
 use crate::stack::egress::Egress;
-use crate::stack::relay::{Relay, UDP_IDLE, Witness, handle_tcp, handle_udp};
+use crate::stack::relay::{Relay, RelayParts, UDP_IDLE, Witness, handle_tcp, handle_udp};
 use crate::tun::device::{Tun, TunDevice};
 #[cfg(not(feature = "relay-experiments"))]
 use crate::tun::MTU;
@@ -276,11 +276,12 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
         }
     };
 
+    let parts = RelayParts { tables: shared_tables, egress, dns, book: engine.book.clone(), names: engine.names.clone(), meters: engine.meters.clone(), filter: engine.filter.clone(), witness, nat };
     #[cfg(not(feature = "relay-experiments"))]
-    let relay = Arc::new(Relay::new(shared_tables, egress, dns, engine.book.clone(), engine.names.clone(), engine.meters.clone(), engine.filter.clone(), witness, nat));
+    let relay = Arc::new(Relay::new(parts));
     #[cfg(feature = "relay-experiments")]
     let relay = {
-        let mut relay = Relay::new(shared_tables, egress, dns, engine.book.clone(), engine.names.clone(), engine.meters.clone(), engine.filter.clone(), witness, nat);
+        let mut relay = Relay::new(parts);
         relay.experiments = engine.experiments.settings.clone();
         Arc::new(relay)
     };

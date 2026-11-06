@@ -47,6 +47,8 @@ const OPTIONS_START: char = '$';
 pub const USER_LIST: &str = "user";
 /// Skip reason for a user entry that is not a host name.
 pub const NOT_A_HOST: &str = "not a host name";
+/// Skip reason for a user rule line holding a line break.
+pub const RULE_WITH_A_BREAK: &str = "holds a line break";
 /// At most this many skipped exception lines are kept per list, so the report
 /// stays under the pipe's frame limit; the total stays exact.
 pub const MAX_LISTED_EXCEPTIONS: usize = 200;
@@ -245,6 +247,13 @@ impl RuleEngine {
     /// The user's domain entries as one engine (B6). A bad entry is skipped
     /// and counted under [`NOT_A_HOST`].
     pub fn compile_user<'a>(entries: impl IntoIterator<Item = (DomainKind, &'a str)>) -> Self {
+        Self::compile_user_rules(entries, std::iter::empty())
+    }
+
+    /// The user's domain entries and own rule lines as one engine, never
+    /// trusted. A rule holding a line break would be two rules to the parser,
+    /// so it is skipped and counted under [`RULE_WITH_A_BREAK`].
+    pub fn compile_user_rules<'a>(entries: impl IntoIterator<Item = (DomainKind, &'a str)>, rules: impl IntoIterator<Item = &'a str>) -> Self {
         let (mut text, mut bad) = (String::new(), 0);
         for (kind, entry) in entries {
             match domain_rule(entry, kind) {
@@ -255,10 +264,21 @@ impl RuleEngine {
                 None => bad += 1,
             }
         }
+        let mut broken = 0;
+        for rule in rules {
+            if rule.contains(['\r', '\n']) {
+                broken += 1;
+            } else {
+                text.push_str(rule);
+                text.push('\n');
+            }
+        }
         let mut engine = Self::compile(&[ListText { id: USER_LIST, text: &text, trusted: false }]);
-        if bad > 0 {
-            engine.reports[0].skipped += bad;
-            engine.reports[0].skip_reasons.insert(NOT_A_HOST.to_string(), bad);
+        for (count, reason) in [(bad, NOT_A_HOST), (broken, RULE_WITH_A_BREAK)] {
+            if count > 0 {
+                engine.reports[0].skipped += count;
+                engine.reports[0].skip_reasons.insert(reason.to_string(), count);
+            }
         }
         engine
     }
@@ -555,6 +575,21 @@ example.invalid##+js(set-constant, adsAllowed, true)
             assert_eq!(verdict(&e, host), HostVerdict::Block, "{host}");
         }
         assert_eq!(verdict(&e, "2001:db8::2"), HostVerdict::None);
+    }
+
+    /// The log's Unblock and Block and the Filters editor write these lines.
+    #[test]
+    fn user_rule_lines_decide_beside_domain_entries_and_stay_untrusted() {
+        let lines = ["! note", "||ads.example^", "@@||ok.ads.example^", "||two.example^\n@@||smuggled.example^", "##+js(trusted-x)"];
+        let e = RuleEngine::compile_user_rules([(DomainKind::Block, "listed.example")], lines);
+        assert_eq!(e.check_host("x.ads.example").verdict, HostVerdict::Block);
+        assert_eq!(e.check_host("ok.ads.example").verdict, HostVerdict::Allow);
+        assert_eq!(e.check_host("listed.example").verdict, HostVerdict::Block);
+        assert_eq!(e.check_host("smuggled.example").verdict, HostVerdict::None, "a broken line reaches nothing");
+        let r = &e.reports()[0];
+        assert_eq!(r.id, USER_LIST);
+        assert_eq!(r.skip_reasons.get(RULE_WITH_A_BREAK), Some(&1));
+        assert_eq!(r.network, 3);
     }
 
     #[test]

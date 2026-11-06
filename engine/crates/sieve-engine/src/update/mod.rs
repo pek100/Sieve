@@ -35,6 +35,7 @@ pub mod win;
 pub(crate) mod testing;
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// What a signature says it is (the trusted comment, [`verify`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -81,6 +82,14 @@ impl Kind {
             Self::App | Self::Engine | Self::Index => None,
         }
     }
+}
+
+/// The one place a data kind's signed copy lives (`updates\` in the engine's
+/// admin-only folder). What is here passed signature, kind and version before it
+/// was put here. The resource loader reads through this; the sensitive-list
+/// consumer of slice 6 reads `Kind::List("sensitive")` the same way.
+pub fn data_path(engine_dir: &Path, kind: &Kind) -> Option<PathBuf> {
+    Some(engine_dir.join(swap::DATA_DIR).join(kind.data_file()?))
 }
 
 impl fmt::Display for Kind {
@@ -137,6 +146,14 @@ mod tests {
         for bad in ["", "App", "list:", "list:A", "list:a b", "list:../x", "list:a:b", "engines"] {
             assert_eq!(Kind::parse(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn signed_data_has_one_path_per_kind_and_releases_have_none() {
+        let dir = Path::new(r"C:\ProgramData\Sieve\engine");
+        assert_eq!(data_path(dir, &Kind::Resources).unwrap(), dir.join("updates").join("resources"));
+        assert_eq!(data_path(dir, &Kind::List("sensitive".into())).unwrap(), dir.join("updates").join("list-sensitive"));
+        assert_eq!(data_path(dir, &Kind::Engine), None);
     }
 
     #[test]

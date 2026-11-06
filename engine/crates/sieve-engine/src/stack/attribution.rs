@@ -70,7 +70,39 @@ pub fn is_own(owner: Owner, own_pid: u32) -> bool {
     }
 }
 
+/// Who a flow belongs to, for the length of its decision. The attribution says
+/// what kind of flow it is, so a guest never reaches an app's row, and a host
+/// flow's key comes from its process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeldOwner {
+    App(String),
+    Forwarded(Option<String>),
+    Unknown,
+}
+
+impl HeldOwner {
+    /// As the decision reads it.
+    pub fn as_owner(&self) -> crate::domain::Owner<'_> {
+        use crate::domain::Owner;
+        match self {
+            Self::App(key) => Owner::App { key },
+            Self::Forwarded(vm) => Owner::Forwarded { vm: vm.as_deref() },
+            Self::Unknown => Owner::Unknown,
+        }
+    }
+}
+
 impl Attribution {
+    /// The owner the decision asks about. `app` is the key of the host flow's
+    /// process; it says nothing about any other kind of flow.
+    pub fn owner(&self, app: Option<String>) -> HeldOwner {
+        match self {
+            Attribution::Host { .. } => app.map_or(HeldOwner::Unknown, HeldOwner::App),
+            Attribution::Forwarded(f) => HeldOwner::Forwarded(f.vm.clone()),
+            Attribution::Unknown(_) => HeldOwner::Unknown,
+        }
+    }
+
     /// The process of a host flow.
     pub fn pid(&self) -> Option<u32> {
         match self {
@@ -190,6 +222,58 @@ mod tests {
         let (pid, forwarded) = decide(Owner::Unknown, Some(named())).event_fields();
         assert_eq!((pid, forwarded), (None, Some(named())));
         assert_eq!(decide(Owner::Unknown, Some(named())).pid(), None, "so no exe or session is looked up");
+    }
+
+    /// The join of attribution and domain policy: a VM's row exempts that VM
+    /// alone, an unnamed guest answers to the unidentified row, and neither can
+    /// reach an app's row. A guest is filtered by domain and never decrypted.
+    #[test]
+    fn a_forwarded_flow_answers_to_its_vm_row_and_is_never_decrypted() {
+        use crate::dns::NameMap;
+        use crate::domain::{DomainFilter, Flow, Reason};
+        use crate::flow::flows::Action;
+        use sieve_filter::rules::{ListText, RuleEngine, RuleSet};
+        use sieve_ipc::{Policy, vm_key};
+        use std::sync::{Arc, Mutex};
+
+        const BLOCKED: &str = "ads.example";
+        let rules = || {
+            let lists = RuleEngine::compile(&[ListText { id: "test", text: "||ads.example^\n", trusted: false }]);
+            RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(lists) }
+        };
+        let filter = |off: Vec<String>| DomainFilter::new(&Policy { sieving: true, off_apps: off, ..Policy::default() }, rules());
+        let names = Mutex::new(NameMap::default());
+        let decide_for = |f: &DomainFilter, owner: &HeldOwner| f.decide(Flow { dns: false, name: Some(BLOCKED), remote: "192.0.2.1".parse().unwrap(), owner: owner.as_owner() }, &names, 0);
+
+        let dev = decide(Owner::Unknown, Some(named())).owner(None);
+        let bare = decide(Owner::Unknown, Some(unnamed())).owner(None);
+        assert_eq!(dev, HeldOwner::Forwarded(Some("DevBox".into())));
+        assert!(!dev.as_owner().may_decrypt() && !bare.as_owner().may_decrypt());
+
+        let vm_row_off = filter(vec![vm_key(Some("DevBox"))]);
+        let got = decide_for(&vm_row_off, &dev);
+        assert_eq!((got.action, got.reason), (Action::Pass, Reason::AppExempt), "its own row");
+        assert_eq!(decide_for(&vm_row_off, &bare).action, Action::Drop, "another guest's row");
+
+        let unnamed_off = filter(vec![vm_key(None)]);
+        assert_eq!(decide_for(&unnamed_off, &bare).reason, Reason::AppExempt);
+        assert_eq!(decide_for(&unnamed_off, &dev).action, Action::Drop);
+
+        // An app sharing the VM's name, or any key the process table could give, is not its row.
+        let app_row_off = filter(vec!["devbox".into()]);
+        assert_eq!(decide_for(&app_row_off, &dev).action, Action::Drop, "filtered by domain only");
+    }
+
+    /// A host flow alone reads its app key: a guest or a contradiction that
+    /// was somehow handed one still gets no app's exemption.
+    #[test]
+    fn only_a_host_flow_is_an_app() {
+        let app = || Some("browser".to_string());
+        assert_eq!(decide(Owner::Pid(7), None).owner(app()), HeldOwner::App("browser".into()));
+        assert_eq!(decide(Owner::Pid(7), None).owner(None), HeldOwner::Unknown, "a hidden exe has no key");
+        assert_eq!(decide(Owner::Unknown, Some(named())).owner(app()), HeldOwner::Forwarded(Some("DevBox".into())));
+        assert_eq!(decide(Owner::Pid(7), Some(named())).owner(app()), HeldOwner::Unknown, "both answered");
+        assert_eq!(decide(Owner::Disagreed { table: Some(7) }, None).owner(app()), HeldOwner::Unknown);
     }
 
     #[test]

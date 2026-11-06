@@ -9,17 +9,42 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use sieve_ipc::{FlowAction, FlowEvent, Forwarded, Guest, MAX_GUESTS, vm_key};
+use sieve_ipc::{FlowAction, FlowEvent, Forwarded, Guest, LOG_RULE_MAX, LogOutcome, LogRow, MAX_GUESTS, cap_text, vm_key};
+
+use crate::domain::{Decision, Reason};
 
 /// The flows the engine holds at most (plan 6, flow caps): past it a new
 /// flow is closed at once and counted.
 pub const MAX_FLOWS: usize = 10_000;
+/// Log rows held between two batches at most; a burst past it loses the excess,
+/// never a flow. Rows are per flow, so this is far above any real 250 ms.
+pub const MAX_PENDING_LOG: usize = 4_000;
 
 /// Who a client is: its Windows session (plan 1.3, session scoping). A guest's
 /// flow belongs to the machine, as a service's does (the pipe's DACL already
 /// limits clients to the owner and admins); an unknown flow could be anyone's.
 pub fn visible_to(event: &FlowEvent, session: u32) -> bool {
     event.forwarded.is_some() || matches!(event.session, Some(s) if s == session || s == 0)
+}
+
+/// [`visible_to`] for a log row: a row shows no more than its flow does.
+pub fn log_visible_to(row: &LogRow, session: u32) -> bool {
+    row.forwarded.is_some() || matches!(row.session, Some(s) if s == session || s == 0)
+}
+
+/// What a decision says in the log; None when nothing was decided. With the
+/// switch off the engine sieves nothing, and a lookup is never a decision.
+pub fn log_outcome(decision: &Decision) -> Option<LogOutcome> {
+    let passed = |reason: &str| Some(LogOutcome::Passed { reason: reason.to_string() });
+    match decision.reason {
+        Reason::Disabled | Reason::Dns => None,
+        Reason::NamedBlock | Reason::AllResolvedNamesBlocked => Some(LogOutcome::Blocked),
+        Reason::AppExempt => passed("app_off"),
+        Reason::NamedAllow => passed("exception"),
+        Reason::NamedNoRule => passed("no_rule"),
+        Reason::MixedResolvedNames => passed("mixed_names"),
+        Reason::UnknownDomain => passed("no_name"),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -32,6 +57,9 @@ pub struct FlowBook {
     closed: HashMap<u64, FlowEvent>,
     /// VMs seen since the engine started, by key.
     guests: BTreeMap<String, Guest>,
+    next_log_id: u64,
+    /// Log rows since the last batch.
+    log: Vec<LogRow>,
 }
 
 impl FlowBook {
@@ -77,6 +105,41 @@ impl FlowBook {
             f(e);
             self.changed.insert(id);
         }
+    }
+
+    /// The host-level log row (plan 8.3, slice 4) of an open flow just decided.
+    /// `url` and `request_type` wait for decryption (slice 6). `t` is the wall clock.
+    pub fn log_decision(&mut self, id: u64, decision: &Decision, t: u64) {
+        let Some(outcome) = log_outcome(decision) else { return };
+        let Some(e) = self.open.get(&id) else { return };
+        if self.log.len() >= MAX_PENDING_LOG {
+            return;
+        }
+        let ip = || e.remote.parse::<std::net::SocketAddr>().map_or_else(|_| e.remote.clone(), |a| a.ip().to_string());
+        let row = LogRow {
+            id: self.next_log_id + 1,
+            t,
+            flow_id: id,
+            pid: e.pid,
+            exe: e.exe.clone(),
+            session: e.session,
+            kind: e.kind,
+            host: e.host.clone().unwrap_or_else(ip),
+            remote: e.remote.clone(),
+            url: None,
+            request_type: None,
+            outcome,
+            rule: decision.rule.as_deref().map(|r| cap_text(r, LOG_RULE_MAX).to_string()),
+            list: decision.list.clone(),
+            forwarded: e.forwarded.clone(),
+        };
+        self.next_log_id += 1;
+        self.log.push(row);
+    }
+
+    /// The log rows since the last batch.
+    pub fn take_log(&mut self) -> Vec<LogRow> {
+        std::mem::take(&mut self.log)
     }
 
     /// The flow ended with these totals.
@@ -158,6 +221,74 @@ mod tests {
 
     fn guest_event(vm: Option<&str>) -> FlowEvent {
         FlowEvent { pid: None, exe: None, session: None, forwarded: Some(Forwarded { vm: vm.map(str::to_string) }), ..event(None) }
+    }
+
+    fn decided(reason: Reason, rule: Option<&str>, list: Option<&str>) -> Decision {
+        let action = if rule.is_some() && reason != Reason::NamedAllow { crate::flow::flows::Action::Drop } else { crate::flow::flows::Action::Pass };
+        Decision { action, reason, rule: rule.map(str::to_string), list: list.map(str::to_string) }
+    }
+
+    #[test]
+    fn a_decided_flow_logs_one_host_level_row_with_the_app_contract_slugs() {
+        let mut b = FlowBook::default();
+        let id = b.open(event(Some(1))).unwrap();
+        b.update(id, |e| e.kind = FlowKind::Tls);
+        b.log_decision(id, &decided(Reason::NamedBlock, Some("||ads.example^"), Some("adguard-dns")), 77);
+        let rows = b.take_log();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!((r.id, r.t, r.flow_id, r.pid, r.session, r.kind), (1, 77, id, Some(42), Some(1), FlowKind::Tls));
+        assert_eq!((r.host.as_str(), r.remote.as_str()), ("93.184.215.14", "93.184.215.14:443"), "no name: the remote IP");
+        assert_eq!((r.url.clone(), r.request_type.clone()), (None, None), "host level");
+        assert_eq!(r.outcome, LogOutcome::Blocked);
+        assert_eq!((r.rule.as_deref(), r.list.as_deref()), (Some("||ads.example^"), Some("adguard-dns")));
+        assert!(b.take_log().is_empty(), "taken once");
+        for (reason, slug) in [(Reason::AppExempt, "app_off"), (Reason::NamedAllow, "exception"), (Reason::NamedNoRule, "no_rule"), (Reason::MixedResolvedNames, "mixed_names"), (Reason::UnknownDomain, "no_name")] {
+            assert_eq!(log_outcome(&decided(reason, None, None)), Some(LogOutcome::Passed { reason: slug.into() }));
+        }
+        assert_eq!(log_outcome(&decided(Reason::AllResolvedNamesBlocked, Some("||x^"), None)), Some(LogOutcome::Blocked));
+    }
+
+    #[test]
+    fn nothing_is_logged_with_the_switch_off_or_for_a_lookup_or_a_closed_flow() {
+        let mut b = FlowBook::default();
+        let id = b.open(event(Some(1))).unwrap();
+        b.log_decision(id, &decided(Reason::Disabled, None, None), 1);
+        b.log_decision(id, &decided(Reason::Dns, None, None), 1);
+        assert!(b.take_log().is_empty());
+        b.close(id, FlowAction::Relayed, 0, 0);
+        b.log_decision(id, &decided(Reason::NamedNoRule, None, None), 1);
+        assert!(b.take_log().is_empty());
+    }
+
+    #[test]
+    fn a_rows_name_rule_cap_guest_and_session_follow_its_flow() {
+        let mut b = FlowBook::default();
+        let named = b.open(event(Some(2))).unwrap();
+        b.update(named, |e| e.host = Some("news.example".into()));
+        b.log_decision(named, &decided(Reason::NamedBlock, Some(&"r".repeat(LOG_RULE_MAX + 10)), None), 1);
+        let guest = b.open(guest_event(Some("DevBox"))).unwrap();
+        b.log_decision(guest, &decided(Reason::AppExempt, None, None), 2);
+        let rows = b.take_log();
+        assert_eq!(rows[0].host, "news.example");
+        assert_eq!(rows[0].rule.as_ref().map(String::len), Some(LOG_RULE_MAX));
+        assert_eq!(rows[1].forwarded, Some(Forwarded { vm: Some("DevBox".into()) }));
+        assert!(rows[1].pid.is_none() && rows[1].exe.is_none());
+        assert_eq!((rows[0].id, rows[1].id), (1, 2));
+        assert!(log_visible_to(&rows[0], 2) && !log_visible_to(&rows[0], 1), "another user's history never reaches this one");
+        assert!(log_visible_to(&rows[1], 1), "a VM belongs to the machine");
+        assert!(!log_visible_to(&LogRow { session: None, forwarded: None, ..rows[0].clone() }, 1));
+    }
+
+    #[test]
+    fn a_burst_past_the_cap_loses_rows_and_not_flows() {
+        let mut b = FlowBook::default();
+        let id = b.open(event(Some(1))).unwrap();
+        for _ in 0..MAX_PENDING_LOG + 5 {
+            b.log_decision(id, &decided(Reason::NamedNoRule, None, None), 1);
+        }
+        assert_eq!(b.take_log().len(), MAX_PENDING_LOG);
+        assert_eq!(b.live(), 1);
     }
 
     #[test]

@@ -13,6 +13,9 @@
 //!   (the engine controller's whole policy) to the engine.
 //! - `engine_lists() -> EngineLists`, `engine_lists_refresh() -> EngineLists`:
 //!   the per-list report; the second also asks for a download of every list.
+//! - `engine_dns_upstreams() -> DnsUpstreams`, `engine_set_dns_upstreams(list)`:
+//!   the encrypted DNS resolvers the engine holds, read and sent (the engine
+//!   controller keeps them equal to `filtering.upstreams`).
 //! - `engine_cert_status() -> CertStatus`, `engine_install_root() -> CertStatus`:
 //!   the root certificate's facts, and the user's Reinstall (plan 8.1).
 //! - `engine_request_update() -> EngineStatus`: asks the engine to update; it
@@ -27,7 +30,7 @@
 //!   cannot strand the window's cursor. Session only, in memory (plan 8.3).
 //!
 //! The app never starts, stops or installs the engine: the installer and the
-//! user do. Wire shape in `src/data/fixtures/engine-probe-v2.json`.
+//! user do. Wire shape in `src/data/fixtures/engine-probe-v3.json`.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -35,7 +38,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sieve_ipc::{CertStatus, EngineStatus, FlowEvent, FlowProto, ListStatus, LogRow, PIPE_NAME, PROTOCOL, Policy};
+use sieve_ipc::{CertStatus, DnsUpstreams, EngineStatus, FlowEvent, FlowProto, ListStatus, LogRow, PIPE_NAME, PROTOCOL, Policy};
 
 use crate::protocol::{Endpoint, Family, Flow, FlowState, Proto};
 
@@ -370,6 +373,25 @@ mod imp {
         tokio::time::timeout(PROBE_TIMEOUT, ask).await.unwrap_or_else(|_| Err(format!("no answer in {} s", PROBE_TIMEOUT.as_secs())))
     }
 
+    /// A resolver request (`DnsUpstreams`, `SetDnsUpstreams`): the list the engine
+    /// then holds, or its refusal.
+    pub async fn dns_upstreams(name: &str, msg: ClientMessage) -> Result<DnsUpstreams, String> {
+        let ask = async {
+            let (mut pipe, _, _) = hello(name).await?.map_err(|fact| match fact {
+                PipeFact::Refused { message } | PipeFact::Unreachable { message } => message,
+                PipeFact::Incompatible { supported } => format!("the engine speaks protocol {} to {}", supported[0], supported[1]),
+                PipeFact::Welcome { .. } => "unexpected welcome".to_string(),
+            })?;
+            write_frame(&mut pipe, &msg).await.map_err(|e| e.to_string())?;
+            match read_frame(&mut pipe).await.map_err(|e| e.to_string())? {
+                EngineMessage::DnsUpstreams(list) => Ok(list),
+                EngineMessage::Error { message } => Err(message),
+                other => Err(format!("unexpected answer: {other:?}")),
+            }
+        };
+        tokio::time::timeout(PROBE_TIMEOUT, ask).await.unwrap_or_else(|_| Err(format!("no answer in {} s", PROBE_TIMEOUT.as_secs())))
+    }
+
     /// One subscription: Hello, Status; while the engine routes, Subscribe
     /// and apply every batch until the engine ends the stream (its routes
     /// went down) or the pipe breaks.
@@ -479,6 +501,33 @@ pub async fn engine_lists_refresh() -> Result<EngineLists, String> {
     Err("the engine runs on Windows only".into())
 }
 
+/// Command: the encrypted DNS resolvers the engine holds.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_dns_upstreams() -> Result<DnsUpstreams, String> {
+    imp::dns_upstreams(PIPE_NAME, sieve_ipc::ClientMessage::DnsUpstreams).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_dns_upstreams() -> Result<DnsUpstreams, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// Command: `filtering.upstreams` to the engine. It answers the list it then
+/// holds, or why it refused this one.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_set_dns_upstreams(list: DnsUpstreams) -> Result<DnsUpstreams, String> {
+    imp::dns_upstreams(PIPE_NAME, sieve_ipc::ClientMessage::SetDnsUpstreams(list)).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_set_dns_upstreams(_list: DnsUpstreams) -> Result<DnsUpstreams, String> {
+    Err("the engine runs on Windows only".into())
+}
+
 /// Command: the root certificate's facts, from the engine.
 #[cfg(windows)]
 #[tauri::command]
@@ -526,7 +575,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    const FIXTURE: &str = include_str!("../../src/data/fixtures/engine-probe-v2.json");
+    const FIXTURE: &str = include_str!("../../src/data/fixtures/engine-probe-v3.json");
     const IPC_FIXTURE: &str = include_str!("../../src/data/fixtures/engine-ipc-v3.json");
     const LOG_FIXTURE: &str = include_str!("../../src/data/fixtures/engine-log-v1.json");
 
@@ -546,6 +595,7 @@ mod tests {
             outcome: sieve_ipc::LogOutcome::Blocked,
             rule: Some("||example.com^".into()),
             list: Some("adguard-base".into()),
+            forwarded: None,
         }
     }
 
@@ -722,8 +772,10 @@ mod tests {
             fake_engine(&test_pipe("welcome"), welcome, status(), ClientAsk::Status).await,
             Ok(PipeFact::Welcome { engine_version: "9.9.9".into(), session_id: 4, status: Box::default() })
         );
-        let old = EngineMessage::Incompatible { supported: [3, 3] };
-        assert_eq!(fake_engine(&test_pipe("old"), old, status(), ClientAsk::Status).await, Ok(PipeFact::Incompatible { supported: [3, 3] }));
+        // A range without this build's protocol, as the fixture's `incompatible` example has.
+        let elsewhere = [PROTOCOL + 1, PROTOCOL + 1];
+        let newer = EngineMessage::Incompatible { supported: elsewhere };
+        assert_eq!(fake_engine(&test_pipe("newer"), newer, status(), ClientAsk::Status).await, Ok(PipeFact::Incompatible { supported: elsewhere }));
         let refused = EngineMessage::Error { message: "only the installed Sieve app may connect".into() };
         assert_eq!(
             fake_engine(&test_pipe("refused"), refused, status(), ClientAsk::Status).await,
@@ -743,6 +795,39 @@ mod tests {
         let stale = EngineMessage::Error { message: "stale policy revision 2 (the engine holds 5)".into() };
         let got = fake_engine(&test_pipe("stale"), welcome(), stale, ClientAsk::Policy(on)).await;
         assert_eq!(got, Err("stale policy revision 2 (the engine holds 5)".into()));
+    }
+
+    /// `engine_dns_upstreams` and `engine_set_dns_upstreams`: what is asked on the
+    /// pipe, the list that comes back, and a refusal as its reason.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_resolver_list_is_read_and_sent_on_the_pipe() {
+        use sieve_ipc::nonblocking::{read_frame, write_frame};
+        use sieve_ipc::{ClientMessage, EngineMessage};
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        async fn round(name: String, ask: ClientMessage, answer: EngineMessage) -> Result<DnsUpstreams, String> {
+            let mut server = ServerOptions::new().first_pipe_instance(true).create(&name).unwrap();
+            let expected = ask.clone();
+            let engine = tokio::spawn(async move {
+                server.connect().await.unwrap();
+                let _: ClientMessage = read_frame(&mut server).await.unwrap();
+                write_frame(&mut server, &EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 }).await.unwrap();
+                let asked: ClientMessage = read_frame(&mut server).await.unwrap();
+                write_frame(&mut server, &answer).await.unwrap();
+                asked
+            });
+            let got = imp::dns_upstreams(&name, ask).await;
+            assert_eq!(engine.await.unwrap(), expected);
+            got
+        }
+
+        let held = DnsUpstreams { revision: 2, upstreams: vec!["tls://a.example".into()] };
+        let answer = || EngineMessage::DnsUpstreams(held.clone());
+        assert_eq!(round(test_pipe("dns-read"), ClientMessage::DnsUpstreams, answer()).await, Ok(held.clone()));
+        assert_eq!(round(test_pipe("dns-set"), ClientMessage::SetDnsUpstreams(held.clone()), answer()).await, Ok(held.clone()));
+        let refusal = EngineMessage::Error { message: "udp://1.1.1.1 is not encrypted".into() };
+        assert_eq!(round(test_pipe("dns-refused"), ClientMessage::SetDnsUpstreams(held.clone()), refusal).await, Err("udp://1.1.1.1 is not encrypted".into()));
     }
 
     /// A stand-in engine on a test pipe: routes, takes the subscription, sends

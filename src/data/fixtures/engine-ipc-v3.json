@@ -22,7 +22,9 @@
         { "kind": "block", "entries": ["ads.example"], "enabled": true },
         { "kind": "allow", "entries": ["ok.ads.example"], "enabled": true }
       ],
-      "https": false
+      "https": false,
+      "user_rules": ["||tracker.example^", "@@||ok.tracker.example^"],
+      "exclusions": ["bank.example"]
     },
     { "type": "subscribe" },
     { "type": "lists" },
@@ -32,6 +34,7 @@
       "revision": 4,
       "upstreams": ["https://cloudflare-dns.com/dns-query", "tls://dns.quad9.net", "quic://dns.example:8853"]
     },
+    { "type": "dns_upstreams" },
     { "type": "cert_status" },
     { "type": "install_root" },
     { "type": "request_update" }
@@ -47,7 +50,7 @@
       "flows": 2,
       "decrypting": false,
       "last_error": null,
-      "policy": { "revision": 3, "engine": true, "sieving": true, "off_apps": ["firefox"], "lists": ["adguard-dns"], "domain_lists": [], "https": false },
+      "policy": { "revision": 3, "engine": true, "sieving": true, "off_apps": ["firefox"], "lists": ["adguard-dns"], "domain_lists": [], "https": false, "user_rules": [], "exclusions": [] },
       "blocker": null,
       "split_tunnels": ["Corp VPN"],
       "update": { "kind": "current" },
@@ -305,6 +308,23 @@
           },
           "rule": null,
           "list": null
+        },
+        {
+          "id": 3,
+          "t": 1760000002000,
+          "flow_id": 9,
+          "pid": null,
+          "exe": null,
+          "session": null,
+          "kind": "tls",
+          "host": "guest.example",
+          "remote": "192.0.2.15:443",
+          "url": null,
+          "request_type": null,
+          "outcome": { "kind": "blocked" },
+          "rule": "||guest.example^",
+          "list": "user",
+          "forwarded": { "vm": "DevBox" }
         }
       ]
     },

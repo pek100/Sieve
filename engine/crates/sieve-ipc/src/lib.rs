@@ -11,8 +11,8 @@
 //! - [`ClientMessage::SetPolicy`] is answered with the Status after the
 //!   change; [`ClientMessage::Subscribe`] turns the connection into an event
 //!   stream of [`EngineMessage::Flows`] batches, every [`FLOWS_BATCH_MS`].
-//! - [`ClientMessage::SetDnsUpstreams`] is answered with
-//!   [`EngineMessage::DnsUpstreams`], the list the engine then holds.
+//! - [`ClientMessage::SetDnsUpstreams`] and [`ClientMessage::DnsUpstreams`] are
+//!   answered with [`EngineMessage::DnsUpstreams`], the list the engine holds.
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
 //!   commit (v3, the wave after slice 3: blocked flows, the grown policy, the
 //!   list report, forwarded flows and guests, the `log` message, the status's filter
@@ -68,7 +68,7 @@ pub const LOG_URL_MAX: usize = 2048;
 pub const LOG_RULE_MAX: usize = 1024;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "cert_status", "install_root", "request_update"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update"];
 /// The `type` names of [`EngineMessage`], in declaration order.
 pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status"];
 /// A flow event's rule text is cut to this many bytes: a list rule can run to
@@ -101,6 +101,9 @@ pub enum ClientMessage {
     /// `revision` is above the engine's and every address is valid, persisted,
     /// answered with [`EngineMessage::DnsUpstreams`]; a refusal is an Error.
     SetDnsUpstreams(DnsUpstreams),
+    /// Asks for [`EngineMessage::DnsUpstreams`]: the app compares it with
+    /// `filtering.upstreams`, as it compares the Status's policy with its settings.
+    DnsUpstreams,
     /// Asks for [`EngineMessage::CertStatus`].
     CertStatus,
     /// Reinstall: a new root and key, the old root removed at once. Refused
@@ -116,7 +119,9 @@ pub enum ClientMessage {
     RequestUpdate {},
 }
 
-/// Engine to app.
+/// Engine to app. Read and written one frame at a time and never stored, so the
+/// Status's size costs nothing a box would save.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EngineMessage {
@@ -185,6 +190,14 @@ pub struct Policy {
     /// before slice 5 must keep its engine switch rather than read as off.
     #[serde(default)]
     pub https: bool,
+    /// `filtering.userRules`: rule lines in the lists' language, compiled
+    /// untrusted beside `domain_lists`.
+    #[serde(default)]
+    pub user_rules: Vec<String>,
+    /// `filtering.exclusions`: sites never decrypted (plan 4.5). Held here so
+    /// the interception of slice 6 finds them; nothing decrypts yet.
+    #[serde(default)]
+    pub exclusions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,6 +599,9 @@ pub struct LogRow {
     pub rule: Option<String>,
     /// A catalogue id, or `user`.
     pub list: Option<String>,
+    /// Some for a guest's flow, which has no process (see [`FlowEvent::forwarded`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded: Option<Forwarded>,
 }
 
 /// A batch of rows as the `log` messages to send.
@@ -775,6 +791,7 @@ mod tests {
             ClientMessage::Lists => "lists",
             ClientMessage::ListsRefresh => "lists_refresh",
             ClientMessage::SetDnsUpstreams(_) => "set_dns_upstreams",
+            ClientMessage::DnsUpstreams => "dns_upstreams",
             ClientMessage::CertStatus => "cert_status",
             ClientMessage::InstallRoot => "install_root",
             ClientMessage::RequestUpdate {} => "request_update",
@@ -996,6 +1013,7 @@ mod tests {
             outcome: LogOutcome::NotDecrypted { reason: "r".repeat(64) },
             rule: Some(rule.to_string().repeat(LOG_RULE_MAX)),
             list: Some("adguard-url-tracking".into()),
+            forwarded: None,
         }
     }
 

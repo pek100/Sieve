@@ -120,20 +120,15 @@ where
     }
 }
 
-/// A client that trusts exactly these roots.
+/// A client that trusts exactly these roots, offering no ALPN: this layer only
+/// speaks HTTP/1.1. How it speaks TLS is `crate::tls`'s, as for lists and DNS.
 pub fn client_config(roots: rustls::RootCertStore) -> Result<Arc<ClientConfig>, String> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(Arc::new(config))
+    crate::tls::client_config(Arc::new(roots), &[]).map(Arc::new)
 }
 
 /// The update client's trust store (plan 2.7), never the Windows store.
 pub fn web_roots() -> rustls::RootCertStore {
-    rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() }
+    rustls::RootCertStore::clone(&crate::tls::public_roots())
 }
 
 /// One GET through TLS over any stream.
@@ -374,5 +369,15 @@ mod tests {
     #[test]
     fn the_trust_store_is_not_empty() {
         assert!(web_roots().len() > 50);
+    }
+
+    /// One owner of how the engine speaks TLS: the update client's key exchange
+    /// is the plan's, and it still offers no ALPN.
+    #[test]
+    fn the_update_client_is_the_engines_tls_client() {
+        let config = client_config(web_roots()).unwrap();
+        let groups = |g: &[&'static dyn rustls::crypto::SupportedKxGroup]| g.iter().map(|g| g.name()).collect::<Vec<_>>();
+        assert_eq!(groups(&config.crypto_provider().kx_groups), groups(&crate::tls::kx_groups()));
+        assert!(config.alpn_protocols.is_empty());
     }
 }

@@ -56,6 +56,16 @@ describe("engine IPC law", () => {
     for (const reason of reasons) expect(REASON_TEXT, reason).toHaveProperty(reason);
   });
 
+  it("every reason the engine's log can say has words in the app, and the row actions' reason is one", () => {
+    const book = read("engine/crates/sieve-engine/src/stack/book.rs");
+    const body = book.match(/pub fn log_outcome[\s\S]*?\n\}/)?.[0] ?? "";
+    const slugs = [...body.matchAll(/passed\("([a-z_]+)"\)/g)].map((m) => m[1]);
+    expect(slugs).toEqual(expect.arrayContaining(["no_rule", "exception", "app_off"]));
+    for (const slug of slugs) expect(REASON_TEXT, slug).toHaveProperty(slug);
+    const log = fixture.engine.find((m) => m.type === "log")! as unknown as { rows: { forwarded?: unknown }[] };
+    expect(log.rows.some((r) => r.forwarded !== undefined), "a guest's row is in the fixture").toBe(true);
+  });
+
   it("the app reads the engine's status and every blocker kind the crate declares", () => {
     const status = fixture.engine.find((m) => m.type === "status")!;
     const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));

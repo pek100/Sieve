@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sieve_ipc::nonblocking::{read_frame, write_frame};
-use sieve_ipc::{CertStatus, ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, ListStatus, Policy, answer_hello};
+use sieve_ipc::{CertStatus, ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, ListStatus, LogRow, Policy, answer_hello, log_frames};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 
-use crate::stack::book::visible_to;
+use crate::stack::book::{log_visible_to, visible_to};
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The app's executable as the installer lays it out: Tauri's main binary,
@@ -36,6 +36,8 @@ pub trait Backend: Send + Sync + 'static {
     fn set_policy(&self, policy: Policy) -> Result<EngineStatus, String>;
     /// Applies a newer, valid resolver list and answers the list then held.
     fn set_dns_upstreams(&self, list: DnsUpstreams) -> Result<DnsUpstreams, String>;
+    /// The resolver list the engine holds.
+    fn dns_upstreams(&self) -> DnsUpstreams;
     /// The open flows now, every batch from now on, and whether routes are
     /// up (a subscription ends when they go down: the app then reads the
     /// connection tables again).
@@ -58,6 +60,8 @@ pub trait Backend: Send + Sync + 'static {
 pub struct Subscription {
     pub open: Vec<FlowEvent>,
     pub batches: broadcast::Receiver<Arc<Vec<FlowEvent>>>,
+    /// Log rows from now on: the log has no backlog to replay (session only).
+    pub log: broadcast::Receiver<Arc<Vec<LogRow>>>,
     pub routes_up: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -122,6 +126,7 @@ where
                 Ok(held) => EngineMessage::DnsUpstreams(held),
                 Err(message) => EngineMessage::Error { message },
             },
+            Ok(ClientMessage::DnsUpstreams) => EngineMessage::DnsUpstreams(backend.dns_upstreams()),
             Ok(ClientMessage::RequestUpdate {}) => match backend.request_update() {
                 Ok(status) => EngineMessage::Status(status),
                 Err(message) => EngineMessage::Error { message },
@@ -159,16 +164,26 @@ async fn send_flows<S: AsyncWrite + Unpin>(stream: &mut S, session_id: u32, even
     Ok(())
 }
 
-/// The subscribed connection: the open flows first, then each batch. A
-/// client that falls behind by more than the backlog is disconnected (it
-/// reconnects and starts from the open flows again); a client that closes
-/// or sends anything ends the stream.
+/// Sends the rows the client may see, split by their encoded size. Rows are
+/// built at the caps, so none is left out as oversized.
+async fn send_log<S: AsyncWrite + Unpin>(stream: &mut S, session_id: u32, rows: &[LogRow]) -> Result<(), FrameError> {
+    let mine: Vec<LogRow> = rows.iter().filter(|r| log_visible_to(r, session_id)).cloned().collect();
+    for message in log_frames(&mine)?.messages {
+        write_frame(stream, &message).await?;
+    }
+    Ok(())
+}
+
+/// The subscribed connection: the open flows first, then each batch of flows
+/// and log rows. A client that falls behind by more than the backlog is
+/// disconnected (it reconnects and starts from the open flows again); a client
+/// that closes or sends anything ends the stream.
 async fn stream_flows<S, B>(stream: &mut S, session_id: u32, backend: &B) -> Result<(), FrameError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     B: Backend + ?Sized,
 {
-    let Subscription { open, mut batches, mut routes_up } = backend.subscribe();
+    let Subscription { open, mut batches, mut log, mut routes_up } = backend.subscribe();
     send_flows(stream, session_id, &open).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut probe = [0u8; 1];
@@ -176,6 +191,10 @@ where
         tokio::select! {
             batch = batches.recv() => match batch {
                 Ok(b) => send_flows(&mut writer, session_id, &b).await?,
+                Err(_) => return Ok(()),
+            },
+            rows = log.recv() => match rows {
+                Ok(r) => send_log(&mut writer, session_id, &r).await?,
                 Err(_) => return Ok(()),
             },
             _ = routes_down(&mut routes_up) => return Ok(()),
@@ -245,6 +264,7 @@ mod tests {
         policy: Mutex<Policy>,
         open: Vec<FlowEvent>,
         flows: broadcast::Sender<Arc<Vec<FlowEvent>>>,
+        log: broadcast::Sender<Arc<Vec<LogRow>>>,
         routes: tokio::sync::watch::Sender<bool>,
         refreshes: Mutex<u64>,
         update_requests: Mutex<u32>,
@@ -253,7 +273,7 @@ mod tests {
     impl Fake {
         fn new(open: Vec<FlowEvent>) -> Arc<Self> {
             let routes = tokio::sync::watch::channel(true).0;
-            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0) })
+            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, log: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0) })
         }
     }
 
@@ -269,8 +289,11 @@ mod tests {
         fn set_dns_upstreams(&self, list: DnsUpstreams) -> Result<DnsUpstreams, String> {
             Ok(list)
         }
+        fn dns_upstreams(&self) -> DnsUpstreams {
+            DnsUpstreams { revision: 9, upstreams: vec!["tls://held.example".into()] }
+        }
         fn subscribe(&self) -> Subscription {
-            Subscription { open: self.open.clone(), batches: self.flows.subscribe(), routes_up: self.routes.subscribe() }
+            Subscription { open: self.open.clone(), batches: self.flows.subscribe(), log: self.log.subscribe(), routes_up: self.routes.subscribe() }
         }
         fn lists(&self) -> (Vec<ListStatus>, Option<u64>) {
             let refreshes = *self.refreshes.lock().unwrap();
@@ -440,6 +463,60 @@ mod tests {
         closing.open = false;
         fake.flows.send(Arc::new(vec![closing.clone()])).unwrap();
         assert_eq!(recv(&mut c).await, EngineMessage::Flows { flows: vec![closing] });
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_held_resolver_list_is_answered_on_request() {
+        let (mut c, task) = start(1);
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::DnsUpstreams).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::DnsUpstreams(l) if l.revision == 9));
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    fn log_row(id: u64, session: Option<u32>, forwarded: Option<sieve_ipc::Forwarded>) -> LogRow {
+        LogRow {
+            id,
+            t: 1,
+            flow_id: id,
+            pid: None,
+            exe: None,
+            session,
+            kind: sieve_ipc::FlowKind::Tls,
+            host: "news.example".into(),
+            remote: "192.0.2.1:443".into(),
+            url: None,
+            request_type: None,
+            outcome: sieve_ipc::LogOutcome::Blocked,
+            rule: None,
+            list: None,
+            forwarded,
+        }
+    }
+
+    /// The log comes on the Subscribe connection and shows a client only its
+    /// session's rows, the services' and the guests': browsing history is private.
+    #[tokio::test]
+    async fn log_rows_reach_the_subscriber_session_scoped() {
+        let mut first = tests_event(Some(1));
+        first.id = 1;
+        let fake = Fake::new(vec![first]);
+        let (mut c, task) = start_with(1, fake.clone());
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::Subscribe).await;
+        recv(&mut c).await;
+        let (mine, service, guest) = (log_row(1, Some(1), None), log_row(2, Some(0), None), log_row(5, None, Some(sieve_ipc::Forwarded { vm: None })));
+        fake.log.send(Arc::new(vec![mine.clone(), service.clone(), log_row(3, Some(2), None), log_row(4, None, None), guest.clone()])).unwrap();
+        assert_eq!(recv(&mut c).await, EngineMessage::Log { rows: vec![mine, service, guest] });
+        fake.log.send(Arc::new(vec![log_row(6, Some(2), None)])).unwrap();
+        let next = log_row(7, Some(1), None);
+        fake.log.send(Arc::new(vec![next.clone()])).unwrap();
+        assert_eq!(recv(&mut c).await, EngineMessage::Log { rows: vec![next] }, "a batch with nothing for this session sends no frame");
         drop(c);
         task.await.unwrap().unwrap();
     }

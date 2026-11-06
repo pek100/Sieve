@@ -23,14 +23,14 @@ use sieve_ipc::{FlowAction, FlowEvent, FlowKind, FlowProto};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
-use super::attribution::{Attribution, decide, is_own};
+use super::attribution::{Attribution, HeldOwner, decide, is_own};
 use super::book::FlowBook;
 use super::dns_flow;
 use super::egress::Egress;
 use super::{DNS_PORT, Meters, close_blocked, drain_udp, kind_of, record_decision};
 use crate::dns::NameMap;
 use crate::dns::service::Service;
-use crate::domain::{FilterSlot, Flow, Owner as FlowOwner};
+use crate::domain::{FilterSlot, Flow};
 use crate::flow::classify::{Decoded, UdpClassifier};
 use crate::flow::etw::PidWitness;
 use crate::flow::flows::os::IpHelper;
@@ -38,6 +38,7 @@ use crate::flow::flows::{Action, AppKeys, Attributor, ExeCache, FiveTuple, Owner
 use crate::flow::nat::NatTable;
 use crate::flow::packet::Proto;
 use crate::flow::relay::relay_tcp;
+use crate::policy::wall_ms;
 use crate::route::table::NetTables;
 use crate::watchdog::monotonic_ms;
 
@@ -50,10 +51,10 @@ const DATAGRAM: usize = 65_535;
 type ExeLookup = fn(u32) -> Option<String>;
 type ProductLookup = fn(&str) -> Option<String>;
 
-/// A flow the book took: its id and its app's key, when it has one.
+/// A flow the book took: its id and who it belongs to.
 pub(super) struct Admitted {
     pub(super) id: u64,
-    app: Option<String>,
+    owner: HeldOwner,
 }
 
 /// The ETW ring, or nothing when its session could not start.
@@ -103,18 +104,21 @@ pub fn session_of(pid: u32) -> Option<u32> {
     unsafe { ProcessIdToSessionId(pid, &mut session) }.ok().map(|()| session)
 }
 
+/// What a routing run hands its relay.
+pub struct RelayParts {
+    pub tables: Arc<RwLock<NetTables>>,
+    pub egress: Arc<Egress>,
+    pub dns: Arc<Service>,
+    pub book: Arc<Mutex<FlowBook>>,
+    pub names: Arc<Mutex<NameMap>>,
+    pub meters: Arc<Meters>,
+    pub filter: Arc<FilterSlot>,
+    pub witness: Witness,
+    pub nat: Arc<NatTable>,
+}
+
 impl Relay {
-    pub fn new(
-        tables: Arc<RwLock<NetTables>>,
-        egress: Arc<Egress>,
-        dns: Arc<Service>,
-        book: Arc<Mutex<FlowBook>>,
-        names: Arc<Mutex<NameMap>>,
-        meters: Arc<Meters>,
-        filter: Arc<FilterSlot>,
-        witness: Witness,
-        nat: Arc<NatTable>,
-    ) -> Self {
+    pub fn new(RelayParts { tables, egress, dns, book, names, meters, filter, witness, nat }: RelayParts) -> Self {
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: crate::experiments::Settings::default(),
@@ -222,16 +226,18 @@ impl Relay {
             list: None,
             forwarded,
         };
-        lock(&self.book).open(event).map(|id| Admitted { id, app })
+        let owner = attribution.owner(app);
+        lock(&self.book).open(event).map(|id| Admitted { id, owner })
     }
 
     /// The one decision for a flow whose first bytes were decoded, in the book.
     /// The snapshot is read here, so a flow decided keeps its decision. Port 53
     /// never comes here (`dns_flow`), so `dns` is false.
     fn decide(&self, admitted: &Admitted, d: &Decoded, flow: &FiveTuple) -> Action {
-        let owner = admitted.app.as_deref().map_or(FlowOwner::Unknown, |key| FlowOwner::App { key });
-        let decision = self.filter.get().decide(Flow::from_decoded(d, false, flow.remote.ip(), owner), &self.names, monotonic_ms());
-        lock(&self.book).update(admitted.id, |e| record_decision(e, d, false, &decision));
+        let decision = self.filter.get().decide(Flow::from_decoded(d, false, flow.remote.ip(), admitted.owner.as_owner()), &self.names, monotonic_ms());
+        let mut book = lock(&self.book);
+        book.update(admitted.id, |e| record_decision(e, d, false, &decision));
+        book.log_decision(admitted.id, &decision, wall_ms());
         decision.action
     }
 }

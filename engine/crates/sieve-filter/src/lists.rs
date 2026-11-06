@@ -41,6 +41,17 @@ pub fn refresh_interval(text: &str) -> Duration {
     declared.clamp(MIN_REFRESH, MAX_REFRESH)
 }
 
+/// A list's own `! Version:`, from the comment header at its top.
+pub fn list_version(text: &str) -> Option<String> {
+    let lines = text.trim_start_matches(BOM).lines().map(str::trim);
+    let header = lines.take_while(|l| l.is_empty() || l.starts_with('!') || l.starts_with('['));
+    header.filter_map(|l| l.strip_prefix('!')).find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        let value = value.trim();
+        (name.trim().eq_ignore_ascii_case("version") && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
@@ -170,6 +181,14 @@ impl FetchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lists_version_comes_from_its_header_only() {
+        assert_eq!(list_version("[Adblock Plus 2.0]\n! Title: x\n! Version: 2026.11.1\n||a^\n").as_deref(), Some("2026.11.1"));
+        assert_eq!(list_version("\u{feff}! version:  7 \n").as_deref(), Some("7"));
+        assert_eq!(list_version("! Title: x\n||a^\n! Version: 9\n"), None, "a comment after the rules is not the header");
+        assert_eq!(list_version("! Version:\n||a^\n"), None);
+    }
 
     const DAY_MS: u64 = 24 * 3_600_000;
 

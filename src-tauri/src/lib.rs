@@ -62,6 +62,8 @@ pub fn run() {
             engine::engine_lists,
             engine::engine_lists_refresh,
             engine::engine_log_tail,
+            engine::engine_dns_upstreams,
+            engine::engine_set_dns_upstreams,
             engine::engine_cert_status,
             engine::engine_install_root,
             engine::engine_request_update,

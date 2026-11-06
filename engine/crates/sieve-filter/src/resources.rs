@@ -9,8 +9,10 @@
 //! bad input and gives every scriptlet the default permission.
 //!
 //! From slice 13 the engine also receives the bundle as a signed update
-//! (`updates\resources`, `sieve_engine::update`); the pin retires once a loader
-//! here reads that file.
+//! (`updates\resources`, `sieve_engine::update`): the engine's loader
+//! (`sieve_engine::lists::resources`) prefers that copy, through
+//! [`load_signed_bundle`], and the pin stays as its fallback until a signed
+//! update exists.
 
 use std::collections::HashSet;
 
@@ -90,6 +92,13 @@ fn identifiers_of(resource: &Resource) -> impl Iterator<Item = &String> {
 /// checked first, so an unverified file is never parsed.
 pub fn load_bundle(bytes: &[u8], pinned: &str) -> Result<ResourceBundle, ResourceError> {
     verify(bytes, pinned)?;
+    load_signed_bundle(bytes)
+}
+
+/// Loads a bundle the signed update path already verified: its signature, kind
+/// and version were checked before the file was put where only an admin can
+/// write. Every other check of a bundle still runs.
+pub fn load_signed_bundle(bytes: &[u8]) -> Result<ResourceBundle, ResourceError> {
     let resources: Vec<Resource> = serde_json::from_slice(bytes)?;
 
     let mut identifiers = HashSet::new();

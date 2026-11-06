@@ -10,7 +10,8 @@ import { TRAY_EVENT } from "@/data/desktop";
 import historyFixture from "@/data/fixtures/history-v1.json";
 import fixture from "@/data/fixtures/snapshot-v1.json";
 import windowsFixture from "@/data/fixtures/windows-dns-v1.json";
-import engineFixture from "@/data/fixtures/engine-probe-v2.json";
+import ipcFixture from "@/data/fixtures/engine-ipc-v3.json";
+import engineFixture from "@/data/fixtures/engine-probe-v3.json";
 import {
   ENGINE_PROBE_VERSION,
   FLOW_STATES,
@@ -102,6 +103,9 @@ describe("protocol law", () => {
     for (const example of Object.values(engineFixture.examples)) {
       expect(parseEngineProbe(example)).toEqual(example);
     }
+    // An engine that says incompatible speaks something else: its range cannot hold this build's protocol.
+    const [low, high] = engineFixture.examples.incompatible.pipe.supported;
+    expect(ipcFixture.protocol < low || ipcFixture.protocol > high).toBe(true);
     const idle = engineFixture.examples.idle;
     expect(() => parseEngineProbe({ ...idle, v: 1 })).toThrow(ProtocolError);
     const status = idle.pipe.status;
@@ -118,7 +122,7 @@ describe("protocol law", () => {
     if (pipe?.kind !== "welcome") throw new Error("expected welcome");
     expect(pipe.status.blocking).toBe(false);
     expect(pipe.status.counters.blocked).toBe(0);
-    expect(pipe.status.policy).toEqual({ revision: 3, engine: true, sieving: false, off_apps: [], lists: null, domain_lists: [], https: false });
+    expect(pipe.status.policy).toEqual({ revision: 3, engine: true, sieving: false, off_apps: [], lists: null, domain_lists: [], https: false, user_rules: [], exclusions: [] });
     expect(() => parseEngineProbe(withStatus({ ...status, blocking: "yes" }))).toThrow(/status\.blocking/);
     expect(() => parseEngineProbe(withStatus({ ...status, policy: { revision: 1, engine: true, off_apps: [1] } }))).toThrow(/off_apps/);
     expect(() => parseEngineProbe(withStatus({ ...status, policy: { revision: 1, engine: true, domain_lists: [{ kind: "nope", entries: [], enabled: true }] } }))).toThrow(/domain_lists/);

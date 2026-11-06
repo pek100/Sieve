@@ -361,6 +361,16 @@ impl<F: Fn(&str) -> Option<String>> AppKeys<F> {
     /// (the app's `label`). None when the exe is hidden: the app names those
     /// by the services they host, which the engine does not read, and an
     /// unattributed flow is sieved rather than given a guessed exemption.
+    ///
+    /// TENSION: the engine runs as SYSTEM and reads exes the unelevated app
+    /// cannot, so a service host the app lists as "DHCP Client and 3 more" keys
+    /// here under its product name ("microsoft windows operating system" from
+    /// svchost.exe), and turning that row off does not exempt it. Sharing the
+    /// app's key would mean reading the service table per flow and copying its
+    /// "hidden to the user" judgement, and its label moves as services stop. The
+    /// failure is on the safe side: that row's traffic stays sieved. A row with a
+    /// readable exe, every ordinary app's, has the same key on both sides
+    /// (`sieve_ipc::app_key`, fixture `app-keys-v1.json`).
     pub fn of_pid(&self, pid: u32, exe: Option<&str>) -> Option<String> {
         match (exe, pid) {
             (Some(exe), _) => Some(self.key(exe)),

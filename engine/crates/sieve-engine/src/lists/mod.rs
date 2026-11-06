@@ -12,18 +12,19 @@
 pub mod cache;
 #[cfg(windows)]
 pub mod https;
+pub mod resources;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sieve_filter::catalogue::{self, LISTS, List};
-use sieve_filter::lists::{Applied, FetchResponse, FetchState};
+use sieve_filter::lists::{Applied, FetchResponse, FetchState, list_version};
 use sieve_filter::rules::{ListReport, ListText, RuleEngine, USER_LIST};
-use sieve_ipc::{ListStatus, MAX_LISTED_LINE_BYTES, cap_text};
+use sieve_ipc::{FilterFacts, ListFact, ListStatus, MAX_LISTED_LINE_BYTES, cap_text};
 use tokio::sync::Notify;
 
 use crate::domain::{DomainFilter, FilterSlot};
@@ -51,9 +52,15 @@ struct Inner {
     states: HashMap<&'static str, FetchState>,
     compile_ms: Option<u64>,
     compile_error: Option<String>,
+    /// Each compiled list's own `! Version:`.
+    versions: HashMap<&'static str, String>,
+    /// The resource bundle in use, as the report quotes it.
+    resource_pin: Option<String>,
+    resource_error: Option<String>,
 }
 
 pub struct Lists {
+    dir: Option<PathBuf>,
     cache: Option<Cache>,
     slot: Arc<FilterSlot>,
     compile: Compile,
@@ -97,7 +104,7 @@ impl Lists {
     fn with_compile(engine_dir: Option<&Path>, slot: Arc<FilterSlot>, selection: Option<Vec<String>>, compile: Compile) -> Self {
         let cache = engine_dir.map(Cache::new);
         let states = cache.as_ref().map(|c| LISTS.iter().map(|l| (l.id, c.read_state(l.id))).collect()).unwrap_or_default();
-        Self { cache, slot, compile, inner: Mutex::new(Inner { selection, states, ..Inner::default() }), force: AtomicBool::new(false), wake: Notify::new() }
+        Self { dir: engine_dir.map(Path::to_path_buf), cache, slot, compile, inner: Mutex::new(Inner { selection, states, ..Inner::default() }), force: AtomicBool::new(false), wake: Notify::new() }
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -123,9 +130,39 @@ impl Lists {
         self.wake.notify_one();
     }
 
-    /// Why the last compile produced nothing, while that is so.
+    /// Why the last compile produced nothing, or why it went without a resource
+    /// bundle that is there, while that is so.
     pub fn compile_error(&self) -> Option<String> {
-        self.inner().compile_error.clone()
+        let inner = self.inner();
+        match (&inner.compile_error, &inner.resource_error) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (a, b) => a.clone().or_else(|| b.clone()),
+        }
+    }
+
+    /// What the engine filters with, for the Status: the selected lists the last
+    /// compile holds. None until a compile finished. The user's rules are not a
+    /// list here: they have no project page and are never what a report names.
+    pub fn facts(&self) -> Option<FilterFacts> {
+        let filter = self.slot.get();
+        let selected = self.selected();
+        let inner = self.inner();
+        inner.compile_ms?;
+        let lists = selected
+            .iter()
+            .filter_map(|l| {
+                let report = filter.rules.lists.reports().iter().find(|r| r.id == l.id)?;
+                Some(ListFact {
+                    id: l.id.to_string(),
+                    title: l.title.to_string(),
+                    homepage: l.homepage.to_string(),
+                    version: inner.versions.get(l.id).cloned(),
+                    applied: counted(report.network),
+                    skipped: counted(report.skipped),
+                })
+            })
+            .collect();
+        Some(FilterFacts { lists, resource_pin: inner.resource_pin.clone() })
     }
 
     /// The per-list report: every catalogue row, then the user's rules.
@@ -193,20 +230,30 @@ impl Lists {
         let cache = self.cache.clone();
         let compile = self.compile;
         let selected = self.selected();
+        let dir = self.dir.clone();
         let job = tokio::task::spawn_blocking(move || {
             let copies: Vec<(&'static List, Option<String>)> = selected.into_iter().map(|l| (l, cache.as_ref().and_then(|c| c.read_text(l.id)))).collect();
             let texts: Vec<ListText<'_>> = copies.iter().filter_map(|(l, t)| t.as_deref().map(|text| ListText { id: l.id, text, trusted: l.trusted })).collect();
-            let engine = compile(&texts);
+            let mut engine = compile(&texts);
+            let (loaded, resource_error) = dir.as_deref().map_or((None, None), |d| resources::load(d, resources::RESOURCE_PIN));
+            let resource_pin = loaded.map(|l| {
+                engine.use_resources(&l.bundle);
+                l.pin
+            });
+            let versions: HashMap<&'static str, String> = copies.iter().filter_map(|(l, t)| Some((l.id, list_version(t.as_deref()?)?))).collect();
             let missing: Vec<&'static str> = copies.iter().filter(|(_, t)| t.is_none()).map(|(l, _)| l.id).collect();
-            (engine, missing)
+            (engine, missing, versions, resource_pin, resource_error)
         });
         match job.await {
-            Ok((engine, missing)) => {
+            Ok((engine, missing, versions, resource_pin, resource_error)) => {
                 let engine = Arc::new(engine);
                 self.slot.update(|f| DomainFilter::with_lists(f, engine.clone()));
                 let mut inner = self.inner();
                 inner.compile_ms = Some(millis(started.elapsed()));
                 inner.compile_error = None;
+                inner.versions = versions;
+                inner.resource_pin = resource_pin;
+                inner.resource_error = resource_error;
                 for id in missing {
                     if inner.states.get(id).is_some_and(|s| s.fetched_at_ms.is_some()) {
                         inner.states.insert(id, FetchState::default());
@@ -548,6 +595,47 @@ mod tests {
         assert_eq!(f.asked_urls().len(), 4);
         l.fetch_due(&f, 2).await;
         assert_eq!(f.asked_urls().len(), 4, "once");
+    }
+
+    /// Plan 7.5 meets plan 5.5: a bundle the signed path placed is what the next
+    /// compile uses, and the report quotes it. A broken one costs scriptlets and
+    /// is said; filtering carries on.
+    #[tokio::test]
+    async fn a_compile_prefers_the_signed_resource_copy_and_says_which_it_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path());
+        cache.write_text(LIST_A, BODY).unwrap();
+        let l = lists_at(dir.path(), &[LIST_A]);
+        l.compile_and_swap().await;
+        assert_eq!(l.facts().unwrap().resource_pin, None, "no bundle yet");
+
+        let path = crate::update::data_path(dir.path(), &crate::update::Kind::Resources).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"[]").unwrap();
+        l.compile_and_swap().await;
+        assert_eq!(l.facts().unwrap().resource_pin, Some(format!("sha256:{}", sieve_filter::resources::sha256_hex(b"[]"))));
+        assert_eq!(l.compile_error(), None);
+
+        std::fs::write(&path, b"not json").unwrap();
+        l.compile_and_swap().await;
+        assert_eq!(l.facts().unwrap().resource_pin, None);
+        assert!(l.compile_error().unwrap().contains("signed resource library"));
+        assert!(blocks(&l, "ads.example"), "the lists still decide");
+    }
+
+    #[tokio::test]
+    async fn the_facts_hold_the_selected_lists_of_the_last_compile() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = lists_at(dir.path(), &[LIST_A]);
+        assert_eq!(l.facts(), None);
+        l.compile_and_swap().await;
+        assert_eq!(l.facts().unwrap().lists, [], "compiled with no copy: no list in force");
+        Cache::new(dir.path()).write_text(LIST_A, BODY).unwrap();
+        l.compile_and_swap().await;
+        let facts = l.facts().unwrap();
+        assert_eq!(facts.lists.iter().map(|f| (f.id.as_str(), f.applied)).collect::<Vec<_>>(), [(LIST_A, 1)]);
+        l.set_selection(Some(vec![]));
+        assert_eq!(l.facts().unwrap().lists, [], "a list turned off is not claimed");
     }
 
     /// The refresh task itself: compile the cached copy first, then fetch, swap,

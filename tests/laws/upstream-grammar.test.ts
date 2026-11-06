@@ -9,6 +9,7 @@
 import { describe, expect, it } from "vitest";
 import { parseUpstream } from "@/core/upstream";
 import { settingDef } from "@/core/settings/registry";
+import ipc from "@/data/fixtures/engine-ipc-v3.json";
 import table from "@/data/fixtures/upstream-grammar.json";
 import { read } from "./files";
 
@@ -28,6 +29,13 @@ describe("law: one upstream grammar", () => {
 
   it("the app's default list is in the table", () => {
     for (const raw of settingDef("filtering.upstreams").default as readonly string[]) expect(table.accept).toContain(raw);
+  });
+
+  it("the app's default list is the engine's, so a new install sends nothing and claims nothing false", () => {
+    const held = ipc.engine.find((m) => m.type === "dns_upstreams") as unknown as { revision: number; upstreams: string[] };
+    expect(settingDef("filtering.upstreams").default).toEqual(held.upstreams);
+    expect(held.revision).toBe(0);
+    expect(read("engine/crates/sieve-engine/src/dns/config.rs")).toContain("engine-ipc-v3.json");
   });
 
   it("the engine's half reads this same table and asks its real parser", () => {
