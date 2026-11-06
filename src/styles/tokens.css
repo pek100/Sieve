@@ -1,6 +1,6 @@
 /*
  * Sieve design tokens. The only file in src/ allowed to hold colour literals.
- * Source: docs/research/2026-10-17-parity/design-language.md (sections 3 to 9).
+ * Source: private research notes, not in this repo (sections 3 to 9).
  * Every name here is a ROLE. Components use roles only (through the Tailwind
  * utilities mapped in globals.css). Light swaps the same names.
  *

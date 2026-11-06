@@ -1,6 +1,6 @@
 # Sieve conventions
 
-How this repo does things, as built by the foundation (2026-10-17). The plan (`docs/plans/2026-10-17-parity.md`) says what to build; this file says how. The look comes from `docs/research/2026-10-17-parity/design-language.md`. If code and this file disagree, fix one of them in the same commit.
+How this repo does things, as built by the foundation (2026-10-17). The plan (`docs/plans/2026-10-17-parity.md`) says what to build; this file says how. The look comes from private research notes, not in this repo. If code and this file disagree, fix one of them in the same commit.
 
 ## 0. Sieve off means a normal network (the top rule)
 

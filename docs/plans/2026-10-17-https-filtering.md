@@ -6,7 +6,7 @@ The user's decision, verbatim: "not chosen sites, everything. our filtering shou
 
 So Sieve filters all traffic by default, the way AdGuard for Windows does: HTTPS decryption with a local root certificate, full-URL network rules, cosmetic CSS and scriptlet injection (this is what removes YouTube video ads), QUIC covered. It also carries everything that makes AdGuard safe to run that way: automatic exclusions, self-healing exclusion, strict upstream validation, and the per-app Sieve/Off switch as a real exemption.
 
-Inputs: `docs/research/2026-10-17-parity/*` (the survey of AdGuard 8.0.5584 at `E:\AdGuard`), `docs/plans/2026-10-17-parity.md`, `docs/conventions.md`, the Wintun spike (branch `worktree-agent-a025d1b361c8851d3`: `spikes/wintun/`, `docs/research/2026-10-17-wintun-spike.md`), and `src-tauri/src/dns/` and `sysdns/` on main at f5775c6 (`sysdns` was removed on 2026-10-18, see the rule below). New read-only facts from `E:\AdGuard` are in section 0, paraphrased in my own words.
+Inputs: private research notes, not in this repo (the survey of AdGuard 8.0.5584 at `E:\AdGuard`), `docs/plans/2026-10-17-parity.md`, `docs/conventions.md`, the Wintun spike (branch `worktree-agent-a025d1b361c8851d3`: `spikes/wintun/`, `docs/research/2026-10-17-wintun-spike.md`), and `src-tauri/src/dns/` and `sysdns/` on main at f5775c6 (`sysdns` was removed on 2026-10-18, see the rule below). New read-only facts from `E:\AdGuard` are in section 0, paraphrased in my own words.
 
 ## Decisions by the user (2026-10-17), these override anything below
 
