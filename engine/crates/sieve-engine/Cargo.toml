@@ -74,10 +74,14 @@ minisign-verify = "0.2.5"
 # TLS stack as the encrypted DNS stream, so one client config survives (S29).
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "prefer-post-quantum"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
-hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 webpki-roots = "1"
+# Slice 6: the trust half of upstream validation (plan 2.6), Windows' chain
+# engine, called off the runtime (task D2). Offline tests never call it (D3).
+rustls-platform-verifier = "0.7"
+bytes = "1"
 
 # Userspace TCP/IP stack (vendored, see engine/vendor/ipstack/Cargo.toml).
 ipstack = "1.0.1"
@@ -156,6 +160,8 @@ tokio = { version = "1", features = ["test-util"] }
 # update client does not trust (`update::https`).
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 hyper = { version = "1", features = ["server"] }
+# A body fed from a test, for streaming and trailers (`http::tests`).
+http-body-util = { version = "0.1", features = ["channel"] }
 # Benchmark only: craft packets for ipstack (same version ipstack uses).
 etherparse = "0.20"
 # The test encoder for the brotli decode path.

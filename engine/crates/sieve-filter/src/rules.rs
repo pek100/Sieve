@@ -70,7 +70,8 @@ pub struct ListText<'a> {
 pub struct ListReport {
     pub id: String,
     /// Network rules parsed. Those with a type or party constraint and all
-    /// `$removeparam` rules cannot decide a bare host; they wait for slice 6.
+    /// `$removeparam` rules cannot decide a bare host; they decide decrypted
+    /// requests (`check_request`), while `filtering.https` is on.
     pub network: usize,
     /// Cosmetic rules parsed. They have no effect until slice 9.
     pub cosmetic: usize,
@@ -108,6 +109,35 @@ pub struct HostDecision {
 
 impl HostDecision {
     const NO_RULE: Self = Self { verdict: HostVerdict::None, rule: None, list: None };
+}
+
+/// One decrypted request as the rule engine asks about it.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestQuery<'a> {
+    pub url: &'a str,
+    /// The page that made the request; empty for a navigation.
+    pub initiator: &'a str,
+    /// adblock's request type: `document`, `script`, `xhr`, `websocket` and so on.
+    pub request_type: &'a str,
+    pub method: &'a str,
+}
+
+/// The answer for one request (task D13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestDecision {
+    pub verdict: HostVerdict,
+    pub rule: Option<String>,
+    pub list: Option<String>,
+    /// A block's resource as a `data:` URL; None means a plain block.
+    pub redirect: Option<String>,
+    /// The URL with `$removeparam` applied, when that changed it.
+    pub rewritten: Option<String>,
+}
+
+impl Default for RequestDecision {
+    fn default() -> Self {
+        Self { verdict: HostVerdict::None, rule: None, list: None, redirect: None, rewritten: None }
+    }
 }
 
 /// A kind of user domain entry (B6).
@@ -353,7 +383,37 @@ impl RuleEngine {
         self.decision(HostVerdict::Block, as_third.filter)
     }
 
-    /// A full-URL decision (slice 6 asks this; the benchmark measures it now).
+    /// The full-URL decision of one decrypted request (plan 5.3, task D13). The
+    /// library's answer plus the question host checks already ask: a block
+    /// yields to a `$document` exception on the page that made the request
+    /// (the request itself for a navigation), unless `$important`.
+    pub fn check_request(&self, query: &RequestQuery<'_>) -> RequestDecision {
+        let Ok(request) = Request::new(query.url, query.initiator, query.request_type, query.method) else { return RequestDecision::default() };
+        // Exceptions are always looked for: a user's allow entry lives in an
+        // engine with no block rule to match (the same as `check_host`).
+        let result = self.engine.check_network_request_subset(&request, false, true);
+        let rewritten = result.rewritten_url.clone();
+        if result.should_block() {
+            let page = if query.initiator.is_empty() { query.url } else { query.initiator };
+            if !result.important
+                && let Ok(document) = Request::new(page, "", DOCUMENT_TYPE, SYNTHETIC_METHOD)
+                && let Some(exception) = self.engine.check_network_request_subset(&document, true, true).exception
+            {
+                let (rule, list) = rule_text(Some(exception), &self.reports);
+                return RequestDecision { verdict: HostVerdict::Allow, rule, list, redirect: None, rewritten };
+            }
+            let redirect = result.redirect;
+            let (rule, list) = rule_text(result.filter, &self.reports);
+            return RequestDecision { verdict: HostVerdict::Block, rule, list, redirect, rewritten: None };
+        }
+        if result.exception.is_some() {
+            let (rule, list) = rule_text(result.exception, &self.reports);
+            return RequestDecision { verdict: HostVerdict::Allow, rule, list, redirect: None, rewritten };
+        }
+        RequestDecision { rewritten, ..RequestDecision::default() }
+    }
+
+    /// A full-URL verdict alone (the benchmark measures this).
     pub fn check_url(&self, url: &str, initiator: &str, request_type: &str) -> HostVerdict {
         let Ok(request) = Request::new(url, initiator, request_type, SYNTHETIC_METHOD) else { return HostVerdict::None };
         let result = self.engine.check_network_request(&request);
@@ -383,6 +443,19 @@ impl RuleSet {
     pub fn check_host(&self, host: &str) -> HostDecision {
         let user = self.user.check_host(host);
         if user.verdict == HostVerdict::None { self.lists.check_host(host) } else { user }
+    }
+
+    /// The user's engine first: its verdict decides. Otherwise the lists are
+    /// asked about the URL as the user's engine left it, and a parameter
+    /// either removed stays removed.
+    pub fn check_request(&self, query: &RequestQuery<'_>) -> RequestDecision {
+        let user = self.user.check_request(query);
+        if user.verdict != HostVerdict::None {
+            return user;
+        }
+        let asked = user.rewritten.as_deref().unwrap_or(query.url);
+        let lists = self.lists.check_request(&RequestQuery { url: asked, ..*query });
+        RequestDecision { rewritten: lists.rewritten.clone().or(user.rewritten), ..lists }
     }
 }
 
@@ -474,6 +547,46 @@ example.invalid##+js(set-constant, adsAllowed, true)
         assert_eq!(verdict(&engine("||x.example^$~image\n||x.example^$image\n"), "x.example"), HostVerdict::Block, "together they cover every type");
         assert_eq!(verdict(&engine("||x.example^$~image\n||x.example^$image,3p\n"), "x.example"), HostVerdict::None, "first-party images stay open");
         assert_eq!(verdict(&engine("||x.example\n"), "x.example"), HostVerdict::Block, "no ^, no type constraint");
+    }
+
+    fn query<'a>(url: &'a str, initiator: &'a str, request_type: &'a str) -> RequestQuery<'a> {
+        RequestQuery { url, initiator, request_type, method: "GET" }
+    }
+
+    #[test]
+    fn a_request_is_decided_by_its_full_url_type_and_party() {
+        let e = engine("||ads.example/banner^\n||x.example^$image\n||y.example^$third-party\n");
+        let block = |url, init, kind| e.check_request(&query(url, init, kind)).verdict;
+        assert_eq!(block("https://ads.example/banner/1.png", "https://news.example/", "image"), HostVerdict::Block);
+        assert_eq!(block("https://ads.example/other", "https://news.example/", "image"), HostVerdict::None);
+        assert_eq!(block("https://x.example/a.png", "https://news.example/", "image"), HostVerdict::Block);
+        assert_eq!(block("https://x.example/a.js", "https://news.example/", "script"), HostVerdict::None);
+        assert_eq!(block("https://y.example/a", "https://news.example/", "script"), HostVerdict::Block);
+        assert_eq!(block("https://y.example/a", "https://y.example/", "script"), HostVerdict::None);
+        let d = e.check_request(&query("https://ads.example/banner/", "https://news.example/", "script"));
+        assert_eq!((d.rule.as_deref(), d.list.as_deref()), (Some("||ads.example/banner^"), Some("fixture")));
+    }
+
+    #[test]
+    fn a_document_exception_on_the_initiator_yields_unless_important() {
+        let e = engine("||ads.example^\n@@||news.example^$document\n");
+        let ask = |init| e.check_request(&query("https://ads.example/a.js", init, "script")).verdict;
+        assert_eq!(ask("https://news.example/"), HostVerdict::Allow);
+        assert_eq!(ask("https://other.example/"), HostVerdict::Block);
+        let e = engine("||ads.example^$important\n@@||news.example^$document\n");
+        assert_eq!(e.check_request(&query("https://ads.example/a.js", "https://news.example/", "script")).verdict, HostVerdict::Block);
+    }
+
+    #[test]
+    fn removeparam_rewrites_and_the_user_engine_decides_first() {
+        let e = engine("||news.example^$removeparam=utm_source\n");
+        let d = e.check_request(&query("https://news.example/a?utm_source=x&id=1", "", "document"));
+        assert_eq!(d.verdict, HostVerdict::None);
+        assert_eq!(d.rewritten.as_deref(), Some("https://news.example/a?id=1"));
+        let set = set(RuleEngine::compile_user_rules(std::iter::empty(), ["@@||ads.example^", "||news.example^$removeparam=one"]), "||ads.example^\n||news.example^$removeparam=two\n");
+        assert_eq!(set.check_request(&query("https://ads.example/x", "https://b.example/", "script")).verdict, HostVerdict::Allow, "the user's allow beats a list's block");
+        let both = set.check_request(&query("https://news.example/a?one=1&two=2&id=3", "", "document"));
+        assert_eq!(both.rewritten.as_deref(), Some("https://news.example/a?id=3"), "the lists are asked on what the user's engine left");
     }
 
     /// Pinned so a change of the library is seen.
