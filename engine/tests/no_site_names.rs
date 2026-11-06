@@ -37,7 +37,7 @@ const EXCEPTIONS: [(&str, &str, &str); 12] = [
     ("sieve-engine/src/exclusions/lists.rs", "raw.githubusercontent.com", "a list URL like the catalogue's, disabled until Q1 of the TLS task"),
     ("sieve-filter/src/exclusions.rs", "go.com", "the test's subject is the public suffix table, and .example is no suffix"),
     ("sieve-filter/src/exclusions.rs", "example.gov", "the test's subject is the public suffix table, and .example is no suffix"),
-    ("sieve-engine/src/dns/service.rs", "use-application-dns.net", "Mozilla's protocol signal, which nothing can derive (dns-extras D2)"),
+    ("sieve-engine/src/dns/service.rs", "use-application-dns.net", "Mozilla's protocol signal, which nothing can derive (dns-extras D9)"),
     ("sieve-engine/src/quic/tests.rs", "agency.gov", "the test's subject is the restricted suffix floor, and .example is no suffix"),
     ("sieve-engine/src/tls/crlite.rs", "mozilla.org", "the URL of a licence, in the notice of code taken under it"),
 ];

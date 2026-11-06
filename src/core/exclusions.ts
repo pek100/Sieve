@@ -148,6 +148,7 @@ export const FLOOR_WORDS: Readonly<Record<string, string>> = {
   "floor:upstream-invalid": "sites whose certificate is not valid",
   "floor:upstream-revoked": "sites whose certificate was revoked",
   "floor:upstream-unavailable": "sites whose certificate could not be checked",
+  "floor:upstream-ct": "sites whose certificate is not publicly logged",
 };
 
 /** The one line that names the floor, under the list. */
