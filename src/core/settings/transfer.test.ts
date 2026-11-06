@@ -55,6 +55,10 @@ describe("settings export and import", () => {
     expect(plan.next.values).not.toHaveProperty("filtering.systemDns");
     expect(plan.next.values).not.toHaveProperty("filtering.dns");
     expect(plan.next.values).not.toHaveProperty("filtering.upstreams");
+    // A current file with no upstream at all is refused: the engine has no meaning for it.
+    const none = planImport(changed, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filtering.upstreams": [] } }));
+    if (!none.ok) throw new Error("expected a plan");
+    expect(none.refused).toEqual([{ key: "filtering.upstreams", reason: "Not a valid value for this setting" }]);
     // A current file with a bare upstream is refused as a bad value.
     const current = planImport(changed, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filtering.upstreams": ["1.1.1.1"], "filtering.dns": true } }));
     if (!current.ok) throw new Error(current.error);

@@ -121,17 +121,20 @@ export function planImport(current: SettingsDoc, text: string): ImportPlan {
     }
     values[key] = v;
   }
-  // A group the engine could not hold: what the file would change in it is refused, as a save is.
+  // A refused known key keeps its current value rather than dropping to the default
+  // (an unavailable one is kept as stored by docWith).
+  for (const r of refused) if (isSettingKey(r.key)) values[r.key] = readValue(current, r.key);
+  // A group the engine could not hold, measured with those values back: what the file
+  // would change in it is refused, as a save is, and keeps its current value too.
   for (const budget of POLICY_BUDGETS) {
     const bytes = budgetBytes(budget, (key) => values[key] ?? defaultValue(key));
     if (bytes <= budget.bytes) continue;
     for (const key of budget.keys) {
-      if (values[key] !== undefined && !same(values[key], readValue(current, key))) refused.push({ key, reason: budgetProblem(budget, bytes) });
+      if (values[key] === undefined || same(values[key], readValue(current, key))) continue;
+      refused.push({ key, reason: budgetProblem(budget, bytes) });
+      values[key] = readValue(current, key);
     }
   }
-  // A refused known key keeps its current value rather than dropping to the default
-  // (an unavailable one is kept as stored by docWith).
-  for (const r of refused) if (isSettingKey(r.key)) values[r.key] = readValue(current, r.key);
   const next = docWith(current, values);
   return { ok: true, changes: changesBetween(current, next), refused, next };
 }

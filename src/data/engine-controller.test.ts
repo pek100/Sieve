@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createPassedChecks } from "@/core/checks";
 import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineUpdate } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
-import { MAX_POLICY_BYTES, type SettingKey } from "@/core/settings/registry";
+import { MAX_POLICY_BYTES, settingDef, type SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
 import { CRASH_LOOP_BANNER, createEngineController } from "./engine-controller";
@@ -412,10 +412,15 @@ describe("engine controller", () => {
     s.undo();
   });
 
-  it("an_empty_resolver_setting_sends_nothing_and_an_unreachable_engine_is_not_asked", async () => {
+  it("a_stored_empty_resolver_list_reads_as_the_default_and_an_unreachable_engine_is_not_asked", async () => {
+    const custom = { revision: 4, upstreams: ["tls://held.example"] };
     const s = setup("idle", memoryBackend({ schema: 5, values: { "filtering.upstreams": [] } }));
+    s.fake.source.dnsUpstreams = async () => custom;
+    await s.fc.flush();
     await s.fc.advance(ENGINE_POLL_MS);
-    expect(s.fake.upstreams).toEqual([]);
+    const defaults = settingDef("filtering.upstreams").default as readonly string[];
+    expect(s.settings.get("filtering.upstreams")).toEqual(defaults);
+    expect(s.fake.upstreams.at(-1), "what the row shows is what the engine gets").toEqual({ revision: 5, upstreams: defaults });
     s.undo();
     const absent = setup("missing", memoryBackend({ schema: 5, values: { "filtering.upstreams": ["tls://a.example"] } }));
     await absent.fc.advance(ENGINE_POLL_MS);

@@ -243,8 +243,8 @@ export function createEngineController({ engine, store, clock, settings, checks,
   };
 
   // Compared with what the engine holds on every probe, so a list the engine lost
-  // or never had is sent again. An empty setting has no meaning for the engine,
-  // which refuses it; it keeps its list until there is one to send.
+  // or never had is sent again. The setting is never empty (the registry refuses
+  // that, as the engine does), so there is always a list to compare.
   const syncUpstreams = async () => {
     if (disposed || !settingsReady || upstreamsInFlight || !engineTakesPolicy(get())) return;
     upstreamsInFlight = true;
@@ -252,7 +252,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
       const held = await engine.dnsUpstreams();
       const want = settings.get("filtering.upstreams");
       const same = want.length === held.upstreams.length && want.every((u, i) => u === held.upstreams[i]);
-      if (want.length > 0 && !same) await engine.setDnsUpstreams({ revision: held.revision + 1, upstreams: [...want] });
+      if (!same) await engine.setDnsUpstreams({ revision: held.revision + 1, upstreams: [...want] });
       if (get().dnsError) set({ dnsError: null });
     } catch (e) {
       set({ dnsError: `The DNS servers did not reach the engine: ${message(e)}` });
