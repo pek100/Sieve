@@ -10,10 +10,9 @@ import { createMockSource, MOCK_SCENARIOS, type MockScenario } from "./mock-sour
 import type { HistoryQuery } from "@/core/history";
 import type { AppIcon, History, Snapshot } from "./protocol";
 import { createTauriSource } from "./tauri-source";
-import { createMockDns, DNS_SCENARIOS, type DnsScenario } from "./dns-mock";
-import { createTauriDns, type DnsSource } from "./dns-source";
 import { createMockEngine, ENGINE_SCENARIOS, type EngineScenario } from "./engine-mock";
 import { createTauriEngine, type EngineSource } from "./engine-source";
+import { createMockWindowsDns, createTauriWindowsDns, type WindowsDnsSource } from "./safety-net";
 
 export type { SourceKind };
 
@@ -41,16 +40,14 @@ export interface SourceOptions {
   kind: SourceKind;
   seed: number;
   scenario: MockScenario;
-  /** Mock DNS scenario (?dns=off|error, default off). */
-  dns: DnsScenario;
-  /** Mock: report AdGuard as running (?adguard=1). */
-  adguard: boolean;
   /** Mock: one Windows adapter asks 127.0.0.1 and ::1 for DNS (?pointed=1). */
   pointed: boolean;
   /** Mock: generated app icons (?icons=1); without it the mock has none, as for unreadable exes. */
   icons: boolean;
   /** Mock engine scenario (?engine=missing|stopped|idle|..., default missing). */
   engine: EngineScenario;
+  /** Mock: every read of the engine's log fails (?log=error). */
+  logError: boolean;
 }
 
 /** Read the source choice from the environment: query string and Tauri presence. */
@@ -62,11 +59,9 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   const seed = Number.isInteger(seedRaw) && seedRaw > 0 ? seedRaw : 1;
   const sc = q.get("scenario");
   const scenario = (MOCK_SCENARIOS as readonly string[]).includes(sc ?? "") ? (sc as MockScenario) : "steady";
-  const d = q.get("dns");
-  const dns = (DNS_SCENARIOS as readonly string[]).includes(d ?? "") ? (d as DnsScenario) : "off";
   const e = q.get("engine");
   const engine = (ENGINE_SCENARIOS as readonly string[]).includes(e ?? "") ? (e as EngineScenario) : "missing";
-  return { kind, seed, scenario, dns, adguard: q.get("adguard") === "1", pointed: q.get("pointed") === "1", icons: q.get("icons") === "1", engine };
+  return { kind, seed, scenario, pointed: q.get("pointed") === "1", icons: q.get("icons") === "1", engine, logError: q.get("log") === "error" };
 }
 
 /**
@@ -78,14 +73,14 @@ export function createSource(o: SourceOptions, untracked: () => ReadonlySet<stri
   return o.kind === "tauri" ? createTauriSource(undefined, untracked) : createMockSource({ seed: o.seed, scenario: o.scenario, icons: o.icons });
 }
 
-/** The DNS seam follows the same choice: Tauri commands, or the mock. */
-export function createDnsSource(o: SourceOptions): DnsSource {
-  return o.kind === "tauri" ? createTauriDns() : createMockDns({ seed: o.seed, scenario: o.dns, adguard: o.adguard, pointed: o.pointed });
+/** The safety net's read follows the same choice: the Tauri command, or the mock. */
+export function createWindowsDnsSource(o: SourceOptions): WindowsDnsSource {
+  return o.kind === "tauri" ? createTauriWindowsDns() : createMockWindowsDns({ pointed: o.pointed });
 }
 
 /** The engine seam follows the same choice: the Tauri command, or the mock. */
 export function createEngineSource(o: SourceOptions): EngineSource {
-  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine);
+  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine, { seed: o.seed, logError: o.logError });
 }
 
 export function isTauriWindow(): boolean {

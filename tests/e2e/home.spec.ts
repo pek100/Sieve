@@ -119,8 +119,16 @@ test.describe("home", () => {
     }
     await expect(page.locator('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Sieved apps");
     await expect(page.locator('section[data-kpi="engine"]')).toHaveAttribute("aria-label", "Engine");
-    // The DNS filter's tile is gone until the engine replaces the filter.
+    // The DNS filter's tile is gone with the filter.
     await expect(page.locator('section[data-kpi="blocked"]')).toHaveCount(0);
+  });
+
+  test("with the engine filtering hosts, Home says the state and still never says ads, trackers or blocked", async ({ page }) => {
+    await page.addInitScript(() => window.localStorage.setItem("sieve.settings", JSON.stringify({ schema: 5, values: { "filtering.engine": true } })));
+    await page.goto("/?source=mock&seed=1&engine=hosts");
+    await expect(page.locator('section[data-kpi="engine"] [data-engine-state]')).toHaveText("Filtering hosts");
+    await waitForData(page);
+    expect(await page.locator("body").innerText()).not.toMatch(/\b(ads|trackers|blocked)\b/i);
   });
 
   test("the pause pill pauses until the chosen time and resume restarts sampling", async ({ page }, info) => {

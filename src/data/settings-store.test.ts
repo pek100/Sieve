@@ -8,7 +8,7 @@ describe("settings store (seam law: only non-default values are stored, defaults
     expect(s.get("sampling.enabled")).toBe(true);
     await s.ready;
     expect(s.get("appearance.theme")).toBe("dark");
-    expect(s.get("filtering.dns")).toBe(false);
+    expect(s.get("filtering.engine")).toBe(false);
   });
 
   it("stores only non-default values and drops a value set back to its default", async () => {
@@ -46,6 +46,22 @@ describe("settings store (seam law: only non-default values are stored, defaults
     const s = createSettingsStore(memoryBackend());
     // @ts-expect-error: not one of the options
     await expect(s.set("appearance.theme", "neon")).rejects.toThrow(/invalid value/);
+  });
+
+  it("a failed save is its caller's to hear of, and the next write still reaches the disk", async () => {
+    const inner = memoryBackend();
+    let fail = true;
+    const s = createSettingsStore({
+      ...inner,
+      save: async (doc) => {
+        if (fail) throw new Error("disk full");
+        await inner.save(doc);
+      },
+    });
+    await expect(s.set("appearance.theme", "light")).rejects.toThrow("disk full");
+    fail = false;
+    await s.set("sampling.intervalMs", 2000);
+    expect(await inner.load()).toEqual({ schema: SETTINGS_SCHEMA, values: { "appearance.theme": "light", "sampling.intervalMs": 2000 } });
   });
 
   it("round-trips through localStorage and absorbs garbage", async () => {

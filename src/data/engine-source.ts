@@ -11,7 +11,7 @@
  * AdGuard's service through one command Windows asks the user to approve.
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { parseEngineLists, parseEngineProbe, parseEngineStatus, type EngineLists, type EnginePolicy, type EngineProbe, type EngineStatus } from "./protocol";
+import { parseEngineLists, parseEngineProbe, parseEngineStatus, parseLogTail, type EngineLists, type EnginePolicy, type EngineProbe, type EngineStatus, type LogTail } from "./protocol";
 
 export interface EngineSource {
   readonly kind: "mock" | "tauri";
@@ -27,6 +27,8 @@ export interface EngineSource {
   stopAdguard(): Promise<void>;
   /** Starts AdGuard's service again (Windows asks the user first). */
   startAdguard(): Promise<void>;
+  /** Log rows after `since` from the tail the app keeps in memory. Rejects when it cannot be read. */
+  logTail(since: number): Promise<LogTail>;
 }
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -40,5 +42,6 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     listsRefresh: async () => parseEngineLists(await invoke<unknown>("engine_lists_refresh")),
     stopAdguard: async () => void (await invoke<unknown>("adguard_stop")),
     startAdguard: async () => void (await invoke<unknown>("adguard_start")),
+    logTail: async (since) => parseLogTail(await invoke<unknown>("engine_log_tail", { since })),
   };
 }

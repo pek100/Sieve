@@ -1,13 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
 
 /**
- * The app-hosted DNS filter is unavailable until the engine's slice 4
- * replaces it (2026-10-18; registry `unavailableUntil`, law 11): Settings
- * and Home show no DNS switch, card or tile, settings from an old build
- * never start it, and the read-only safety net (?pointed=1: a Windows
- * adapter that still asks 127.0.0.1 and ::1) points to Windows network
- * settings only. The DNS card's own states are covered by rendering it
- * directly (src/components/sieve/settings/dns-card.test.tsx). Nothing here
+ * The app-hosted DNS filter is gone (engine slice 4): Settings and Home show
+ * no DNS switch, card or tile, settings from an old build start nothing, and
+ * the read-only safety net (?pointed=1: a Windows adapter that still asks
+ * 127.0.0.1 and ::1) points to Windows network settings only. Nothing here
  * touches the machine's DNS: the mock stands in for Rust, and Sieve never
  * changes Windows DNS anyway.
  */
@@ -31,7 +28,7 @@ async function open(page: Page, url: string) {
 async function storedByOldBuild(page: Page, schema: 2 | 3) {
   await page.addInitScript((s) => {
     if (localStorage.getItem("sieve.settings") === null) {
-      localStorage.setItem("sieve.settings", JSON.stringify({ schema: s, values: { "filtering.dns": true, "filtering.systemDns": true } }));
+      localStorage.setItem("sieve.settings", JSON.stringify({ schema: s, values: { "filtering.dns": true, "filtering.systemDns": true, "filtering.upstreams": ["1.1.1.1"] } }));
     }
   }, schema);
 }
@@ -40,29 +37,28 @@ const banner = (page: Page) => page.locator("[data-banner]").filter({ hasText: "
 const noHorizontalScroll = async (page: Page) =>
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
 
-/** Nothing of the DNS filter on this page: no switch, row, card, upstream editor or tile. */
+/** Nothing of the DNS filter on this page: no switch, row, card or tile. */
 async function noDnsFilter(page: Page) {
-  await expect(page.locator('[data-setting="filtering.dns"], [data-setting="filtering.upstreams"], [data-setting="filtering.systemDns"]')).toHaveCount(0);
+  await expect(page.locator('[data-setting="filtering.dns"], [data-setting="filtering.systemDns"]')).toHaveCount(0);
   await expect(page.getByRole("switch", { name: /DNS filtering/ })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "DNS filter" })).toHaveCount(0);
   await expect(page.locator("[data-dns-card], [data-dns-derived], [data-kpi=blocked]")).toHaveCount(0);
-  await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(0);
 }
 
-test.describe("dns filter, hidden until the engine replaces it", () => {
-  test("Settings: no DNS switch or card; Filtering shows the engine", async ({ page }, info) => {
+test.describe("dns filter, gone", () => {
+  test("Settings: no DNS switch or card; Filtering shows the engine and the encrypted upstreams", async ({ page }, info) => {
     const errors = await open(page, SETTINGS);
     const engine = page.getByRole("region", { name: "Engine" });
     await expect(engine).toBeVisible();
     await noDnsFilter(page);
     await expect(page.getByRole("navigation", { name: "Settings sections" }).getByRole("link", { name: "Filtering" })).toBeVisible();
-    // Search does not find the hidden keys.
+    await expect(page.locator('[data-setting="filtering.upstreams"]')).toContainText("https://cloudflare-dns.com/dns-query");
     await page.getByRole("searchbox", { name: "Search settings" }).fill("upstream");
-    await expect(page.getByText("No setting matches")).toBeVisible();
+    await expect(page.locator("[data-setting]")).toHaveCount(1);
     await page.getByRole("searchbox", { name: "Search settings" }).fill("");
     await page.locator("#section-filtering").scrollIntoViewIfNeeded();
     await noHorizontalScroll(page);
-    await page.locator("#section-filtering").screenshot({ path: `test-results/screens/dns-hidden-settings-${info.project.name}.png` });
+    await page.locator("#section-filtering").screenshot({ path: `test-results/screens/dns-gone-settings-${info.project.name}.png` });
     expect(errors).toEqual([]);
   });
 
@@ -75,7 +71,7 @@ test.describe("dns filter, hidden until the engine replaces it", () => {
     expect(await page.locator("body").innerText()).not.toMatch(/\b(ads|trackers|blocked)\b/i);
     await expect(banner(page)).toHaveCount(0);
     await noHorizontalScroll(page);
-    await page.getByRole("group", { name: "Right now" }).screenshot({ path: `test-results/screens/dns-hidden-home-${info.project.name}.png` });
+    await page.getByRole("group", { name: "Right now" }).screenshot({ path: `test-results/screens/dns-gone-home-${info.project.name}.png` });
     await tile.getByRole("link", { name: "Details in Settings" }).click();
     await expect(page).toHaveURL(/\/settings\/#engine$/);
     await expect(page.getByRole("region", { name: "Engine" })).toBeInViewport();
@@ -86,11 +82,10 @@ test.describe("dns filter, hidden until the engine replaces it", () => {
     const errors = await open(page, `${HOME}&pointed=1`);
     await expect(banner(page)).toHaveCount(1);
     await expect(banner(page)).toContainText(STRANDED);
-    // No action: nothing in Sieve turns a DNS filter on, and Sieve never changes Windows DNS.
+    // No action: Sieve never changes Windows DNS.
     await expect(banner(page).getByRole("button", { name: /Turn DNS filtering on|Point Windows|Restore my DNS/ })).toHaveCount(0);
     await noHorizontalScroll(page);
     await banner(page).screenshot({ path: `test-results/screens/dns-safety-home-${info.project.name}.png` });
-    // Settings has no DNS card to repeat it.
     await page.getByRole("link", { name: "Settings", exact: true }).click();
     await expect(page.getByRole("region", { name: "Engine" })).toBeVisible();
     await noDnsFilter(page);
@@ -98,18 +93,19 @@ test.describe("dns filter, hidden until the engine replaces it", () => {
   });
 
   for (const schema of [2, 3] as const) {
-    test(`settings from a schema ${schema} build with DNS filtering on: the filter never starts, Home never says blocked`, async ({ page }) => {
+    test(`settings from a schema ${schema} build with DNS filtering on: nothing starts, Home never says blocked`, async ({ page }) => {
       await storedByOldBuild(page, schema);
       const errors = await open(page, `${HOME}&pointed=1`);
       await expect(page.locator('section[data-kpi="engine"]')).toHaveAttribute("aria-label", "Engine");
-      // Nothing answers on loopback (the filter did not start): the safety banner says so.
+      // Nothing answers on loopback: the safety banner says so.
       await expect(banner(page)).toContainText(STRANDED);
       await noDnsFilter(page);
       expect(await page.locator("body").innerText()).not.toMatch(/\b(ads|trackers|blocked)\b/i);
-      // The stored document reads through the migration: the switch is off and stays out of sight.
+      // The stored document reads through the migration: the bare upstream is gone.
       await page.getByRole("link", { name: "Settings", exact: true }).click();
       await expect(page.getByRole("region", { name: "Engine" })).toBeVisible();
       await noDnsFilter(page);
+      await expect(page.locator('[data-setting="filtering.upstreams"]')).not.toContainText("1.1.1.1");
       expect(errors).toEqual([]);
     });
   }

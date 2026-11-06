@@ -2,8 +2,8 @@
  * Home KPIs from snapshots (pure). Three counts of what the machine is doing
  * now, each with its change since the start of the chart window: sieved
  * apps with connections, connections and remote hosts. They never claim
- * filtering. The fourth Home tile (blocked lookups) is not derived from
- * snapshots: it is the DNS filter's own counter (src/core/dns.ts).
+ * filtering. The fourth Home tile is not derived from snapshots: it is the
+ * engine's state (src/core/engine.ts).
  *
  * Callers pass tracked snapshots (apps.trackedSnapshot), so apps the user
  * turned off are not in any count.

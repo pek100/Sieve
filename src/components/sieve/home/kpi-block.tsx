@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 import { SectionIcon, type SectionIconTone } from "@/components/sieve/primitives/section-icon";
 import { CardBoundary } from "@/components/sieve/shell/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ENGINE_HREF, ENGINE_STATE_TEXT, enginePhase } from "@/core/engine";
+import { ENGINE_HREF, ENGINE_STATE_TEXT, enginePhase, engineRoutes } from "@/core/engine";
 import type { DeltaDir, Kpi, KpiId } from "@/core/kpis";
 import { useEngine } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
@@ -71,18 +71,17 @@ function Tile({ id, kpi, phase }: { id: KpiId; kpi: Kpi | null; phase: "loading"
 
 /**
  * The engine tile: what Sieve's filtering engine is, from facts only (the
- * engine controller's probe: Not installed, Not running, Installed, not
- * filtering, ...), with the way to Settings > Engine. It replaced the DNS
- * filter's tile on 2026-10-18, when the app-hosted DNS filter became
- * unavailable until the engine's slice 4. It says nothing about blocking:
- * nothing Home shows is blocked until the engine filters.
+ * engine controller's probe: Not installed, Not running, Routing traffic,
+ * Filtering hosts, ...), with the way to Settings > Engine. It says nothing
+ * about what was blocked (Home's copy law): the Engine block and the Log do.
  */
 function EngineTile() {
-  const phase = enginePhase(useEngine());
+  const e = useEngine();
+  const phase = enginePhase(e);
   return (
     <section aria-label="Engine" data-kpi="engine" data-engine-phase={phase} className="flex min-w-0 flex-col text-on-surface">
       <p data-kpi-label="" className="flex h-(--section-header-h) items-center gap-2 text-label text-on-surface-muted">
-        <SectionIcon size={16} tone={phase === "routing" ? "mint" : "neutral"}>
+        <SectionIcon size={16} tone={engineRoutes(e) ? "mint" : "neutral"}>
           <Cpu strokeWidth={1.75} />
         </SectionIcon>
         Engine

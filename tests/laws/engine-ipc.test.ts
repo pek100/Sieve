@@ -7,8 +7,10 @@
  * Changing a message shape bumps PROTOCOL and the fixture in one commit.
  */
 import { describe, expect, it } from "vitest";
+import { REASON_TEXT } from "@/core/log";
 import fixture from "@/data/fixtures/engine-ipc-v3.json";
-import { BLOCKER_KINDS, parseEngineLists, parseEngineStatus } from "@/data/protocol";
+import logFixture from "@/data/fixtures/engine-log-v1.json";
+import { BLOCKER_KINDS, LOG_OUTCOMES, parseEngineLists, parseEngineStatus, parseLogTail } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -31,6 +33,27 @@ describe("engine IPC law", () => {
     expect(fixture.pipe).toBe(rustConst("PIPE_NAME").replace(/^r"|"$/g, ""));
     expect(fixture.flowsBatchMs).toBe(Number(rustConst("FLOWS_BATCH_MS")));
     expect(fixture.flowsPerFrame).toBe(Number(rustConst("FLOWS_PER_FRAME")));
+    expect(fixture.logPerFrame).toBe(Number(rustConst("LOG_PER_FRAME")));
+    expect(fixture.logUrlMax).toBe(Number(rustConst("LOG_URL_MAX")));
+    expect(fixture.logRuleMax).toBe(Number(rustConst("LOG_RULE_MAX")));
+  });
+
+  it("the crate's log outcome kinds are the app's, and the app reads every fixture row", () => {
+    const crate = (RUST.match(/pub enum LogOutcome \{([\s\S]*?)\n\}/)?.[1] ?? "").match(/^\s{4}(\w+)\b/gm) ?? [];
+    const snake = crate.map((v) => v.trim().replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()));
+    expect(snake).toEqual([...LOG_OUTCOMES]);
+    expect([...new Set(fixture.outcomes.map((o) => o.kind))]).toEqual([...LOG_OUTCOMES]);
+    const rows = fixture.engine.find((m) => m.type === "log")!.rows!;
+    const tail = parseLogTail({ v: 1, next: rows.length, dropped: 0, rows: rows.map((row, i) => ({ seq: i + 1, row })) });
+    expect(tail.skipped).toBe(0);
+    expect(tail.rows.map((e) => e.row)).toEqual(rows);
+  });
+
+  it("every reason in the fixtures has words in the app", () => {
+    const logRows = parseLogTail(logFixture).rows.map((e) => e.row.outcome);
+    const reasons = [...fixture.outcomes, ...logRows].flatMap((o) => ("reason" in o && o.reason ? [o.reason] : []));
+    expect(reasons.length).toBeGreaterThan(0);
+    for (const reason of reasons) expect(REASON_TEXT, reason).toHaveProperty(reason);
   });
 
   it("the app reads the engine's status and every blocker kind the crate declares", () => {

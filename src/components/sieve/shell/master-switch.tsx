@@ -21,8 +21,7 @@ function clock(ms: number): string {
 
 /**
  * The master switch: the global Sieving state (policy GLOBAL_SWITCH). Off
- * pauses sampling and puts DNS filtering into pass-through. The one glow in
- * the UI breathes around it while it is on.
+ * pauses sampling. The one glow in the UI breathes around it while it is on.
  *
  * It is also the window's one status: there is no separate status chip (the
  * switch beside it said the same thing). `data-phase` carries the sampling

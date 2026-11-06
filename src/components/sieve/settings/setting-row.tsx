@@ -113,8 +113,8 @@ export function SettingRow({
     case "map":
     case "list":
       control = (
-        <div className="flex items-center gap-2">
-          <span className="text-label text-on-surface-muted tabular">{formatValue(k, value)}</span>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="min-w-0 text-label text-on-surface-muted tabular break-words">{formatValue(k, value)}</span>
           {!same(value, defaultValue(k)) && (
             // Back to the default: "Clear" when the default is empty, "Reset" when it has entries.
             <Button
@@ -153,7 +153,7 @@ export function SettingRow({
         </p>
         {lock && <LockNote lock={lock} />}
       </div>
-      <div className="flex shrink-0 items-center">{control}</div>
+      <div className="flex max-w-full min-w-0 items-center">{control}</div>
     </div>
   );
 }

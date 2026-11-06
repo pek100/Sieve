@@ -7,18 +7,17 @@ import { createNoticeBus, type NoticeBus } from "@/core/notices";
 import { offKeys } from "@/core/policy";
 import { createStore, phase, type SieveStore } from "@/core/store";
 import { trayState } from "@/core/tray";
-import { tauriDesktop, type Desktop } from "@/data/desktop";
+import { browserPages, tauriDesktop, tauriPages, type Desktop, type Pages } from "@/data/desktop";
 import { createPoller, realClock, type Clock, type Poller } from "@/data/poller";
 import { createSettingsStore, localBackend, memoryBackend, tauriBackend, type SettingsBackend, type SettingsStore } from "@/data/settings-store";
 import { createPassedChecks, type PassedChecks } from "@/core/checks";
-import { createDnsController, type DnsController } from "@/data/dns-controller";
-import { createMockDns } from "@/data/dns-mock";
-import type { DnsSource } from "@/data/dns-source";
 import { createEngineController, type EngineController } from "@/data/engine-controller";
 import { createMockEngine } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
+import { createLogController, type LogController } from "@/data/log-controller";
 import { createMockSource } from "@/data/mock-source";
-import { createDnsSource, createEngineSource, createSource, isTauriWindow, sourceOptions, type SieveSource } from "@/data/source";
+import { createMockWindowsDns, createSafetyNet, type SafetyNet, type WindowsDnsSource } from "@/data/safety-net";
+import { createEngineSource, createSource, createWindowsDnsSource, isTauriWindow, sourceOptions, type SieveSource } from "@/data/source";
 
 export interface Runtime {
   readonly isTauri: boolean;
@@ -27,20 +26,22 @@ export interface Runtime {
   readonly poller: Poller;
   readonly settings: SettingsStore;
   readonly notices: NoticeBus;
-  /** Live checks (by settings key of their data switch) that passed this session. Written by the DNS controller. */
+  /** Live checks (by settings key of their data switch) that passed this session. Written by the engine controller. */
   readonly passedChecks: PassedChecks;
   /** The window's clock (the poller's): "now" for history queries. Injected in tests. */
   readonly clock: Clock;
   /** Tray and launch at startup; null outside the desktop app. */
   readonly desktop: Desktop | null;
-  /** The DNS seam (Tauri commands or the mock). */
-  readonly dns: DnsSource;
-  /** The one owner of DNS state; components call its actions through hooks. */
-  readonly dnsController: DnsController;
+  /** Opens public pages and says Sieve's version. Injected in tests. */
+  readonly pages: Pages;
+  /** The read-only safety net: it reads Windows DNS and keeps its banner true. */
+  readonly safetyNet: SafetyNet;
   /** The engine seam (the Tauri commands or the mock). */
   readonly engine: EngineSource;
   /** The one owner of the store's engine part. */
   readonly engineController: EngineController;
+  /** The one owner of the store's log part. */
+  readonly logController: LogController;
 }
 
 export interface RuntimeOptions {
@@ -49,8 +50,10 @@ export interface RuntimeOptions {
   clock?: Clock;
   isTauri?: boolean;
   desktop?: Desktop | null;
-  /** Default: the mock DNS, scenario off. */
-  dns?: DnsSource;
+  /** Default: the browser's. */
+  pages?: Pages;
+  /** Default: the mock's own Windows DNS, nothing pointed. */
+  windowsDns?: WindowsDnsSource;
   /** Default: the mock engine, not installed. */
   engine?: EngineSource;
 }
@@ -62,7 +65,6 @@ export function createRuntime(o: RuntimeOptions): Runtime {
   const notices = createNoticeBus();
   const passedChecks = createPassedChecks();
   const desktop = o.desktop ?? null;
-  const dns = o.dns ?? createMockDns({ seed: 1, now: clock.now });
   const engine = o.engine ?? createMockEngine();
   return {
     isTauri: o.isTauri ?? false,
@@ -74,17 +76,11 @@ export function createRuntime(o: RuntimeOptions): Runtime {
     passedChecks,
     clock,
     desktop,
-    dns,
-    dnsController: createDnsController({
-      dns,
-      store,
-      settings,
-      notices,
-      checks: passedChecks,
-      clock,
-    }),
+    pages: o.pages ?? browserPages(),
+    safetyNet: createSafetyNet({ source: o.windowsDns ?? createMockWindowsDns(), notices, clock }),
     engine,
     engineController: createEngineController({ engine, store, clock, settings, checks: passedChecks, notices }),
+    logController: createLogController({ engine, store, clock }),
   };
 }
 
@@ -99,24 +95,30 @@ export function createBrowserRuntime(): Runtime {
   let settings: SettingsStore | null = null;
   const rt = createRuntime({
     source: createSource(options, () => offKeys(settings?.get("apps.levels") ?? {})),
-    dns: createDnsSource(options),
+    windowsDns: createWindowsDnsSource(options),
     engine: createEngineSource(options),
     settings: isTauri ? tauriBackend() : localBackend(),
     isTauri,
     desktop: isTauri ? tauriDesktop() : null,
+    pages: isTauri ? tauriPages() : browserPages(),
   });
   settings = rt.settings;
   return rt;
 }
 
-/** Run the DNS controller (load, follow the switches, poll, the read-only safety net). Returns the undo. */
-export function bindDns(rt: Runtime): () => void {
-  return rt.dnsController.bind();
+/** Run the read-only safety net (read Windows DNS now and on its cadence, keep its banner true). Returns the undo. */
+export function bindSafetyNet(rt: Runtime): () => void {
+  return rt.safetyNet.bind();
 }
 
 /** Run the engine controller (probe now and on its cadence, follow the engine switch). Returns the undo. */
 export function bindEngine(rt: Runtime): () => void {
   return rt.engineController.bind();
+}
+
+/** Run the log controller (read the engine's log tail while the engine routes). Returns the undo. */
+export function bindLog(rt: Runtime): () => void {
+  return rt.logController.bind();
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));

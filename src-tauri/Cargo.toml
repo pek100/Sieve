@@ -24,12 +24,11 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
+# Opens a list's public issue page in the default browser (Report a broken site).
+tauri-plugin-opener = "2"
 
-# DNS filter engine (src/dns): message parsing, the proxy's sockets and
-# the runtime list download (OS TLS stack, no bundled crypto).
-hickory-proto = "0.26"
+# The pipe to the engine (src/engine.rs): named pipes, frames, timeouts.
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
-reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
 # The engine's pipe protocol (src/engine.rs), shared with the engine workspace.
 sieve-ipc = { path = "../engine/crates/sieve-ipc", features = ["tokio"] }
@@ -44,8 +43,7 @@ tempfile = "3"
 # the IP Helper owner-pid tables, process image names and file version info
 # (slice S1); the service list, for the service names of a process whose exe
 # Windows hides (EnumServicesStatusExW with SC_MANAGER_ENUMERATE_SERVICE, no
-# admin); the process list (adguard); adapter DNS servers
-# (GetAdaptersAddresses, windns); app icons (icons:
+# admin); adapter DNS servers (GetAdaptersAddresses, windns); app icons (icons:
 # SHCreateItemFromParsingName and IShellItemImageFactory under COM, the
 # bitmap read with GetDIBits).
 [target.'cfg(windows)'.dependencies]
@@ -57,7 +55,6 @@ windows = { version = "0.62", features = [
     "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
-    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",

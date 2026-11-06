@@ -15,7 +15,8 @@
 //!   [`EngineMessage::DnsUpstreams`], the list the engine then holds.
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
 //!   commit (v3, the wave after slice 3: blocked flows, the grown policy, the
-//!   list report, forwarded flows and guests, and the streams after them).
+//!   list report, forwarded flows and guests, the `log` message and the status's filter
+//!   facts).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -55,11 +56,20 @@ pub const VM_UNIDENTIFIED: &str = "unidentified";
 pub fn vm_key(vm: Option<&str>) -> String {
     format!("vm:{}", vm.map_or_else(|| VM_UNIDENTIFIED.to_string(), str::to_lowercase))
 }
+/// At most this many log rows per `log` frame; [`log_frames`] splits a larger
+/// batch, and sooner when the rows' encoded size says so.
+pub const LOG_PER_FRAME: usize = 200;
+/// The engine truncates a row's URL and rule to these many raw bytes. They bound
+/// one row, not a frame: JSON escaping can make a byte six on the wire, so 200
+/// rows at the caps can pass [`MAX_FRAME`]. [`log_frames`] is what keeps a frame
+/// within it.
+pub const LOG_URL_MAX: usize = 2048;
+pub const LOG_RULE_MAX: usize = 1024;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
 pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams"];
 /// The `type` names of [`EngineMessage`], in declaration order.
-pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams"];
+pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log"];
 /// A flow event's rule text is cut to this many bytes: a list rule can run to
 /// kilobytes, and at this cap a full `flows` frame stays under [`MAX_FRAME`].
 pub const MAX_RULE_BYTES: usize = 256;
@@ -113,6 +123,10 @@ pub enum EngineMessage {
     Lists { lists: Vec<ListStatus>, compile_ms: Option<u64> },
     /// The encrypted DNS resolvers the engine holds.
     DnsUpstreams(DnsUpstreams),
+    /// What the filter did since the last batch, on the Subscribe connection,
+    /// session scoped like flows (plan 8.3). Built with [`log_frames`]: a frame
+    /// refused as too large would end the stream, flows included.
+    Log { rows: Vec<LogRow> },
 }
 
 /// The encrypted DNS resolvers as the engine holds them (`dns.json`). The
@@ -286,6 +300,34 @@ pub struct EngineStatus {
     /// VMs whose traffic was seen since the engine started: named rows by
     /// key, then the unidentified row.
     pub guests: Vec<Guest>,
+    /// What it filters with; None until it holds compiled lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterFacts>,
+}
+
+/// What the engine filters with, as the app shows it. The catalogue stays in
+/// `sieve-filter`, which the app does not link; only its facts cross the pipe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilterFacts {
+    pub lists: Vec<ListFact>,
+    /// The resource library's pin (plan 8.4).
+    pub resource_pin: Option<String>,
+}
+
+/// One filter list as the engine compiled it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListFact {
+    /// The catalogue's id.
+    pub id: String,
+    pub title: String,
+    /// The list's public project page; its issue page derives from it.
+    pub homepage: String,
+    /// The list's own `! Version:`.
+    pub version: Option<String>,
+    pub applied: u64,
+    pub skipped: u64,
 }
 
 /// A flow that matched a NAT session exactly on its whole tuple: a guest's,
@@ -418,6 +460,85 @@ pub fn app_key(product: Option<&str>, exe: Option<&str>, process_name: &str) -> 
     product.or(exe.map(exe_stem)).unwrap_or(process_name).to_lowercase()
 }
 
+/// What the filter did with one request or flow (plan 8.3). A reason is a
+/// slug the app turns into words; later slices add reasons with no bump.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LogOutcome {
+    Blocked,
+    Redirected,
+    ParamsRemoved,
+    Hidden { elements: u32 },
+    Scriptlets { count: u32 },
+    Passed { reason: String },
+    NotDecrypted { reason: String },
+}
+
+/// One row of the filtering log. A host-level row leaves `url` and
+/// `request_type` null.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogRow {
+    /// Unique for the engine's run.
+    pub id: u64,
+    /// When, ms since the Unix epoch.
+    pub t: u64,
+    pub flow_id: u64,
+    pub pid: Option<u32>,
+    pub exe: Option<String>,
+    pub session: Option<u32>,
+    pub kind: FlowKind,
+    /// The name, else the remote IP.
+    pub host: String,
+    /// The far end, `ip:port` (`[v6]:port`).
+    pub remote: String,
+    /// At most [`LOG_URL_MAX`] bytes.
+    pub url: Option<String>,
+    pub request_type: Option<String>,
+    pub outcome: LogOutcome,
+    /// At most [`LOG_RULE_MAX`] bytes.
+    pub rule: Option<String>,
+    /// A catalogue id, or `user`.
+    pub list: Option<String>,
+}
+
+/// A batch of rows as the `log` messages to send.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LogFrames {
+    /// In the batch's order, each encoding to at most [`MAX_FRAME`] and holding
+    /// at most [`LOG_PER_FRAME`] rows.
+    pub messages: Vec<EngineMessage>,
+    /// Rows left out because one alone is over [`MAX_FRAME`]: only a row that
+    /// skipped the caps. The caller says so; the stream goes on.
+    pub oversized: usize,
+}
+
+/// Splits rows by their encoded size, which is what [`MAX_FRAME`] limits.
+pub fn log_frames(rows: &[LogRow]) -> Result<LogFrames, FrameError> {
+    const SEPARATOR: usize = b",".len();
+    let empty = serde_json::to_vec(&EngineMessage::Log { rows: Vec::new() })?.len();
+    let mut frames = LogFrames::default();
+    let mut current: Vec<LogRow> = Vec::new();
+    let mut size = empty;
+    for row in rows {
+        let len = serde_json::to_vec(row)?.len();
+        if empty + len > MAX_FRAME {
+            frames.oversized += 1;
+            continue;
+        }
+        if !current.is_empty() && (current.len() == LOG_PER_FRAME || size + SEPARATOR + len > MAX_FRAME) {
+            frames.messages.push(EngineMessage::Log { rows: std::mem::take(&mut current) });
+            size = empty;
+        }
+        size += len + if current.is_empty() { 0 } else { SEPARATOR };
+        current.push(row.clone());
+    }
+    if !current.is_empty() {
+        frames.messages.push(EngineMessage::Log { rows: current });
+    }
+    Ok(frames)
+}
+
 /// The engine's answer to a client's Hello.
 pub fn answer_hello(client_protocol: u32, engine_version: &str, session_id: u32) -> EngineMessage {
     let [min, max] = SUPPORTED;
@@ -528,6 +649,9 @@ mod tests {
         assert_eq!(f["maxFrame"], MAX_FRAME);
         assert_eq!(f["flowsBatchMs"], FLOWS_BATCH_MS);
         assert_eq!(f["flowsPerFrame"], FLOWS_PER_FRAME);
+        assert_eq!(f["logPerFrame"], LOG_PER_FRAME);
+        assert_eq!(f["logUrlMax"], LOG_URL_MAX);
+        assert_eq!(f["logRuleMax"], LOG_RULE_MAX);
         assert_eq!(types(&f["client"]), CLIENT_TYPES);
         assert_eq!(types(&f["engine"]), ENGINE_TYPES);
     }
@@ -574,6 +698,7 @@ mod tests {
             EngineMessage::Flows { .. } => "flows",
             EngineMessage::Lists { .. } => "lists",
             EngineMessage::DnsUpstreams(_) => "dns_upstreams",
+            EngineMessage::Log { .. } => "log",
         };
         let f = fixture();
         for m in f["client"].as_array().unwrap() {
@@ -720,6 +845,147 @@ mod tests {
         };
         let msg = EngineMessage::Lists { lists: vec![list; LISTS_AT_WORST], compile_ms: Some(u64::MAX) };
         assert!(encode(&msg).is_ok(), "{:?}", encode(&msg).err());
+    }
+
+    /// Every outcome kind round trips, so the TS law sees each wire name, and
+    /// a new variant fails here until it has a fixture example.
+    #[test]
+    fn every_fixture_outcome_round_trips_and_every_kind_is_shown() {
+        let f = fixture();
+        let outcomes = f["outcomes"].as_array().unwrap();
+        let name = |o: &LogOutcome| match o {
+            LogOutcome::Blocked => "blocked",
+            LogOutcome::Redirected => "redirected",
+            LogOutcome::ParamsRemoved => "params_removed",
+            LogOutcome::Hidden { .. } => "hidden",
+            LogOutcome::Scriptlets { .. } => "scriptlets",
+            LogOutcome::Passed { .. } => "passed",
+            LogOutcome::NotDecrypted { .. } => "not_decrypted",
+        };
+        let mut seen = Vec::new();
+        for o in outcomes {
+            let parsed: LogOutcome = serde_json::from_value(o.clone()).unwrap();
+            assert_eq!(&serde_json::to_value(&parsed).unwrap(), o);
+            assert_eq!(name(&parsed), o["kind"]);
+            seen.push(name(&parsed));
+        }
+        seen.dedup();
+        assert_eq!(seen, ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted"]);
+    }
+
+    /// The status's filter facts are additive: without them the wire is as
+    /// before, so a status with none round trips with no `filter` key.
+    #[test]
+    fn filter_facts_are_absent_until_the_engine_holds_lists() {
+        let none = serde_json::to_value(EngineMessage::Status(EngineStatus::default())).unwrap();
+        assert!(none.get("filter").is_none());
+        let facts = FilterFacts {
+            lists: vec![ListFact { id: "a".into(), title: "A".into(), homepage: "https://a.example/a".into(), version: None, applied: 1, skipped: 0 }],
+            resource_pin: Some("sha256:0".into()),
+        };
+        let some = EngineMessage::Status(EngineStatus { filter: Some(facts), ..EngineStatus::default() });
+        let wire = serde_json::to_value(&some).unwrap();
+        assert_eq!(wire["filter"]["lists"][0]["homepage"], "https://a.example/a");
+        assert_eq!(serde_json::from_value::<EngineMessage>(wire).unwrap(), some);
+    }
+
+    /// A row at every cap, its URL and rule made of `url` and `rule` repeated.
+    fn log_row_at_caps(url: char, rule: char) -> LogRow {
+        LogRow {
+            id: u64::MAX,
+            t: u64::MAX,
+            flow_id: u64::MAX,
+            pid: Some(u32::MAX),
+            exe: Some(format!(r"C:\{}\app.exe", "d".repeat(250))),
+            session: Some(u32::MAX),
+            kind: FlowKind::Tls,
+            host: "h".repeat(253),
+            remote: "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535".into(),
+            url: Some(url.to_string().repeat(LOG_URL_MAX)),
+            request_type: Some("xmlhttprequest".into()),
+            outcome: LogOutcome::NotDecrypted { reason: "r".repeat(64) },
+            rule: Some(rule.to_string().repeat(LOG_RULE_MAX)),
+            list: Some("adguard-url-tracking".into()),
+        }
+    }
+
+    fn rows_of(frames: &LogFrames) -> Vec<LogRow> {
+        frames.messages.iter().flat_map(|m| match m {
+            EngineMessage::Log { rows } => rows.clone(),
+            other => panic!("not a log message: {other:?}"),
+        }).collect()
+    }
+
+    /// Every frame encodes and holds what the limits allow, and no frame could
+    /// have taken the next one's first row: nothing lost, nothing split early.
+    fn assert_split_exactly(rows: &[LogRow], frames: &LogFrames) {
+        assert_eq!(rows_of(frames), rows);
+        let batches: Vec<&Vec<LogRow>> = frames.messages.iter().map(|m| match m {
+            EngineMessage::Log { rows } => rows,
+            other => panic!("not a log message: {other:?}"),
+        }).collect();
+        for (i, batch) in batches.iter().enumerate() {
+            assert!(!batch.is_empty());
+            assert!(batch.len() <= LOG_PER_FRAME);
+            let body = encode(&frames.messages[i]).unwrap().len() - 4;
+            assert!(body <= MAX_FRAME, "{body}");
+            if let Some(next) = batches.get(i + 1) {
+                let next_row = serde_json::to_vec(&next[0]).unwrap().len();
+                assert!(batch.len() == LOG_PER_FRAME || body + 1 + next_row > MAX_FRAME, "frame {i} of {body} bytes split early");
+            }
+        }
+    }
+
+    #[test]
+    fn plain_rows_at_the_caps_fill_one_frame_by_count() {
+        let rows = vec![log_row_at_caps('u', 'r'); LOG_PER_FRAME];
+        let frames = log_frames(&rows).unwrap();
+        assert_eq!(frames.messages.len(), 1);
+        assert_split_exactly(&rows, &frames);
+
+        let rows = vec![log_row_at_caps('u', 'r'); LOG_PER_FRAME + 1];
+        let frames = log_frames(&rows).unwrap();
+        assert_eq!(frames.messages.len(), 2);
+        assert_split_exactly(&rows, &frames);
+    }
+
+    /// The raw caps do not bound a frame: escaping does the rest, up to six
+    /// bytes for one. Sent whole these are refused, and that would end the stream.
+    #[test]
+    fn rows_that_escape_at_the_caps_split_by_encoded_size() {
+        for (url, rule, parts) in [('\\', 'r', 2), ('\\', '\\', 2), ('\u{1}', 'r', 3), ('\u{1}', '\u{1}', 4)] {
+            let rows = vec![log_row_at_caps(url, rule); LOG_PER_FRAME];
+            assert!(matches!(encode(&EngineMessage::Log { rows: rows.clone() }), Err(FrameError::TooLarge(_))));
+            let frames = log_frames(&rows).unwrap();
+            assert_eq!(frames.messages.len(), parts, "{url:?} {rule:?}");
+            assert_eq!(frames.oversized, 0);
+            assert_split_exactly(&rows, &frames);
+        }
+    }
+
+    #[test]
+    fn a_row_too_large_alone_is_counted_and_the_rest_still_go() {
+        let plain = log_row_at_caps('u', 'r');
+        let huge = LogRow { url: Some("u".repeat(MAX_FRAME)), ..plain.clone() };
+        let frames = log_frames(&[plain.clone(), huge, plain.clone()]).unwrap();
+        assert_eq!(frames.oversized, 1);
+        assert_split_exactly(&[plain.clone(), plain], &frames);
+    }
+
+    #[test]
+    fn no_rows_are_no_frames() {
+        assert_eq!(log_frames(&[]).unwrap(), LogFrames::default());
+    }
+
+    /// A row that just fits alone is sent: the limit is on the body, inclusive.
+    #[test]
+    fn a_frame_of_exactly_the_limit_goes() {
+        let mut row = log_row_at_caps('u', 'r');
+        let overhead = encode(&EngineMessage::Log { rows: vec![row.clone()] }).unwrap().len() - 4 - LOG_URL_MAX;
+        row.url = Some("u".repeat(MAX_FRAME - overhead));
+        let frames = log_frames(std::slice::from_ref(&row)).unwrap();
+        assert_eq!(frames.oversized, 0);
+        assert_eq!(encode(&frames.messages[0]).unwrap().len() - 4, MAX_FRAME);
     }
 
     #[test]

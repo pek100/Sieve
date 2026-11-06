@@ -297,6 +297,7 @@ impl Backend for Engine {
             split_tunnels: f.split_tunnels,
             counters: self.meters.counters(),
             guests,
+            filter: None,
         }
     }
 

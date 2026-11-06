@@ -1,7 +1,9 @@
 "use client";
 
-import { Check, Copy, Trash2 } from "lucide-react";
+import { Bug, Check, Copy, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { ReportDialog } from "@/components/sieve/log/report-dialog";
+import { CardBoundary } from "@/components/sieve/shell/card";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -131,6 +133,7 @@ function RemoteHosts({ flows }: { flows: Flow[] }) {
 function Detail({ app, actions }: { app: AppEntry; actions: RowActions }) {
   const on = actions.isOn(app.key);
   const pids = app.pids.length;
+  const [report, setReport] = useState(false);
   return (
     <div className="flex flex-col gap-6 overflow-y-auto px-5 pb-6">
       <Section title="Sieve">
@@ -170,14 +173,21 @@ function Detail({ app, actions }: { app: AppEntry; actions: RowActions }) {
         <RemoteHosts flows={app.flows} />
       </Section>
 
-      {app.pinnedPaths.length > 0 && (
-        <div>
+      <div className="flex flex-wrap gap-2">
+        <Button variant="secondary" onClick={() => setReport(true)}>
+          <Bug strokeWidth={1.75} />
+          Report a broken site
+        </Button>
+        {app.pinnedPaths.length > 0 && (
           <Button variant="destructive" onClick={() => actions.unpin(app.key)}>
             <Trash2 strokeWidth={1.75} />
             Remove from my apps
           </Button>
-        </div>
-      )}
+        )}
+      </div>
+      <CardBoundary title="Report a broken site">
+        <ReportDialog seed={report ? { url: null, exe: iconExe(app) } : null} onClose={() => setReport(false)} />
+      </CardBoundary>
     </div>
   );
 }

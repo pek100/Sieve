@@ -1,11 +1,12 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { DNS_SWITCH, STRANDED_DNS_TEXT } from "@/core/dns";
+import { STRANDED_DNS_TEXT } from "@/core/dns";
 import { OTHER_KEY, SERIES_COUNT } from "@/core/series";
-import { createMockDns } from "@/data/dns-mock";
+import { createMockEngine } from "@/data/engine-mock";
 import { createMockSource } from "@/data/mock-source";
 import type { Clock } from "@/data/poller";
+import { createMockWindowsDns } from "@/data/safety-net";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
@@ -165,8 +166,7 @@ const CLAIMS = /\b(ads|trackers|blocked)\b/i;
 
 describe("home copy and KPIs", () => {
   it("law: Home never says ads, trackers or blocked; the fourth tile is the engine, from facts, linking to Settings > Engine", async () => {
-    const { runtime } = await setup();
-    expect(runtime.store.getState().dns.status?.running).toBe(false);
+    await setup();
     expect(document.body.textContent ?? "").not.toMatch(CLAIMS);
     const group = screen.getByRole("group", { name: "Right now" });
     const tiles = group.querySelectorAll("section[data-kpi]");
@@ -177,7 +177,7 @@ describe("home copy and KPIs", () => {
     }
     // The apps count is isSieved (effectively on, with a connection): sieved apps, and its label says so.
     expect(group.querySelector('section[data-kpi="apps"]')).toHaveAttribute("aria-label", "Sieved apps");
-    // No DNS filter tile: the DNS filter is unavailable until the engine replaces it.
+    // No DNS filter tile: the app-hosted filter is gone.
     expect(group.querySelector('[data-kpi="blocked"], [data-dns-derived]')).toBeNull();
     expect(screen.queryByText(/DNS filter/)).toBeNull();
     const engine = group.querySelector<HTMLElement>('section[data-kpi="engine"]')!;
@@ -195,14 +195,31 @@ describe("home copy and KPIs", () => {
     for (const t of tiles) expect(t.className).not.toMatch(/\b(bg-|shadow-|rounded|border|p-\d)/);
   });
 
-  it("law, settings from an old build with DNS filtering on: the filter never starts, Home never says blocked, the safety banner points to Windows only", async () => {
+  it("law, the engine filtering hosts: Home says the state and never says blocked", async () => {
+    const runtime = createRuntime({
+      source: createMockSource({ seed: 1 }),
+      settings: memoryBackend({ schema: 5, values: { "filtering.engine": true } }),
+      engine: createMockEngine("hosts"),
+    });
+    render(
+      <SieveProvider runtime={runtime}>
+        <HomeScreen />
+      </SieveProvider>,
+    );
+    const engine = () => screen.getByRole("group", { name: "Right now" }).querySelector<HTMLElement>('section[data-kpi="engine"]')!;
+    await vi.waitFor(() => expect(engine()).toHaveAttribute("data-engine-phase", "filtering"));
+    expect(within(engine()).getByText("Filtering hosts")).toBeInTheDocument();
+    expect(document.body.textContent ?? "").not.toMatch(CLAIMS);
+  });
+
+  it("law, settings from an old build with DNS filtering on: nothing starts, Home never says blocked, the safety banner points to Windows only", async () => {
     const fc = fakeClock();
     const runtime = createRuntime({
       source: createMockSource({ seed: 1, now: fc.clock.now }),
-      settings: memoryBackend({ schema: 3, values: { [DNS_SWITCH]: true } }),
+      settings: memoryBackend({ schema: 3, values: { "filtering.dns": true } }),
       clock: fc.clock,
-      // An adapter asks 127.0.0.1 and ::1 (left by an old build), so a running filter would get lookups.
-      dns: createMockDns({ seed: 1, pointed: true, now: fc.clock.now }),
+      // An adapter asks 127.0.0.1 and ::1 (left by an old build).
+      windowsDns: createMockWindowsDns({ pointed: true }),
     });
     render(
       <SieveProvider runtime={runtime}>
@@ -214,8 +231,6 @@ describe("home copy and KPIs", () => {
       await fc.flush();
     });
     await act(() => fc.advance(20_000));
-    expect(runtime.settings.get(DNS_SWITCH)).toBe(false);
-    expect(runtime.store.getState().dns.status?.running).toBe(false);
     const banner = runtime.notices.list().find((n) => n.surface === "banner");
     expect(banner?.text).toBe(STRANDED_DNS_TEXT);
     expect(banner?.action).toBeUndefined();
@@ -314,7 +329,7 @@ describe("home history periods", () => {
       const line = chart().querySelector('path[data-part="line"]')!.getAttribute("d")!;
       expect(line.split("L").length).toBeGreaterThan(80);
     }
-    // Three snapshot numbers; the DNS tile says Off while the filter is off.
+    // Three snapshot numbers; the Engine tile has none.
     expect(document.querySelectorAll("section[data-kpi] [data-numeric]")).toHaveLength(3);
   });
 
@@ -345,7 +360,7 @@ describe("home states", () => {
     expect(within(chart()).getByRole("alert")).toHaveTextContent(/scenario error/);
     const tiles = screen.getByRole("group", { name: "Right now" });
     expect(tiles.textContent).not.toMatch(/\d/);
-    // The three snapshot tiles; the DNS tile does not depend on the snapshot source.
+    // The three snapshot tiles; the Engine tile does not depend on the snapshot source.
     expect(within(tiles).getAllByText("No data")).toHaveLength(3);
     expect(within(screen.getByRole("region", { name: "Top apps" })).getByRole("alert")).toBeInTheDocument();
   });

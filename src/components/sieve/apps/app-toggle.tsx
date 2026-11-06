@@ -5,9 +5,9 @@ import { cn } from "@/lib/utils";
 
 /**
  * What per-app Off does, said once (the switch's tooltip and accessible
- * description): tracking stops, and a routing engine relays the app untouched.
+ * description): plan 8.2's wording; while the engine routes, it relays the app untouched.
  */
-export const APP_OFF_MEANS = "Off: Sieve stops tracking and charting this app, and its traffic is left alone.";
+export const APP_OFF_MEANS = "Off: Sieve passes this app's traffic through untouched and stops charting it.";
 
 /**
  * Per-app on/off: Sieve (on, the default) or Off. `on` is the user's choice

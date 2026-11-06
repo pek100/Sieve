@@ -24,17 +24,18 @@ export function initials(name: string): string {
 }
 
 /** The stand-in for an app's icon (AppIcon's fallback, while it loads or when the exe has none): a monogram on the app's tint. */
-export function Monogram({ appKey, name, size = 32 }: { appKey: string; name: string; size?: 32 | 40 }) {
+export function Monogram({ appKey, name, size = 32 }: { appKey: string; name: string; size?: 16 | 32 | 40 }) {
   return (
     <span
       aria-hidden="true"
       className={cn(
         "inline-flex shrink-0 items-center justify-center rounded-sm font-semibold",
-        size === 40 ? "size-10 text-body-strong" : "size-8 text-label",
+        size === 40 ? "size-10 text-body-strong" : size === 32 ? "size-8 text-label" : "size-4 rounded-xs text-caption",
         TINTS[tintIndex(appKey)],
       )}
     >
-      {initials(name)}
+      {/* 16 px has room for one letter. */}
+      {size === 16 ? initials(name).charAt(0) : initials(name)}
     </span>
   );
 }

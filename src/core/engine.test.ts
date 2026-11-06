@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import fixture from "@/data/fixtures/engine-probe-v2.json";
-import { parseEngineProbe } from "@/data/protocol";
+import { parseEngineProbe, type EngineStatus, type ListFact } from "@/data/protocol";
 import {
   ADGUARD_PAUSE_TEXT,
   EMPTY_ENGINE,
@@ -12,6 +12,7 @@ import {
   attribution,
   engineDetail,
   engineInForce,
+  engineLists,
   engineLockReason,
   enginePhase,
   engineRoutes,
@@ -48,6 +49,7 @@ describe("engine phase", () => {
       incompatible: "incompatible",
       idle: "idle",
       filtering: "routing",
+      hosts: "filtering",
       adguard: "adguard",
       adguard_paused: "routing",
       vpn: "vpn",
@@ -64,11 +66,11 @@ describe("engine phase", () => {
     expect(enginePhase(starting)).toBe("starting");
   });
 
-  it("claims no blocking unless the engine says it blocks", () => {
-    for (const s of [EMPTY_ENGINE, { probe: null, error: "e" }, ...ALL.map(facts)]) {
+  it("claims filtering only from rules the engine reports applied, and blocking only when the engine says it blocks", () => {
+    for (const s of [EMPTY_ENGINE, { probe: null, error: "e" }, ...ALL.filter((n) => n !== "hosts").map(facts)]) {
       expect(ENGINE_STATE_TEXT[enginePhase(s)]).not.toMatch(/filtering|blocked|blocking/i);
       // AdGuard's filtering is a fact the refusal states; Sieve's own never is claimed.
-      expect(engineDetail(s).replace("AdGuard is filtering", "")).not.toMatch(/is filtering|blocks |are blocked|blocked for/i);
+      expect(engineDetail(s).replace("AdGuard is filtering", "")).not.toMatch(/is filtering|blocks |are blocked|blocked for|applies/i);
     }
     expect(engineDetail(facts("filtering"))).toContain("Nothing is blocked yet");
     const routing = facts("filtering");
@@ -76,6 +78,40 @@ describe("engine phase", () => {
     const blocking: EngineSlice = { ...routing, probe: { ...routing.probe!, pipe: { ...pipe, status: { ...pipe.status, blocking: true } } } };
     expect(enginePhase(blocking)).toBe("routing");
     expect(engineDetail(blocking)).toMatch(/closes connections to blocked hosts/);
+    expect(ENGINE_STATE_TEXT.filtering).toBe("Filtering hosts");
+    expect(engineDetail(facts("hosts"))).not.toMatch(/blocks |are blocked|blocked for|Nothing is blocked/i);
+  });
+
+  /** The `hosts` example with its status changed. */
+  const hosts = (patch: Partial<EngineStatus>): EngineSlice => {
+    const s = facts("hosts");
+    const pipe = s.probe!.pipe!;
+    if (pipe.kind !== "welcome") throw new Error("hosts is a welcome");
+    return { ...s, probe: { ...s.probe!, pipe: { ...pipe, status: { ...pipe.status, ...patch } } } };
+  };
+  const fact = (applied: number, skipped = 0): ListFact => ({ id: "a", title: "A", homepage: "https://a.example/a", version: null, applied, skipped });
+
+  it("the filtering phase takes both the engine's fact and an applied rule", () => {
+    expect(enginePhase(hosts({}))).toBe("filtering");
+    expect(enginePhase(hosts({ filtering: false }))).not.toBe("filtering");
+    // Null, empty and zero-applied facts are routing, never "Filtering hosts".
+    expect(enginePhase(hosts({ filter: undefined }))).toBe("routing");
+    expect(enginePhase(hosts({ filter: { lists: [], resource_pin: null } }))).toBe("routing");
+    expect(enginePhase(hosts({ filter: { lists: [fact(0, 90)], resource_pin: null } }))).toBe("routing");
+    expect(enginePhase(hosts({ filter: { lists: [fact(0), fact(1)], resource_pin: null } }))).toBe("filtering");
+    expect(engineRoutes(hosts({}))).toBe(true);
+    expect(engineRoutes(hosts({ filter: undefined }))).toBe(true);
+  });
+
+  it("the detail states the counts from facts, and HTTPS only while the engine decrypts", () => {
+    const off = engineDetail(hosts({ decrypting: false }));
+    expect(off).toMatch(/applies 142,000 rules from 2 lists to host names only/);
+    expect(off).not.toMatch(/HTTPS/);
+    expect(off).toMatch(/Apps you turned off pass through/);
+    expect(engineDetail(hosts({ decrypting: true }))).toMatch(/HTTPS/);
+    expect(engineDetail(hosts({ filter: { lists: [fact(1)], resource_pin: null } }))).toMatch(/applies 1 rule from 1 list /);
+    expect(engineLists(facts("idle"))).toEqual([]);
+    expect(engineLists(EMPTY_ENGINE)).toEqual([]);
   });
 
   it("names the blocker: AdGuard filtering, the VPN adapter, the restarts, the setup error", () => {
@@ -98,7 +134,7 @@ describe("engine phase", () => {
   });
 
   it("the app reads engine flows only while the engine routes", () => {
-    expect(ALL.filter((n) => engineRoutes(facts(n)))).toEqual(["filtering", "adguard_paused"]);
+    expect(ALL.filter((n) => engineRoutes(facts(n))).sort()).toEqual(["adguard_paused", "filtering", "hosts"]);
     expect(engineRoutes({ ...facts("filtering"), error: "x" })).toBe(false);
   });
 

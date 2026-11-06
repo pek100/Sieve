@@ -9,7 +9,6 @@ import { memoryBackend } from "@/data/settings-store";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { NoticeToaster } from "@/components/sieve/shell/notice-toaster";
-import { DNS_CARD_KEYS } from "./dns-card";
 import { SettingsScreen } from "./settings-screen";
 
 vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
@@ -42,12 +41,6 @@ describe("settings view (rendered from the registry)", () => {
         expect(screen.queryAllByText(settingDef(key).label), key).toHaveLength(0);
         continue;
       }
-      if (DNS_CARD_KEYS.has(key)) {
-        // One owner on screen: the DNS filter section edits it, no row repeats it.
-        expect(r, key).toBeNull();
-        expect(screen.getAllByText(settingDef(key).label)).toHaveLength(1);
-        continue;
-      }
       expect(r, key).not.toBeNull();
       expect(r).toHaveTextContent(settingDef(key).label);
     }
@@ -58,32 +51,36 @@ describe("settings view (rendered from the registry)", () => {
     );
   });
 
-  it("there is no per-app filtering row: per-app DNS exemption would need a network driver", async () => {
+  it("there is no per-app filtering row: an old file's value is gone", async () => {
     await setup({ schema: 1, values: { "filtering.perApp": true } });
     expect(document.querySelector('[data-setting="filtering.perApp"]')).toBeNull();
     expect(document.querySelector("[data-lock=unavailable]")).toBeNull();
     expect(row("apps.levels")).toHaveTextContent("Apps turned off");
   });
 
-  it("the DNS filter is hidden until the engine replaces it: no switch, no card; Filtering shows the engine", async () => {
-    // Stored by an old build with DNS filtering on.
-    const rt = await setup({ schema: 3, values: { "filtering.dns": true } });
+  it("the DNS filter is gone: no switch, no card; Filtering shows the engine and the encrypted upstreams", async () => {
+    // Stored by an old build with DNS filtering on and bare upstreams.
+    const rt = await setup({ schema: 3, values: { "filtering.dns": true, "filtering.upstreams": ["1.1.1.1"] } });
     expect(row("filtering.dns")).toBeNull();
     expect(screen.queryByRole("region", { name: "DNS filter" })).toBeNull();
     expect(screen.queryByRole("switch", { name: /DNS filtering/ })).toBeNull();
-    expect(screen.queryByText("Upstream DNS servers")).toBeNull();
     // There is no switch that points Windows DNS anywhere (removed 2026-10-18).
     expect(document.querySelector('[data-setting="filtering.systemDns"]')).toBeNull();
     const filtering = document.getElementById("section-filtering")!;
     expect(within(filtering).getByRole("region", { name: "Engine" })).toBeInTheDocument();
     expect(filtering.querySelector("#engine")).not.toBeNull();
-    // The stored "on" reads off, and the filter is never started for it.
-    expect(rt.settings.get("filtering.dns")).toBe(false);
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 50));
-    });
-    expect(rt.store.getState().dns.status?.running).toBe(false);
+    // The upstream row is a summary of the defaults, no bare address, nothing to reset.
+    expect(row("filtering.upstreams")).toHaveTextContent("https://cloudflare-dns.com/dns-query, https://dns.quad9.net/dns-query");
+    expect(row("filtering.upstreams")).not.toHaveTextContent("1.1.1.1");
+    expect(within(row("filtering.upstreams")).queryByRole("button")).toBeNull();
     expect(rt.passedChecks.has("filtering.dns")).toBe(false);
+  });
+
+  it("a migrated upstream list shows with a way back to the defaults", async () => {
+    const rt = await setup({ schema: 4, values: { "filtering.upstreams": ["tls://a.example"] } });
+    expect(row("filtering.upstreams")).toHaveTextContent("tls://a.example, https://cloudflare-dns.com/dns-query");
+    await userEvent.click(within(row("filtering.upstreams")).getByRole("button", { name: "Reset Upstream DNS servers" }));
+    expect(rt.settings.get("filtering.upstreams")).toEqual(settingDef("filtering.upstreams").default);
   });
 
   it("a search hides the engine's section unless a Filtering key matches; clearing it brings it back", async () => {
@@ -152,14 +149,14 @@ describe("settings view (rendered from the registry)", () => {
     fireEvent.change(search, { target: { value: "zzz" } });
     expect(screen.getByText("No setting matches")).toBeInTheDocument();
     fireEvent.keyDown(search, { key: "Escape" });
-    expect(document.querySelectorAll("[data-setting]")).toHaveLength(SETTING_KEYS.filter((k) => isAvailable(k) && !DNS_CARD_KEYS.has(k)).length);
+    expect(document.querySelectorAll("[data-setting]")).toHaveLength(SETTING_KEYS.filter(isAvailable).length);
   });
 
-  it("import previews every change before applying, never reaches the hidden DNS switch, and undo restores", async () => {
+  it("import previews every change before applying, refuses the retired DNS switch, and undo restores", async () => {
     const rt = await setup();
     await userEvent.click(screen.getByRole("button", { name: "Settings actions" }));
     await userEvent.click(await screen.findByRole("menuitem", { name: "Import settings" }));
-    // A current file (an older one loses the DNS switch to the schema 4 migration before the preview).
+    // A current file (an older one loses the DNS switch to the migration before the preview).
     const file = JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "appearance.theme": "light", "filtering.dns": true } });
     fireEvent.change(screen.getByRole("textbox", { name: "Settings file to import" }), { target: { value: file } });
     await userEvent.click(screen.getByRole("button", { name: "Preview changes" }));
@@ -167,13 +164,12 @@ describe("settings view (rendered from the registry)", () => {
     const changes = screen.getByRole("list", { name: "Changes" });
     expect(within(changes).getAllByRole("listitem")).toHaveLength(1);
     expect(changes).toHaveTextContent(/Theme\s*Dark.*Light/);
-    expect(screen.getByRole("list", { name: "Not imported" })).toHaveTextContent(/filtering\.dns.*Not available in this version of Sieve/);
+    expect(screen.getByRole("list", { name: "Not imported" })).toHaveTextContent(/filtering\.dns.*Not a setting in this version of Sieve/);
     // Nothing applied yet.
     expect(rt.settings.get("appearance.theme")).toBe("dark");
 
     await userEvent.click(screen.getByRole("button", { name: "Apply 1 change" }));
     expect(rt.settings.get("appearance.theme")).toBe("light");
-    expect(rt.settings.get("filtering.dns")).toBe(false);
     const undo = await screen.findByRole("button", { name: "Undo" });
     await userEvent.click(undo);
     expect(rt.settings.get("appearance.theme")).toBe("dark");

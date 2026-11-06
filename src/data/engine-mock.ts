@@ -13,11 +13,19 @@
  * a stopping one cannot be started. The rest of a sent policy is held and
  * echoed, as the engine would, so the controller sees it in force. Nothing
  * else is invented.
+ *
+ * `logTail` answers only in scenarios where the engine routes (`filtering`,
+ * `hosts`), as a real engine would: every row of the log fixture on the first
+ * read, then its host-level rows cycled, one per read, content from the seed
+ * and the read count. Hosts are under `example.*`, addresses from the
+ * documentation ranges. `?log=error` makes every read fail.
  */
+import { hash01 } from "./prng";
 import fixture from "./fixtures/engine-probe-v2.json";
 import ipc from "./fixtures/engine-ipc-v3.json";
+import logFixture from "./fixtures/engine-log-v1.json";
 import type { EngineSource } from "./engine-source";
-import { parseEngineLists, parseEngineProbe, parseEngineStatus, type EngineLists, type EnginePolicy, type EngineStatus } from "./protocol";
+import { LOG_TAIL_VERSION, parseEngineLists, parseEngineProbe, parseEngineStatus, parseLogTail, type EngineLists, type EnginePolicy, type EngineStatus, type LogEntry } from "./protocol";
 
 export const ENGINE_SCENARIOS = [
   "missing",
@@ -25,6 +33,7 @@ export const ENGINE_SCENARIOS = [
   "starting",
   "idle",
   "filtering",
+  "hosts",
   "adguard",
   "adguard_paused",
   "vpn",
@@ -41,17 +50,35 @@ export const MOCK_ENGINE_ERROR = "service manager: Access is denied. (os error 5
 /** What the mock's AdGuard actions answer when they cannot apply (no AdGuard to stop or start). */
 export const MOCK_ADGUARD_ERROR = "Adguard Service: the service is not in a state that allows this";
 
-const WELCOME: readonly EngineScenario[] = ["idle", "filtering", "adguard", "adguard_paused", "vpn", "crash_loop", "setup"];
+/** The message of a failed log read (?log=error). */
+export const MOCK_LOG_ERROR = "the engine's log could not be read";
+
+const WELCOME: readonly EngineScenario[] = ["idle", "filtering", "hosts", "adguard", "adguard_paused", "vpn", "crash_loop", "setup"];
+const ROUTES: readonly EngineScenario[] = ["filtering", "hosts", "adguard_paused"];
 
 function statusOf(scenario: EngineScenario): EngineStatus {
   const example = fixture.examples[scenario as keyof typeof fixture.examples];
   return parseEngineStatus((example.pipe as { status: unknown }).status);
 }
 
-export function createMockEngine(start: EngineScenario = "missing"): EngineSource {
+export function createMockEngine(start: EngineScenario = "missing", log: { seed?: number; logError?: boolean } = {}): EngineSource {
   let scenario = start;
   let held: Omit<EnginePolicy, "revision" | "engine"> | null = null;
   const echo = (status: EngineStatus): EngineStatus => (held ? { ...status, policy: { ...status.policy, ...held } } : status);
+  const seed = log.seed ?? 1;
+  const all = parseLogTail(logFixture).rows;
+  const hostLevel = all.filter((e) => e.row.url === null);
+  let reads = 0;
+  let seq = 0;
+  /** One read's rows: the whole fixture, then one cycled host-level row, a new seq and time each. */
+  const nextRows = (): LogEntry[] => {
+    reads += 1;
+    const from = reads === 1 ? all : [hostLevel[Math.floor(hash01(seed, reads) * hostLevel.length)]];
+    return from.map((e) => {
+      seq += 1;
+      return { seq, row: { ...e.row, id: seq, t: e.row.t + (reads - 1) * 1000 } };
+    });
+  };
   const requireWelcome = () => {
     if (!WELCOME.includes(scenario)) throw new Error("The system cannot find the file specified. (os error 2)");
   };
@@ -80,8 +107,13 @@ export function createMockEngine(start: EngineScenario = "missing"): EngineSourc
       scenario = "adguard_paused";
     },
     startAdguard: async () => {
-      if (scenario !== "filtering") throw new Error(MOCK_ADGUARD_ERROR);
+      if (scenario !== "filtering" && scenario !== "hosts") throw new Error(MOCK_ADGUARD_ERROR);
       scenario = "adguard";
+    },
+    logTail: async (since) => {
+      if (log.logError) throw new Error(MOCK_LOG_ERROR);
+      const rows = ROUTES.includes(scenario) ? nextRows().filter((e) => e.seq > since) : [];
+      return { v: LOG_TAIL_VERSION, next: rows.at(-1)?.seq ?? since, dropped: 0, rows, skipped: 0 };
     },
   };
 }

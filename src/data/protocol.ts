@@ -164,84 +164,11 @@ export function parseHistory(x: unknown): History {
 }
 
 // ---------------------------------------------------------------------------
-// DNS filter (phase B). Mirrors of src-tauri/src/dns/status.rs (dns_status),
-// src-tauri/src/dns/probe.rs (dns_self_check) and src-tauri/src/windns.rs
-// (windows_dns, read only). Wire names are Rust's snake_case. Fixtures:
-// src/data/fixtures/dns-status-v3.json, windows-dns-v1.json (Rust reads them too).
+// Windows DNS, read only (the safety net). Mirror of src-tauri/src/windns.rs;
+// wire names are Rust's snake_case. Fixture: src/data/fixtures/windows-dns-v1.json
+// (Rust reads it too).
 
-export const DNS_STATUS_VERSION = 3 as const;
 export const WINDOWS_DNS_VERSION = 1 as const;
-
-export interface DnsCounters {
-  /** Every query received. */
-  queries: number;
-  /** Answered by Sieve with the block answer. */
-  blocked: number;
-  /** Answered by an upstream. */
-  forwarded: number;
-  /** Every upstream failed: SERVFAIL sent. */
-  failed: number;
-  /** Blocked but past the per-name tracking cap. */
-  untracked: number;
-}
-
-export interface DnsListInfo {
-  url: string | null;
-  /** When the list in use was downloaded, ms since the epoch; null: no list. */
-  fetched_at: number | null;
-  rules: number;
-  allow: number;
-  skipped: number;
-  user_rules: boolean;
-  /** Why the list is stale or missing, or null. */
-  error: string | null;
-}
-
-export interface DomainCount {
-  domain: string;
-  count: number;
-}
-
-export interface DnsStatus {
-  v: typeof DNS_STATUS_VERSION;
-  running: boolean;
-  /** Running but forwarding everything, blocking nothing (the global Sieving switch is off). */
-  pass_through: boolean;
-  /** Every address the proxy listens on; empty when stopped. */
-  binds: string[];
-  started_at: number | null;
-  upstreams: string[];
-  counters: DnsCounters;
-  last_error: string | null;
-  list: DnsListInfo;
-  /** At most 20, most blocked first. */
-  top_blocked: DomainCount[];
-}
-
-/**
- * What a check tests, as Rust's `CheckKind` (probe.rs) names it:
- * `rules` at least one block rule is loaded (no server), `canary` the
- * built-in test name gets the block answer, `resolve` a normal name
- * resolves through the upstreams.
- */
-export const CHECK_KINDS = ["rules", "canary", "resolve"] as const;
-/** `call` is never on the wire: the window's own record that the dns_self_check command itself failed. */
-export type DnsCheckKind = (typeof CHECK_KINDS)[number] | "call";
-
-export interface DnsCheck {
-  kind: DnsCheckKind;
-  /** The listen address that was asked; empty for a check no listener answers (`rules`, `call`). */
-  server: string;
-  name: string;
-  expect: string;
-  got: string;
-  pass: boolean;
-}
-
-export interface SelfCheck {
-  pass: boolean;
-  checks: DnsCheck[];
-}
 
 /** One active adapter's DNS servers in force (Rust `windns::AdapterDns`). */
 export interface AdapterDns {
@@ -264,10 +191,6 @@ function bool(x: unknown, where: string): boolean {
   return x;
 }
 
-function intOrNull(x: unknown, where: string): number | null {
-  return x === null ? null : int(x, where);
-}
-
 function strings(x: unknown, where: string): string[] {
   if (!Array.isArray(x)) throw new ProtocolError(`${where} must be an array`);
   return x.map((s, i) => str(s, `${where}[${i}]`));
@@ -284,67 +207,6 @@ function version(x: Rec, want: number, what: string): void {
       `${what} version ${String(x.v)} is not ${want}: the Sieve backend and this window disagree. Restart Sieve after updating.`,
     );
   }
-}
-
-/** Validate an untrusted `dns_status` answer. Throws ProtocolError. */
-export function parseDnsStatus(raw: unknown): DnsStatus {
-  const x = rec(raw, "dns status");
-  version(x, DNS_STATUS_VERSION, "dns status");
-  const c = rec(x.counters, "counters");
-  const l = rec(x.list, "list");
-  if (!Array.isArray(x.top_blocked)) throw new ProtocolError("top_blocked must be an array");
-  return {
-    v: DNS_STATUS_VERSION,
-    running: bool(x.running, "running"),
-    pass_through: bool(x.pass_through, "pass_through"),
-    binds: strings(x.binds, "binds"),
-    started_at: intOrNull(x.started_at, "started_at"),
-    upstreams: strings(x.upstreams, "upstreams"),
-    counters: {
-      queries: int(c.queries, "counters.queries"),
-      blocked: int(c.blocked, "counters.blocked"),
-      forwarded: int(c.forwarded, "counters.forwarded"),
-      failed: int(c.failed, "counters.failed"),
-      untracked: int(c.untracked, "counters.untracked"),
-    },
-    last_error: strOrNull(x.last_error, "last_error"),
-    list: {
-      url: strOrNull(l.url, "list.url"),
-      fetched_at: intOrNull(l.fetched_at, "list.fetched_at"),
-      rules: int(l.rules, "list.rules"),
-      allow: int(l.allow, "list.allow"),
-      skipped: int(l.skipped, "list.skipped"),
-      user_rules: bool(l.user_rules, "list.user_rules"),
-      error: strOrNull(l.error, "list.error"),
-    },
-    top_blocked: x.top_blocked.map((d, i) => {
-      const r = rec(d, `top_blocked[${i}]`);
-      return { domain: str(r.domain, `top_blocked[${i}].domain`), count: int(r.count, `top_blocked[${i}].count`) };
-    }),
-  };
-}
-
-/** Validate an untrusted `dns_self_check` answer. Throws ProtocolError. */
-export function parseSelfCheck(raw: unknown): SelfCheck {
-  const x = rec(raw, "self check");
-  if (!Array.isArray(x.checks)) throw new ProtocolError("checks must be an array");
-  return {
-    pass: bool(x.pass, "pass"),
-    checks: x.checks.map((c, i) => {
-      const r = rec(c, `checks[${i}]`);
-      const w = `checks[${i}]`;
-      const kind = CHECK_KINDS.find((k) => k === r.kind);
-      if (kind === undefined) throw new ProtocolError(`${w}.kind must be one of ${CHECK_KINDS.join(", ")}`);
-      return {
-        kind,
-        server: str(r.server, `${w}.server`),
-        name: str(r.name, `${w}.name`),
-        expect: str(r.expect, `${w}.expect`),
-        got: str(r.got, `${w}.got`),
-        pass: bool(r.pass, `${w}.pass`),
-      };
-    }),
-  };
 }
 
 /** Validate an untrusted `windows_dns` answer. Throws ProtocolError. */
@@ -445,6 +307,26 @@ export interface EngineStatus {
   split_tunnels: string[];
   counters: EngineCounters;
   guests: EngineGuest[];
+  /** Absent until the engine holds compiled lists, and from an older engine. */
+  filter?: FilterFacts;
+}
+
+/** One filter list as the engine compiled it (sieve-ipc `ListFact`; the catalogue stays in Rust). */
+export interface ListFact {
+  id: string;
+  title: string;
+  homepage: string;
+  /** The list's own `! Version:`, when it has one. */
+  version: string | null;
+  applied: number;
+  skipped: number;
+}
+
+/** What the engine filters with (sieve-ipc `FilterFacts`). */
+export interface FilterFacts {
+  lists: ListFact[];
+  /** The resource library's pin, when one is loaded. */
+  resource_pin: string | null;
 }
 
 const COUNTER_KEYS = [
@@ -521,6 +403,26 @@ function blocker(raw: unknown): EngineBlocker {
   }
 }
 
+function filterFacts(raw: unknown): FilterFacts {
+  const f = rec(raw, "status.filter");
+  if (!Array.isArray(f.lists)) throw new ProtocolError("filter.lists must be an array");
+  return {
+    lists: f.lists.map((item, i) => {
+      const w = `filter.lists[${i}]`;
+      const l = rec(item, w);
+      return {
+        id: str(l.id, `${w}.id`),
+        title: str(l.title, `${w}.title`),
+        homepage: str(l.homepage, `${w}.homepage`),
+        version: strOrNull(l.version ?? null, `${w}.version`),
+        applied: int(l.applied, `${w}.applied`),
+        skipped: int(l.skipped, `${w}.skipped`),
+      };
+    }),
+    resource_pin: strOrNull(f.resource_pin ?? null, "filter.resource_pin"),
+  };
+}
+
 /** Validate an untrusted engine Status (sieve-ipc). Throws ProtocolError. */
 export function parseEngineStatus(raw: unknown): EngineStatus {
   const s = rec(raw, "status");
@@ -540,6 +442,134 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
       blocked: orDefault(c.blocked, (v) => int(v, "counters.blocked"), 0),
     },
     guests: guests(s.guests),
+    ...(s.filter === undefined || s.filter === null ? {} : { filter: filterFacts(s.filter) }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The filtering log. `LogRow` and `LogOutcome` mirror sieve-ipc; the envelope is
+// `engine_log_tail` (src-tauri/src/engine.rs). Fixture:
+// src/data/fixtures/engine-log-v1.json.
+
+export const LOG_TAIL_VERSION = 1 as const;
+/** sieve-ipc `LogOutcome` kinds, in declaration order. */
+export const LOG_OUTCOMES = ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted"] as const;
+
+export type LogOutcome =
+  | { kind: "blocked" }
+  | { kind: "redirected" }
+  | { kind: "params_removed" }
+  | { kind: "hidden"; elements: number }
+  | { kind: "scriptlets"; count: number }
+  | { kind: "passed"; reason: string }
+  | { kind: "not_decrypted"; reason: string };
+
+export interface LogRow {
+  id: number;
+  /** ms since the Unix epoch, the engine's clock. */
+  t: number;
+  flow_id: number;
+  pid: number | null;
+  exe: string | null;
+  session: number | null;
+  /** sieve-ipc `FlowKind`: tls, http, quic, dns or other. */
+  kind: string;
+  /** The name, else the remote IP. */
+  host: string;
+  remote: string;
+  /** Null on a host-level row. */
+  url: string | null;
+  request_type: string | null;
+  outcome: LogOutcome;
+  rule: string | null;
+  /** A catalogue id, or "user". */
+  list: string | null;
+}
+
+/** A row and its place in the app's own count, which survives an engine restart. */
+export interface LogEntry {
+  seq: number;
+  row: LogRow;
+}
+
+export interface LogTail {
+  v: typeof LOG_TAIL_VERSION;
+  /** Ask for rows after this next time. */
+  next: number;
+  /** Rows the Rust ring dropped before this read could see them. */
+  dropped: number;
+  rows: LogEntry[];
+  /** Rows of this answer that could not be read. */
+  skipped: number;
+}
+
+const isCount = (x: unknown): x is number => typeof x === "number" && Number.isInteger(x) && x >= 0;
+const optCount = (x: unknown): number | null => (isCount(x) ? x : null);
+const optStr = (x: unknown): string | null => (typeof x === "string" ? x : null);
+
+function logOutcome(raw: unknown): LogOutcome | null {
+  if (!isRec(raw)) return null;
+  switch (raw.kind) {
+    case "blocked":
+    case "redirected":
+    case "params_removed":
+      return { kind: raw.kind };
+    case "hidden":
+      return isCount(raw.elements) ? { kind: "hidden", elements: raw.elements } : null;
+    case "scriptlets":
+      return isCount(raw.count) ? { kind: "scriptlets", count: raw.count } : null;
+    case "passed":
+    case "not_decrypted":
+      return typeof raw.reason === "string" ? { kind: raw.kind, reason: raw.reason } : null;
+    default:
+      return null;
+  }
+}
+
+/** One row, or null when it has no seq, time, host or readable outcome. Optional fields default to null. */
+function logEntry(raw: unknown): LogEntry | null {
+  if (!isRec(raw) || !isCount(raw.seq) || !isRec(raw.row)) return null;
+  const r = raw.row;
+  const outcome = logOutcome(r.outcome);
+  if (!isCount(r.t) || typeof r.host !== "string" || r.host === "" || outcome === null) return null;
+  return {
+    seq: raw.seq,
+    row: {
+      id: optCount(r.id) ?? raw.seq,
+      t: r.t,
+      flow_id: optCount(r.flow_id) ?? raw.seq,
+      pid: optCount(r.pid),
+      exe: optStr(r.exe),
+      session: optCount(r.session),
+      kind: optStr(r.kind) ?? "other",
+      host: r.host,
+      remote: optStr(r.remote) ?? "",
+      url: optStr(r.url),
+      request_type: optStr(r.request_type),
+      outcome,
+      rule: optStr(r.rule),
+      list: optStr(r.list),
+    },
+  };
+}
+
+/**
+ * Validate an untrusted `engine_log_tail` answer. A wrong version or a
+ * non-array throws ProtocolError; one bad row is skipped and counted, so it
+ * never empties a batch.
+ */
+export function parseLogTail(raw: unknown): LogTail {
+  const x = rec(raw, "log tail");
+  version(x, LOG_TAIL_VERSION, "log tail");
+  if (!Array.isArray(x.rows)) throw new ProtocolError("log tail rows must be an array");
+  const rows = x.rows.map(logEntry).filter((e): e is LogEntry => e !== null);
+  const newest = rows.at(-1)?.seq ?? 0;
+  return {
+    v: LOG_TAIL_VERSION,
+    next: isCount(x.next) ? x.next : newest,
+    dropped: isCount(x.dropped) ? x.dropped : 0,
+    rows,
+    skipped: x.rows.length - rows.length,
   };
 }
 

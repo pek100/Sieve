@@ -73,7 +73,7 @@ describe("registry law", () => {
     }
   });
 
-  it("UI code never names a data switch key: it reads it from `requires` or src/core/dns.ts", () => {
+  it("UI code never names a data switch key: it reads it from `requires` or src/core/engine.ts", () => {
     const switches = defs.filter(([, d]) => d.kind === "dataSwitch").map(([k]) => k);
     const files = walk("src/components", [".ts", ".tsx"]).filter((f) => !f.endsWith(".test.ts") && !f.endsWith(".test.tsx"));
     const re = new RegExp(`["'\`](${switches.map((k) => k.replace(".", "\\.")).join("|")})["'\`]`);

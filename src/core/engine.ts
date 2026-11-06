@@ -3,15 +3,17 @@
  * about it, derived from facts only (plan 1.6.5: "Filtering is not running"
  * comes from facts, never assumed). The facts are `engine_probe`: the
  * Windows service's state and, while it runs, the engine's own answer on
- * its pipe (sieve-ipc v3 Status: policy, blocker, split tunnels, counters).
+ * its pipe (sieve-ipc Status: policy, blocker, split tunnels, counters and,
+ * from slice 4, the per-list filter facts).
  *
- * The phase says what routes, and whether anything is blocked is its own fact
- * (`status.blocking`): routing with no list compiled yet closes nothing, and
- * the copy must not claim it does.
+ * An engine that routes with no rule applied blocks nothing: it is "Routing
+ * traffic". Only rules the engine reports applied make it "Filtering hosts".
+ * Whether anything is blocked is its own fact (`status.blocking`): routing with
+ * no list compiled yet closes nothing, and the copy must not claim it does.
  *
  * The slice has one writer, the engine controller (src/data/engine-controller.ts).
  */
-import type { EngineBlocker, EngineProbe, EngineStatus } from "@/data/protocol";
+import type { EngineBlocker, EngineProbe, EngineStatus, ListFact } from "@/data/protocol";
 
 /** How often the engine is asked while Sieve is open (plan 1.6.5). */
 export const ENGINE_POLL_MS = 2000;
@@ -52,6 +54,7 @@ export const ENGINE_PHASES = [
   "idle",
   "starting",
   "routing",
+  "filtering",
   "adguard",
   "vpn",
   "crash_loop",
@@ -64,6 +67,13 @@ export function engineStatus(e: EngineSlice): EngineStatus | null {
   const pipe = e.probe?.pipe;
   return pipe?.kind === "welcome" ? pipe.status : null;
 }
+
+/** The lists the engine reports, in its order; empty when it reports none. */
+export function engineLists(e: EngineSlice): readonly ListFact[] {
+  return engineStatus(e)?.filter?.lists ?? [];
+}
+
+const appliedRules = (lists: readonly ListFact[]) => lists.reduce((sum, l) => sum + l.applied, 0);
 
 const BLOCKER_PHASE: Record<EngineBlocker["kind"], EnginePhase> = {
   adguard: "adguard",
@@ -87,7 +97,7 @@ export function enginePhase(e: EngineSlice): EnginePhase {
       return "incompatible";
     case "welcome": {
       const s = p.pipe.status;
-      if (s.filtering) return "routing";
+      if (s.filtering) return appliedRules(s.filter?.lists ?? []) > 0 ? "filtering" : "routing";
       if (!s.policy.engine) return "idle";
       return s.blocker ? BLOCKER_PHASE[s.blocker.kind] : "starting";
     }
@@ -142,6 +152,7 @@ export const ENGINE_STATE_TEXT: Record<EnginePhase, string> = {
   idle: "Installed, not routing",
   starting: "Starting",
   routing: "Routing traffic",
+  filtering: "Filtering hosts",
   adguard: "Waiting for AdGuard",
   vpn: "Paused for a VPN",
   crash_loop: "Stopped after repeated failures",
@@ -164,6 +175,15 @@ export const ENGINE_PROBLEMS: ReadonlySet<EnginePhase> = new Set<EnginePhase>([
   "crash_loop",
   "setup_failed",
 ]);
+
+const count = (n: number, one: string, many: string) => `${n.toLocaleString("en-US")} ${n === 1 ? one : many}`;
+
+/** What the filtering engine applies, from its own facts. */
+function filteringDetail(e: EngineSlice): string {
+  const lists = engineLists(e);
+  const scope = engineStatus(e)?.decrypting === true ? "to host names and to the HTTPS it decrypts" : "to host names only";
+  return `The engine applies ${count(appliedRules(lists), "rule", "rules")} from ${count(lists.length, "list", "lists")} ${scope}. Apps you turned off pass through untouched.`;
+}
 
 /** One sentence on what the facts mean; never claims filtering or blocking that is not happening. */
 export function engineDetail(e: EngineSlice): string {
@@ -196,6 +216,8 @@ export function engineDetail(e: EngineSlice): string {
       return engineStatus(e)?.blocking
         ? "This computer's traffic goes through the engine, which shows each app's connections and closes connections to blocked hosts."
         : "This computer's traffic goes through the engine, which shows each app's connections. Nothing is blocked yet.";
+    case "filtering":
+      return filteringDetail(e);
     case "adguard":
       return (
         "AdGuard is filtering this computer, and two filters would capture each other's connections. Sieve routes nothing while AdGuard filters; your network works as usual." +
@@ -267,7 +289,8 @@ export function engineVersion(e: EngineSlice): string | null {
   return pipe?.kind === "welcome" ? pipe.engine_version : null;
 }
 
-/** The engine routes now: the app reads flows from it instead of the connection tables. */
+/** The engine routes now, filtering or not: the app reads flows and its log from it. */
 export function engineRoutes(e: EngineSlice): boolean {
-  return enginePhase(e) === "routing";
+  const phase = enginePhase(e);
+  return phase === "routing" || phase === "filtering";
 }

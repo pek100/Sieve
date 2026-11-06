@@ -9,15 +9,16 @@
  * No switch may write persistent system network state (DNS servers, routes,
  * proxy settings, firewall rules): Sieve off means a normal network.
  */
-import { isUpstream } from "../dns";
 import { APP_STATES, type AppState } from "../policy";
+import { parseUpstream } from "../upstream";
 
 /**
  * 2: apps.levels became on/off per app. 3: filtering.systemDns is gone. 4: a
- * stored unavailable data switch (filtering.dns) is dropped, so it is off
+ * stored unavailable data switch is dropped, so it is off. 5: filtering.dns
+ * and filtering.perApp are gone; filtering.upstreams holds encrypted upstreams
  * (see migrate.ts).
  */
-export const SETTINGS_SCHEMA = 4;
+export const SETTINGS_SCHEMA = 5;
 
 /** Settings sections in the order the settings view shows them; a key's prefix is its section. */
 export const SECTIONS = [
@@ -49,7 +50,7 @@ interface Base<T> {
   unavailableUntil?: string;
 }
 
-/** Shape of one element of a map or list setting. `upstream`: a DNS server address (see isUpstream). */
+/** Shape of one element of a map or list setting. `upstream`: an encrypted DNS upstream (see parseUpstream). */
 export type ElementSpec = { type: "string" } | { type: "upstream" } | { type: "enum"; options: readonly string[] };
 
 export function isValidElement(spec: ElementSpec, v: unknown): boolean {
@@ -58,7 +59,7 @@ export function isValidElement(spec: ElementSpec, v: unknown): boolean {
     case "string":
       return v.trim().length > 0;
     case "upstream":
-      return isUpstream(v);
+      return parseUpstream(v) !== null;
     case "enum":
       return spec.options.includes(v);
   }
@@ -111,9 +112,6 @@ export type SettingDef =
   | ListSetting<unknown>
   | DataSwitchSetting;
 
-/** The plan step that replaces the app-hosted DNS filter (law: the plan names every key unavailable until it). */
-const ENGINE_SLICE_4 = "engine slice 4 (docs/plans/2026-10-17-https-filtering.md)";
-
 const enumSetting = <const O extends string>(d: Omit<EnumSetting<O>, "kind">): EnumSetting<O> => ({
   kind: "enum",
   ...d,
@@ -127,13 +125,13 @@ export const REGISTRY = {
     options: ["system", "light", "dark"],
     default: "dark",
   }),
-  // The global state (policy GLOBAL_SWITCH). Off pauses DNS blocking by
-  // passing every lookup through, so whatever asks the filter keeps working.
+  // The global state (policy GLOBAL_SWITCH). Static help cannot know the
+  // build's facts, so it claims nothing about blocking: the Engine block derives that.
   "sampling.enabled": {
     kind: "boolean",
     section: "sampling",
     label: "Sieving",
-    help: "On: Sieve charts which apps talk to the network and, while the engine routes, closes their connections to blocked hosts. Off pauses both.",
+    help: "On: Sieve charts which apps talk to the network and, while the engine routes, closes their connections to blocked hosts. Off pauses both. What the engine filters is in Settings, under Engine.",
     default: true,
   } satisfies BooleanSetting,
   "sampling.intervalMs": {
@@ -175,22 +173,6 @@ export const REGISTRY = {
     default: [] as readonly string[],
     of: { type: "string" },
   } satisfies ListSetting<string>,
-  // A local DNS filter that answers only lookups sent to it directly: Sieve
-  // never points Windows DNS at it. The filtering engine replaces it
-  // (docs/plans/2026-10-17-https-filtering.md, slice 4). Unavailable since
-  // 2026-10-18 (the user: "Hide the DNS filter switch and its card until the
-  // engine's slice 4 replaces it; keep the code for now"): with "Point
-  // Windows at Sieve" gone nothing sends it lookups, so it filtered nothing,
-  // and its self check kept failing on [::1]:53.
-  "filtering.dns": {
-    kind: "dataSwitch",
-    section: "filtering",
-    label: "DNS filtering",
-    help: "Runs a DNS filter on 127.0.0.1:53 with the AdGuard DNS filter list. It filters only lookups sent to it directly; Windows keeps its own DNS servers.",
-    default: false,
-    liveCheck: "live_dns_filter_resolves_blocked_domain",
-    unavailableUntil: ENGINE_SLICE_4,
-  } satisfies DataSwitchSetting,
   // The engine's switch (docs/plans/2026-10-17-https-filtering.md, slice 3):
   // on, the engine brings up its Wintun adapter and routes this computer's
   // traffic through itself; it relays each flow or closes one to a blocked host. The
@@ -201,7 +183,7 @@ export const REGISTRY = {
     kind: "dataSwitch",
     section: "filtering",
     label: "Route traffic through the engine",
-    help: "Sends this computer's traffic through Sieve's engine, so Home and Apps show each app's connections as the engine sees them and connections to blocked hosts are closed. Off: the engine adds no adapter and no route, and your network is as it was.",
+    help: "Sends this computer's traffic through Sieve's engine, so Home and Apps show each app's connections as the engine sees them and connections to blocked hosts are closed. The Engine block below says what it filters. Off: the engine adds no adapter and no route, and your network is as it was.",
     default: false,
     liveCheck: "live_engine_full_route_relays_and_restores",
     needsEngine: true,
@@ -225,15 +207,31 @@ export const REGISTRY = {
     default: [] as readonly string[],
     of: { type: "string" },
   } satisfies ListSetting<string>,
-  // Edited only by the DNS filter's card, so unavailable with it.
+  // Plan 1.4: the engine forwards every lookup encrypted, tried in order.
   "filtering.upstreams": {
     kind: "list",
     section: "filtering",
     label: "Upstream DNS servers",
-    help: "Where DNS filtering sends the lookups it does not block, tried in order. Applies the next time DNS filtering starts.",
-    default: ["1.1.1.1", "9.9.9.9"] as readonly string[],
+    help: "Where the engine sends DNS lookups, encrypted, tried in order: DNS over HTTPS, TLS or QUIC. It never sends plain DNS.",
+    default: ["https://cloudflare-dns.com/dns-query", "https://dns.quad9.net/dns-query"] as readonly string[],
     of: { type: "upstream" },
-    unavailableUntil: ENGINE_SLICE_4,
+  } satisfies ListSetting<string>,
+  // Written by the log's row actions after a preview (core/log-actions).
+  "filtering.userRules": {
+    kind: "list",
+    section: "filtering",
+    label: "Your rules",
+    help: "Filter rules you added from the log, in adblock syntax.",
+    default: [] as readonly string[],
+    of: { type: "string" },
+  } satisfies ListSetting<string>,
+  "filtering.exclusions": {
+    kind: "list",
+    section: "filtering",
+    label: "Sites not decrypted",
+    help: "Sites you chose from the log that Sieve leaves encrypted.",
+    default: [] as readonly string[],
+    of: { type: "string" },
   } satisfies ListSetting<string>,
 } as const;
 
@@ -269,9 +267,8 @@ export function isSettingKey(key: string): key is SettingKey {
 
 /**
  * Can the user see and change this setting in this build? The one place the
- * answer comes from: the settings document, export, import, search, the
- * Settings view and the DNS card all ask it. Tests of code that stays while
- * its setting is unavailable (the DNS filter's) mock this to true.
+ * answer comes from: the settings document, export, import, search and the
+ * Settings view all ask it. No key is unavailable today (law 11).
  */
 export function isAvailable(key: SettingKey): boolean {
   return settingDef(key).unavailableUntil === undefined;

@@ -375,6 +375,17 @@ example.invalid##+js(set-constant, adsAllowed, true)
         RuleSet { user: Arc::new(user_rules), lists: Arc::new(engine(list)) }
     }
 
+    /// The form the log's row actions write (src/core/log-actions.ts): an IPv6
+    /// literal in a rule takes its URL form, in brackets; bare, it matches nothing.
+    #[test]
+    fn an_ipv6_rule_matches_only_in_its_bracketed_form() {
+        const V6: &str = "[2001:db8::1]";
+        assert_eq!(verdict(&engine("||[2001:db8::1]^\n"), V6), HostVerdict::Block);
+        assert_eq!(verdict(&engine("||2001:db8::1^\n"), V6), HostVerdict::None);
+        assert_eq!(verdict(&engine("||[2001:db8::1]^\n@@||[2001:db8::1]^\n"), V6), HostVerdict::Allow);
+        assert_eq!(verdict(&engine("||198.51.100.25^\n"), "198.51.100.25"), HostVerdict::Block);
+    }
+
     #[test]
     fn the_fixture_list_blocks_the_test_host_and_its_subdomains() {
         let e = engine(FIXTURE);

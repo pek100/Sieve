@@ -1,6 +1,6 @@
 /**
  * The engine controller: the one owner of the store's `engine` part and the
- * only caller of the engine source. It asks at load and then every
+ * only caller of `probe`, `setPolicy` and the AdGuard actions. It asks at load and then every
  * ENGINE_POLL_MS (plan 1.6.5), one probe at a time; a probe that fails
  * clears the facts and records why, so nothing is ever shown from a stale
  * or assumed state. Time comes from the injected clock.
@@ -23,7 +23,7 @@
  * banner, dismissed when it is over.
  */
 import type { PassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, engineStatus, enginePhase, engineTakesPolicy, type EngineSlice } from "@/core/engine";
+import { ENGINE_POLL_MS, ENGINE_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, type EngineSlice } from "@/core/engine";
 import type { NoticeBus } from "@/core/notices";
 import { GLOBAL_SWITCH, offKeys } from "@/core/policy";
 import type { SettingKey } from "@/core/settings/registry";
@@ -107,7 +107,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
   const follow = () => {
     const e = get();
     const phase = enginePhase(e);
-    if (phase === "routing") checks.add(ENGINE_SWITCH);
+    if (engineRoutes(e)) checks.add(ENGINE_SWITCH);
     else checks.delete(ENGINE_SWITCH);
     if (phase === "crash_loop" && banner === null) banner = notices.push({ kind: "error", surface: "banner", text: CRASH_LOOP_BANNER });
     if (phase !== "crash_loop" && banner !== null) {
