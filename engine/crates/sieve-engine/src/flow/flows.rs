@@ -373,10 +373,7 @@ impl<F: Fn(&str) -> Option<String>, H: Fn(u32) -> Option<String>> AppKeys<F, H> 
     /// Off none. So both sides key such a process by the name the app shows.
     ///
     /// TENSION: the name moves as a host's services stop and start, and a row's Off
-    /// goes with its old name, on both sides alike. And "hidden" is judged here,
-    /// not asked of the app ([`hidden_from_the_app`]); where the two differ the
-    /// process is keyed under a row that is not the one it shows in, which fails
-    /// on the safe side for a row that reads sieved: it stays sieved.
+    /// goes with its old name, on both sides alike.
     pub fn of_pid(&self, pid: u32, exe: Option<&str>) -> Option<String> {
         match (exe, pid) {
             (None, 0) => return Some(app_key(None, None, "System idle")),
@@ -393,36 +390,61 @@ impl<F: Fn(&str) -> Option<String>, H: Fn(u32) -> Option<String>> AppKeys<F, H> 
     }
 }
 
-/// Whether the unelevated app is refused this process, from the account the
-/// process runs as (its SID as text; None when it could not be read): only a
-/// person's own accounts, local, domain (S-1-5-21) or Entra (S-1-12-1), leave
-/// their processes open to that person. SYSTEM, the service accounts and virtual
-/// service accounts do not.
+/// Whether the unelevated app is refused this process, when nobody is logged on to
+/// ask, from the account the process runs as (its SID as text; None when it could
+/// not be read): as a rule a person's own accounts, local, domain (S-1-5-21) or
+/// Entra (S-1-12-1), leave their processes open to that person, and SYSTEM, the
+/// service accounts and virtual service accounts do not. A rule only: remote
+/// desktop hosts run as SYSTEM and leave themselves open
+/// (docs/live/engine-slice-3.md), which is why [`hidden_given`] asks first.
 pub fn hidden_from_the_app(account: Option<&str>) -> bool {
     account.is_none_or(|sid| !(sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-")))
 }
 
+/// Whether the app is refused this process. `user_can_open` is the question
+/// itself, put as the logged-on user; the account rule stands in only when no
+/// user can be asked.
+pub fn hidden_given(user_can_open: Option<bool>, account: impl FnOnce() -> Option<String>) -> bool {
+    user_can_open.map_or_else(|| hidden_from_the_app(account().as_deref()), |open| !open)
+}
+
 /// The name the app shows for a pid whose exe is hidden from it: what its
 /// services are called, else "pid n" (`src-tauri`'s `netstat::process::label`).
-/// The service table is read at most once per [`EXE_CACHE_MS`], outside the lock.
+/// The service table is read at most once per [`EXE_CACHE_MS`], outside the lock,
+/// and so is each pid's answer, which is asked once per flow otherwise.
 pub struct HiddenNames<A, S> {
-    account_of: A,
+    is_hidden: A,
     read_services: S,
     /// The table and when it was read.
     services: Mutex<Option<(ServiceTable, u64)>>,
+    /// Each pid's answer and when it was asked.
+    hidden: Mutex<HashMap<u32, (bool, u64)>>,
 }
 
 /// The display names of the running services each pid hosts.
 pub type ServiceTable = HashMap<u32, Vec<String>>;
 
-impl<A: Fn(u32) -> Option<String>, S: Fn() -> ServiceTable> HiddenNames<A, S> {
-    pub fn new(account_of: A, read_services: S) -> Self {
-        Self { account_of, read_services, services: Mutex::default() }
+impl<A: Fn(u32) -> bool, S: Fn() -> ServiceTable> HiddenNames<A, S> {
+    pub fn new(is_hidden: A, read_services: S) -> Self {
+        Self { is_hidden, read_services, services: Mutex::default(), hidden: Mutex::default() }
+    }
+
+    fn hidden(&self, pid: u32, now_ms: u64) -> bool {
+        let held = self.hidden.lock().unwrap_or_else(|p| p.into_inner()).get(&pid).filter(|(_, at)| now_ms.saturating_sub(*at) < EXE_CACHE_MS).map(|(hidden, _)| *hidden);
+        held.unwrap_or_else(|| {
+            let answer = (self.is_hidden)(pid);
+            let mut hidden = self.hidden.lock().unwrap_or_else(|p| p.into_inner());
+            if hidden.len() >= MAX_APP_KEYS {
+                hidden.clear();
+            }
+            hidden.insert(pid, (answer, now_ms));
+            answer
+        })
     }
 
     /// None when the app can read the exe itself.
     pub fn name(&self, pid: u32, now_ms: u64) -> Option<String> {
-        if !hidden_from_the_app((self.account_of)(pid).as_deref()) {
+        if !self.hidden(pid, now_ms) {
             return None;
         }
         let held = {
@@ -583,9 +605,47 @@ pub mod os {
 
     /// The name the app shows for `pid` when its exe is hidden from the app.
     pub fn hidden_name(pid: u32) -> Option<String> {
-        type Names = super::HiddenNames<fn(u32) -> Option<String>, fn() -> std::collections::HashMap<u32, Vec<String>>>;
+        type Names = super::HiddenNames<fn(u32) -> bool, fn() -> std::collections::HashMap<u32, Vec<String>>>;
         static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
-        NAMES.get_or_init(|| super::HiddenNames::new(account_of, service_names)).name(pid, crate::watchdog::monotonic_ms())
+        NAMES.get_or_init(|| super::HiddenNames::new(hidden_from_the_user, service_names)).name(pid, crate::watchdog::monotonic_ms())
+    }
+
+    fn hidden_from_the_user(pid: u32) -> bool {
+        super::hidden_given(console_user_can_open(pid), || account_of(pid))
+    }
+
+    /// Whether the console's user may open `pid` as the unelevated app does, the
+    /// open its exe read starts with. None when no user can be asked: nobody is
+    /// logged on, or this process is not SYSTEM and may not have their token.
+    fn console_user_can_open(pid: u32) -> Option<bool> {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
+        use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+        let mut token = HANDLE::default();
+        // SAFETY: plain calls; `token` is a valid out pointer and is closed below.
+        unsafe { WTSQueryUserToken(WTSGetActiveConsoleSessionId(), &mut token) }.ok()?;
+        // SAFETY: `token` is open. Nothing between this and RevertToSelf can unwind.
+        let answer = unsafe { ImpersonateLoggedOnUser(token) }.ok().map(|()| {
+            // SAFETY: plain call; the handle is closed at once.
+            let open = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+            let can_open = open.as_ref().is_ok_and(|process| {
+                // SAFETY: `process` came from OpenProcess and is closed once.
+                let _ = unsafe { CloseHandle(*process) };
+                true
+            });
+            // SAFETY: this thread is impersonating. A worker that stayed the user
+            // would run the engine as them, so the process goes instead: routes
+            // go with it and the network is normal.
+            if unsafe { RevertToSelf() }.is_err() {
+                std::process::abort();
+            }
+            can_open
+        });
+        // SAFETY: `token` came from WTSQueryUserToken and is closed once.
+        let _ = unsafe { CloseHandle(token) };
+        answer
     }
 
     /// The account a process runs as, its SID as text; None when Windows refuses.
@@ -1088,13 +1148,10 @@ mod tests {
     const SHELL: u32 = 3000;
     const WORKER: u32 = 3300;
 
-    /// A machine: a service host and a service's worker as SYSTEM, and the
-    /// user's own shell. All three exes carry Windows' product name.
+    /// A machine: a service host and a service's worker hidden from the user, and
+    /// the user's own shell. All three exes carry Windows' product name.
     fn machine_keys() -> AppKeys<impl Fn(&str) -> Option<String>, impl Fn(u32) -> Option<String>> {
-        let names = HiddenNames::new(
-            |pid| Some(if pid == SHELL { "S-1-5-21-1-2-3-1001" } else { "S-1-5-18" }.to_string()),
-            || HashMap::from([(HOST, vec!["DNS Client".to_string(), "DHCP Client".to_string()])]),
-        );
+        let names = HiddenNames::new(|pid| pid != SHELL, || HashMap::from([(HOST, vec!["DNS Client".to_string(), "DHCP Client".to_string()])]));
         AppKeys::new(|_: &str| Some(WINDOWS_PRODUCT.to_string()), move |pid| names.name(pid, 0))
     }
 
@@ -1150,11 +1207,47 @@ mod tests {
         assert!(hidden_from_the_app(None), "unread: no shared key is given on a guess");
     }
 
+    /// A remote desktop host, measured: SYSTEM, and its exe open to the user, so
+    /// the app shows it by product. The answer is the user's, not the account's;
+    /// a row for it that reads Off is the row its flows answer to.
+    #[test]
+    fn what_the_user_can_open_beats_the_account_it_runs_as() {
+        let account_never_read = || panic!("the user answered");
+        assert!(!hidden_given(Some(true), account_never_read), "SYSTEM, and open to the user");
+        assert!(hidden_given(Some(false), account_never_read));
+        assert!(hidden_given(None, || Some("S-1-5-18".to_string())), "nobody to ask: the account rule");
+        assert!(!hidden_given(None, || Some("S-1-5-21-1-2-3-1001".to_string())));
+
+        const REMOTING_HOST: u32 = 7000;
+        let names = HiddenNames::new(|pid| hidden_given(Some(pid == REMOTING_HOST), || None), HashMap::new);
+        let keys = AppKeys::new(|_: &str| Some("Chrome Remote Desktop".to_string()), move |pid| names.name(pid, 0));
+        assert_eq!(keys.of_pid(REMOTING_HOST, Some(r"C:\Program Files\remoting_host.exe")).as_deref(), Some("chrome remote desktop"));
+    }
+
+    #[test]
+    fn each_pids_answer_is_asked_once_per_period() {
+        let asked = std::cell::Cell::new(0);
+        let names = HiddenNames::new(
+            |_| {
+                asked.set(asked.get() + 1);
+                false
+            },
+            HashMap::new,
+        );
+        assert_eq!(names.name(SHELL, 0), None);
+        assert_eq!(names.name(SHELL, EXE_CACHE_MS - 1), None);
+        assert_eq!(asked.get(), 1);
+        assert_eq!(names.name(HOST, 1), None);
+        assert_eq!(asked.get(), 2, "per pid");
+        assert_eq!(names.name(SHELL, EXE_CACHE_MS), None);
+        assert_eq!(asked.get(), 3);
+    }
+
     #[test]
     fn the_service_table_is_read_once_per_period_and_only_for_a_hidden_process() {
         let reads = std::cell::Cell::new(0);
         let names = HiddenNames::new(
-            |pid| Some(if pid == SHELL { "S-1-5-21-1" } else { "S-1-5-18" }.to_string()),
+            |pid| pid != SHELL,
             || {
                 reads.set(reads.get() + 1);
                 HashMap::from([(HOST, vec!["DNS Client".to_string()])])

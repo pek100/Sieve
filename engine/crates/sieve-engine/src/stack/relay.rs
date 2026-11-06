@@ -152,14 +152,15 @@ impl Relay {
 
     /// The flow's origin (`stack::attribution`). NAT is read only on an owner
     /// miss, so a machine with no VMs issues a query only for its rare unknown
-    /// flows. An owner answer is checked against the NAT state already held: a
-    /// forwarded UDP flow whose external port equals a host wildcard-bound
-    /// port would otherwise match that row and borrow that app's exemption.
+    /// flows. An owner answer is checked against the NAT state: a forwarded UDP
+    /// flow whose external port equals a host wildcard-bound port would otherwise
+    /// match that row and borrow that app's exemption. Only a flow the held state
+    /// claims is read for, since that claim may be a guest's ended session.
     ///
     /// TENSION (S24): a NAT session newer than the last read can slip past
-    /// that check. A fresh read here would add a WMI round trip to every host
-    /// DNS lookup, which is not acceptable. On a machine with an active VM,
-    /// its own misses keep the index fresh; live proof L3 counts collisions.
+    /// that check. A read for every owner answer would add a WMI round trip to
+    /// every host DNS lookup, which is not acceptable. On a machine with an active
+    /// VM, its own misses keep the index fresh; live proof L3 counts collisions.
     pub(super) async fn attribute(&self, flow: FiveTuple) -> Attributed {
         #[cfg(feature = "attribution-diagnostics")]
         let started = monotonic_ms();
@@ -167,7 +168,7 @@ impl Relay {
         let nat = match owner {
             Owner::Disagreed { .. } => None,
             Owner::Unknown => self.nat.fresh_match(&flow, monotonic_ms()).await,
-            _ => self.nat.held_match(&flow),
+            _ => self.nat.confirmed_match(&flow, monotonic_ms()).await,
         };
         Attributed {
             attribution: decide(owner, nat),
@@ -227,8 +228,9 @@ impl Relay {
             list: None,
             forwarded,
         };
-        let owner = attribution.owner(app);
-        lock(&self.book).open(event).map(|id| Admitted { id, owner })
+        let mut book = lock(&self.book);
+        let id = book.open(event)?;
+        Some(Admitted { id, owner: attribution.row_owner(app, &book) })
     }
 
     /// The one decision for a flow whose first bytes were decoded, in the book.

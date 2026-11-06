@@ -238,10 +238,17 @@ impl NatTable {
         Self { shared, requests, asked: Mutex::default(), finished }
     }
 
-    /// The match in what is held, with no read: for a flow that already has
-    /// an owner.
+    /// The match in what is held, with no read.
     pub fn held_match(&self, flow: &FiveTuple) -> Option<Forwarded> {
         exact_match(flow, &lock(&self.shared.index))
+    }
+
+    /// For a flow that already has an owner: nothing held means no match and no
+    /// read, so a normal host flow costs nothing. What is held may be a session
+    /// that has ended, so a claim is read again before it counts.
+    pub async fn confirmed_match(&self, flow: &FiveTuple, now_ms: u64) -> Option<Forwarded> {
+        self.held_match(flow)?;
+        self.fresh_match(flow, now_ms).await
     }
 
     /// The match after a read that started no earlier than `now_ms` minus

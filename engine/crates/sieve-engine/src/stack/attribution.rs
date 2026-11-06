@@ -17,6 +17,7 @@
 use sieve_ipc::Forwarded;
 
 use super::Meters;
+use super::book::FlowBook;
 use crate::flow::flows::Owner;
 
 /// Why a flow has no origin.
@@ -103,6 +104,15 @@ impl Attribution {
         }
     }
 
+    /// [`Self::owner`] for a flow already in the book: a guest answers to the row
+    /// it counts in, so a name folded past the cap answers to the row that reads Off.
+    pub fn row_owner(&self, app: Option<String>, book: &FlowBook) -> HeldOwner {
+        match self {
+            Attribution::Forwarded(f) => HeldOwner::Forwarded(book.guest_row(f).map(str::to_string)),
+            _ => self.owner(app),
+        }
+    }
+
     /// The process of a host flow.
     pub fn pid(&self) -> Option<u32> {
         match self {
@@ -184,37 +194,94 @@ mod tests {
         }
     }
 
-    /// A forwarded UDP flow whose external port equals a host wildcard-bound
-    /// port matches that owner row: the NAT state already held must overrule
-    /// it, or the flow borrows that app's exemption. No read may be issued.
-    #[tokio::test]
-    async fn a_udp_owner_with_a_held_nat_match_is_unknown() {
-        use crate::flow::flows::FiveTuple;
+    /// A NAT table whose one session lasts for this many reads.
+    fn table_with_session_for(reads: usize) -> crate::flow::nat::NatTable {
         use crate::flow::nat::{NatSession, NatSource, NatTable, NoDirectory, VmDirectory};
         use crate::flow::packet::Proto;
 
-        struct OneSession;
-        impl NatSource for OneSession {
+        struct Ending(usize);
+        impl NatSource for Ending {
             fn read(&mut self) -> Result<Vec<NatSession>, String> {
-                Ok(vec![NatSession {
-                    proto: Proto::Udp,
-                    internal_source: "172.17.83.30:36099".parse().unwrap(),
-                    external_source: "198.18.0.1:62049".parse().unwrap(),
-                    external_destination: "185.125.190.57:123".parse().unwrap(),
-                }])
+                let live = self.0 > 0;
+                self.0 = self.0.saturating_sub(1);
+                Ok(live
+                    .then(|| NatSession {
+                        proto: Proto::Udp,
+                        internal_source: "172.17.83.30:36099".parse().unwrap(),
+                        external_source: "198.18.0.1:62049".parse().unwrap(),
+                        external_destination: "185.125.190.57:123".parse().unwrap(),
+                    })
+                    .into_iter()
+                    .collect())
             }
         }
-        let table = NatTable::spawn(|| {
-            let sources: Vec<Box<dyn NatSource>> = vec![Box::new(OneSession)];
+        NatTable::spawn(move || {
+            let sources: Vec<Box<dyn NatSource>> = vec![Box::new(Ending(reads))];
             let directory: Box<dyn VmDirectory> = Box::new(NoDirectory);
             (sources, directory)
-        });
-        let flow = FiveTuple { proto: Proto::Udp, local: "198.18.0.1:62049".parse().unwrap(), remote: "185.125.190.57:123".parse().unwrap() };
-        assert_eq!(decide(Owner::Pid(7), table.held_match(&flow)), Attribution::Host { pid: 7, witness_only: false }, "nothing held yet");
+        })
+    }
+
+    fn session_flow() -> crate::flow::flows::FiveTuple {
+        use crate::flow::packet::Proto;
+        crate::flow::flows::FiveTuple { proto: Proto::Udp, local: "198.18.0.1:62049".parse().unwrap(), remote: "185.125.190.57:123".parse().unwrap() }
+    }
+
+    /// Later than any read asked before it, so it shares none.
+    const LATER_MS: u64 = 60_000;
+
+    /// A forwarded UDP flow whose external port equals a host wildcard-bound
+    /// port matches that owner row: a NAT session still there must overrule it,
+    /// or the flow borrows that app's exemption.
+    #[tokio::test]
+    async fn a_udp_owner_with_a_live_nat_match_is_unknown() {
+        let (table, flow) = (table_with_session_for(usize::MAX), session_flow());
+        assert_eq!(decide(Owner::Pid(7), table.confirmed_match(&flow, 0).await), Attribution::Host { pid: 7, witness_only: false }, "nothing held yet");
+        assert_eq!(table.stats().reads, 0, "and a flow with nothing held costs no read");
         assert!(table.fresh_match(&flow, 1_000).await.is_some());
-        let reads = table.stats().reads;
-        assert_eq!(decide(Owner::Pid(7), table.held_match(&flow)), Attribution::Unknown(Unproven::OwnerAndNat));
-        assert_eq!(table.stats().reads, reads, "the check reads only what is held");
+        assert_eq!(decide(Owner::Pid(7), table.confirmed_match(&flow, LATER_MS).await), Attribution::Unknown(Unproven::OwnerAndNat));
+    }
+
+    /// A guest's session ended and a host app reuses its exact tuple: what is held
+    /// is out of date, and only a read can say so.
+    #[tokio::test]
+    async fn a_stale_held_match_does_not_turn_a_host_flow_unknown() {
+        let (table, flow) = (table_with_session_for(1), session_flow());
+        assert!(table.fresh_match(&flow, 1_000).await.is_some());
+        assert!(table.held_match(&flow).is_some(), "the index still claims it");
+        assert_eq!(decide(Owner::Pid(7), table.confirmed_match(&flow, LATER_MS).await), Attribution::Host { pid: 7, witness_only: false });
+    }
+
+    /// The row's Off has to reach the flows the row counts: the 32nd name reads
+    /// under the unidentified row, so that row's Off exempts it, and no other does.
+    #[test]
+    fn a_guest_folded_past_the_cap_answers_to_the_row_it_counts_in() {
+        use crate::domain::{DomainFilter, Flow, Reason};
+        use sieve_filter::rules::{ListText, RuleEngine, RuleSet};
+        use sieve_ipc::{MAX_GUESTS, Policy, vm_key};
+        use std::sync::{Arc, Mutex};
+
+        let mut book = FlowBook::default();
+        let guest = |vm: &str| decide(Owner::Unknown, Some(Forwarded { vm: Some(vm.to_string()) }));
+        let open = |book: &mut FlowBook, vm: &str| {
+            let (_, forwarded) = guest(vm).event_fields();
+            book.open(sieve_ipc::FlowEvent { pid: None, exe: None, session: None, forwarded, ..crate::stack::book::tests_event(None) }).unwrap();
+        };
+        for i in 0..MAX_GUESTS - 1 {
+            open(&mut book, &format!("vm{i:02}"));
+        }
+        let (held, folded) = ("vm00", "one too many");
+        open(&mut book, folded);
+        assert_eq!(guest(held).row_owner(None, &book), HeldOwner::Forwarded(Some(held.to_string())));
+        assert_eq!(guest(folded).row_owner(None, &book), HeldOwner::Forwarded(None));
+
+        let lists = RuleEngine::compile(&[ListText { id: "test", text: "||ads.example^\n", trusted: false }]);
+        let rules = RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(lists) };
+        let row_off = DomainFilter::new(&Policy { sieving: true, off_apps: vec![vm_key(None)], ..Policy::default() }, rules);
+        let names = Mutex::default();
+        let reason = |owner: HeldOwner| row_off.decide(Flow { dns: false, name: Some("ads.example"), remote: "192.0.2.1".parse().unwrap(), owner: owner.as_owner() }, &names, 0).reason;
+        assert_eq!(reason(guest(folded).row_owner(None, &book)), Reason::AppExempt);
+        assert_ne!(reason(guest(held).row_owner(None, &book)), Reason::AppExempt);
     }
 
     #[test]

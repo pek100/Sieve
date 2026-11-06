@@ -386,6 +386,19 @@ impl VmDirectory for HostCompute {
     }
 }
 
+/// The directory and the apartment its COM objects need. The reader thread drops
+/// its sources first, then this; the fields drop in order, the apartment last.
+struct InApartment {
+    directory: HostCompute,
+    _apartment: ComApartment,
+}
+
+impl VmDirectory for InApartment {
+    fn vm_of(&mut self, internal: IpAddr) -> Option<String> {
+        self.directory.vm_of(internal)
+    }
+}
+
 /// What the NAT reader thread runs: both sources behind the one trait, and
 /// the directory. A failure to enter COM leaves the event table and no names.
 pub fn reader_sources(winnat: Arc<Mutex<WinNatTable>>) -> (Vec<Box<dyn NatSource>>, Box<dyn VmDirectory>) {
@@ -393,9 +406,7 @@ pub fn reader_sources(winnat: Arc<Mutex<WinNatTable>>) -> (Vec<Box<dyn NatSource
     let Ok(apartment) = ComApartment::enter() else {
         return (vec![events], Box::new(NoDirectory));
     };
-    // Lives as long as the reader thread, whose sources need it.
-    std::mem::forget(apartment);
-    (vec![Box::new(WmiNat::default()), events], Box::new(HostCompute::load()))
+    (vec![Box::new(WmiNat::default()), events], Box::new(InApartment { directory: HostCompute::load(), _apartment: apartment }))
 }
 
 /// Proves COM and WMI load under the service's System32-only DLL search
@@ -419,6 +430,29 @@ mod tests {
     fn drained(script: Vec<(HRESULT, Option<u32>)>) -> Result<Vec<u32>, String> {
         let mut script = script.into_iter();
         drain_rows(|| script.next().expect("the loop stopped at the end of the script"))
+    }
+
+    /// The thread leaves the apartment when the reader's parts go: entering another
+    /// kind of apartment is refused for as long as it is still in the first.
+    #[test]
+    fn the_reader_leaves_com_when_its_parts_are_dropped() {
+        use windows::Win32::System::Com::COINIT_APARTMENTTHREADED;
+        let entered_after = std::thread::spawn(|| {
+            let (sources, directory) = reader_sources(Arc::default());
+            drop(sources);
+            drop(directory);
+            // SAFETY: plain call on this thread, paired below when it succeeds.
+            let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            if hr.is_ok() {
+                // SAFETY: this thread just entered.
+                unsafe { CoUninitialize() };
+            }
+            hr
+        })
+        .join()
+        .unwrap();
+        assert_ne!(entered_after, RPC_E_CHANGED_MODE, "still in the reader's apartment");
+        assert!(entered_after.is_ok(), "{entered_after:?}");
     }
 
     #[test]
