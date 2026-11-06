@@ -34,7 +34,7 @@ use super::first_bytes::{First, read_first};
 use super::server::{server_config, speaks_to};
 use super::splice::{AppSide, Prefixed, splice};
 use super::upstream::{HandshakeEnd, Handshaken, LeafFacts, Verifier, filter_alpn, handshake, is_post_handshake_auth, leaf_facts, rustls_error};
-use super::verdict::VerdictCache;
+use super::verdict::{Cached, VerdictCache};
 use crate::ca::{CaError, LeafRequest, Minter};
 use crate::dns::NameMap;
 use crate::domain::FilterSlot;
@@ -126,6 +126,23 @@ pub struct FlowMeta<'a> {
     pub decide: &'a (dyn Fn(&Decoded) -> Action + Send + Sync),
 }
 
+/// What `decrypt` needs to know about a flow's origin, on any transport.
+#[derive(Debug, Clone, Copy)]
+pub struct Who<'a> {
+    pub remote: SocketAddr,
+    pub exe: Option<&'a str>,
+    pub session: Option<u32>,
+    pub may_decrypt: bool,
+    pub app_off: bool,
+    pub names_now_ms: u64,
+}
+
+impl FlowMeta<'_> {
+    pub fn who(&self) -> Who<'_> {
+        Who { remote: self.remote, exe: self.exe, session: self.session, may_decrypt: self.may_decrypt, app_off: self.app_off, names_now_ms: self.names_now_ms }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Outcome {
     pub action: FlowAction,
@@ -156,6 +173,12 @@ impl<C> HttpsSlot<C> {
             before.active.close_all();
         }
     }
+
+    /// True while new flows would be judged with the switch on. A refused QUIC
+    /// flow asks this per datagram.
+    pub fn is_on(&self) -> bool {
+        self.get().is_some_and(|https| !https.active.is_closed())
+    }
 }
 
 /// The switch of one policy: HTTPS filtering only while sieving (plan 8).
@@ -181,9 +204,52 @@ impl<C: Dial> Interception<C> {
         decrypt(facts, &store, &switches)
     }
 
-    fn not_decrypted(&self, id: u64, reason: &PassReason) {
+    /// The facts of a flow whose first bytes were decoded, on either transport:
+    /// the only difference between TCP and QUIC is `transport`.
+    pub(crate) fn facts_for<'a>(&self, transport: Transport, decoded: &'a Decoded, who: &Who<'a>) -> FlowFacts<'a> {
+        let host = decoded.domain.as_deref();
+        // Task D9: the engine's own DNS answered this SNI for this address, so the
+        // app resolved the SNI itself and the extension is GREASE. A wrong "GREASE"
+        // cannot leak: the client reads our answer as ECH rejected, authenticates
+        // the public name and retries without ECH under a normal decision.
+        let ech = decoded.ech && !host.is_some_and(|h| lock(&self.names).names(who.remote.ip(), who.names_now_ms).contains(&h));
+        FlowFacts {
+            transport,
+            may_decrypt: who.may_decrypt,
+            exe: who.exe,
+            session: who.session,
+            host,
+            ip: who.remote.ip(),
+            port: who.remote.port(),
+            alpn: &decoded.alpn,
+            ech,
+            client_compatible: speaks_to(&decoded.offer),
+            app_in_scope: self.exclusions.in_scope(who.exe),
+            app_off: who.app_off,
+            upstream: None,
+        }
+    }
+
+    /// The look before any upstream socket speaks, with what is already cached.
+    fn first_look(&self, facts: FlowFacts<'_>, cached: Option<Cached>) -> Decrypt {
+        self.says(&FlowFacts { upstream: cached.and_then(|c| rejection(c.verdict)), ..facts })
+    }
+
+    /// The answer a TCP flow of these facts would get at its first look (task
+    /// F4): a host TCP will not filter, by a cached rejection, passes here too.
+    pub(crate) fn before_upstream(&self, facts: FlowFacts<'_>) -> Decrypt {
+        let cached = facts.host.and_then(|h| self.verdicts.get(h, facts.port, (self.clock)()));
+        self.first_look(facts, cached)
+    }
+
+    /// The log row of a flow not decrypted, with no judgment of its own.
+    pub(crate) fn not_decrypted_row(&self, id: u64, slug: &str) {
+        lock(&self.book).log_not_decrypted(id, slug, (self.clock)());
+    }
+
+    pub(crate) fn not_decrypted(&self, id: u64, reason: &PassReason) {
         Meters::bump(&self.meters.https.passed);
-        lock(&self.book).log_not_decrypted(id, &reason.slug(), (self.clock)());
+        self.not_decrypted_row(id, &reason.slug());
     }
 
     /// An entry the engine writes itself. One that cannot reach the disk still
@@ -262,31 +328,11 @@ where
         return if splice(&mut app, upstream, &held).await { FlowAction::Relayed } else { FlowAction::Failed };
     }
     let host = decoded.domain.as_deref();
-    // Task D9: the engine's own DNS answered this SNI for this address, so the
-    // app resolved the SNI itself and the extension is GREASE. A wrong "GREASE"
-    // cannot leak: the client reads our answer as ECH rejected, authenticates
-    // the public name and retries without ECH under a normal decision.
-    let ech = decoded.ech && !host.is_some_and(|h| lock(&deps.names).names(flow.remote.ip(), flow.names_now_ms).contains(&h));
-    let facts = FlowFacts {
-        transport: Transport::Tcp,
-        may_decrypt: flow.may_decrypt,
-        exe: flow.exe,
-        session: flow.session,
-        host,
-        ip: flow.remote.ip(),
-        port: flow.remote.port(),
-        alpn: &decoded.alpn,
-        ech,
-        client_compatible: speaks_to(&decoded.offer),
-        app_in_scope: deps.exclusions.in_scope(flow.exe),
-        app_off: flow.app_off,
-        upstream: None,
-    };
+    let facts = deps.facts_for(Transport::Tcp, &decoded, &flow.who());
     // Before the cache is read: see `active`, no close can fall in the gap.
     let registered = host.map(|h| deps.active.register(h));
     let cached = host.and_then(|h| deps.verdicts.get(h, flow.remote.port(), (deps.clock)()));
-    let before = FlowFacts { upstream: cached.and_then(|c| rejection(c.verdict)), ..facts };
-    if let Decrypt::PassThrough(reason) = deps.says(&before) {
+    if let Decrypt::PassThrough(reason) = deps.first_look(facts, cached) {
         drop(registered);
         deps.not_decrypted(flow.id, &reason);
         return if splice(&mut app, upstream, &held).await { FlowAction::Relayed } else { FlowAction::Failed };
