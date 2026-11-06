@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 pub const WINTUN_DLL: &str = "wintun.dll";
-/// SHA-256 of Wintun 0.14.1's `bin/amd64/wintun.dll` (wintun.net, 2026-10-17,
+/// SHA-256 of Wintun 0.14.1's `bin/amd64/wintun.dll` (the project's download, 2026-10-17,
 /// 427,552 bytes, signed by WireGuard LLC). The installer bundles this file;
 /// `scripts/wintun.mjs` refuses to bundle any other.
 pub const WINTUN_SHA256: &str = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce";

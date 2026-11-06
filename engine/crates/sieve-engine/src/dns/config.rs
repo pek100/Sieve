@@ -136,11 +136,11 @@ mod tests {
     #[test]
     fn a_file_with_a_utf8_bom_is_the_list_it_holds() {
         let dir = tempfile::tempdir().unwrap();
-        let held = br#"{ "revision": 1, "upstreams": ["https://192.0.2.1/dns-query", "https://cloudflare-dns.com/dns-query"] }"#;
+        let held = br#"{ "revision": 1, "upstreams": ["https://192.0.2.1/dns-query", "https://dns.example/dns-query"] }"#;
         std::fs::write(dir.path().join(DNS_FILE), [b"\xEF\xBB\xBF".as_slice(), held].concat()).unwrap();
         let (read, why) = load(dir.path());
         assert_eq!(why, None);
-        assert_eq!(read, list(1, &["https://192.0.2.1/dns-query", "https://cloudflare-dns.com/dns-query"]));
+        assert_eq!(read, list(1, &["https://192.0.2.1/dns-query", "https://dns.example/dns-query"]));
     }
 
     #[test]

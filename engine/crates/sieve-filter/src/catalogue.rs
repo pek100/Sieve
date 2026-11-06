@@ -26,7 +26,10 @@ pub struct List {
     pub homepage: &'static str,
 }
 
-const UBO_SLICE: &str = "slice 10 (YouTube acceptance, two arms)";
+/// Slice 10's rule, from plan 5.4: both arms pass, the gated rows turn on; only
+/// one passes, that arm is the default, with the numbers in the plan. Not decided
+/// here: the one-word change waits for the live result.
+const UBO_SLICE: &str = "slice 10 (video site acceptance, two arms)";
 const ADGUARD_HOME: &str = "https://github.com/AdguardTeam/AdguardFilters";
 const UASSETS_HOME: &str = "https://github.com/uBlockOrigin/uAssets";
 
@@ -92,6 +95,20 @@ pub fn defaults_on() -> impl Iterator<Item = &'static List> {
     LISTS.iter().filter(|l| l.default == Default::On)
 }
 
+/// The two arms slice 10's acceptance runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListArm {
+    AdguardOnly,
+    WithUbo,
+}
+
+/// An arm's lists, in catalogue order, derived from each row's `default`: the
+/// defaults, or the defaults and every gated row.
+pub fn arm_lists(arm: ListArm) -> Vec<&'static List> {
+    let in_arm = |l: &&List| l.default == Default::On || (arm == ListArm::WithUbo && matches!(l.default, Default::Gated(_)));
+    LISTS.iter().filter(in_arm).collect()
+}
+
 /// The lists the user's choice names, in catalogue order; None means the
 /// defaults. An id no catalogue row has (an older or newer app) is ignored.
 pub fn selected(ids: Option<&[String]>) -> Vec<&'static List> {
@@ -151,6 +168,16 @@ mod tests {
         }
         assert_eq!(find("adguard-base").map(|l| l.homepage), Some(ADGUARD_HOME));
         assert_eq!(find("ubo-filters").map(|l| l.homepage), Some(UASSETS_HOME));
+    }
+
+    #[test]
+    fn arms_differ_exactly_by_the_gated_lists() {
+        let ids = |arm| arm_lists(arm).iter().map(|l| l.id).collect::<Vec<_>>();
+        assert_eq!(ids(ListArm::AdguardOnly), defaults_on().map(|l| l.id).collect::<Vec<_>>());
+        let added: Vec<_> = ids(ListArm::WithUbo).into_iter().filter(|id| !ids(ListArm::AdguardOnly).contains(id)).collect();
+        assert_eq!(added, ["ubo-filters", "ubo-quick-fixes", "ubo-unbreak"]);
+        assert!(ids(ListArm::AdguardOnly).iter().all(|id| ids(ListArm::WithUbo).contains(id)), "nothing leaves");
+        assert!(arm_lists(ListArm::WithUbo).iter().all(|l| l.default != Default::Off), "no off row is in an arm");
     }
 
     #[test]

@@ -174,7 +174,7 @@ fn main() {
     };
     time("owner match, 500-row table, last row", 200_000, || match_owner(&flow, &rows));
 
-    let text: String = (0..100_000).map(|i| format!("||ads{i}.tracker{}.com^\n", i % 997)).collect();
+    let text: String = (0..100_000).map(|i| format!("||ads{i}.tracker{}.example^\n", i % 997)).collect();
     let lists = RuleEngine::compile(&[ListText { id: "bench", text: &text, trusted: false }]);
     let rules = RuleSet { user: std::sync::Arc::new(RuleEngine::empty()), lists: std::sync::Arc::new(lists) };
     let filter = DomainFilter::new(&Policy { sieving: true, ..Policy::default() }, rules);
@@ -184,7 +184,7 @@ fn main() {
         filter.decide(flow, &names, 0)
     };
     time("decision, 100k rules, 5-label miss", 1_000_000, || decide("a.b.cdn.example.org"));
-    time("decision, 100k rules, hit", 1_000_000, || decide("x.ads77.tracker77.com"));
+    time("decision, 100k rules, hit", 1_000_000, || decide("x.ads77.tracker77.example"));
 
     println!("\n== ipstack ingress (every packet; one flow, one task hop each) ==");
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
