@@ -3,7 +3,8 @@
 //!   - `service`: the `sieve-engine` service's state from the service manager
 //!     (connect and query access only), `missing` when not installed;
 //!   - `adguard`: AdGuard for Windows' service state, read the same way (the
-//!     pause offer and its undo follow it);
+//!     pause offer reads it beside the engine's blocker, which alone says
+//!     whether AdGuard intercepts);
 //!   - `pipe` (only while the service runs): the engine's own answer over
 //!     `\\.\pipe\sieve-engine` (protocol `sieve-ipc` v3): Welcome with its
 //!     Status, Incompatible, the engine's refusal (only the installed app may

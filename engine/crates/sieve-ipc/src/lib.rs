@@ -177,8 +177,9 @@ pub struct ListStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Blocker {
-    /// AdGuard for Windows' service is running: its driver would capture the
-    /// engine's own connections (probe run 2). `service` is its service name.
+    /// AdGuard for Windows is intercepting, whatever its service's state: its
+    /// driver would capture the engine's own connections (probe run 2).
+    /// `service` is its service name.
     Adguard { service: String },
     /// A full-tunnel VPN holds the default route on `adapter`.
     Vpn { adapter: String },

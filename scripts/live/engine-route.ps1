@@ -181,12 +181,15 @@ switch ($Step) {
     Check "the engine refuses while AdGuard runs (blocker adguard)" ($s -and $s.blocker.kind -eq "adguard") "status.json blocker: $($s.blocker.kind)"
     Check "no route on Sieve while AdGuard runs" ((Get-SieveRoutes).Count -eq 0)
     Check "the app shows the AdGuard refusal" (Ask "Does Settings > Filtering > Engine say 'Waiting for AdGuard' with the reason?")
-    Check "the app offers to pause AdGuard" (Ask "Is there a 'Pause AdGuard' button, with the text that it stops AdGuard's Windows service and Windows asks you first?")
+    Check "the app offers to pause AdGuard" (Ask "Is there a 'Pause AdGuard' button, with the text that it asks AdGuard's Windows service to stop and Windows asks you first?")
     Write-Host "Click 'Pause AdGuard' and approve the Windows prompt."
-    $stopped = Wait-For { (Get-Service $AdguardService).Status -eq "Stopped" } 90
-    Check "pausing AdGuard stops its service" $stopped
+    # AdGuard's service stays StopPending after a pause, so the engine's verdict is what to wait for.
+    $cleared = Wait-For { $now = Read-Status; $now -and $now.blocker.kind -ne "adguard" } 90
+    Check "the engine's AdGuard blocker clears after the pause" $cleared
+    Write-Evidence "route-adguard-paused-service.txt" ((Get-Service $AdguardService).Status.ToString())
     $routed = Wait-For { (Get-SieveRoutes).Count -gt 0 } 30
-    Check "the engine routes once AdGuard stopped" $routed
+    Check "the engine routes once AdGuard stopped filtering" $routed
+    Check "the app says AdGuard is paused, with no Start button" (Ask "Does the Engine block say 'AdGuard is paused' and how to turn it back on, with no 'Start AdGuard again' button?")
   }
 
   "on" {
@@ -336,11 +339,17 @@ switch ($Step) {
 
   "adguard-back" {
     Assert-Admin
-    Write-Host "In Settings > Filtering > Engine, click 'Start AdGuard again' and approve the Windows prompt."
-    $running = Wait-For { (Get-Service $AdguardService).Status -eq "Running" } 90
-    Check "starting AdGuard again runs its service" $running
+    # A paused AdGuard stays StopPending, where sc start cannot resume it (the app shows no button then).
+    if ((Get-Service $AdguardService).Status -eq "Stopped") {
+      Write-Host "In Settings > Filtering > Engine, click 'Start AdGuard again' and approve the Windows prompt."
+    } else {
+      Write-Host "Turn protection on in AdGuard's own window."
+    }
+    $back = Wait-For { $now = Read-Status; $now -and $now.blocker.kind -eq "adguard" } 90
+    Check "the engine sees AdGuard filter again (blocker adguard)" $back
+    Write-Evidence "route-adguard-back-service.txt" ((Get-Service $AdguardService).Status.ToString())
     $down = Wait-For { (Get-SieveRoutes).Count -eq 0 } 30
-    Check "the engine steps aside when AdGuard runs again" $down
+    Check "the engine steps aside when AdGuard filters again" $down
     Test-Network "adguard-back" | Out-Null
   }
 }

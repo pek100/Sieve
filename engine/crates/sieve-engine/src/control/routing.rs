@@ -1,10 +1,10 @@
 //! Windows: the routing loop. It brings the adapter and its routes up when
 //! the user's switch is on and nothing blocks it, and takes them down when
-//! the switch goes off, AdGuard's service runs, a full-tunnel VPN comes up
-//! or the service stops. It wakes on a policy change, on every route change
-//! (`NotifyRouteChange2`) and, while the switch is on, every
-//! [`RECHECK_EVERY`] for AdGuard's service; with the switch off it waits
-//! with no timer at all (plan 6: idle CPU 0).
+//! the switch goes off, AdGuard intercepts (`coexist`), a full-tunnel VPN
+//! comes up or the service stops. It wakes on a policy change, on every route
+//! change (`NotifyRouteChange2`) and, while the switch is on, every
+//! [`RECHECK_EVERY`] for AdGuard; with the switch off it waits with no timer
+//! at all (plan 6: idle CPU 0).
 //!
 //! Bringing up: load the pinned wintun.dll, create the adapter, give it its
 //! addresses, journal and add each planned route, start the stack, arm the
@@ -41,8 +41,8 @@ use crate::tun::MTU;
 use crate::tun::{TUN_V4, TUN_V6};
 use crate::watchdog::monotonic_ms;
 
-/// While the switch is on, AdGuard's service is read this often (it has no
-/// route change to wake the loop).
+/// While the switch is on, AdGuard is checked this often (it has no route
+/// change to wake the loop). With its service alive, each check is one probe.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(5);
 /// Cancelled flow tasks get this long to finish at take-down.
 const TASKS_BOUND: Duration = Duration::from_secs(5);
@@ -98,10 +98,13 @@ async fn stop_attribution(engine: &Engine, session: Option<EtwSession>) {
     }
 }
 
-/// The machine's tables and what may run beside the engine, now.
-fn evaluate() -> Result<(NetTables, Coexistence), String> {
+/// The machine's tables and what may run beside the engine, now. Async because
+/// the AdGuard probe waits out its window; a probe that cannot run is an error
+/// (a Setup blocker that routes nothing), never a verdict.
+async fn evaluate() -> Result<(NetTables, Coexistence), String> {
     let tables = read::tables()?;
-    let coexistence = coexist::classify(&tables, coexist::adguard_running()?);
+    let intercepting = coexist::adguard_intercepts(coexist::adguard_service()?, || coexist::probe_adguard(&tables)).await?;
+    let coexistence = coexist::classify(&tables, intercepting);
     Ok((tables, coexistence))
 }
 
@@ -119,7 +122,7 @@ pub async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
         let on = engine.policy().engine && engine.crash_loop().is_none();
         let mut want: Option<NetTables> = None;
         if on {
-            match evaluate() {
+            match evaluate().await {
                 Ok((tables, c)) => {
                     let blocked = c.blocker.is_some();
                     engine.set_facts(|f| {

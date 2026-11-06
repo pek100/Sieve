@@ -318,7 +318,7 @@ describe("engine controller", () => {
     s.undo();
   });
 
-  it("pausing AdGuard runs only on request, then probes: the waiting engine routes; starting it again makes it wait", async () => {
+  it("pausing AdGuard runs only on request, then probes: the waiting engine routes with the service left stopping", async () => {
     const s = setup("adguard", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
     await s.fc.flush();
     expect(s.phase()).toBe("adguard");
@@ -326,7 +326,18 @@ describe("engine controller", () => {
     await s.controller.stopAdguard();
     expect(s.fake.probes()).toBe(probes + 1);
     expect(s.phase()).toBe("routing");
+    expect(s.store.getState().engine.probe?.adguard).toBe("stopping");
     expect(s.store.getState().engine.adguard).toBeNull();
+    await s.controller.startAdguard();
+    expect(s.store.getState().engine.actionError).toMatch(/AdGuard/);
+    expect(s.phase()).toBe("routing");
+    s.undo();
+  });
+
+  it("starting AdGuard's stopped service makes the routing engine wait", async () => {
+    const s = setup("filtering", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+    await s.fc.flush();
+    expect(s.phase()).toBe("routing");
     await s.controller.startAdguard();
     expect(s.phase()).toBe("adguard");
     s.undo();

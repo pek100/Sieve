@@ -1,0 +1,85 @@
+{
+  "about": "The rows here are constructed from the redirect model (docs/tasks/2026-11-02-coexist.md, decision 2), not recorded from a live AdGuard. Live proof L1 replaces them. Pid 4242 is AdGuard's service, 9000 the engine, 5555 another app.",
+  "observations": {
+    "redirected": {
+      "local": "192.168.7.20:50001",
+      "dest": "192.0.2.1:443",
+      "connected": true,
+      "rows": [
+        { "local": "192.168.7.20:50001", "remote": "192.0.2.1:443", "pid": 9000 },
+        { "local": "192.168.7.20:17000", "remote": "192.168.7.20:50001", "pid": 4242 },
+        { "local": "192.168.7.20:50002", "remote": "192.0.2.1:443", "pid": 4242 }
+      ]
+    },
+    "redirected_v6": {
+      "local": "[2001:db8:7:1::20]:50001",
+      "dest": "[2001:db8::1]:443",
+      "connected": true,
+      "rows": [
+        { "local": "[2001:db8:7:1::20]:50001", "remote": "[2001:db8::1]:443", "pid": 9000 },
+        { "local": "[2001:db8:7:1::20]:17000", "remote": "[2001:db8:7:1::20]:50001", "pid": 4242 }
+      ]
+    },
+    "clear": {
+      "local": "192.168.7.20:50001",
+      "dest": "192.0.2.1:443",
+      "connected": false,
+      "rows": [
+        { "local": "192.168.7.20:50001", "remote": "192.0.2.1:443", "pid": 9000 },
+        { "local": "192.168.7.20:50100", "remote": "198.51.100.7:443", "pid": 4242 }
+      ]
+    },
+    "accepted_row": {
+      "local": "192.168.7.20:50001",
+      "dest": "192.0.2.1:443",
+      "connected": false,
+      "rows": [
+        { "local": "192.168.7.20:50001", "remote": "192.0.2.1:443", "pid": 9000 },
+        { "local": "192.168.7.20:17000", "remote": "192.168.7.20:50001", "pid": 4242 }
+      ]
+    },
+    "upstream_row": {
+      "local": "192.168.7.20:50001",
+      "dest": "192.0.2.1:443",
+      "connected": false,
+      "rows": [
+        { "local": "192.168.7.20:50001", "remote": "192.0.2.1:443", "pid": 9000 },
+        { "local": "192.168.7.20:50002", "remote": "192.0.2.1:443", "pid": 4242 }
+      ]
+    },
+    "answered_no_row": {
+      "local": "192.168.7.20:50001",
+      "dest": "192.0.2.1:443",
+      "connected": true,
+      "rows": [{ "local": "192.168.7.20:50001", "remote": "192.0.2.1:443", "pid": 9000 }]
+    },
+    "other_process_row": {
+      "local": "192.168.7.20:50001",
+      "dest": "192.0.2.1:443",
+      "connected": false,
+      "rows": [
+        { "local": "192.168.7.20:50001", "remote": "192.0.2.1:443", "pid": 9000 },
+        { "local": "192.168.7.20:17000", "remote": "192.168.7.20:50001", "pid": 5555 }
+      ]
+    }
+  },
+  "cases": [
+    { "name": "running_intercepted_home", "service": "running", "pid": 4242, "observation": "redirected", "tables": "home", "intercepting": true, "blocker": { "kind": "adguard", "service": "Adguard Service" }, "probes": 1 },
+    { "name": "running_intercepted_vpn_full", "service": "running", "pid": 4242, "observation": "redirected", "tables": "vpn_full", "intercepting": true, "blocker": { "kind": "adguard", "service": "Adguard Service" }, "probes": 1 },
+    { "name": "running_intercepted_vpn_split", "service": "running", "pid": 4242, "observation": "redirected", "tables": "vpn_split", "intercepting": true, "blocker": { "kind": "adguard", "service": "Adguard Service" }, "probes": 1 },
+    { "name": "running_intercepted_over_ipv6", "service": "running", "pid": 4242, "observation": "redirected_v6", "tables": "home", "intercepting": true, "blocker": { "kind": "adguard", "service": "Adguard Service" }, "probes": 1 },
+    { "name": "stop_pending_clear_home", "service": "stop_pending", "pid": 4242, "observation": "clear", "tables": "home", "intercepting": false, "blocker": null, "probes": 1 },
+    { "name": "running_protection_off_home", "service": "running", "pid": 4242, "observation": "clear", "tables": "home", "intercepting": false, "blocker": null, "probes": 1 },
+    { "name": "stopped_sends_no_probe", "service": "stopped", "pid": null, "observation": "redirected", "tables": "home", "intercepting": false, "blocker": null, "probes": 0 },
+    { "name": "absent_sends_no_probe", "service": "absent", "pid": null, "observation": "redirected", "tables": "home", "intercepting": false, "blocker": null, "probes": 0 },
+    { "name": "accepted_row_is_a_witness", "service": "stop_pending", "pid": 4242, "observation": "accepted_row", "tables": "home", "intercepting": true, "blocker": { "kind": "adguard", "service": "Adguard Service" }, "probes": 1 },
+    { "name": "upstream_row_is_a_witness", "service": "stop_pending", "pid": 4242, "observation": "upstream_row", "tables": "home", "intercepting": true, "blocker": { "kind": "adguard", "service": "Adguard Service" }, "probes": 1 },
+    { "name": "finished_connect_without_a_row", "service": "stop_pending", "pid": 4242, "observation": "answered_no_row", "tables": "home", "intercepting": true, "blocker": { "kind": "adguard", "service": "Adguard Service" }, "probes": 1 },
+    { "name": "another_process_row", "service": "running", "pid": 4242, "observation": "other_process_row", "tables": "home", "intercepting": false, "blocker": null, "probes": 1 },
+    { "name": "no_pid_finished_connect", "service": "running", "pid": null, "observation": "answered_no_row", "tables": "home", "intercepting": true, "blocker": { "kind": "adguard", "service": "Adguard Service" }, "probes": 1 },
+    { "name": "no_pid_rows_alone", "service": "running", "pid": null, "observation": "accepted_row", "tables": "home", "intercepting": false, "blocker": null, "probes": 1 },
+    { "name": "paused_with_adguard_vpn", "service": "stop_pending", "pid": 4242, "observation": "clear", "tables": "vpn_full", "intercepting": false, "blocker": { "kind": "vpn", "adapter": "AdGuard VPN" }, "probes": 1 },
+    { "name": "stopped_with_adguard_vpn", "service": "stopped", "pid": null, "observation": "redirected", "tables": "vpn_full", "intercepting": false, "blocker": { "kind": "vpn", "adapter": "AdGuard VPN" }, "probes": 0 },
+    { "name": "intercepting_with_adguard_vpn", "service": "running", "pid": 4242, "observation": "redirected", "tables": "vpn_full", "intercepting": true, "blocker": { "kind": "adguard", "service": "Adguard Service" }, "probes": 1 }
+  ]
+}

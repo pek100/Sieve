@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/sieve/shell/card";
 import {
   ADGUARD_PAUSE_TEXT,
+  ADGUARD_PAUSED_TEXT,
   ADGUARD_START_TEXT,
   ENGINE_PROBLEMS,
   ENGINE_STATE_TEXT,
@@ -22,6 +23,8 @@ import { cn } from "@/lib/utils";
 
 const percent = (share: number) => `${Math.floor(share * 1000) / 10}%`;
 
+const ADGUARD_OFFER_TEXT = { pause: ADGUARD_PAUSE_TEXT, start: ADGUARD_START_TEXT, paused: ADGUARD_PAUSED_TEXT };
+
 /**
  * Settings > Filtering, the engine: what Sieve's filtering engine is, from
  * facts only (the Windows service's state and the engine's own answer on its
@@ -29,9 +32,10 @@ const percent = (share: number) => `${Math.floor(share * 1000) / 10}%`;
  * "Route traffic through the engine" switch above turns its routing on.
  * Flat like every block: a title, a status line, one sentence on what it
  * means, then what the engine itself reported: split tunnels, its flow
- * counters, its version. While AdGuard's service blocks it, the pause offer
- * says exactly what it does (it stops that service; Windows asks first) and
- * "Start AdGuard again" undoes it.
+ * counters, its version. While AdGuard intercepts, the pause offer says
+ * exactly what it does (it asks that service to stop; Windows asks first).
+ * After a pause the service stays stopping, so the block says how to resume it
+ * and has no button; "Start AdGuard again" is for a service really stopped.
  */
 export function EngineCard() {
   const e = useEngine();
@@ -86,12 +90,13 @@ export function EngineCard() {
         </div>
         {offer && (
           <div className="flex flex-col items-start gap-2" data-adguard-offer={offer}>
-            <p className="text-label text-on-surface-muted break-words">{offer === "pause" ? ADGUARD_PAUSE_TEXT : ADGUARD_START_TEXT}</p>
-            {offer === "pause" ? (
+            <p className="text-label text-on-surface-muted break-words">{ADGUARD_OFFER_TEXT[offer]}</p>
+            {offer === "pause" && (
               <Button variant="secondary" disabled={busy !== null} onClick={() => void stopAdguard()}>
                 {busy === "stopping" ? "Pausing AdGuard" : "Pause AdGuard"}
               </Button>
-            ) : (
+            )}
+            {offer === "start" && (
               <Button variant="secondary" disabled={busy !== null} onClick={() => void startAdguard()}>
                 {busy === "starting" ? "Starting AdGuard" : "Start AdGuard again"}
               </Button>
