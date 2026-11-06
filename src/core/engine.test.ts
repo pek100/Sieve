@@ -139,7 +139,7 @@ describe("engine phase", () => {
   });
 
   it("a running service with no pipe answer is not running, and an error wins over old facts", () => {
-    const running: EngineSlice = { probe: { v: 2, service: "running", adguard: "missing", pipe: null }, error: null };
+    const running: EngineSlice = { probe: { v: 3, service: "running", adguard: "missing", pipe: null }, error: null };
     expect(enginePhase(running)).toBe("not_running");
     expect(enginePhase({ ...facts("idle"), error: "x" })).toBe("unreadable");
   });
@@ -218,10 +218,10 @@ describe("the AdGuard offer", () => {
       expect(adguardOffer({ ...withService("adguard_paused", service), error: "read failed" }), service).toBeNull();
     }
     // Old or partial probes reach the render path only past the boundary; the guard holds anyway.
-    const partial = { ...facts("adguard_paused"), probe: { v: 2, service: "running", pipe: null } } as unknown as EngineSlice;
+    const partial = { ...facts("adguard_paused"), probe: { v: 3, service: "running", pipe: null } } as unknown as EngineSlice;
     expect(adguardOffer(partial)).toBeNull();
     expect(() => engineDetail(partial)).not.toThrow();
-    const noPipe: EngineSlice = { probe: { v: 2, service: "running", adguard: "stopping", pipe: null }, error: null };
+    const noPipe: EngineSlice = { probe: { v: 3, service: "running", adguard: "stopping", pipe: null }, error: null };
     expect(adguardOffer(noPipe)).toBeNull();
     expect(adguardOffer(withService("adguard_paused", "other"))).toBeNull();
   });

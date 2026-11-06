@@ -118,7 +118,7 @@ describe("protocol law", () => {
     if (pipe?.kind !== "welcome") throw new Error("expected welcome");
     expect(pipe.status.blocking).toBe(false);
     expect(pipe.status.counters.blocked).toBe(0);
-    expect(pipe.status.policy).toEqual({ revision: 3, engine: true, sieving: false, off_apps: [], lists: null, domain_lists: [] });
+    expect(pipe.status.policy).toEqual({ revision: 3, engine: true, sieving: false, off_apps: [], lists: null, domain_lists: [], https: false });
     expect(() => parseEngineProbe(withStatus({ ...status, blocking: "yes" }))).toThrow(/status\.blocking/);
     expect(() => parseEngineProbe(withStatus({ ...status, policy: { revision: 1, engine: true, off_apps: [1] } }))).toThrow(/off_apps/);
     expect(() => parseEngineProbe(withStatus({ ...status, policy: { revision: 1, engine: true, domain_lists: [{ kind: "nope", entries: [], enabled: true }] } }))).toThrow(/domain_lists/);

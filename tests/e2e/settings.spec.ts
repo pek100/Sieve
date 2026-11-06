@@ -72,8 +72,8 @@ test.describe("settings", () => {
         return { name: s.getAttribute("aria-label"), height: own.height, gap: own.bottom - content };
       }),
     );
-    // Five registry sections with rows (Filtering's is the engine's switch, slice 3), then the engine.
-    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Engine"]);
+    // Five registry sections with rows (Filtering's is the engine's switch, slice 3), then the engine and its certificate.
+    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Engine", "Certificate"]);
     // Was 686 px of empty space under Filtering's rows: its card took the height of its wrapper (Card h-full).
     // Allowed: a row's own bottom padding (16) and at most a section's padding.
     for (const g of gaps) expect(g.gap, `${g.name} ends ${g.gap}px below its content`).toBeLessThanOrEqual(40);

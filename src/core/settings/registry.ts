@@ -112,6 +112,9 @@ export type SettingDef =
   | ListSetting<unknown>
   | DataSwitchSetting;
 
+/** The plan step that brings interception, without which the HTTPS switch means nothing. */
+const ENGINE_SLICE_6 = "engine slice 6 (docs/plans/2026-10-17-https-filtering.md)";
+
 const enumSetting = <const O extends string>(d: Omit<EnumSetting<O>, "kind">): EnumSetting<O> => ({
   kind: "enum",
   ...d,
@@ -207,6 +210,21 @@ export const REGISTRY = {
     default: [] as readonly string[],
     of: { type: "string" },
   } satisfies ListSetting<string>,
+  // The root certificate (docs/plans/2026-10-17-https-filtering.md, slice 5).
+  // Hidden until interception exists: it "cannot be on without slice 6". The
+  // app therefore sends off, and the live check drives it with the app closed
+  // (docs/live/engine-slice-5.md). Settings' Certificate group turns it off.
+  "filtering.https": {
+    kind: "dataSwitch",
+    section: "filtering",
+    label: "Decrypt HTTPS traffic",
+    help: "Installs Sieve's own certificate on this computer so the engine can filter inside HTTPS. Off: the certificate is removed from Windows and Firefox.",
+    default: false,
+    liveCheck: "live_https_intercepts_public_and_passes_floor",
+    requires: "filtering.engine",
+    needsEngine: true,
+    unavailableUntil: ENGINE_SLICE_6,
+  } satisfies DataSwitchSetting,
   // Plan 1.4: the engine forwards every lookup encrypted, tried in order.
   "filtering.upstreams": {
     kind: "list",
@@ -268,7 +286,7 @@ export function isSettingKey(key: string): key is SettingKey {
 /**
  * Can the user see and change this setting in this build? The one place the
  * answer comes from: the settings document, export, import, search and the
- * Settings view all ask it. No key is unavailable today (law 11).
+ * Settings view all ask it. Only `filtering.https` is unavailable today (law 11).
  */
 export function isAvailable(key: SettingKey): boolean {
   return settingDef(key).unavailableUntil === undefined;

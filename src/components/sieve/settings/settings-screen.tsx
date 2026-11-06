@@ -8,9 +8,10 @@ import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { GridRegion, LayoutGrid } from "@/components/sieve/shell/layout-grid";
 import { Page } from "@/components/sieve/shell/page";
 import { Button } from "@/components/ui/button";
-import { ENGINE_ANCHOR, ENGINE_SWITCH } from "@/core/engine";
+import { CERTIFICATE_ANCHOR, ENGINE_ANCHOR, ENGINE_SWITCH } from "@/core/engine";
 import { settingDef, type Section, type SettingKey } from "@/core/settings/registry";
 import { cn } from "@/lib/utils";
+import { CertificateGroup } from "./certificate-group";
 import { EngineCard } from "./engine-card";
 import { SettingRow } from "./setting-row";
 import { TransferMenu } from "./transfer-menu";
@@ -30,7 +31,8 @@ const BLOCK_SECTIONS: ReadonlySet<Section> = new Set([FILTERING_SECTION]);
  * actions' line) with the search, the section titles and the rows on its
  * edges. Search covers label, help, key and options; the overflow menu has
  * export, import and reset. The section that owns the engine's switch also
- * carries the engine (EngineCard, read only, anchor ENGINE_ANCHOR).
+ * carries the engine (EngineCard, read only, anchor ENGINE_ANCHOR) with the root certificate
+ * under it (CertificateGroup, anchor CERTIFICATE_ANCHOR).
  */
 export function SettingsScreen() {
   const [query, setQuery] = useState("");
@@ -94,6 +96,9 @@ export function SettingsScreen() {
                     <div className={cn("flex flex-col gap-8", s.keys.length > 0 && "pt-8")}>
                       <div id={ENGINE_ANCHOR} className="scroll-mt-[4rem]">
                         <EngineCard />
+                      </div>
+                      <div id={CERTIFICATE_ANCHOR} className="scroll-mt-[4rem]">
+                        <CertificateGroup />
                       </div>
                     </div>
                   )}

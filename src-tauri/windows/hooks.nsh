@@ -46,6 +46,7 @@
 ; again at every start.
 
 Var SieveEngine
+Var SieveEngineKept
 Var SieveForeign
 
 ; $SieveForeign: the first entry of $INSTDIR when the folder holds files and
@@ -195,20 +196,26 @@ FunctionEnd
   ${EndIf}
 !macroend
 
-; Uninstall removes the service and ProgramData\Sieve (the verb is safe to
-; rerun), using the engine the service is registered with. An uninstall that
-; is part of an update only stops the engine.
+; Uninstall removes the service and ProgramData\Sieve, using the engine the
+; service is registered with. When the verb fails, its exe, the folder's other
+; files and the shortcut stay, because the verb's rerun needs them. An uninstall
+; that is part of an update only stops the engine.
 !macro NSIS_HOOK_PREUNINSTALL
   !insertmacro SIEVE_REGISTERED_ENGINE
   ${If} ${FileExists} "$SieveEngine"
     ${If} $UpdateMode = 1
       DetailPrint "Stopping Sieve's engine for the update"
       nsExec::ExecToLog '"$SieveEngine" restore'
+      Pop $0
     ${Else}
       DetailPrint "Removing Sieve's engine"
       nsExec::ExecToLog '"$SieveEngine" uninstall'
+      Pop $0
+      ${If} $0 != 0
+        StrCpy $SieveEngineKept 1
+        MessageBox MB_ICONEXCLAMATION|MB_OK "Sieve's engine could not be removed completely (exit code $0), so $SieveEngine was left in place. It does not start by itself. To finish, install Sieve and uninstall it again, or run this at an administrator prompt:$\r$\n$\r$\n$\"$SieveEngine$\" uninstall" /SD IDOK
+      ${EndIf}
     ${EndIf}
-    Pop $0
   ${EndIf}
 !macroend
 
@@ -217,6 +224,7 @@ FunctionEnd
 ; build may have left in another folder.
 !macro NSIS_HOOK_POSTUNINSTALL
   ${If} $UpdateMode <> 1
+  ${AndIf} $SieveEngineKept != 1
     Delete "$SieveEngine"
     Delete "$INSTDIR\${SIEVE_ENGINE_EXE}"
     Delete "$INSTDIR\${SIEVE_WINTUN_DLL}"

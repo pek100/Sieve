@@ -10,7 +10,7 @@ import { createMockSource, MOCK_SCENARIOS, type MockScenario } from "./mock-sour
 import type { HistoryQuery } from "@/core/history";
 import type { AppIcon, History, Snapshot } from "./protocol";
 import { createTauriSource } from "./tauri-source";
-import { createMockEngine, ENGINE_SCENARIOS, type EngineScenario } from "./engine-mock";
+import { CERT_SCENARIOS, createMockEngine, ENGINE_SCENARIOS, type CertScenario, type EngineScenario } from "./engine-mock";
 import { createTauriEngine, type EngineSource } from "./engine-source";
 import { createMockWindowsDns, createTauriWindowsDns, type WindowsDnsSource } from "./safety-net";
 
@@ -48,6 +48,8 @@ export interface SourceOptions {
   engine: EngineScenario;
   /** Mock: every read of the engine's log fails (?log=error). */
   logError: boolean;
+  /** Mock certificate scenario (?cert=installed|expires_soon|not_installed|policy_off|error, default not_installed). */
+  cert: CertScenario;
 }
 
 /** Read the source choice from the environment: query string and Tauri presence. */
@@ -61,7 +63,9 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   const scenario = (MOCK_SCENARIOS as readonly string[]).includes(sc ?? "") ? (sc as MockScenario) : "steady";
   const e = q.get("engine");
   const engine = (ENGINE_SCENARIOS as readonly string[]).includes(e ?? "") ? (e as EngineScenario) : "missing";
-  return { kind, seed, scenario, pointed: q.get("pointed") === "1", icons: q.get("icons") === "1", engine, logError: q.get("log") === "error" };
+  const c = q.get("cert");
+  const cert = (CERT_SCENARIOS as readonly string[]).includes(c ?? "") ? (c as CertScenario) : "not_installed";
+  return { kind, seed, scenario, pointed: q.get("pointed") === "1", icons: q.get("icons") === "1", engine, logError: q.get("log") === "error", cert };
 }
 
 /**
@@ -80,7 +84,7 @@ export function createWindowsDnsSource(o: SourceOptions): WindowsDnsSource {
 
 /** The engine seam follows the same choice: the Tauri command, or the mock. */
 export function createEngineSource(o: SourceOptions): EngineSource {
-  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine, { seed: o.seed, logError: o.logError });
+  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine, { seed: o.seed, logError: o.logError, cert: o.cert });
 }
 
 export function isTauriWindow(): boolean {

@@ -47,7 +47,7 @@ describe("Engine block", () => {
     ["vpn", "vpn", "Paused for a VPN", /Paused while AdGuard VPN is connected/],
     ["crash_loop", "crash_loop", "Stopped after repeated failures", /restarted 3 times within an hour/],
     ["setup", "setup_failed", "Could not start", /SHA-256 does not match/],
-    ["incompatible", "incompatible", "Installed, needs an update", /supports 3 to 3/],
+    ["incompatible", "incompatible", "Installed, needs an update", /supports 4 to 4/],
     ["refused", "refused", "Installed", /not the installed one/],
   ];
 
@@ -159,7 +159,7 @@ describe("Engine block", () => {
   });
 
   it("degraded answers are refused at the boundary and shown as unreadable, not crashed", async () => {
-    const partial = async () => ({ v: 2, service: "running", adguard: "missing", pipe: { kind: "welcome" } });
+    const partial = async () => ({ v: 3, service: "running", adguard: "missing", pipe: { kind: "welcome" } });
     const { parseEngineProbe } = await import("@/data/protocol");
     await setup({ ...createMockEngine("idle"), probe: async () => parseEngineProbe(await partial()) });
     await vi.waitFor(() => expect(phase()).toBe("unreadable"));

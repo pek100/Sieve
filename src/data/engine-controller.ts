@@ -15,6 +15,9 @@
  *   sent while the engine cannot take a policy (`engineTakesPolicy`); the
  *   stored values then wait untouched. A refused send is retried at the next
  *   probe, not at once;
+ * - the root certificate, only when the user asks (`installRoot`). Its facts
+ *   are read after each probe while the engine can answer, and cleared when
+ *   it cannot;
  * - AdGuard's service, stopped or started only when the user clicks the
  *   pause offer (`stopAdguard`, `startAdguard`; Windows asks the user first).
  *
@@ -23,7 +26,7 @@
  * banner, dismissed when it is over.
  */
 import type { PassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, type EngineSlice } from "@/core/engine";
+import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, type EngineSlice } from "@/core/engine";
 import type { NoticeBus } from "@/core/notices";
 import { GLOBAL_SWITCH, offKeys } from "@/core/policy";
 import type { SettingKey } from "@/core/settings/registry";
@@ -40,6 +43,8 @@ export interface EngineController {
   stopAdguard(): Promise<void>;
   /** Start AdGuard's service again (Windows asks the user), then probe. */
   startAdguard(): Promise<void>;
+  /** The user's Reinstall: a new root and key, then probe. */
+  installRoot(): Promise<void>;
 }
 
 export interface EngineControllerDeps {
@@ -56,6 +61,7 @@ export const CRASH_LOOP_BANNER =
   "Sieve's engine stopped routing after repeated failures. Your network works as usual. Details in Settings > Filtering.";
 
 const SWITCH = ENGINE_SWITCH as SettingKey;
+const HTTPS = HTTPS_SWITCH as SettingKey;
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 type WantedPolicy = Omit<EnginePolicy, "revision">;
@@ -70,6 +76,7 @@ function wantedPolicy(settings: SettingsStore): WantedPolicy {
     engine: Boolean(settings.get(SWITCH)),
     sieving: Boolean(settings.get(GLOBAL_SWITCH)),
     off_apps: [...offKeys(settings.get("apps.levels"))],
+    https: Boolean(settings.get(HTTPS)),
     lists: null,
     domain_lists: [...domainList("block", settings.get("filtering.blockedDomains")), ...domainList("allow", settings.get("filtering.allowedDomains"))],
   };
@@ -80,6 +87,7 @@ function normalised(p: WantedPolicy): string {
   const sorted = (l: readonly string[]) => [...l].sort();
   return JSON.stringify({
     engine: p.engine,
+    https: p.https,
     sieving: p.sieving,
     off_apps: sorted(p.off_apps),
     lists: p.lists && sorted(p.lists),
@@ -156,6 +164,30 @@ export function createEngineController({ engine, store, clock, settings, checks,
     await probeNow();
   };
 
+  // One read per probe, only while the engine can answer (the same fact as a
+  // policy). A failed read clears the facts: nothing shows from a stale state.
+  const readCert = async () => {
+    if (!engineTakesPolicy(get())) {
+      if (get().cert || get().certError) set({ cert: null, certError: null });
+      return;
+    }
+    try {
+      set({ cert: await engine.certStatus(), certError: null });
+    } catch (e) {
+      set({ cert: null, certError: message(e) });
+    }
+  };
+
+  const installRoot = async () => {
+    set({ certActionError: null });
+    try {
+      set({ cert: await engine.installRoot() });
+    } catch (e) {
+      set({ certActionError: `The certificate was not reinstalled: ${message(e)}` });
+    }
+    await probeNow();
+  };
+
   return {
     bind() {
       disposed = false;
@@ -168,7 +200,9 @@ export function createEngineController({ engine, store, clock, settings, checks,
         } catch (e) {
           set({ probe: null, error: message(e) });
         }
-        if (!disposed) follow();
+        if (disposed) return;
+        follow();
+        await readCert();
       };
       probeNow = probe;
 
@@ -200,5 +234,6 @@ export function createEngineController({ engine, store, clock, settings, checks,
     },
     stopAdguard: () => adguard("stopping", () => engine.stopAdguard()),
     startAdguard: () => adguard("starting", () => engine.startAdguard()),
+    installRoot,
   };
 }

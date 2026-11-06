@@ -11,7 +11,7 @@
  * AdGuard's service through one command Windows asks the user to approve.
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { parseEngineLists, parseEngineProbe, parseEngineStatus, parseLogTail, type EngineLists, type EnginePolicy, type EngineProbe, type EngineStatus, type LogTail } from "./protocol";
+import { parseCertStatus, parseEngineLists, parseEngineProbe, parseEngineStatus, parseLogTail, type CertStatus, type EngineLists, type EnginePolicy, type EngineProbe, type EngineStatus, type LogTail } from "./protocol";
 
 export interface EngineSource {
   readonly kind: "mock" | "tauri";
@@ -29,6 +29,10 @@ export interface EngineSource {
   startAdguard(): Promise<void>;
   /** Log rows after `since` from the tail the app keeps in memory. Rejects when it cannot be read. */
   logTail(since: number): Promise<LogTail>;
+  /** The root certificate's facts. Rejects when the engine did not answer. */
+  certStatus(): Promise<CertStatus>;
+  /** The user's Reinstall: a new root and key. Rejects while `https` is off in the engine. */
+  installRoot(): Promise<CertStatus>;
 }
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -43,5 +47,7 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     stopAdguard: async () => void (await invoke<unknown>("adguard_stop")),
     startAdguard: async () => void (await invoke<unknown>("adguard_start")),
     logTail: async (since) => parseLogTail(await invoke<unknown>("engine_log_tail", { since })),
+    certStatus: async () => parseCertStatus(await invoke<unknown>("engine_cert_status")),
+    installRoot: async () => parseCertStatus(await invoke<unknown>("engine_install_root")),
   };
 }

@@ -74,6 +74,18 @@ socket2 = "0.6"
 # quinn speaks DoQ. webpki-roots is the resolver trust store (never the Windows
 # verifier, whose network fetches would wait on this engine's own DNS).
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
+# The root CA and its leaves (plan 2.1, 2.5). rcgen builds the certificates
+# with a signer the CNG key sits behind (`rcgen::SigningKey`); x509-parser
+# reads back the root the store holds. aws-lc-rs is the one crypto provider
+# (plan 2.7), with its prebuilt NASM objects: this machine has CMake and no
+# NASM (probe of 2026-11-05). sha1 is the store's identity, the thumbprint.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "x509-parser"] }
+aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
+# The DER wrapper rcgen's issuer takes (rcgen does not re-export it).
+rustls-pki-types = "1"
+time = "0.3"
+sha1 = "0.10"
+x509-parser = "0.18"
 
 # Windows calls. The library reads the owner-pid tables, process images and
 # session ids, the adapter and forwarding tables and AdGuard's service state,
@@ -88,6 +100,8 @@ quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc
 # Attribution reads: a real-time ETW session (Diagnostics_Etw, Time) and WMI
 # queries of NAT state on its own COM thread (Com, Ole for VARIANT, Rpc,
 # Variant, Wmi).
+# The root CA (`ca::win`, plan 2.2, 2.3): its CNG key and the machine root
+# store (Security_Cryptography), the Firefox policy value (System_Registry).
 [target.'cfg(windows)'.dependencies]
 # Loads wintun.dll at run time (libloading); verify_binary_signature refuses
 # a DLL whose Authenticode signer is not "WireGuard LLC".
@@ -99,12 +113,14 @@ windows = { workspace = true, features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Rpc",
     "Win32_System_Services",

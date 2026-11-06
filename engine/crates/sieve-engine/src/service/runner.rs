@@ -14,6 +14,10 @@
 //! A panic on any thread but a flow worker deletes Sieve's routes and stops
 //! the ETW session before the process dies (plan 1.6.6); a flow task's panic
 //! ends that flow only.
+//!
+//! Started with [`PURGE_ARG`] (by `uninstall` only, as SYSTEM is the one
+//! account the key's DACL admits), after the same folder check it deletes the
+//! recorded CA keys and stops: no routing, no pipe.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -29,7 +33,10 @@ use windows_service::{define_windows_service, service_dispatcher};
 use super::acl::pipe_sddl;
 use super::image::check_this_exe;
 use super::{EXIT_UNSAFE_FOLDER, EXIT_WATCHDOG, SERVICE_NAME, state};
-use crate::control::{Engine, routing};
+use crate::ca::removal::{PURGE_ARG, purge_keys};
+use crate::ca::win::{CngKeyStore, RegistryFirefoxPolicy, WindowsRootStore};
+use crate::ca::{Ca, Seams};
+use crate::control::{Engine, certs, routing};
 use crate::flow::etw::os::stop_stale;
 use crate::ipc::server;
 use crate::policy::{self, crash_loop};
@@ -63,7 +70,24 @@ fn system32_only() {
     let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
 }
 
-fn service_main(_args: Vec<OsString>) {
+/// The CA over the real system. A failure here means no root and no
+/// interception; the engine still runs.
+fn real_ca(dir: &std::path::Path) -> Result<Arc<Ca>, crate::ca::CaError> {
+    let seams = Seams { keys: Arc::new(CngKeyStore), store: Arc::new(WindowsRootStore), firefox: Arc::new(RegistryFirefoxPolicy) };
+    let machine = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "this computer".to_string());
+    Ca::new(dir.to_path_buf(), machine, seams).map(Arc::new)
+}
+
+/// `uninstall`'s key step. The verb reads back its outcome from `ca.json` and a
+/// failure's reason from `last-error.txt`.
+fn purge_ca_keys() {
+    let purged = state::program_data().and_then(|pd| purge_keys(&state::engine_dir(&pd), &CngKeyStore));
+    if let Err(why) = purged {
+        record_failure(&why);
+    }
+}
+
+fn service_main(args: Vec<OsString>) {
     system32_only();
     let (stop_tx, stop_rx) = watch::channel(false);
     let handler = move |control| match control {
@@ -93,6 +117,14 @@ fn service_main(_args: Vec<OsString>) {
         report(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::ServiceSpecific(UNSAFE_FOLDER));
         return;
     }
+    if args.iter().any(|a| a == PURGE_ARG) {
+        report(ServiceState::Running, ServiceControlAccept::empty(), ServiceExitCode::Win32(0));
+        purge_ca_keys();
+        // Exit code 0 even after a failure: a failure code would make the
+        // SCM's recovery start the engine again in the middle of uninstall.
+        report(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::Win32(0));
+        return;
+    }
     report(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, ServiceExitCode::Win32(0));
     let code = match serve(stop_rx) {
         Ok(()) => ServiceExitCode::Win32(0),
@@ -110,11 +142,9 @@ fn service_main(_args: Vec<OsString>) {
 /// it is best effort: the exit code already tells the SCM it failed.
 fn record_failure(why: &str) {
     if let Ok(pd) = state::program_data() {
-        let _ = std::fs::write(state::engine_dir(&pd).join(LAST_ERROR_FILE), why);
+        let _ = std::fs::write(state::engine_dir(&pd).join(state::LAST_ERROR_FILE), why);
     }
 }
-
-const LAST_ERROR_FILE: &str = "last-error.txt";
 
 /// An emergency exit waits this long for the ETW session to stop: the process
 /// must still end, or the SCM's recovery never runs.
@@ -204,6 +234,16 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let engine = Arc::new(Engine::new(Some(dir.clone()), exe, policy, runs, crash));
     report_start_problems(&engine, policy_error, &cleaned);
+    let ca = match real_ca(&dir) {
+        Ok(ca) => {
+            engine.attach_ca(ca.clone());
+            Some(ca)
+        }
+        Err(why) => {
+            engine.add_error(format!("certificate: {why}"));
+            None
+        }
+    };
 
     // The watchdog: a plain thread, armed only while routes are up.
     let (ping_tx, ping_rx) = mpsc::unbounded_channel();
@@ -240,6 +280,9 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
     let result = rt.block_on(async {
         tokio::spawn(routing::answer_pings(engine.clone(), ping_rx));
         let (halt_tx, halt_rx) = watch::channel(false);
+        if let Some(ca) = ca {
+            tokio::spawn(certs::run(engine.clone(), ca, halt_rx.clone()));
+        }
         let routing = tokio::spawn(routing::run(engine.clone(), halt_rx));
         let served = server::serve(&sddl, engine.clone(), stop).await;
         // The pipe ended (a stop, or a pipe error): the routes go down either way.

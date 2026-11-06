@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createMockEngine, MOCK_LOG_ERROR } from "./engine-mock";
+import certFixture from "./fixtures/engine-ipc-v3.json";
 import fixture from "./fixtures/engine-probe-v2.json";
 import logFixture from "./fixtures/engine-log-v1.json";
 import { createTauriEngine } from "./engine-source";
@@ -49,6 +50,21 @@ describe("Tauri engine source", () => {
     expect(tail.rows).toHaveLength(logFixture.rows.length);
     const bad = async <T,>(): Promise<T> => ({ v: 9, rows: [] }) as T;
     await expect(createTauriEngine(bad).logTail(0)).rejects.toThrow(ProtocolError);
+  });
+
+  it("asks for the certificate and validates the answer; a bad one rejects", async () => {
+    const calls: string[] = [];
+    const answer = certFixture.certStatuses.installed;
+    const invoke = async <T,>(cmd: string): Promise<T> => {
+      calls.push(cmd);
+      return answer as T;
+    };
+    const engine = createTauriEngine(invoke);
+    expect(await engine.certStatus()).toEqual(answer);
+    expect(await engine.installRoot()).toEqual(answer);
+    expect(calls).toEqual(["engine_cert_status", "engine_install_root"]);
+    const bad = async <T,>(): Promise<T> => ({ state: "installed" }) as T;
+    await expect(createTauriEngine(bad).certStatus()).rejects.toThrow(ProtocolError);
   });
 });
 

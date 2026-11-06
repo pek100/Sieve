@@ -19,13 +19,30 @@
  * read, then its host-level rows cycled, one per read, content from the seed
  * and the read count. Hosts are under `example.*`, addresses from the
  * documentation ranges. `?log=error` makes every read fail.
+ *
+ * The certificate answers `certStatuses` of the IPC fixture, chosen by
+ * `?cert=<scenario>` (default `not_installed`); `error` makes each read fail.
+ * Turning `https` off leaves `policy_off`, and on or Reinstall leaves
+ * `installed`, as the engine does; Reinstall is refused while `https` is off.
  */
 import { hash01 } from "./prng";
 import fixture from "./fixtures/engine-probe-v2.json";
 import ipc from "./fixtures/engine-ipc-v3.json";
 import logFixture from "./fixtures/engine-log-v1.json";
 import type { EngineSource } from "./engine-source";
-import { LOG_TAIL_VERSION, parseEngineLists, parseEngineProbe, parseEngineStatus, parseLogTail, type EngineLists, type EnginePolicy, type EngineStatus, type LogEntry } from "./protocol";
+import {
+  LOG_TAIL_VERSION,
+  parseCertStatus,
+  parseEngineLists,
+  parseEngineProbe,
+  parseEngineStatus,
+  parseLogTail,
+  type CertStatus,
+  type EngineLists,
+  type EnginePolicy,
+  type EngineStatus,
+  type LogEntry,
+} from "./protocol";
 
 export const ENGINE_SCENARIOS = [
   "missing",
@@ -46,9 +63,15 @@ export const ENGINE_SCENARIOS = [
 ] as const;
 export type EngineScenario = (typeof ENGINE_SCENARIOS)[number];
 
+export const CERT_SCENARIOS = ["installed", "expires_soon", "not_installed", "policy_off", "error"] as const;
+export type CertScenario = (typeof CERT_SCENARIOS)[number];
+
 export const MOCK_ENGINE_ERROR = "service manager: Access is denied. (os error 5)";
 /** What the mock's AdGuard actions answer when they cannot apply (no AdGuard to stop or start). */
 export const MOCK_ADGUARD_ERROR = "Adguard Service: the service is not in a state that allows this";
+/** The engine's refusals of a certificate request (`?cert=error`, Reinstall with `https` off). */
+export const MOCK_CERT_ERROR = "unexpected answer: the engine did not say";
+export const MOCK_HTTPS_OFF = "HTTPS filtering is off, so there is no certificate to reinstall";
 
 /** The message of a failed log read (?log=error). */
 export const MOCK_LOG_ERROR = "the engine's log could not be read";
@@ -61,11 +84,11 @@ function statusOf(scenario: EngineScenario): EngineStatus {
   return parseEngineStatus((example.pipe as { status: unknown }).status);
 }
 
-export function createMockEngine(start: EngineScenario = "missing", log: { seed?: number; logError?: boolean } = {}): EngineSource {
+export function createMockEngine(start: EngineScenario = "missing", options: { seed?: number; logError?: boolean; cert?: CertScenario } = {}): EngineSource {
   let scenario = start;
   let held: Omit<EnginePolicy, "revision" | "engine"> | null = null;
   const echo = (status: EngineStatus): EngineStatus => (held ? { ...status, policy: { ...status.policy, ...held } } : status);
-  const seed = log.seed ?? 1;
+  const seed = options.seed ?? 1;
   const all = parseLogTail(logFixture).rows;
   const hostLevel = all.filter((e) => e.row.url === null);
   let reads = 0;
@@ -79,12 +102,18 @@ export function createMockEngine(start: EngineScenario = "missing", log: { seed?
       return { seq, row: { ...e.row, id: seq, t: e.row.t + (reads - 1) * 1000 } };
     });
   };
+  let cert = options.cert ?? "not_installed";
+  let https = false;
   const requireWelcome = () => {
     if (!WELCOME.includes(scenario)) throw new Error("The system cannot find the file specified. (os error 2)");
   };
   const lists = async (): Promise<EngineLists> => {
     requireWelcome();
     return parseEngineLists(ipc.engine.find((m) => m.type === "lists"));
+  };
+  const certAnswer = (): CertStatus => {
+    if (cert === "error") throw new Error(MOCK_CERT_ERROR);
+    return parseCertStatus(ipc.certStatuses[cert]);
   };
   return {
     kind: "mock",
@@ -97,7 +126,10 @@ export function createMockEngine(start: EngineScenario = "missing", log: { seed?
       requireWelcome();
       if (!policy.engine) scenario = "idle";
       else if (scenario === "idle" || scenario === "crash_loop") scenario = "filtering";
-      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists };
+      if (https && !policy.https) cert = "policy_off";
+      if (!https && policy.https && (cert === "policy_off" || cert === "not_installed")) cert = "installed";
+      https = policy.https;
+      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists, https: policy.https };
       return echo(statusOf(scenario));
     },
     lists,
@@ -111,9 +143,19 @@ export function createMockEngine(start: EngineScenario = "missing", log: { seed?
       scenario = "adguard";
     },
     logTail: async (since) => {
-      if (log.logError) throw new Error(MOCK_LOG_ERROR);
+      if (options.logError) throw new Error(MOCK_LOG_ERROR);
       const rows = ROUTES.includes(scenario) ? nextRows().filter((e) => e.seq > since) : [];
       return { v: LOG_TAIL_VERSION, next: rows.at(-1)?.seq ?? since, dropped: 0, rows, skipped: 0 };
+    },
+    certStatus: async () => {
+      requireWelcome();
+      return certAnswer();
+    },
+    installRoot: async () => {
+      requireWelcome();
+      if (!https) throw new Error(MOCK_HTTPS_OFF);
+      cert = "installed";
+      return certAnswer();
     },
   };
 }

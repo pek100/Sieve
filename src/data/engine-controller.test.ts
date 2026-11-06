@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { createPassedChecks } from "@/core/checks";
-import { ENGINE_POLL_MS, ENGINE_SWITCH, engineLockReason, enginePhase } from "@/core/engine";
+import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
 import type { SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
 import { CRASH_LOOP_BANNER, createEngineController } from "./engine-controller";
-import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_ENGINE_ERROR, type EngineScenario } from "./engine-mock";
+import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_CERT_ERROR, MOCK_ENGINE_ERROR, MOCK_HTTPS_OFF, type CertScenario, type EngineScenario } from "./engine-mock";
 import type { EngineSource } from "./engine-source";
 import type { Clock } from "./poller";
 import type { EnginePolicy, EngineProbe } from "./protocol";
@@ -15,7 +15,7 @@ import { createSettingsStore, memoryBackend, type SettingsBackend } from "./sett
 const SWITCH = ENGINE_SWITCH as SettingKey;
 
 /** What the settings' defaults ask of the engine, at a revision and switch. */
-const policy = (revision: number, engine: boolean): EnginePolicy => ({ revision, engine, sieving: true, off_apps: [], lists: null, domain_lists: [] });
+const policy = (revision: number, engine: boolean): EnginePolicy => ({ revision, engine, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false });
 
 function fakeClock() {
   let now = 0;
@@ -57,6 +57,7 @@ function fakeEngine(start: EngineScenario) {
   let mock = createMockEngine(start);
   const policies: EnginePolicy[] = [];
   let probes = 0;
+  let certReads = 0;
   const source: EngineSource = {
     kind: "mock",
     probe: () => {
@@ -72,8 +73,13 @@ function fakeEngine(start: EngineScenario) {
     stopAdguard: () => mock.stopAdguard(),
     startAdguard: () => mock.startAdguard(),
     logTail: (since) => mock.logTail(since),
+    certStatus: () => {
+      certReads++;
+      return mock.certStatus();
+    },
+    installRoot: () => mock.installRoot(),
   };
-  return { source, set: (s: EngineScenario) => void (mock = createMockEngine(s)), probes: () => probes, policies };
+  return { source, set: (s: EngineScenario) => void (mock = createMockEngine(s)), setCert: (c: CertScenario) => void (mock = createMockEngine(start, { cert: c })), probes: () => probes, certReads: () => certReads, policies };
 }
 
 function setup(start: EngineScenario, backend: SettingsBackend = memoryBackend()) {
@@ -198,6 +204,7 @@ describe("engine controller", () => {
         engine: true,
         sieving: false,
         off_apps: ["firefox"],
+        https: false,
         lists: null,
         domain_lists: [
           { kind: "block", entries: ["ads.example"], enabled: true },
@@ -398,5 +405,62 @@ describe("engine controller", () => {
     await fc.flush();
     expect(store.getState().engine.probe).toBeNull();
     expect(fc.pending()).toBe(0);
+  });
+  describe("the certificate", () => {
+    it("is read after each probe while the engine takes a policy, and cleared when it cannot", async () => {
+      const s = setup("idle");
+      await s.fc.flush();
+      expect(s.fake.certReads()).toBe(1);
+      expect(s.store.getState().engine.cert?.state).toBe("not_installed");
+      s.fake.set("stopped");
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(s.fake.certReads()).toBe(1);
+      expect(s.store.getState().engine.cert).toBeNull();
+      s.fake.set("idle");
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(s.fake.certReads()).toBe(2);
+      s.undo();
+    });
+
+    it("a failed read sets certError and clears the cert; the next good read restores it", async () => {
+      const s = setup("idle");
+      await s.fc.flush();
+      s.fake.setCert("error");
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(s.store.getState().engine.cert).toBeNull();
+      expect(s.store.getState().engine.certError).toBe(MOCK_CERT_ERROR);
+      expect(s.phase()).toBe("idle");
+      s.fake.setCert("installed");
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(s.store.getState().engine.cert?.state).toBe("installed");
+      expect(s.store.getState().engine.certError).toBeNull();
+      s.undo();
+    });
+
+    it("the unavailable switch reads off, so the policy sends https false whatever is stored", async () => {
+      const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true, [HTTPS_SWITCH]: true } }));
+      await s.fc.flush();
+      expect(s.fake.policies).toEqual([policy(1, true)]);
+      s.undo();
+    });
+
+    it("an engine holding https on while the switch is off is told off: both switches go in one policy", async () => {
+      const s = setup("idle");
+      await s.fc.flush();
+      await s.fake.source.setPolicy({ ...policy(1, false), https: true });
+      s.fake.policies.length = 0;
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(s.fake.policies.at(-1)).toMatchObject({ engine: false, https: false });
+      s.undo();
+    });
+
+    it("Reinstall is passed on; a refusal is said in its own field and the facts stay the engine's", async () => {
+      const s = setup("idle");
+      await s.fc.flush();
+      await s.controller.installRoot();
+      expect(s.store.getState().engine.certActionError).toBe(`The certificate was not reinstalled: ${MOCK_HTTPS_OFF}`);
+      expect(s.store.getState().engine.actionError).toBeNull();
+      s.undo();
+    });
   });
 });

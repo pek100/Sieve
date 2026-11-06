@@ -6,16 +6,19 @@
 //! Turning the engine on through `SetPolicy` after a crash loop forgives
 //! the earlier failures (the user's explicit act, plan 1.6.4).
 
+pub mod certs;
 #[cfg(windows)]
 pub mod routing;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use sieve_filter::rules::{RuleEngine, RuleSet};
-use sieve_ipc::{Blocker, DnsUpstreams, EngineStatus, FlowEvent, ListStatus, Policy};
+use sieve_ipc::{Blocker, CertStatus, DnsUpstreams, EngineStatus, FlowEvent, ListStatus, Policy};
 use tokio::sync::{Notify, broadcast, watch};
 
+use crate::ca::Ca;
 use crate::dns::service::Service;
 use crate::dns::upstream::Upstream;
 use crate::dns::{NameMap, config};
@@ -87,7 +90,20 @@ pub struct Engine {
     pub wake: Arc<Notify>,
     pub beats: Arc<Beats>,
     pub arm: Arc<Arm>,
+    /// The root CA, set by the runner (unset when it could not be made, and
+    /// in tests that have no use for one).
+    ca: OnceLock<Arc<Ca>>,
+    /// Wakes the certificate loop. Its own: `wake` is the routing loop's and
+    /// a single permit would be stolen.
+    pub ca_wake: Notify,
+    /// The user asked for a new root; the certificate loop takes it.
+    reinstall: AtomicBool,
 }
+
+/// `install_root`'s refusal while the switch is off (plan 7.3: no root
+/// without the user's act, and the act here is the switch).
+pub const HTTPS_OFF: &str = "HTTPS filtering is off, so there is no certificate to reinstall";
+pub const NO_CA: &str = "the certificate service did not start";
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -132,7 +148,20 @@ impl Engine {
             wake: Arc::default(),
             beats: Arc::default(),
             arm: Arc::default(),
+            ca: OnceLock::new(),
+            ca_wake: Notify::new(),
+            reinstall: AtomicBool::new(false),
         }
+    }
+
+    /// Gives the running engine its CA (once, from the runner).
+    pub fn attach_ca(&self, ca: Arc<Ca>) {
+        let _ = self.ca.set(ca);
+    }
+
+    /// Whether the user asked for a new root since the last call.
+    pub fn take_reinstall(&self) -> bool {
+        self.reinstall.swap(false, Ordering::SeqCst)
     }
 
     pub fn policy(&self) -> Policy {
@@ -319,6 +348,7 @@ impl Backend for Engine {
             *current = next;
         }
         self.wake.notify_one();
+        self.ca_wake.notify_one();
         Ok(self.status())
     }
 
@@ -354,6 +384,22 @@ impl Backend for Engine {
 
     fn lists_refresh(&self) {
         self.lists.refresh_now();
+    }
+
+    fn cert_status(&self) -> CertStatus {
+        self.ca.get().map(|ca| ca.status(policy::wall_ms())).unwrap_or_default()
+    }
+
+    fn install_root(&self) -> Result<CertStatus, String> {
+        if !self.policy().https {
+            return Err(HTTPS_OFF.to_string());
+        }
+        if self.ca.get().is_none() {
+            return Err(NO_CA.to_string());
+        }
+        self.reinstall.store(true, Ordering::SeqCst);
+        self.ca_wake.notify_one();
+        Ok(self.cert_status())
     }
 }
 

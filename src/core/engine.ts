@@ -13,7 +13,7 @@
  *
  * The slice has one writer, the engine controller (src/data/engine-controller.ts).
  */
-import type { EngineBlocker, EngineProbe, EngineStatus, ListFact } from "@/data/protocol";
+import type { CertState, CertStatus, EngineBlocker, EngineProbe, EngineStatus, FirefoxTrust, ListFact } from "@/data/protocol";
 
 /** How often the engine is asked while Sieve is open (plan 1.6.5). */
 export const ENGINE_POLL_MS = 2000;
@@ -24,6 +24,11 @@ export const ENGINE_SWITCH = "filtering.engine";
 /** The Engine block's anchor in Settings (Settings > Engine), and the link to it (Home's Engine tile). */
 export const ENGINE_ANCHOR = "engine";
 export const ENGINE_HREF = `/settings/#${ENGINE_ANCHOR}`;
+
+/** The data switch that holds a root certificate (registry key; UI reads it from here). Off removes it. */
+export const HTTPS_SWITCH = "filtering.https";
+/** The Certificate group's anchor in Settings. */
+export const CERTIFICATE_ANCHOR = "certificate";
 
 /** AdGuard for Windows' service, the one Sieve offers to stop and start (src-tauri/src/adguard.rs, the engine's coexist::ADGUARD_SERVICE). */
 export const ADGUARD_SERVICE = "Adguard Service";
@@ -40,9 +45,15 @@ export interface EngineSlice {
   adguard?: AdguardAction;
   /** Why the last AdGuard stop or start, or policy change, failed; null after a good one. */
   actionError?: string | null;
+  /** The root certificate as the engine last said; null while it cannot be asked. */
+  cert?: CertStatus | null;
+  /** Why the newest certificate read failed; null after a good one. */
+  certError?: string | null;
+  /** Why the user's last Reinstall failed; null after a good one. */
+  certActionError?: string | null;
 }
 
-export const EMPTY_ENGINE: EngineSlice = { probe: null, error: null, adguard: null, actionError: null };
+export const EMPTY_ENGINE: EngineSlice = { probe: null, error: null, adguard: null, actionError: null, cert: null, certError: null, certActionError: null };
 
 export const ENGINE_PHASES = [
   "checking",
@@ -281,6 +292,32 @@ export function hostAttribution(e: EngineSlice): number | null {
   if (!c) return null;
   const hostFlows = c.flows - c.forwarded;
   return hostFlows > 0 ? (c.attributed - c.forwarded_named) / hostFlows : null;
+}
+
+/** The certificate's state in words (plan 8.1). The engine derives the state; the app never recomputes it. */
+export const CERT_STATE_TEXT: Record<CertState, string> = {
+  not_installed: "Not installed",
+  installed: "Installed",
+  expires_soon: "Expires soon",
+};
+/** What the Certificate group says with no answer from the engine. */
+export const CERT_STATE_UNKNOWN = "Unknown";
+
+/** Firefox and the root, in words. `not_using_windows` is a policy someone else set to off: never a claim of trust. */
+export const FIREFOX_TEXT: Record<FirefoxTrust, string> = {
+  not_installed: "Not installed",
+  uses_windows: "Uses Windows certificates",
+  not_using_windows: "Does not use Windows certificates",
+};
+
+/** A root is installed, from the engine's own state. */
+export function certInstalled(cert: CertStatus | null | undefined): boolean {
+  return cert?.state === "installed" || cert?.state === "expires_soon";
+}
+
+/** The engine holds `filtering.https` on (its Status's policy), so it can take a Reinstall. */
+export function httpsInForce(e: EngineSlice): boolean {
+  return engineStatus(e)?.policy.https === true;
 }
 
 /** The engine's version, when it said it. */

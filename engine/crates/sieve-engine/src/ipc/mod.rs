@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sieve_ipc::nonblocking::{read_frame, write_frame};
-use sieve_ipc::{ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, ListStatus, Policy, answer_hello};
+use sieve_ipc::{CertStatus, ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, ListStatus, Policy, answer_hello};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 
@@ -44,6 +44,11 @@ pub trait Backend: Send + Sync + 'static {
     fn lists(&self) -> (Vec<ListStatus>, Option<u64>);
     /// Downloads every selected list at the next chance, whatever its age.
     fn lists_refresh(&self);
+    /// The root certificate's status.
+    fn cert_status(&self) -> CertStatus;
+    /// Asks for a new root (refused unless `policy.https` is on) and answers
+    /// the status as it stands; the certificate loop does the work.
+    fn install_root(&self) -> Result<CertStatus, String>;
 }
 
 pub struct Subscription {
@@ -119,6 +124,11 @@ where
                 backend.lists_refresh();
                 lists_answer(backend)
             }
+            Ok(ClientMessage::CertStatus) => EngineMessage::CertStatus(backend.cert_status()),
+            Ok(ClientMessage::InstallRoot) => match backend.install_root() {
+                Ok(status) => EngineMessage::CertStatus(status),
+                Err(message) => EngineMessage::Error { message },
+            },
             Ok(ClientMessage::Hello { .. }) => return refuse(stream, HELLO_ONCE).await,
             Err(FrameError::Closed) => return Ok(()),
             Err(e) => return refuse(stream, &e.to_string()).await,
@@ -260,6 +270,12 @@ mod tests {
         fn lists_refresh(&self) {
             *self.refreshes.lock().unwrap() += 1;
         }
+        fn cert_status(&self) -> CertStatus {
+            CertStatus { thumbprint: Some("abc".into()), ..CertStatus::default() }
+        }
+        fn install_root(&self) -> Result<CertStatus, String> {
+            if self.policy.lock().unwrap().https { Ok(self.cert_status()) } else { Err("https is off".into()) }
+        }
     }
 
     async fn send(s: &mut DuplexStream, m: &ClientMessage) {
@@ -325,6 +341,32 @@ mod tests {
         assert!(matches!(recv(&mut c).await, EngineMessage::Lists { lists, compile_ms: Some(5) } if lists[0].network == 0));
         send(&mut c, &ClientMessage::ListsRefresh).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Lists { lists, .. } if lists[0].network == 1));
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cert_status_answers_over_the_pipe() {
+        let (mut c, task) = start(1);
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::CertStatus).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::CertStatus(s) if s.thumbprint.as_deref() == Some("abc")));
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_root_answers_the_status_or_the_refusal_and_the_pipe_stays_usable() {
+        let (mut c, task) = start(1);
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::InstallRoot).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Error { message } if message.contains("off")));
+        send(&mut c, &ClientMessage::SetPolicy(Policy { revision: 1, https: true, ..Policy::default() })).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::InstallRoot).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::CertStatus(_)));
         drop(c);
         task.await.unwrap().unwrap();
     }

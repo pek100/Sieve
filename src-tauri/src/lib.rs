@@ -58,6 +58,8 @@ pub fn run() {
             engine::engine_lists,
             engine::engine_lists_refresh,
             engine::engine_log_tail,
+            engine::engine_cert_status,
+            engine::engine_install_root,
             windns::windows_dns,
         ])
         .run(tauri::generate_context!());

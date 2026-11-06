@@ -90,6 +90,10 @@ function str(x: unknown, where: string): string {
   return x;
 }
 
+function intOrNull(x: unknown, where: string): number | null {
+  return x === null ? null : int(x, where);
+}
+
 function strOrNull(x: unknown, where: string): string | null {
   return x === null ? null : str(x, where);
 }
@@ -235,7 +239,7 @@ export function parseWindowsDns(raw: unknown): WindowsDns {
  * service state (`adguard`), for the pause offer. Fields protocol 3 added read
  * as their typed defaults when absent, so an older answer degrades, not throws.
  */
-export const ENGINE_PROBE_VERSION = 2 as const;
+export const ENGINE_PROBE_VERSION = 3 as const;
 export const SERVICE_FACTS = ["missing", "stopped", "starting", "stopping", "running", "other"] as const;
 export type ServiceFact = (typeof SERVICE_FACTS)[number];
 export const PIPE_KINDS = ["welcome", "incompatible", "refused", "unreachable"] as const;
@@ -266,6 +270,37 @@ export interface EnginePolicy {
   /** Catalogue ids; null means the catalogue's defaults. */
   lists: string[] | null;
   domain_lists: EngineDomainList[];
+  /** `filtering.https`: hold a root certificate. Off removes it. */
+  https: boolean;
+}
+
+/** `sieve-ipc` CertState and FirefoxTrust wire names, in declaration order. */
+export const CERT_STATES = ["not_installed", "installed", "expires_soon"] as const;
+export type CertState = (typeof CERT_STATES)[number];
+export const FIREFOX_TRUST = ["not_installed", "uses_windows", "not_using_windows"] as const;
+export type FirefoxTrust = (typeof FIREFOX_TRUST)[number];
+
+/** The `cert_status` message (`sieve-ipc` CertStatus, plan 8.1): facts the engine holds; `null` is a fact it does not have. */
+export interface CertStatus {
+  state: CertState;
+  valid_until_ms: number | null;
+  thumbprint: string | null;
+  firefox: FirefoxTrust;
+  last_rotation_ms: number | null;
+  last_error: string | null;
+}
+
+/** Validate an untrusted `cert_status` answer, the one normalizer of this shape. Throws ProtocolError. */
+export function parseCertStatus(raw: unknown): CertStatus {
+  const c = rec(raw, "cert status");
+  return {
+    state: oneOf(c.state, CERT_STATES, "cert.state"),
+    valid_until_ms: intOrNull(c.valid_until_ms, "cert.valid_until_ms"),
+    thumbprint: strOrNull(c.thumbprint, "cert.thumbprint"),
+    firefox: oneOf(c.firefox, FIREFOX_TRUST, "cert.firefox"),
+    last_rotation_ms: intOrNull(c.last_rotation_ms, "cert.last_rotation_ms"),
+    last_error: strOrNull(c.last_error, "cert.last_error"),
+  };
 }
 
 export interface EngineCounters {
@@ -384,6 +419,7 @@ function policy(raw: unknown): EnginePolicy {
     off_apps: orDefault(p.off_apps, (v) => strings(v, "policy.off_apps"), []),
     lists: orDefault<string[] | null>(p.lists, (v) => (v === null ? null : strings(v, "policy.lists")), null),
     domain_lists: orDefault(p.domain_lists, domainLists, []),
+    https: orDefault(p.https, (v) => bool(v, "policy.https"), false),
   };
 }
 

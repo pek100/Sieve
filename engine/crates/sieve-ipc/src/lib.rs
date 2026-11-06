@@ -15,8 +15,8 @@
 //!   [`EngineMessage::DnsUpstreams`], the list the engine then holds.
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
 //!   commit (v3, the wave after slice 3: blocked flows, the grown policy, the
-//!   list report, forwarded flows and guests, the `log` message and the status's filter
-//!   facts).
+//!   list report, forwarded flows and guests, the `log` message, the status's filter
+//!   facts, the certificate's status, `InstallRoot` and `Policy.https`).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -67,9 +67,9 @@ pub const LOG_URL_MAX: usize = 2048;
 pub const LOG_RULE_MAX: usize = 1024;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "cert_status", "install_root"];
 /// The `type` names of [`EngineMessage`], in declaration order.
-pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log"];
+pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status"];
 /// A flow event's rule text is cut to this many bytes: a list rule can run to
 /// kilobytes, and at this cap a full `flows` frame stays under [`MAX_FRAME`].
 pub const MAX_RULE_BYTES: usize = 256;
@@ -100,6 +100,12 @@ pub enum ClientMessage {
     /// `revision` is above the engine's and every address is valid, persisted,
     /// answered with [`EngineMessage::DnsUpstreams`]; a refusal is an Error.
     SetDnsUpstreams(DnsUpstreams),
+    /// Asks for [`EngineMessage::CertStatus`].
+    CertStatus,
+    /// Reinstall: a new root and key, the old root removed at once. Refused
+    /// unless `policy.https` is on. Answered with the status as it stands;
+    /// the engine does the work on its own thread.
+    InstallRoot,
 }
 
 /// Engine to app.
@@ -127,6 +133,8 @@ pub enum EngineMessage {
     /// session scoped like flows (plan 8.3). Built with [`log_frames`]: a frame
     /// refused as too large would end the stream, flows included.
     Log { rows: Vec<LogRow> },
+    /// The root certificate, from facts the engine holds (plan 8.1).
+    CertStatus(CertStatus),
 }
 
 /// The encrypted DNS resolvers as the engine holds them (`dns.json`). The
@@ -155,7 +163,7 @@ pub struct Policy {
     /// sent the Off list, so an Off app is never blocked by a missing field.
     #[serde(default)]
     pub sieving: bool,
-    /// App keys ([`app_key`]) and guest keys ([`VM_PREFIX`]) the user turned off.
+    /// App keys ([`app_key`]) and guest keys ([`vm_key`]) the user turned off.
     #[serde(default)]
     pub off_apps: Vec<String>,
     /// Catalogue ids of the selected lists; None means the catalogue's defaults.
@@ -164,6 +172,11 @@ pub struct Policy {
     /// The user's own domain lists (B6).
     #[serde(default)]
     pub domain_lists: Vec<DomainList>,
+    /// `filtering.https`: hold a root certificate (plan 2.4). Off removes it.
+    /// Defaulted, because `policy.json` denies unknown fields and a file from
+    /// before slice 5 must keep its engine switch rather than read as off.
+    #[serde(default)]
+    pub https: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +219,43 @@ pub struct ListStatus {
     /// [`MAX_LISTED_LINE_BYTES`].
     pub skipped_exceptions: Vec<String>,
     pub skipped_exceptions_total: u64,
+}
+
+/// The root certificate's state; the engine derives it, the app shows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertState {
+    #[default]
+    NotInstalled,
+    Installed,
+    /// The rotation window has come and no new root is in place yet.
+    ExpiresSoon,
+}
+
+/// Whether Firefox trusts the Windows store. `NotUsingWindows` is a policy
+/// someone else set to 0: it must not read as a claim of trust.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirefoxTrust {
+    #[default]
+    NotInstalled,
+    UsesWindows,
+    NotUsingWindows,
+}
+
+/// The `cert_status` message (plan 8.1). A fact the engine does not have is
+/// `null`, never a stand-in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertStatus {
+    pub state: CertState,
+    /// The active root's notAfter, ms since the Unix epoch.
+    pub valid_until_ms: Option<u64>,
+    /// SHA-1 of the root's DER, lowercase hex (`certutil -store Root <hash>`).
+    pub thumbprint: Option<String>,
+    pub firefox: FirefoxTrust,
+    pub last_rotation_ms: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 /// Why the engine does not route although its switch is on (plan 1.6, 1.7).
@@ -689,6 +739,8 @@ mod tests {
             ClientMessage::Lists => "lists",
             ClientMessage::ListsRefresh => "lists_refresh",
             ClientMessage::SetDnsUpstreams(_) => "set_dns_upstreams",
+            ClientMessage::CertStatus => "cert_status",
+            ClientMessage::InstallRoot => "install_root",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -699,6 +751,7 @@ mod tests {
             EngineMessage::Lists { .. } => "lists",
             EngineMessage::DnsUpstreams(_) => "dns_upstreams",
             EngineMessage::Log { .. } => "log",
+            EngineMessage::CertStatus(_) => "cert_status",
         };
         let f = fixture();
         for m in f["client"].as_array().unwrap() {
@@ -986,6 +1039,34 @@ mod tests {
         let frames = log_frames(std::slice::from_ref(&row)).unwrap();
         assert_eq!(frames.oversized, 0);
         assert_eq!(encode(&frames.messages[0]).unwrap().len() - 4, MAX_FRAME);
+    }
+
+    /// The fixture's `certStatuses` are what the app's mock serves, so TS,
+    /// Rust and the mock share one shape; each state has an example.
+    #[test]
+    fn every_fixture_cert_status_round_trips_and_every_state_is_shown() {
+        let f = fixture();
+        let examples = f["certStatuses"].as_object().unwrap();
+        for (name, example) in examples {
+            let parsed: CertStatus = serde_json::from_value(example.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(&serde_json::to_value(&parsed).unwrap(), example, "{name}");
+        }
+        let text = f.to_string();
+        for wire in ["not_installed", "installed", "expires_soon", "uses_windows", "not_using_windows"] {
+            assert!(text.contains(&format!(r#""{wire}""#)), "{wire}");
+        }
+        let _exhaustive = |s: CertState, ff: FirefoxTrust| match (s, ff) {
+            (CertState::NotInstalled | CertState::Installed | CertState::ExpiresSoon, _) => match ff {
+                FirefoxTrust::NotInstalled | FirefoxTrust::UsesWindows | FirefoxTrust::NotUsingWindows => (),
+            },
+        };
+    }
+
+    #[test]
+    fn an_old_policy_file_keeps_its_engine_switch_and_reads_https_off() {
+        let old: Policy = serde_json::from_str(r#"{"revision":4,"engine":true}"#).unwrap();
+        assert_eq!(old, Policy { revision: 4, engine: true, https: false, ..Policy::default() });
+        assert!(serde_json::from_str::<Policy>(r#"{"revision":4,"engine":true,"x":1}"#).is_err(), "unknown fields stay refused");
     }
 
     #[test]

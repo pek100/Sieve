@@ -21,7 +21,8 @@
       "domain_lists": [
         { "kind": "block", "entries": ["ads.example"], "enabled": true },
         { "kind": "allow", "entries": ["ok.ads.example"], "enabled": true }
-      ]
+      ],
+      "https": false
     },
     { "type": "subscribe" },
     { "type": "lists" },
@@ -30,7 +31,9 @@
       "type": "set_dns_upstreams",
       "revision": 4,
       "upstreams": ["https://cloudflare-dns.com/dns-query", "tls://dns.quad9.net", "quic://dns.example:8853"]
-    }
+    },
+    { "type": "cert_status" },
+    { "type": "install_root" }
   ],
   "engine": [
     { "type": "welcome", "protocol": 3, "engine_version": "0.1.0", "session_id": 1 },
@@ -43,7 +46,7 @@
       "flows": 2,
       "decrypting": false,
       "last_error": null,
-      "policy": { "revision": 3, "engine": true, "sieving": true, "off_apps": ["firefox"], "lists": ["adguard-dns"], "domain_lists": [] },
+      "policy": { "revision": 3, "engine": true, "sieving": true, "off_apps": ["firefox"], "lists": ["adguard-dns"], "domain_lists": [], "https": false },
       "blocker": null,
       "split_tunnels": ["Corp VPN"],
       "counters": {
@@ -302,6 +305,15 @@
           "list": null
         }
       ]
+    },
+    {
+      "type": "cert_status",
+      "state": "installed",
+      "valid_until_ms": 1825000000000,
+      "thumbprint": "a9993e364706816aba3e25717850c26c9cd0d89d",
+      "firefox": "uses_windows",
+      "last_rotation_ms": null,
+      "last_error": null
     }
   ],
   "outcomes": [
@@ -315,6 +327,40 @@
     { "kind": "passed", "reason": "app_off" },
     { "kind": "not_decrypted", "reason": "no_rule" }
   ],
+  "certStatuses": {
+    "installed": {
+      "state": "installed",
+      "valid_until_ms": 1825000000000,
+      "thumbprint": "a9993e364706816aba3e25717850c26c9cd0d89d",
+      "firefox": "uses_windows",
+      "last_rotation_ms": 1793000000000,
+      "last_error": null
+    },
+    "expires_soon": {
+      "state": "expires_soon",
+      "valid_until_ms": 1795000000000,
+      "thumbprint": "a9993e364706816aba3e25717850c26c9cd0d89d",
+      "firefox": "not_using_windows",
+      "last_rotation_ms": null,
+      "last_error": "the new certificate's key could not be created: access denied"
+    },
+    "not_installed": {
+      "state": "not_installed",
+      "valid_until_ms": null,
+      "thumbprint": null,
+      "firefox": "not_installed",
+      "last_rotation_ms": null,
+      "last_error": null
+    },
+    "policy_off": {
+      "state": "not_installed",
+      "valid_until_ms": null,
+      "thumbprint": null,
+      "firefox": "not_installed",
+      "last_rotation_ms": null,
+      "last_error": null
+    }
+  },
   "blockers": [
     { "kind": "adguard", "service": "Adguard Service" },
     { "kind": "vpn", "adapter": "AdGuard VPN" },

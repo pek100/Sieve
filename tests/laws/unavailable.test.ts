@@ -7,6 +7,7 @@
  * becomes unavailable must name a plan that exists and names it.
  */
 import { describe, expect, it } from "vitest";
+import { HTTPS_SWITCH } from "@/core/engine";
 import { normalizeDoc, readValue } from "@/core/settings/document";
 import { migrate } from "@/core/settings/migrate";
 import { REGISTRY, SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef } from "@/core/settings/registry";
@@ -19,8 +20,8 @@ const RETIRED = ["filtering.dns", "filtering.perApp"];
 const unavailable = SETTING_KEYS.filter((k) => !isAvailable(k));
 
 describe("unavailable settings law", () => {
-  it("no key is unavailable today: the list is exactly empty", () => {
-    expect(unavailable).toEqual([]);
+  it("only the HTTPS switch is unavailable, until interception exists", () => {
+    expect(unavailable).toEqual([HTTPS_SWITCH]);
   });
 
   it("every unavailable key would name a plan step whose plan exists and names the key", () => {

@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 const SIEVE_DIR: &str = "Sieve";
 const ENGINE_DIR: &str = "engine";
 const STATE_FILE: &str = "state.json";
+/// Why the service last stopped by itself. It has no console, so this file is
+/// how the reason reaches a person or the verb that started it.
+pub const LAST_ERROR_FILE: &str = "last-error.txt";
 
 /// `%ProgramData%`, which Windows sets for every account, SYSTEM included.
 pub fn program_data() -> Result<PathBuf, String> {

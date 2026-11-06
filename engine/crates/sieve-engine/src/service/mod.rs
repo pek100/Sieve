@@ -11,11 +11,18 @@
 //!   restart after 5 s twice then stay stopped, required privileges trimmed),
 //!   create `ProgramData\Sieve\engine` with an admin-only DACL, record the
 //!   installing user's SID (the pipe's one non-admin user), start it;
-//! - `uninstall`: remove Sieve's routes, stop and delete the service (by
-//!   name, wherever its registered image is), delete `ProgramData\Sieve`.
-//!   Every step runs even when one fails, and rerunning it is safe;
+//! - `uninstall`: remove Sieve's routes, stop the service, remove the roots
+//!   and the Firefox policy (admin rights reach those), start the service
+//!   once with [`crate::ca::removal::PURGE_ARG`] to delete the CNG keys (their
+//!   DACL is SYSTEM only), delete the service (by name, wherever its
+//!   registered image is), delete `ProgramData\Sieve`. While `ca.json` records
+//!   anything unremoved it stays, and so does the service (set to start on
+//!   demand), because a rerun reaches the keys only through it; that step
+//!   reports FAILED. Every other step runs even when one fails, and rerunning
+//!   the verb with the same exe finishes the job;
 //! - `restore`: the emergency off. Delete every route on an interface named
-//!   "Sieve", stop the service and its ETW session; nothing else.
+//!   "Sieve", stop the service and its ETW session; nothing else (the root is not
+//!   network state, and an update runs `restore` then `install`).
 //!
 //! The service runs the same `image` check at every start and refuses to run
 //! (exit code [`EXIT_UNSAFE_FOLDER`], reason in `last-error.txt`) when it
@@ -67,7 +74,7 @@ pub const USAGE: &str = "\
 usage: sieve-engine.exe [install | uninstall | restore]
   (no argument)  run as the Windows service (started by Windows only)
   install        create or update the service and start it (admin)
-  uninstall      stop filtering, delete the service and ProgramData\\Sieve (admin)
+  uninstall      stop filtering, remove the certificate, delete the service and ProgramData\\Sieve (admin)
   restore        delete every route on an interface named \"Sieve\" and stop the service (admin)
 ";
 

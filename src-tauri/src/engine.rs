@@ -13,6 +13,8 @@
 //!   (the engine controller's whole policy) to the engine.
 //! - `engine_lists() -> EngineLists`, `engine_lists_refresh() -> EngineLists`:
 //!   the per-list report; the second also asks for a download of every list.
+//! - `engine_cert_status() -> CertStatus`, `engine_install_root() -> CertStatus`:
+//!   the root certificate's facts, and the user's Reinstall (plan 8.1).
 //! - [`EngineFlows`]: while the engine routes, a subscription to its `Flows`
 //!   events; `net_snapshot` then builds the snapshot from them instead of
 //!   the connection tables (whose rows would show every flow twice: the
@@ -31,11 +33,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sieve_ipc::{EngineStatus, FlowEvent, FlowProto, ListStatus, LogRow, PIPE_NAME, PROTOCOL, Policy};
+use sieve_ipc::{CertStatus, EngineStatus, FlowEvent, FlowProto, ListStatus, LogRow, PIPE_NAME, PROTOCOL, Policy};
 
 use crate::protocol::{Endpoint, Family, Flow, FlowState, Proto};
 
-pub const ENGINE_PROBE_VERSION: u32 = 2;
+pub const ENGINE_PROBE_VERSION: u32 = 3;
 /// The engine's service name (sieve-engine `service::SERVICE_NAME`).
 pub const SERVICE_NAME: &str = "sieve-engine";
 /// A probe that gets no answer in this time reports the pipe unreachable.
@@ -337,6 +339,25 @@ mod imp {
         }
     }
 
+    /// A certificate request (`CertStatus`, `InstallRoot`): the status the
+    /// engine answers, or its refusal.
+    pub async fn cert(name: &str, msg: ClientMessage) -> Result<CertStatus, String> {
+        let ask = async {
+            let (mut pipe, _, _) = hello(name).await?.map_err(|fact| match fact {
+                PipeFact::Refused { message } | PipeFact::Unreachable { message } => message,
+                PipeFact::Incompatible { supported } => format!("the engine speaks protocol {} to {}", supported[0], supported[1]),
+                PipeFact::Welcome { .. } => "unexpected welcome".to_string(),
+            })?;
+            write_frame(&mut pipe, &msg).await.map_err(|e| e.to_string())?;
+            match read_frame(&mut pipe).await.map_err(|e| e.to_string())? {
+                EngineMessage::CertStatus(status) => Ok(status),
+                EngineMessage::Error { message } => Err(message),
+                other => Err(format!("unexpected answer: {other:?}")),
+            }
+        };
+        tokio::time::timeout(PROBE_TIMEOUT, ask).await.unwrap_or_else(|_| Err(format!("no answer in {} s", PROBE_TIMEOUT.as_secs())))
+    }
+
     /// One subscription: Hello, Status; while the engine routes, Subscribe
     /// and apply every batch until the engine ends the stream (its routes
     /// went down) or the pipe breaks.
@@ -353,7 +374,7 @@ mod imp {
             match read_frame::<_, EngineMessage>(&mut pipe).await {
                 Ok(EngineMessage::Flows { flows: batch }) => flows.apply(batch),
                 Ok(EngineMessage::Log { rows }) => log.push(rows),
-                Ok(EngineMessage::Welcome { .. } | EngineMessage::Incompatible { .. } | EngineMessage::Status(_) | EngineMessage::Error { .. } | EngineMessage::Lists { .. } | EngineMessage::DnsUpstreams(_)) => {}
+                Ok(EngineMessage::Welcome { .. } | EngineMessage::Incompatible { .. } | EngineMessage::Status(_) | EngineMessage::Error { .. } | EngineMessage::Lists { .. } | EngineMessage::DnsUpstreams(_) | EngineMessage::CertStatus(_)) => {}
                 Err(sieve_ipc::FrameError::Closed) => break Ok(()),
                 Err(e) => break Err(e.to_string()),
             }
@@ -443,6 +464,33 @@ pub async fn engine_lists() -> Result<EngineLists, String> {
 #[cfg(not(windows))]
 #[tauri::command]
 pub async fn engine_lists_refresh() -> Result<EngineLists, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// Command: the root certificate's facts, from the engine.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_cert_status() -> Result<CertStatus, String> {
+    imp::cert(PIPE_NAME, sieve_ipc::ClientMessage::CertStatus).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_cert_status() -> Result<CertStatus, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// Command: the user's Reinstall. The engine refuses it while `filtering.https`
+/// is off; it answers at once and does the work on its own thread.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_install_root() -> Result<CertStatus, String> {
+    imp::cert(PIPE_NAME, sieve_ipc::ClientMessage::InstallRoot).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_install_root() -> Result<CertStatus, String> {
     Err("the engine runs on Windows only".into())
 }
 
@@ -727,6 +775,44 @@ mod tests {
         assert_eq!(got, EngineLists { lists: report, compile_ms: Some(9) });
         assert_eq!(engine.await.unwrap(), ClientMessage::ListsRefresh);
         assert!(imp::lists(&test_pipe("lists-nobody"), ClientMessage::Lists).await.is_err());
+    }
+
+    /// A stand-in engine that answers one certificate request after Hello.
+    #[cfg(windows)]
+    async fn cert_engine(tag: &str, msg: sieve_ipc::ClientMessage, then: sieve_ipc::EngineMessage) -> Result<CertStatus, String> {
+        use sieve_ipc::nonblocking::{read_frame, write_frame};
+        use sieve_ipc::{ClientMessage, EngineMessage};
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let name = test_pipe(tag);
+        let mut server = ServerOptions::new().first_pipe_instance(true).create(&name).unwrap();
+        let want = msg.clone();
+        let engine = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let _: ClientMessage = read_frame(&mut server).await.unwrap();
+            let welcome = EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 };
+            write_frame(&mut server, &welcome).await.unwrap();
+            let asked: ClientMessage = read_frame(&mut server).await.unwrap();
+            write_frame(&mut server, &then).await.unwrap();
+            assert_eq!(asked, want);
+        });
+        let got = imp::cert(&name, msg).await;
+        engine.await.unwrap();
+        got
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_certificate_commands_read_the_status_or_the_refusal() {
+        use sieve_ipc::{CertState, ClientMessage, EngineMessage};
+        let installed = CertStatus { state: CertState::Installed, thumbprint: Some("ab".into()), ..CertStatus::default() };
+        let got = cert_engine("cert", ClientMessage::CertStatus, EngineMessage::CertStatus(installed.clone())).await;
+        assert_eq!(got, Ok(installed.clone()));
+        let got = cert_engine("reinstall", ClientMessage::InstallRoot, EngineMessage::CertStatus(installed)).await;
+        assert!(got.is_ok());
+        let off = EngineMessage::Error { message: "HTTPS filtering is off".into() };
+        assert_eq!(cert_engine("off", ClientMessage::InstallRoot, off).await, Err("HTTPS filtering is off".to_string()));
+        assert!(imp::cert(&test_pipe("nobody-cert"), ClientMessage::CertStatus).await.is_err());
     }
 
     #[cfg(windows)]
