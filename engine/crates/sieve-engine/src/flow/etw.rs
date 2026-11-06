@@ -17,7 +17,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::flow::flows::{FiveTuple, NO_OWNER_PID};
 use crate::flow::nat::WinNatTable;
@@ -262,12 +265,56 @@ pub fn event_id_filter(ids: &[u16]) -> Vec<u8> {
     b
 }
 
+/// How long a start waits to learn its consumer has the session open.
+pub const CONSUMER_OPEN_BOUND: Duration = Duration::from_secs(5);
+
+/// Runs a consumer on its own thread and answers once it has the session
+/// open, so a consumer that cannot open fails the start, which is what puts
+/// it in `last_error`. Past that, `on_end` gets what ended it.
+pub fn spawn_consumer<T>(
+    open: impl FnOnce() -> Result<T, String> + Send + 'static,
+    process: impl FnOnce(T) -> Result<(), String> + Send + 'static,
+    on_end: impl FnOnce(Result<(), String>) + Send + 'static,
+    bound: Duration,
+) -> Result<JoinHandle<()>, String> {
+    let (opened, wait) = std::sync::mpsc::sync_channel(1);
+    let consumer = std::thread::Builder::new()
+        .name("sieve-etw".into())
+        .spawn(move || match open() {
+            Ok(session) => {
+                let _ = opened.send(Ok(()));
+                on_end(process(session));
+            }
+            Err(why) => {
+                let _ = opened.send(Err(why));
+            }
+        })
+        .map_err(|e| format!("no consumer thread: {e}"))?;
+    match wait.recv_timeout(bound) {
+        Ok(Ok(())) => Ok(consumer),
+        Ok(Err(why)) => Err(why),
+        Err(RecvTimeoutError::Timeout) => Err(format!("the consumer did not open the session within {} s", bound.as_secs())),
+        Err(RecvTimeoutError::Disconnected) => Err("the consumer ended before it opened the session".into()),
+    }
+}
+
+/// What a consumer's end means for `last_error`. Only a stop the engine asked
+/// for is expected; any other end, even a clean one (someone stopped the
+/// session by name), leaves the witness answering nothing for the whole run.
+pub fn consumer_failure(stopping: bool, end: &Result<(), String>) -> Option<String> {
+    match end {
+        _ if stopping => None,
+        Ok(()) => Some("attribution without ETW: the session ended while the routes were up".into()),
+        Err(why) => Some(format!("attribution without ETW: {why}")),
+    }
+}
+
 /// The named real-time session. The one place that starts, flushes or stops it.
 #[cfg(windows)]
 pub mod os {
     use std::ffi::c_void;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND, WIN32_ERROR};
@@ -275,12 +322,12 @@ pub mod os {
         CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, ENABLE_TRACE_PARAMETERS, ENABLE_TRACE_PARAMETERS_VERSION_2,
         EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_FILTER_DESCRIPTOR, EVENT_FILTER_TYPE_EVENT_ID, EVENT_RECORD, EVENT_TRACE_CONTROL,
         EVENT_TRACE_CONTROL_FLUSH, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
-        EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, ProcessTrace, StartTraceW,
-        TRACE_LEVEL_VERBOSE, WNODE_FLAG_TRACED_GUID,
+        EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace,
+        StartTraceW, TRACE_LEVEL_VERBOSE, WNODE_FLAG_TRACED_GUID,
     };
     use windows::core::{GUID, PCWSTR, PWSTR};
 
-    use super::{KERNEL_NETWORK, KERNEL_NETWORK_EVENTS, KERNEL_NETWORK_KEYWORDS, Sinks, event_id_filter};
+    use super::{CONSUMER_OPEN_BOUND, KERNEL_NETWORK, KERNEL_NETWORK_EVENTS, KERNEL_NETWORK_KEYWORDS, Sinks, consumer_failure, event_id_filter, spawn_consumer};
     use crate::flow::nat::{WINNAT, WINNAT_EVENTS};
     use crate::stack::Meters;
     use crate::watchdog::monotonic_ms;
@@ -376,17 +423,60 @@ pub mod os {
         unsafe { EnableTraceEx2(handle, &guid, EVENT_CONTROL_CODE_ENABLE_PROVIDER.0, TRACE_LEVEL_VERBOSE as u8, keywords, 0, 0, Some(&params)) }
     }
 
+    /// One open read of a session. Lives on the consumer thread: Windows reads
+    /// through these boxes until the trace closes, and their addresses are stable.
+    struct Consumer {
+        trace: PROCESSTRACE_HANDLE,
+        _log: Box<EVENT_TRACE_LOGFILEW>,
+        _name: Vec<u16>,
+        _sinks: Box<Sinks>,
+    }
+
+    impl Consumer {
+        fn open(session: &str, sinks: Sinks) -> Result<Self, String> {
+            let mut name = wide(session);
+            let sinks = Box::new(sinks);
+            // SAFETY: all zeros is a valid EVENT_TRACE_LOGFILEW before the fields below.
+            let mut log: Box<EVENT_TRACE_LOGFILEW> = Box::new(unsafe { std::mem::zeroed() });
+            log.LoggerName = PWSTR(name.as_mut_ptr());
+            log.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+            log.Anonymous2.EventRecordCallback = Some(on_event);
+            log.Context = (&raw const *sinks).cast_mut().cast::<c_void>();
+            // SAFETY: `log` and what it points at live as long as `Consumer`.
+            let trace = unsafe { OpenTraceW(&mut *log) };
+            if trace.Value == u64::MAX {
+                let code = std::io::Error::last_os_error().raw_os_error().unwrap_or_default();
+                return Err(format!("opening {session}: Win32 error {code}"));
+            }
+            Ok(Self { trace, _log: log, _name: name, _sinks: sinks })
+        }
+
+        /// Delivers events until the session stops, then closes the trace.
+        fn process(self) -> Result<(), String> {
+            // SAFETY: `trace` came from OpenTraceW.
+            let processed = unsafe { ProcessTrace(&[self.trace], None, None) };
+            // SAFETY: `trace` is closed once, after its callbacks ended.
+            let _ = unsafe { CloseTrace(self.trace) };
+            if processed == ERROR_SUCCESS { Ok(()) } else { Err(format!("reading the session: Win32 error {}", processed.0)) }
+        }
+    }
+
     /// The running session and its consumer thread.
     pub struct EtwSession {
         consumer: std::thread::JoinHandle<()>,
+        /// Set before the engine stops it, so the consumer's end is expected.
+        stopping: Arc<AtomicBool>,
         /// Why the WinNat provider could not be enabled; the tables and
         /// Kernel-Network still work.
         pub winnat_error: Option<String>,
     }
 
     /// Starts the session (real-time, no log file, fixed small buffers) and
-    /// its consumer. Any failure leaves no session behind.
-    pub fn start(sinks: Sinks) -> Result<EtwSession, String> {
+    /// its consumer, and returns once the consumer has it open. Any failure
+    /// leaves no session behind. If the consumer ends later, unasked, the
+    /// session is stopped (no provider stays enabled for nobody) and `report`
+    /// gets why.
+    pub fn start(sinks: Sinks, report: impl FnOnce(String) + Send + 'static) -> Result<EtwSession, String> {
         let name = wide(SESSION_NAME);
         let mut handle = CONTROLTRACE_HANDLE::default();
         let begin = |handle: &mut CONTROLTRACE_HANDLE| {
@@ -418,31 +508,25 @@ pub mod os {
         let winnat = enable(handle, WINNAT, ALL_KEYWORDS, &WINNAT_EVENTS);
         let winnat_error = (winnat != ERROR_SUCCESS).then(|| format!("enabling WinNat events: Win32 error {}", winnat.0));
 
-        let consumer = std::thread::Builder::new()
-            .name("sieve-etw".into())
-            .spawn(move || {
-                let mut name = wide(SESSION_NAME);
-                // Boxed so its address is stable while ProcessTrace runs.
-                let sinks = Box::new(sinks);
-                // SAFETY: all zeros is a valid EVENT_TRACE_LOGFILEW before the fields below.
-                let mut log: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
-                log.LoggerName = PWSTR(name.as_mut_ptr());
-                log.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
-                log.Anonymous2.EventRecordCallback = Some(on_event);
-                log.Context = (&raw const *sinks).cast_mut().cast::<c_void>();
-                // SAFETY: `log` and what it points at live until CloseTrace below.
-                let trace = unsafe { OpenTraceW(&mut log) };
-                if trace.Value == u64::MAX {
-                    return;
+        let stopping = Arc::new(AtomicBool::new(false));
+        let asked = stopping.clone();
+        let consumer = spawn_consumer(
+            move || Consumer::open(SESSION_NAME, sinks),
+            Consumer::process,
+            move |end| {
+                if let Some(why) = consumer_failure(asked.load(Ordering::Acquire), &end) {
+                    let _ = stop_stale();
+                    report(why);
                 }
-                // SAFETY: `trace` came from OpenTraceW. Returns when the session stops.
-                let _ = unsafe { ProcessTrace(&[trace], None, None) };
-                // SAFETY: `trace` is closed once, after its callbacks ended.
-                let _ = unsafe { CloseTrace(trace) };
-                drop(sinks);
-            })
-            .map_err(|e| fail(format!("ETW consumer thread: {e}")))?;
-        Ok(EtwSession { consumer, winnat_error })
+            },
+            CONSUMER_OPEN_BOUND,
+        )
+        .map_err(|why| {
+            // A consumer that opens late must not stop a later run's session.
+            stopping.store(true, Ordering::Release);
+            fail(format!("ETW consumer: {why}"))
+        })?;
+        Ok(EtwSession { consumer, stopping, winnat_error })
     }
 
     impl EtwSession {
@@ -450,6 +534,7 @@ pub mod os {
         /// detaches it. Call after the routes are deleted, so a hang here
         /// cannot hold a route.
         pub fn stop(self, bound: Duration) -> Result<String, String> {
+            self.stopping.store(true, Ordering::Release);
             let stopped = stop_stale();
             let (done, wait) = std::sync::mpsc::channel();
             let consumer = self.consumer;
@@ -469,6 +554,20 @@ pub mod os {
     pub fn flusher(meters: Arc<Meters>) -> impl Fn() + Send {
         let lost_seen = AtomicU64::new(0);
         move || flush(&lost_seen, &meters)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Asks Windows for a session nobody started: reads only, starts nothing.
+        #[test]
+        fn reading_a_session_that_does_not_exist_is_an_error_not_silence() {
+            let sinks = Sinks::new(std::process::id(), Arc::default());
+            let read = Consumer::open("SieveEngineAttributionNoSuchSession", sinks).and_then(Consumer::process);
+            let why = read.expect_err("no session to read");
+            assert!(why.contains("Win32 error"), "{why}");
+        }
     }
 }
 
@@ -639,6 +738,84 @@ mod tests {
         sinks.ingest(KERNEL_NETWORK, id, &bytes, 0);
         assert_eq!(lock(&sinks.ring).len(), 1);
         assert_eq!(meters.counters().etw_dropped, 0);
+    }
+
+    const BOUND: Duration = Duration::from_secs(30);
+
+    type End = Result<(), String>;
+
+    fn ended() -> (impl FnOnce(End) + Send + 'static, std::sync::mpsc::Receiver<End>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (move |end| tx.send(end).unwrap(), rx)
+    }
+
+    #[test]
+    fn a_consumer_that_cannot_open_fails_the_start() {
+        let (on_end, end) = ended();
+        let started = spawn_consumer(|| Err::<(), _>("opening: Win32 error 5".to_string()), |()| Ok(()), on_end, BOUND);
+        assert_eq!(started.err().as_deref(), Some("opening: Win32 error 5"));
+        assert!(end.recv_timeout(BOUND).is_err(), "nothing ran, so nothing ended");
+    }
+
+    #[test]
+    fn a_start_does_not_return_before_the_consumer_opens() {
+        let (entered, opening) = std::sync::mpsc::channel();
+        let (on_end, end) = ended();
+        let consumer = spawn_consumer(
+            move || {
+                std::thread::sleep(Duration::from_millis(50));
+                entered.send("opened").unwrap();
+                Ok(())
+            },
+            |()| Ok(()),
+            on_end,
+            BOUND,
+        )
+        .unwrap();
+        assert_eq!(opening.try_recv(), Ok("opened"), "the start waited for the open");
+        assert_eq!(end.recv_timeout(BOUND).unwrap(), Ok(()));
+        consumer.join().unwrap();
+    }
+
+    #[test]
+    fn a_consumer_that_never_opens_fails_the_start_within_its_bound() {
+        let (release, hung) = std::sync::mpsc::channel::<()>();
+        let (on_end, _end) = ended();
+        let started = spawn_consumer(
+            move || {
+                let _ = hung.recv();
+                Err::<(), _>("too late".to_string())
+            },
+            |()| Ok(()),
+            on_end,
+            Duration::from_millis(20),
+        );
+        assert!(started.err().unwrap().contains("did not open"));
+        drop(release);
+    }
+
+    #[test]
+    fn a_consumer_that_dies_opening_fails_the_start() {
+        let (on_end, _end) = ended();
+        let started = spawn_consumer(|| -> Result<(), String> { panic!("a test's expected panic") }, |()| Ok(()), on_end, BOUND);
+        assert!(started.err().unwrap().contains("before it opened"));
+    }
+
+    #[test]
+    fn a_read_that_fails_after_the_start_reaches_its_end_report() {
+        let (on_end, end) = ended();
+        let consumer = spawn_consumer(|| Ok(()), |()| Err("reading the session: Win32 error 6".to_string()), on_end, BOUND).unwrap();
+        assert_eq!(end.recv_timeout(BOUND).unwrap(), Err("reading the session: Win32 error 6".to_string()));
+        consumer.join().unwrap();
+    }
+
+    #[test]
+    fn only_a_stop_the_engine_asked_for_is_a_quiet_end() {
+        let failed: Result<(), String> = Err("reading the session: Win32 error 6".into());
+        assert_eq!(consumer_failure(true, &Ok(())), None);
+        assert_eq!(consumer_failure(true, &failed), None);
+        assert_eq!(consumer_failure(false, &failed).as_deref(), Some("attribution without ETW: reading the session: Win32 error 6"));
+        assert!(consumer_failure(false, &Ok(())).unwrap().starts_with("attribution without ETW:"), "stopped by someone else");
     }
 
     #[test]

@@ -64,13 +64,15 @@ fn journal(engine: &Engine) -> Option<Journal> {
 }
 
 /// The attribution sources of one routing run. Starting them is not a Setup
-/// blocker: a failed session goes to `last_error` and routing continues with
-/// the owner tables alone (fail-open).
-fn start_attribution(engine: &Engine) -> (Option<EtwSession>, Witness, Arc<NatTable>) {
+/// blocker: a failed session, or a consumer that ends later, goes to
+/// `last_error` and routing continues with the owner tables alone (fail-open).
+fn start_attribution(engine: &Arc<Engine>) -> (Option<EtwSession>, Witness, Arc<NatTable>) {
     let sinks = Sinks::new(std::process::id(), engine.meters.clone());
     let winnat = sinks.winnat.clone();
     let ring = sinks.ring.clone();
-    let (session, witness): (Option<EtwSession>, Witness) = match etw_os::start(sinks) {
+    let reporter = engine.clone();
+    let report = move |why| reporter.set_facts(|f| f.last_error = Some(why));
+    let (session, witness): (Option<EtwSession>, Witness) = match etw_os::start(sinks, report) {
         Ok(session) => {
             if let Some(why) = &session.winnat_error {
                 engine.set_facts(|f| f.last_error = Some(why.clone()));
