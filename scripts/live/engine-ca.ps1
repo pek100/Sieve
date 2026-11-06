@@ -64,7 +64,7 @@ function Check([string]$name, [bool]$ok, [string]$detail = "") {
 
 function Read-Record {
   if (-not (Test-Path $CaFile)) { return $null }
-  return Get-Content -Raw $CaFile | ConvertFrom-Json
+  return Get-Content -Raw -Encoding UTF8 $CaFile | ConvertFrom-Json
 }
 
 function Recorded-Thumbprints($record) {
@@ -94,7 +94,7 @@ function Start-Engine {
 # Written with no BOM: the engine's JSON reader refuses one, and a refused file reads as off.
 function Write-PolicyWith([scriptblock]$json) {
   Stop-Engine
-  $policy = if (Test-Path $PolicyFile) { Get-Content -Raw $PolicyFile | ConvertFrom-Json } else { [pscustomobject]@{ revision = 0; engine = $false } }
+  $policy = if (Test-Path $PolicyFile) { Get-Content -Raw -Encoding UTF8 $PolicyFile | ConvertFrom-Json } else { [pscustomobject]@{ revision = 0; engine = $false } }
   $encoding = New-Object Text.UTF8Encoding($false)
   [IO.File]::WriteAllText($PolicyFile, (& $json $policy), $encoding)
   Start-Engine
@@ -106,7 +106,7 @@ function Set-HttpsSwitch([bool]$on) {
 
 # The engine rewrites the file by rename, so a read can miss it for a moment.
 function Read-Status {
-  try { return Get-Content -Raw $StatusFile | ConvertFrom-Json } catch { return $null }
+  try { return Get-Content -Raw -Encoding UTF8 $StatusFile | ConvertFrom-Json } catch { return $null }
 }
 
 function Wait-Until([scriptblock]$test) {
@@ -165,7 +165,7 @@ function Read-KeyFactsAsSystem($keyName) {
     cmd /c "schtasks /Run /TN $task 2>&1" | Out-Null
     if (-not (Wait-Until { Test-Path $result })) { return $null }
     Start-Sleep -Milliseconds 500
-    return Get-Content -Raw $result | ConvertFrom-Json
+    return Get-Content -Raw -Encoding UTF8 $result | ConvertFrom-Json
   } finally {
     cmd /c "schtasks /Delete /TN $task /F 2>&1" | Out-Null
   }

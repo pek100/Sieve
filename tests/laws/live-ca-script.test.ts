@@ -5,7 +5,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { ROOT, read } from "./files";
+import { ROOT, hits, read, walk } from "./files";
 
 const CHECKS = "scripts/live/engine-ca-checks.ps1";
 
@@ -56,6 +56,15 @@ describe("the slice 6 route", () => {
     const runbook = read("docs/live/engine-slice-6.md");
     expect(runbook).toContain("-Step intercept");
     expect(runbook).toContain("https.intercepted");
+  });
+});
+
+describe("every live script", () => {
+  // Windows PowerShell 5.1 reads BOM-less UTF-8 as Windows-1252, so a policy written back
+  // after a plain read garbles non-ASCII app names and rules, and an Off stops matching.
+  it("reads the engine's JSON as UTF-8", () => {
+    const plain = walk("scripts/live", [".ps1"]).flatMap((f) => hits(f, /Get-Content\b.*-Raw(?!.*-Encoding)/i).filter((l) => !/-Encoding\s+utf8.*-Raw/i.test(l)));
+    expect(plain).toEqual([]);
   });
 });
 

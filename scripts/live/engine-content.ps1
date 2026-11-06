@@ -45,7 +45,7 @@ function Assert-AppClosed {
 }
 
 function Read-Policy {
-  return Get-Content -Raw $PolicyFile | ConvertFrom-Json
+  return Get-Content -Raw -Encoding UTF8 $PolicyFile | ConvertFrom-Json
 }
 
 # Written with no BOM: the engine's JSON reader refuses one, and a refused file reads as off.
@@ -59,7 +59,7 @@ function Write-Policy($policy) {
 }
 
 function Show-Content {
-  $status = Get-Content -Raw $StatusFile | ConvertFrom-Json
+  $status = Get-Content -Raw -Encoding UTF8 $StatusFile | ConvertFrom-Json
   return $status.content | ConvertTo-Json -Depth 5
 }
 

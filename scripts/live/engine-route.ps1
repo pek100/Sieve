@@ -128,7 +128,7 @@ function Test-Network([string]$tag) {
 
 function Read-Status {
   if (-not (Test-Path $StatusFile)) { return $null }
-  Get-Content -Raw $StatusFile | ConvertFrom-Json
+  Get-Content -Raw -Encoding UTF8 $StatusFile | ConvertFrom-Json
 }
 
 function Wait-For([scriptblock]$condition, [int]$seconds) {
@@ -177,7 +177,7 @@ switch ($Step) {
     $null = Read-Host "Press Enter once it is on"
     Start-Sleep -Seconds 6
     $s = Read-Status
-    Write-Evidence "route-adguard-status.json" ((Get-Content -Raw $StatusFile -ErrorAction SilentlyContinue) + "")
+    Write-Evidence "route-adguard-status.json" ((Get-Content -Raw -Encoding UTF8 $StatusFile -ErrorAction SilentlyContinue) + "")
     Check "the engine refuses while AdGuard runs (blocker adguard)" ($s -and $s.blocker.kind -eq "adguard") "status.json blocker: $($s.blocker.kind)"
     Check "no route on Sieve while AdGuard runs" ((Get-SieveRoutes).Count -eq 0)
     Check "the app shows the AdGuard refusal" (Ask "Does Settings > Filtering > Engine say 'Waiting for AdGuard' with the reason?")
@@ -203,7 +203,7 @@ switch ($Step) {
     $sieveDns = @(Get-DnsClientServerAddress -InterfaceAlias $Adapter -ErrorAction SilentlyContinue | Where-Object { $_.ServerAddresses.Count -gt 0 })
     Check "no DNS server set on the Sieve adapter" ($sieveDns.Count -eq 0)
     Test-Network "on" | Out-Null
-    $gw = (Get-Content -Raw (Join-Path $Out "route-gateway.txt")).Trim()
+    $gw = (Get-Content -Raw -Encoding UTF8 (Join-Path $Out "route-gateway.txt")).Trim()
     $lan = Test-NetConnection $gw -Port 80 -WarningAction SilentlyContinue
     Check "LAN router UI reachable" ($lan.TcpTestSucceeded) "TCP $gw`:80"
     Check "the router UI loads in a browser" (Ask "Open http://$gw/ in a browser. Does the router's page load?")
@@ -218,7 +218,7 @@ switch ($Step) {
     Write-Host "browsing, a video call and a game launcher, without a failure."
     Check "30 minutes of normal use without a failure" (Ask "Did 30 minutes of browsing, a video call and a game launcher all work?")
     $s = Read-Status
-    Write-Evidence "route-soak-status.json" ((Get-Content -Raw $StatusFile) + "")
+    Write-Evidence "route-soak-status.json" ((Get-Content -Raw -Encoding UTF8 $StatusFile) + "")
     $rate = if ($s.counters.flows -gt 0) { $s.counters.attributed / $s.counters.flows } else { 0 }
     # The gate stays the rate of ALL flows; host only is reported beside it.
     $hostFlows = $s.counters.flows - $s.counters.forwarded
@@ -268,7 +268,7 @@ switch ($Step) {
       $tripped = Wait-For { (Get-SieveRoutes).Count -eq 0 } 60
       $elapsed = ((Get-Date) - $upAt).TotalSeconds
       Check "the watchdog removed the routes" $tripped ("{0:N0} s after the routes came up" -f $elapsed)
-      $err = Get-Content -Raw (Join-Path $EngineDir "last-error.txt") -ErrorAction SilentlyContinue
+      $err = Get-Content -Raw -Encoding UTF8 (Join-Path $EngineDir "last-error.txt") -ErrorAction SilentlyContinue
       Write-Evidence "route-stall-last-error.txt" "$err"
       Check "the watchdog says why" ("$err" -match "watchdog") "$err"
       Test-Network "stall" | Out-Null
@@ -303,7 +303,7 @@ switch ($Step) {
     # The kill, the watchdog's exit and the kill before the reboot: three unclean ends within the hour.
     Start-Sleep -Seconds 6
     $s = Read-Status
-    Write-Evidence "route-after-reboot-status.json" ((Get-Content -Raw $StatusFile -ErrorAction SilentlyContinue) + "")
+    Write-Evidence "route-after-reboot-status.json" ((Get-Content -Raw -Encoding UTF8 $StatusFile -ErrorAction SilentlyContinue) + "")
     Check "the crash-loop stop engaged after three unclean ends within the hour" ($s -and $s.blocker.kind -eq "crash_loop") "status.json blocker: $($s.blocker.kind)"
     Check "no route while in the crash-loop stop" ((Get-SieveRoutes).Count -eq 0)
     Write-Host "Now turn 'Route traffic through the engine' off and on again in the app."

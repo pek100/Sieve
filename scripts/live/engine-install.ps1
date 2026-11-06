@@ -236,7 +236,7 @@ function Test-Installed([string]$tag) {
   $acl = (icacls $ProgramDataSieve) -join "`n"
   Write-Evidence "$tag-programdata-acl.txt" $acl
   Check "ProgramData\Sieve: SYSTEM and Administrators only" (($acl -match "NT AUTHORITY\\SYSTEM:\(OI\)\(CI\)\(F\)") -and ($acl -match "BUILTIN\\Administrators:\(OI\)\(CI\)\(F\)") -and -not ($acl -match "Users:|Everyone:|Authenticated Users:|CREATOR OWNER:"))
-  $state = Get-Content -Raw (Join-Path $ProgramDataSieve "engine\state.json") | ConvertFrom-Json
+  $state = Get-Content -Raw -Encoding UTF8 (Join-Path $ProgramDataSieve "engine\state.json") | ConvertFrom-Json
   $me = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
   Check "state.json records the installing user" ($state.owner_sid -eq $me) "recorded $($state.owner_sid), you are $me"
   # Get-Acl cannot read named pipes in Windows PowerShell 5.1 (it reports "does not exist"),

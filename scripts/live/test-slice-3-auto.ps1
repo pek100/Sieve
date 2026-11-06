@@ -117,7 +117,7 @@ try {
     $script:Calls.Add("$name $state")
     if ($state -eq "Running") {
       # Simulated engine startup publishes exactly the file it just loaded.
-      $policy = Get-Content -Raw -LiteralPath $PolicyFile | ConvertFrom-Json
+      $policy = Get-Content -Raw -Encoding UTF8 -LiteralPath $PolicyFile | ConvertFrom-Json
       [IO.File]::WriteAllText($StatusFile, (@{ policy = $policy } | ConvertTo-Json), $Utf8)
     }
   }
