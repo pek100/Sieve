@@ -273,6 +273,8 @@ QUIC is relayed in every other case: app Off, excluded host (sensitive list, EV 
 
 Why ICMP and not a silent drop: a silent drop makes the browser wait for its QUIC-to-TCP race timer, while an unreachable error fails the QUIC attempt straight away. UNVERIFIED: whether Chromium on Windows treats the ICMP error (`WSAECONNRESET` on the UDP socket) as an immediate QUIC failure. Slice 8 measures the time from the first Initial to the first TCP SYN for the same host in Chrome, Edge and Firefox. If ICMP is not faster than a drop, the drop is used and the decision is recorded with the numbers.
 
+*As built (slice 8, 2026-11-06):* `quic::path` asks `decrypt` with the cached rejection TCP's first look reads, not with the verdict unknown, so a host TCP will not filter keeps QUIC. A first visit to a host whose verdict is not known yet is refused, and TCP then learns the verdict. ipstack hands the relay the payload and the addresses, so the ICMP quote is rebuilt from them: right checksums and lengths, an IP id and TTL that cannot match the original (`docs/live/engine-slice-8.md`, U1). The arm is one word, `quic::REFUSAL`. A refused flow's log row is "Not decrypted (quic refused)", and its event closes `Relayed` with 0 bytes: no block is counted.
+
 ## 4. Exclusions: what makes it bulletproof
 
 ### 4.1 One store, one function
@@ -774,6 +776,7 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
   - unit tests: refused exactly when `decrypt()` says Intercept; relayed for Off, excluded, not HTTP/3 and ECH; the ICMP packet is checksum-correct (v4 and v6);
   - **live:** YouTube and Google Search in Chrome, Edge and Firefox load over TCP via Sieve (`chrome://net-internals` or the log shows h2), with the first TCP SYN within 100 ms of the refused Initial; an Off app's QUIC flows stay QUIC.
 - **Files:** `engine/crates/sieve-engine/src/quic/**`. **Live:** yes. **Switch:** part of `filtering.https`.
+- **Status (2026-11-06):** built and tested offline only (`docs/tasks/2026-11-06-quic.md`, branch `wf2-quic`). No packet has reached a real app or browser, and `filtering.https` stays unavailable: the runbook is `docs/live/engine-slice-8.md`, and the arm stays `PortUnreachable` until its numbers are in. No new setting and no new switch.
 
 ### Slice 9: content: HTML injection, cosmetics, scriptlets
 
@@ -836,7 +839,7 @@ Risks:
 - **R1. AdGuard on this machine.** Sieve refuses to filter while AdGuard intercepts (1.7). Using Sieve means stopping AdGuard's protection. Slice 3 offers it in the app: Pause AdGuard asks its service to stop after the Windows prompt. **Dated note, 2026-11-05:** the pause has no one-click undo. The service stays in StopPending, where `sc start` returns 1056, so the app says to use AdGuard's own window or restart; Start AdGuard again is offered only for a service really stopped.
 - **R2. Decrypting every app, not just browsers.** This goes further than AdGuard, which keeps 42 known apps undecrypted (E3). A pinning app can fail one request before self-healing excludes it.
 - **R3. Pinned resource library.** List rules that name newer scriptlets are skipped until the pin is bumped. YouTube fixes can depend on that.
-- **R4. QUIC refusal.** Filtered sites load over TCP in Chrome and Edge, which costs a little on lossy networks. The first visit's fallback time is measured in slice 8.
+- **R4. QUIC refusal.** Filtered sites load over TCP in Chrome and Edge, which costs a little on lossy networks. The first visit's fallback time is measured in slice 8 (`docs/live/engine-slice-8.md`, U2).
 - **R5. TLS fingerprint.** Bot-detection sites may challenge more often through rustls (2.7). Measured in slice 6.
 - **R6. Code signing.** Sieve and its installer are unsigned: SmartScreen warnings, and nothing ties the service binary to a publisher. Wintun is signed.
 

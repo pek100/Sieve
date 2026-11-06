@@ -11,7 +11,9 @@
 //! once, client bytes are held until decoded and decided, then relayed or the
 //! flow is closed with nothing sent). UDP holds datagrams until decoded and
 //! decided; a blocked UDP flow's book entry closes and its datagrams are
-//! swallowed until idle. Port 53 goes to `stack::dns_flow` instead and is never
+//! swallowed until idle; a flow `quic::path` refuses closes the same way and each
+//! of its datagrams is answered until idle (`quic::refuse`), with nothing sent
+//! upstream. Port 53 goes to `stack::dns_flow` instead and is never
 //! relayed or blocked. The upstream TCP connect happens before the decision, so
 //! server-first bytes may reach an app: a decoded name beats the IP map, so
 //! the decision cannot be earlier.
@@ -40,8 +42,9 @@ use crate::flow::nat::NatTable;
 use crate::flow::packet::Proto;
 use crate::flow::relay::relay_tcp;
 use crate::policy::wall_ms;
+use crate::quic::{self, PacketSink, Reply, UdpPath};
 use crate::route::table::NetTables;
-use crate::tls::intercept::{FlowMeta, HttpsSlot, run as run_intercepted};
+use crate::tls::intercept::{FlowMeta, HttpsSlot, Who, run as run_intercepted};
 use crate::watchdog::monotonic_ms;
 
 /// A TCP flow that sends nothing this long is decided without a name.
@@ -95,6 +98,8 @@ pub struct Relay {
     pub meters: Arc<Meters>,
     /// `filtering.https`: empty means every flow takes `relay_tcp`.
     pub https: Arc<HttpsSlot<Egress>>,
+    /// Where a refused QUIC flow's answers go: the adapter.
+    pub sink: Arc<dyn PacketSink>,
 }
 
 pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -121,10 +126,11 @@ pub struct RelayParts {
     pub witness: Witness,
     pub nat: Arc<NatTable>,
     pub https: Arc<HttpsSlot<Egress>>,
+    pub sink: Arc<dyn PacketSink>,
 }
 
 impl Relay {
-    pub fn new(RelayParts { tables, egress, dns, book, names, meters, filter, witness, nat, https }: RelayParts) -> Self {
+    pub fn new(RelayParts { tables, egress, dns, book, names, meters, filter, witness, nat, https, sink }: RelayParts) -> Self {
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: crate::experiments::Settings::default(),
@@ -141,6 +147,7 @@ impl Relay {
             book,
             meters,
             https,
+            sink,
         }
     }
 
@@ -259,6 +266,7 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
     if flow.remote.port() == DNS_PORT {
         return dns_flow::tcp(ctx, app, flow).await;
     }
+    let accepted_ms = monotonic_ms();
     let (attributed, upstream) = tokio::join!(ctx.attribute(flow), ctx.egress.connect(flow.remote));
     let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Tcp, FlowKind::Other) else { return close_app(&mut app).await };
     let upstream = match upstream {
@@ -273,6 +281,13 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
     if let Some(https) = ctx.https.get() {
         let owner = admitted.owner.as_owner();
         let event = lock(&ctx.book).snapshot_of(admitted.id);
+        let pid = event.as_ref().and_then(|e| e.pid);
+        let decide = |d: &Decoded| {
+            if let (Some(pid), Some(host)) = (pid, d.domain.as_deref()) {
+                ctx.meters.quic.tcp_seen(pid, host, accepted_ms);
+            }
+            decide(d)
+        };
         let meta = FlowMeta {
             id: admitted.id,
             remote: flow.remote,
@@ -324,9 +339,11 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
     let mut classifier = UdpClassifier::new();
     let mut held: Vec<Vec<u8>> = Vec::new();
     let mut buf = vec![0u8; DATAGRAM];
+    let mut first_datagram_ms = None;
     let decided = loop {
         match tokio::time::timeout(UDP_IDLE, app.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
+                first_datagram_ms.get_or_insert_with(monotonic_ms);
                 held.push(buf[..n].to_vec());
                 if let Some(d) = classifier.push(&buf[..n]) {
                     break d;
@@ -338,9 +355,33 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
     let Ok(attributed) = attribution.await else { return };
     let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Udp, kind_of(&decided)) else { return };
     let id = admitted.id;
-    if ctx.decide(&admitted, &decided, &flow) == Action::Drop {
-        close_blocked(&ctx.book, &ctx.meters, id);
-        return drain_udp(&mut app, UDP_IDLE).await;
+    let action = ctx.decide(&admitted, &decided, &flow);
+    // Read only with the slot there, so off asks nothing new. A slot that comes up
+    // in between reads as an unknown app: relayed, which is the fail-open way.
+    let event = ctx.https.get().and_then(|_| lock(&ctx.book).snapshot_of(id));
+    let owner = admitted.owner.as_owner();
+    let who = Who {
+        remote: flow.remote,
+        exe: event.as_ref().and_then(|e| e.exe.as_deref()),
+        session: event.as_ref().and_then(|e| e.session),
+        may_decrypt: owner.may_decrypt(),
+        app_off: event.is_some() && ctx.filter.get().is_off(owner),
+        names_now_ms: monotonic_ms(),
+    };
+    match quic::path(action, &ctx.https, &decided, &who, id) {
+        UdpPath::Drop => {
+            close_blocked(&ctx.book, &ctx.meters, id);
+            return drain_udp(&mut app, UDP_IDLE).await;
+        }
+        UdpPath::Refuse(refusal) => {
+            quic::close_refused(&ctx.book, id);
+            if let (Some(pid), Some(host), Some(first)) = (event.as_ref().and_then(|e| e.pid), decided.domain.as_deref(), first_datagram_ms) {
+                ctx.meters.quic.refused(pid, host, first);
+            }
+            let reply = Reply { ends: (flow.local, flow.remote), refusal, sink: &*ctx.sink, meters: &ctx.meters.quic };
+            return quic::refuse(&mut app, &reply, &held, &mut buf, UDP_IDLE, || ctx.https.is_on()).await;
+        }
+        UdpPath::Relay => {}
     }
     let up = match ctx.egress.socket(flow.remote, true).and_then(|s| UdpSocket::from_std(s.into()).map_err(|e| e.to_string())) {
         Ok(u) => u,

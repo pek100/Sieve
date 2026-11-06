@@ -50,7 +50,7 @@ use crate::tls::active::Active;
 use crate::tls::intercept::{Interception, NoWatch, wanted};
 use crate::tls::upstream::{PlatformTrust, TRUST_TIMEOUT, Verifier};
 use crate::tls::verdict::VerdictCache;
-use crate::tun::device::{Tun, TunDevice};
+use crate::tun::device::{Tun, TunDevice, TunSink};
 #[cfg(not(feature = "relay-experiments"))]
 use crate::tun::MTU;
 use crate::tun::{TUN_V4, TUN_V6};
@@ -289,7 +289,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     };
 
     sync_https(engine, &egress);
-    let parts = RelayParts { tables: shared_tables, egress, dns, book: engine.book.clone(), names: engine.names.clone(), meters: engine.meters.clone(), filter: engine.filter.clone(), witness, nat, https: engine.https.clone() };
+    let parts = RelayParts { tables: shared_tables, egress, dns, book: engine.book.clone(), names: engine.names.clone(), meters: engine.meters.clone(), filter: engine.filter.clone(), witness, nat, https: engine.https.clone(), sink: Arc::new(TunSink::new(&tun.session, engine.meters.clone())) };
     #[cfg(not(feature = "relay-experiments"))]
     let relay = Arc::new(Relay::new(parts));
     #[cfg(feature = "relay-experiments")]
