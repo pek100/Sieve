@@ -16,8 +16,8 @@ const _asHTMLElement = (node) => {
 };
 const _compileRegEx = (regexText) => {
     const regexEnd = regexText.lastIndexOf('/');
-    const regexPattern = regexText.slice(1, regexEnd);
-    const regexArgs = regexText.slice(regexEnd + 1);
+    const regexPattern = regexEnd > 0 ? regexText.slice(1, regexEnd) : regexText.slice(1);
+    const regexArgs = regexEnd > 0 ? regexText.slice(regexEnd + 1) : '';
     const regex = new W.RegExp(regexPattern, regexArgs);
     return regex;
 };

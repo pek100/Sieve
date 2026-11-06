@@ -256,9 +256,11 @@ impl SplitHorizon {
     }
 }
 
-/// The most specific rule over a name, longest suffix first.
+/// The most specific rule over a name, longest suffix first. Between two equal
+/// suffixes one with a server wins, whatever the adapter order: a second adapter
+/// with only a link-local server must not refuse a name another one can answer.
 fn rule_for<'a>(labels: &[Vec<u8>], rules: &'a [SplitHorizon]) -> Option<&'a SplitHorizon> {
-    rules.iter().filter(|r| r.covers(labels)).max_by_key(|r| r.suffix.len())
+    rules.iter().filter(|r| r.covers(labels)).max_by_key(|r| (r.suffix.len(), r.server.is_some()))
 }
 
 /// Where a query goes, read from the wire and not from what the evidence parser
@@ -547,6 +549,13 @@ mod tests {
         assert_eq!(route_of("router.example", &split_rules(&scoped)), SplitRoute::Encrypted);
         scoped.adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap().dns.push(lan);
         assert_eq!(route_of("router.lan", &split_rules(&scoped)), SplitRoute::Lan(lan));
+
+        // Two adapters with one suffix: the one with a reachable server answers,
+        // in either order.
+        let lan_rule = SplitHorizon { suffix: "lan".to_string(), server: Some(lan) };
+        let no_server = SplitHorizon::unreachable("lan").unwrap();
+        assert_eq!(route_of("router.lan", &[lan_rule.clone(), no_server.clone()]), SplitRoute::Lan(lan));
+        assert_eq!(route_of("router.lan", &[no_server, lan_rule]), SplitRoute::Lan(lan));
 
         // A link-local server beside a public one: the suffix resolves publicly.
         let mut mixed = load(HOME);

@@ -31,6 +31,12 @@ function sieveRunProcedural(applier, filters) {
   // it put back, and a pass with nothing to do changes nothing.
   const applyStyle = (element, declared) => {
     const { style } = element;
+    // A shorthand holding var() has longhands that read empty, and setting those
+    // would remove them: such a declaration can only go on whole, as its text.
+    if ([...declared].some((name) => declared.getPropertyValue(name) === "")) {
+      if (!style.cssText.includes(declared.cssText)) style.cssText += declared.cssText;
+      return;
+    }
     for (const name of declared) {
       const value = declared.getPropertyValue(name);
       const priority = declared.getPropertyPriority(name);

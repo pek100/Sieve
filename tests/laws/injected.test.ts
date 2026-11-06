@@ -17,7 +17,7 @@ const PINNED_SHA256 = "85a6545f0138127eb86bd5a9ac1d5c852c3c74f34b75d9414c153b199
 /** Sieve's edits to the pinned file (engine/injected/README.md), as [ours, theirs]. */
 const PATCHES: [string, string][] = [
   [
-    "  const regexEnd = regexText.lastIndexOf('/')\n  const regexPattern = regexText.slice(1, regexEnd)\n  const regexArgs = regexText.slice(regexEnd + 1)\n",
+    "  const regexEnd = regexText.lastIndexOf('/')\n  const regexPattern = regexEnd > 0 ? regexText.slice(1, regexEnd) : regexText.slice(1)\n  const regexArgs = regexEnd > 0 ? regexText.slice(regexEnd + 1) : ''\n",
     "  const regexParts = regexText.split('/')\n  const regexPattern = regexParts[1]!\n  const regexArgs = regexParts[2]\n",
   ],
   [
@@ -180,6 +180,13 @@ describe("the bootstrap under jsdom", () => {
   it("a regex may hold an escaped slash", () => {
     document.body.innerHTML = `<div class="box" id="slashed">foo/bar</div><div class="box" id="plain">foo</div>`;
     run({ selector: [css(".box"), { type: "has-text", arg: "/foo\\/bar/" }] });
+    expect(hidden("slashed")).toBe(true);
+    expect(hidden("plain")).toBe(false);
+  });
+
+  it("a text that opens with a slash and never closes it is all pattern, not flags", () => {
+    document.body.innerHTML = `<div class="box" id="slashed">see /shorts here</div><div class="box" id="plain">other</div>`;
+    run({ selector: [css(".box"), { type: "has-text", arg: "/shorts" }] });
     expect(hidden("slashed")).toBe(true);
     expect(hidden("plain")).toBe(false);
   });
