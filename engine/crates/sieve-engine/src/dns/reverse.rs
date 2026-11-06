@@ -77,7 +77,7 @@ pub fn private_address(name: &str) -> Option<IpAddr> {
 /// from the wire as `upstream::split_route` reads suffixes: a query's destination
 /// must not depend on what `dns::parse` accepts. A raw label holding a dot reads as
 /// two labels, which can only err towards private. None for a query that cannot be
-/// walked: nothing says it holds such a name.
+/// walked, which `upstream::split_route` has already refused.
 pub fn private_question(query: &[u8]) -> Option<IpAddr> {
     question_names(query)?.iter().find_map(|labels| {
         let name: Vec<String> = labels.iter().map(|label| String::from_utf8_lossy(label).to_ascii_lowercase()).collect();

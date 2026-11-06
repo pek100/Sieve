@@ -20,7 +20,7 @@
 //! (plan 5.3). The library's source location then gives the list directly.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use adblock::Engine;
@@ -162,8 +162,13 @@ pub struct RuleEngine {
     strips: Vec<Strips>,
 }
 
-/// One list's `$removeparam` lines, by the parameter each names.
+/// One list's `$removeparam` lines, by the parameter each names, without those a
+/// `$badfilter` in any list cancelled: such a line removes nothing in the engine, and
+/// alone in its own it would still claim to.
 type Strips = HashMap<String, Vec<String>>;
+
+/// A `$removeparam` line as a list wrote it: the parameter, the filter's id, the line.
+type StripLine = (String, u64, String);
 
 /// Lines asked per rewritten request to say who removed a parameter, each a small
 /// engine of its own. Past this the row names nothing: evidence, not the removal,
@@ -203,12 +208,12 @@ fn rule_lines(text: &str) -> impl Iterator<Item = &str> {
 /// A compiled list's derived network lines: half to the line that says it.
 type NetworkHalves = Vec<(String, String)>;
 
-fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, ScriptletUse, NetworkHalves, Strips) {
+fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder, cancelled: &mut HashSet<u64>) -> (ListReport, ScriptletUse, NetworkHalves, Vec<StripLine>) {
     let opts = options(list.trusted);
     let mut r = ListReport { id: list.id.to_string(), ..ListReport::default() };
     let mut scriptlets = ScriptletUse::new();
     let mut halves = NetworkHalves::new();
-    let mut strips = Strips::new();
+    let mut strips = Vec::new();
     for line in rule_lines(list.text) {
         // A skipped exception is a defect (plan 5.2): the parser refuses these
         // options, so a line it can answer through `page_exception` is applied.
@@ -225,8 +230,10 @@ fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, S
                 match &parsed {
                     ParsedLine::Network(filter) => {
                         r.network += 1;
-                        if let Some(key) = filter.modifier_option.filter(|_| filter.is_removeparam()) {
-                            strips.entry(key.to_string()).or_default().push(line.to_string());
+                        if filter.is_badfilter() {
+                            cancelled.insert(filter.get_id());
+                        } else if let Some(key) = filter.modifier_option.filter(|_| filter.is_removeparam()) {
+                            strips.push((key.to_string(), filter.get_id(), line.to_string()));
                         }
                     }
                     ParsedLine::Cosmetic(_) => r.cosmetic += 1,
@@ -249,6 +256,14 @@ fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder) -> (ListReport, S
         }
     }
     (r, scriptlets, halves, strips)
+}
+
+fn live_strips(lines: Vec<StripLine>, cancelled: &HashSet<u64>) -> Strips {
+    let mut strips = Strips::new();
+    for (key, _, line) in lines.into_iter().filter(|(_, id, _)| !cancelled.contains(id)) {
+        strips.entry(key).or_default().push(line);
+    }
+    strips
 }
 
 /// True when `text` holds at least one rule the parser accepts: a response
@@ -292,10 +307,11 @@ impl RuleEngine {
         let mut reports = Vec::with_capacity(lists.len());
         let mut scriptlets = Vec::with_capacity(lists.len());
         let mut written = HashMap::new();
-        let mut strips = Vec::with_capacity(lists.len());
+        let mut strip_lines = Vec::with_capacity(lists.len());
+        let mut cancelled = HashSet::new();
         for (index, list) in lists.iter().enumerate() {
-            let (report, uses, halves, list_strips) = report(list, &mut cosmetic);
-            strips.push(list_strips);
+            let (report, uses, halves, list_strips) = report(list, &mut cosmetic, &mut cancelled);
+            strip_lines.push(list_strips);
             let mut text = list.text.to_string();
             for (half, line) in halves {
                 text.push('\n');
@@ -306,6 +322,7 @@ impl RuleEngine {
             reports.push(report);
             scriptlets.push(uses);
         }
+        let strips = strip_lines.into_iter().map(|lines| live_strips(lines, &cancelled)).collect();
         Self { engine: Engine::new_with_filter_set_no_optimize(set), reports, cosmetic: cosmetic.build(), scriptlets, written, strips }
     }
 
@@ -680,6 +697,37 @@ example.invalid##+js(set-constant, adsAllowed, true)
         assert_eq!(credit(&e), want("||site.example^$removeparam=utm_source", "strip"), "not the first line naming the parameter");
         let e = lists(&[("first", "$removeparam=utm_source\n"), ("second", "||site.example^$removeparam=utm_source\n")]);
         assert_eq!(credit(&e), want("$removeparam=utm_source", "first"), "list order, as the matcher reads them");
+    }
+
+    #[test]
+    fn a_line_a_badfilter_cancelled_takes_no_credit() {
+        const CANCELLED: &str = "||site.example^$removeparam=a";
+        const CANCELS: &str = "||site.example^$removeparam=a,badfilter";
+        const OTHER: &str = "||site.example^$removeparam=b";
+        const URL: &str = "https://site.example/p?a=1&b=2";
+        let credit = |e: &RuleEngine| {
+            let d = e.check_request(&query(URL, "", "document"));
+            assert_eq!(d.rewritten.as_deref(), Some("https://site.example/p?a=1"), "what the engine did");
+            (d.rule, d.list)
+        };
+        let want = (Some(OTHER.to_string()), Some("b".to_string()));
+        let same_list: &'static str = Box::leak(format!("{CANCELLED}\n{CANCELS}\n").into_boxed_str());
+        let other_list: &'static str = Box::leak(format!("{OTHER}\n").into_boxed_str());
+        assert_eq!(credit(&lists(&[("a", same_list), ("b", other_list)])), want, "cancelled in its own list");
+        let cancelled_only: &'static str = Box::leak(format!("{CANCELLED}\n").into_boxed_str());
+        let cancels_later: &'static str = Box::leak(format!("{OTHER}\n{CANCELS}\n").into_boxed_str());
+        assert_eq!(credit(&lists(&[("a", cancelled_only), ("b", cancels_later)])), want, "cancelled from a later list");
+        let cancels_only: &'static str = Box::leak(format!("{CANCELS}\n").into_boxed_str());
+        let nothing_left = lists(&[("a", cancelled_only), ("z", cancels_only)]).check_request(&query(URL, "", "document"));
+        assert_eq!((nothing_left.rewritten, nothing_left.rule, nothing_left.list), (None, None, None), "the cancelled line and its cancel, and no strip");
+    }
+
+    #[test]
+    fn a_cancelled_line_does_not_use_up_the_lines_asked() {
+        let cancelled: String = (0..MAX_STRIP_LINES_ASKED).map(|n| format!("||h{n}.example^$removeparam=utm_source\n||h{n}.example^$removeparam=utm_source,badfilter\n")).collect();
+        let text: &'static str = Box::leak(format!("{cancelled}||site.example^$removeparam=utm_source\n").into_boxed_str());
+        let d = lists(&[("many", text)]).check_request(&query(STRIPPABLE, "", "document"));
+        assert_eq!((d.rule.as_deref(), d.list.as_deref()), (Some("||site.example^$removeparam=utm_source"), Some("many")));
     }
 
     #[test]

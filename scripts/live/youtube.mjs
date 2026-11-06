@@ -51,10 +51,25 @@ const PLAYER_STATE = `(() => {
 })()`;
 // Ads a person can see. A rule's display:none and a blocked fetch's empty slot leave the
 // node in the DOM. Its children are measured too: a display:contents wrapper has no box.
-export const HOME_ADS = `[...document.querySelectorAll("ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, #masthead-ad, ytd-banner-promo-renderer")].filter((ad) => [ad, ...ad.querySelectorAll("*")].some((el) => {
-  const box = el.getBoundingClientRect();
-  return box.width > 0 && box.height > 0 && getComputedStyle(el).visibility === "visible";
-})).length`;
+// Also hidden: no opacity, clipped by a parent collapsed to nothing, or wholly above or
+// left of the page, where no scroll reaches. Any other way stays counted, so a doubt here
+// fails a run and never passes one: an out-of-flow box may escape its parent's clip, so
+// it counts, and a box past the page's right or bottom end can be scrolled to.
+export const HOME_ADS = `(() => {
+  const clippedAway = (el) => {
+    for (let at = el; at.parentElement && !["absolute", "fixed"].includes(getComputedStyle(at).position); at = at.parentElement) {
+      const style = getComputedStyle(at.parentElement);
+      const box = at.parentElement.getBoundingClientRect();
+      if (style.display !== "contents" && ((box.height === 0 && style.overflowY !== "visible") || (box.width === 0 && style.overflowX !== "visible"))) return true;
+    }
+    return false;
+  };
+  const shown = (el) => {
+    const box = el.getBoundingClientRect();
+    return box.width > 0 && box.height > 0 && box.right + scrollX > 0 && box.bottom + scrollY > 0 && el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) && !clippedAway(el);
+  };
+  return [...document.querySelectorAll("ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, #masthead-ad, ytd-banner-promo-renderer")].filter((ad) => [ad, ...ad.querySelectorAll("*")].some(shown)).length;
+})()`;
 const SEEK = `(() => { const v = document.querySelector("video"); const before = v.currentTime; v.currentTime = before + ${SEEK_BY_S}; return before; })()`;
 const CURRENT_TIME = `document.querySelector("video").currentTime`;
 const SET_QUALITY = `(() => { const p = document.querySelector("#movie_player"); p.setPlaybackQualityRange("${LOWER_QUALITY}"); return true; })()`;
@@ -93,8 +108,9 @@ export function videoVerdict(samples) {
   if (samples.some((s) => s.enforcement)) return { verdict: "fail", reason: "an enforcement message showed" };
   if (times.length === 0 || Math.max(...times) === 0) return { verdict: "unplayed", reason: "no playback seen" };
   if (Math.max(...times) - Math.min(...times) < MIN_ADVANCE_S) return { verdict: "fail", reason: "currentTime stuck" };
-  // A page slow to start is not a stall, so the intervals count from the first rise.
-  const playing = times.slice(times.findIndex((t) => t !== times[0]) - 1);
+  // A page slow to start sits at 0, and that is not a stall, so the intervals count from
+  // its last 0. A first sample past 0 has been playing: a flat run from there is a freeze.
+  const playing = times.slice(Math.max(0, times.findIndex((t) => t > 0) - 1));
   const rose = playing.slice(1).filter((t, i) => t > playing[i]).length;
   if (rose < (playing.length - 1) * MIN_ADVANCING_SHARE) return { verdict: "fail", reason: "currentTime stuck" };
   return { verdict: "pass", reason: "advancing and clean" };

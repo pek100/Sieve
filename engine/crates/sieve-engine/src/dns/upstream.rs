@@ -282,13 +282,11 @@ fn rule_for<'a>(labels: &[Vec<u8>], rules: &'a [SplitHorizon]) -> Option<&'a Spl
 /// accepts. A query with no name under a suffix goes encrypted, including when
 /// every encrypted upstream is unavailable. One whose names all have the same
 /// LAN server goes there. Anything that might carry a LAN name and has no one
-/// server for it is refused: the public upstream would publish that name. With
-/// no rules at all there is no suffix to protect, and a query goes encrypted here,
-/// opaque; private reverse names are [`path_of`]'s.
+/// server for it is refused: the public upstream would publish that name. That
+/// includes a question section that cannot be walked, with or without rules: part
+/// of it may be a private reverse name, which is a LAN name with no suffix rule
+/// (the rest of those are [`path_of`]'s).
 pub fn split_route(query: &[u8], rules: &[SplitHorizon]) -> Path {
-    if rules.is_empty() {
-        return Path::Encrypted;
-    }
     let Some(names) = question_names(query) else { return Path::Refused };
     let mut matched = names.iter().map(|labels| rule_for(labels, rules));
     let Some(first) = matched.next() else { return Path::Encrypted };
@@ -537,7 +535,33 @@ mod tests {
         let mut cut = wire_query(&[under]);
         cut.truncate(cut.len() - 6);
         assert_eq!(split_route(&cut, &rules), Path::Refused, "it cannot be walked");
-        assert_eq!(split_route(&cut, &[]), Path::Encrypted, "with no rule there is no LAN name");
+        assert_eq!(split_route(&cut, &[]), Path::Refused, "with no rule it may still be a private reverse name");
+        assert_eq!(split_route(&wire_query(&[elsewhere]), &[]), Path::Encrypted, "the control: a query that can be walked");
+    }
+
+    #[test]
+    fn a_query_that_cannot_be_walked_never_reaches_the_public_upstream() {
+        use crate::route::table::fixtures::*;
+        const PRIVATE: &[&[u8]] = &[b"7", b"168", b"192", b"in-addr", b"arpa"];
+        const PUBLIC: &[&[u8]] = &[b"www", b"example"];
+        const QTYPE_AND_QCLASS: usize = 4;
+        let tables = load(HOME);
+        assert!(split_rules(&tables).is_empty(), "no suffix rule is what opened this");
+        assert_eq!(path_of(&wire_query(&[PRIVATE]), &tables), Path::Lan("192.168.7.1".parse().unwrap()), "the control: whole");
+        assert_eq!(path_of(&wire_query(&[PUBLIC]), &tables), Path::Encrypted, "the control: whole and public");
+
+        let mut no_type = wire_query(&[PRIVATE]);
+        no_type.truncate(no_type.len() - QTYPE_AND_QCLASS);
+        assert_eq!(path_of(&no_type, &tables), Path::Refused, "a whole private name, its type cut off");
+        let mut second_cut = wire_query(&[PRIVATE, PUBLIC]);
+        second_cut.truncate(second_cut.len() - 1);
+        assert_eq!(path_of(&second_cut, &tables), Path::Refused, "a good private question, then a cut one");
+        let mut name_cut = wire_query(&[PRIVATE]);
+        name_cut.truncate(name_cut.len() - QTYPE_AND_QCLASS - 1);
+        assert_eq!(path_of(&name_cut, &tables), Path::Refused, "a name with no end");
+        let mut public_cut = wire_query(&[PUBLIC]);
+        public_cut.truncate(public_cut.len() - 1);
+        assert_eq!(path_of(&public_cut, &tables), Path::Refused, "nothing says what a cut query holds");
     }
 
     fn with_suffix(tables: &mut NetTables, alias: &str, suffix: &str) {

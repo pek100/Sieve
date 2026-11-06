@@ -476,8 +476,8 @@ mod tests {
         assert_eq!((s.etag, s.fetched_at_ms, s.refresh), (old.etag, old.fetched_at_ms, old.refresh), "the state describes the copy on disk");
         assert_eq!(s.failed_at_ms, Some(at));
         assert!(s.last_error.is_some());
-        let saved = std::fs::read_to_string(dir.path().join(cache::FOLDER).join(format!("{LIST_A}.json"))).unwrap();
-        assert!(saved.contains("v1") && !saved.contains("v2"), "{saved}");
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(cache::FOLDER).join(format!("{LIST_A}.json"))).unwrap()).unwrap();
+        assert_eq!(saved["etag"], "\"v1\"", "the file too: {saved}");
     }
 
     #[tokio::test]
