@@ -18,9 +18,9 @@ Replace `<ech name>` with a name you know publishes ECH today, and `<router ip>`
 
 | # | Do | Pass |
 |---|---|---|
-| 1 | With `filtering.https` off: `Resolve-DnsName <ech name> -Type HTTPS`. | The answer shows `ech`. `ech_stripped` stays; `ech_left` rises. |
-| 2 | After the check of `docs/live/engine-slice-6.md` passed, with `filtering.https` on: the same query. Then load the name in Chrome and Edge with Secure DNS off. | No `ech` in the answer. `ech_stripped` rises. The page shows Sieve's issuer. |
-| 3 | With `filtering.https` on, the same query for a name under a restricted suffix or in your "not decrypted" list. | `ech` is still there (`ech_left` rises). |
+| 1 | With `filtering.https` off: `powershell -ExecutionPolicy Bypass -File scripts\live\https-record.ps1 <ech name>`. `Resolve-DnsName` refuses `-Type HTTPS` and `nslookup` does not know type 65. The script sends a plain question to this machine's DNS server, not through the DNS Client: row 4 covers what browsers send. | It says `ech: yes`. `ech_stripped` stays; `ech_left` rises. |
+| 2 | After the check of `docs/live/engine-slice-6.md` passed, with `filtering.https` on: the same query. Then load the name in Chrome and Edge with Secure DNS off. | It says `ech: no`. `ech_stripped` rises. The page shows Sieve's issuer. |
+| 3 | With `filtering.https` on, the same query for a name under a restricted suffix or in your "not decrypted" list. | It says `ech: yes` (`ech_left` rises). |
 | 4 | Which clients ask where: with Secure DNS off, the port 53 capture of `encrypted-dns.md` while Chrome and Edge load a page. In Firefox, the same. | Say what you saw: do Chrome's and Edge's HTTPS queries reach port 53 on the TUN? Does Firefox ask the OS for HTTPS records at all? Does the DNS Client set DO? A DO query keeps its `ech` by design, so if it does set DO, nothing is ever stripped and the design has to change. |
 | 5 | Address hints: browse with Chrome for a while, then read the log for `floor:ech`. | How often a flow connects from an `ipv4hint` or `ipv6hint` with no A query (it reads as "not resolved here" and passes through). Safe; the share is the fact wanted. |
 | 6 | `Resolve-DnsName use-application-dns.net`. | NXDOMAIN; `canary` rises. |

@@ -220,7 +220,8 @@ switch ($Step) {
     if ((Get-Process sieve -ErrorAction SilentlyContinue)) { throw "Close the Sieve app first: it sends https false whenever it runs." }
     Write-PolicyWith { param($policy) New-InterceptionPolicyJson $policy }
     if (-not (Wait-Until { $r = Read-Record; $r -and $r.active })) { throw "The engine recorded no active root within $WaitSeconds s. See $EngineDir." }
-    $up = Wait-Until { $s = Read-Status; $s -and $s.routes_up -and $s.policy.https -and $s.policy.sieving }
+    $want = Get-PolicyRevision (Get-Content -Raw -Encoding UTF8 $PolicyFile)
+    $up = Wait-Until { Test-InterceptionUp (Read-Status) $want }
     $status = Read-Status
     Check "the engine holds interception on with routes up" $up "routes_up: $($status.routes_up), blocker: $($status.blocker | ConvertTo-Json -Compress), intercepted: $($status.https.intercepted)"
     Write-Host "Next: step 0 of docs/live/engine-slice-6.md. Nothing else there counts until https.intercepted grows."

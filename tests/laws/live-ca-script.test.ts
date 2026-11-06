@@ -49,13 +49,54 @@ describe("the slice 6 route", () => {
     expect(written).toEqual({ ...OFF, revision: 8, https: true, engine: true, sieving: true });
   });
 
+  it("believes only a status of this run", () => {
+    const up = (status: string, revision: number) => powershell(`Test-InterceptionUp ('${status}' | ConvertFrom-Json) ${revision}`) === "True";
+    const status = (revision: number, routes = true) => JSON.stringify({ routes_up: routes, policy: { revision, https: true, sieving: true } });
+    expect(up(status(8), 8)).toBe(true);
+    expect(up(status(7), 8), "the last run's file, routes up").toBe(false);
+    expect(up(status(8, false), 8), "this run, no routes").toBe(false);
+    expect(powershell("Test-InterceptionUp $null 8"), "no file").toBe("False");
+    expect(powershell(`Get-PolicyRevision '${JSON.stringify({ revision: 8 })}'`)).toBe("8");
+  });
+
   it("is what the script's own step writes, and what the runbook names", () => {
     const script = read("scripts/live/engine-ca.ps1");
     expect(script).toContain('"intercept" {');
     expect(script).toContain("New-InterceptionPolicyJson $policy");
+    expect(script).toContain("Test-InterceptionUp (Read-Status) $want");
     const runbook = read("docs/live/engine-slice-6.md");
     expect(runbook).toContain("-Step intercept");
     expect(runbook).toContain("https.intercepted");
+  });
+});
+
+describe("the HTTPS record tool", () => {
+  const HTTPS_CHECKS = "scripts/live/https-record-checks.ps1";
+  const run = (body: string) => execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; . '${HTTPS_CHECKS}'; ${body}`], { cwd: ROOT, encoding: "utf8" }).trim();
+  const NAME = [1, 97, 7, 101, 120, 97, 109, 112, 108, 101, 0];
+  const QUESTION = [...NAME, 0, 65, 0, 1];
+  /** A reply to `QUESTION` with one record per rdata; its owner is a pointer back to the question. */
+  const reply = (records: number[][]) => {
+    const answers = records.flatMap((rdata) => [0xc0, 0x0c, 0, 65, 0, 1, 0, 0, 1, 44, 0, rdata.length, ...rdata]);
+    return [0, 7, 0x81, 0x80, 0, 1, 0, records.length, 0, 0, 0, 0, ...QUESTION, ...answers];
+  };
+  const read = (bytes: number[]) => JSON.parse(run(`@(Read-HttpsAnswers ([byte[]](${bytes.join(",")}))) | ConvertTo-Json -Compress -Depth 3`) || "[]");
+
+  it("asks type 65, class IN, with no EDNS", () => {
+    const asked = JSON.parse(run(`(New-HttpsQuery 'a.example.' 7) -join ','  | ForEach-Object { '[' + $_ + ']' }`));
+    expect(asked).toEqual([0, 7, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, ...QUESTION]);
+  });
+
+  it("tells an answer with ech from one without", () => {
+    const ALPN = [0, 1, 0, 3, 2, 104, 50];
+    const ECH = [0, 5, 0, 3, 0xaa, 0xbb, 0xcc];
+    expect(read(reply([[0, 1, 0, ...ALPN, ...ECH]]))).toEqual({ Priority: 1, Keys: [1, 5], Ech: true });
+    expect(read(reply([[0, 2, 0, ...ALPN]]))).toEqual({ Priority: 2, Keys: [1], Ech: false });
+  });
+
+  it("reads past a target name, and finds no record in an empty answer", () => {
+    expect(read(reply([[0, 1, 1, 98, 0, 0, 5, 0, 1, 9]]))).toEqual({ Priority: 1, Keys: [5], Ech: true });
+    expect(read(reply([]))).toEqual([]);
   });
 });
 

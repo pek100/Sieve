@@ -22,6 +22,19 @@ function New-InterceptionPolicyJson($policy) {
   return New-HttpsPolicyJson $policy $true
 }
 
+# The revision of the policy file as just written.
+function Get-PolicyRevision([string]$json) {
+  return [int64]($json | ConvertFrom-Json).revision
+}
+
+# True only for a status of this run: a run that ended uncleanly leaves its file, and a
+# new service reports Running before it writes one, so routes and switches alone can be
+# the last run's. A policy file the engine refused loads at another revision and fails too.
+function Test-InterceptionUp($status, [int64]$revision) {
+  if ($null -eq $status) { return $false }
+  return [bool]($status.routes_up -and $status.policy.https -and $status.policy.sieving -and [int64]$status.policy.revision -eq $revision)
+}
+
 # What certutil's answer about the key says: "refused", "missing", "readable" or "error".
 function Get-KeyAnswer([string]$text, [int]$exitCode) {
   if ($exitCode -eq 0) { return "readable" }

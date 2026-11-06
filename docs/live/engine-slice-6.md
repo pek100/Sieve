@@ -33,6 +33,7 @@ Pass when `https.intercepted` grew. If it did not, stop and read `routes_up`, `b
 | U12 | Kill, reboot and uninstall tests of `docs/conventions.md` section 0, with interception on. | After a kill: connections reset, the network works within 5 s, every listing matches the before-listing. |
 | U13 | A site using WebSockets over HTTP/2 in Chrome and Firefox. | It falls back to HTTP/1.1 for the WebSocket and works (task D12). |
 | U14 | Check the app talks to the engine as before, and 7.3 holds. | IPC and the pipe are unchanged. |
+| U15 | With a browser holding an intercepted connection (Sieve's issuer), turn that browser's row Off in the app with the engine running, then reload. | The reload shows the real issuer and the log row reads `app_off`. This one cannot be driven from the script: a row only turns Off through `SetPolicy`, the pipe admits only `sieve.exe`, and today's app sends `https: false` whenever it runs, while a restart would end the connection anyway and prove nothing. So it waits for the first build with the switch available. Offline tests cover the engine's path from `SetPolicy` to the closed flow; how a real browser reconnects is what is left to see. |
 
 ## Reading a result
 
