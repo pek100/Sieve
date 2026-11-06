@@ -1420,6 +1420,25 @@ arms!(no_alpn_non_http_is_copied_between_the_two_sessions, |arm| async move {
     task.await.unwrap();
 });
 
+/// Bytes that only look like the start of a request are the copy's, after the wait
+/// that silence no longer gets: a client may be waiting for the server.
+#[tokio::test(start_paused = true)]
+async fn no_alpn_bytes_that_stop_inside_a_request_are_copied_after_the_wait() {
+    let pki = Pki::new("Test Public Root");
+    let (dial, _) = echo_dial(Arm::Duplex, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let rig = Rig::new(dial, RigOpts::new(pki.roots()));
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, _) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    tls.write_all(b"GE").await.unwrap();
+    tls.flush().await.unwrap();
+    let mut back = [0u8; 2];
+    tokio::time::timeout(super::intercept::FIRST_BYTES_WAIT * 2, tls.read_exact(&mut back)).await.expect("not held for ever").unwrap();
+    assert_eq!(&back, b"GE");
+    drop(tls);
+    task.await.unwrap();
+}
+
 arms!(leaf_names_only_the_sni_and_chains_to_the_minter_root, |arm| async move {
     let pki = Pki::new("Test Public Root");
     let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
@@ -1710,7 +1729,8 @@ async fn grease_ech_with_a_resolved_sni_intercepts_and_unresolved_passes() {
     let hello = || {
         let groups = (0x000a_u16, vec![0, 2, 0, 0x1d]);
         let versions = (0x002b_u16, vec![2, 3, 4]);
-        build::records(&build::handshake(&[build::sni_ext(HOST), build::ech_ext(), groups, versions]), 1 << 14)
+        let schemes = (0x000d_u16, vec![0, 2, 4, 3]);
+        build::records(&build::handshake(&[build::sni_ext(HOST), build::ech_ext(), groups, versions, schemes]), 1 << 14)
     };
     for resolved in [false, true] {
         let rig = Rig::new(TestDial::new(Arm::Duplex, raw(|_, stream| echo(stream))), RigOpts::new(pki.roots()));
@@ -1992,6 +2012,10 @@ arms!(an_alert_right_after_the_handshake_is_strong_evidence, |arm| async move {
         let (rig, heal, upstream_leaf) = healing_rig(arm, alpn);
         alert_after_handshake(&rig, alpn, rustls::AlertDescription::BadCertificate).await;
         assert_eq!(heal.notices(0).1.len(), 1, "{alpn:?}: one alert excludes");
+        // What a client sends after a real ECH was taken for GREASE (task D9).
+        let (ech_rig, ech_heal, _) = healing_rig(arm, alpn);
+        alert_after_handshake(&ech_rig, alpn, rustls::AlertDescription::EncryptedClientHelloRequired).await;
+        assert_eq!(ech_heal.notices(0).1.len(), 1, "{alpn:?}: ech_required excludes");
         // No ALPN in this client: its retry just passes through.
         passes_untouched(&rig, &upstream_leaf).await;
         // The control: another alert is one failed attempt, not an exclusion.

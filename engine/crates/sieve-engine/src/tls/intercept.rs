@@ -33,7 +33,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::active::{Active, Registered};
 use super::ech::{EchCache, usable_config};
-use super::first_bytes::{First, read_first};
+use super::first_bytes::{First, Waits, read_first};
 use super::server::{server_config, speaks_to};
 use super::splice::{AppSide, Prefixed, splice};
 use super::upstream::{HandshakeEnd, Handshaken, LeafFacts, Verifier, alert_in, filter_alpn, handshake, is_post_handshake_auth, leaf_facts, rustls_error};
@@ -52,6 +52,11 @@ use crate::stack::book::FlowBook;
 
 /// A flow that sends nothing this long is decided without a name.
 pub const FIRST_BYTES_WAIT: Duration = Duration::from_secs(5);
+/// A decrypted session with no ALPN waits for its first byte this long, which is
+/// to say for it: silence is no verdict on what it will speak, and giving up would
+/// copy its later requests past the filter (plan 2.8). It holds nothing the copy
+/// would not: `tls::splice` has no idle deadline, and `must_end` closes either.
+const NO_ALPN_WAITS: Waits = Waits { silence: Duration::from_secs(365 * 86_400), partial: FIRST_BYTES_WAIT };
 /// How long a client may take over the local handshake.
 pub const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -240,10 +245,13 @@ impl<C: Dial> Interception<C> {
     /// the only difference between TCP and QUIC is `transport`.
     pub(crate) fn facts_for<'a>(&self, transport: Transport, decoded: &'a Decoded, who: &Who<'a>) -> FlowFacts<'a> {
         let host = decoded.domain.as_deref();
-        // Task D9: the engine's own DNS answered this SNI for this address, so the
-        // app resolved the SNI itself and the extension is GREASE. A wrong "GREASE"
-        // cannot leak: the client reads our answer as ECH rejected, authenticates
-        // the public name and retries without ECH under a normal decision.
+        // Task D9: the engine's own DNS answered this SNI for this address, so some
+        // asker resolved it, and the extension is taken for GREASE. The map is shared
+        // by every app and resolver, so that is a bet. A wrong one does not open the
+        // inner hello: the client reads our answer as ECH rejected and authenticates
+        // the public name. It costs one attempt and the privacy of the retry, whose
+        // plain SNI is the hidden name. Its `ech_required` alert excludes (app, public
+        // name) at once (`heal::dials::FATAL_ALERTS`), so a pair pays this once.
         let ech = decoded.ech && !host.is_some_and(|h| lock(&self.names).names(who.remote.ip(), who.names_now_ms).contains(&h));
         FlowFacts {
             transport,
@@ -366,7 +374,7 @@ where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     C: Dial,
 {
-    let (decoded, held) = match read_first(&mut app, &mut upstream, FIRST_BYTES_WAIT).await {
+    let (decoded, held) = match read_first(&mut app, &mut upstream, Waits::both(FIRST_BYTES_WAIT)).await {
         First::ClientGone { .. } => return FlowAction::Relayed,
         First::ServerSpoke { server, held } => return server_first(app, upstream, server, held, flow).await,
         First::Decoded { decoded, held } => (decoded, held),
@@ -547,9 +555,10 @@ where
 }
 
 /// Which protocol the pair of sessions speaks: what the server chose. With no
-/// ALPN at all, HTTP/1.1 only if the first decrypted bytes parse as HTTP; else
-/// the two sessions are copied as plain bytes (plan 2.8), and a copy cannot say
-/// which side ended it, so it is no evidence about the client.
+/// ALPN at all, HTTP/1.1 only if the first decrypted bytes parse as HTTP; else,
+/// and only once there are bytes, the two sessions are copied as plain bytes (plan
+/// 2.8), and a copy cannot say which side ended it, so it is no evidence about the
+/// client.
 async fn run_protocol<C, U>(ctx: Arc<Serve>, mut client: C, mut upstream: U, alpn: Option<&[u8]>) -> Ended
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -559,7 +568,7 @@ where
         Some(H2) => serve(ctx, client, upstream, Proto::H2).await,
         Some(HTTP1) => serve(ctx, client, upstream, Proto::H1).await,
         Some(_) => Ended::without_error(false),
-        None => match read_first(&mut client, &mut upstream, FIRST_BYTES_WAIT).await {
+        None => match read_first(&mut client, &mut upstream, NO_ALPN_WAITS).await {
             First::ClientGone { alert } => Ended { client_alert: alert, ..Ended::without_error(true) },
             First::Decoded { decoded, held } if decoded.kind == Some(Kind::Http) && decoded.domain.is_some() => serve(ctx, Prefixed::new(held, client), upstream, Proto::H1).await,
             First::Decoded { held, .. } => {

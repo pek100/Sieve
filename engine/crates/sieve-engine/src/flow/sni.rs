@@ -36,6 +36,7 @@ const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_ALPN: u16 = 0x0010;
 const EXT_ECH: u16 = 0xfe0d;
 const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
+const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 
 /// What a ClientHello says about where it is going.
@@ -52,14 +53,16 @@ pub struct Hello {
     pub offer: TlsOffer,
 }
 
-/// A ClientHello's versions, cipher suites and key exchange groups, as their
-/// wire numbers (GREASE values included: they simply match nothing).
+/// A ClientHello's versions, cipher suites, key exchange groups and signature
+/// schemes, as their wire numbers (GREASE values included: they simply match
+/// nothing).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlsOffer {
     /// `supported_versions`, else the legacy version alone.
     pub versions: Vec<u16>,
     pub suites: Vec<u16>,
     pub groups: Vec<u16>,
+    pub schemes: Vec<u16>,
 }
 
 /// Parses the start of a client's TCP byte stream as TLS records carrying a
@@ -198,6 +201,7 @@ fn client_hello_body(body: &[u8]) -> Result<Hello, &'static str> {
             EXT_ECH => hello.ech = true,
             EXT_SUPPORTED_VERSIONS => hello.offer.versions = Reader::new(data).vec(1).map(wire_numbers).unwrap_or_default(),
             EXT_SUPPORTED_GROUPS => hello.offer.groups = Reader::new(data).vec(2).map(wire_numbers).unwrap_or_default(),
+            EXT_SIGNATURE_ALGORITHMS => hello.offer.schemes = Reader::new(data).vec(2).map(wire_numbers).unwrap_or_default(),
             _ => {}
         }
     }
@@ -430,8 +434,10 @@ mod tests {
     fn a_hello_says_what_it_offers() {
         let groups = (0x000a_u16, vec![0, 4, 0x11, 0xec, 0, 0x1d]);
         let versions = (0x002b_u16, vec![4, 3, 4, 3, 3]);
-        let hello = done(parse_handshake(&handshake(&[groups, versions])));
+        let schemes = (0x000d_u16, vec![0, 4, 4, 3, 8, 4]);
+        let hello = done(parse_handshake(&handshake(&[groups, versions, schemes])));
         assert_eq!(hello.offer.groups, [0x11ec, 0x001d]);
+        assert_eq!(hello.offer.schemes, [0x0403, 0x0804]);
         assert_eq!(hello.offer.versions, [0x0304, 0x0303], "supported_versions replaces the legacy version");
         assert_eq!(hello.offer.suites, [0x1301, 0x1302, 0x0a0a], "in order, GREASE included");
     }

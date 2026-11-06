@@ -394,6 +394,25 @@ arms!(no_alpn_http_gets_the_rules_too, |arm| async move {
     task.await.unwrap();
 });
 
+/// Silence is not bytes that failed to parse: the requests after it still meet the
+/// rules, and the log.
+#[tokio::test(start_paused = true)]
+async fn no_alpn_http_after_a_long_silence_gets_the_rules_too() {
+    let pki = Pki::new("Test Public Root");
+    let dial = origin_dial(Arm::Duplex, &pki, &[], Origin::default());
+    let rig = Rig::new(dial, RigOpts { rules: list_rules("||site.example/ads^\n"), ..RigOpts::new(pki.roots()) });
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (config, shown) = client_tls(&[], None);
+    let tls = connect(app, config, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert!(shown_is_sieves(&shown, &rig));
+    tokio::time::sleep(crate::tls::intercept::FIRST_BYTES_WAIT * 2).await;
+    let mut client = Client::start(tls).await;
+    assert_eq!(client.get(HOST, "/ads/1", &[]).await.status(), StatusCode::FORBIDDEN);
+    assert!(rows(&rig).iter().any(|row| row.outcome == LogOutcome::Blocked), "and it is in the log");
+    drop(client);
+    task.await.unwrap();
+}
+
 arms!(one_upstream_per_client_connection, |arm| async move {
     for alpn in BOTH {
         let mut s = setup(arm, alpn, "").await;
@@ -737,7 +756,12 @@ arms!(removeparam_rewrites_a_subresource_upstream, |arm| async move {
         let status = s.client.get(HOST, "/api?utm_source=x&id=1", &[("sec-fetch-dest", "empty"), ("referer", "https://site.example/")]).await.status();
         assert_eq!(status, StatusCode::OK, "{alpn}");
         assert_eq!(s.origin.paths(), ["/api?id=1"], "{alpn}");
-        assert!(rows(&s.rig).iter().any(|r| r.outcome == LogOutcome::ParamsRemoved));
+        let log = rows(&s.rig);
+        let row = log.iter().find(|r| r.outcome == LogOutcome::ParamsRemoved).expect("a row");
+        assert_eq!(row.list.as_deref(), Some("fixture"), "{alpn}: the list that removed it");
+        assert!(row.rule.as_deref().is_some_and(|rule| rule.contains("removeparam")), "{alpn}");
+        let hits = s.rig.deps.book.lock().unwrap().list_hits().get("fixture").copied();
+        assert_eq!(hits, Some(1), "{alpn}: and it counts as that list's");
         drop(s.client);
         s.task.await.unwrap();
     }

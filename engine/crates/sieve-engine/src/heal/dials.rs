@@ -20,14 +20,17 @@ pub const EXCLUDE_AT: f64 = 1.5;
 /// 4 quick closes instead of 2. Bounded, so a client that starts pinning after an
 /// update still heals, and fatal alerts ignore it (task F4, Q2, U5).
 pub const MAX_CREDIT: f64 = 2.0;
-/// One of these from the client excludes the pair at once (plan 4.3).
-pub const FATAL_ALERTS: [AlertDescription; 6] = [
+/// One of these from the client excludes the pair at once (plan 4.3). `ech_required`
+/// says the hello was real ECH that task D9 took for GREASE: the name is not one to
+/// decrypt, and each further attempt would cost the client its privacy again.
+pub const FATAL_ALERTS: [AlertDescription; 7] = [
     AlertDescription::BadCertificate,
     AlertDescription::UnsupportedCertificate,
     AlertDescription::CertificateUnknown,
     AlertDescription::UnknownCA,
     AlertDescription::DecryptError,
     AlertDescription::AccessDenied,
+    AlertDescription::EncryptedClientHelloRequired,
 ];
 /// Exclusions of one app this close to its group's first join that group: a fixed
 /// window, so a slow trickle cannot hold one group open for ever (plan 4.3).

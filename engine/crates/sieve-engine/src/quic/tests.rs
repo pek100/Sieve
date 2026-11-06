@@ -39,13 +39,14 @@ const IDLE: Duration = Duration::from_secs(30);
 const BUF: usize = 65_535;
 const DAY_MS: u64 = 86_400_000;
 const DCID: [u8; 8] = [9; 8];
-/// TLS 1.3, its first suite, X25519: what a browser's QUIC hello always offers.
+/// TLS 1.3, its first suite, X25519, ECDSA P-256: what a browser's QUIC hello always offers.
 const TLS13: u16 = 0x0304;
 const AES128_GCM_SHA256: u16 = 0x1301;
 const X25519: u16 = 0x001d;
+const ECDSA_P256: u16 = 0x0403;
 
 fn good_offer() -> TlsOffer {
-    TlsOffer { versions: vec![TLS13], suites: vec![AES128_GCM_SHA256], groups: vec![X25519] }
+    TlsOffer { versions: vec![TLS13], suites: vec![AES128_GCM_SHA256], groups: vec![X25519], schemes: vec![ECDSA_P256] }
 }
 
 fn h3(host: &str) -> Decoded {
@@ -260,7 +261,8 @@ fn a_cached_rejection_relays_and_a_cached_eligible_refuses() {
 fn tcp_hello() -> Vec<u8> {
     let groups = (0x000a_u16, vec![0, 2, 0, 0x1d]);
     let versions = (0x002b_u16, vec![2, 3, 4]);
-    build::records(&build::handshake(&[build::sni_ext(HOST), build::alpn_ext(&["h2"]), groups, versions]), 1 << 14)
+    let schemes = (0x000d_u16, vec![0, 2, 4, 3]);
+    build::records(&build::handshake(&[build::sni_ext(HOST), build::alpn_ext(&["h2"]), groups, versions, schemes]), 1 << 14)
 }
 
 /// Each verdict through the real TCP path: a first look that passes uses the
@@ -425,7 +427,7 @@ struct FlowRig {
     meters: Arc<QuicMeters>,
     on: Arc<AtomicBool>,
     app: tokio::io::DuplexStream,
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Vec<Vec<u8>>>,
 }
 
 fn spawn_flow(refusal: Refusal, held: Vec<Vec<u8>>) -> FlowRig {
@@ -436,7 +438,7 @@ fn spawn_flow(refusal: Refusal, held: Vec<Vec<u8>>) -> FlowRig {
         let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
         let reply = Reply { ends, refusal, sink: &*s, meters: &m };
         let mut buf = vec![0u8; BUF];
-        refuse(&mut stack, &reply, &held, &mut buf, IDLE, || o.load(Ordering::Relaxed)).await;
+        refuse(&mut stack, &reply, held, &mut buf, IDLE, || o.load(Ordering::Relaxed)).await
     });
     FlowRig { sink, meters, on, app, task }
 }
@@ -519,13 +521,13 @@ async fn an_app_turned_off_ends_its_refused_flow_and_no_other() {
     let (mut app, mut stack) = tokio::io::duplex(BUF);
     let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
     let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters };
-    let held = [vec![1u8; 200]];
+    let held = vec![vec![1u8; 200]];
     let mut buf = vec![0u8; BUF];
     let on = slot.clone();
-    let flow = refuse(&mut stack, &reply, &held, &mut buf, IDLE, move || on.refuses(BROWSER));
+    let flow = refuse(&mut stack, &reply, held, &mut buf, IDLE, move || on.refuses(BROWSER));
     tokio::pin!(flow);
     tokio::select! {
-        () = &mut flow => panic!("not Off: the flow goes on"),
+        _ = &mut flow => panic!("not Off: the flow goes on"),
         () = tokio::time::sleep(Duration::from_millis(1)) => {}
     }
     assert_eq!(sink.count(), 1);
@@ -536,9 +538,12 @@ async fn an_app_turned_off_ends_its_refused_flow_and_no_other() {
     assert!(!rig.deps.active.is_closed(), "the switch itself stayed on");
     app.write_all(&[2; 200]).await.unwrap();
     let started = tokio::time::Instant::now();
-    flow.await;
+    assert_eq!(flow.await, [vec![2u8; 200]], "that datagram is the new flow's, not lost");
     assert_eq!(tokio::time::Instant::now(), started, "ended on that datagram, not by idling");
     assert_eq!(sink.count(), 1, "and no reply went");
+    // What the new flow is told: relayed, for the reason the log gives.
+    let who = Who { remote: REMOTE.parse().unwrap(), exe: Some(CHROME), session: Some(1), may_decrypt: true, app_off: true, names_now_ms: 0 };
+    assert_eq!(path(Action::Pass, &slot, &h3(HOST), &who, rig.open_flow()), UdpPath::Relay);
 }
 
 #[tokio::test(start_paused = true)]
@@ -551,13 +556,13 @@ async fn the_switch_going_off_ends_a_refused_flow() {
     let (mut app, mut stack) = tokio::io::duplex(BUF);
     let ends = (LOCAL.parse().unwrap(), REMOTE.parse().unwrap());
     let reply = Reply { ends, refusal: Refusal::PortUnreachable, sink: &sink, meters: &meters };
-    let held = [vec![1u8; 200]];
+    let held = vec![vec![1u8; 200]];
     let mut buf = vec![0u8; BUF];
     let on = slot.clone();
-    let flow = refuse(&mut stack, &reply, &held, &mut buf, IDLE, move || on.refuses(BROWSER));
+    let flow = refuse(&mut stack, &reply, held, &mut buf, IDLE, move || on.refuses(BROWSER));
     tokio::pin!(flow);
     tokio::select! {
-        () = &mut flow => panic!("still on: the flow goes on"),
+        _ = &mut flow => panic!("still on: the flow goes on"),
         () = tokio::time::sleep(Duration::from_millis(1)) => {}
     }
     assert_eq!(sink.count(), 1);
@@ -566,7 +571,7 @@ async fn the_switch_going_off_ends_a_refused_flow() {
     assert!(rig.deps.active.is_closed(), "the closed set says so too (F9)");
     app.write_all(&[2; 200]).await.unwrap();
     let started = tokio::time::Instant::now();
-    flow.await;
+    assert_eq!(flow.await, [vec![2u8; 200]], "that datagram is the new flow's, not lost");
     assert_eq!(tokio::time::Instant::now(), started, "ended on that datagram, not by idling");
     assert_eq!(sink.count(), 1, "and no reply went");
 }
@@ -576,7 +581,7 @@ async fn a_switch_off_before_the_held_datagrams_answers_none() {
     let flow = spawn_flow(Refusal::PortUnreachable, vec![vec![1; 200]]);
     flow.on.store(false, Ordering::Relaxed);
     // The task has not run yet: it starts after the switch went off.
-    flow.task.await.unwrap();
+    assert_eq!(flow.task.await.unwrap(), [vec![1u8; 200]], "they go on to the new flow");
     assert_eq!(flow.sink.count(), 0);
     drop(flow.app);
 }
@@ -628,7 +633,8 @@ impl AsyncWrite for MemDevice {
 fn sealed_initials(host: &str) -> [Vec<u8>; 2] {
     let groups = (0x000a_u16, vec![0, 2, 0, 0x1d]);
     let versions = (0x002b_u16, vec![2, 3, 4]);
-    let hello = build::handshake(&[build::sni_ext(host), build::alpn_ext(&["h3"]), groups, versions, (0x0033, vec![1; 1300])]);
+    let schemes = (0x000d_u16, vec![0, 2, 4, 3]);
+    let hello = build::handshake(&[build::sni_ext(host), build::alpn_ext(&["h3"]), groups, versions, schemes, (0x0033, vec![1; 1300])]);
     let (first, second) = hello.split_at(800);
     let mut f1 = crypto_frame(0, first);
     f1.resize(1100, 0);
@@ -690,7 +696,7 @@ async fn through_the_stack(rig: &Rig, local: SocketAddr, remote: SocketAddr) -> 
     if let UdpPath::Refuse(refusal) = answer {
         let meters = QuicMeters::default();
         let reply = Reply { ends: (app.local_addr(), app.peer_addr()), refusal, sink: &sink, meters: &meters };
-        refuse(&mut app, &reply, &held, &mut buf, Duration::from_millis(50), || slot.refuses(BROWSER)).await;
+        assert!(refuse(&mut app, &reply, held, &mut buf, Duration::from_millis(50), || slot.refuses(BROWSER)).await.is_empty(), "it idled out");
     }
     StackRun { answer, sink, from_stack }
 }

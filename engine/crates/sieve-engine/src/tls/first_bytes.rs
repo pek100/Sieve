@@ -25,8 +25,24 @@ pub enum First {
     ClientGone { alert: Option<AlertDescription> },
 }
 
+/// How long [`read_first`] listens before deciding with what it holds.
+#[derive(Debug, Clone, Copy)]
+pub struct Waits {
+    /// For the first client byte.
+    pub silence: Duration,
+    /// For more, once some bytes the classifier cannot answer yet are held: a client
+    /// can stop inside what only looks like a request, and wait for the server.
+    pub partial: Duration,
+}
+
+impl Waits {
+    pub const fn both(wait: Duration) -> Self {
+        Self { silence: wait, partial: wait }
+    }
+}
+
 /// A read that fills `buf` from whichever side has bytes.
-pub async fn read_first<A, U>(app: &mut A, upstream: &mut U, wait: Duration) -> First
+pub async fn read_first<A, U>(app: &mut A, upstream: &mut U, waits: Waits) -> First
 where
     A: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
@@ -35,6 +51,7 @@ where
     let mut client = vec![0u8; CLASSIFIER_READ];
     let mut server = vec![0u8; CLASSIFIER_READ];
     loop {
+        let wait = if classifier.held().is_empty() { waits.silence } else { waits.partial };
         let read = async {
             tokio::select! {
                 n = app.read(&mut client) => (true, n),
@@ -69,7 +86,7 @@ mod tests {
     use crate::flow::classify::Kind;
     use crate::flow::sni::build;
 
-    const WAIT: Duration = Duration::from_secs(5);
+    const WAIT: Waits = Waits::both(Duration::from_secs(5));
 
     #[tokio::test]
     async fn a_hello_split_across_writes_is_held_whole_with_its_tail() {
@@ -110,6 +127,25 @@ mod tests {
             First::Decoded { decoded, held } => assert_eq!((decoded.failure, held.len()), (Some("no client bytes in time"), 0)),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_wait_covers_its_own_silence() {
+        const LONG: Duration = Duration::from_secs(3_600);
+        const SHORT: Duration = Duration::from_secs(5);
+        let waits = Waits { silence: LONG, partial: SHORT };
+        let (mut client, mut app) = tokio::io::duplex(1024);
+        let (_server, mut up) = tokio::io::duplex(1024);
+        let started = tokio::time::Instant::now();
+        let reader = tokio::spawn(async move { read_first(&mut app, &mut up, waits).await });
+        tokio::time::sleep(LONG - SHORT).await;
+        assert!(!reader.is_finished(), "nothing said yet, nothing decided");
+        client.write_all(b"GE").await.unwrap();
+        match reader.await.unwrap() {
+            First::Decoded { decoded, held } => assert_eq!((decoded.kind, held.as_slice()), (None, &b"GE"[..]), "what only looked like a request"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(started.elapsed(), LONG);
     }
 
     #[tokio::test]

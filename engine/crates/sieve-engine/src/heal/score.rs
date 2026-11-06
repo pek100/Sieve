@@ -152,7 +152,12 @@ mod tests {
         for alert in FATAL_ALERTS {
             assert!(Ledger::default().hear(EXE, HOST, Evidence::Refused(Some(alert)), NOW), "{alert:?}");
         }
-        assert_eq!(FATAL_ALERTS.len(), 6);
+        assert_eq!(FATAL_ALERTS.len(), 7);
+    }
+
+    #[test]
+    fn a_real_ech_taken_for_grease_excludes_on_its_first_refusal() {
+        assert!(Ledger::default().hear(EXE, HOST, Evidence::Refused(Some(AlertDescription::EncryptedClientHelloRequired)), NOW));
     }
 
     #[test]

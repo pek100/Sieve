@@ -127,20 +127,24 @@ impl Reply<'_> {
 
 /// Answers the held datagrams and each later one until the flow has been idle
 /// for `idle`, so a retransmit costs no new attribution. `still_on` is asked per
-/// datagram: with the switch off or the app Off the task ends, and the next
-/// datagram is a new flow, judged as such. An idle flow costs nothing and needs
-/// no wake.
-pub async fn refuse<A: AsyncRead + Unpin>(app: &mut A, reply: &Reply<'_>, held: &[Vec<u8>], buf: &mut [u8], idle: Duration, still_on: impl Fn() -> bool) {
-    for datagram in held {
+/// datagram: with the switch off or the app Off the refusal ends, and the datagrams
+/// not answered are returned, to be judged as a new flow. None is lost. Empty when
+/// the flow simply ended. An idle flow costs nothing and needs no wake.
+pub async fn refuse<A: AsyncRead + Unpin>(app: &mut A, reply: &Reply<'_>, held: Vec<Vec<u8>>, buf: &mut [u8], idle: Duration, still_on: impl Fn() -> bool) -> Vec<Vec<u8>> {
+    for (at, datagram) in held.iter().enumerate() {
         if !still_on() {
-            return;
+            return held[at..].to_vec();
         }
         reply.answer(datagram);
     }
     while let Ok(Ok(n)) = tokio::time::timeout(idle, app.read(buf)).await {
-        if n == 0 || !still_on() {
-            return;
+        if n == 0 {
+            break;
+        }
+        if !still_on() {
+            return vec![buf[..n].to_vec()];
         }
         reply.answer(&buf[..n]);
     }
+    Vec::new()
 }

@@ -359,36 +359,42 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         }
     };
     let Ok(attributed) = attribution.await else { return };
-    let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Udp, kind_of(&decided)) else { return };
-    let id = admitted.id;
-    let action = ctx.decide(&admitted, &decided, &flow);
-    // Read only with the slot there, so off asks nothing new. A slot that comes up
-    // in between reads as an unknown app: relayed, which is the fail-open way.
-    let event = ctx.https.get().and_then(|_| lock(&ctx.book).snapshot_of(id));
-    let owner = admitted.owner.as_owner();
-    let who = Who {
-        remote: flow.remote,
-        exe: event.as_ref().and_then(|e| e.exe.as_deref()),
-        session: event.as_ref().and_then(|e| e.session),
-        may_decrypt: owner.may_decrypt(),
-        app_off: event.is_some() && ctx.filter.get().is_off(owner),
-        names_now_ms: monotonic_ms(),
-    };
-    match quic::path(action, &ctx.https, &decided, &who, id) {
-        UdpPath::Drop => {
-            close_blocked(&ctx.book, &ctx.meters, id);
-            return drain_udp(&mut app, UDP_IDLE).await;
-        }
-        UdpPath::Refuse(refusal) => {
-            quic::close_refused(&ctx.book, id);
-            if let (Some(pid), Some(host), Some(first)) = (event.as_ref().and_then(|e| e.pid), decided.domain.as_deref(), first_datagram_ms) {
-                ctx.meters.quic.refused(pid, host, first);
+    // Once more when a refusal ends on a datagram: that datagram is a new flow.
+    let id = loop {
+        let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Udp, kind_of(&decided)) else { return };
+        let id = admitted.id;
+        let action = ctx.decide(&admitted, &decided, &flow);
+        // Read only with the slot there, so off asks nothing new. A slot that comes up
+        // in between reads as an unknown app: relayed, which is the fail-open way.
+        let event = ctx.https.get().and_then(|_| lock(&ctx.book).snapshot_of(id));
+        let owner = admitted.owner.as_owner();
+        let who = Who {
+            remote: flow.remote,
+            exe: event.as_ref().and_then(|e| e.exe.as_deref()),
+            session: event.as_ref().and_then(|e| e.session),
+            may_decrypt: owner.may_decrypt(),
+            app_off: event.is_some() && ctx.filter.get().is_off(owner),
+            names_now_ms: monotonic_ms(),
+        };
+        match quic::path(action, &ctx.https, &decided, &who, id) {
+            UdpPath::Drop => {
+                close_blocked(&ctx.book, &ctx.meters, id);
+                return drain_udp(&mut app, UDP_IDLE).await;
             }
-            let reply = Reply { ends: (flow.local, flow.remote), refusal, sink: &*ctx.sink, meters: &ctx.meters.quic };
-            return quic::refuse(&mut app, &reply, &held, &mut buf, UDP_IDLE, || ctx.https.refuses(owner)).await;
+            UdpPath::Refuse(refusal) => {
+                quic::close_refused(&ctx.book, id);
+                if let (Some(pid), Some(host), Some(first)) = (event.as_ref().and_then(|e| e.pid), decided.domain.as_deref(), first_datagram_ms.take()) {
+                    ctx.meters.quic.refused(pid, host, first);
+                }
+                let reply = Reply { ends: (flow.local, flow.remote), refusal, sink: &*ctx.sink, meters: &ctx.meters.quic };
+                held = quic::refuse(&mut app, &reply, held, &mut buf, UDP_IDLE, || ctx.https.refuses(owner)).await;
+                if held.is_empty() {
+                    return;
+                }
+            }
+            UdpPath::Relay => break id,
         }
-        UdpPath::Relay => {}
-    }
+    };
     let up = match ctx.egress.socket(flow.remote, true).and_then(|s| UdpSocket::from_std(s.into()).map_err(|e| e.to_string())) {
         Ok(u) => u,
         Err(_) => return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0),

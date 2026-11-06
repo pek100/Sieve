@@ -13,7 +13,8 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use super::provider;
 use crate::flow::sni::TlsOffer;
 
-/// The leaves are ECDSA P-256 (plan 2.2), so a TLS 1.2 suite must sign with it.
+/// The leaves are ECDSA P-256 (plan 2.2), so a TLS 1.2 suite must sign with it and a
+/// client must accept it, under either version.
 const LEAF_SCHEME: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
 
 fn suite_fits(suite: &SupportedCipherSuite, offer: &TlsOffer) -> bool {
@@ -25,11 +26,11 @@ fn suite_fits(suite: &SupportedCipherSuite, offer: &TlsOffer) -> bool {
 }
 
 fn shares(provider: &CryptoProvider, offer: &TlsOffer) -> bool {
-    provider.kx_groups.iter().any(|g| offer.groups.contains(&u16::from(g.name()))) && provider.cipher_suites.iter().any(|s| suite_fits(s, offer))
+    offer.schemes.contains(&u16::from(LEAF_SCHEME)) && provider.kx_groups.iter().any(|g| offer.groups.contains(&u16::from(g.name()))) && provider.cipher_suites.iter().any(|s| suite_fits(s, offer))
 }
 
 /// True when the client shares a version of 1.2 or later, a suite and a group
-/// with the engine's provider.
+/// with the engine's provider, and accepts what the leaves sign with.
 pub fn speaks_to(offer: &TlsOffer) -> bool {
     shares(&provider(), offer)
 }
@@ -64,9 +65,21 @@ mod tests {
     const ECDHE_RSA_AES128_GCM: u16 = 0xc02f;
     const X25519: u16 = 0x001d;
     const RC4_MD5: u16 = 0x0004;
+    const ECDSA_P256: u16 = 0x0403;
+    const RSA_PSS_SHA256: u16 = 0x0804;
 
     fn offer(versions: &[u16], suites: &[u16], groups: &[u16]) -> TlsOffer {
-        TlsOffer { versions: versions.to_vec(), suites: suites.to_vec(), groups: groups.to_vec() }
+        TlsOffer { versions: versions.to_vec(), suites: suites.to_vec(), groups: groups.to_vec(), schemes: vec![RSA_PSS_SHA256, ECDSA_P256] }
+    }
+
+    #[test]
+    fn a_client_is_asked_for_the_scheme_the_leaves_sign_with() {
+        for (version, suite) in [(TLS13, AES128_GCM_SHA256), (TLS12, ECDHE_ECDSA_AES128_GCM)] {
+            let good = offer(&[version], &[suite], &[X25519]);
+            assert!(speaks_to(&good), "the control");
+            assert!(!speaks_to(&TlsOffer { schemes: vec![RSA_PSS_SHA256], ..good.clone() }), "RSA only, under {version:#x}");
+            assert!(!speaks_to(&TlsOffer { schemes: Vec::new(), ..good }), "none, under {version:#x}");
+        }
     }
 
     #[test]
