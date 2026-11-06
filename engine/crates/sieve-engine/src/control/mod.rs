@@ -59,6 +59,9 @@ pub struct Facts {
     /// The newest route failure ([`Engine::route_failed`]). Status reports it
     /// last.
     pub route_error: Option<String>,
+    /// Why interception could not be built, while that is still so
+    /// ([`Engine::publish_https`]). Status reports it after `route_error`.
+    pub https_error: Option<String>,
     /// What went wrong with attribution's sources in the latest routing run
     /// ([`Engine::attribution_failed`]). Status reports it after `route_error`.
     pub attribution_error: Option<String>,
@@ -132,6 +135,12 @@ pub const NO_CA: &str = "the certificate service did not start";
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Whether a built interception has a use: its switch is on and routes can carry it.
+#[cfg(windows)]
+fn https_can_run(policy: &Policy) -> bool {
+    crate::tls::intercept::wanted(policy) && policy.engine
 }
 
 /// One error text from whichever of the two reasons exist.
@@ -218,8 +227,32 @@ impl Engine {
         // Off closes every decrypted flow now; on waits for the routing loop,
         // which holds the pinned sockets.
         #[cfg(windows)]
-        if !crate::tls::intercept::wanted(now) {
-            self.https.set(None);
+        {
+            if !crate::tls::intercept::wanted(now) {
+                self.https.set(None);
+            }
+            if !https_can_run(now) {
+                self.set_facts(|f| f.https_error = None);
+            }
+        }
+    }
+
+    /// What building interception came to. Under the policy's lock, as `set_policy`
+    /// empties the slot under it: a switch that went off during the build is seen
+    /// here, or finds this published and empties it, so no flow decrypts after off.
+    /// Each outcome replaces the last, and one that no longer matters says nothing.
+    #[cfg(windows)]
+    pub fn publish_https(&self, built: Result<crate::tls::intercept::Interception<crate::stack::egress::Egress>, String>) {
+        let policy = lock(&self.policy);
+        if !https_can_run(&policy) {
+            return;
+        }
+        match built {
+            Ok(interception) => {
+                self.https.set(Some(Arc::new(interception)));
+                self.set_facts(|f| f.https_error = None);
+            }
+            Err(why) => self.set_facts(|f| f.https_error = Some(format!("HTTPS filtering is not running: {why}"))),
         }
     }
 
@@ -406,7 +439,7 @@ impl Engine {
             blocking: f.routes_up && self.filter.get().blocks_anything(),
             flows: u32::try_from(live).unwrap_or(u32::MAX),
             decrypting: false,
-            last_error: [f.dns_file_error, f.route_error, f.attribution_error, f.policy_save_error, self.lists.compile_error()].into_iter().fold(f.last_error, beside),
+            last_error: [f.dns_file_error, f.route_error, f.https_error, f.attribution_error, f.policy_save_error, self.lists.compile_error()].into_iter().fold(f.last_error, beside),
             policy,
             blocker,
             split_tunnels: f.split_tunnels,
