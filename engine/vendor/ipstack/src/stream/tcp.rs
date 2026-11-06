@@ -292,6 +292,14 @@ impl IpStackTcpStream {
             if let Err(err) = write_packet_to_device(&self.up_packet_sender, nt, &tcb, None, ACK | RST, None, None) {
                 log::warn!("{nt} [abort] error sending RST/ACK packet: {err}");
             }
+            // A client that has not seen our unacknowledged bytes expects this sequence,
+            // not the one above, and under RFC 5961 only challenges any other reset.
+            let acked = tcb.get_last_received_ack();
+            if acked != tcb.get_seq()
+                && let Err(err) = write_packet_to_device(&self.up_packet_sender, nt, &tcb, None, ACK | RST, Some(acked), None)
+            {
+                log::warn!("{nt} [abort] error sending RST/ACK packet: {err}");
+            }
             tcb.change_state(TcpState::Closed);
         }
         self.shutdown.lock().unwrap().ready();

@@ -20,8 +20,8 @@ struct Meter {
     down: AtomicU64,
 }
 
-/// An app end that can be torn down at once: a browser treats a reset as final
-/// where it retries a FIN.
+/// An app end that can be torn down at once. A reset does not stop a page's own
+/// retries (live, 2026-11-06: about 730 in 15 s with a FIN or an RST alike).
 pub trait Abort {
     fn abort(&self);
 }

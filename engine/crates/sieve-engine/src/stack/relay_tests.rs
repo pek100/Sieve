@@ -369,6 +369,27 @@ async fn a_blocked_flow_after_server_bytes_resets_after_them() {
     }
 }
 
+/// A client that never saw the server's bytes expects the older sequence, and under
+/// RFC 5961 only challenges a reset at any other: it gets one at each.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_missed_server_bytes_still_gets_a_reset_it_accepts() {
+    for flow in FLOWS {
+        let mut bed = TcpBed::new(flow).await;
+        let expected = bed.server_next;
+        bed.server.write_all(BANNER).await.unwrap();
+        let banner = bed.next_segment().await;
+        assert_eq!(banner.sequence_number, expected);
+        bed.server_next = expected;
+        bed.send(&hello(BLOCKED));
+        let first = bed.until_the_end().await;
+        let second = bed.until_the_end().await;
+        assert!(first.rst && second.rst, "{first:?} {second:?}");
+        assert_eq!(first.sequence_number, expected.wrapping_add(u32::try_from(BANNER.len()).unwrap()));
+        assert_eq!(second.sequence_number, expected);
+        ended(&mut bed.task).await.unwrap();
+    }
+}
+
 /// The control: a flow no rule blocks still ends with a FIN when its server does.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_passed_flow_still_closes_with_a_fin() {
