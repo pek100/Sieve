@@ -1,7 +1,8 @@
 //! Content injection (plan 5.6, slice 9): given a rule snapshot, a page URL and a
-//! response, produce the rewritten response. A pure library: slice 6's HTTP path
-//! calls [`begin`], then [`PageRewriter::push`] per body chunk, then
-//! [`PageRewriter::finish`]. Nothing here carries traffic.
+//! response, produce the rewritten response. A pure library: slice 9 implements
+//! `http::hook::ResponseHook` over it, calling [`begin`], then
+//! [`PageRewriter::push`] per body chunk, then [`PageRewriter::finish`]. Nothing
+//! here carries traffic.
 //!
 //! - [`response`]: which responses qualify, and which headers a rewrite falsifies;
 //! - [`decode`]: streaming, capped decoding;
@@ -73,7 +74,7 @@ impl InjectError {
     }
 }
 
-/// One response body being rewritten. `Send`: slice 6 holds it across awaits.
+/// One response body being rewritten. `Send`: the HTTP path holds it across awaits.
 pub struct PageRewriter {
     decoder: BodyDecoder,
     html: HtmlInjector,

@@ -316,7 +316,7 @@ export const REGISTRY = {
     default: [] as readonly string[],
     of: { type: "rule" },
   } satisfies ListSetting<string>,
-  // Sent in the policy; nothing decrypts before slice 6, so nothing reads them yet.
+  // Sent in the policy; the engine's exclusion store reads them while `filtering.https` is on.
   "filtering.exclusions": {
     kind: "list",
     section: "filtering",

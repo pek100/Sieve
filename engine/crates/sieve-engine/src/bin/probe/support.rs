@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn summary_counts_and_text() {
-        let d = Decoded { kind: Some(Kind::Tls), domain: Some("a.example".into()), alpn: vec![], ech: true, failure: None };
+        let d = Decoded { kind: Some(Kind::Tls), domain: Some("a.example".into()), alpn: vec![], ech: true, ..Decoded::default() };
         let l = "10.0.0.2:5000".parse().unwrap();
         let r = "1.1.1.1:443".parse().unwrap();
         let mut s = Summary::default();

@@ -52,12 +52,14 @@ pub struct Decoded {
     pub ech: bool,
     /// Why no domain: "not tls/quic/http", "cap", or the parser's reason.
     pub failure: Option<&'static str>,
+    /// What a ClientHello offers (`tls::server::speaks_to` reads it).
+    pub offer: sni::TlsOffer,
 }
 
 impl Decoded {
     fn from_hello(kind: Kind, h: sni::Hello) -> Self {
         let failure = if h.sni.is_none() { Some("no SNI") } else { None };
-        Self { kind: Some(kind), domain: h.sni, alpn: h.alpn, ech: h.ech, failure }
+        Self { kind: Some(kind), domain: h.sni, alpn: h.alpn, ech: h.ech, failure, offer: h.offer }
     }
 
     fn failed(kind: Option<Kind>, why: &'static str) -> Self {

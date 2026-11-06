@@ -1,7 +1,7 @@
 //! The per-install root CA (plan 2.1 to 2.5, slice 5): a key the engine
 //! cannot export, a root with the 2.1 limits, trusted by the machine and by
 //! Firefox, rotated silently before expiry, removed on every off path.
-//! Nothing decrypts yet; slice 6 calls [`Ca::minter`].
+//! `tls::intercept` asks [`Ca::minter`] for each flow it decrypts.
 //!
 //! [`Ca::reconcile`] is the only path that changes trust: turn on, turn off,
 //! rotate, retire and retry are all one function, so no path can forget a
@@ -66,10 +66,10 @@ pub enum CaError {
     /// A certificate could not be built or read.
     #[error("{0}")]
     Cert(String),
-    /// A host no leaf may name; slice 6 passes through.
+    /// A host no leaf may name; the flow passes through.
     #[error("{0}")]
     Host(String),
-    /// No validity is left for a leaf; slice 6 passes through.
+    /// No validity is left for a leaf; the flow passes through.
     #[error("{0}")]
     Expired(String),
     /// `ca.json` cannot be read: nothing is guessed, no root is made.
@@ -392,7 +392,7 @@ impl Ca {
         }
     }
 
-    /// None: no installed, in-date root; slice 6 passes through.
+    /// None: no installed, in-date root; `tls::intercept` passes through.
     pub fn minter(&self) -> Option<Arc<Minter>> {
         self.held().minter.clone()
     }

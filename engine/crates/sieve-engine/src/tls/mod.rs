@@ -1,8 +1,26 @@
 //! The one owner of how the engine speaks TLS (plan 2.6, 2.7): TLS 1.2 and
 //! 1.3 on aws-lc-rs, with key exchange groups in the plan's order on every
 //! session the engine makes or answers. Early data stays off (plan 2.10,
-//! rustls's default). Later slices build on [`provider`], so one change here
+//! rustls's default). Everything builds on [`provider`], so one change here
 //! reaches every session.
+//!
+//! Interception (plan 2, slice 6), behind `filtering.https`:
+//! - [`intercept`]: the path of one flow, upstream first;
+//! - [`upstream`]: the upstream handshake and its validation;
+//! - [`verdict`]: what validation said, per host and port;
+//! - [`server`]: who the client side can answer, and with what;
+//! - [`first_bytes`], [`splice`]: holding, replaying and copying bytes;
+//! - [`active`]: the intercepted flows and their close signals.
+
+pub mod active;
+pub mod first_bytes;
+pub mod intercept;
+pub mod server;
+pub mod splice;
+#[cfg(test)]
+pub(crate) mod tests;
+pub mod upstream;
+pub mod verdict;
 
 use std::sync::Arc;
 
@@ -38,7 +56,7 @@ pub fn client_config(roots: Arc<RootCertStore>, alpn: &[&[u8]]) -> Result<Client
 }
 
 #[cfg(test)]
-mod tests {
+mod config_tests {
     use super::*;
     use rustls::NamedGroup;
 

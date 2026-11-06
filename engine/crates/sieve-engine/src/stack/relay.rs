@@ -6,7 +6,8 @@
 //! - a failed connect closes the app side with a FIN at once (live run 1:
 //!   a dropped ipstack stream left curl waiting 20 s).
 //!
-//! TCP uses the offline-tested `flow::relay::relay_tcp` (server bytes flow at
+//! TCP with `filtering.https` on goes to `tls::intercept`; off (no slot), it
+//! uses the offline-tested `flow::relay::relay_tcp` (server bytes flow at
 //! once, client bytes are held until decoded and decided, then relayed or the
 //! flow is closed with nothing sent). UDP holds datagrams until decoded and
 //! decided; a blocked UDP flow's book entry closes and its datagrams are
@@ -40,6 +41,7 @@ use crate::flow::packet::Proto;
 use crate::flow::relay::relay_tcp;
 use crate::policy::wall_ms;
 use crate::route::table::NetTables;
+use crate::tls::intercept::{FlowMeta, HttpsSlot, run as run_intercepted};
 use crate::watchdog::monotonic_ms;
 
 /// A TCP flow that sends nothing this long is decided without a name.
@@ -91,6 +93,8 @@ pub struct Relay {
     pub names: Arc<Mutex<NameMap>>,
     pub book: Arc<Mutex<FlowBook>>,
     pub meters: Arc<Meters>,
+    /// `filtering.https`: empty means every flow takes `relay_tcp`.
+    pub https: Arc<HttpsSlot<Egress>>,
 }
 
 pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -116,10 +120,11 @@ pub struct RelayParts {
     pub filter: Arc<FilterSlot>,
     pub witness: Witness,
     pub nat: Arc<NatTable>,
+    pub https: Arc<HttpsSlot<Egress>>,
 }
 
 impl Relay {
-    pub fn new(RelayParts { tables, egress, dns, book, names, meters, filter, witness, nat }: RelayParts) -> Self {
+    pub fn new(RelayParts { tables, egress, dns, book, names, meters, filter, witness, nat, https }: RelayParts) -> Self {
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: crate::experiments::Settings::default(),
@@ -135,6 +140,7 @@ impl Relay {
             names,
             book,
             meters,
+            https,
         }
     }
 
@@ -265,6 +271,28 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
         }
     };
     let decide = |d: &Decoded| ctx.decide(&admitted, d, &flow);
+    // One path per flow, chosen once (task D1): no slot is today's relay.
+    if let Some(https) = ctx.https.get() {
+        let owner = admitted.owner.as_owner();
+        let event = lock(&ctx.book).snapshot_of(admitted.id);
+        let meta = FlowMeta {
+            id: admitted.id,
+            remote: flow.remote,
+            exe: event.as_ref().and_then(|e| e.exe.as_deref()),
+            session: event.as_ref().and_then(|e| e.session),
+            may_decrypt: owner.may_decrypt(),
+            app_off: ctx.filter.get().is_off(owner),
+            names_now_ms: monotonic_ms(),
+            decide: &decide,
+        };
+        let out = run_intercepted(&https, app, upstream, meta).await;
+        if out.action == FlowAction::Blocked {
+            close_blocked(&ctx.book, &ctx.meters, admitted.id);
+        } else {
+            lock(&ctx.book).close(admitted.id, out.action, out.bytes_up, out.bytes_down);
+        }
+        return;
+    }
     #[cfg(feature = "relay-experiments")]
     let out = if let Some(capacity) = ctx.experiments.copy_buffer_bytes {
         crate::flow::relay::relay_tcp_buffered(&mut app, upstream, FIRST_BYTES_WAIT, decide, capacity).await

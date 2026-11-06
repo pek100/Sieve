@@ -87,7 +87,7 @@ impl Kind {
 /// The one place a data kind's signed copy lives (`updates\` in the engine's
 /// admin-only folder). What is here passed signature, kind and version before it
 /// was put here. The resource loader reads through this; the sensitive-list
-/// consumer of slice 6 reads `Kind::List("sensitive")` the same way.
+/// consumer (`exclusions::lists`) reads `Kind::List("sensitive")` the same way.
 pub fn data_path(engine_dir: &Path, kind: &Kind) -> Option<PathBuf> {
     Some(engine_dir.join(swap::DATA_DIR).join(kind.data_file()?))
 }

@@ -9,7 +9,11 @@
 //! - [`stack`]: the relay of every flow, with attribution (slice 3);
 //! - [`dns`]: lookups on the TUN answered over encrypted upstreams, and their
 //!   answers read into the IP-to-names map (slices 3, 4);
-//! - [`tls`]: the one owner of how the engine speaks TLS (plan 2.7);
+//! - [`tls`]: the one owner of how the engine speaks TLS (plan 2.7), and
+//!   interception behind `filtering.https` (slice 6);
+//! - [`http`]: decrypted requests through hyper, with full-URL rules (slice 6);
+//! - [`exclusions`]: the store behind `sieve_filter::exclusions::decrypt`;
+//! - [`lru`]: the bounded caches' shape;
 //! - [`coexist`]: AdGuard and VPN detection, read only (slice 3);
 //! - [`update`]: signed updates, the service as the only updater (slice 13);
 //! - [`watchdog`], [`policy`]: hang and crash-loop safety (slice 3);
@@ -17,7 +21,8 @@
 //! - [`domain`]: the one per-flow decision (slice 4);
 //! - [`lists`]: the default lists' download, cache and compile (slice 4);
 //! - [`ca`]: the root CA, its removal paths and the leaf API (slice 5);
-//! - [`inject`]: the content injection library (slice 9), not yet wired to traffic.
+//! - [`inject`]: the content injection library (slice 9), not yet wired to
+//!   traffic: `http::hook` is where it will plug in.
 //!
 //! Traffic goes through the engine only while the user's `filtering.engine`
 //! switch is on; off, killed or crashed is a normal network.
@@ -26,13 +31,16 @@ pub mod coexist;
 pub mod control;
 pub mod dns;
 pub mod domain;
+pub mod exclusions;
 #[cfg(feature = "relay-experiments")]
 pub mod experiments;
 pub mod flow;
 pub mod hand_file;
+pub mod http;
 pub mod inject;
 pub mod ipc;
 pub mod lists;
+pub mod lru;
 pub mod policy;
 pub mod route;
 pub mod service;

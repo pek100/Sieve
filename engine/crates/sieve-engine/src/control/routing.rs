@@ -29,11 +29,15 @@ use crate::coexist::{self, Coexistence};
 use crate::dns::pool::{Context, Tls};
 use crate::dns::service::Service;
 use crate::dns::upstream;
+use crate::exclusions::ExclusionSlot;
+use crate::exclusions::browsers::{BrowserSet, WindowsRegistry};
 use crate::flow::etw::os::{self as etw_os, EtwSession};
 use crate::flow::etw::{RingWitness, Sinks, Unwitnessed};
 use crate::flow::nat::{NatTable, os as nat_os};
 use crate::flow::tasks::FlowTasks;
+use crate::http::hook::NoRewrite;
 use crate::lists::https::HttpsFetcher;
+use crate::policy::wall_ms;
 use crate::route::apply::{self, SieveLuid};
 use crate::route::journal::Journal;
 use crate::route::plan::{self, RoutePlan};
@@ -42,6 +46,10 @@ use crate::route::table::{NetTables, read};
 use crate::route::watch::{RouteWatch, watch as watch_routes};
 use crate::stack::egress::Egress;
 use crate::stack::relay::{Relay, RelayParts, UDP_IDLE, Witness, handle_tcp, handle_udp};
+use crate::tls::active::Active;
+use crate::tls::intercept::{Interception, NoWatch, wanted};
+use crate::tls::upstream::{PlatformTrust, TRUST_TIMEOUT, Verifier};
+use crate::tls::verdict::VerdictCache;
 use crate::tun::device::{Tun, TunDevice};
 #[cfg(not(feature = "relay-experiments"))]
 use crate::tun::MTU;
@@ -53,6 +61,7 @@ use crate::watchdog::monotonic_ms;
 pub const RECHECK_EVERY: Duration = Duration::from_secs(5);
 /// Cancelled flow tasks get this long to finish at take-down.
 const TASKS_BOUND: Duration = Duration::from_secs(5);
+const EXCLUSIONS_EVERY: Duration = Duration::from_secs(3_600);
 
 /// What is up while the engine routes.
 struct Up {
@@ -64,6 +73,7 @@ struct Up {
     accept: JoinHandle<()>,
     batches: JoinHandle<()>,
     lists: JoinHandle<()>,
+    exclusions: JoinHandle<()>,
     /// Lives exactly as long as the routes; None when it could not start.
     etw: Option<EtwSession>,
 }
@@ -183,6 +193,7 @@ pub async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
 /// Removes routes that are no longer planned and adds new ones; the relay
 /// pins with the new tables.
 fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
+    sync_https(engine, &up.relay.egress);
     let RoutePlan { routes, .. } = plan::plan(&tables);
     let network_moved = {
         let mut held = up.relay.tables.write().unwrap_or_else(|p| p.into_inner());
@@ -277,7 +288,8 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
         }
     };
 
-    let parts = RelayParts { tables: shared_tables, egress, dns, book: engine.book.clone(), names: engine.names.clone(), meters: engine.meters.clone(), filter: engine.filter.clone(), witness, nat };
+    sync_https(engine, &egress);
+    let parts = RelayParts { tables: shared_tables, egress, dns, book: engine.book.clone(), names: engine.names.clone(), meters: engine.meters.clone(), filter: engine.filter.clone(), witness, nat, https: engine.https.clone() };
     #[cfg(not(feature = "relay-experiments"))]
     let relay = Arc::new(Relay::new(parts));
     #[cfg(feature = "relay-experiments")]
@@ -292,6 +304,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     let device = TunDevice::new(tun.session.clone(), engine.meters.clone(), engine.beats.clone());
     let stack = IpStack::new(config, device);
     let lists = tokio::spawn(engine.lists.clone().run(HttpsFetcher::new(relay.clone())));
+    let exclusions = tokio::spawn(refresh_exclusions(engine.exclusions.clone(), HttpsFetcher::new(relay.clone())));
     let (stop_accept, stopped) = oneshot::channel();
     let accept = tokio::spawn(accept(stack, relay.clone(), stopped));
     let batches = {
@@ -317,7 +330,57 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     engine.beats.relay.end();
     engine.beats.tun.end();
     engine.arm.set(true);
-    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, etw })
+    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, exclusions, etw })
+}
+
+/// Interception as this engine run wires it (task D1, D2). Nothing here runs
+/// while the slot is empty, and a failure here means every flow takes the relay.
+fn build_interception(engine: &Engine, egress: &Arc<Egress>) -> Result<Interception<Egress>, String> {
+    let trust = Arc::new(PlatformTrust::new()?);
+    let verifier = Arc::new(Verifier::new(crate::tls::public_roots(), trust, TRUST_TIMEOUT)?);
+    let ca = engine.ca();
+    Ok(Interception {
+        connector: egress.clone(),
+        exclusions: engine.exclusions.clone(),
+        verifier,
+        verdicts: VerdictCache::default(),
+        active: Active::default(),
+        minter: Box::new(move || ca.as_ref().and_then(|c| c.minter())),
+        filter: engine.filter.clone(),
+        names: engine.names.clone(),
+        book: engine.book.clone(),
+        meters: engine.meters.clone(),
+        watch: Arc::new(NoWatch),
+        hook: Arc::new(NoRewrite),
+        clock: wall_ms,
+    })
+}
+
+/// Makes the slot match the policy. Called while routes are up, so a switch
+/// turned on reaches new flows at the next wake.
+fn sync_https(engine: &Engine, egress: &Arc<Egress>) {
+    if !wanted(&engine.policy()) {
+        engine.https.set(None);
+    } else if engine.https.get().is_none() {
+        engine.exclusions.set_browsers(BrowserSet::read(&WindowsRegistry));
+        match build_interception(engine, egress) {
+            Ok(interception) => engine.https.set(Some(Arc::new(interception))),
+            Err(why) => engine.route_failed(format!("HTTPS filtering is not running: {why}")),
+        }
+    }
+}
+
+/// While routes are up: the browsers Windows declares, and the fetched exclusion
+/// lists when any is enabled. One wake an hour, as `Lists::run` (plan 6).
+async fn refresh_exclusions(slot: Arc<ExclusionSlot>, fetcher: HttpsFetcher) {
+    let mut every = tokio::time::interval(EXCLUSIONS_EVERY);
+    loop {
+        every.tick().await;
+        slot.set_browsers(BrowserSet::read(&WindowsRegistry));
+        if slot.fetches() {
+            slot.refresh(&fetcher, wall_ms()).await;
+        }
+    }
 }
 
 async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiver<()>) {
@@ -346,10 +409,12 @@ async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiv
 async fn take_down(engine: &Engine, up: Up) {
     engine.arm.set(false);
     let _ = up.tun.session.shutdown();
+    engine.https.set(None);
     let _ = up.stop_accept.send(());
     let _ = up.accept.await;
     up.batches.abort();
     up.lists.abort();
+    up.exclusions.abort();
     engine.stop_dns_service();
     for p in &up.routes {
         let _ = apply::delete_route(up.luid.value(), *p);

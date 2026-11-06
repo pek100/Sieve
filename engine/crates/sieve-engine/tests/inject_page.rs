@@ -1,7 +1,7 @@
 //! Slice 9 integration, loopback only: a server on `127.0.0.1:0` serves one
 //! fixture page per encoding, with a strict header CSP, a meta CSP and Trusted
 //! Types. The response is read over a raw socket and rewritten by the library,
-//! as slice 6 will do. Structure is proved by parsing the output; the script is
+//! as the HTTP path will (`http::hook`). Structure is proved by parsing the output; the script is
 //! run under node. What a browser does with it stays UNVERIFIED (task doc).
 
 use std::cell::RefCell;

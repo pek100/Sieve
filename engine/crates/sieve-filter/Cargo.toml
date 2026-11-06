@@ -14,6 +14,9 @@ publish.workspace = true
 # procedural operators and refuses invalid selectors and styles: without it
 # the validator is a stub and every list line reaches the page unchecked.
 adblock = { version = "0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling", "css-validation"] }
+# The public suffix table behind `floor:restricted-suffix` (exclusions.rs);
+# already in the tree through adblock.
+psl = "2"
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

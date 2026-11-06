@@ -23,6 +23,7 @@ use crate::dns::service::Service;
 use crate::dns::upstream::Upstream;
 use crate::dns::{NameMap, config};
 use crate::domain::{DomainFilter, FilterSlot, user_engine, user_rules_changed};
+use crate::exclusions::ExclusionSlot;
 use crate::ipc::{Backend, Subscription};
 use crate::lists::Lists;
 use crate::policy::{self, Runs};
@@ -91,6 +92,12 @@ pub struct Engine {
     pub filter: Arc<FilterSlot>,
     /// The default lists: download state, cache and compile.
     pub lists: Arc<Lists>,
+    /// What is never decrypted (plan 4.1).
+    pub exclusions: Arc<ExclusionSlot>,
+    /// `filtering.https`: built by the routing loop while it is wanted and
+    /// routes are up, empty otherwise.
+    #[cfg(windows)]
+    pub https: Arc<crate::tls::intercept::HttpsSlot<crate::stack::egress::Egress>>,
     pub flows: broadcast::Sender<Arc<Vec<FlowEvent>>>,
     /// What the filter did, on the same cadence (plan 8.3).
     pub log: broadcast::Sender<Arc<Vec<LogRow>>>,
@@ -137,6 +144,7 @@ impl Engine {
         let filter = Arc::new(FilterSlot::new(DomainFilter::new(&policy, rules)));
         let lists = Arc::new(Lists::new(dir.as_deref(), filter.clone(), policy.lists.clone()));
         let (dns_upstreams, unused_dns_file) = dir.as_deref().map(config::load).unwrap_or_else(|| (config::defaults(), None));
+        let exclusions = Arc::new(ExclusionSlot::new(dir.as_deref(), &policy.exclusions, policy::wall_ms()));
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: dir.as_deref().map(crate::experiments::Loaded::load).unwrap_or_else(crate::experiments::Loaded::absent),
@@ -155,6 +163,9 @@ impl Engine {
             meters: Arc::default(),
             filter,
             lists,
+            exclusions,
+            #[cfg(windows)]
+            https: Arc::default(),
             flows: broadcast::channel(FLOWS_BACKLOG).0,
             log: broadcast::channel(FLOWS_BACKLOG).0,
             routes_up: watch::channel(false).0,
@@ -192,6 +203,18 @@ impl Engine {
             DomainFilter::new(now, rules)
         });
         self.lists.set_selection(now.lists.clone());
+        self.exclusions.set_user(&now.exclusions, policy::wall_ms());
+        // Off closes every decrypted flow now; on waits for the routing loop,
+        // which holds the pinned sockets.
+        #[cfg(windows)]
+        if !crate::tls::intercept::wanted(now) {
+            self.https.set(None);
+        }
+    }
+
+    /// The root CA, once the runner attached it.
+    pub fn ca(&self) -> Option<Arc<Ca>> {
+        self.ca.get().cloned()
     }
 
     /// Restarts that stopped routing, when this run is a crash loop.
@@ -256,6 +279,7 @@ impl Engine {
 
     /// Records this run's clean end (the service was asked to stop).
     pub fn stop_clean(&self) {
+        self.exclusions.flush();
         let mut runs = lock(&self.runs);
         runs.stop_clean();
         if let Some(dir) = &self.dir {
@@ -275,7 +299,7 @@ impl Engine {
             }
         }
         #[cfg(not(feature = "relay-experiments"))]
-        let json = serde_json::to_vec_pretty(&self.status_saying(self.updates.status()));
+        let json = self.status_json();
         #[cfg(feature = "relay-experiments")]
         let json = self.experimental_status_json();
         if let (Some(dir), Ok(json)) = (&self.dir, json) {
@@ -285,6 +309,18 @@ impl Engine {
             }
         }
         self.write_dns_status_file();
+    }
+
+    /// The Status plus what stays local: the key exchange evidence (task D18).
+    fn status_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let mut status = serde_json::to_value(self.status_saying(self.updates.status()))?;
+        status["https"] = self.meters.https.report();
+        Ok(status)
+    }
+
+    #[cfg(not(feature = "relay-experiments"))]
+    fn status_json(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec_pretty(&self.status_value()?)
     }
 
     /// Beside `status.json`: an empty list while nothing is up, so an old fact
@@ -299,7 +335,7 @@ impl Engine {
 
     #[cfg(feature = "relay-experiments")]
     fn experimental_status_json(&self) -> Result<Vec<u8>, serde_json::Error> {
-        let mut status = serde_json::to_value(self.status_saying(self.updates.status()))?;
+        let mut status = self.status_value()?;
         let mut experiments = serde_json::to_value(&self.experiments)?;
         let copy = self.experiments.settings.copy_buffer_bytes.unwrap_or(crate::experiments::DEFAULT_COPY_BYTES);
         experiments["copy_buffers"] = serde_json::json!({
@@ -915,7 +951,7 @@ mod tests {
 
     /// C2: the rules the log's actions and the Filters editor write reach the
     /// decision through SetPolicy, and a change to them recompiles the user's
-    /// engine. Exclusions are held for slice 6 and compile nothing.
+    /// engine. Exclusions go to the store and compile nothing.
     #[test]
     fn user_rules_and_exclusions_travel_in_the_policy() {
         use crate::flow::flows::Action;
@@ -934,6 +970,60 @@ mod tests {
         assert_eq!(sees(&e, "other.example", "off"), Action::Drop);
         e.set_policy(Policy { off_apps: vec!["off".into()], ..ruled(4, &["||other.example^"]) }).unwrap();
         assert_eq!(sees(&e, "other.example", "off"), Action::Pass, "off apps win over the user's rules");
+    }
+
+    #[test]
+    fn a_policys_exclusions_reach_the_store_and_the_status_file_counts_without_a_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        let ip = "192.0.2.1".parse().unwrap();
+        let found = |e: &Engine| e.exclusions.get().find(Some("www.bank.example"), ip, None, true).cloned();
+        assert_eq!(found(&e), None);
+        e.set_policy(Policy { revision: 1, exclusions: vec!["bank.example".into()], ..Policy::default() }).unwrap();
+        assert_eq!(found(&e), Some(sieve_filter::exclusions::Source::User));
+        crate::stack::Meters::bump(&e.meters.https.intercepted);
+        e.meters.https.upstream_groups[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        e.write_status_file();
+        let text = std::fs::read_to_string(dir.path().join(STATUS_FILE)).unwrap();
+        let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(status["https"]["intercepted"], 1);
+        assert_eq!(status["https"]["upstream_groups"]["X25519MLKEM768"], 1);
+        assert_eq!(status["https"]["client_groups"]["X25519"], 0);
+        assert!(serde_json::to_value(e.status()).unwrap().get("https").is_none(), "IPC protocol unchanged");
+    }
+
+    /// Off closes every decrypted flow at once: it does not wait for the routing
+    /// loop's next wake.
+    #[cfg(windows)]
+    #[test]
+    fn turning_https_off_empties_the_slot_at_once() {
+        use crate::tls::active::Active;
+        use crate::tls::intercept::{Interception, NoWatch};
+        use crate::tls::upstream::{PlatformTrust, TRUST_TIMEOUT, Verifier};
+        use crate::tls::verdict::VerdictCache;
+        let on = Policy { revision: 1, sieving: true, https: true, ..Policy::default() };
+        let e = Engine::new(None, PathBuf::new(), on.clone(), Runs::default(), None);
+        let egress = Arc::new(crate::stack::egress::Egress::new(0, Arc::new(std::sync::RwLock::new(crate::route::table::NetTables::default()))));
+        let interception = Interception {
+            connector: egress,
+            exclusions: e.exclusions.clone(),
+            verifier: Arc::new(Verifier::new(crate::tls::public_roots(), Arc::new(PlatformTrust::new().unwrap()), TRUST_TIMEOUT).unwrap()),
+            verdicts: VerdictCache::default(),
+            active: Active::default(),
+            minter: Box::new(|| None),
+            filter: e.filter.clone(),
+            names: e.names.clone(),
+            book: e.book.clone(),
+            meters: e.meters.clone(),
+            watch: Arc::new(NoWatch),
+            hook: Arc::new(crate::http::hook::NoRewrite),
+            clock: policy::wall_ms,
+        };
+        e.https.set(Some(Arc::new(interception)));
+        e.set_policy(Policy { revision: 2, ..on.clone() }).unwrap();
+        assert!(e.https.get().is_some(), "still wanted");
+        e.set_policy(Policy { revision: 3, https: false, ..on.clone() }).unwrap();
+        assert!(e.https.get().is_none(), "the switch off");
     }
 
     #[test]

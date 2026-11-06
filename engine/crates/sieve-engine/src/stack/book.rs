@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use sieve_ipc::{FlowAction, FlowEvent, Forwarded, Guest, LOG_RULE_MAX, LogOutcome, LogRow, MAX_GUESTS, cap_text, vm_key};
+use sieve_ipc::{FlowAction, FlowEvent, Forwarded, Guest, LOG_RULE_MAX, LOG_URL_MAX, LogOutcome, LogRow, MAX_GUESTS, cap_text, vm_key};
 
 use crate::domain::{Decision, Reason};
 
@@ -47,6 +47,16 @@ pub fn log_outcome(decision: &Decision) -> Option<LogOutcome> {
         Reason::MixedResolvedNames => passed("mixed_names"),
         Reason::UnknownDomain => passed("no_name"),
     }
+}
+
+/// What the log keeps of one decrypted request.
+#[derive(Debug, Clone)]
+pub struct RequestRow<'a> {
+    pub url: &'a str,
+    pub request_type: &'a str,
+    pub outcome: LogOutcome,
+    pub rule: Option<&'a str>,
+    pub list: Option<&'a str>,
 }
 
 #[derive(Debug, Default)]
@@ -114,10 +124,8 @@ impl FlowBook {
         }
     }
 
-    /// The host-level log row (plan 8.3, slice 4) of an open flow just decided.
-    /// `url` and `request_type` wait for decryption (slice 6). `t` is the wall clock.
-    pub fn log_decision(&mut self, id: u64, decision: &Decision, t: u64) {
-        let Some(outcome) = log_outcome(decision) else { return };
+    /// One row about an open flow, with what the flow's event already says.
+    fn push_row(&mut self, id: u64, t: u64, request: Option<(&str, &str)>, outcome: LogOutcome, rule: Option<&str>, list: Option<&str>) {
         let Some(e) = self.open.get(&id) else { return };
         if self.log.len() >= MAX_PENDING_LOG {
             self.next_log_id += 1;
@@ -134,15 +142,34 @@ impl FlowBook {
             kind: e.kind,
             host: e.host.clone().unwrap_or_else(ip),
             remote: e.remote.clone(),
-            url: None,
-            request_type: None,
+            url: request.map(|(url, _)| cap_text(url, LOG_URL_MAX).to_string()),
+            request_type: request.map(|(_, kind)| kind.to_string()),
             outcome,
-            rule: decision.rule.as_deref().map(|r| cap_text(r, LOG_RULE_MAX).to_string()),
-            list: decision.list.clone(),
+            rule: rule.map(|r| cap_text(r, LOG_RULE_MAX).to_string()),
+            list: list.map(str::to_string),
             forwarded: e.forwarded.clone(),
         };
         self.next_log_id += 1;
         self.log.push(row);
+    }
+
+    /// The host-level log row (plan 8.3, slice 4) of an open flow just decided.
+    /// A decrypted request has its own row ([`FlowBook::log_request`]). `t` is
+    /// the wall clock.
+    pub fn log_decision(&mut self, id: u64, decision: &Decision, t: u64) {
+        let Some(outcome) = log_outcome(decision) else { return };
+        self.push_row(id, t, None, outcome, decision.rule.as_deref(), decision.list.as_deref());
+    }
+
+    /// One decrypted request (task D13). Only what `RequestRow` holds reaches
+    /// the log: bodies, cookies and auth headers never do (plan 7.1).
+    pub fn log_request(&mut self, id: u64, request: RequestRow<'_>, t: u64) {
+        self.push_row(id, t, Some((request.url, request.request_type)), request.outcome, request.rule, request.list);
+    }
+
+    /// A flow that goes on undecrypted, and why (plan 4.1).
+    pub fn log_not_decrypted(&mut self, id: u64, reason: &str, t: u64) {
+        self.push_row(id, t, None, LogOutcome::NotDecrypted { reason: reason.to_string() }, None, None);
     }
 
     /// The log rows since the last batch.
@@ -172,6 +199,11 @@ impl FlowBook {
         for id in ids {
             self.close(id, FlowAction::Relayed, 0, 0);
         }
+    }
+
+    /// An open flow's event.
+    pub fn snapshot_of(&self, id: u64) -> Option<FlowEvent> {
+        self.open.get(&id).cloned()
     }
 
     pub fn live(&self) -> usize {
