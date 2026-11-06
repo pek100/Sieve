@@ -56,7 +56,7 @@ The executor cannot be assumed to have network, so these were recorded once and 
 2. `Validation::check(chain, now_ms)`: CRLite, then CT, both local and inline;
 3. trust, unless the same leaf is already known.
 
-Reasons: a private root never reaches CT, which is plan 2.6's "chains to public roots only" by order, with no second test. Revoked comes first so a revoked and non-compliant chain still closes open flows. Steps 2 run **even for a known leaf**: they cost microseconds, and a filter that arrived an hour ago must reach a host visited all day. A `Revoked` on a known leaf takes the existing path in `intercept.rs` (`put`, then `close_host`), which needs no change.
+Reasons: a private root never reaches CT, which is plan 2.6's "chains to public roots only" by order, with no second test. Revoked comes first so a revoked and non-compliant chain still closes open flows. Steps 2 run **even for a known leaf**: they cost microseconds, and a filter that arrived an hour ago must reach a host visited all day. A `Revoked` on a known leaf takes the existing path in `intercept.rs` (`put`, then `close_host`). That path also had to cover a server asking for a client certificate: the local checks make `Revoked` reachable there too, so `close_host` now runs after the handshake however it ended.
 
 `Verifier::new` gains a required `Arc<ValidationSlot>` and `verify` a required `now_ms` from `Interception.clock` (S15). They are required arguments, not optional ones (S47): a missed caller fails to compile. Existing tests pass `ValidationSlot::default()`, which holds no data.
 

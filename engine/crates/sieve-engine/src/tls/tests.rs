@@ -1135,9 +1135,12 @@ arms!(server_first_bytes_are_forwarded_and_the_flow_only_splices, |arm| async mo
 // ---- Client certificate, EV.
 
 fn cert_server(pki: &Pki, client_pki: &Pki, required: bool) -> Arc<ServerConfig> {
+    cert_server_with(pki.leaf(HOST, GOOD), client_pki, required)
+}
+
+pub(crate) fn cert_server_with((chain, key): (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), client_pki: &Pki, required: bool) -> Arc<ServerConfig> {
     let builder = WebPkiClientVerifier::builder_with_provider(client_pki.roots(), provider());
     let verifier = if required { builder.build() } else { builder.allow_unauthenticated().build() }.unwrap();
-    let (chain, key) = pki.leaf(HOST, GOOD);
     Arc::new(ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions().unwrap().with_client_cert_verifier(verifier).with_single_cert(chain, key).unwrap())
 }
 

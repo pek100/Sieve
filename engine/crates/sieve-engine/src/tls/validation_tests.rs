@@ -23,7 +23,7 @@ use super::ct::{self, CtAnswer, LogList, MAX_LIST_AGE_MS};
 use super::ech::ECH_HANDSHAKE_TIMEOUT;
 use super::ech::testing::{FakeLookup, config_list};
 use super::ech::usable_config;
-use super::tests::{Arm, FakeTrust, GOOD, HOST, Pki, Rig, RigOpts, TestDial, arms, client_tls, connect, echo, echo_dial, expect_real, flow_opts, raw, round_trip, server_tls, server_tls_no_tickets, shown_is_sieves, tls_server};
+use super::tests::{Arm, FakeTrust, GOOD, HOST, Pki, Rig, RigOpts, TestDial, arms, cert_server_with, client_tls, connect, echo, echo_dial, expect_real, flow_opts, raw, round_trip, server_tls, server_tls_no_tickets, shown_is_sieves, tls_server};
 use super::upstream::{Chain, HandshakeEnd, TRUST_TIMEOUT, TrustAnswer, Verifier, handshake, leaf_facts};
 use super::validation::{KIND_CRLITE, ValidationSlot};
 use crate::dns::HttpsRecord;
@@ -349,6 +349,33 @@ arms!(crlite_revoked_passes_through_and_closes_open_flows_to_that_host, |arm| as
     drop(second);
     second_task.await.unwrap();
     assert_eq!(rig.reasons(), ["floor:upstream-revoked"]);
+    assert_eq!(count(&rig.deps.meters.https.crlite_revoked), 1);
+});
+
+// The cached Revoked skips the handshake from here on, so the connection that
+// found it is the only one that can close the flows already open.
+arms!(crlite_revoked_on_a_certificate_request_closes_open_flows_to_that_host, |arm| async move {
+    let (pki, clients, world) = (Pki::new("Test Public Root"), Pki::new("Clients"), World::new());
+    let (rig, _) = ct_rig(arm, vec![server_tls(world.compliant(&pki), &[], None), cert_server_with(world.compliant(&pki), &clients, false)], &pki);
+    let (app, first_task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut first = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert!(shown_is_sieves(&shown, &rig));
+    round_trip(&mut first).await;
+    rig.validation.install(None, Some(world.revoking(&pki)));
+    let (app, second_task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut second = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    expect_real(&shown, &rig);
+    round_trip(&mut second).await;
+    tokio::time::timeout(Duration::from_secs(10), first_task).await.expect("the open flow closed").unwrap();
+    let mut rest = Vec::new();
+    let _ = first.read_to_end(&mut rest).await;
+    assert!(rest.is_empty());
+    drop(second);
+    second_task.await.unwrap();
+    assert_eq!(rig.reasons(), ["floor:upstream-revoked"]);
+    assert_eq!(rig.deps.verdicts.get(HOST, 443, wall_ms()).unwrap().verdict, UpstreamVerdict::Revoked);
     assert_eq!(count(&rig.deps.meters.https.crlite_revoked), 1);
 });
 

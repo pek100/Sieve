@@ -358,9 +358,6 @@ where
             if !(verdict == UpstreamVerdict::Eligible && (known || closed)) {
                 deps.verdicts.put(host, flow.remote.port(), verdict, leaf, facts_of_leaf.map(|l| l.not_after_ms), (deps.clock)());
             }
-            if verdict == UpstreamVerdict::Revoked {
-                deps.active.close_host(host);
-            }
             if verdict == UpstreamVerdict::Eligible
                 && !closed
                 && let Some(l) = facts_of_leaf.filter(|l| l.ev)
@@ -370,6 +367,11 @@ where
             (Some((shaken, facts_of_leaf)), verdict)
         }
     };
+    // However the handshake ended: the cached verdict makes later flows skip
+    // theirs, so no other flow would close the open ones.
+    if verdict == UpstreamVerdict::Revoked {
+        deps.active.close_host(host);
+    }
     // Another flow found this host revoked while this one was asking.
     let verdict = if verdict == UpstreamVerdict::Eligible && registered.is_closed() { UpstreamVerdict::Revoked } else { verdict };
     let after = FlowFacts { upstream: Some(verdict), ..facts };
