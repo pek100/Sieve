@@ -61,6 +61,8 @@ export function createLockController({ source, clock, settings, notices }: LockC
   let parked: { run: () => void; drop: () => void }[] = [];
   let lastActive = clock.now();
   let timer: unknown = null;
+  // Moved by each unlock and each cancel: an answer checked for a prompt since closed opens nothing.
+  let attempt = 0;
 
   const set = (patch: Partial<LockState>) => {
     state = { ...state, ...patch };
@@ -165,17 +167,20 @@ export function createLockController({ source, clock, settings, notices }: LockC
     async unlock(password) {
       if (state.phase !== "locked" || state.busy) return;
       set({ busy: true, error: null });
+      const mine = ++attempt;
       try {
         const verdict = await source.verify(password);
+        if (mine !== attempt) return;
         if (verdict.ok) return opened();
         set({ busy: false, error: verdict.retry_after_secs > 0 ? retryText(verdict.retry_after_secs) : WRONG_PASSWORD_TEXT });
       } catch (e) {
-        set({ busy: false, error: message(e) });
+        if (mine === attempt) set({ busy: false, error: message(e) });
       }
     },
     cancel() {
+      attempt++;
       drop();
-      set({ asking: false, error: null });
+      set({ asking: false, error: null, busy: false });
     },
     lockNow() {
       if (state.phase === "unlocked") lock();
