@@ -73,6 +73,7 @@ export function SettingRow({
   // Back to the default: "Clear" when the default is empty, "Reset" when it has entries.
   const reset = !same(value, defaultValue(k)) && (
     <Button
+      type="button"
       variant="ghost"
       size="sm"
       className={d.kind === "list" && d.of.type === "upstream" ? "max-[640px]:h-11" : undefined}

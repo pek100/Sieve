@@ -143,6 +143,28 @@ describe("the upstream editor", () => {
     expect(row().queryByRole("button", { name: /^Reset/ })).toBeNull();
   });
 
+  it("Reset with text typed leaves exactly the defaults and keeps the text", async () => {
+    const rt = await setup([A]);
+    await userEvent.type(field(), "typed.example");
+    await userEvent.click(row().getByRole("button", { name: "Reset Upstream DNS servers" }));
+    expect(rt.settings.get(KEY)).toEqual(DEFAULTS);
+    expect(field()).toHaveValue("typed.example");
+  });
+
+  it("Reset with an empty field shows no alert", async () => {
+    const rt = await setup([A]);
+    await userEvent.click(row().getByRole("button", { name: "Reset Upstream DNS servers" }));
+    expect(rt.settings.get(KEY)).toEqual(DEFAULTS);
+    expect(row().queryByRole("alert")).toBeNull();
+  });
+
+  it("Reset at the limit with text typed leaves exactly the defaults", async () => {
+    const rt = await setup(Array.from({ length: MAX_UPSTREAMS }, (_, i) => `tls://n${i}.example`));
+    await userEvent.type(field(), "more.example");
+    await userEvent.click(row().getByRole("button", { name: "Reset Upstream DNS servers" }));
+    expect(rt.settings.get(KEY)).toEqual(DEFAULTS);
+  });
+
   it("locked by the password, every control is disabled at the value in force", async () => {
     await setup([A, B], createMockLock("set"));
     const editor = within(document.querySelector<HTMLElement>("[data-upstream-editor]")!);
