@@ -152,7 +152,11 @@ impl KeyStore for CngKeyStore {
             Err(e) if e.code() == KEY_NOT_FOUND => return Ok(()),
             Err(e) => return Err(format!("NCryptOpenKey: {e}")),
         };
-        // SAFETY: the key is open; NCryptDeleteKey frees the handle as well.
-        unsafe { NCryptDeleteKey(key, NCRYPT_SILENT_FLAG.0) }.map_err(|e| format!("NCryptDeleteKey: {e}"))
+        let guard = Object(NCRYPT_HANDLE(key.0));
+        // SAFETY: the key is open. On success NCryptDeleteKey has freed the handle,
+        // so the guard must not; on failure the handle is still this code's to free.
+        unsafe { NCryptDeleteKey(key, NCRYPT_SILENT_FLAG.0) }.map_err(|e| format!("NCryptDeleteKey: {e}"))?;
+        std::mem::forget(guard);
+        Ok(())
     }
 }

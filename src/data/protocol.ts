@@ -302,7 +302,7 @@ export function parseDnsUpstreams(raw: unknown): EngineDnsUpstreams {
 }
 
 /** `sieve-ipc` CertState and FirefoxTrust wire names, in declaration order. */
-export const CERT_STATES = ["not_installed", "installed", "expires_soon"] as const;
+export const CERT_STATES = ["not_installed", "installed", "expires_soon", "removal_pending"] as const;
 export type CertState = (typeof CERT_STATES)[number];
 export const FIREFOX_TRUST = ["not_installed", "uses_windows", "not_using_windows"] as const;
 export type FirefoxTrust = (typeof FIREFOX_TRUST)[number];

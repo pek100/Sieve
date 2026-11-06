@@ -39,6 +39,7 @@ $ServerAuthOid = "1.3.6.1.5.5.7.3.1"
 $WaitSeconds = 20
 $script:Failed = 0
 . (Join-Path $PSScriptRoot 'live-lease.ps1')
+. (Join-Path $PSScriptRoot 'engine-ca-checks.ps1')
 $liveLease = Enter-SieveLiveLease
 try {
 
@@ -89,9 +90,8 @@ function Start-Engine {
 function Set-HttpsSwitch([bool]$on) {
   Stop-Engine
   $policy = if (Test-Path $PolicyFile) { Get-Content -Raw $PolicyFile | ConvertFrom-Json } else { [pscustomobject]@{ revision = 0; engine = $false } }
-  $next = [ordered]@{ revision = [int64]$policy.revision + 1; engine = [bool]$policy.engine; https = $on }
   $encoding = New-Object Text.UTF8Encoding($false)
-  [IO.File]::WriteAllText($PolicyFile, ($next | ConvertTo-Json), $encoding)
+  [IO.File]::WriteAllText($PolicyFile, (New-HttpsPolicyJson $policy $on), $encoding)
   Start-Engine
 }
 
@@ -132,10 +132,29 @@ function Check-Key($keyName) {
   Write-Evidence "keys.txt" $listing
   Check "the key is a machine CNG key of the software provider" ($listing -match [regex]::Escape($keyName)) $keyName
   $detail = cmd /c "certutil -csp `"Microsoft Software Key Storage Provider`" -key `"$keyName`" 2>&1" | Out-String
+  $answer = Get-KeyAnswer $detail $LASTEXITCODE
   Write-Evidence "key-detail.txt" $detail
-  Write-Host "Read key-detail.txt: the export policy must be none, the DACL SYSTEM only. An admin may be refused the key: that refusal is itself the DACL at work."
-  $allowed = $detail -notmatch "(?i)allow.*export" -and $detail -notmatch "BUILTIN\\Administrators" -and $detail -notmatch "BUILTIN\\Users"
-  Check "the key is not exportable and its DACL lists SYSTEM only" $allowed
+  Check "an admin is refused the key" ($answer -eq "refused") "certutil's answer: $answer"
+  $facts = Read-KeyFactsAsSystem $keyName
+  Check "the key is not exportable and its DACL lists SYSTEM only" (Test-KeyFacts $facts) "read as SYSTEM: $(if ($facts) { $facts | ConvertTo-Json -Compress } else { 'no answer' })"
+}
+
+# Only SYSTEM can open the key, so a one-shot task asks as SYSTEM and is deleted.
+function Read-KeyFactsAsSystem($keyName) {
+  $probe = Join-Path $Out "key-probe.ps1"
+  $result = Join-Path $Out "key-facts.json"
+  Remove-Item $result -ErrorAction SilentlyContinue
+  New-KeyProbeScript $keyName $result | Out-File -Encoding utf8 $probe
+  $task = "SieveLiveKeyProbe"
+  try {
+    cmd /c "schtasks /Create /TN $task /SC ONCE /ST 00:00 /RU SYSTEM /F /TR `"powershell -NoProfile -ExecutionPolicy Bypass -File \`"$probe\`"`" 2>&1" | Out-Null
+    cmd /c "schtasks /Run /TN $task 2>&1" | Out-Null
+    if (-not (Wait-Until { Test-Path $result })) { return $null }
+    Start-Sleep -Milliseconds 500
+    return Get-Content -Raw $result | ConvertFrom-Json
+  } finally {
+    cmd /c "schtasks /Delete /TN $task /F 2>&1" | Out-Null
+  }
 }
 
 function Check-NoKeyMaterial {

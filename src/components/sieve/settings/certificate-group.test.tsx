@@ -73,6 +73,15 @@ describe("Certificate group", () => {
     expect(within(group()).queryByRole("button")).toBeNull();
   });
 
+  it("a failed removal says so: the thumbprint to find it by, the reason, and no Remove to press again", async () => {
+    await setup(mock("idle", "removal_pending"));
+    await settled("Removal pending");
+    expect(rowLabels()).toEqual(["Thumbprint"]);
+    expect(group()).toHaveTextContent(THUMBPRINT);
+    expect(within(group()).getByRole("alert")).toHaveTextContent(ipc.certStatuses.removal_pending.last_error!);
+    expect(within(group()).queryByRole("button", { name: "Remove certificate" })).toBeNull();
+  });
+
   it("a Firefox that is not installed says so", async () => {
     const answer: CertStatus = { ...(ipc.certStatuses.installed as CertStatus), firefox: "not_installed" };
     await setup({ ...mock(), certStatus: async () => answer });

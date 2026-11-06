@@ -79,7 +79,8 @@ export function CertificateGroup() {
   const problem = lock === null && e.certError ? `Sieve could not read the certificate: ${e.certError}` : (cert?.last_error ?? null);
   const validUntil = installed ? day(cert?.valid_until_ms) : null;
   const rotated = installed ? day(cert?.last_rotation_ms) : null;
-  const thumbprint = installed ? (cert?.thumbprint ?? null) : null;
+  // Beside an installed root, this is the one a pending removal has not reached.
+  const thumbprint = cert?.thumbprint ?? null;
   const firefox = installed && cert ? (FIREFOX_TEXT[cert.firefox] ?? null) : null;
 
   const copy = () => {
@@ -118,7 +119,7 @@ export function CertificateGroup() {
             </p>
           )}
         </div>
-        {installed && (validUntil || thumbprint || firefox || rotated) && (
+        {(validUntil || thumbprint || firefox || rotated) && (
           <dl className="flex flex-col">
             {validUntil && <Row label="Valid until">{validUntil}</Row>}
             {thumbprint && (

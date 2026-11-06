@@ -306,6 +306,7 @@ export const CERT_STATE_TEXT: Record<CertState, string> = {
   not_installed: "Not installed",
   installed: "Installed",
   expires_soon: "Expires soon",
+  removal_pending: "Removal pending",
 };
 /** What the Certificate group says with no answer from the engine. */
 export const CERT_STATE_UNKNOWN = "Unknown";

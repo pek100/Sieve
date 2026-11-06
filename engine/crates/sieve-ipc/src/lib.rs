@@ -16,8 +16,8 @@
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
 //!   commit (v3, the wave after slice 3: blocked flows, the grown policy, the
 //!   list report, forwarded flows and guests, the `log` message, the status's filter
-//!   facts, the certificate's status, `InstallRoot`, `Policy.https`,
-//!   `request_update` and the `update` status).
+//!   facts, the certificate's status with its `removal_pending` state,
+//!   `InstallRoot`, `Policy.https`, `request_update` and the `update` status).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -255,6 +255,9 @@ pub enum CertState {
     Installed,
     /// The rotation window has come and no new root is in place yet.
     ExpiresSoon,
+    /// Off or withdrawn, and removing the root has not succeeded yet: Windows
+    /// may still trust it, and the engine keeps trying. Sieve mints nothing.
+    RemovalPending,
 }
 
 /// Whether Firefox trusts the Windows store. `NotUsingWindows` is a policy
@@ -1144,11 +1147,11 @@ mod tests {
             assert_eq!(&serde_json::to_value(&parsed).unwrap(), example, "{name}");
         }
         let text = f.to_string();
-        for wire in ["not_installed", "installed", "expires_soon", "uses_windows", "not_using_windows"] {
+        for wire in ["not_installed", "installed", "expires_soon", "removal_pending", "uses_windows", "not_using_windows"] {
             assert!(text.contains(&format!(r#""{wire}""#)), "{wire}");
         }
         let _exhaustive = |s: CertState, ff: FirefoxTrust| match (s, ff) {
-            (CertState::NotInstalled | CertState::Installed | CertState::ExpiresSoon, _) => match ff {
+            (CertState::NotInstalled | CertState::Installed | CertState::ExpiresSoon | CertState::RemovalPending, _) => match ff {
                 FirefoxTrust::NotInstalled | FirefoxTrust::UsesWindows | FirefoxTrust::NotUsingWindows => (),
             },
         };
