@@ -71,9 +71,9 @@ pub const LOG_URL_MAX: usize = 2048;
 pub const LOG_RULE_MAX: usize = 1024;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices"];
 /// The `type` names of [`EngineMessage`], in declaration order.
-pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status"];
+pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status", "exclusions", "heal_notices"];
 /// A flow event's rule text is cut to this many bytes: a list rule can run to
 /// kilobytes, and at this cap a full `flows` frame stays under [`MAX_FRAME`].
 pub const MAX_RULE_BYTES: usize = 256;
@@ -120,6 +120,16 @@ pub enum ClientMessage {
     /// tagged unit variant, even with `deny_unknown_fields`, and this one must
     /// refuse them.
     RequestUpdate {},
+    /// Asks for one page of [`EngineMessage::Exclusions`], from row `after`.
+    Exclusions { after: u32 },
+    /// "Try decrypting again": a `line` in the list grammar for this `app` (None
+    /// for an entry of every app), or with no `line` every `auto:pinning` entry of
+    /// `app`. Answered with the first page of [`EngineMessage::Exclusions`]; an
+    /// unparsable line or neither field is an Error. No field reaches the user or
+    /// list layers (plan 4.3, S24).
+    TryDecryptAgain { line: Option<String>, app: Option<String> },
+    /// Asks for [`EngineMessage::HealNotices`] newer than revision `after`.
+    HealNotices { after: u64 },
 }
 
 /// Engine to app. Read and written one frame at a time and never stored, so the
@@ -151,6 +161,90 @@ pub enum EngineMessage {
     Log { rows: Vec<LogRow> },
     /// The root certificate, from facts the engine holds (plan 8.1).
     CertStatus(CertStatus),
+    /// One page of what the engine keeps from being decrypted (plan 8.2), built
+    /// with [`exclusions_page`]. `next` is the `after` of the next page, None on
+    /// the last. The `user` layer is not here: those lines are the app's own.
+    Exclusions { revision: u64, rows: Vec<ExclusionRow>, total: u32, next: Option<u32>, scope: ExclusionScope, browsers: Vec<String> },
+    /// What self-healing excluded since `after`, for this client's session (plan
+    /// 4.3). `revision` is the next `after`; `exclusions_revision` moves when the
+    /// rows do, so this is cheap to ask and the rows are read only then.
+    HealNotices { revision: u64, exclusions_revision: u64, notices: Vec<HealNotice> },
+}
+
+/// How far decryption reaches. The same two values as the engine's decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusionScope {
+    /// Only [`EngineMessage::Exclusions`]' `browsers`, full paths, lower case.
+    #[default]
+    Browsers,
+    All,
+}
+
+/// One entry of the `list:*` or `auto:*` layers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExclusionRow {
+    /// The pattern in the list grammar, with no `$app=`.
+    pub line: String,
+    /// Lower-case exe file names; empty means every app.
+    pub apps: Vec<String>,
+    /// `list:<id>`, `auto:pinning`, `auto:client-cert` or `auto:ev`.
+    pub reason: String,
+    /// When the engine first wrote it; None for a list's line.
+    pub created_ms: Option<u64>,
+    /// How many times "Try decrypting again" was used on it.
+    pub retries: u32,
+}
+
+/// One group of self-healing exclusions of one app (plan 4.3). A later exclusion
+/// in the group's window raises `rev` and keeps `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealNotice {
+    /// Unique for the engine's run.
+    pub id: u64,
+    pub session: u32,
+    /// The exe's file name, lower case.
+    pub exe: String,
+    /// The first few hosts; `total` counts them all.
+    pub hosts: Vec<String>,
+    pub total: u32,
+    pub rev: u64,
+}
+
+/// What [`exclusions_page`] cuts into frames.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExclusionsView {
+    pub revision: u64,
+    pub rows: Vec<ExclusionRow>,
+    pub scope: ExclusionScope,
+    pub browsers: Vec<String>,
+}
+
+/// The page of `view` from row `after`, as much as one frame holds, by encoded
+/// size. A row too large for any frame cannot be sent and is passed over, so a
+/// page always moves on.
+pub fn exclusions_page(view: &ExclusionsView, after: u32) -> Result<EngineMessage, FrameError> {
+    const SEPARATOR: usize = b",".len();
+    let total = u32::try_from(view.rows.len()).unwrap_or(u32::MAX);
+    let page = |rows: Vec<ExclusionRow>, next: Option<u32>| EngineMessage::Exclusions { revision: view.revision, rows, total, next, scope: view.scope, browsers: view.browsers.clone() };
+    // The largest `total` and `next` there are, so the page never grows past this.
+    let empty = serde_json::to_vec(&page(Vec::new(), Some(u32::MAX)))?.len();
+    let mut rows = Vec::new();
+    let mut size = empty;
+    for (index, row) in view.rows.iter().enumerate().skip(after as usize) {
+        let len = serde_json::to_vec(row)?.len();
+        if empty + len > MAX_FRAME {
+            continue;
+        }
+        if !rows.is_empty() && size + SEPARATOR + len > MAX_FRAME {
+            return Ok(page(rows, u32::try_from(index).ok()));
+        }
+        size += len + if rows.is_empty() { 0 } else { SEPARATOR };
+        rows.push(row.clone());
+    }
+    Ok(page(rows, None))
 }
 
 /// The encrypted DNS resolvers as the engine holds them (`dns.json`). The
@@ -816,6 +910,9 @@ mod tests {
             ClientMessage::CertStatus => "cert_status",
             ClientMessage::InstallRoot => "install_root",
             ClientMessage::RequestUpdate {} => "request_update",
+            ClientMessage::Exclusions { .. } => "exclusions",
+            ClientMessage::TryDecryptAgain { .. } => "try_decrypt_again",
+            ClientMessage::HealNotices { .. } => "heal_notices",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -827,6 +924,8 @@ mod tests {
             EngineMessage::DnsUpstreams(_) => "dns_upstreams",
             EngineMessage::Log { .. } => "log",
             EngineMessage::CertStatus(_) => "cert_status",
+            EngineMessage::Exclusions { .. } => "exclusions",
+            EngineMessage::HealNotices { .. } => "heal_notices",
         };
         let f = fixture();
         for m in f["client"].as_array().unwrap() {
@@ -1233,6 +1332,72 @@ mod tests {
         assert_eq!(vm_key(Some("Ubuntu Box")), "vm:ubuntu box");
         assert_eq!(vm_key(None), "vm:unidentified");
         assert_eq!(vm_key(Some("Unidentified")), vm_key(None), "the name cannot make a second row of that key");
+    }
+
+    /// The auto layer at its caps (3 x 1024, from `exclusions::auto`), every host at
+    /// its 253 bytes and a long exe name, plus a list: past one frame.
+    fn rows_at_the_caps() -> Vec<ExclusionRow> {
+        const AUTO_AT_WORST: usize = 3 * 1024;
+        const LIST_LINES: usize = 2000;
+        let row = |i: usize| ExclusionRow { line: format!("\"h{i}{}\"", "h".repeat(240)), apps: vec![format!("{}.exe", "e".repeat(200))], reason: "auto:client-cert".into(), created_ms: Some(u64::MAX), retries: u32::MAX };
+        (0..AUTO_AT_WORST + LIST_LINES).map(row).collect()
+    }
+
+    fn view_of(rows: Vec<ExclusionRow>) -> ExclusionsView {
+        ExclusionsView { revision: 7, rows, scope: ExclusionScope::Browsers, browsers: vec![format!(r"c:\{}\browser.exe", "d".repeat(250)); 8] }
+    }
+
+    fn walk(view: &ExclusionsView) -> Vec<Vec<ExclusionRow>> {
+        let (mut pages, mut after) = (Vec::new(), 0);
+        loop {
+            let EngineMessage::Exclusions { rows, next, total, .. } = exclusions_page(view, after).unwrap() else { panic!("not a page") };
+            assert_eq!(total as usize, view.rows.len());
+            pages.push(rows);
+            let Some(next) = next else { return pages };
+            assert!(next > after, "a page moves on");
+            after = next;
+        }
+    }
+
+    #[test]
+    fn exclusion_pages_fit_a_frame_at_the_caps() {
+        let view = view_of(rows_at_the_caps());
+        let whole = EngineMessage::Exclusions { revision: 7, rows: view.rows.clone(), total: 0, next: None, scope: view.scope, browsers: view.browsers.clone() };
+        assert!(matches!(encode(&whole), Err(FrameError::TooLarge(_))), "the control: sent whole it is refused");
+        let mut after = 0;
+        loop {
+            let page = exclusions_page(&view, after).unwrap();
+            assert!(encode(&page).unwrap().len() - 4 <= MAX_FRAME);
+            let EngineMessage::Exclusions { next, .. } = page else { panic!() };
+            let Some(next) = next else { break };
+            after = next;
+        }
+        assert!(after > 0, "more than one page");
+    }
+
+    #[test]
+    fn every_row_arrives_once_across_pages() {
+        let view = view_of(rows_at_the_caps());
+        let pages = walk(&view);
+        assert!(pages.len() > 1);
+        assert_eq!(pages.concat(), view.rows);
+    }
+
+    #[test]
+    fn no_rows_is_one_empty_page_and_a_cursor_past_the_end_is_empty() {
+        let view = view_of(Vec::new());
+        assert_eq!(walk(&view), [Vec::<ExclusionRow>::new()]);
+        let view = view_of(rows_at_the_caps());
+        let EngineMessage::Exclusions { rows, next, .. } = exclusions_page(&view, u32::MAX).unwrap() else { panic!() };
+        assert!(rows.is_empty() && next.is_none());
+    }
+
+    #[test]
+    fn a_row_too_large_for_any_frame_is_passed_over() {
+        let plain = rows_at_the_caps().swap_remove(0);
+        let huge = ExclusionRow { line: "h".repeat(MAX_FRAME), ..plain.clone() };
+        let view = view_of(vec![plain.clone(), huge, plain.clone()]);
+        assert_eq!(walk(&view).concat(), [plain.clone(), plain]);
     }
 
     /// The illegal fourth state of a flow event has no example.

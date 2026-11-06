@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use sieve_filter::rules::{RuleEngine, RuleSet};
-use sieve_ipc::{Blocker, CertStatus, DnsUpstreams, EngineStatus, FlowEvent, ListStatus, LogRow, Policy};
+use sieve_ipc::{Blocker, CertStatus, DnsUpstreams, EngineStatus, ExclusionsView, FlowEvent, HealNotice, ListStatus, LogRow, Policy};
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::ca::Ca;
@@ -24,6 +24,7 @@ use crate::dns::upstream::Upstream;
 use crate::dns::{NameMap, config};
 use crate::domain::{DomainFilter, FilterSlot, user_engine, user_rules_changed};
 use crate::exclusions::ExclusionSlot;
+use crate::heal::{Heal, Retry};
 use crate::ipc::{Backend, Subscription};
 use crate::lists::Lists;
 use crate::policy::{self, Runs};
@@ -94,6 +95,9 @@ pub struct Engine {
     pub lists: Arc<Lists>,
     /// What is never decrypted (plan 4.1).
     pub exclusions: Arc<ExclusionSlot>,
+    /// Self-healing: outlives each `Interception`, so a switch off and on forgets
+    /// nothing. Hears flows only through one.
+    pub heal: Arc<Heal>,
     /// `filtering.https`: built by the routing loop while it is wanted and
     /// routes are up, empty otherwise.
     #[cfg(windows)]
@@ -145,6 +149,8 @@ impl Engine {
         let lists = Arc::new(Lists::new(dir.as_deref(), filter.clone(), policy.lists.clone()));
         let (dns_upstreams, unused_dns_file) = dir.as_deref().map(config::load).unwrap_or_else(|| (config::defaults(), None));
         let exclusions = Arc::new(ExclusionSlot::new(dir.as_deref(), &policy.exclusions, policy::wall_ms()));
+        let meters: Arc<Meters> = Arc::default();
+        let heal = Arc::new(Heal::new(exclusions.clone(), meters.clone()));
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: dir.as_deref().map(crate::experiments::Loaded::load).unwrap_or_else(crate::experiments::Loaded::absent),
@@ -160,10 +166,11 @@ impl Engine {
             dns_service: Mutex::new(None),
             book: Arc::default(),
             names: Arc::default(),
-            meters: Arc::default(),
+            meters,
             filter,
             lists,
             exclusions,
+            heal,
             #[cfg(windows)]
             https: Arc::default(),
             flows: broadcast::channel(FLOWS_BACKLOG).0,
@@ -483,6 +490,19 @@ impl Backend for Engine {
     fn request_update(&self) -> Result<EngineStatus, String> {
         self.updates.request(crate::watchdog::monotonic_ms())?;
         Ok(self.status())
+    }
+
+    fn exclusions(&self) -> ExclusionsView {
+        self.exclusions.view(policy::wall_ms())
+    }
+
+    fn try_decrypt_again(&self, retry: Retry) {
+        self.heal.try_again(&retry, policy::wall_ms());
+    }
+
+    fn heal_notices(&self, after: u64) -> (u64, u64, Vec<HealNotice>) {
+        let (revision, notices) = self.heal.notices(after);
+        (revision, self.exclusions.revision(), notices)
     }
 }
 
@@ -1017,6 +1037,30 @@ mod tests {
         assert!(e.https.get().is_some(), "still wanted");
         e.set_policy(Policy { revision: 3, https: false, ..on.clone() }).unwrap();
         assert!(e.https.get().is_none(), "the switch off");
+    }
+
+    /// The real wiring: routing hands the interception the engine's `Heal`, not the
+    /// plain watch, and `Heal` writes to the store the flows read.
+    #[test]
+    fn production_wires_heal_not_nowatch() {
+        let routing = include_str!("routing.rs");
+        let production = &routing[..routing.find("#[cfg(test)]").unwrap_or(routing.len())];
+        assert!(production.contains("watch: engine.heal.clone(),"));
+        assert!(!production.contains("NoWatch"));
+        let e = Engine::new(None, PathBuf::new(), Policy::default(), Runs::default(), None);
+        let pair = crate::tls::intercept::Pair { exe: Some(r"C:\Apps\Client.exe".into()), host: "pin.example".into(), session: Some(1) };
+        use crate::tls::intercept::ClientWatch;
+        e.heal.handshake_failed(&pair, Some(rustls::AlertDescription::UnknownCA));
+        let ip = "192.0.2.1".parse().unwrap();
+        assert!(e.exclusions.get().find(Some("pin.example"), ip, Some(r"C:\Apps\Client.exe"), true).is_some());
+        assert!(e.exclusions.get().find(Some("pin.example"), ip, Some(r"C:\Apps\Other.exe"), true).is_none());
+        assert_eq!(e.meters.https.report()["healed"], 1);
+        let (revision, rows_revision, notices) = e.heal_notices(0);
+        assert_eq!((revision, notices.len()), (1, 1));
+        assert_eq!(rows_revision, e.exclusions.revision());
+        assert_eq!(e.exclusions().rows.iter().filter(|r| r.reason == "auto:pinning").count(), 1);
+        e.try_decrypt_again(Retry::One { pattern: sieve_filter::exclusions::Pattern::Exact("pin.example".into()), app: Some("client.exe".into()) });
+        assert_eq!(e.exclusions().rows.iter().filter(|r| r.reason == "auto:pinning").count(), 0);
     }
 
     #[test]

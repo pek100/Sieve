@@ -13,9 +13,11 @@ pub mod browsers;
 pub mod lists;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sieve_filter::exclusions::{Exclusion, ExclusionSet, Pattern, Scope, Source as EntrySource, Switches, parse_line};
+use sieve_filter::exclusions::{AutoReason, Exclusion, ExclusionSet, Pattern, Scope, Source as EntrySource, Switches, parse_line};
+use sieve_ipc::{ExclusionRow, ExclusionScope, ExclusionsView};
 
 pub use auto::AutoEntry;
 use browsers::BrowserSet;
@@ -29,6 +31,31 @@ use crate::policy::wall_ms;
 pub const SKIP_EV: bool = true;
 /// Browsers first (the user's decision); `All` after slice 7 is proven live.
 pub const SCOPE: Scope = Scope::Browsers;
+
+/// The file a `live-scope` build reads at start (task D10): slice 7's live check
+/// needs a client that is not a browser to be intercepted at all, and browsers
+/// first means none is. A diagnostic build's alone; a release build has neither
+/// this code nor the file's meaning.
+#[cfg(feature = "live-scope")]
+pub const LIVE_SCOPE_FILE: &str = "live-scope.json";
+
+/// `{"scope":"all"}` in the engine's folder widens this run; anything else is
+/// the production floor, so a damaged file cannot widen anything (S24).
+#[cfg(feature = "live-scope")]
+fn start_scope(dir: Option<&Path>) -> Scope {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LiveScope {
+        scope: String,
+    }
+    let asked = dir.and_then(|d| std::fs::read(d.join(LIVE_SCOPE_FILE)).ok()).and_then(|bytes| serde_json::from_slice::<LiveScope>(&bytes).ok());
+    if asked.is_some_and(|a| a.scope == "all") { Scope::All } else { SCOPE }
+}
+
+#[cfg(not(feature = "live-scope"))]
+fn start_scope(_dir: Option<&Path>) -> Scope {
+    SCOPE
+}
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -55,7 +82,7 @@ impl Layers {
             set.add(entries.iter().flatten().cloned(), &EntrySource::List((*id).to_string()));
         }
         let mut next = None;
-        for entry in self.auto.iter().filter(|e| !e.expired(now_ms)) {
+        for entry in self.auto.iter().filter(|e| e.is_held(now_ms)) {
             set.add([entry.exclusion()], &EntrySource::Auto(entry.reason));
             next = match (next, entry.expires_ms) {
                 (Some(a), Some(b)) => Some(u64::min(a, b)),
@@ -67,6 +94,15 @@ impl Layers {
 
     fn lists_ready(&self) -> bool {
         self.auto_error.is_none() && self.lists.iter().all(|(_, entries)| entries.is_some())
+    }
+
+    /// The rows the app shows from the engine: the lists, then what the engine wrote.
+    fn rows(&self, now_ms: u64) -> Vec<ExclusionRow> {
+        let listed = self.lists.iter().flat_map(|(id, entries)| {
+            entries.iter().flatten().map(move |e| ExclusionRow { line: e.pattern.line(), apps: e.apps.clone(), reason: EntrySource::List((*id).to_string()).slug(), created_ms: None, retries: 0 })
+        });
+        let written = self.auto.iter().filter(|e| e.is_held(now_ms)).map(|e| ExclusionRow { line: e.pattern.line(), apps: e.app.iter().cloned().collect(), reason: e.reason.slug().to_string(), created_ms: Some(e.created_ms), retries: e.retries });
+        listed.chain(written).collect()
     }
 }
 
@@ -85,8 +121,11 @@ pub struct ExclusionSlot {
     writer: Option<auto::Writer>,
     sources: Vec<Source>,
     skip_ev: bool,
+    scope: Scope,
     layers: Mutex<Layers>,
     snapshot: Mutex<Snapshot>,
+    /// Raised by every rebuild: the app reads the rows only when this moved.
+    revision: AtomicU64,
 }
 
 /// The policy's lines as entries. A line that does not parse decrypts nothing
@@ -122,7 +161,7 @@ impl ExclusionSlot {
         let writer = dir.filter(|_| auto_error.is_none()).map(auto::Writer::for_dir);
         let layers = Layers { user: user_entries(policy_exclusions), lists: list_layers, auto, auto_error, browsers: BrowserSet::default() };
         let (set, next_expiry) = layers.build(now_ms);
-        Self { dir: dir.map(Path::to_path_buf), writer, sources: enabled, skip_ev: SKIP_EV, layers: Mutex::new(layers), snapshot: Mutex::new(Snapshot { set: Arc::new(set), next_expiry }) }
+        Self { dir: dir.map(Path::to_path_buf), writer, sources: enabled, skip_ev: SKIP_EV, scope: start_scope(dir), layers: Mutex::new(layers), snapshot: Mutex::new(Snapshot { set: Arc::new(set), next_expiry }), revision: AtomicU64::new(0) }
     }
 
     /// The other value of the one dial with no setting yet.
@@ -134,6 +173,30 @@ impl ExclusionSlot {
     fn rebuild(&self, layers: &Layers, now_ms: u64) {
         let (set, next_expiry) = layers.build(now_ms);
         *lock(&self.snapshot) = Snapshot { set: Arc::new(set), next_expiry };
+        self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Moves when the rows may have.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
+    }
+
+    /// The `list:*` and held `auto:*` rows. The `user` layer is the app's own.
+    pub fn rows(&self, now_ms: u64) -> Vec<ExclusionRow> {
+        lock(&self.layers).rows(now_ms)
+    }
+
+    /// What the app is told of the store and of this engine's reach, the fact
+    /// `decrypt` uses (S14).
+    pub fn view(&self, now_ms: u64) -> ExclusionsView {
+        // Read before the rows: a change in between shows as a newer revision.
+        let revision = self.revision();
+        let layers = lock(&self.layers);
+        let scope = match self.scope {
+            Scope::Browsers => ExclusionScope::Browsers,
+            Scope::All => ExclusionScope::All,
+        };
+        ExclusionsView { revision, rows: layers.rows(now_ms), scope, browsers: layers.browsers.paths() }
     }
 
     /// The snapshot, read once per flow.
@@ -153,7 +216,7 @@ impl ExclusionSlot {
 
     /// The switches a flow is judged by. `root_ready` is the minter's to say.
     pub fn switches(&self, https: bool, root_ready: bool) -> Switches {
-        Switches { https, root_ready, lists_ready: lock(&self.layers).lists_ready(), skip_ev: self.skip_ev, scope: SCOPE }
+        Switches { https, root_ready, lists_ready: lock(&self.layers).lists_ready(), skip_ev: self.skip_ev, scope: self.scope }
     }
 
     /// What is wrong with the file, for the status file: why the store holds the
@@ -166,8 +229,13 @@ impl ExclusionSlot {
         exe.is_some_and(|e| lock(&self.layers).browsers.contains(e))
     }
 
+    /// A changed set is news to the app's "in scope" line.
     pub fn set_browsers(&self, browsers: BrowserSet) {
-        lock(&self.layers).browsers = browsers;
+        let mut layers = lock(&self.layers);
+        if layers.browsers != browsers {
+            layers.browsers = browsers;
+            self.revision.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The policy's exclusions changed.
@@ -180,31 +248,56 @@ impl ExclusionSlot {
         }
     }
 
-    /// Slice 7 writes here too. Holds from this call on; the disk follows on the
-    /// writer's thread, and a write that fails is reported by [`Self::error`].
-    /// The newest [`auto::MAX_PER_REASON`] of a reason stay.
-    pub fn add_auto(&self, entry: AutoEntry, now_ms: u64) {
+    /// An entry the engine writes: `tls::intercept` and `heal`. Holds from this call
+    /// on; the disk follows on the writer's thread, and a write that fails is
+    /// reported by [`Self::error`]. The newest [`auto::MAX_PER_REASON`] of a reason
+    /// stay. True when this newly excludes something. Over a `retrying` entry it
+    /// keeps the first date and the count: the entry comes back with its history.
+    pub fn add_auto(&self, mut entry: AutoEntry, now_ms: u64) -> bool {
         let mut layers = lock(&self.layers);
         layers.auto.retain(|e| !e.expired(now_ms));
+        let same = |e: &AutoEntry| e.pattern == entry.pattern && e.app == entry.app && e.reason == entry.reason;
+        let before = layers.auto.iter().position(same).map(|at| layers.auto.remove(at));
         // A held entry moves to the newest place.
-        layers.auto.retain(|e| e.pattern != entry.pattern || e.app != entry.app || e.reason != entry.reason);
+        if let Some(before) = &before {
+            entry.retries = before.retries;
+            if before.retrying {
+                entry.created_ms = before.created_ms;
+            }
+        }
+        let newly = before.is_none_or(|b| b.retrying);
         layers.auto.push(entry);
         auto::cap(&mut layers.auto);
         self.rebuild(&layers, now_ms);
         self.write(&layers);
+        newly
     }
 
-    /// True when an entry was removed ("Try decrypting again", plan 4.3).
-    pub fn remove_auto(&self, pattern: &Pattern, app: Option<&str>) -> bool {
+    /// "Try decrypting again" (plan 4.3) on one row: the entry stops excluding and
+    /// remembers the try. It can only touch this layer: not a user line, not a list
+    /// line, not a floor fact (S24). False when there is no such entry held.
+    pub fn try_again(&self, pattern: &Pattern, app: Option<&str>, now_ms: u64) -> bool {
+        !self.take_back(now_ms, |e| &e.pattern == pattern && e.app.as_deref() == app).is_empty()
+    }
+
+    /// The bulk form, for one app's entries of one reason. The patterns taken back.
+    pub fn try_again_app(&self, app: &str, reason: AutoReason, now_ms: u64) -> Vec<Pattern> {
+        self.take_back(now_ms, |e| e.reason == reason && e.app.as_deref() == Some(app))
+    }
+
+    fn take_back(&self, now_ms: u64, named: impl Fn(&AutoEntry) -> bool) -> Vec<Pattern> {
         let mut layers = lock(&self.layers);
-        let before = layers.auto.len();
-        layers.auto.retain(|e| !(&e.pattern == pattern && e.app.as_deref() == app));
-        if layers.auto.len() == before {
-            return false;
+        let mut taken = Vec::new();
+        for entry in layers.auto.iter_mut().filter(|e| e.is_held(now_ms) && named(e)) {
+            entry.retrying = true;
+            entry.retries = entry.retries.saturating_add(1);
+            taken.push(entry.pattern.clone());
         }
-        self.rebuild(&layers, wall_ms());
-        self.write(&layers);
-        true
+        if !taken.is_empty() {
+            self.rebuild(&layers, now_ms);
+            self.write(&layers);
+        }
+        taken
     }
 
     fn write(&self, layers: &Layers) {
@@ -281,11 +374,117 @@ mod tests {
         let again = ExclusionSlot::new(Some(dir.path()), &[], NOW + DAY);
         assert_eq!(find(&again, "cert.example", NOW + DAY), Some(Src::Auto(AutoReason::ClientCert)));
         assert_eq!(find(&again, "pin.example", NOW + DAY), Some(Src::Auto(AutoReason::Pinning)));
-        assert!(again.remove_auto(&Pattern::Exact("pin.example".into()), None));
-        assert!(!again.remove_auto(&Pattern::Exact("pin.example".into()), None));
+        assert!(again.try_again(&Pattern::Exact("pin.example".into()), None, NOW + DAY));
+        assert!(!again.try_again(&Pattern::Exact("pin.example".into()), None, NOW + DAY), "already taken back");
         again.flush();
         let third = ExclusionSlot::new(Some(dir.path()), &[], NOW + DAY);
         assert_eq!(find(&third, "pin.example", NOW + DAY), None, "try again removed it");
+    }
+
+    #[test]
+    fn a_retrying_entry_survives_a_restart_and_is_not_an_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        slot.add_auto(pinned("pin.example"), NOW);
+        assert!(slot.try_again(&Pattern::Exact("pin.example".into()), None, NOW + 1));
+        slot.flush();
+        let again = ExclusionSlot::new(Some(dir.path()), &[], NOW + DAY);
+        assert_eq!(find(&again, "pin.example", NOW + DAY), None, "not an exclusion");
+        assert!(again.rows(NOW + DAY).iter().all(|r| !r.reason.starts_with("auto:")), "and no row");
+        assert!(again.add_auto(AutoEntry::host("pin.example", AutoReason::Pinning, NOW + DAY, None), NOW + DAY), "it newly excludes");
+        let row = again.rows(NOW + DAY).into_iter().find(|r| r.reason == "auto:pinning").unwrap();
+        assert_eq!((row.created_ms, row.retries), (Some(NOW), 1), "with its history, across the restart");
+    }
+
+    #[test]
+    fn add_auto_says_when_it_newly_excludes() {
+        let slot = ExclusionSlot::new(None, &[], NOW);
+        assert!(slot.add_auto(pinned("a.example"), NOW), "new");
+        assert!(!slot.add_auto(pinned("a.example"), NOW), "held");
+        assert!(slot.add_auto(AutoEntry::host("a.example", AutoReason::ClientCert, NOW, None), NOW), "another reason is another entry");
+        assert!(slot.try_again(&Pattern::Exact("a.example".into()), None, NOW));
+        assert!(slot.add_auto(pinned("a.example"), NOW), "back from a retry");
+    }
+
+    #[test]
+    fn retry_cannot_touch_a_user_line_a_list_line_or_a_floor_fact() {
+        use sieve_filter::exclusions::restricted_suffix;
+        let slot = ExclusionSlot::new(None, &["bank.example".to_string()], NOW);
+        assert_eq!(find(&slot, "bank.example", NOW), Some(Src::User));
+        assert!(!slot.try_again(&Pattern::Subdomains("bank.example".into()), None, NOW), "a user line");
+        assert_eq!(find(&slot, "bank.example", NOW), Some(Src::User));
+        // The seed's own line: it names a real exclusion the test need not spell.
+        let listed = slot.rows(NOW).into_iter().find(|r| r.reason == "list:sensitive").expect("the seed has rows");
+        let entry = parse_line(&listed.line).unwrap();
+        assert!(!slot.try_again(&entry.pattern, None, NOW), "a list line");
+        assert_eq!(slot.rows(NOW).iter().filter(|r| r.line == listed.line).count(), 1);
+        assert!(!slot.try_again(&Pattern::Exact("service.gov.uk".into()), None, NOW), "a floor fact has no entry to take back");
+        assert!(restricted_suffix("service.gov.uk"), "and stands whatever the store says");
+    }
+
+    #[test]
+    fn retry_of_nothing_is_false() {
+        let slot = ExclusionSlot::new(None, &[], NOW);
+        assert!(!slot.try_again(&Pattern::Exact("pin.example".into()), None, NOW));
+        slot.add_auto(AutoEntry::for_app("pin.example", "client.exe", AutoReason::Pinning, NOW), NOW);
+        assert!(!slot.try_again(&Pattern::Exact("pin.example".into()), Some("other.exe"), NOW), "another app's");
+        assert!(!slot.try_again(&Pattern::Exact("pin.example".into()), None, NOW), "every app's is another entry");
+        assert!(slot.try_again(&Pattern::Exact("pin.example".into()), Some("client.exe"), NOW), "the control");
+    }
+
+    #[test]
+    fn the_revision_moves_when_the_rows_do() {
+        let slot = ExclusionSlot::new(None, &[], NOW);
+        let start = slot.revision();
+        slot.add_auto(pinned("a.example"), NOW);
+        let added = slot.revision();
+        assert!(added > start);
+        assert!(!slot.try_again(&Pattern::Exact("none.example".into()), None, NOW));
+        assert_eq!(slot.revision(), added, "nothing changed");
+        slot.try_again(&Pattern::Exact("a.example".into()), None, NOW);
+        assert!(slot.revision() > added);
+    }
+
+    #[test]
+    fn rows_hold_the_lists_and_the_auto_layer_not_the_user_layer() {
+        let slot = ExclusionSlot::new(None, &["mine.example".to_string()], NOW);
+        slot.add_auto(AutoEntry::for_app("pin.example", "client.exe", AutoReason::Pinning, NOW), NOW);
+        slot.add_auto(AutoEntry::host("ev.example", AutoReason::Ev, NOW, Some(NOW + DAY)), NOW);
+        let rows = slot.rows(NOW);
+        assert!(rows.iter().all(|r| !r.line.contains("mine.example") && r.reason != "user"), "the user layer is not sent");
+        assert!(rows.iter().any(|r| r.line == "\"pin.example\"" && r.apps == ["client.exe"] && r.reason == "auto:pinning"));
+        assert!(rows.iter().any(|r| r.reason == "list:sensitive" && r.created_ms.is_none()));
+        assert!(!slot.rows(NOW + DAY).iter().any(|r| r.reason == "auto:ev"), "gone at its end");
+    }
+
+    #[test]
+    fn the_view_says_the_scope_and_the_browsers_decrypt_uses() {
+        struct One;
+        impl browsers::BrowserRegistry for One {
+            fn commands(&self) -> Vec<String> {
+                vec![r"C:\B\Browser.exe".to_string()]
+            }
+        }
+        let slot = ExclusionSlot::new(None, &[], NOW);
+        assert_eq!(slot.view(NOW).scope, ExclusionScope::Browsers);
+        let before = slot.revision();
+        slot.set_browsers(BrowserSet::read(&One));
+        assert_eq!(slot.view(NOW).browsers, [r"c:\b\browser.exe"]);
+        assert!(slot.view(NOW).revision > before, "the app's in-scope line reads it");
+    }
+
+    #[cfg(feature = "live-scope")]
+    #[test]
+    fn a_live_scope_file_widens_this_run_and_nothing_else_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope_of = |dir: &Path| ExclusionSlot::new(Some(dir), &[], NOW).switches(true, true).scope;
+        assert_eq!(scope_of(dir.path()), Scope::Browsers, "no file");
+        for bad in ["not json", r#"{"scope":"browsers"}"#, r#"{"scope":"all","x":1}"#] {
+            std::fs::write(dir.path().join(LIVE_SCOPE_FILE), bad).unwrap();
+            assert_eq!(scope_of(dir.path()), Scope::Browsers, "{bad}");
+        }
+        std::fs::write(dir.path().join(LIVE_SCOPE_FILE), r#"{"scope":"all"}"#).unwrap();
+        assert_eq!(scope_of(dir.path()), Scope::All);
     }
 
     #[test]

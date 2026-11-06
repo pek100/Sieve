@@ -166,6 +166,17 @@ fn glob_match(glob: &str, text: &str) -> bool {
     true
 }
 
+impl Pattern {
+    /// The pattern in the list grammar: what [`parse_line`] reads back as it.
+    pub fn line(&self) -> String {
+        match self {
+            Self::Subdomains(host) | Self::Wildcard(host) => host.clone(),
+            Self::Exact(host) => format!("\"{host}\""),
+            Self::Ip(ip) => ip.to_string(),
+        }
+    }
+}
+
 impl Exclusion {
     /// True when this entry excludes a flow to `host` (lower case, as
     /// decoded) or to `ip`, made by `exe` (full path or file name; None when
@@ -247,7 +258,7 @@ pub enum AutoReason {
 impl AutoReason {
     pub const ALL: [Self; 3] = [Self::Pinning, Self::ClientCert, Self::Ev];
 
-    fn slug(self) -> &'static str {
+    pub fn slug(self) -> &'static str {
         match self {
             Self::Pinning => "auto:pinning",
             Self::ClientCert => "auto:client-cert",
@@ -333,6 +344,15 @@ pub enum Source {
 }
 
 impl Source {
+    /// The word the log and the UI read: `user`, `list:banks`, `auto:pinning`.
+    pub fn slug(&self) -> String {
+        match self {
+            Self::User => "user".to_string(),
+            Self::List(id) => format!("list:{id}"),
+            Self::Auto(a) => a.slug().to_string(),
+        }
+    }
+
     fn rank(&self) -> u8 {
         match self {
             Self::User => 0,
@@ -359,9 +379,7 @@ impl PassReason {
         match self {
             Self::SwitchOff => Cow::Borrowed("off"),
             Self::Floor(f) => Cow::Borrowed(f.slug()),
-            Self::Stored(Source::User) => Cow::Borrowed("user"),
-            Self::Stored(Source::List(id)) => Cow::Owned(format!("list:{id}")),
-            Self::Stored(Source::Auto(a)) => Cow::Borrowed(a.slug()),
+            Self::Stored(source) => Cow::Owned(source.slug()),
             Self::AppOff => Cow::Borrowed("app_off"),
         }
     }
@@ -901,6 +919,14 @@ naïve.example
     }
 
     proptest! {
+        /// Whatever the parser takes, `line` writes back as the same pattern.
+        #[test]
+        fn pattern_line_round_trips(line in prop_oneof!["\"?[a-zA-Z0-9_.*-]{1,40}\"?", any::<std::net::IpAddr>().prop_map(|ip| ip.to_string())]) {
+            if let Ok(entry) = parse_line(&line) {
+                prop_assert_eq!(parse_line(&entry.pattern.line()).map(|e| e.pattern), Ok(entry.pattern));
+            }
+        }
+
         #[test]
         fn parsing_any_text_never_panics_and_accounts_for_every_rule_line(text in "[ -~\n\"$*|.]{0,400}") {
             let p = parse(&text);

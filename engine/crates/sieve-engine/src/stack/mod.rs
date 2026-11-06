@@ -68,6 +68,8 @@ const KX_GROUP_NAMES: [&str; KX_GROUPS] = ["X25519MLKEM768", "X25519", "secp256r
 pub struct HttpsMeters {
     pub intercepted: AtomicU64,
     pub passed: AtomicU64,
+    /// Exclusions self-healing wrote (plan 6's rate), no host.
+    pub healed: AtomicU64,
     pub upstream_groups: [AtomicU64; KX_GROUPS],
     pub client_groups: [AtomicU64; KX_GROUPS],
 }
@@ -81,6 +83,7 @@ impl HttpsMeters {
         serde_json::json!({
             "intercepted": self.intercepted.load(Ordering::Relaxed),
             "passed": self.passed.load(Ordering::Relaxed),
+            "healed": self.healed.load(Ordering::Relaxed),
             "upstream_groups": groups(&self.upstream_groups),
             "client_groups": groups(&self.client_groups),
         })

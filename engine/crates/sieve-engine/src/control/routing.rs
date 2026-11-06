@@ -47,7 +47,7 @@ use crate::route::watch::{RouteWatch, watch as watch_routes};
 use crate::stack::egress::Egress;
 use crate::stack::relay::{Relay, RelayParts, UDP_IDLE, Witness, handle_tcp, handle_udp};
 use crate::tls::active::Active;
-use crate::tls::intercept::{Interception, NoWatch, wanted};
+use crate::tls::intercept::{Interception, wanted};
 use crate::tls::upstream::{PlatformTrust, TRUST_TIMEOUT, Verifier};
 use crate::tls::verdict::VerdictCache;
 use crate::tun::device::{Tun, TunDevice};
@@ -350,7 +350,7 @@ fn build_interception(engine: &Engine, egress: &Arc<Egress>) -> Result<Intercept
         names: engine.names.clone(),
         book: engine.book.clone(),
         meters: engine.meters.clone(),
-        watch: Arc::new(NoWatch),
+        watch: engine.heal.clone(),
         hook: Arc::new(NoRewrite),
         clock: wall_ms,
     })

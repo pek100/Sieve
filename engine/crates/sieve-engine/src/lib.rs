@@ -13,6 +13,7 @@
 //!   interception behind `filtering.https` (slice 6);
 //! - [`http`]: decrypted requests through hyper, with full-URL rules (slice 6);
 //! - [`exclusions`]: the store behind `sieve_filter::exclusions::decrypt`;
+//! - [`heal`]: self-healing exclusions and their notices (slice 7);
 //! - [`lru`]: the bounded caches' shape;
 //! - [`coexist`]: AdGuard and VPN detection, read only (slice 3);
 //! - [`update`]: signed updates, the service as the only updater (slice 13);
@@ -36,6 +37,7 @@ pub mod exclusions;
 pub mod experiments;
 pub mod flow;
 pub mod hand_file;
+pub mod heal;
 pub mod http;
 pub mod inject;
 pub mod ipc;

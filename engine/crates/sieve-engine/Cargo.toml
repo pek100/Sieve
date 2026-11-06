@@ -37,6 +37,9 @@ stall = []
 attribution-diagnostics = []
 # Restart-only relay CPU experiments, absent from production builds.
 relay-experiments = []
+# Slice 7's live check only (task D10): reads `live-scope.json` at start, so a
+# client that is no browser can be intercepted and heal. Never in a release.
+live-scope = []
 
 [dependencies]
 sieve-filter = { path = "../sieve-filter" }

@@ -40,6 +40,13 @@ impl BrowserSet {
     pub fn contains(&self, exe: &str) -> bool {
         self.0.contains(&exe.to_ascii_lowercase())
     }
+
+    /// The full paths, lower case and sorted: what `contains` compares, for the app.
+    pub fn paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.0.iter().cloned().collect();
+        paths.sort();
+        paths
+    }
 }
 
 /// The machine's registry (Windows). Reading is always allowed; each hive that

@@ -32,6 +32,11 @@ pub fn log_visible_to(row: &LogRow, session: u32) -> bool {
     row.forwarded.is_some() || matches!(row.session, Some(s) if s == session || s == 0)
 }
 
+/// [`visible_to`] for a self-healing notice: a client gets its own session's.
+pub fn notice_visible_to(notice: &sieve_ipc::HealNotice, session: u32) -> bool {
+    notice.session == session || notice.session == 0
+}
+
 /// What a decision says in the log; None when nothing was decided. With the
 /// switch off the engine sieves nothing, and a lookup is never a decision.
 pub fn log_outcome(decision: &Decision) -> Option<LogOutcome> {

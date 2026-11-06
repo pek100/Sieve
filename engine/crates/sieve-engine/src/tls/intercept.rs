@@ -70,13 +70,17 @@ pub trait Dial: Send + Sync + 'static {
 pub struct Pair {
     pub exe: Option<String>,
     pub host: String,
+    /// The flow's Windows session: what a notice of this pair is scoped to.
+    pub session: Option<u32>,
 }
 
-/// What the client side did, for self-healing (slice 7). `NoWatch` until then.
+/// What the client side did, for self-healing (`heal::Heal` in production; the
+/// plain `NoWatch` in tests that do not read it).
 pub trait ClientWatch: Send + Sync {
-    /// The client refused our handshake, with its alert when it sent one.
+    /// The client refused our handshake, or sent a fatal alert right after it, with
+    /// its alert when it sent one.
     fn handshake_failed(&self, pair: &Pair, alert: Option<AlertDescription>);
-    /// A request arrived on an intercepted connection.
+    /// The first request of an intercepted connection arrived.
     fn request_seen(&self, pair: &Pair);
     /// The client closed after the handshake without one request.
     fn closed_without_request(&self, pair: &Pair, after: Duration);
@@ -190,7 +194,7 @@ impl<C: Dial> Interception<C> {
     /// holds for this run, and comes back at its next sighting after a restart.
     fn exclude(&self, host: &str, reason: AutoReason, expires_ms: Option<u64>) {
         let now = (self.clock)();
-        self.exclusions.add_auto(AutoEntry::host(host, reason, now, expires_ms), now);
+        let _newly = self.exclusions.add_auto(AutoEntry::host(host, reason, now, expires_ms), now);
     }
 
     /// The pass-through after an upstream handshake: its socket has spoken, so
@@ -404,7 +408,7 @@ where
             return deps.fresh_splice(&mut app, flow.remote, &held).await;
         }
     };
-    let pair = Pair { exe: flow.exe.map(str::to_string), host: host.to_string() };
+    let pair = Pair { exe: flow.exe.map(str::to_string), host: host.to_string(), session: flow.session };
     // The client has our answer by now, so a close can only end the flow. That
     // says nothing about the client, so the watch does not hear of it.
     let accepted = tokio::select! {
@@ -437,7 +441,10 @@ where
     deps.after_serve(host, ended.upstream_error.as_ref());
     // Evidence about the client only if the client did it (task D17, plan 4.3).
     if ended.client_ended && !ctx.request_was_seen() {
-        deps.watch.closed_without_request(&pair, started.elapsed());
+        match ended.client_alert {
+            Some(alert) => deps.watch.handshake_failed(&pair, Some(alert)),
+            None => deps.watch.closed_without_request(&pair, started.elapsed()),
+        }
     }
     FlowAction::Relayed
 }
