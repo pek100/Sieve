@@ -4,11 +4,20 @@ Run by the user, on a machine where the engine is installed and `filtering.engin
 
 `dns-status.json` beside `status.json` holds the facts these checks read, rewritten every 30 s while routes are up: per upstream its `address`, `connected`, `kx_group`, `alpn`, `answers`, `failures`, and never a queried name. `kx_group` is `null` for DoQ because quinn does not expose it.
 
-To set a list, stop the engine, write `dns.json` beside `policy.json`, and start it (the app's setting comes with the settings stream). A raised `revision` matters only for later writes through the pipe. A bad file reads as the defaults and `last_error` in `status.json` says why. Save it as UTF-8, up to 32 KB: `Set-Content -Encoding utf8` is fine (its BOM is accepted), while `>` in Windows PowerShell writes UTF-16, which is refused by name. Setting a good list through the pipe replaces a bad file and ends its reason in `last_error`.
+**The setting owns the list.** While the app runs, `filtering.upstreams` wins over `dns.json`: at the first probe, and at every probe after, the app reads the engine's list back and overwrites it, and so `dns.json`, if it differs. The setting's default is not empty, so an untouched app does this too. A list written by hand lasts only while the app is closed.
+
+To set a list, use one of these two ways.
+
+- **Through the setting, with the app open.** The row in Settings has no editor, so use the settings menu: export, change `filtering.upstreams` in the file, and import it. Change only that key: an import replaces, and a known key the file does not carry goes back to its default, the engine switch included.
+- **By hand, with the app quit.** Quit Sieve, and keep it closed for the whole check, because opening it puts the setting's list back. Stop the engine, write `dns.json` beside `policy.json`, and start it. A raised `revision` matters only for later writes through the pipe.
+
+A bad file reads as the defaults and `last_error` in `status.json` says why. Save it as UTF-8, up to 32 KB: `Set-Content -Encoding utf8` is fine (its BOM is accepted), while `>` in Windows PowerShell writes UTF-16, which is refused by name. Setting a good list through the pipe, which the app also does, replaces a bad file and ends its reason in `last_error`.
 
 ```json
 { "revision": 1, "upstreams": ["https://192.0.2.1/dns-query", "https://cloudflare-dns.com/dns-query"] }
 ```
+
+In the settings file the same list is the value of `filtering.upstreams`, with no `revision`.
 
 ## 1. No plain DNS leaves the machine
 
@@ -26,7 +35,7 @@ Pass: every port 53 packet is to or from a LAN address, or on the Sieve interfac
 
 ## 2. Failover on the real path
 
-List `https://192.0.2.1/dns-query` first, as above (a documentation address that never answers). Run `Measure-Command { Resolve-DnsName example.com -DnsOnly -Type A }` with a name not in the cache. First confirm the list applied: `last_error` does not mention `dns.json`, and `dns-status.json` lists `192.0.2.1`. Otherwise the defaults are answering and this check proves nothing. Pass: an answer, in under 2 s. Later lookups skip the dead upstream for 30 s at a time and take no extra second.
+List `https://192.0.2.1/dns-query` first, as above (a documentation address that never answers). Run `Measure-Command { Resolve-DnsName example.com -DnsOnly -Type A }` with a name not in the cache. First confirm the list applied: `last_error` does not mention `dns.json`, and `dns-status.json` lists `192.0.2.1`. Otherwise the defaults are answering, or the app overwrote a hand-written list, and this check proves nothing. Pass: an answer, in under 2 s. Later lookups skip the dead upstream for 30 s at a time and take no extra second.
 
 ## 3. Post-quantum key exchange with the real resolver
 
