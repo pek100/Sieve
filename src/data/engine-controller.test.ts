@@ -103,7 +103,7 @@ function fakeEngine(start: EngineScenario) {
     source,
     set: (s: EngineScenario) => void (mock = createMockEngine(s)),
     setCert: (c: CertScenario) => void (mock = createMockEngine(start, { cert: c })),
-    holdHttps: () => void (mock = createMockEngine(start, { heal: true })),
+    holdHttps: (run?: number) => void (mock = createMockEngine(start, { heal: true, run })),
     probes: () => probes,
     certReads: () => certReads,
     rowReads: () => rowReads,
@@ -206,7 +206,7 @@ describe("engine controller, what is not decrypted", () => {
     const s = await holdingOff();
     const group = (id: number, rev: number) => ({ id, session: 1, exe: "client.exe", hosts: [`h${id}.example`], total: 1, rev });
     const asked: number[] = [];
-    let answer = { revision: 5, exclusions_revision: 1, notices: [group(1, 2), group(2, 5)] };
+    let answer = { run: 1, revision: 5, exclusions_revision: 1, notices: [group(1, 2), group(2, 5)] };
     s.fake.source.healNotices = async (after) => {
       asked.push(after);
       return answer;
@@ -214,7 +214,7 @@ describe("engine controller, what is not decrypted", () => {
     await s.fc.advance(ENGINE_POLL_MS);
     expect(slice(s).healNotices ?? [], "the window was not there for these").toEqual([]);
     expect(s.notices.list()).toEqual([]);
-    answer = { revision: 6, exclusions_revision: 1, notices: [group(3, 6)] };
+    answer = { run: 1, revision: 6, exclusions_revision: 1, notices: [group(3, 6)] };
     await s.fc.advance(ENGINE_POLL_MS);
     expect(asked).toEqual([0, 5]);
     expect(slice(s).healNotices?.map((n) => n.id), "what comes after it is told").toEqual([3]);
@@ -254,14 +254,42 @@ describe("engine controller, what is not decrypted", () => {
   it("a group's new revision replaces it in the slice, and a new engine run is a new group", async () => {
     const s = await holding();
     await s.fc.advance(ENGINE_POLL_MS);
-    expect(slice(s).healNotices?.map((n) => [n.key, n.total])).toEqual([["0:1", 1]]);
+    expect(slice(s).healNotices?.map((n) => [n.key, n.total])).toEqual([["1:1", 1]]);
     await s.fc.advance(ENGINE_POLL_MS);
-    expect(slice(s).healNotices?.map((n) => [n.key, n.total])).toEqual([["0:1", 2]]);
-    s.fake.holdHttps();
+    expect(slice(s).healNotices?.map((n) => [n.key, n.total])).toEqual([["1:1", 2]]);
+    s.fake.holdHttps(2);
     await s.fc.advance(ENGINE_POLL_MS);
-    expect(slice(s).healNotices?.map((n) => n.key), "a new run with nothing to say yet").toEqual(["0:1"]);
+    expect(slice(s).healNotices?.map((n) => n.key)).toEqual(["1:1", "2:1"]);
+    s.undo();
+  });
+
+  // The new run's first group can sit at or past the old cursor before the next poll:
+  // no revision comparison can tell, and at the same revision `after` holds nothing.
+  it.each([
+    ["behind the old cursor", 2, 1],
+    ["at the old cursor", 2, 2],
+    ["past the old cursor", 2, 3],
+  ])("a new engine run whose revision is %s has its first group told", async (_, cursor, revision) => {
+    const s = await holdingOff();
+    const asked: number[] = [];
+    const group = (rev: number) => ({ id: 1, session: 1, exe: "client.exe", hosts: ["h.example"], total: 1, rev });
+    let held = { run: 10, revision: cursor, exclusions_revision: 1, notices: [group(cursor)] };
+    s.fake.source.healNotices = async (after) => {
+      asked.push(after);
+      return { ...held, notices: held.notices.filter((n) => n.rev > after) };
+    };
     await s.fc.advance(ENGINE_POLL_MS);
-    expect(slice(s).healNotices?.map((n) => n.key)).toEqual(["0:1", "1:1"]);
+    held = { ...held, revision: cursor + 1, notices: [group(cursor + 1)] };
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).healNotices?.map((n) => n.key), "the control: told in the old run").toEqual(["10:1"]);
+    held = { run: 11, revision, exclusions_revision: 1, notices: [group(revision)] };
+    asked.length = 0;
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(asked, "the old cursor means nothing to the new run").toEqual([cursor + 1, 0]);
+    expect(slice(s).healNotices?.map((n) => n.key)).toEqual(["10:1", "11:1"]);
+    asked.length = 0;
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(asked, "and its own cursor holds from here").toEqual([revision]);
     s.undo();
   });
 

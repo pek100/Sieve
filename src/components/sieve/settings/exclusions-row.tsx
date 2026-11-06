@@ -5,7 +5,7 @@ import { IconButton } from "@/components/sieve/primitives/icon-button";
 import { AppIcon } from "@/components/sieve/primitives/app-icon";
 import { Monogram } from "@/components/sieve/apps/monogram";
 import { Button } from "@/components/ui/button";
-import { canTryAgain, retryWords, rowReasonWords, type ExclusionView } from "@/core/exclusions";
+import { canTryAgain, firstDateWords, retryWords, rowReasonWords, type ExclusionView } from "@/core/exclusions";
 import type { ExclusionsModel } from "./use-exclusions";
 
 /** The apps a row is for: each with its icon, or "All apps". */
@@ -31,6 +31,7 @@ function RowApps({ apps, appInfo }: { apps: readonly string[]; appInfo: Exclusio
 /** One thing that is not decrypted: its pattern, who for, why, and what can be done about it. A list's line offers nothing. */
 export function ExclusionsRow({ row, model }: { row: ExclusionView; model: Pick<ExclusionsModel, "appInfo" | "remove" | "tryAgain"> }) {
   const retried = retryWords(row.retries);
+  const first = firstDateWords(row.createdMs);
   return (
     <li className="flex min-h-11 flex-wrap items-center justify-between gap-x-4 gap-y-1 py-1" data-exclusion-row={row.reason}>
       <div className="flex min-w-0 flex-1 basis-64 flex-col gap-1">
@@ -40,6 +41,7 @@ export function ExclusionsRow({ row, model }: { row: ExclusionView; model: Pick<
           <span className="min-w-0 text-label text-on-surface-muted">
             {rowReasonWords(row)}
             {retried && `, ${retried}`}
+            {first && `, ${first}`}
           </span>
         </span>
       </div>

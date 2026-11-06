@@ -210,6 +210,39 @@ describe("Not decrypted", () => {
     expect(screen.queryByRole("button", { name: "Try decrypting all again" }), "nothing left to try").toBeNull();
   });
 
+  it("an app of several files: the view holds the rows of each, and try all reaches each that has any", async () => {
+    const engine = createMockEngine("idle", { heal: true });
+    const tryAgain = vi.spyOn(engine, "tryDecryptAgain");
+    const { runtime, user } = await withRows({ engine, search: "?exclusionsApp=agent.exe&exclusionsApp=client.exe&exclusionsApp=helper.exe&exclusionsReason=pinning" });
+    const pin = (line: string, apps: string[]): ExclusionRow => ({ line, apps, reason: "auto:pinning", created_ms: 1793000000000, retries: 0 });
+    await withSlice(runtime, { exclusions: { revision: 4, rows: [pin('"pin.example"', ["client.exe"]), pin('"more.example"', ["helper.exe"]), pin('"else.example"', ["other.exe"])], scope: "all", browsers: [], skipped: 0 } });
+    expect(lines()).toEqual(['"pin.example"', '"more.example"']);
+    await user.click(screen.getByRole("button", { name: "Try decrypting all again" }));
+    await vi.waitFor(() => expect(tryAgain.mock.calls).toEqual([[null, "client.exe", null], [null, "helper.exe", null]]));
+    expect(within(group()).queryByRole("alert")).toBeNull();
+  });
+
+  it("try all stops at a refusal and says so; the rows taken back so far stay taken back", async () => {
+    const engine = createMockEngine("idle", { heal: true });
+    const works = engine.tryDecryptAgain;
+    engine.tryDecryptAgain = async (line, app, reason) => (app === "helper.exe" ? Promise.reject(new Error("the pipe closed")) : works(line, app, reason));
+    const { runtime, user } = await withRows({ engine, search: "?exclusionsApp=client.exe&exclusionsApp=helper.exe" });
+    const before = runtime.store.getState().engine.exclusions;
+    if (!before) throw new Error("the rows came");
+    await withSlice(runtime, { exclusions: { ...before, rows: [...before.rows, { line: '"more.example"', apps: ["helper.exe"], reason: "auto:pinning", created_ms: 1, retries: 0 }] } });
+    await user.click(screen.getByRole("button", { name: "Try decrypting all again" }));
+    expect(await within(group()).findByRole("alert")).toHaveTextContent("the pipe closed");
+    expect(lines()).not.toContain('"pin.example"');
+  });
+
+  it("the date an auto row first came, where it says why; a row with no date says none", async () => {
+    await withRows({ lines: ["mine.example"] });
+    expect(rowOf('"pin.example"')).toHaveTextContent(/tried again 1 time, first on .*2026/);
+    expect(rowOf('"cert.example"')).toHaveTextContent(/client certificate \(auto\), first on .*2026/);
+    expect(rowOf("mine.example")).not.toHaveTextContent("first on");
+    expect(rowOf("bank.example")).not.toHaveTextContent("first on");
+  });
+
   it("no try all with no app, or for an app with nothing rejected", async () => {
     await withRows();
     expect(screen.queryByRole("button", { name: "Try decrypting all again" })).toBeNull();

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use sieve_filter::rules::{RuleEngine, RuleSet};
-use sieve_ipc::{Blocker, CertStatus, DnsUpstreams, EngineStatus, ExclusionsView, FlowEvent, HealNotice, ListStatus, LogRow, Policy};
+use sieve_ipc::{Blocker, CertStatus, DnsUpstreams, EngineStatus, ExclusionsView, FlowEvent, ListStatus, LogRow, Policy};
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::ca::Ca;
@@ -25,7 +25,7 @@ use crate::dns::{NameMap, config};
 use crate::domain::{DomainFilter, FilterSlot, user_engine, user_rules_changed};
 use crate::exclusions::ExclusionSlot;
 use crate::heal::{Heal, Retry};
-use crate::ipc::{Backend, Subscription};
+use crate::ipc::{Backend, HealAnswer, Subscription};
 use crate::lists::Lists;
 use crate::policy::{self, Runs};
 use crate::stack::Meters;
@@ -500,9 +500,9 @@ impl Backend for Engine {
         self.heal.try_again(&retry, policy::wall_ms());
     }
 
-    fn heal_notices(&self, after: u64) -> (u64, u64, Vec<HealNotice>) {
+    fn heal_notices(&self, after: u64) -> HealAnswer {
         let (revision, notices) = self.heal.notices(after);
-        (revision, self.exclusions.revision(), notices)
+        HealAnswer { run: self.heal.run(), revision, exclusions_revision: self.exclusions.revision(), notices }
     }
 }
 
@@ -1055,9 +1055,10 @@ mod tests {
         assert!(e.exclusions.get().find(Some("pin.example"), ip, Some(r"C:\Apps\Client.exe"), true).is_some());
         assert!(e.exclusions.get().find(Some("pin.example"), ip, Some(r"C:\Apps\Other.exe"), true).is_none());
         assert_eq!(e.meters.https.report()["healed"], 1);
-        let (revision, rows_revision, notices) = e.heal_notices(0);
-        assert_eq!((revision, notices.len()), (1, 1));
-        assert_eq!(rows_revision, e.exclusions.revision());
+        let answer = e.heal_notices(0);
+        assert_eq!((answer.revision, answer.notices.len()), (1, 1));
+        assert_eq!(answer.exclusions_revision, e.exclusions.revision());
+        assert_eq!(answer.run, e.heal.run());
         assert_eq!(e.exclusions().rows.iter().filter(|r| r.reason == "auto:pinning").count(), 1);
         e.try_decrypt_again(Retry::One { pattern: sieve_filter::exclusions::Pattern::Exact("pin.example".into()), app: Some("client.exe".into()), reason: sieve_filter::exclusions::AutoReason::Pinning });
         assert_eq!(e.exclusions().rows.iter().filter(|r| r.reason == "auto:pinning").count(), 0);

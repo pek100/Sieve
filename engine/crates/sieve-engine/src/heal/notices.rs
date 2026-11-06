@@ -73,10 +73,9 @@ impl Notices {
         self.revision
     }
 
-    /// The groups that changed after `after`. A cursor past the newest revision is
-    /// from before a restart, so it reads from the start.
+    /// The groups that changed after `after`, a revision of this run: a client that
+    /// sees a new run reads from 0 (`EngineMessage::HealNotices`).
     pub fn after(&self, after: u64) -> Vec<HealNotice> {
-        let after = if after > self.revision { 0 } else { after };
         self.groups.iter().filter(|g| g.notice.rev > after).map(|g| g.notice.clone()).collect()
     }
 }
@@ -214,9 +213,9 @@ mod tests {
     }
 
     #[test]
-    fn a_cursor_past_a_restart_reads_from_the_start() {
-        let notices = pushed(&[(1, APP, "a.example", NOW)]);
-        assert_eq!(notices.after(9000).len(), 1);
-        assert!(Notices::default().after(9000).is_empty());
+    fn reading_from_zero_holds_every_group_of_the_run() {
+        let notices = pushed(&[(1, APP, "a.example", NOW), (1, "other.exe", "a.example", NOW)]);
+        assert_eq!(notices.after(0).len(), 2);
+        assert!(notices.after(9000).is_empty(), "a cursor means nothing outside its run, and the run says so");
     }
 }

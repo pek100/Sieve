@@ -22,7 +22,7 @@ Copy the output of `route print`, `Get-DnsClientServerAddress`, `netsh winhttp s
 |---|---|---|
 | U1 | `curl --cacert <public bundle> https://<intercepted host>/`, twice. First confirm the build's curl honours `--cacert` (schannel builds differ); a curl with OpenSSL or the bundled cacert is the alternative. | The first fails. A row appears: that host, curl, "Rejected Sieve's certificate (auto)". The second works and shows the host's real issuer. One notice. |
 | U2 | Discord or Steam, if installed, for a few minutes. | Each works after at most one failed request per host. One notice per app, not per host. |
-| U3 | "Try decrypting again" on U1's row, then curl again. | The next curl fails once. The row comes back with its first date and "tried again 1 time". |
+| U3 | "Try decrypting again" on U1's row, then curl again. | The next curl fails once. The row comes back reading "tried again 1 time, first on" U1's day, not a later one. |
 | U4 | What real clients do: for U1 and U2, read which alert or close each client produced. Does any fatal alert arrive after the handshake (task D3)? | Reported, with the client and the alert. Nothing to pass. |
 | U5 | 30 minutes of normal browsing in Chrome, Edge and Firefox. Count closes within `SILENT_CLOSE_MS` per host, and `status.json`'s `https.healed` per app. | Zero `auto:pinning` rows expected. The number decides Q2 and `MAX_CREDIT`. |
 | U6 | Firefox open during the first enable and during a Reinstall (task F7). | Reported: does it reject until restart, and how many rows does that leave? After a restart, "Try decrypting all again" on Firefox recovers it. The answer decides Q3. |

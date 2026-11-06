@@ -17,10 +17,10 @@ export function AppExclusionsLine({ on, exes }: { on: boolean; exes: readonly st
   if (said.line === null) return null;
   return (
     <p className="text-label text-on-surface-muted" data-testid="app-https">
-      {said.app === null ? (
+      {said.apps.length === 0 ? (
         said.line
       ) : (
-        <Link href={exclusionsHref(said.app)} className="underline underline-offset-2 hover:text-on-surface">
+        <Link href={exclusionsHref(said.apps)} className="underline underline-offset-2 hover:text-on-surface">
           {said.line}
         </Link>
       )}

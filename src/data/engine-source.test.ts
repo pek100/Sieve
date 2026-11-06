@@ -95,7 +95,7 @@ describe("Tauri engine source", () => {
     const asked: [string, unknown][] = [];
     const rows = createTauriEngine((async (cmd: string, args: unknown) => {
       asked.push([cmd, args]);
-      return cmd === "engine_heal_notices" ? { revision: 3, exclusions_revision: 4, notices: [] } : page;
+      return cmd === "engine_heal_notices" ? { run: 9, revision: 3, exclusions_revision: 4, notices: [] } : page;
     }) as never);
     expect(await rows.exclusions(5)).toEqual({ ...page, skipped: 0 });
     expect(await rows.tryDecryptAgain('"a.example"', "x.exe", "auto:pinning")).toEqual({ ...page, skipped: 0 });

@@ -11,7 +11,9 @@ import { createMockSource } from "@/data/mock-source";
 import { parseEngineProbe } from "@/data/protocol";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "@/hooks/runtime";
+import { SieveProvider } from "@/hooks/sieve-provider";
 import { AppShell } from "@/components/sieve/shell/app-shell";
+import { AppExclusionsLine } from "./app-exclusions-line";
 import { APP_OFF_MEANS } from "./app-toggle";
 import { AppsScreen } from "./apps-screen";
 
@@ -103,6 +105,22 @@ describe("apps screen", () => {
       expect(line).toHaveTextContent("Sieve decrypts this app's HTTPS except 2 sites");
       // The build's trailing slash is next.config's, which this test does not load.
       expect(within(line!).getByRole("link").getAttribute("href")).toMatch(/^\/settings\/?\?exclusionsApp=chrome\.exe#not-decrypted$/);
+    });
+
+    it("an app of several files links to all of them, so the view holds the row it counted", async () => {
+      const { runtime } = await setup();
+      const welcome = parseEngineProbe(fixture.examples.idle);
+      if (welcome.pipe?.kind !== "welcome") throw new Error("the example answers");
+      const probe = { ...welcome, pipe: { ...welcome.pipe, status: { ...welcome.pipe.status, policy: { ...welcome.pipe.status.policy, https: true } } } };
+      act(() => runtime.store.setEngine({ ...runtime.store.getState().engine, probe, exclusions: { revision: 1, rows: [rowFor('"pin.example"', ["firefox.exe"])], scope: "all", browsers: [], skipped: 0 } }));
+      render(
+        <SieveProvider runtime={runtime}>
+          <AppExclusionsLine on exes={[String.raw`C:\ff\default-browser-agent.exe`, String.raw`C:\ff\firefox.exe`]} />
+        </SieveProvider>,
+      );
+      const line = screen.getByTestId("app-https");
+      expect(line).toHaveTextContent("except 1 site");
+      expect(within(line).getByRole("link").getAttribute("href")).toMatch(/^\/settings\/?\?exclusionsApp=default-browser-agent\.exe&exclusionsApp=firefox\.exe#not-decrypted$/);
     });
 
     it("in force, out of scope", async () => {

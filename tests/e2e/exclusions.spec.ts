@@ -27,7 +27,7 @@ test.describe("exclusions", () => {
       await page.setViewportSize(viewport);
       const { group, errors } = await openGroup(page);
       await expect(lines(group)).toHaveCount(4);
-      await expect(group).toContainText("Rejected Sieve's certificate (auto), tried again 1 time");
+      await expect(group).toContainText(/Rejected Sieve's certificate \(auto\), tried again 1 time, first on .*2026/);
       await expect(group).toContainText("Sieve never decrypts these");
       await expect(group.getByRole("radiogroup", { name: "Filter by reason" })).toBeVisible();
       expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
@@ -48,6 +48,13 @@ test.describe("exclusions", () => {
     await expect(lines(group)).toHaveCount(3);
     const asked = new URL(page.url()).searchParams;
     expect([asked.get("exclusionsApp"), asked.get("exclusionsReason")]).toEqual([null, null]);
+  });
+
+  test("a link carrying every file of an app holds the rows of the one that was excluded, and can try them", async ({ page }) => {
+    const { group } = await openGroup(page, "&exclusionsApp=agent.exe&exclusionsApp=client.exe&exclusionsReason=pinning");
+    await expect(lines(group)).toHaveText(['"pin.example"']);
+    await group.getByRole("button", { name: "Try decrypting all again" }).click();
+    await expect(lines(group)).toHaveCount(0);
   });
 
   test("the toast appears once with two grouped exclusions, and Show opens the filtered view", async ({ page }, info) => {

@@ -2,7 +2,7 @@
 
 import { useCallback, useMemo, useState } from "react";
 import { httpsInForce } from "@/core/engine";
-import { EXCLUSIONS_SHOWN, exclusionLine, exeFileName, filterRows, groupsOf, hasRejected, mergeRows, refusedLineWords, runningApp, type ExclusionView, type ReasonGroup } from "@/core/exclusions";
+import { EXCLUSIONS_SHOWN, exclusionLine, exeFileName, filterRows, groupsOf, mergeRows, refusedLineWords, rejectedFiles, runningApp, type ExclusionView, type ReasonGroup } from "@/core/exclusions";
 import { addLine, removeLine } from "@/core/log-actions";
 import { groupApps } from "@/core/apps";
 import { newest, type SieveState } from "@/core/store";
@@ -42,8 +42,10 @@ export interface ExclusionsModel {
   setGroup: (g: ReasonGroup) => void;
   query: string;
   setQuery: (q: string) => void;
-  /** The one app the view is filtered to, by file name. */
-  app: string | null;
+  /** The app the view is filtered to: its file names, or none. */
+  apps: readonly string[];
+  /** That app's name; null with no app. */
+  appName: string | null;
   clearApp: () => void;
   clearFilters: () => void;
   /** The filtered app has rejected sites to try again. */
@@ -65,11 +67,11 @@ export interface ExclusionsModel {
 export function useExclusions(): ExclusionsModel {
   const e = useEngine();
   const { notices, settings } = useRuntime();
-  const { tryDecryptAgain } = useEngineActions();
+  const { tryDecryptAgain, tryDecryptAllAgain } = useEngineActions();
   const [, writeLines] = useSetting("filtering.exclusions");
   const rows = useExclusionRows();
   const snapshot = useSieve(selectNewest);
-  const { app, group, setGroup, clearApp } = useExclusionsLink();
+  const { apps, group, setGroup, clearApp } = useExclusionsLink();
   const [query, setQuery] = useState("");
 
   const running = useMemo<RunningExe[]>(() => {
@@ -88,7 +90,10 @@ export function useExclusions(): ExclusionsModel {
     [snapshot],
   );
 
-  const matched = useMemo(() => filterRows(rows, { group, query, app }, (exe) => runningApp(snapshot, exe)?.name ?? null), [rows, group, query, app, snapshot]);
+  const matched = useMemo(() => filterRows(rows, { group, query, apps }, (exe) => runningApp(snapshot, exe)?.name ?? null), [rows, group, query, apps, snapshot]);
+  // Any of its files that runs names it; the one that opened the link may have exited.
+  const appInfos = apps.map(appInfo);
+  const rejected = rejectedFiles(rows, apps);
 
   const said = useCallback((err: unknown) => void notices.push({ kind: "error", text: message(err) }), [notices]);
   const now = useCallback(() => settings.get("filtering.exclusions"), [settings]);
@@ -133,14 +138,15 @@ export function useExclusions(): ExclusionsModel {
     setGroup,
     query,
     setQuery,
-    app,
+    apps,
+    appName: (appInfos.find((a) => a.exe !== null) ?? appInfos[0])?.name ?? null,
     clearApp,
     clearFilters: () => {
       setQuery("");
       setGroup("all");
       clearApp();
     },
-    canTryAll: app !== null && hasRejected(rows, app),
+    canTryAll: rejected.length > 0,
     appInfo,
     running,
     skipped: httpsInForce(e) ? (e.exclusions?.skipped ?? 0) : 0,
@@ -149,8 +155,6 @@ export function useExclusions(): ExclusionsModel {
     add,
     remove,
     tryAgain: (row) => void tryDecryptAgain(row.line, row.apps[0] ?? null, row.reason),
-    tryAll: () => {
-      if (app !== null) void tryDecryptAgain(null, app, null);
-    },
+    tryAll: () => void tryDecryptAllAgain(rejected),
   };
 }

@@ -49,11 +49,18 @@ pub struct Heal {
     exclusions: Arc<ExclusionSlot>,
     meters: Arc<Meters>,
     state: Mutex<State>,
+    /// Names this run for the notices, whose revisions and ids start over with a new
+    /// one: the time it started, which no other run of this engine shares.
+    run: u64,
 }
 
 impl Heal {
     pub fn new(exclusions: Arc<ExclusionSlot>, meters: Arc<Meters>) -> Self {
-        Self { exclusions, meters, state: Mutex::default() }
+        Self { exclusions, meters, state: Mutex::default(), run: wall_ms() }
+    }
+
+    pub fn run(&self) -> u64 {
+        self.run
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -183,6 +190,19 @@ mod tests {
         let notices = h.notices(0).1;
         assert_eq!(notices.iter().map(|n| (n.id, n.total)).collect::<Vec<_>>(), [(1, 1), (2, 1)], "a new notice of one site, inside the window too; the first stands");
         assert_eq!(notices[1].hosts, [HOST]);
+    }
+
+    #[test]
+    fn a_second_refusal_after_a_retry_keeps_the_first_date() {
+        let h = heal();
+        h.hear(&pair(CLIENT, HOST), refused(), NOW);
+        h.try_again(&one_row(), NOW + 5);
+        h.hear(&pair(CLIENT, HOST), refused(), NOW + 9);
+        h.hear(&pair(CLIENT, HOST), refused(), NOW + 10);
+        let rows = h.exclusions.rows(NOW + 10);
+        let row = rows.iter().find(|r| r.reason == "auto:pinning").unwrap();
+        assert_eq!((row.created_ms, row.retries), (Some(NOW), 1), "a client with two connections in flight loses nothing");
+        assert_eq!(h.notices(0).1.len(), 2, "and the second refusal raises no notice");
     }
 
     #[test]

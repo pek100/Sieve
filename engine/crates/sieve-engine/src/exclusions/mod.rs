@@ -251,19 +251,18 @@ impl ExclusionSlot {
     /// An entry the engine writes: `tls::intercept` and `heal`. Holds from this call
     /// on; the disk follows on the writer's thread, and a write that fails is
     /// reported by [`Self::error`]. The newest [`auto::MAX_PER_REASON`] of a reason
-    /// stay. True when this newly excludes something. Over a `retrying` entry it
-    /// keeps the first date and the count: the entry comes back with its history.
+    /// stay. True when this newly excludes something. Over any entry of the same
+    /// pattern, app and reason it keeps the first date and the count: the entry comes
+    /// back with its history, and another refusal of it changes neither.
     pub fn add_auto(&self, mut entry: AutoEntry, now_ms: u64) -> bool {
         let mut layers = lock(&self.layers);
         layers.auto.retain(|e| !e.expired(now_ms));
         let same = |e: &AutoEntry| e.pattern == entry.pattern && e.app == entry.app && e.reason == entry.reason;
         let before = layers.auto.iter().position(same).map(|at| layers.auto.remove(at));
-        // A held entry moves to the newest place.
+        // Its place is the newest: `cap` goes by position, not by date.
         if let Some(before) = &before {
             entry.retries = before.retries;
-            if before.retrying {
-                entry.created_ms = before.created_ms;
-            }
+            entry.created_ms = before.created_ms;
         }
         let newly = before.is_none_or(|b| b.retrying);
         layers.auto.push(entry);
@@ -571,7 +570,28 @@ mod tests {
         slot.add_auto(pinned("b.example"), NOW);
         slot.add_auto(AutoEntry::host("a.example", AutoReason::Pinning, NOW + 1, None), NOW + 1);
         let auto = &lock(&slot.layers).auto;
-        assert_eq!(auto.iter().map(|e| (e.pattern.clone(), e.created_ms)).collect::<Vec<_>>(), [(Pattern::Exact("b.example".into()), NOW), (Pattern::Exact("a.example".into()), NOW + 1)]);
+        assert_eq!(auto.iter().map(|e| (e.pattern.clone(), e.created_ms)).collect::<Vec<_>>(), [(Pattern::Exact("b.example".into()), NOW), (Pattern::Exact("a.example".into()), NOW)], "the newest place, its first date");
+    }
+
+    #[test]
+    fn retry_refuse_refuse_keeps_the_first_date() {
+        let slot = ExclusionSlot::new(None, &[], NOW);
+        let again = |at| slot.add_auto(AutoEntry::host("a.example", AutoReason::Pinning, at, None), at);
+        assert!(again(NOW));
+        assert!(slot.try_again(&Pattern::Exact("a.example".into()), None, AutoReason::Pinning, NOW + 1));
+        assert!(again(NOW + 2), "back from the retry");
+        assert!(!again(NOW + 3), "held");
+        let row = slot.rows(NOW + 3).into_iter().find(|r| r.reason == "auto:pinning").unwrap();
+        assert_eq!((row.created_ms, row.retries), (Some(NOW), 1));
+    }
+
+    #[test]
+    fn an_entry_past_its_end_starts_a_new_date() {
+        let slot = ExclusionSlot::new(None, &[], NOW);
+        slot.add_auto(AutoEntry::host("ev.example", AutoReason::Ev, NOW, Some(NOW + 1)), NOW);
+        assert!(slot.add_auto(AutoEntry::host("ev.example", AutoReason::Ev, NOW + 2, Some(NOW + 3)), NOW + 2), "gone, so new");
+        let row = slot.rows(NOW + 2).into_iter().find(|r| r.reason == "auto:ev").unwrap();
+        assert_eq!(row.created_ms, Some(NOW + 2));
     }
 
     #[test]

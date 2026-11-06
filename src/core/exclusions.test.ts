@@ -19,11 +19,12 @@ import {
   exclusionsLink,
   filterRows,
   groupsOf,
-  hasRejected,
   mergeRows,
   noticeText,
   reasonGroup,
   refusedLineWords,
+  firstDateWords,
+  rejectedFiles,
   retryWords,
   rowReasonWords,
 } from "./exclusions";
@@ -76,6 +77,11 @@ describe("reason words", () => {
     expect([0, 1, 2].map(retryWords)).toEqual([null, "tried again 1 time", "tried again 2 times"]);
     expect(retryWords(undefined as unknown as number)).toBeNull();
   });
+
+  it("the first date, in words; no date says nothing", () => {
+    expect(firstDateWords(rows.find((r) => r.reason === "auto:pinning")?.created_ms)).toMatch(/^first on .*2026$/);
+    for (const none of [null, undefined, 0, -1, Number.NaN, Number.MAX_SAFE_INTEGER]) expect(firstDateWords(none), String(none)).toBeNull();
+  });
 });
 
 describe("rows", () => {
@@ -114,7 +120,7 @@ describe("rows", () => {
   });
 
   it("filters by reason, by app and by words in the pattern, the app and the reason", () => {
-    const by = (group: Parameters<typeof filterRows>[1]["group"], query = "", app: string | null = null) => filterRows(merged, { group, query, app }, (e) => (e === "client.exe" ? "The Client" : null)).map((r) => r.line);
+    const by = (group: Parameters<typeof filterRows>[1]["group"], query = "", ...apps: string[]) => filterRows(merged, { group, query, apps }, (e) => (e === "client.exe" ? "The Client" : null)).map((r) => r.line);
     expect(by("pinning")).toEqual(['"pin.example"']);
     expect(by("all", "PIN")).toEqual(['"pin.example"']);
     expect(by("all", "the client")).toEqual(["shop.example", '"pin.example"']);
@@ -122,6 +128,7 @@ describe("rows", () => {
     expect(by("all", "nothing-like-this")).toEqual([]);
     expect(by("all", "", "client.exe"), "what applies to it: its own and every app's").toEqual(["mine.example", "shop.example", "bank.example", '"pin.example"', '"cert.example"', '"ev.example"']);
     expect(by("all", "", "other.exe")).not.toContain('"pin.example"');
+    expect(by("pinning", "", "other.exe", "client.exe"), "any of the app's files").toEqual(['"pin.example"']);
   });
 
   it("a line the engine would skip is marked, shows so it can be removed, and applies to no app", () => {
@@ -133,9 +140,9 @@ describe("rows", () => {
     expect(refused.line, "as it was written: nothing of it was read").toBe(skipped);
     expect(rowReasonWords(read)).toBe("You added this");
     expect(rowReasonWords(refused)).toBe(REFUSED_LINE_WORDS);
-    expect(filterRows([refused], { group: "all", query: "", app: null }, () => null), "it stays on the list").toEqual([refused]);
-    expect(filterRows([refused], { group: "all", query: "does nothing", app: null }, () => null)).toEqual([refused]);
-    expect(filterRows([refused], { group: "all", query: "", app: "a b.exe" }, () => null)).toEqual([]);
+    expect(filterRows([refused], { group: "all", query: "", apps: [] }, () => null), "it stays on the list").toEqual([refused]);
+    expect(filterRows([refused], { group: "all", query: "does nothing", apps: [] }, () => null)).toEqual([refused]);
+    expect(filterRows([refused], { group: "all", query: "", apps: ["a b.exe"] }, () => null)).toEqual([]);
   });
 
   it("says why a new line would do nothing, and nothing of a line the engine reads", () => {
@@ -146,8 +153,9 @@ describe("rows", () => {
   });
 
   it("knows when an app has rejected sites to try again", () => {
-    expect(hasRejected(merged, "client.exe")).toBe(true);
-    expect(hasRejected(merged, "other.exe")).toBe(false);
+    expect(rejectedFiles(merged, ["client.exe"])).toEqual(["client.exe"]);
+    expect(rejectedFiles(merged, ["other.exe"])).toEqual([]);
+    expect(rejectedFiles(merged, ["other.exe", "client.exe"]), "only the files with something to take back").toEqual(["client.exe"]);
   });
 
   it("a line and an app make a line of the grammar", () => {
@@ -159,14 +167,21 @@ describe("rows", () => {
 describe("the deep link", () => {
   it("round trips, and asks nothing with no filter", () => {
     expect(exclusionsHref()).toBe("/settings/#not-decrypted");
-    const href = exclusionsHref("client.exe", "pinning");
+    const href = exclusionsHref(["client.exe"], "pinning");
     expect(href).toBe("/settings/?exclusionsApp=client.exe&exclusionsReason=pinning#not-decrypted");
-    expect(exclusionsLink(new URL(href, "http://x").search)).toEqual({ app: "client.exe", group: "pinning" });
+    expect(exclusionsLink(new URL(href, "http://x").search)).toEqual({ apps: ["client.exe"], group: "pinning" });
+  });
+
+  it("carries every file of an app", () => {
+    const href = exclusionsHref(["helper.exe", "client.exe"]);
+    expect(href).toBe("/settings/?exclusionsApp=helper.exe&exclusionsApp=client.exe#not-decrypted");
+    expect(exclusionsLink(new URL(href, "http://x").search).apps).toEqual(["helper.exe", "client.exe"]);
   });
 
   it("other parameters and a nonsense reason mean nothing", () => {
-    expect(exclusionsLink("?source=mock&exclusionsReason=everything")).toEqual({ app: null, group: "all" });
-    expect(exclusionsLink("?exclusionsApp=CLIENT.EXE").app).toBe("client.exe");
+    expect(exclusionsLink("?source=mock&exclusionsReason=everything")).toEqual({ apps: [], group: "all" });
+    expect(exclusionsLink("?exclusionsApp=CLIENT.EXE").apps).toEqual(["client.exe"]);
+    expect(exclusionsLink("?exclusionsApp=&exclusionsApp=a.exe&exclusionsApp=A.EXE").apps, "none empty, none twice").toEqual(["a.exe"]);
   });
 });
 
@@ -190,8 +205,20 @@ describe("the app sheet's line", () => {
     const shouted = { on: true, exes: [CHROME.toUpperCase()] };
     const appliesToEveryApp = merged.filter((r) => r.apps.length === 0).length;
     const said = appDecryption(slice(true), shouted, merged);
-    expect(said).toEqual({ line: `Sieve decrypts this app's HTTPS except ${appliesToEveryApp + 1} sites`, count: appliesToEveryApp + 1, app: "chrome.exe" });
+    expect(said).toEqual({ line: `Sieve decrypts this app's HTTPS except ${appliesToEveryApp + 1} sites`, count: appliesToEveryApp + 1, apps: ["chrome.exe"] });
     expect(appDecryption(slice(true), chrome, mergeRows(["one.example"], [])).line).toBe("Sieve decrypts this app's HTTPS except 1 site");
+  });
+
+  it("an app of several files: the link opens a view holding every row it counted", () => {
+    const helper = String.raw`C:\Program Files\Google\Chrome\Application\agent.exe`;
+    const app = { on: true, exes: [helper, CHROME, helper] };
+    const held = mergeRows([], [{ line: '"pin.example"', apps: ["chrome.exe"], reason: "auto:pinning", created_ms: 1, retries: 0 }]);
+    const said = appDecryption(slice(true), app, held);
+    expect(said).toEqual({ line: "Sieve decrypts this app's HTTPS except 1 site", count: 1, apps: ["agent.exe", "chrome.exe"] });
+    if (said.line === null) throw new Error("the line says so");
+    const { apps } = exclusionsLink(new URL(exclusionsHref(said.apps), "http://x").search);
+    expect(filterRows(held, { group: "all", query: "", apps }, () => null)).toHaveLength(said.count);
+    expect(rejectedFiles(held, apps), "and it can be tried again from there").toEqual(["chrome.exe"]);
   });
 
   it("another app's row does not count", () => {

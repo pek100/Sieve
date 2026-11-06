@@ -404,6 +404,8 @@ export interface HealNotice {
 
 /** The `heal_notices` message. */
 export interface HealNotices {
+  /** This engine run. A new one starts `revision` and the ids over. */
+  run: number;
   revision: number;
   exclusions_revision: number;
   notices: HealNotice[];
@@ -423,6 +425,7 @@ export function parseHealNotices(raw: unknown): HealNotices {
   const h = rec(raw, "heal notices");
   if (!Array.isArray(h.notices)) throw new ProtocolError("heal.notices must be an array");
   return {
+    run: int(h.run, "heal.run"),
     revision: int(h.revision, "heal.revision"),
     exclusions_revision: int(h.exclusions_revision, "heal.exclusions_revision"),
     notices: h.notices.map(healNotice).filter((n): n is HealNotice => n !== null),

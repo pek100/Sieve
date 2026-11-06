@@ -34,15 +34,14 @@ export function followExclusionsLink(href: string) {
   const asked = new URL(href, window.location.href).searchParams;
   write((q) => {
     for (const name of [APP_PARAM, REASON_PARAM]) {
-      const value = asked.get(name);
-      if (value === null) q.delete(name);
-      else q.set(name, value);
+      q.delete(name);
+      for (const value of asked.getAll(name)) q.append(name, value);
     }
   });
   document.getElementById(EXCLUSIONS_ANCHOR)?.scrollIntoView?.();
 }
 
-export function useExclusionsLink(): { app: string | null; group: ReasonGroup; setGroup: (g: ReasonGroup) => void; clearApp: () => void } {
+export function useExclusionsLink(): { apps: readonly string[]; group: ReasonGroup; setGroup: (g: ReasonGroup) => void; clearApp: () => void } {
   const search = useSyncExternalStore(subscribe, read, readOnServer);
   const link = useMemo(() => exclusionsLink(search), [search]);
   const setGroup = useCallback((g: ReasonGroup) => write((q) => (g === "all" ? q.delete(REASON_PARAM) : q.set(REASON_PARAM, g))), []);

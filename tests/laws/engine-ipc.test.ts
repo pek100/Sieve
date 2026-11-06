@@ -120,7 +120,8 @@ describe("engine IPC law", () => {
     expect(() => parseExclusionsPage({ ...body, rows: null })).toThrow(/rows/);
     expect(() => parseExclusionsPage({ ...body, scope: "some" })).toThrow(/scope/);
     expect(() => parseExclusionsPage(null)).toThrow();
-    const notices = parseHealNotices({ revision: 1, exclusions_revision: 1, notices: [null, { id: 1 }, { id: 1, session: 1, exe: "a.exe", hosts: [], total: 0, rev: 1 }, { id: 2, session: 1, exe: "a.exe", hosts: ["a.example"], total: 0, rev: 1 }] });
+    expect(() => parseHealNotices({ revision: 1, exclusions_revision: 1, notices: [] }), "a run names the cursor's meaning").toThrow(/heal\.run/);
+    const notices = parseHealNotices({ run: 1, revision: 1, exclusions_revision: 1, notices: [null, { id: 1 }, { id: 1, session: 1, exe: "a.exe", hosts: [], total: 0, rev: 1 }, { id: 2, session: 1, exe: "a.exe", hosts: ["a.example"], total: 0, rev: 1 }] });
     expect(notices.notices).toEqual([{ id: 2, session: 1, exe: "a.exe", hosts: ["a.example"], total: 1, rev: 1 }]);
     expect(() => parseHealNotices({ revision: 1, exclusions_revision: 1 })).toThrow(/notices/);
   });

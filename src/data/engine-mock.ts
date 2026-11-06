@@ -121,7 +121,7 @@ function statusOf(scenario: EngineScenario): EngineStatus {
   return parseEngineStatus((example.pipe as { status: unknown }).status);
 }
 
-export function createMockEngine(start: EngineScenario = "missing", options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean } = {}): EngineSource {
+export function createMockEngine(start: EngineScenario = "missing", options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean; run?: number } = {}): EngineSource {
   let scenario = start;
   let held: Omit<EnginePolicy, "revision" | "engine"> | null = null;
   const holdsHttps = options.heal === true;
@@ -259,12 +259,12 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
     },
     healNotices: async (after) => {
       requireWelcome();
-      if (!holdsHttps) return { revision: 0, exclusions_revision: rowsRevision, notices: [] };
+      const run = options.run ?? 1;
+      if (!holdsHttps) return { run, revision: 0, exclusions_revision: rowsRevision, notices: [] };
       healReads += 1;
       const rev = Math.min(healReads - 1, first.hosts.length);
       const notice = { ...first, hosts: first.hosts.slice(0, rev), total: rev, rev };
-      // A cursor past the newest is from before a restart, so it reads from the start.
-      return { revision: rev, exclusions_revision: rowsRevision, notices: rev > (after > rev ? 0 : after) ? [notice] : [] };
+      return { run, revision: rev, exclusions_revision: rowsRevision, notices: rev > after ? [notice] : [] };
     },
   };
 }

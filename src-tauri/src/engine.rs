@@ -403,7 +403,7 @@ mod imp {
     /// The notices newer than `after`, of this client's session.
     pub async fn heal_notices(name: &str, after: u64) -> Result<HealNotices, String> {
         match ask(name, ClientMessage::HealNotices { after }).await? {
-            EngineMessage::HealNotices { revision, exclusions_revision, notices } => Ok(HealNotices { revision, exclusions_revision, notices }),
+            EngineMessage::HealNotices { run, revision, exclusions_revision, notices } => Ok(HealNotices { run, revision, exclusions_revision, notices }),
             EngineMessage::Error { message } => Err(message),
             other => Err(format!("unexpected answer: {other:?}")),
         }
@@ -578,6 +578,7 @@ pub struct ExclusionsPage {
 /// `EngineMessage::HealNotices`, for the window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HealNotices {
+    pub run: u64,
     pub revision: u64,
     pub exclusions_revision: u64,
     pub notices: Vec<HealNotice>,
@@ -1064,9 +1065,9 @@ mod tests {
     async fn the_notices_command_reads_the_notices_or_the_refusal() {
         use sieve_ipc::{ClientMessage, EngineMessage};
         let notice = HealNotice { id: 1, session: 1, exe: "client.exe".into(), hosts: vec!["pin.example".into()], total: 1, rev: 1 };
-        let answer = EngineMessage::HealNotices { revision: 1, exclusions_revision: 2, notices: vec![notice.clone()] };
+        let answer = EngineMessage::HealNotices { run: 9, revision: 1, exclusions_revision: 2, notices: vec![notice.clone()] };
         let got = one_answer("notices", ClientMessage::HealNotices { after: 0 }, answer, async |n| imp::heal_notices(n, 0).await).await;
-        assert_eq!(got, Ok(HealNotices { revision: 1, exclusions_revision: 2, notices: vec![notice] }));
+        assert_eq!(got, Ok(HealNotices { run: 9, revision: 1, exclusions_revision: 2, notices: vec![notice] }));
         let old = EngineMessage::Error { message: "unknown variant".into() };
         let got = one_answer("notices-old", ClientMessage::HealNotices { after: 9 }, old, async |n| imp::heal_notices(n, 9).await).await;
         assert_eq!(got, Err("unknown variant".to_string()));

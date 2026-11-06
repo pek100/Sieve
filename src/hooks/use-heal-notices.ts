@@ -34,7 +34,7 @@ export function useHealNotices() {
         continue;
       }
       if (before) notices.dismiss(before.notice);
-      const href = exclusionsHref(group.exe, "pinning");
+      const href = exclusionsHref([group.exe], "pinning");
       const name = runningApp(snapshot, group.exe)?.name ?? group.exe;
       const notice = notices.push({
         kind: "info",

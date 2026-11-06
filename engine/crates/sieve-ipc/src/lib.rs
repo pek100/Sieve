@@ -168,8 +168,10 @@ pub enum EngineMessage {
     Exclusions { revision: u64, rows: Vec<ExclusionRow>, total: u32, next: Option<u32>, scope: ExclusionScope, browsers: Vec<String> },
     /// What self-healing excluded since `after`, for this client's session (plan
     /// 4.3). `revision` is the next `after`; `exclusions_revision` moves when the
-    /// rows do, so this is cheap to ask and the rows are read only then.
-    HealNotices { revision: u64, exclusions_revision: u64, notices: Vec<HealNotice> },
+    /// rows do, so this is cheap to ask and the rows are read only then. `run` names
+    /// this engine run: a new one starts `revision` and the notices' ids over, so an
+    /// `after` from another run means nothing.
+    HealNotices { run: u64, revision: u64, exclusions_revision: u64, notices: Vec<HealNotice> },
 }
 
 /// How far decryption reaches. The same two values as the engine's decision.

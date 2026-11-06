@@ -68,9 +68,17 @@ pub trait Backend: Send + Sync + 'static {
     fn exclusions(&self) -> ExclusionsView;
     /// "Try decrypting again". Only ever reaches `auto:*` entries.
     fn try_decrypt_again(&self, retry: Retry);
-    /// The notices' revision, the rows' revision, and every session's notices newer
-    /// than `after`.
-    fn heal_notices(&self, after: u64) -> (u64, u64, Vec<HealNotice>);
+    /// This run's self-healing notices newer than `after`, of every session.
+    fn heal_notices(&self, after: u64) -> HealAnswer;
+}
+
+/// What [`Backend::heal_notices`] answers; the fields of `EngineMessage::HealNotices`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealAnswer {
+    pub run: u64,
+    pub revision: u64,
+    pub exclusions_revision: u64,
+    pub notices: Vec<HealNotice>,
 }
 
 pub struct Subscription {
@@ -167,8 +175,8 @@ where
                 Err(message) => EngineMessage::Error { message },
             },
             Ok(ClientMessage::HealNotices { after }) => {
-                let (revision, exclusions_revision, notices) = backend.heal_notices(after);
-                EngineMessage::HealNotices { revision, exclusions_revision, notices: notices.into_iter().filter(|n| notice_visible_to(n, session_id)).collect() }
+                let HealAnswer { run, revision, exclusions_revision, notices } = backend.heal_notices(after);
+                EngineMessage::HealNotices { run, revision, exclusions_revision, notices: notices.into_iter().filter(|n| notice_visible_to(n, session_id)).collect() }
             }
             Ok(ClientMessage::Hello { .. }) => return refuse(stream, HELLO_ONCE).await,
             Err(FrameError::Closed) => return Ok(()),
@@ -367,9 +375,9 @@ mod tests {
         fn try_decrypt_again(&self, retry: Retry) {
             self.retries.lock().unwrap().push(retry);
         }
-        fn heal_notices(&self, after: u64) -> (u64, u64, Vec<HealNotice>) {
-            let newer = self.notices.lock().unwrap().iter().filter(|n| n.rev > after).cloned().collect();
-            (self.notices.lock().unwrap().iter().map(|n| n.rev).max().unwrap_or(0), 4, newer)
+        fn heal_notices(&self, after: u64) -> HealAnswer {
+            let notices = self.notices.lock().unwrap();
+            HealAnswer { run: 7, revision: notices.iter().map(|n| n.rev).max().unwrap_or(0), exclusions_revision: 4, notices: notices.iter().filter(|n| n.rev > after).cloned().collect() }
         }
     }
 
@@ -444,8 +452,8 @@ mod tests {
         fake.notices.lock().unwrap().extend([notice(1, 1), notice(2, 2)]);
         let (mut c, task) = welcomed(fake.clone(), 1).await;
         send(&mut c, &ClientMessage::HealNotices { after: 0 }).await;
-        let EngineMessage::HealNotices { revision, exclusions_revision, notices } = recv(&mut c).await else { panic!("not notices") };
-        assert_eq!((revision, exclusions_revision), (2, 4));
+        let EngineMessage::HealNotices { run, revision, exclusions_revision, notices } = recv(&mut c).await else { panic!("not notices") };
+        assert_eq!((run, revision, exclusions_revision), (7, 2, 4));
         assert_eq!(notices, [notice(1, 1)], "its own session's");
         drop(c);
         task.await.unwrap().unwrap();

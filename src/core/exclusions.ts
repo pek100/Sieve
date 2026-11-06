@@ -10,7 +10,7 @@
  */
 import type { ExclusionRow, ExclusionScope, HealNotice, Snapshot } from "@/data/protocol";
 import { groupApps } from "./apps";
-import { httpsInForce, type EngineSlice } from "./engine";
+import { factDay, httpsInForce, type EngineSlice } from "./engine";
 
 /** The "Not decrypted" group's anchor in Settings. */
 export const EXCLUSIONS_ANCHOR = "not-decrypted";
@@ -27,7 +27,7 @@ export interface ExclusionsFacts {
   skipped: number;
 }
 
-/** A notice of the current engine run: `key` tells it from one of an earlier run, whose ids start over. */
+/** A notice with `key`, its engine run and id: a new run's ids start over. */
 export interface HealGroup extends HealNotice {
   key: string;
 }
@@ -236,28 +236,34 @@ export function retryWords(retries: number): string | null {
   return retries === 1 ? "tried again 1 time" : `tried again ${retries} times`;
 }
 
+/** The row's first date, which a try again does not move (plan 4.3). Zero is no date. */
+export function firstDateWords(createdMs: number | null | undefined): string | null {
+  const day = typeof createdMs === "number" && createdMs > 0 ? factDay(createdMs) : null;
+  return day === null ? null : `first on ${day}`;
+}
+
 /** Whether a row excludes anything for an app with one of these file names. */
 const appliesTo = (r: Pick<ExclusionView, "apps" | "refused">, ...files: readonly string[]) => !r.refused && (r.apps.length === 0 || files.some((f) => r.apps.includes(f)));
 
 export interface ExclusionFilter {
   group: ReasonGroup;
   query: string;
-  /** A file name, lower case: the rows that apply to this app. */
-  app: string | null;
+  /** An app's file names, lower case: the rows that apply to it. None means every app. */
+  apps: readonly string[];
 }
 
-export function filterRows(rows: readonly ExclusionView[], { group, query, app }: ExclusionFilter, nameOf: (exe: string) => string | null): ExclusionView[] {
+export function filterRows(rows: readonly ExclusionView[], { group, query, apps }: ExclusionFilter, nameOf: (exe: string) => string | null): ExclusionView[] {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
   return rows.filter((r) => {
     if (group !== "all" && reasonGroup(r.reason) !== group) return false;
-    if (app !== null && !appliesTo(r, app)) return false;
+    if (apps.length > 0 && !appliesTo(r, ...apps)) return false;
     const hay = [r.line, ...r.apps, ...r.apps.map((a) => nameOf(a) ?? ""), rowReasonWords(r)].join(" ").toLowerCase();
     return words.every((w) => hay.includes(w));
   });
 }
 
-/** What the rows say about the one app they are filtered to: is there anything to try again in bulk? */
-export const hasRejected = (rows: readonly ExclusionView[], app: string) => rows.some((r) => r.reason === "auto:pinning" && r.apps.includes(app));
+/** Which of an app's files have rejected sites to try again in bulk. */
+export const rejectedFiles = (rows: readonly ExclusionView[], files: readonly string[]) => files.filter((f) => rows.some((r) => r.reason === "auto:pinning" && r.apps.includes(f)));
 
 // ---- Names.
 
@@ -279,20 +285,21 @@ export function runningApp(snapshot: Snapshot | null | undefined, exe: string): 
 export const APP_PARAM = "exclusionsApp";
 export const REASON_PARAM = "exclusionsReason";
 
-export function exclusionsHref(app: string | null = null, reason: ReasonGroup | null = null): string {
+/** An app is every file it runs as, so the view holds the rows of each. */
+export function exclusionsHref(apps: readonly string[] = [], reason: ReasonGroup | null = null): string {
   const q = new URLSearchParams();
-  if (app) q.set(APP_PARAM, app);
+  for (const file of apps) q.append(APP_PARAM, file);
   if (reason) q.set(REASON_PARAM, reason);
   const search = q.toString();
   return `/settings/${search ? `?${search}` : ""}#${EXCLUSIONS_ANCHOR}`;
 }
 
 /** What a location's query string asks the view to show. Anything else in it means nothing here. */
-export function exclusionsLink(search: string): { app: string | null; group: ReasonGroup } {
+export function exclusionsLink(search: string): { apps: string[]; group: ReasonGroup } {
   const q = new URLSearchParams(search);
   const reason = q.get(REASON_PARAM);
   return {
-    app: q.get(APP_PARAM)?.toLowerCase() || null,
+    apps: [...new Set(q.getAll(APP_PARAM).map((a) => a.toLowerCase()))].filter(Boolean),
     group: (REASON_GROUPS as readonly string[]).includes(reason ?? "") ? (reason as ReasonGroup) : "all",
   };
 }
@@ -302,7 +309,8 @@ export function exclusionsLink(search: string): { app: string | null; group: Rea
 export const DECRYPTS_TEXT = "Sieve decrypts this app's HTTPS.";
 export const DOES_NOT_DECRYPT_TEXT = "Sieve does not decrypt this app's HTTPS.";
 
-export type AppDecryption = { line: null } | { line: string; count: number; app: string | null };
+/** `apps` is what the line links to: the app's files, or none when there is nothing to show. */
+export type AppDecryption = { line: null } | { line: string; count: number; apps: readonly string[] };
 
 /**
  * The one line under an app's switch, true for what the engine does. None while
@@ -313,11 +321,11 @@ export function appDecryption(e: EngineSlice, app: { on: boolean; exes: readonly
   const facts = e.exclusions;
   if (!app.on || !httpsInForce(e) || !facts) return { line: null };
   const inScope = facts.scope === "all" || app.exes.some((x) => facts.browsers.includes(x.toLowerCase()));
-  if (!inScope) return { line: DOES_NOT_DECRYPT_TEXT, count: 0, app: null };
-  const files = app.exes.map(exeFileName);
+  if (!inScope) return { line: DOES_NOT_DECRYPT_TEXT, count: 0, apps: [] };
+  const files = [...new Set(app.exes.map(exeFileName))];
   const count = rows.filter((r) => appliesTo(r, ...files)).length;
-  if (count === 0) return { line: DECRYPTS_TEXT, count, app: null };
-  return { line: `Sieve decrypts this app's HTTPS except ${count.toLocaleString("en-US")} ${count === 1 ? "site" : "sites"}`, count, app: files[0] ?? null };
+  if (count === 0) return { line: DECRYPTS_TEXT, count, apps: [] };
+  return { line: `Sieve decrypts this app's HTTPS except ${count.toLocaleString("en-US")} ${count === 1 ? "site" : "sites"}`, count, apps: files };
 }
 
 // ---- The notice.

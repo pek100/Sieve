@@ -21,7 +21,7 @@ const plural = (n: number, one: string, many: string) => `${n.toLocaleString("en
  */
 export function ExclusionsGroup() {
   const m = useExclusions();
-  const filtered = m.group !== "all" || m.app !== null || m.query.trim() !== "";
+  const filtered = m.group !== "all" || m.apps.length > 0 || m.query.trim() !== "";
   return (
     <Card title="Not decrypted" icon={<ShieldOff strokeWidth={1.75} />}>
       <div className="flex flex-col gap-4" data-exclusions-group="">
@@ -49,9 +49,9 @@ export function ExclusionsGroup() {
               </div>
             )}
             <SearchField value={m.query} onChange={m.setQuery} label="Search sites not decrypted" placeholder="Search by site, app or reason" />
-            {m.app !== null && (
-              <div className="flex flex-wrap items-center gap-2" data-exclusions-app={m.app}>
-                <span className="min-w-0 flex-auto text-label break-all text-on-surface-muted">What applies to {m.appInfo(m.app).name}</span>
+            {m.appName !== null && (
+              <div className="flex flex-wrap items-center gap-2" data-exclusions-app={m.apps.join(" ")}>
+                <span className="min-w-0 flex-auto text-label break-all text-on-surface-muted">What applies to {m.appName}</span>
                 {m.canTryAll && (
                   <Button variant="secondary" size="sm" onClick={m.tryAll}>
                     Try decrypting all again

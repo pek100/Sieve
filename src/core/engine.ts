@@ -19,6 +19,13 @@ import type { ExclusionsFacts, HealGroup } from "./exclusions";
 /** An update state that says nothing: no answer, or a missing or broken one. */
 export const NO_UPDATE_NEWS: EngineUpdate = { kind: "not_configured" };
 
+/** The day of a fact the engine gave, or null when it is not one. */
+export function factDay(ms: number | null | undefined): string | null {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return null;
+  const date = new Date(ms);
+  return Number.isNaN(date.getTime()) ? null : date.toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
+}
+
 /** How often the engine is asked while Sieve is open (plan 1.6.5). */
 export const ENGINE_POLL_MS = 2000;
 

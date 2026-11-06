@@ -79,6 +79,30 @@ describe("heal notices", () => {
     expect(toasts(rt)).toHaveLength(1);
   });
 
+  it("a new engine run told through a real poll, at a revision past the old cursor, is a toast", async () => {
+    const engine = createMockEngine("idle", { heal: true });
+    const notice = (hosts: string[], rev: number) => ({ id: 1, session: 1, exe: "client.exe", hosts, total: hosts.length, rev });
+    let held = { run: 10, revision: 1, exclusions_revision: 1, notices: [notice(["a.example"], 1)] };
+    let reads = 0;
+    engine.healNotices = async (after) => {
+      reads += 1;
+      return { ...held, notices: held.notices.filter((n) => n.rev > after) };
+    };
+    const rt = setup(engine);
+    await act(async () => {
+      await vi.waitFor(() => expect(reads).toBeGreaterThan(0));
+    });
+    held = { ...held, revision: 2, notices: [notice(["a.example", "b.example"], 2)] };
+    await act(async () => {
+      await vi.waitFor(() => expect(toasts(rt)).toHaveLength(1), { timeout: 10_000 });
+    });
+    act(() => rt.notices.dismiss(rt.notices.list()[0].id));
+    held = { run: 11, revision: 3, exclusions_revision: 1, notices: [notice(["c.example", "d.example", "e.example"], 3)] };
+    await act(async () => {
+      await vi.waitFor(() => expect(toasts(rt)).toEqual(["client.exe rejected Sieve's certificate for 3 sites. Sieve stopped decrypting them."]), { timeout: 10_000 });
+    });
+  }, 30_000);
+
   it("the action opens the filtered view", () => {
     const rt = setup();
     set(rt, [group(["a.example"], 1)]);
@@ -116,7 +140,7 @@ describe("heal notices", () => {
 
   it("a window opened over a running engine does not tell of what it did before", async () => {
     const engine = createMockEngine("idle", { heal: true });
-    engine.healNotices = async () => ({ revision: 5, exclusions_revision: 1, notices: [{ id: 1, session: 1, exe: "client.exe", hosts: ["old.example"], total: 1, rev: 5 }] });
+    engine.healNotices = async () => ({ run: 1, revision: 5, exclusions_revision: 1, notices: [{ id: 1, session: 1, exe: "client.exe", hosts: ["old.example"], total: 1, rev: 5 }] });
     const rt = setup(engine);
     await act(async () => {
       await vi.waitFor(() => expect(rt.store.getState().engine.exclusions).not.toBeNull());
