@@ -489,6 +489,21 @@ pub fn decrypt(facts: &FlowFacts<'_>, store: &ExclusionSet, switches: &Switches)
     Decrypt::Intercept
 }
 
+/// True when a flow to `host` might be decrypted, judged with no flow yet: at DNS
+/// time there is no exe, session or ALPN. It decides whether an answer for this
+/// name keeps its ECH, and it is built from `decrypt`'s own parts: the switch, the
+/// switches of the floor, the restricted suffixes, the store.
+///
+/// True means "may", and the flow is still judged by `decrypt`. False means no
+/// flow of this name with every-app entries in the way is ever decrypted (the law
+/// below). An entry limited to some apps counts as naming the host, as
+/// [`Exclusion::matches`] reads an unknown exe: that name keeps its ECH for every
+/// app, and another app's hello then carries it and takes `floor:ech`. Keeping ECH
+/// is the conservative side, since the worst it costs is a pass-through.
+pub fn name_may_intercept(host: &str, store: &ExclusionSet, switches: &Switches) -> bool {
+    switches.https && switches.root_ready && switches.lists_ready && !restricted_suffix(host) && !store.names_host(host, switches.skip_ev)
+}
+
 /// One entry and where it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Stored {
@@ -527,19 +542,33 @@ impl ExclusionSet {
         self.len == 0
     }
 
-    /// The source of the highest-ranked entry matching this flow. `auto:ev`
-    /// only counts while `skip_ev` holds.
-    pub fn find(&self, host: Option<&str>, ip: IpAddr, exe: Option<&str>, skip_ev: bool) -> Option<&Source> {
-        let lower = host.map(str::to_ascii_lowercase);
-        let host = lower.as_deref();
+    /// The entries that could match `host` (lower case): those filed under one of
+    /// its suffixes, and the scanned ones. `auto:ev` only counts while `skip_ev`
+    /// holds.
+    fn candidates<'a, 'h>(&'a self, host: Option<&'h str>, skip_ev: bool) -> impl Iterator<Item = &'a Stored> + use<'a, 'h> {
         let suffixes = std::iter::successors(host, |h| h.split_once('.').map(|(_, rest)| rest));
         suffixes
             .filter_map(|s| self.hosts.get(s))
             .flatten()
             .chain(&self.scanned)
-            .filter(|s| (skip_ev || s.source != Source::Auto(AutoReason::Ev)) && s.entry.matches(host, Some(ip), exe))
+            .filter(move |s| skip_ev || s.source != Source::Auto(AutoReason::Ev))
+    }
+
+    /// The source of the highest-ranked entry matching this flow.
+    pub fn find(&self, host: Option<&str>, ip: IpAddr, exe: Option<&str>, skip_ev: bool) -> Option<&Source> {
+        let lower = host.map(str::to_ascii_lowercase);
+        let host = lower.as_deref();
+        self.candidates(host, skip_ev)
+            .filter(|s| s.entry.matches(host, Some(ip), exe))
             .map(|s| &s.source)
             .min_by_key(|s| s.rank())
+    }
+
+    /// True when an entry names this host, for any app. An IP entry names no host:
+    /// no address is known yet.
+    pub fn names_host(&self, host: &str, skip_ev: bool) -> bool {
+        let lower = host.to_ascii_lowercase();
+        self.candidates(Some(&lower), skip_ev).any(|s| s.entry.matches(Some(&lower), None, None))
     }
 }
 
@@ -755,6 +784,65 @@ mod decrypt_tests {
         assert_eq!(decrypt(&base(&alpn), &set, &Switches { skip_ev: false, ..switches() }), Decrypt::Intercept);
     }
 
+    #[test]
+    fn a_name_may_be_intercepted_unless_a_switch_a_suffix_or_an_entry_says_no() {
+        let empty = ExclusionSet::default();
+        assert!(name_may_intercept(HOST, &empty, &switches()));
+        assert!(!name_may_intercept(HOST, &empty, &Switches { https: false, ..switches() }));
+        assert!(!name_may_intercept(HOST, &empty, &Switches { root_ready: false, ..switches() }));
+        assert!(!name_may_intercept(HOST, &empty, &Switches { lists_ready: false, ..switches() }));
+        assert!(!name_may_intercept("service.gov.uk", &empty, &switches()));
+    }
+
+    #[test]
+    fn every_host_entry_kind_holds_a_name_back_and_an_ip_entry_does_not() {
+        let held = |text: &str, host: &str| !name_may_intercept(host, &store_of(text, &[]), &switches());
+        assert!(held("\"news.example\"", HOST), "exact");
+        assert!(held("news.example", "a.b.news.example") && held("news.example", "NEWS.example"), "subdomain, any case");
+        assert!(held("*.example", HOST), "wildcard");
+        assert!(held("news.example$app=client.exe", HOST), "an app-scoped entry names the host for all");
+        assert!(!held("\"news.example\"", "www.news.example"));
+        assert!(!held("notnews.example", HOST));
+        assert!(!held("192.0.2.1", HOST), "no address is known yet");
+    }
+
+    #[test]
+    fn auto_ev_holds_a_name_back_only_with_skip_on() {
+        let store = store_of("", &[(line(HOST), AutoReason::Ev)]);
+        assert!(!name_may_intercept(HOST, &store, &switches()));
+        assert!(name_may_intercept(HOST, &store, &Switches { skip_ev: false, ..switches() }));
+        let pinned = store_of("", &[(line(HOST), AutoReason::Pinning)]);
+        assert!(!name_may_intercept(HOST, &pinned, &Switches { skip_ev: false, ..switches() }));
+    }
+
+    #[test]
+    fn an_app_scoped_name_keeps_its_ech_so_another_apps_flow_takes_the_ech_floor() {
+        let store = store_of("news.example$app=client.exe", &[]);
+        let alpn = alpn();
+        assert!(!name_may_intercept(HOST, &store, &switches()));
+        let hello = FlowFacts { ech: true, ..base(&alpn) };
+        assert_eq!(decrypt(&hello, &store, &switches()), Decrypt::PassThrough(PassReason::Floor(Floor::Ech)));
+    }
+
+    fn arbitrary_exe() -> impl Strategy<Value = Option<&'static str>> {
+        prop_oneof![Just(Some(CHROME)), Just(Some(r"C:\x\client.exe")), Just(None)]
+    }
+
+    fn arbitrary_verdict() -> impl Strategy<Value = Option<UpstreamVerdict>> {
+        use UpstreamVerdict::*;
+        prop::option::of(prop::sample::select(vec![Eligible, NonPublicRoot, Invalid, Revoked, Unavailable, Protocol]))
+    }
+
+    fn arbitrary_switches() -> impl Strategy<Value = Switches> {
+        (any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>(), prop_oneof![Just(Scope::Browsers), Just(Scope::All)])
+            .prop_map(|(https, root_ready, lists_ready, skip_ev, scope)| Switches { https, root_ready, lists_ready, skip_ev, scope })
+    }
+
+    fn every_app_lines() -> impl Strategy<Value = String> {
+        let entry = prop_oneof!["[a-z]{1,2}\\.example", Just(HOST.to_string()), Just(format!("\"{HOST}\"")), Just("*.example".to_string()), Just("192.0.2.1".to_string())];
+        prop::collection::vec(entry, 0..6).prop_map(|lines| lines.join("\n"))
+    }
+
     /// Host names from the facts themselves, so the arbitrary lists do match.
     fn list_lines() -> impl Strategy<Value = String> {
         let host = prop_oneof!["[a-z]{1,4}\\.example", Just(HOST.to_string()), Just("service.gov.uk".to_string()), Just("*".to_string()), Just("192.0.2.1".to_string()), "[ -~]{0,20}"];
@@ -767,6 +855,27 @@ mod decrypt_tests {
     }
 
     proptest! {
+        /// The law of the name decision: what it holds back, `decrypt` passes
+        /// through, whatever the flow turns out to be.
+        #[test]
+        fn a_name_held_back_is_never_decrypted(
+            text in every_app_lines(),
+            auto in arbitrary_auto(),
+            sw in arbitrary_switches(),
+            host in prop_oneof![Just(HOST.to_string()), Just("service.gov.uk".to_string()), Just("other.example".to_string()), "[a-z]{1,2}\\.example"],
+            exe in arbitrary_exe(),
+            session in prop::option::of(0u32..3),
+            names in prop::sample::select(vec![vec![], vec!["h2".to_string()], vec!["h3".to_string()], vec!["acme-tls/1".to_string()]]),
+            transport in prop_oneof![Just(Transport::Tcp), Just(Transport::Quic)],
+            (may_decrypt, in_scope, app_off, compatible, ech) in (any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>()),
+            upstream in arbitrary_verdict(),
+        ) {
+            let store = store_of(&text, &auto);
+            prop_assume!(!name_may_intercept(&host, &store, &sw));
+            let facts = FlowFacts { transport, may_decrypt, exe, session, host: Some(&host), ip: ip(), port: 443, alpn: &names, ech, client_compatible: compatible, app_in_scope: in_scope, app_off, upstream };
+            prop_assert!(matches!(decrypt(&facts, &store, &sw), Decrypt::PassThrough(_)));
+        }
+
         #[test]
         fn no_list_input_yields_intercept_for_a_floor_fact(text in list_lines(), auto in arbitrary_auto(), root in any::<bool>(), lists in any::<bool>(), skip_ev in any::<bool>()) {
             let store = store_of(&text, &auto);
