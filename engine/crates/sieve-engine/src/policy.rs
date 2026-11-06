@@ -192,6 +192,39 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"real");
     }
 
+    /// What `scripts/live/engine-ca-checks.ps1` writes for one call, through this
+    /// file's reader. Touches only a temporary folder.
+    #[cfg(windows)]
+    fn live_script_writes(before: &Policy, call: &str) -> Policy {
+        const CHECKS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../scripts/live/engine-ca-checks.ps1");
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.json");
+        std::fs::write(&source, serde_json::to_vec(before).unwrap()).unwrap();
+        let script = format!("$ErrorActionPreference = 'Stop'; . '{CHECKS}'; $policy = Get-Content -Raw '{}' | ConvertFrom-Json; {call}", source.display());
+        let out = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        std::fs::write(dir.path().join(POLICY_FILE), &out.stdout).unwrap();
+        let (written, refused) = load(dir.path());
+        assert_eq!(refused, None, "the engine reads what the script writes");
+        written
+    }
+
+    /// The slice 6 route must reach interception, or the floor checks pass with
+    /// nothing intercepted.
+    #[cfg(windows)]
+    #[test]
+    fn the_policy_the_live_script_writes_is_one_interception_wants() {
+        use crate::tls::intercept::wanted;
+        let list = sieve_ipc::DomainList { kind: sieve_ipc::DomainListKind::Block, entries: vec!["a.example".into()], enabled: true };
+        let before = Policy { revision: 7, off_apps: vec!["chrome".into()], lists: Some(vec!["adguard-dns".into()]), domain_lists: vec![list], user_rules: vec!["||x.example^".into()], ..Policy::default() };
+        let written = live_script_writes(&before, "New-InterceptionPolicyJson $policy");
+        assert!(wanted(&written) && written.engine, "{written:?}");
+        assert_eq!(written, Policy { revision: 8, engine: true, sieving: true, https: true, ..before.clone() }, "nothing else moved");
+        // The control: slice 5's route holds a root and intercepts nothing.
+        let root_only = live_script_writes(&before, "New-HttpsPolicyJson $policy $true");
+        assert!(root_only.https && !wanted(&root_only) && !root_only.engine, "{root_only:?}");
+    }
+
     #[test]
     fn an_old_policy_file_loads_with_sieving_off() {
         let dir = tempfile::tempdir().unwrap();
