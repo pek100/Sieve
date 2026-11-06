@@ -176,6 +176,8 @@ describe("apps screen", () => {
     await user.click(screen.getByRole("button", { name: "More app actions" }));
     await user.click(await screen.findByRole("menuitem", { name: "Turn every app off" }));
     expect(runtime.settings.get("apps.levels")[CHROME]).toBe("off");
+    // The mock lists one process Windows hides, which keeps its pid for a name.
+    await waitFor(() => expect(runtime.notices.list().map((n) => n.text)).toContain("Every app that can be turned off is off. 1 stays sieved: Windows gives it no name."));
     await user.click(screen.getByRole("button", { name: "More app actions" }));
     await user.click(await screen.findByRole("menuitem", { name: "Sieve every app" }));
     expect(runtime.settings.get("apps.levels")).toEqual({});

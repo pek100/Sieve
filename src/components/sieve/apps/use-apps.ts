@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
-import { listApps, offAll, pin, setAppState, sieveAll, sievedCount, unpin, type AppEntry } from "@/core/apps-actions";
+import { listApps, offAll, offAllNotice, pin, setAppState, sieveAll, sievedCount, unpin, type AppEntry } from "@/core/apps-actions";
 import { exeStem } from "@/core/apps";
 import { engineStatus } from "@/core/engine";
 import { guestRows, type GuestRow } from "@/core/guests";
@@ -73,7 +73,10 @@ export function useApps(): AppsModel {
     isOn: (key) => isAppOn(states, key),
     setOn: (key, on) => void writeStates(setAppState(statesNow(), key, on ? "sieve" : "off")).catch(said),
     sieveAll: () => writeAllStates(sieveAll(), "Every app is sieved"),
-    offAll: () => writeAllStates(offAll(statesNow(), [...apps, ...guests].map((a) => a.key)), "Every app is off"),
+    offAll: () => {
+      const keys = [...apps, ...guests].map((a) => a.key);
+      writeAllStates(offAll(statesNow(), keys), offAllNotice(keys));
+    },
     pin: (path) => {
       const before = pinnedNow();
       const next = pin(before, path);

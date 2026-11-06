@@ -27,6 +27,13 @@ export function offAll(states: AppStates, keys: readonly string[]): AppStates {
   return keys.reduce((acc, k) => setAppState(acc, k, "off"), states);
 }
 
+/** What bulk Off did to `keys`: a row named only by its pid cannot be turned off, and the notice says so. */
+export function offAllNotice(keys: readonly string[]): string {
+  const stay = keys.filter((k) => !canTurnOff(k)).length;
+  if (stay === 0) return "Every app is off";
+  return `Every app that can be turned off is off. ${stay === 1 ? "1 stays sieved: Windows gives it no name." : `${stay} stay sieved: Windows gives them no name.`}`;
+}
+
 function samePath(a: string, b: string): boolean {
   return a.toLowerCase() === b.toLowerCase();
 }

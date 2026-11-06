@@ -232,7 +232,7 @@ describe("a toast says only what happened", () => {
       text: "Removed quiet from your apps",
     },
     { name: "sieve all", key: "apps.levels", values: { "apps.levels": { discord: "off" } }, act: bulk("Sieve every app"), text: "Every app is sieved" },
-    { name: "off all", key: "apps.levels", values: { "apps.pinned": ["D:\\Tools\\quiet.exe"] }, act: bulk("Turn every app off"), text: "Every app is off" },
+    { name: "off all", key: "apps.levels", values: { "apps.pinned": ["D:\\Tools\\quiet.exe"] }, act: bulk("Turn every app off"), text: "Every app that can be turned off is off. 1 stays sieved: Windows gives it no name." },
   ] as const;
 
   it.each(writers)("$name, cancelled: nothing is written and nothing is said", async ({ key, values, act: run, text }) => {
