@@ -845,10 +845,10 @@ mod tests {
 
     #[test]
     fn nxdomain_keeps_the_id_and_the_question_and_holds_no_records() {
-        let q = query(7, "use-application-dns.net");
+        let q = query(7, "absent.example");
         let reply = nxdomain(&q).unwrap();
         assert_eq!((id_of(&reply), flags_of(&reply).unwrap() & 0xf), (Some(7), RCODE_NXDOMAIN));
-        assert_eq!(parse(&reply).unwrap().question.as_deref(), Some("use-application-dns.net"));
+        assert_eq!(parse(&reply).unwrap().question.as_deref(), Some("absent.example"));
         assert_eq!(reply[6..12], [0; 6]);
     }
 

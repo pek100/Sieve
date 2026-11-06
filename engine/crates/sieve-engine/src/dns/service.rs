@@ -546,6 +546,24 @@ mod tests {
         assert!(b.connector.tcp_recorded().iter().all(|t| t.port() == doh.port), "TCP only to the configured upstream");
     }
 
+    /// The engine's own lookup has one routing decision with its clients: a LAN name
+    /// stays on the LAN, and one with nowhere to go goes nowhere, never public.
+    #[tokio::test]
+    async fn the_engines_own_lookup_takes_the_path_a_client_would() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let router = Plain::start(answering(), answering()).await;
+        let b = bed(&ca, &[doh.url()], Some("lan"), connector_with(&router));
+        let records = tokio::time::timeout(PATIENT, b.service.https_records("router.lan")).await.unwrap().unwrap();
+        assert!(records.is_empty());
+        assert_eq!(b.connector.udp_recorded(), [lan_target()], "to the LAN server");
+        b.service.tables.write().unwrap().adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap().dns = vec!["fe80::1".parse().unwrap()];
+        for nowhere in ["router.lan", "7.168.192.in-addr.arpa"] {
+            assert!(b.service.https_records(nowhere).await.is_err(), "{nowhere}");
+        }
+        assert!(doh.seen().is_empty(), "nothing went public");
+    }
+
     #[tokio::test]
     async fn a_non_query_opcode_is_answered_locally_and_nothing_leaves() {
         let ca = Ca::new();

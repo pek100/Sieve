@@ -318,6 +318,28 @@ mod tests {
         }
     }
 
+    /// One reader of SvcParams: the record the engine's upstream hello reads is the
+    /// one a browser's answer loses its `ech` from, and a record the reader refuses
+    /// is never rewritten.
+    #[test]
+    fn the_strip_and_the_answer_reader_read_one_format() {
+        let mut reply = Reply::new();
+        reply.rr(ANSWER, &pointer(QUESTION_AT), TYPE_HTTPS, &with_ech());
+        let read = crate::dns::parse(&reply.0).unwrap().https;
+        assert_eq!((read[0].priority, read[0].ech.as_deref()), (1, Some(ECH)));
+        let stripped = crate::dns::parse(&cut(&reply.0)).unwrap().https;
+        assert_eq!((stripped[0].priority, stripped[0].ech.as_deref()), (1, None), "the same record, with nothing left to read");
+
+        let mut overrun = service(1, &[0], &[(SVC_PARAM_ECH, ECH)]);
+        overrun.truncate(overrun.len() - 1);
+        for malformed in [service(1, &[0], &[(SVC_PARAM_ECH, ECH), (3, PORT)]), overrun] {
+            let mut reply = Reply::new();
+            reply.rr(ANSWER, &pointer(QUESTION_AT), TYPE_HTTPS, &malformed);
+            assert!(crate::dns::parse(&reply.0).unwrap().https.is_empty(), "the reader refuses it");
+            assert_eq!(strip(&reply.0), Stripped::Left, "the strip leaves it");
+        }
+    }
+
     /// Every record as text: owner, type, class, TTL, and rdata with names read
     /// through their pointers.
     fn dump(msg: &[u8]) -> Vec<String> {
