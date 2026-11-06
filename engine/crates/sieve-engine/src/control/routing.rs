@@ -16,6 +16,7 @@
 //! adds or removes the routes whose plan changed. Taking down drops the DNS
 //! service, so its connections end with the routes.
 
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -47,8 +48,10 @@ use crate::route::watch::{RouteWatch, watch as watch_routes};
 use crate::stack::egress::Egress;
 use crate::stack::relay::{Relay, RelayParts, UDP_IDLE, Witness, handle_tcp, handle_udp};
 use crate::tls::active::Active;
+use crate::tls::ech::EchCache;
 use crate::tls::intercept::{Interception, wanted};
 use crate::tls::upstream::{PlatformTrust, TRUST_TIMEOUT, Verifier};
+use crate::tls::validation::ValidationSlot;
 use crate::tls::verdict::VerdictCache;
 use crate::tun::device::{Tun, TunDevice, TunSink};
 #[cfg(not(feature = "relay-experiments"))]
@@ -304,7 +307,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     let device = TunDevice::new(tun.session.clone(), engine.meters.clone(), engine.beats.clone());
     let stack = IpStack::new(config, device);
     let lists = tokio::spawn(engine.lists.clone().run(HttpsFetcher::new(relay.clone())));
-    let exclusions = tokio::spawn(refresh_exclusions(engine.exclusions.clone(), HttpsFetcher::new(relay.clone())));
+    let exclusions = tokio::spawn(refresh_exclusions(engine.exclusions.clone(), HttpsFetcher::new(relay.clone()), engine.validation.clone(), engine.dir.clone()));
     let (stop_accept, stopped) = oneshot::channel();
     let accept = tokio::spawn(accept(stack, relay.clone(), stopped));
     let batches = {
@@ -337,13 +340,19 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
 /// while the slot is empty, and a failure here means every flow takes the relay.
 fn build_interception(engine: &Engine, egress: &Arc<Egress>) -> Result<Interception<Egress>, String> {
     let trust = Arc::new(PlatformTrust::new()?);
-    let verifier = Arc::new(Verifier::new(crate::tls::public_roots(), trust, TRUST_TIMEOUT)?);
+    let verifier = Arc::new(Verifier::new(crate::tls::public_roots(), trust, TRUST_TIMEOUT, engine.validation.clone())?);
+    let lookup = super::lock(&engine.dns_service).clone().ok_or("the DNS service is not running")?;
+    if let Some(dir) = engine.dir.clone() {
+        let validation = engine.validation.clone();
+        tokio::spawn(async move { validation.reload(&dir).await });
+    }
     let ca = engine.ca();
     Ok(Interception {
         connector: egress.clone(),
         exclusions: engine.exclusions.clone(),
         verifier,
         verdicts: VerdictCache::default(),
+        ech: Arc::new(EchCache::new(lookup)),
         active: Active::default(),
         minter: Box::new(move || ca.as_ref().and_then(|c| c.minter())),
         filter: engine.filter.clone(),
@@ -370,15 +379,19 @@ fn sync_https(engine: &Engine, egress: &Arc<Egress>) {
     }
 }
 
-/// While routes are up: the browsers Windows declares, and the fetched exclusion
-/// lists when any is enabled. One wake an hour, as `Lists::run` (plan 6).
-async fn refresh_exclusions(slot: Arc<ExclusionSlot>, fetcher: HttpsFetcher) {
+/// While routes are up: the browsers Windows declares, the fetched exclusion
+/// lists when any is enabled, and what the update cycle left for validation. One
+/// wake an hour, as `Lists::run` (plan 6).
+async fn refresh_exclusions(slot: Arc<ExclusionSlot>, fetcher: HttpsFetcher, validation: Arc<ValidationSlot>, dir: Option<PathBuf>) {
     let mut every = tokio::time::interval(EXCLUSIONS_EVERY);
     loop {
         every.tick().await;
         slot.set_browsers(BrowserSet::read(&WindowsRegistry));
         if slot.fetches() {
             slot.refresh(&fetcher, wall_ms()).await;
+        }
+        if let Some(dir) = &dir {
+            validation.reload(dir).await;
         }
     }
 }

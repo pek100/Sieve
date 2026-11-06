@@ -79,6 +79,23 @@ Publish an engine build that exits at start. Check that the real supervisor roll
 
 Sign a test release with your offline key, request it from the app, watch it apply; `sc qc` and the version in the app show the new one. Then re-serve an older release: it is refused.
 
+## 8. Slice 11's data
+
+Two artefacts carry what CT and CRLite read (`docs/tasks/2026-11-06-validation.md` D2, D7). Nothing downloads them for you, so until you publish them CT and CRLite are skipped on every connection, and `status.json` says so (`ct_skipped_no_list`). A log list is fine monthly, with a limit of 70 days. A CRLite bundle signed weekly can be up to a week behind Firefox, which is safe because the OS revocation check still runs.
+
+Fetch the inputs by hand, then make the artefacts offline with the tool, which refuses anything the engine would refuse:
+
+```powershell
+cd engine
+cargo run -p sieve-engine --example validation_bundle -- ct-logs log_list.json log_list.sig list-ct-logs
+cargo run -p sieve-engine --example validation_bundle -- crlite list-crlite full.filter 1.filter.delta 2.filter.delta
+```
+
+- `ct-logs`: `log_list.json` and `log_list.sig` from Chrome's published list. The tool checks Google's signature against the key compiled into the engine.
+- `crlite`: the `default` channel of the settings collection `security-state/cert-revocations`: its full filter first, then the deltas in order.
+
+Sign each with the procedure above, with the comments `sieve-update kind=list:ct-logs version=<n>` and `sieve-update kind=list:crlite version=<n>`, and list them in the signed index under those kinds. The update cycle puts them at `update::data_path`, and the engine reads them at its next hourly wake. The live proof is `docs/live/engine-slice-11.md`.
+
 ## Known limits, stated plainly
 
 - Power loss during a swap with a broken new engine: after that boot no supervisor exists, so nothing rolls back. The service manager restarts twice and stops, the network stays normal, and you reinstall.

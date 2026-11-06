@@ -249,6 +249,8 @@ pub enum UpstreamVerdict {
     Unavailable,
     /// The upstream handshake failed: it needs less than rustls offers.
     Protocol,
+    /// The chain fails Chrome's Certificate Transparency policy (slice 11).
+    NoTransparency,
 }
 
 /// An entry the engine wrote itself (plan 4.1's table).
@@ -303,11 +305,12 @@ pub enum Floor {
     UpstreamInvalid,
     UpstreamRevoked,
     UpstreamUnavailable,
+    UpstreamTransparency,
 }
 
 impl Floor {
     /// Every floor fact, for the coverage law and the property tests.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Forwarded,
         Self::UnknownApp,
         Self::Service,
@@ -323,6 +326,7 @@ impl Floor {
         Self::UpstreamInvalid,
         Self::UpstreamRevoked,
         Self::UpstreamUnavailable,
+        Self::UpstreamTransparency,
     ];
 
     fn slug(self) -> &'static str {
@@ -342,6 +346,7 @@ impl Floor {
             Self::UpstreamInvalid => "floor:upstream-invalid",
             Self::UpstreamRevoked => "floor:upstream-revoked",
             Self::UpstreamUnavailable => "floor:upstream-unavailable",
+            Self::UpstreamTransparency => "floor:upstream-ct",
         }
     }
 }
@@ -497,6 +502,7 @@ fn floor(facts: &FlowFacts<'_>, switches: &Switches) -> Option<Floor> {
         UpstreamVerdict::Revoked => Some(Floor::UpstreamRevoked),
         UpstreamVerdict::Unavailable => Some(Floor::UpstreamUnavailable),
         UpstreamVerdict::Protocol => Some(Floor::Protocol),
+        UpstreamVerdict::NoTransparency => Some(Floor::UpstreamTransparency),
     }
 }
 
@@ -632,6 +638,7 @@ mod decrypt_tests {
             Floor::UpstreamInvalid => f.upstream = Some(UpstreamVerdict::Invalid),
             Floor::UpstreamRevoked => f.upstream = Some(UpstreamVerdict::Revoked),
             Floor::UpstreamUnavailable => f.upstream = Some(UpstreamVerdict::Unavailable),
+            Floor::UpstreamTransparency => f.upstream = Some(UpstreamVerdict::NoTransparency),
         }
         (f, s)
     }

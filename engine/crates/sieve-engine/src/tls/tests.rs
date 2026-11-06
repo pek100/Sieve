@@ -29,8 +29,11 @@ use tokio::task::JoinHandle;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use super::active::Active;
+use super::ech::EchCache;
+use super::ech::testing::FakeLookup;
 use super::intercept::{ClientWatch, Dial, DialFuture, FlowMeta, HttpsSlot, Interception, NoWatch, Outcome, Pair, run};
 use super::upstream::{Chain, PlatformTrust, TRUST_TIMEOUT, TrustAnswer, TrustVerifier, Verifier, filter_alpn, handshake, is_post_handshake_auth, rustls_error};
+use super::validation::ValidationSlot;
 use super::verdict::VerdictCache;
 use super::{provider, public_roots};
 use crate::ca::key::MemoryKeyStore;
@@ -135,6 +138,40 @@ impl Pki {
         }
         let cert = params.signed_by(&key, &Issuer::from_params(&self.params, &self.key)).unwrap();
         (vec![cert.der().clone()], PrivatePkcs8KeyDer::from(key.serialize_der()).into())
+    }
+
+    /// An intermediate under this one.
+    pub(crate) fn child(&self, name: &str) -> Self {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName, name);
+        let key = KeyPair::generate().unwrap();
+        let der = params.signed_by(&key, &Issuer::from_params(&self.params, &self.key)).unwrap().der().clone();
+        Self { params, key, der }
+    }
+
+    /// A leaf carrying an SCT from each of `logs`: a first pass gives the TBS the
+    /// logs sign, a second carries the extension, and removing it must give that
+    /// TBS back. Its issuer's key is this one's.
+    pub(crate) fn leaf_with_scts(&self, name: &str, opts: LeafOpts, logs: &[&super::ct::testing::MemoryLog], at_ms: u64) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        const SCT_LIST_OID: [u64; 9] = [1, 3, 6, 1, 4, 1, 11129, 2, 4];
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now + time::Duration::seconds(opts.from_days * DAY_S);
+        params.not_after = now + time::Duration::seconds(opts.to_days * DAY_S);
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(&[0x51, 0x1e, 0x7e]));
+        let issuer = Issuer::from_params(&self.params, &self.key);
+        let first = params.signed_by(&key, &issuer).unwrap();
+        let tbs = X509Certificate::from_der(first.der()).unwrap().1.tbs_certificate.as_ref().to_vec();
+        let issuer_hash = super::ct::spki_hash(X509Certificate::from_der(&self.der).unwrap().1.public_key().raw);
+        let entry = super::ct::SignedEntry::Precert { issuer: &issuer_hash, tbs: &tbs };
+        let scts: Vec<Vec<u8>> = logs.iter().map(|log| log.sct(at_ms, entry)).collect();
+        let oid: Vec<u64> = SCT_LIST_OID.iter().copied().chain([2]).collect();
+        params.custom_extensions.push(CustomExtension::from_oid_content(&oid, super::ct::testing::sct_list_value(&scts)));
+        let second = params.signed_by(&key, &issuer).unwrap();
+        assert_eq!(super::ct::precert_tbs(second.der()).unwrap(), tbs, "the helper's own witness");
+        (vec![second.der().clone()], PrivatePkcs8KeyDer::from(key.serialize_der()).into())
     }
 }
 
@@ -379,6 +416,7 @@ pub(crate) struct Rig {
     pub(crate) trust: Arc<FakeTrust>,
     /// With `RigOpts::heals`: the watch, on this rig's store and meters.
     pub(crate) heal: Option<Arc<Heal>>,
+    pub(crate) validation: Arc<ValidationSlot>,
     _ca: Arc<Ca>,
     _dirs: Vec<tempfile::TempDir>,
 }
@@ -398,11 +436,12 @@ pub(crate) struct RigOpts {
     pub(crate) clock: fn() -> u64,
     /// The exclusion lists the store loads.
     pub(crate) sources: Vec<crate::exclusions::lists::Source>,
+    pub(crate) ech: Arc<FakeLookup>,
 }
 
 impl RigOpts {
     pub(crate) fn new(roots: Arc<RootCertStore>) -> Self {
-        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, clock: wall_ms, sources: Vec::new() }
+        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, clock: wall_ms, sources: Vec::new(), ech: FakeLookup::none() }
     }
 }
 
@@ -426,11 +465,13 @@ impl Rig {
         let meters = Arc::new(Meters::default());
         let heal = opts.heals.then(|| Arc::new(Heal::new(slot.clone(), meters.clone())));
         let watch: Arc<dyn ClientWatch> = heal.clone().map_or(opts.watch, |h| h);
+        let validation = Arc::new(ValidationSlot::new(meters.clone()));
         let deps = Interception {
             connector: Arc::new(dial),
             exclusions: slot,
-            verifier: Arc::new(Verifier::new(opts.roots, opts.trust.clone(), opts.trust_timeout).unwrap()),
+            verifier: Arc::new(Verifier::new(opts.roots, opts.trust.clone(), opts.trust_timeout, validation.clone()).unwrap()),
             verdicts: VerdictCache::default(),
+            ech: Arc::new(EchCache::new(opts.ech)),
             active: Active::default(),
             minter: Box::new(move || if minted.1 { minted.0.minter() } else { None }),
             filter: Arc::new(FilterSlot::new(DomainFilter::new(&policy, opts.rules))),
@@ -441,7 +482,7 @@ impl Rig {
             hook: opts.hook,
             clock: opts.clock,
         };
-        Rig { deps: Arc::new(deps), minter, trust: opts.trust, heal, _ca: ca, _dirs: vec![ca_dir, store_dir] }
+        Rig { deps: Arc::new(deps), minter, trust: opts.trust, heal, validation, _ca: ca, _dirs: vec![ca_dir, store_dir] }
     }
 
     /// An open flow in the book, as `admit` makes it.
@@ -582,12 +623,12 @@ pub(crate) fn shown_is_sieves(shown: &Shown, rig: &Rig) -> bool {
     issuer_of(&shown.leaf()) == subject_of(rig.minter.root_der())
 }
 
-fn expect_real(shown: &Shown, rig: &Rig) {
+pub(crate) fn expect_real(shown: &Shown, rig: &Rig) {
     assert!(!shown_is_sieves(shown, rig), "the client judged the real certificate");
 }
 
 /// One upstream on `configs`, echoing.
-fn echo_dial(arm: Arm, configs: Vec<Arc<ServerConfig>>) -> (TestDial, Arc<AtomicUsize>) {
+pub(crate) fn echo_dial(arm: Arm, configs: Vec<Arc<ServerConfig>>) -> (TestDial, Arc<AtomicUsize>) {
     let shaken = Arc::new(AtomicUsize::new(0));
     (TestDial::new(arm, tls_server(configs, shaken.clone(), |_, tls| echo(tls))), shaken)
 }
@@ -596,7 +637,7 @@ fn echo_dial(arm: Arm, configs: Vec<Arc<ServerConfig>>) -> (TestDial, Arc<Atomic
 const PING: [u8; 4] = [0, 1, 2, 3];
 
 /// A round trip of plain bytes through whatever the path is.
-async fn round_trip<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
+pub(crate) async fn round_trip<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
     stream.write_all(&PING).await.unwrap();
     stream.flush().await.unwrap();
     let mut pong = [0u8; PING.len()];
@@ -606,7 +647,7 @@ async fn round_trip<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
 
 // ---- Upstream first and the verifier stack.
 
-async fn passes_through(arm: Arm, pki: &Pki, leaf_pki: &Pki, opts: LeafOpts, sni_on_cert: &str, trust: Arc<FakeTrust>, reason: &str) -> Rig {
+pub(crate) async fn passes_through(arm: Arm, pki: &Pki, leaf_pki: &Pki, opts: LeafOpts, sni_on_cert: &str, trust: Arc<FakeTrust>, reason: &str) -> Rig {
     let config = server_tls_no_tickets(leaf_pki.leaf(sni_on_cert, opts));
     let (dial, shaken) = echo_dial(arm, vec![config]);
     let rig = Rig::new(dial, RigOpts { trust, ..RigOpts::new(pki.roots()) });
@@ -719,7 +760,7 @@ async fn the_trust_call_does_not_block_the_runtime() {
     // One worker: if the call ran on it, nothing else could.
     let pki = Pki::new("Test Public Root");
     let trust = FakeTrust::blocking(TrustAnswer::Trusted, Duration::from_millis(300));
-    let verifier = Verifier::new(pki.roots(), trust, Duration::from_secs(10)).unwrap();
+    let verifier = Verifier::new(pki.roots(), trust, Duration::from_secs(10), Arc::default()).unwrap();
     let (chain, _) = pki.leaf(HOST, GOOD);
     let chain = Chain { end_entity: chain[0].clone(), intermediates: Vec::new(), ocsp: Vec::new() };
     let ticks = Arc::new(AtomicU64::new(0));
@@ -732,7 +773,7 @@ async fn the_trust_call_does_not_block_the_runtime() {
             }
         })
     };
-    assert_eq!(verifier.verify(&chain, HOST, false).await, UpstreamVerdict::Eligible);
+    assert_eq!(verifier.verify(&chain, HOST, false, wall_ms()).await, UpstreamVerdict::Eligible);
     ticker.abort();
     assert!(ticks.load(Ordering::Relaxed) >= 5, "only {} ticks", ticks.load(Ordering::Relaxed));
 }
@@ -775,14 +816,14 @@ async fn resumption_is_disabled_upstream_so_the_verifier_always_runs() {
                 echo(tls).await;
             }
         });
-        match handshake(near, HOST, Vec::new()).await {
+        match handshake(near, HOST, Vec::new(), None).await {
             super::upstream::HandshakeEnd::Done(shaken) => assert!(!shaken.chain.end_entity.is_empty(), "the verifier ran"),
             _ => panic!("no handshake"),
         }
         server.abort();
     }
     let capture = Arc::default();
-    let shown = format!("{:?}", super::upstream::client_config(&capture, Vec::new()).unwrap().resumption);
+    let shown = format!("{:?}", super::upstream::client_config(&capture, Vec::new(), None).unwrap().resumption);
     assert!(shown.contains("NoClientSessionStorage"), "{shown}");
 }
 
@@ -1104,9 +1145,12 @@ arms!(server_first_bytes_are_forwarded_and_the_flow_only_splices, |arm| async mo
 // ---- Client certificate, EV.
 
 fn cert_server(pki: &Pki, client_pki: &Pki, required: bool) -> Arc<ServerConfig> {
+    cert_server_with(pki.leaf(HOST, GOOD), client_pki, required)
+}
+
+pub(crate) fn cert_server_with((chain, key): (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), client_pki: &Pki, required: bool) -> Arc<ServerConfig> {
     let builder = WebPkiClientVerifier::builder_with_provider(client_pki.roots(), provider());
     let verifier = if required { builder.build() } else { builder.allow_unauthenticated().build() }.unwrap();
-    let (chain, key) = pki.leaf(HOST, GOOD);
     Arc::new(ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions().unwrap().with_client_cert_verifier(verifier).with_single_cert(chain, key).unwrap())
 }
 
@@ -1647,7 +1691,7 @@ fn policy_without_https_builds_no_slot() {
 fn production_verifier_constructs() {
     // No verify call: that may ask Windows Update for roots (task D3).
     let trust = Arc::new(PlatformTrust::new().unwrap());
-    Verifier::new(public_roots(), trust, TRUST_TIMEOUT).unwrap();
+    Verifier::new(public_roots(), trust, TRUST_TIMEOUT, Arc::default()).unwrap();
 }
 
 #[tokio::test]

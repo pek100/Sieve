@@ -98,6 +98,8 @@ pub struct Engine {
     /// Self-healing: outlives each `Interception`, so a switch off and on forgets
     /// nothing. Hears flows only through one.
     pub heal: Arc<Heal>,
+    /// The log list and CRLite data, outliving the switch (slice 11).
+    pub validation: Arc<crate::tls::validation::ValidationSlot>,
     /// `filtering.https`: built by the routing loop while it is wanted and
     /// routes are up, empty otherwise.
     #[cfg(windows)]
@@ -151,6 +153,7 @@ impl Engine {
         let exclusions = Arc::new(ExclusionSlot::new(dir.as_deref(), &policy.exclusions, policy::wall_ms()));
         let meters: Arc<Meters> = Arc::default();
         let heal = Arc::new(Heal::new(exclusions.clone(), meters.clone()));
+        let validation = Arc::new(crate::tls::validation::ValidationSlot::new(meters.clone()));
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: dir.as_deref().map(crate::experiments::Loaded::load).unwrap_or_else(crate::experiments::Loaded::absent),
@@ -171,6 +174,7 @@ impl Engine {
             lists,
             exclusions,
             heal,
+            validation,
             #[cfg(windows)]
             https: Arc::default(),
             flows: broadcast::channel(FLOWS_BACKLOG).0,
@@ -324,6 +328,7 @@ impl Engine {
         let mut status = serde_json::to_value(self.status_saying(self.updates.status()))?;
         status["https"] = self.meters.https.report();
         status["quic"] = self.meters.quic.report(crate::quic::REFUSAL);
+        self.validation.report(&mut status["https"]);
         Ok(status)
     }
 
@@ -1050,8 +1055,9 @@ mod tests {
         let interception = Interception {
             connector: egress,
             exclusions: e.exclusions.clone(),
-            verifier: Arc::new(Verifier::new(crate::tls::public_roots(), Arc::new(PlatformTrust::new().unwrap()), TRUST_TIMEOUT).unwrap()),
+            verifier: Arc::new(Verifier::new(crate::tls::public_roots(), Arc::new(PlatformTrust::new().unwrap()), TRUST_TIMEOUT, e.validation.clone()).unwrap()),
             verdicts: VerdictCache::default(),
+            ech: Arc::new(crate::tls::ech::EchCache::new(service_from(Vec::new()))),
             active: Active::default(),
             minter: Box::new(|| None),
             filter: e.filter.clone(),

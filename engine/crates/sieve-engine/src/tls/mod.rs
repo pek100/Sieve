@@ -11,15 +11,27 @@
 //! - [`server`]: who the client side can answer, and with what;
 //! - [`first_bytes`], [`splice`]: holding, replaying and copying bytes;
 //! - [`active`]: the intercepted flows and their close signals.
+//!
+//! Validation parity (plan 2.6, 2.9, slice 11), part of the same switch:
+//! - [`validation`]: the two local chain checks and their data;
+//! - [`ct`]: Certificate Transparency under Chrome's policy;
+//! - [`crlite`]: CRLite as a hard-fail revocation source;
+//! - [`ech`]: the engine's own upstream hello uses ECH when a record has it.
 
 pub mod active;
+pub mod crlite;
+pub mod ct;
+pub mod ech;
 pub mod first_bytes;
 pub mod intercept;
 pub mod server;
 pub mod splice;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod validation_tests;
 pub mod upstream;
+pub mod validation;
 pub mod verdict;
 
 use std::sync::Arc;
