@@ -45,7 +45,7 @@ export function ExclusionsGroup() {
           <div className="flex flex-col gap-3">
             {m.groups.length > 2 && (
               <div className="max-w-full overflow-x-auto">
-                <Segmented size="sm" label="Filter by reason" value={m.group} onChange={m.setGroup} items={m.groups.map((g) => ({ value: g, label: REASON_GROUP_TEXT[g] }))} />
+                <Segmented className="w-max" size="sm" label="Filter by reason" value={m.group} onChange={m.setGroup} items={m.groups.map((g) => ({ value: g, label: REASON_GROUP_TEXT[g] }))} />
               </div>
             )}
             <SearchField value={m.query} onChange={m.setQuery} label="Search sites not decrypted" placeholder="Search by site, app or reason" />

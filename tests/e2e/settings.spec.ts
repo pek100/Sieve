@@ -73,8 +73,8 @@ test.describe("settings", () => {
         return { name: s.getAttribute("aria-label"), height: own.height, gap: own.bottom - content };
       }),
     );
-    // Five registry sections with rows (Filtering's is the engine's switch, slice 3), then the engine and its certificate, then the backlog's sections.
-    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Engine", "Certificate", "Notifications", "Filter lists", "Password"]);
+    // Five registry sections with rows (Filtering's is the engine's switch, slice 3), then the engine, its certificate and what is not decrypted, then the backlog's sections.
+    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Engine", "Certificate", "Not decrypted", "Notifications", "Filter lists", "Password"]);
     // Was 686 px of empty space under Filtering's rows: its card took the height of its wrapper (Card h-full).
     // Allowed: a row's own bottom padding (16) and at most a section's padding.
     for (const g of gaps) expect(g.gap, `${g.name} ends ${g.gap}px below its content`).toBeLessThanOrEqual(40);
