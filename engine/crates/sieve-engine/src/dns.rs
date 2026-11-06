@@ -344,9 +344,18 @@ pub struct HttpsRecord {
     pub ttl: u32,
 }
 
-/// The config to use: the lowest priority that has one.
+/// The longest `ech` value that counts as a config. A list is one or two configs,
+/// each a key, its suites and a name: about 70 bytes with X25519 and about 1,300
+/// with a post-quantum key, so this holds a few of either. The record format allows
+/// 65,535, which a resolver could repeat for every host `tls::ech::EchCache` holds,
+/// about 268 MB; with this bound, 16 MB.
+pub const MAX_ECH_CONFIG_BYTES: usize = 4_096;
+
+/// The config to use: the lowest priority that has one. A value over
+/// [`MAX_ECH_CONFIG_BYTES`] is no config, so the hello goes without ECH, as with any
+/// other config it cannot use.
 pub fn best_ech(records: &[HttpsRecord]) -> Option<&HttpsRecord> {
-    records.iter().filter(|r| r.ech.is_some()).min_by_key(|r| r.priority)
+    records.iter().filter(|r| r.ech.as_ref().is_some_and(|ech| ech.len() <= MAX_ECH_CONFIG_BYTES)).min_by_key(|r| r.priority)
 }
 
 /// Where the parameters of an HTTPS or SVCB RDATA start (RFC 9460 2.2): after the
@@ -988,6 +997,12 @@ mod tests {
         let out_of_order = https_data(1, "", &[NEXT, (ECH, &ech)]);
         let compressed = vec![0, 1, 0xc0, 0x0c];
         row("malformed records beside a good one", Some(config(1)), https_reply(host, OK, &[(host, TYPE_HTTPS, 300, cut), (host, TYPE_HTTPS, 300, out_of_order), (host, TYPE_HTTPS, 300, compressed), (host, TYPE_HTTPS, 300, with(service(2, 1)))]));
+        // A value over the bound is no config, and costs nothing else.
+        let longest = vec![1; MAX_ECH_CONFIG_BYTES];
+        let over = vec![2; MAX_ECH_CONFIG_BYTES + 1];
+        row("a config at the bound", Some(longest.clone()), https_reply(host, OK, &[(host, TYPE_HTTPS, 300, https_data(1, "", &[(ECH, &longest)]))]));
+        row("a config over the bound", None, https_reply(host, OK, &[(host, TYPE_HTTPS, 300, https_data(1, "", &[(ECH, &over)]))]));
+        row("one over the bound beside a good one", Some(config(3)), https_reply(host, OK, &[(host, TYPE_HTTPS, 300, https_data(1, "", &[(ECH, &over)])), (host, TYPE_HTTPS, 300, with(service(2, 3)))]));
         // The address path is unchanged by any of this.
         let mut both = https_reply(host, OK, &[(host, TYPE_HTTPS, 300, with(service(1, 1)))]);
         both[6..8].copy_from_slice(&2u16.to_be_bytes());

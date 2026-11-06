@@ -60,6 +60,18 @@ impl<K: Eq + Hash + Clone, V: Clone> Lru<K, V> {
         }
     }
 
+    /// Drops every value `keep` refuses.
+    pub fn retain(&mut self, keep: impl Fn(&V) -> bool) {
+        let used = &mut self.used;
+        self.items.retain(|_, (value, tick)| {
+            let kept = keep(value);
+            if !kept {
+                used.remove(tick);
+            }
+            kept
+        });
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }

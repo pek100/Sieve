@@ -91,12 +91,20 @@ impl EchCache {
         lock(&self.entries).get(host, |e| now_ms < e.expires_ms).map(|e| e.config)
     }
 
+    /// A host never asked for again would hold its config until the count pushed it
+    /// out, so what is out of date goes with each store: at most once per lookup.
+    fn store(&self, host: String, entry: Entry, now_ms: u64) {
+        let mut entries = lock(&self.entries);
+        entries.retain(|e| now_ms < e.expires_ms);
+        entries.insert(host, entry);
+    }
+
     fn start(self: &Arc<Self>, host: &str, now_ms: u64) -> watch::Receiver<()> {
         let (done, waiting) = watch::channel(());
         let (cache, host) = (self.clone(), host.to_string());
         tokio::spawn(async move {
             let answer = cache.lookup.https(&host).await;
-            lock(&cache.entries).insert(host.clone(), entry_of(answer, now_ms));
+            cache.store(host.clone(), entry_of(answer, now_ms), now_ms);
             lock(&cache.in_flight).remove(&host);
             let _ = done.send(());
         });
@@ -128,7 +136,7 @@ impl EchCache {
 
     /// This host's config failed on the wire: no ECH for a while.
     pub fn mark_negative(&self, host: &str, now_ms: u64) {
-        lock(&self.entries).insert(host.to_string(), Entry { config: None, expires_ms: now_ms.saturating_add(NEGATIVE_TTL_MS) });
+        self.store(host.to_string(), Entry { config: None, expires_ms: now_ms.saturating_add(NEGATIVE_TTL_MS) }, now_ms);
     }
 }
 
@@ -215,6 +223,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+    use crate::dns::MAX_ECH_CONFIG_BYTES;
 
     const HOST: &str = "site.example";
     const NOW: u64 = 1_800_000_000_000;
@@ -290,6 +299,34 @@ mod tests {
         tokio::time::sleep(ECH_LOOKUP_WAIT * 2).await;
         assert_eq!(cache.config_for(HOST, 443, NOW).await.as_deref(), Some(&vec![9]));
         assert_eq!(lookup.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_config_is_not_retained() {
+        let lookup = FakeLookup::with_config(vec![1; MAX_ECH_CONFIG_BYTES + 1]);
+        let oversized = cache(lookup.clone());
+        assert!(oversized.config_for(HOST, 443, NOW).await.is_none());
+        assert!(matches!(oversized.cached(HOST, NOW), Some(None)), "held as no config");
+        assert!(oversized.config_for(HOST, 443, NOW + NEGATIVE_TTL_MS - 1).await.is_none());
+        assert_eq!(lookup.calls(), 1, "and not asked again meanwhile");
+        // The control: one at the bound is a config.
+        let longest = cache(FakeLookup::with_config(vec![1; MAX_ECH_CONFIG_BYTES]));
+        assert_eq!(longest.config_for(HOST, 443, NOW).await.map(|c| c.len()), Some(MAX_ECH_CONFIG_BYTES));
+    }
+
+    #[tokio::test]
+    async fn an_expired_entry_gives_its_bytes_back_at_the_next_store() {
+        const LIVES_MS: u64 = 300_000;
+        let cache = cache(with_ttl(300));
+        cache.config_for(HOST, 443, NOW).await;
+        // The control: still in date, so it stays.
+        cache.config_for("live.example", 443, NOW + LIVES_MS - 1).await;
+        assert_eq!(lock(&cache.entries).len(), 2);
+        cache.config_for("later.example", 443, NOW + LIVES_MS).await;
+        let entries = lock(&cache.entries);
+        assert_eq!((entries.len(), entries.index_len()), (2, 2), "the first went, from both sides of the index");
+        drop(entries);
+        assert!(cache.cached(HOST, NOW).is_none());
     }
 
     #[tokio::test]
