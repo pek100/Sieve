@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { REASON_TEXT } from "@/core/log";
+import { MAX_POLICY_BYTES } from "@/core/settings/registry";
 import fixture from "@/data/fixtures/engine-ipc-v3.json";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
 import { BLOCKER_KINDS, CERT_STATES, FIREFOX_TRUST, LOG_OUTCOMES, parseCertStatus, parseEngineLists, parseEngineStatus, parseLogTail, UPDATE_KINDS } from "@/data/protocol";
@@ -30,6 +31,9 @@ describe("engine IPC law", () => {
     expect(fixture.protocol).toBe(Number(rustConst("PROTOCOL")));
     expect(fixture.supported).toEqual(JSON.parse(rustConst("SUPPORTED")));
     expect(fixture.maxFrame).toBe(1 << Number(rustConst("MAX_FRAME").replace("1 << ", "")));
+    expect(rustConst("MAX_POLICY_BYTES")).toBe("MAX_FRAME / 2");
+    expect(fixture.maxPolicyBytes).toBe(fixture.maxFrame / 2);
+    expect(MAX_POLICY_BYTES, "what the app measures against is what the engine refuses at").toBe(fixture.maxPolicyBytes);
     expect(fixture.pipe).toBe(rustConst("PIPE_NAME").replace(/^r"|"$/g, ""));
     expect(fixture.flowsBatchMs).toBe(Number(rustConst("FLOWS_BATCH_MS")));
     expect(fixture.flowsPerFrame).toBe(Number(rustConst("FLOWS_PER_FRAME")));

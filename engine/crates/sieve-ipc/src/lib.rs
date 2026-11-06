@@ -37,6 +37,9 @@ pub const SUPPORTED: [u32; 2] = [3, 3];
 pub const PIPE_NAME: &str = r"\\.\pipe\sieve-engine";
 /// Largest frame body in bytes (1 MiB).
 pub const MAX_FRAME: usize = 1 << 20;
+/// The largest policy the engine takes, half a frame: the Status that carries
+/// the policy has the other half. The app measures against it before it sends.
+pub const MAX_POLICY_BYTES: usize = MAX_FRAME / 2;
 /// A subscribed client gets the flows that changed at most this often (plan 1.3).
 pub const FLOWS_BATCH_MS: u64 = 250;
 /// At most this many flow events per `flows` frame; a larger batch is split,
@@ -559,6 +562,23 @@ pub fn app_key(product: Option<&str>, exe: Option<&str>, process_name: &str) -> 
     product.or(exe.map(exe_stem)).unwrap_or(process_name).to_lowercase()
 }
 
+/// The name of a process hosting these Windows services, where its exe is
+/// hidden from the app: the display name when there is one, else the first by
+/// name and how many more ("Windows Update and 3 more"). Sorted, so the name,
+/// and the app it groups into, is stable from one read to the next. None for no
+/// services. The app shows it as the row's name and the engine keys the same
+/// process by it ([`app_key`]), so the row's Off means that process on both sides.
+pub fn service_label(mut names: Vec<String>) -> Option<String> {
+    names.retain(|n| !n.trim().is_empty());
+    names.sort();
+    names.dedup();
+    match names.len() {
+        0 => None,
+        1 => names.pop(),
+        n => Some(format!("{} and {} more", names[0], n - 1)),
+    }
+}
+
 /// What the filter did with one request or flow (plan 8.3). A reason is a
 /// slug the app turns into words; later slices add reasons with no bump.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,6 +769,7 @@ mod tests {
         assert_eq!(f["supported"], serde_json::json!(SUPPORTED));
         assert_eq!(f["pipe"], PIPE_NAME);
         assert_eq!(f["maxFrame"], MAX_FRAME);
+        assert_eq!(f["maxPolicyBytes"], MAX_POLICY_BYTES);
         assert_eq!(f["flowsBatchMs"], FLOWS_BATCH_MS);
         assert_eq!(f["flowsPerFrame"], FLOWS_PER_FRAME);
         assert_eq!(f["logPerFrame"], LOG_PER_FRAME);

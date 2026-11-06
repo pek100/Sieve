@@ -10,9 +10,12 @@
  * imported or reset: its stored value stays as it is.
  */
 import {
+  POLICY_BUDGETS,
   SETTINGS_SCHEMA,
   SECTIONS,
   SETTING_KEYS,
+  budgetBytes,
+  budgetProblem,
   defaultValue,
   isAvailable,
   isSettingKey,
@@ -117,6 +120,14 @@ export function planImport(current: SettingsDoc, text: string): ImportPlan {
       continue;
     }
     values[key] = v;
+  }
+  // A group the engine could not hold: what the file would change in it is refused, as a save is.
+  for (const budget of POLICY_BUDGETS) {
+    const bytes = budgetBytes(budget, (key) => values[key] ?? defaultValue(key));
+    if (bytes <= budget.bytes) continue;
+    for (const key of budget.keys) {
+      if (values[key] !== undefined && !same(values[key], readValue(current, key))) refused.push({ key, reason: budgetProblem(budget, bytes) });
+    }
   }
   // A refused known key keeps its current value rather than dropping to the default
   // (an unavailable one is kept as stored by docWith).

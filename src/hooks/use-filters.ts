@@ -87,23 +87,27 @@ export function useFilters(): FiltersModel {
 
   const hostList = (key: "filtering.allowedDomains" | "filtering.blockedDomains", write: (v: readonly string[]) => Promise<boolean>, name: string) => {
     const now = () => settings.get(key);
+    // A refused write says why; it never fails silently.
+    const said = (e: unknown) => void notices.push({ kind: "error", text: message(e) });
     return {
       add: (host: string) => {
         if (now().includes(host)) {
           notices.push({ kind: "info", text: `${host} is already on the ${name}` });
           return;
         }
-        void write([...now(), host]);
+        write([...now(), host]).catch(said);
       },
       remove: (host: string) => {
-        void write(now().filter((h) => h !== host)).then((ran) => {
-          if (!ran) return;
-          notices.push({
-            kind: "info",
-            text: `Removed ${host} from the ${name}`,
-            action: { label: "Undo", run: () => void write(now().includes(host) ? now() : [...now(), host]) },
-          });
-        });
+        write(now().filter((h) => h !== host))
+          .then((ran) => {
+            if (!ran) return;
+            notices.push({
+              kind: "info",
+              text: `Removed ${host} from the ${name}`,
+              action: { label: "Undo", run: () => void write(now().includes(host) ? now() : [...now(), host]).catch(said) },
+            });
+          })
+          .catch(said);
       },
     };
   };

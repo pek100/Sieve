@@ -33,20 +33,7 @@ pub fn describe(
     ProcessInfo { pid, exe, name, product }
 }
 
-/// The name for a process hosting these services: the display name when it
-/// is one, else the first by name and how many more ("Windows Update and 3
-/// more"). Sorted, so the name (and the app it groups into) is stable from
-/// one sample to the next. None for no services.
-pub fn service_label(mut names: Vec<String>) -> Option<String> {
-    names.retain(|n| !n.trim().is_empty());
-    names.sort();
-    names.dedup();
-    match names.len() {
-        0 => None,
-        1 => names.pop(),
-        n => Some(format!("{} and {} more", names[0], n - 1)),
-    }
-}
+pub use sieve_ipc::service_label;
 
 /// The service-name lookup for one snapshot: pid -> its label.
 pub fn service_lookup(services: &HashMap<u32, Vec<String>>) -> impl Fn(u32) -> Option<String> + '_ {

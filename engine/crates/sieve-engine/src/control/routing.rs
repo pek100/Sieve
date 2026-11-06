@@ -76,20 +76,21 @@ fn journal(engine: &Engine) -> Option<Journal> {
 /// blocker: a failed session, or a consumer that ends later, goes to
 /// `last_error` and routing continues with the owner tables alone (fail-open).
 fn start_attribution(engine: &Arc<Engine>) -> (Option<EtwSession>, Witness, Arc<NatTable>) {
+    engine.attribution_starts();
     let sinks = Sinks::new(std::process::id(), engine.meters.clone());
     let winnat = sinks.winnat.clone();
     let ring = sinks.ring.clone();
     let reporter = engine.clone();
-    let report = move |why| reporter.set_facts(|f| f.last_error = Some(why));
+    let report = move |why| reporter.attribution_failed(why);
     let (session, witness): (Option<EtwSession>, Witness) = match etw_os::start(sinks, report) {
         Ok(session) => {
             if let Some(why) = &session.winnat_error {
-                engine.set_facts(|f| f.last_error = Some(why.clone()));
+                engine.attribution_failed(why.clone());
             }
             (Some(session), Box::new(RingWitness { ring, flush: etw_os::flusher(engine.meters.clone()) }))
         }
         Err(why) => {
-            engine.set_facts(|f| f.last_error = Some(format!("attribution without ETW: {why}")));
+            engine.attribution_failed(format!("attribution without ETW: {why}"));
             (None, Box::new(Unwitnessed))
         }
     };
@@ -101,7 +102,7 @@ async fn stop_attribution(engine: &Engine, session: Option<EtwSession>) {
     let Some(session) = session else { return };
     let stopped = tokio::task::spawn_blocking(move || session.stop(TASKS_BOUND)).await;
     if let Ok(Err(why)) = stopped {
-        engine.set_facts(|f| f.last_error = Some(why));
+        engine.attribution_failed(why);
     }
 }
 

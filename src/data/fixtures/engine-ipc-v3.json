@@ -3,6 +3,7 @@
   "supported": [3, 3],
   "pipe": "\\\\.\\pipe\\sieve-engine",
   "maxFrame": 1048576,
+  "maxPolicyBytes": 524288,
   "flowsBatchMs": 250,
   "flowsPerFrame": 500,
   "logPerFrame": 200,

@@ -102,6 +102,39 @@ export function listValueProblem(key: SettingKey, value: unknown): string | null
   return null;
 }
 
+/** The largest policy the engine takes (`sieve_ipc::MAX_POLICY_BYTES`; tests/laws/engine-ipc.test.ts ties them). */
+export const MAX_POLICY_BYTES = 512 * 1024;
+const KIB = 1024;
+
+/**
+ * The settings the engine controller sends whole in its one policy, and how much
+ * of the engine's limit each group may use. The groups leave room for the
+ * switches, the list selection and the JSON around them, so settings within
+ * these budgets always fit. A setting over its budget is refused where it is
+ * saved or imported: a policy that does not fit would hold back the off switch.
+ */
+export const POLICY_BUDGETS: readonly { keys: readonly SettingKey[]; bytes: number; what: string }[] = [
+  {
+    keys: ["filtering.userRules", "filtering.blockedDomains", "filtering.allowedDomains", "filtering.exclusions"],
+    bytes: MAX_POLICY_BYTES - 64 * KIB,
+    what: "Your rules, blocklist, allowlist and undecrypted sites",
+  },
+  { keys: ["apps.levels"], bytes: 32 * KIB, what: "The apps you turned off" },
+];
+
+export type PolicyBudget = (typeof POLICY_BUDGETS)[number];
+
+/** What these values of a budget's settings take up in a policy, in bytes. */
+export function budgetBytes(budget: PolicyBudget, read: (key: SettingKey) => unknown): number {
+  return new TextEncoder().encode(JSON.stringify(budget.keys.map(read))).length;
+}
+
+/** The person's sentence for a budget this many bytes would break. */
+export function budgetProblem(budget: PolicyBudget, bytes: number): string {
+  const kb = (n: number) => Math.ceil(n / KIB);
+  return `${budget.what} would come to ${kb(bytes)} KB, more than the ${kb(budget.bytes)} KB the engine can hold, so this was not saved. Remove some and try again.`;
+}
+
 export interface EnumSetting<O extends string = string> extends Base<O> {
   kind: "enum";
   options: readonly O[];

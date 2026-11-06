@@ -57,6 +57,9 @@ pub struct Facts {
     /// The newest route failure ([`Engine::route_failed`]). Status reports it
     /// last.
     pub route_error: Option<String>,
+    /// What went wrong with attribution's sources in the latest routing run
+    /// ([`Engine::attribution_failed`]). Status reports it after `route_error`.
+    pub attribution_error: Option<String>,
     /// When the routes came up (monotonic ms), for the Stall test build.
     pub up_since: Option<u64>,
 }
@@ -216,6 +219,18 @@ impl Engine {
         self.set_facts(|f| f.route_error = Some(reason));
     }
 
+    /// A routing run starts its attribution sources again: what the last run's
+    /// reported is over, and is not said twice if it happens again.
+    pub fn attribution_starts(&self) {
+        self.set_facts(|f| f.attribution_error = None);
+    }
+
+    /// Reports an attribution source that failed or ended, beside any other of
+    /// this run's: routing goes on with the owner tables alone.
+    pub fn attribution_failed(&self, reason: String) {
+        self.set_facts(|f| f.attribution_error = beside(f.attribution_error.take(), Some(reason)));
+    }
+
     /// The encrypted DNS resolvers the engine holds.
     pub fn dns_upstreams(&self) -> DnsUpstreams {
         lock(&self.dns_upstreams).clone()
@@ -333,7 +348,7 @@ impl Backend for Engine {
             blocking: f.routes_up && self.filter.get().blocks_anything(),
             flows: u32::try_from(live).unwrap_or(u32::MAX),
             decrypting: false,
-            last_error: beside(beside(beside(f.last_error, f.dns_file_error), f.route_error), self.lists.compile_error()),
+            last_error: beside(beside(beside(beside(f.last_error, f.dns_file_error), f.route_error), f.attribution_error), self.lists.compile_error()),
             policy,
             blocker,
             split_tunnels: f.split_tunnels,
@@ -651,6 +666,40 @@ mod tests {
             assert!(reported.contains(held), "{held} in {reported}");
         }
         assert!(!reported.contains("code 5"), "{reported}");
+    }
+
+    /// The routing loop's sites (`control/routing.rs`) go through these two; a
+    /// plain assignment there is what hid the reasons before.
+    #[test]
+    fn an_attribution_failure_hides_no_other_reason_and_is_not_repeated_by_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(config::DNS_FILE), b"{\"revision\":1,\"upstreams\":[\"udp://1.1.1.1\"]}").unwrap();
+        let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        e.add_error("policy.json: broken".into());
+        e.add_error("certificate: no store".into());
+        e.add_error("route changes are not watched: code 5".into());
+        e.route_failed("route 10.0.0.0/8: code 5".into());
+
+        e.attribution_starts();
+        e.attribution_failed("attribution without ETW: code 5".into());
+        e.attribution_failed("the consumer ended".into());
+        let reported = e.status().last_error.unwrap();
+        for held in ["read as the defaults", "policy.json: broken", "certificate: no store", "route changes are not watched", "route 10.0.0.0/8: code 5", "attribution without ETW: code 5", "the consumer ended"] {
+            assert!(reported.contains(held), "{held} in {reported}");
+        }
+
+        e.attribution_starts();
+        e.attribution_failed("attribution without ETW: code 5".into());
+        let reported = e.status().last_error.unwrap();
+        assert_eq!(reported.matches("attribution without ETW").count(), 1, "{reported}");
+        assert!(!reported.contains("the consumer ended"), "the last run's is over: {reported}");
+        assert!(reported.contains("policy.json: broken"), "{reported}");
+    }
+
+    #[test]
+    fn nothing_in_the_routing_loop_assigns_the_kept_reasons() {
+        let routing = include_str!("routing.rs");
+        assert!(!routing.contains("f.last_error ="), "use add_error or attribution_failed: one reason never hides another");
     }
 
     #[test]

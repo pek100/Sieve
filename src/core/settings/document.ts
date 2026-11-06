@@ -6,7 +6,10 @@
  */
 import { migrate } from "./migrate";
 import {
+  POLICY_BUDGETS,
   SETTINGS_SCHEMA,
+  budgetBytes,
+  budgetProblem,
   defaultValue,
   isAvailable,
   isSettingKey,
@@ -47,7 +50,11 @@ export function readValue<K extends SettingKey>(doc: SettingsDoc, key: K): Setti
   return v !== undefined && isValidValue(key, v) ? (v as SettingValue<K>) : defaultValue(key);
 }
 
-/** Store a value. An unavailable setting takes only its default (which clears it). */
+/**
+ * Store a value. An unavailable setting takes only its default (which clears it).
+ * A value that would put its group over the engine's budget is refused with a
+ * sentence the person reads; one that makes an oversized group smaller is not.
+ */
 export function writeValue<K extends SettingKey>(doc: SettingsDoc, key: K, value: SettingValue<K>): SettingsDoc {
   if (!isValidValue(key, value)) throw new Error(`Setting ${key}: invalid value ${JSON.stringify(value)}`);
   if (!isAvailable(key) && !sameValue(value, defaultValue(key))) {
@@ -56,7 +63,13 @@ export function writeValue<K extends SettingKey>(doc: SettingsDoc, key: K, value
   const values: Record<string, unknown> = { ...doc.values };
   if (sameValue(value, defaultValue(key))) delete values[key];
   else values[key] = value;
-  return { schema: doc.schema, values };
+  const next = { schema: doc.schema, values };
+  const budget = POLICY_BUDGETS.find((b) => b.keys.includes(key));
+  if (budget) {
+    const after = budgetBytes(budget, (k) => readValue(next, k));
+    if (after > budget.bytes && after > budgetBytes(budget, (k) => readValue(doc, k))) throw new Error(budgetProblem(budget, after));
+  }
+  return next;
 }
 
 export function resetValue(doc: SettingsDoc, key: SettingKey): SettingsDoc {

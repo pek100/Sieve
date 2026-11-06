@@ -94,4 +94,17 @@ test.describe("filters", () => {
     await page.getByRole("listitem").filter({ hasText: "Removed www.example.com" }).getByRole("button", { name: "Undo" }).click();
     await expect(entry).toBeVisible();
   });
+
+  test("rules the engine could not hold are refused where they are saved, with the reason, and stay in the editor", async ({ page }) => {
+    await open(page);
+    const editor = page.getByRole("textbox", { name: "User rules" });
+    // Under the editor's own line limit, over what one policy can carry.
+    const lines = Array.from({ length: 4_500 }, (_, i) => `||a-long-enough-host-name-for-a-rule-number-${i}.tracker.example.com^$third-party,domain=shop.example.com`);
+    await editor.fill(lines.join("\n"));
+    await page.getByRole("button", { name: "Save rules" }).click();
+    await expect(page.getByRole("list", { name: "Rule problems" }).getByRole("alert")).toContainText("the engine can hold, so this was not saved");
+    await expect(editor).toHaveValue(new RegExp(`number-${lines.length - 1}\\.`));
+    await page.reload();
+    await expect(page.getByRole("textbox", { name: "User rules" })).toHaveValue("");
+  });
 });

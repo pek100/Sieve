@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NoticeToaster } from "@/components/sieve/shell/notice-toaster";
+import { MAX_POLICY_BYTES } from "@/core/settings/registry";
 import fixture from "@/data/fixtures/filter-lists-v1.json";
 import { MOCK_LISTS_ERROR, createMockFilterLists, type FilterListScenario } from "@/data/filter-lists-mock";
 import type { FilterListSource } from "@/data/filter-lists-source";
@@ -204,6 +205,19 @@ describe("user rules", () => {
     expect(editor()).toHaveValue("||a.example^");
     fireEvent.change(editor(), { target: { value: "||b.example^" } });
     expect(screen.queryByRole("list", { name: "Rule problems" })).toBeNull();
+  });
+
+  it("a list the engine could not hold is refused with the reason, wherever it is added to", async () => {
+    // In a setting no row lists, so the budget is what is under test and not jsdom.
+    const rt = await setup("pending", { schema: 5, values: { "filtering.exclusions": ["x".repeat(MAX_POLICY_BYTES)] } });
+    fireEvent.change(editor(), { target: { value: "||a-rule-that-is-one-too-many.example^" } });
+    await userEvent.click(save());
+    expect(within(await screen.findByRole("list", { name: "Rule problems" })).getByRole("alert")).toHaveTextContent("the engine can hold, so this was not saved");
+    expect(rt.settings.get("filtering.userRules")).toEqual([]);
+
+    await userEvent.type(screen.getByRole("textbox", { name: "Add to Allowlist" }), "one-too-many.example{Enter}");
+    await waitFor(() => expect(rt.notices.list().map((n) => n.text)).toContainEqual(expect.stringContaining("the engine can hold, so this was not saved")));
+    expect(rt.settings.get("filtering.allowedDomains")).toEqual([]);
   });
 
   it("an error names its line and Save is disabled; fixing it enables Save, and Save stores the lines", async () => {

@@ -7,10 +7,11 @@
  */
 import { describe, expect, it } from "vitest";
 import { LIST_GROUPS, listGroup } from "@/core/filter-lists";
-import { EMPTY_DOC } from "@/core/settings/document";
-import { isSettingKey, isValidValue } from "@/core/settings/registry";
+import { EMPTY_DOC, readValue, writeValue } from "@/core/settings/document";
+import { MAX_POLICY_BYTES, POLICY_BUDGETS, budgetBytes, isSettingKey, isValidValue } from "@/core/settings/registry";
 import { EXPORT_KIND, planImport } from "@/core/settings/transfer";
 import fixture from "@/data/fixtures/filter-lists-v1.json";
+import { createSettingsStore, memoryBackend } from "@/data/settings-store";
 import { hits, read, walk } from "./files";
 
 interface Row {
@@ -58,6 +59,60 @@ describe("law: one store for the user's own rules", () => {
       expect(controller, key).toContain(key);
     }
     expect(read("src/core/log-actions.ts")).toContain("filtering.userRules");
+  });
+});
+
+describe("law: what the engine could not hold is refused where it is saved", () => {
+  /** About 20k pasted lines, each a valid rule. */
+  const PASTED = Array.from({ length: 20_000 }, (_, i) => `||a-rule-for-host-number-${i}.tracker.example^$third-party`);
+  const rulesBudget = POLICY_BUDGETS.find((b) => b.keys.includes("filtering.userRules"))!;
+
+  it("settings within their budgets always fit one policy, with room for the switches and the catalogue's every list", () => {
+    const spent = POLICY_BUDGETS.reduce((sum, b) => sum + b.bytes, 0);
+    const lists = new TextEncoder().encode(JSON.stringify(fixture.examples.pending.lists.map((l) => l.id))).length;
+    const domainLists = new TextEncoder().encode(JSON.stringify({ domain_lists: [{ kind: "block", entries: [], enabled: true }, { kind: "allow", entries: [], enabled: true }] })).length;
+    expect(spent + lists + domainLists + 256).toBeLessThanOrEqual(MAX_POLICY_BYTES);
+  });
+
+  it("every setting the policy carries from a list or a map is in a budget", () => {
+    const controller = read("src/data/engine-controller.ts");
+    const wanted = controller.slice(controller.indexOf("function wantedPolicy"), controller.indexOf("/** One form of a policy"));
+    const budgeted = POLICY_BUDGETS.flatMap((b) => b.keys) as string[];
+    const sent = [...wanted.matchAll(/settings\.get\("([a-z.A-Z]+)"\)/g)].map((m) => m[1]).filter((k) => k !== "filters.lists");
+    expect(sent.length).toBeGreaterThan(0);
+    for (const key of sent) expect(budgeted, key).toContain(key);
+  });
+
+  it("a save over the budget is refused with a sentence, and nothing changes", async () => {
+    const store = createSettingsStore(memoryBackend({ schema: EMPTY_DOC.schema, values: { "filtering.userRules": ["||kept.example^"] } }));
+    await store.ready;
+    await expect(store.set("filtering.userRules", PASTED)).rejects.toThrow(/Your rules.*more than the \d+ KB the engine can hold, so this was not saved/);
+    expect(store.get("filtering.userRules")).toEqual(["||kept.example^"]);
+  });
+
+  it("the budget is shared: a big allowlist counts against the rules", () => {
+    const half = PASTED.slice(0, 5_000);
+    const hosts = half.map((_, i) => `a-rather-long-name-for-an-allowed-host-number-${i}.tracker.example`);
+    const withHosts = writeValue(EMPTY_DOC, "filtering.allowedDomains", hosts);
+    expect(() => writeValue(withHosts, "filtering.userRules", half)).toThrow(/not saved/);
+    expect(writeValue(EMPTY_DOC, "filtering.userRules", half).values["filtering.userRules"]).toEqual(half);
+  });
+
+  it("a group an older build stored over the budget can still be made smaller, and only smaller", () => {
+    const over = { schema: EMPTY_DOC.schema, values: { "filtering.userRules": PASTED } };
+    expect(budgetBytes(rulesBudget, (k) => readValue(over, k))).toBeGreaterThan(rulesBudget.bytes);
+    expect(writeValue(over, "filtering.userRules", PASTED.slice(0, -1)).values["filtering.userRules"]).toHaveLength(PASTED.length - 1);
+    expect(() => writeValue(over, "filtering.userRules", [...PASTED, "||one-more.example^"])).toThrow(/not saved/);
+  });
+
+  it("an import over the budget is refused with the same sentence, the current value kept, the rest of the file applied", () => {
+    const current = { schema: EMPTY_DOC.schema, values: { "filtering.userRules": ["||kept.example^"] } };
+    const plan = planImport(current, JSON.stringify({ kind: EXPORT_KIND, schema: EMPTY_DOC.schema, values: { "filtering.userRules": PASTED, "appearance.theme": "light" } }));
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.refused).toEqual([{ key: "filtering.userRules", reason: expect.stringMatching(/Your rules.*not saved/) }]);
+    expect(plan.next.values["filtering.userRules"]).toEqual(["||kept.example^"]);
+    expect(plan.next.values["appearance.theme"]).toBe("light");
   });
 });
 

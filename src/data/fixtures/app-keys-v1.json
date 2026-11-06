@@ -10,6 +10,8 @@
     { "why": "a trailing dot is not an extension", "product": null, "exe": "C:\\Tools\\odd.", "name": "odd.", "key": "odd." },
     { "why": "no exe: the process name", "product": null, "exe": null, "name": "Windows Update", "key": "windows update" },
     { "why": "the kernel's fixed label", "product": null, "exe": null, "name": "System", "key": "system" },
+    { "why": "a hidden exe hosting services: their label", "product": null, "exe": null, "name": "DHCP Client and 3 more", "key": "dhcp client and 3 more" },
+    { "why": "a hidden exe hosting no service: its pid", "product": null, "exe": null, "name": "pid 77", "key": "pid 77" },
     { "why": "non-ASCII lower-cases the same on both sides", "product": "ÉDITEUR", "exe": null, "name": "x", "key": "éditeur" }
   ]
 }

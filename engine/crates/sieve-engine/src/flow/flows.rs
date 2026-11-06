@@ -31,7 +31,7 @@ use std::sync::Mutex;
 
 use crate::flow::etw::{ETW_FLUSH_MIN_MS, PidWitness, Unwitnessed, Witnessed};
 use crate::flow::packet::{Packet, Proto};
-use sieve_ipc::app_key;
+use sieve_ipc::{app_key, service_label};
 
 /// A refresh of a table is never more frequent than this on misses.
 pub const REFRESH_MIN_MS: u64 = 15;
@@ -330,14 +330,17 @@ const MAX_APP_KEYS: usize = 4_096;
 
 /// exe path -> app key, read once per path: version info does not change
 /// while a file is in use. The lookup runs outside the lock.
-pub struct AppKeys<F> {
+pub struct AppKeys<F, H> {
     product_of: F,
+    hidden_name: H,
     keys: Mutex<HashMap<String, String>>,
 }
 
-impl<F: Fn(&str) -> Option<String>> AppKeys<F> {
-    pub fn new(product_of: F) -> Self {
-        Self { product_of, keys: Mutex::default() }
+impl<F: Fn(&str) -> Option<String>, H: Fn(u32) -> Option<String>> AppKeys<F, H> {
+    /// `hidden_name`: the name the app shows for a pid whose exe it cannot read
+    /// ([`HiddenNames`]), None for a pid it can.
+    pub fn new(product_of: F, hidden_name: H) -> Self {
+        Self { product_of, hidden_name, keys: Mutex::default() }
     }
 
     fn keys(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
@@ -357,27 +360,79 @@ impl<F: Fn(&str) -> Option<String>> AppKeys<F> {
         key
     }
 
-    /// The app key of `pid`: from its exe, or the fixed label of a kernel pid
-    /// (the app's `label`). None when the exe is hidden: the app names those
-    /// by the services they host, which the engine does not read, and an
+    /// The app key of `pid`, the key of the row the app shows it under: the name
+    /// it shows for an exe hidden from it, else from the exe, or the fixed label
+    /// of a kernel pid (the app's `label`). None when nothing names it: an
     /// unattributed flow is sieved rather than given a guessed exemption.
     ///
-    /// TENSION: the engine runs as SYSTEM and reads exes the unelevated app
-    /// cannot, so a service host the app lists as "DHCP Client and 3 more" keys
-    /// here under its product name ("microsoft windows operating system" from
-    /// svchost.exe), and turning that row off does not exempt it. Sharing the
-    /// app's key would mean reading the service table per flow and copying its
-    /// "hidden to the user" judgement, and its label moves as services stop. The
-    /// failure is on the safe side: that row's traffic stays sieved. A row with a
-    /// readable exe, every ordinary app's, has the same key on both sides
-    /// (`sieve_ipc::app_key`, fixture `app-keys-v1.json`).
+    /// The engine runs as SYSTEM and reads exes the unelevated app cannot. Keying
+    /// those by what the engine reads would put svchost.exe under "microsoft
+    /// windows operating system", the row of the readable explorer.exe, while the
+    /// app lists that host as "DHCP Client and 3 more" and reads it as sieved: that
+    /// product row's Off would exempt every service host, and the service row's
+    /// Off none. So both sides key such a process by the name the app shows.
+    ///
+    /// TENSION: the name moves as a host's services stop and start, and a row's Off
+    /// goes with its old name, on both sides alike. And "hidden" is judged here,
+    /// not asked of the app ([`hidden_from_the_app`]); where the two differ the
+    /// process is keyed under a row that is not the one it shows in, which fails
+    /// on the safe side for a row that reads sieved: it stays sieved.
     pub fn of_pid(&self, pid: u32, exe: Option<&str>) -> Option<String> {
         match (exe, pid) {
-            (Some(exe), _) => Some(self.key(exe)),
-            (None, 0) => Some(app_key(None, None, "System idle")),
-            (None, 4) => Some(app_key(None, None, "System")),
-            (None, _) => None,
+            (None, 0) => return Some(app_key(None, None, "System idle")),
+            (None, 4) => return Some(app_key(None, None, "System")),
+            _ => {}
         }
+        match (self.hidden_name)(pid) {
+            Some(name) => Some(app_key(None, None, &name)),
+            None => exe.map(|exe| self.key(exe)),
+        }
+    }
+}
+
+/// Whether the unelevated app is refused this process, from the account the
+/// process runs as (its SID as text; None when it could not be read): only a
+/// person's own accounts, local, domain (S-1-5-21) or Entra (S-1-12-1), leave
+/// their processes open to that person. SYSTEM, the service accounts and virtual
+/// service accounts do not.
+pub fn hidden_from_the_app(account: Option<&str>) -> bool {
+    account.is_none_or(|sid| !(sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-")))
+}
+
+/// The name the app shows for a pid whose exe is hidden from it: what its
+/// services are called, else "pid n" (`src-tauri`'s `netstat::process::label`).
+/// The service table is read at most once per [`EXE_CACHE_MS`], outside the lock.
+pub struct HiddenNames<A, S> {
+    account_of: A,
+    read_services: S,
+    /// The table and when it was read.
+    services: Mutex<Option<(ServiceTable, u64)>>,
+}
+
+/// The display names of the running services each pid hosts.
+pub type ServiceTable = HashMap<u32, Vec<String>>;
+
+impl<A: Fn(u32) -> Option<String>, S: Fn() -> ServiceTable> HiddenNames<A, S> {
+    pub fn new(account_of: A, read_services: S) -> Self {
+        Self { account_of, read_services, services: Mutex::default() }
+    }
+
+    /// None when the app can read the exe itself.
+    pub fn name(&self, pid: u32, now_ms: u64) -> Option<String> {
+        if !hidden_from_the_app((self.account_of)(pid).as_deref()) {
+            return None;
+        }
+        let held = {
+            let services = self.services.lock().unwrap_or_else(|p| p.into_inner());
+            services.as_ref().filter(|(_, at)| now_ms.saturating_sub(*at) < EXE_CACHE_MS).map(|(table, _)| table.get(&pid).cloned())
+        };
+        let names = held.unwrap_or_else(|| {
+            let table = (self.read_services)();
+            let names = table.get(&pid).cloned();
+            *self.services.lock().unwrap_or_else(|p| p.into_inner()) = Some((table, now_ms));
+            names
+        });
+        Some(names.and_then(service_label).unwrap_or_else(|| format!("pid {pid}")))
     }
 }
 
@@ -521,6 +576,115 @@ pub mod os {
         let _ = unsafe { CloseHandle(handle) };
         ok.ok()?;
         buf.get(..len as usize).map(String::from_utf16_lossy).filter(|p| !p.is_empty())
+    }
+
+    /// The name the app shows for `pid` when its exe is hidden from the app.
+    pub fn hidden_name(pid: u32) -> Option<String> {
+        type Names = super::HiddenNames<fn(u32) -> Option<String>, fn() -> std::collections::HashMap<u32, Vec<String>>>;
+        static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
+        NAMES.get_or_init(|| super::HiddenNames::new(account_of, service_names)).name(pid, crate::watchdog::monotonic_ms())
+    }
+
+    /// The account a process runs as, its SID as text; None when Windows refuses.
+    pub fn account_of(pid: u32) -> Option<String> {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+        use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+        use windows::core::PWSTR;
+
+        // SAFETY: plain call; the handle is closed below.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let mut token = HANDLE::default();
+        // SAFETY: `process` is open and `token` is a valid out pointer.
+        let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
+        // SAFETY: `process` came from OpenProcess and is closed once.
+        let _ = unsafe { CloseHandle(process) };
+        opened.ok()?;
+        // u64 storage keeps the buffer aligned for the TOKEN_USER written into it;
+        // a TOKEN_USER and its SID fit in far less than this.
+        let mut buf = [0u64; 32];
+        let mut len = 0u32;
+        // SAFETY: the buffer is writable for the size given and `len` is a valid out pointer.
+        let read = unsafe { GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), size_of_val(&buf) as u32, &mut len) };
+        // SAFETY: `token` came from OpenProcessToken and is closed once.
+        let _ = unsafe { CloseHandle(token) };
+        read.ok()?;
+        // SAFETY: the call above succeeded, so the buffer starts with a TOKEN_USER.
+        let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut text = PWSTR::null();
+        // SAFETY: `sid` points into `buf`; `text` is a valid out pointer, freed below.
+        unsafe { ConvertSidToStringSidW(sid, &mut text) }.ok()?;
+        // SAFETY: Windows wrote a NUL-terminated string to `text`.
+        let out = unsafe { text.to_string() }.ok();
+        // SAFETY: `text` was allocated by ConvertSidToStringSidW for LocalFree, once.
+        let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+        out
+    }
+
+    /// First buffer for the service list (64 KiB, about 400 services); it grows
+    /// to what Windows asks for.
+    const SERVICE_BUF_WORDS: usize = 8 * 1024;
+    /// Calls before giving up on a list that keeps changing under us.
+    const SERVICE_ROUNDS: usize = 16;
+
+    /// Running Windows services by the pid that hosts them, display names. Empty
+    /// when Windows refuses; the names are then "pid n".
+    ///
+    /// TENSION: this OS read also lives in `src-tauri/src/netstat/process.rs`, for
+    /// the same reason as `clean_resource_string` below. The pure rule is shared
+    /// (`sieve_ipc::service_label`). The app reads the list as the user and this as
+    /// SYSTEM: a service the user may not query would make the labels differ, and
+    /// that row's Off then exempts nothing, the safe side
+    /// (docs/live/engine-slice-3.md, "A row's Off").
+    pub fn service_names() -> std::collections::HashMap<u32, Vec<String>> {
+        use windows::Win32::Foundation::ERROR_MORE_DATA;
+        use windows::Win32::System::Services::{
+            CloseServiceHandle, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW, OpenSCManagerW, SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_ACTIVE, SERVICE_WIN32,
+        };
+        use windows::core::PCWSTR;
+
+        let mut out: std::collections::HashMap<u32, Vec<String>> = std::collections::HashMap::new();
+        // SAFETY: plain call; the handle is closed below on every path.
+        let Ok(scm) = (unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE) }) else {
+            return out;
+        };
+        // u64 storage keeps the buffer aligned for the structs Windows writes into it.
+        let mut buf: Vec<u64> = vec![0; SERVICE_BUF_WORDS];
+        let mut resume: u32 = 0;
+        for _ in 0..SERVICE_ROUNDS {
+            let (mut needed, mut count) = (0u32, 0u32);
+            let result = {
+                // SAFETY: a byte view of `buf`, which outlives this call.
+                let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), buf.len() * 8) };
+                // SAFETY: `bytes` is writable for its whole length; the out pointers are valid locals.
+                unsafe { EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_ACTIVE, Some(bytes), &mut needed, &mut count, Some(&mut resume), PCWSTR::null()) }
+            };
+            // SAFETY: Windows wrote `count` entries at the start of `buf`; their
+            // strings point into `buf`, which is not touched until they are read.
+            let entries = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<ENUM_SERVICE_STATUS_PROCESSW>(), count as usize) };
+            for e in entries {
+                let pid = e.ServiceStatusProcess.dwProcessId;
+                // SAFETY: a NUL-terminated string inside `buf` (or null, which reads as an error).
+                let name = if e.lpDisplayName.is_null() { None } else { unsafe { e.lpDisplayName.to_string() }.ok() };
+                if let (true, Some(name)) = (pid != 0, name) {
+                    out.entry(pid).or_default().push(name);
+                }
+            }
+            match result {
+                Ok(()) => break,
+                Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
+                    // Nothing fitted: grow to what Windows asked for, then ask again from `resume`.
+                    if count == 0 {
+                        buf = vec![0; (needed as usize).div_ceil(8).max(buf.len() * 2)];
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // SAFETY: `scm` came from OpenSCManagerW and is closed once.
+        let _ = unsafe { CloseServiceHandle(scm) };
+        out
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -892,10 +1056,13 @@ mod tests {
     #[test]
     fn an_exes_key_is_read_once_per_path() {
         let asked = Mutex::new(Vec::new());
-        let keys = AppKeys::new(|exe: &str| {
-            asked.lock().unwrap().push(exe.to_string());
-            exe.contains("chrome").then(|| "Google Chrome".to_string())
-        });
+        let keys = AppKeys::new(
+            |exe: &str| {
+                asked.lock().unwrap().push(exe.to_string());
+                exe.contains("chrome").then(|| "Google Chrome".to_string())
+            },
+            |_: u32| None,
+        );
         assert_eq!(keys.key(r"C:\x\chrome.exe"), "google chrome");
         assert_eq!(keys.key(r"C:\x\chrome.exe"), "google chrome");
         assert_eq!(keys.key(r"C:\x\Tool.exe"), "tool");
@@ -904,11 +1071,103 @@ mod tests {
 
     #[test]
     fn a_pid_has_a_key_from_its_exe_or_its_fixed_label_never_a_guess() {
-        let keys = AppKeys::new(|_: &str| None);
+        let keys = AppKeys::new(|_: &str| None, |_: u32| None);
         assert_eq!(keys.of_pid(99, Some(r"C:\x\Tool.exe")).as_deref(), Some("tool"));
         assert_eq!(keys.of_pid(4, None).as_deref(), Some("system"));
         assert_eq!(keys.of_pid(0, None).as_deref(), Some("system idle"));
         assert_eq!(keys.of_pid(99, None), None);
+    }
+
+    const WINDOWS_PRODUCT: &str = "Microsoft Windows Operating System";
+    const SVCHOST: &str = r"C:\Windows\System32\svchost.exe";
+    const EXPLORER: &str = r"C:\Windows\explorer.exe";
+    const HOST: u32 = 1200;
+    const SHELL: u32 = 3000;
+    const WORKER: u32 = 3300;
+
+    /// A machine: a service host and a service's worker as SYSTEM, and the
+    /// user's own shell. All three exes carry Windows' product name.
+    fn machine_keys() -> AppKeys<impl Fn(&str) -> Option<String>, impl Fn(u32) -> Option<String>> {
+        let names = HiddenNames::new(
+            |pid| Some(if pid == SHELL { "S-1-5-21-1-2-3-1001" } else { "S-1-5-18" }.to_string()),
+            || HashMap::from([(HOST, vec!["DNS Client".to_string(), "DHCP Client".to_string()])]),
+        );
+        AppKeys::new(|_: &str| Some(WINDOWS_PRODUCT.to_string()), move |pid| names.name(pid, 0))
+    }
+
+    /// The key is the row's: the app shows the host under its services and the
+    /// worker under its pid, and only the readable exe under the product name.
+    #[test]
+    fn a_process_hidden_from_the_app_has_the_key_of_the_row_the_app_shows_it_in() {
+        let keys = machine_keys();
+        assert_eq!(keys.of_pid(HOST, Some(SVCHOST)).as_deref(), Some("dhcp client and 1 more"));
+        assert_eq!(keys.of_pid(WORKER, Some(SVCHOST)).as_deref(), Some("pid 3300"));
+        assert_eq!(keys.of_pid(SHELL, Some(EXPLORER)).as_deref(), Some("microsoft windows operating system"));
+    }
+
+    /// The Off leak: one row's Off exempts that row's traffic and no other row's.
+    #[test]
+    fn a_rows_off_exempts_only_that_row() {
+        use crate::domain::{DomainFilter, Flow, Owner as FlowOwner, Reason};
+        use sieve_filter::rules::{ListText, RuleEngine, RuleSet};
+        use std::sync::Arc;
+
+        let keys = machine_keys();
+        let lists = RuleEngine::compile(&[ListText { id: "test", text: "||ads.example^\n", trusted: false }]);
+        let rules = RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(lists) };
+        let off = |key: &str| DomainFilter::new(&sieve_ipc::Policy { sieving: true, off_apps: vec![key.to_string()], ..Default::default() }, rules.clone());
+        let exempt = |filter: &DomainFilter, pid: u32, exe: &str| {
+            let key = keys.of_pid(pid, Some(exe)).unwrap();
+            let flow = Flow { dns: false, name: Some("ads.example"), remote: "192.0.2.1".parse().unwrap(), owner: FlowOwner::App { key: &key } };
+            filter.decide(flow, &Mutex::default(), 0).reason == Reason::AppExempt
+        };
+
+        let product_row = off("microsoft windows operating system");
+        assert!(exempt(&product_row, SHELL, EXPLORER));
+        assert!(!exempt(&product_row, HOST, SVCHOST), "the service host's own row still reads sieved");
+        assert!(!exempt(&product_row, WORKER, SVCHOST), "and so does the worker's");
+
+        let service_row = off("dhcp client and 1 more");
+        assert!(exempt(&service_row, HOST, SVCHOST), "their traffic is relayed untouched, as the setting says");
+        assert!(!exempt(&service_row, SHELL, EXPLORER));
+    }
+
+    #[test]
+    fn only_a_persons_own_account_leaves_a_process_readable() {
+        for person in ["S-1-5-21-1-2-3-1001", "S-1-12-1-1-2-3-4"] {
+            assert!(!hidden_from_the_app(Some(person)), "{person}");
+        }
+        for other in ["S-1-5-18", "S-1-5-19", "S-1-5-20", "S-1-5-80-1-2-3-4-5", "S-1-5-90-0-1", "S-1-5-96-0-1"] {
+            assert!(hidden_from_the_app(Some(other)), "{other}");
+        }
+        assert!(hidden_from_the_app(None), "unread: no shared key is given on a guess");
+    }
+
+    #[test]
+    fn the_service_table_is_read_once_per_period_and_only_for_a_hidden_process() {
+        let reads = std::cell::Cell::new(0);
+        let names = HiddenNames::new(
+            |pid| Some(if pid == SHELL { "S-1-5-21-1" } else { "S-1-5-18" }.to_string()),
+            || {
+                reads.set(reads.get() + 1);
+                HashMap::from([(HOST, vec!["DNS Client".to_string()])])
+            },
+        );
+        assert_eq!(names.name(SHELL, 0), None);
+        assert_eq!(reads.get(), 0);
+        assert_eq!(names.name(HOST, 0).as_deref(), Some("DNS Client"));
+        assert_eq!(names.name(WORKER, 1).as_deref(), Some("pid 3300"));
+        assert_eq!(reads.get(), 1);
+        assert_eq!(names.name(HOST, EXE_CACHE_MS).as_deref(), Some("DNS Client"));
+        assert_eq!(reads.get(), 2);
+    }
+
+    /// Windows' own answer for this process: a test runs as a person.
+    #[cfg(windows)]
+    #[test]
+    fn this_process_reads_as_its_users_account() {
+        let sid = os::account_of(std::process::id()).expect("a process can read its own token");
+        assert!(sid.starts_with("S-1-"), "{sid}");
     }
 
     #[test]

@@ -50,6 +50,7 @@ const DATAGRAM: usize = 65_535;
 
 type ExeLookup = fn(u32) -> Option<String>;
 type ProductLookup = fn(&str) -> Option<String>;
+type HiddenNameLookup = fn(u32) -> Option<String>;
 
 /// A flow the book took: its id and who it belongs to.
 pub(super) struct Admitted {
@@ -78,7 +79,7 @@ pub struct Relay {
     /// The NAT state that proves a guest's flow.
     pub nat: Arc<NatTable>,
     pub exes: Mutex<ExeCache<ExeLookup>>,
-    pub keys: AppKeys<ProductLookup>,
+    pub keys: AppKeys<ProductLookup, HiddenNameLookup>,
     /// The decision snapshot, read once per flow.
     pub filter: Arc<FilterSlot>,
     /// Re-read on every route change (control); pinning and DNS's split rules
@@ -126,7 +127,7 @@ impl Relay {
             attributor: Mutex::new(Attributor::new(IpHelper, witness)),
             nat,
             exes: Mutex::new(ExeCache::new(crate::flow::flows::os::exe_path as ExeLookup)),
-            keys: AppKeys::new(crate::flow::flows::os::product_name as ProductLookup),
+            keys: AppKeys::new(crate::flow::flows::os::product_name as ProductLookup, crate::flow::flows::os::hidden_name as HiddenNameLookup),
             filter,
             tables,
             egress,

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createPassedChecks } from "@/core/checks";
 import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineUpdate } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
-import type { SettingKey } from "@/core/settings/registry";
+import { MAX_POLICY_BYTES, type SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
 import { CRASH_LOOP_BANNER, createEngineController } from "./engine-controller";
@@ -442,6 +442,119 @@ describe("engine controller", () => {
     await s.fc.advance(ENGINE_POLL_MS);
     expect(s.store.getState().engine.actionError).toBeNull();
     s.undo();
+  });
+
+  describe("law: an oversized policy never holds back an off switch", () => {
+    /** Rules well over the engine's limit, as an older build could have stored them. */
+    const OVERSIZED = Array.from({ length: 20_000 }, (_, i) => `||a-rule-for-host-number-${i}.tracker.example^$third-party`);
+    const stored = (values: object = {}) => memoryBackend({ schema: 5, values: { [ENGINE_SWITCH]: true, "filtering.userRules": OVERSIZED, ...values } });
+
+    /** The engine's own refusal (`policy::accept`), so a test cannot pass by an unsized fake. */
+    function capped(s: ReturnType<typeof setup>) {
+      const accepting = s.fake.source.setPolicy;
+      const refused: number[] = [];
+      s.fake.source.setPolicy = async (p) => {
+        const size = new TextEncoder().encode(JSON.stringify(p)).length;
+        if (size > MAX_POLICY_BYTES) {
+          refused.push(size);
+          throw new Error(`a policy of ${size} bytes is over the ${MAX_POLICY_BYTES} byte limit`);
+        }
+        return accepting(p);
+      };
+      return refused;
+    }
+
+    const held = (s: ReturnType<typeof setup>) => s.store.getState().engine.probe;
+    const inForce = (s: ReturnType<typeof setup>) => {
+      const pipe = held(s)?.pipe;
+      return pipe?.kind === "welcome" ? pipe.status.policy : null;
+    };
+
+    it("the rules really are over the limit", () => {
+      expect(new TextEncoder().encode(JSON.stringify(OVERSIZED)).length).toBeGreaterThan(MAX_POLICY_BYTES);
+    });
+
+    it("engine false reaches the engine while the rules are over the limit, and it stops routing", async () => {
+      const s = setup("filtering", stored());
+      const refused = capped(s);
+      await s.fc.flush();
+      await s.settings.set(SWITCH, false);
+      await s.fc.flush();
+      expect(refused, "nothing the engine must refuse is sent").toEqual([]);
+      expect(s.fake.policies.at(-1)).toMatchObject({ engine: false, user_rules: [] });
+      expect(inForce(s)?.engine).toBe(false);
+      expect(s.phase()).toBe("idle");
+      s.undo();
+    });
+
+    it("the Sieving switch and one app's Off arrive too, the first send included", async () => {
+      const s = setup("filtering", stored({ [GLOBAL_SWITCH]: false }));
+      capped(s);
+      await s.fc.flush();
+      expect(inForce(s)?.sieving, "a stored off, at the first send").toBe(false);
+      await s.settings.set("apps.levels", { firefox: "off" });
+      await s.fc.flush();
+      expect(inForce(s)?.off_apps).toEqual(["firefox"]);
+      s.undo();
+    });
+
+    it("the rules the engine holds stay as they are, and the user is told why theirs did not arrive", async () => {
+      const s = setup("filtering", memoryBackend({ schema: 5, values: { [ENGINE_SWITCH]: true, "filtering.userRules": ["||kept.example^"] } }));
+      capped(s);
+      await s.fc.flush();
+      expect(inForce(s)?.user_rules).toEqual(["||kept.example^"]);
+      // Not a save, which would refuse it: an older build's stored value.
+      await s.settings.replace({ schema: 5, values: { [ENGINE_SWITCH]: false, "filtering.userRules": OVERSIZED } });
+      await s.fc.flush();
+      expect(inForce(s)).toMatchObject({ engine: false, user_rules: ["||kept.example^"] });
+      expect(s.store.getState().engine.actionError).toMatch(/your rules.*over the.*Your switches reached it/);
+      s.undo();
+    });
+
+    it("sends nothing more once the switches are in force, and the error ends when the rules are back in range", async () => {
+      const s = setup("filtering", stored());
+      capped(s);
+      await s.fc.flush();
+      const sent = s.fake.policies.length;
+      await s.fc.advance(ENGINE_POLL_MS * 3);
+      expect(s.fake.policies, "the part the engine can take is already held").toHaveLength(sent);
+      expect(s.store.getState().engine.actionError).toMatch(/your rules/);
+      await s.settings.set("filtering.userRules", ["||small.example^"]);
+      await s.fc.flush();
+      expect(inForce(s)?.user_rules).toEqual(["||small.example^"]);
+      expect(s.store.getState().engine.actionError).toBeNull();
+      s.undo();
+    });
+
+    it("a refusal for any other reason also lets the switches through, once", async () => {
+      const s = setup("filtering", memoryBackend({ schema: 5, values: { [ENGINE_SWITCH]: true } }));
+      await s.fc.flush();
+      const accepting = s.fake.source.setPolicy;
+      const asked: EnginePolicy[] = [];
+      s.fake.source.setPolicy = async (p) => {
+        asked.push(p);
+        if (p.user_rules.length > 0) throw new Error("the engine will not take these");
+        return accepting(p);
+      };
+      await s.settings.replace({ schema: 5, values: { [ENGINE_SWITCH]: false, "filtering.userRules": ["||a.example^"] } });
+      await s.fc.flush();
+      expect(inForce(s)).toMatchObject({ engine: false, user_rules: [] });
+      expect(asked.filter((p) => p.user_rules.length > 0), "tried, and tried once more after the switches went: never in a loop").toHaveLength(2);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(asked.filter((p) => p.user_rules.length > 0), "then at each probe").toHaveLength(3);
+      expect(s.store.getState().engine.actionError).toMatch(/your rules.*will not take/);
+      s.undo();
+    });
+
+    it("off-apps over the limit, as an old file could hold, cannot hold back the engine switch", async () => {
+      const apps = Object.fromEntries(Array.from({ length: 30_000 }, (_, i) => [`an-app-named-number-${i}`, "off"]));
+      const s = setup("filtering", memoryBackend({ schema: 5, values: { [ENGINE_SWITCH]: false, "apps.levels": apps } }));
+      capped(s);
+      await s.fc.flush();
+      expect(inForce(s)).toMatchObject({ engine: false, off_apps: [] });
+      expect(s.phase()).toBe("idle");
+      s.undo();
+    });
   });
 
   it("refused (this copy is not the installed one): a flip sends nothing, and nothing claims routing", async () => {

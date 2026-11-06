@@ -53,11 +53,14 @@ export function useApps(): AppsModel {
   const statesNow = () => settings.get("apps.levels");
   const pinnedNow = () => settings.get("apps.pinned");
   // A toast says only what happened: it waits for the write, which the lock may park or drop.
+  const said = (e: unknown) => void notices.push({ kind: "error", text: e instanceof Error ? e.message : String(e) });
   const writeAllStates = (next: ReturnType<typeof statesNow>, text: string) => {
     const before = statesNow();
-    void writeStates(next).then((ran) => {
-      if (ran) notices.push({ kind: "info", text, action: { label: "Undo", run: () => void writeStates(before) } });
-    });
+    writeStates(next)
+      .then((ran) => {
+        if (ran) notices.push({ kind: "info", text, action: { label: "Undo", run: () => void writeStates(before).catch(said) } });
+      })
+      .catch(said);
   };
 
   return {
@@ -68,7 +71,7 @@ export function useApps(): AppsModel {
     globalOn,
     sievedNow,
     isOn: (key) => isAppOn(states, key),
-    setOn: (key, on) => void writeStates(setAppState(statesNow(), key, on ? "sieve" : "off")),
+    setOn: (key, on) => void writeStates(setAppState(statesNow(), key, on ? "sieve" : "off")).catch(said),
     sieveAll: () => writeAllStates(sieveAll(), "Every app is sieved"),
     offAll: () => writeAllStates(offAll(statesNow(), [...apps, ...guests].map((a) => a.key)), "Every app is off"),
     pin: (path) => {

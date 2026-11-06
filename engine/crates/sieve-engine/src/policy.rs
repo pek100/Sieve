@@ -13,12 +13,11 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use sieve_ipc::{MAX_FRAME, Policy};
+pub use sieve_ipc::MAX_POLICY_BYTES;
+use sieve_ipc::Policy;
 
 pub const POLICY_FILE: &str = "policy.json";
 pub const RUNS_FILE: &str = "runs.json";
-/// Half a frame: the Status that carries the policy has the other half.
-pub const MAX_POLICY_BYTES: usize = MAX_FRAME / 2;
 
 /// Restarts within [`CRASH_WINDOW_MS`] that stop routing (plan 1.6.4).
 pub const CRASH_LOOP_RESTARTS: u32 = 3;

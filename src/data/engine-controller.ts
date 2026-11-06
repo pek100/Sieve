@@ -14,7 +14,9 @@
  *   part-filled one would clear the rest. The switch defaults off, so the engine
  *   routes nothing until the user turns it on. Nothing is sent while the engine
  *   cannot take a policy (`engineTakesPolicy`); the stored values then wait
- *   untouched. A refused send is retried at the next probe, not at once;
+ *   untouched. A policy that is over the engine's limit or is refused gives way to
+ *   one with the rules as the engine holds them (`policyParts`), so the off
+ *   switches always arrive. What was refused is retried at the next probe, not at once;
  * - the encrypted DNS resolvers follow `filtering.upstreams` the same way, with
  *   their own revision, read back once per probe. Their order is the order they
  *   are tried in, so it counts;
@@ -34,7 +36,7 @@ import { ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus
 import type { NoticeBus } from "@/core/notices";
 import { selectedListIds } from "@/core/filter-lists";
 import { GLOBAL_SWITCH, offKeys } from "@/core/policy";
-import type { SettingKey } from "@/core/settings/registry";
+import { MAX_POLICY_BYTES, type SettingKey } from "@/core/settings/registry";
 import type { SieveStore } from "@/core/store";
 import type { EngineSource } from "./engine-source";
 import type { FilterListSource } from "./filter-lists-source";
@@ -119,9 +121,25 @@ function normalised(p: WantedPolicy): string {
   });
 }
 
+const rulesAsHeld = (want: WantedPolicy, held: WantedPolicy): WantedPolicy => ({ ...want, domain_lists: held.domain_lists, user_rules: held.user_rules, exclusions: held.exclusions });
+
+/**
+ * What to try, in order, so that a refused policy still delivers its switches:
+ * all of it; then the rules left as the engine holds them, which it took once and
+ * need no compiling; then the off-apps and the list selection too, for a stored
+ * value the settings' budgets never saw. Turning something off never waits on
+ * the size of what is switched.
+ */
+function policyParts(want: WantedPolicy, held: WantedPolicy): WantedPolicy[] {
+  const switches = rulesAsHeld(want, held);
+  return [want, switches, { ...switches, off_apps: held.off_apps, lists: held.lists }];
+}
+
 export function createEngineController({ engine, store, clock, settings, checks, notices, filterLists }: EngineControllerDeps): EngineController {
   let disposed = true;
   let policyInFlight = false;
+  // The error on show is about the policy, so it ends when the engine holds what is wanted.
+  let policyHeldBack = false;
   let upstreamsInFlight = false;
   let catalogue: Pick<FilterCatalogue, "lists"> | null = null;
   let catalogueInFlight = false;
@@ -165,20 +183,47 @@ export function createEngineController({ engine, store, clock, settings, checks,
     if (disposed || !settingsReady || policyInFlight || !engineTakesPolicy(e) || status === null) return;
     if (catalogue === null && Object.keys(settings.get("filters.lists")).length > 0) void readCatalogue();
     const want = wantedPolicy(settings, catalogue, status.policy.lists);
-    if (normalised(status.policy) === normalised(want)) return;
+    if (normalised(status.policy) === normalised(want)) {
+      if (policyHeldBack) set({ actionError: null });
+      policyHeldBack = false;
+      return;
+    }
     policyInFlight = true;
+    const revision = status.policy.revision + 1;
+    const tried = new Set([normalised(status.policy)]);
+    let holds: WantedPolicy = status.policy;
     let sent = false;
+    let refusal: string | null = null;
     try {
-      const next = await engine.setPolicy({ ...want, revision: status.policy.revision + 1 });
-      const probe = get().probe;
-      if (probe?.pipe?.kind === "welcome") set({ probe: { ...probe, pipe: { ...probe.pipe, status: next } }, actionError: null });
-      sent = true;
-    } catch (e) {
-      set({ actionError: `Could not tell the engine: ${message(e)}` });
+      for (const part of policyParts(want, status.policy)) {
+        const form = normalised(part);
+        if (tried.has(form)) continue;
+        tried.add(form);
+        const size = new TextEncoder().encode(JSON.stringify({ ...part, revision })).length;
+        if (size > MAX_POLICY_BYTES) {
+          // Measured here, not sent: the answer could only be a refusal, and the engine's own limit is this one.
+          refusal ??= `a policy of ${size} bytes is over the ${MAX_POLICY_BYTES} byte limit`;
+          continue;
+        }
+        try {
+          const next = await engine.setPolicy({ ...part, revision });
+          const probe = get().probe;
+          if (probe?.pipe?.kind === "welcome") set({ probe: { ...probe, pipe: { ...probe.pipe, status: next } } });
+          holds = part;
+          sent = true;
+          break;
+        } catch (e) {
+          refusal ??= message(e);
+        }
+      }
     } finally {
       policyInFlight = false;
     }
-    // A refusal waits for the next probe: following now would send it again at once, forever.
+    policyHeldBack = refusal !== null;
+    if (refusal === null) set({ actionError: null });
+    else if (normalised(rulesAsHeld(want, holds)) === normalised(holds)) set({ actionError: `Could not tell the engine your rules: ${refusal}. Your switches reached it, and it keeps the rules it had.` });
+    else set({ actionError: `Could not tell the engine: ${refusal}` });
+    // Only a send that went through follows: after a refusal, following now would send it again at once, forever.
     if (sent && !disposed) follow();
   };
 

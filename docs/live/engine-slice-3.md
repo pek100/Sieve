@@ -94,6 +94,17 @@ The engine now judges AdGuard by one test connection instead of by its service s
 
 Also unmeasured: a network that answers documentation addresses (the engine would keep waiting on a computer with AdGuard), and an AdGuard rule exempting `sieve-engine.exe` (the probe reads clear while apps are still redirected, so Sieve is blind but does not loop).
 
+## A row's Off: live proof (added 2026-11-06, nobody has run it)
+
+The engine keys a process hidden from the app by the name the app shows for it (`AppKeys::of_pid` in `engine/crates/sieve-engine/src/flow/flows.rs`). Offline tests use a constructed machine. Two facts only a real machine can settle: that the account rule matches what the unelevated app can read, and that the service list reads the same as SYSTEM and as the user.
+
+With the switch on and the rule `||example.com^` under Filters:
+
+1. Turn **Microsoft Windows Operating System** off under Apps. From a program the row covers, such as a Windows tool in your own session, `example.com` loads. A service host keeps its row reading sieved, and its connections to a blocked host are still closed.
+2. Turn that row on again and turn off a row named after services, such as **DHCP Client and 3 more**. In the log, the flows of that host read as exempt.
+
+If step 2 does not exempt, the app and the engine disagree on that row's name: a service the user may not query. That row then stays sieved, the safe side, and its Off does not do what the setting's help says. Record which row.
+
 ## Emergency: getting the network back by hand
 
 Whatever state the engine is in, routing it added can always be removed from an admin prompt:
