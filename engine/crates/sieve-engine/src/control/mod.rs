@@ -323,12 +323,16 @@ impl Engine {
     }
 
     /// The Status plus what stays local: the key exchange evidence (task D18) and
-    /// the QUIC fallback evidence (slice 8).
+    /// the QUIC fallback evidence (slice 8) and what content filtering did
+    /// (content task D7, D11). Counts only, no host. Only an answer on the pipe
+    /// tells a person about a release, so this holds the plain update state.
     fn status_value(&self) -> Result<serde_json::Value, serde_json::Error> {
         let mut status = serde_json::to_value(self.status_saying(self.updates.status()))?;
         status["https"] = self.meters.https.report();
         status["quic"] = self.meters.quic.report(crate::quic::REFUSAL);
         self.validation.report(&mut status["https"]);
+        status["content"] = self.meters.content.report();
+        status["content"]["list_hits"] = serde_json::to_value(lock(&self.book).list_hits())?;
         Ok(status)
     }
 
@@ -1038,6 +1042,51 @@ mod tests {
         assert_eq!(status["quic"]["raced"], 0);
         assert_eq!(status["quic"]["fallback_ms"], serde_json::json!([37]));
         assert!(serde_json::to_value(e.status()).unwrap().get("quic").is_none(), "IPC protocol unchanged");
+    }
+
+    #[test]
+    fn status_json_content_holds_no_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        crate::stack::Meters::bump(&e.meters.content.rewritten);
+        crate::stack::Meters::bump(&e.meters.content.with_scriptlets);
+        const HOST: &str = "secret-host.example";
+        {
+            let mut book = lock(&e.book);
+            let event = sieve_ipc::FlowEvent {
+                id: 0,
+                pid: None,
+                exe: None,
+                session: None,
+                proto: sieve_ipc::FlowProto::Tcp,
+                local: "198.18.0.1:5000".into(),
+                remote: "192.0.2.1:443".into(),
+                kind: sieve_ipc::FlowKind::Tls,
+                host: Some(HOST.into()),
+                action: sieve_ipc::FlowAction::Relayed,
+                bytes_up: 0,
+                bytes_down: 0,
+                open: true,
+                reason: None,
+                rule: None,
+                list: None,
+                forwarded: None,
+            };
+            let id = book.open(event).unwrap();
+            let url = format!("https://{HOST}/a.js");
+            let row = crate::stack::book::RequestRow { url: &url, request_type: "script", outcome: sieve_ipc::LogOutcome::Blocked, rule: Some("||secret-host.example^"), list: Some("adguard-dns") };
+            book.log_request(id, row, 1);
+        }
+        e.write_status_file();
+        let text = std::fs::read_to_string(dir.path().join(STATUS_FILE)).unwrap();
+        let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(status["content"]["rewritten"], 1);
+        assert_eq!(status["content"]["with_scriptlets"], 1);
+        assert_eq!(status["content"]["with_procedural"], 0);
+        assert_eq!(status["content"]["resets"], 0);
+        assert_eq!(status["content"]["list_hits"]["adguard-dns"], 1);
+        assert!(!text.contains(HOST), "{text}");
+        assert!(serde_json::to_value(e.status()).unwrap().get("content").is_none(), "not on the pipe");
     }
 
     /// Off closes every decrypted flow at once: it does not wait for the routing

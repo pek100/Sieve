@@ -186,6 +186,8 @@ export type SettingDef =
 
 /** The plan step that brings interception, without which the HTTPS switch means nothing. */
 const ENGINE_SLICE_6 = "engine slice 6 (docs/plans/2026-10-17-https-filtering.md)";
+/** The plan step whose live check opens rewriting pages to the user. */
+const ENGINE_SLICE_9 = "engine slice 9 (docs/plans/2026-10-17-https-filtering.md)";
 
 const enumSetting = <const O extends string>(d: Omit<EnumSetting<O>, "kind">): EnumSetting<O> => ({
   kind: "enum",
@@ -297,6 +299,19 @@ export const REGISTRY = {
     needsEngine: true,
     unavailableUntil: ENGINE_SLICE_6,
   } satisfies DataSwitchSetting,
+  // Rewriting decrypted pages (slice 9). Hidden until its live check has run; the
+  // app sends off, and docs/live/engine-slice-9.md drives it with the app closed.
+  "filtering.content": {
+    kind: "dataSwitch",
+    section: "filtering",
+    label: "Filter inside pages",
+    help: "Hides page elements and runs the lists' page fixes on decrypted pages. Off: pages arrive exactly as the site sent them.",
+    default: false,
+    liveCheck: "live_content_injects_into_test_page",
+    requires: "filtering.https",
+    needsEngine: true,
+    unavailableUntil: ENGINE_SLICE_9,
+  } satisfies DataSwitchSetting,
   // Plan 1.4: the engine forwards every lookup encrypted, tried in order.
   "filtering.upstreams": {
     kind: "list",
@@ -401,7 +416,8 @@ export function isSettingKey(key: string): key is SettingKey {
 /**
  * Can the user see and change this setting in this build? The one place the
  * answer comes from: the settings document, export, import, search and the
- * Settings view all ask it. Only `filtering.https` is unavailable today (law 11).
+ * Settings view all ask it. `filtering.https` and `filtering.content` are the
+ * unavailable ones today (law 11).
  */
 export function isAvailable(key: SettingKey): boolean {
   return settingDef(key).unavailableUntil === undefined;

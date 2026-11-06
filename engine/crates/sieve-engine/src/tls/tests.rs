@@ -437,11 +437,13 @@ pub(crate) struct RigOpts {
     /// The exclusion lists the store loads.
     pub(crate) sources: Vec<crate::exclusions::lists::Source>,
     pub(crate) ech: Arc<FakeLookup>,
+    /// A slot the test also holds, to swap the snapshot; else one made of `rules`.
+    pub(crate) filter: Option<Arc<FilterSlot>>,
 }
 
 impl RigOpts {
     pub(crate) fn new(roots: Arc<RootCertStore>) -> Self {
-        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, clock: wall_ms, sources: Vec::new(), ech: FakeLookup::none() }
+        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, clock: wall_ms, sources: Vec::new(), ech: FakeLookup::none(), filter: None }
     }
 }
 
@@ -474,7 +476,7 @@ impl Rig {
             ech: Arc::new(EchCache::new(opts.ech)),
             active: Active::default(),
             minter: Box::new(move || if minted.1 { minted.0.minter() } else { None }),
-            filter: Arc::new(FilterSlot::new(DomainFilter::new(&policy, opts.rules))),
+            filter: opts.filter.unwrap_or_else(|| Arc::new(FilterSlot::new(DomainFilter::new(&policy, opts.rules)))),
             names: Arc::new(Mutex::new(NameMap::default())),
             book: Arc::new(Mutex::new(FlowBook::default())),
             meters,

@@ -448,9 +448,9 @@ mod tests {
 
     #[test]
     fn ech_is_reported_with_the_outer_name_only() {
-        let h = done(parse_handshake(&handshake(&[sni_ext("public.cloudflare-ech.com"), ech_ext()])));
+        let h = done(parse_handshake(&handshake(&[sni_ext("public.ech.example"), ech_ext()])));
         assert!(h.ech);
-        assert_eq!(h.sni.as_deref(), Some("public.cloudflare-ech.com"));
+        assert_eq!(h.sni.as_deref(), Some("public.ech.example"));
     }
 
     #[test]
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn non_host_names_are_invalid_never_guessed() {
-        for bad in ["", "a..b", "spa ce.com", "caf\u{e9}.fr", ".lead", "under\0nul.com"] {
+        for bad in ["", "a..b", "spa ce.example", "caf\u{e9}.fr", ".lead", "under\0nul.example"] {
             let p = parse_handshake(&handshake(&[sni_ext(bad)]));
             assert!(matches!(p, Progress::Invalid(_)), "{bad:?} gave {p:?}");
         }

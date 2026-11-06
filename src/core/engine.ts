@@ -38,6 +38,8 @@ export const ENGINE_HREF = `/settings/#${ENGINE_ANCHOR}`;
 
 /** The data switch that holds a root certificate (registry key; UI reads it from here). Off removes it. */
 export const HTTPS_SWITCH = "filtering.https";
+/** The data switch that rewrites decrypted pages (registry key; UI reads it from here). */
+export const CONTENT_SWITCH = "filtering.content";
 /** The Certificate group's anchor in Settings. */
 export const CERTIFICATE_ANCHOR = "certificate";
 

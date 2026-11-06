@@ -81,6 +81,15 @@ describe("engine IPC law", () => {
     for (const b of fixture.blockers) expect(parseEngineStatus({ ...body, blocker: b }).blocker).toEqual(b);
   });
 
+  it("the app reads a policy holding content, and absent stays absent", () => {
+    const status = fixture.engine.find((m) => m.type === "status")!;
+    const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
+    const policy = Object.fromEntries(Object.entries(fixture.policyWithContent).filter(([k]) => k !== "type"));
+    expect(parseEngineStatus({ ...body, policy }).policy).toEqual(policy);
+    expect(parseEngineStatus(body).policy).not.toHaveProperty("content");
+    expect(() => parseEngineStatus({ ...body, policy: { ...policy, content: 1 } })).toThrow(/policy\.content/);
+  });
+
   it("the app reads every certificate status, and its enums are the crate's", () => {
     const message = fixture.engine.find((m) => m.type === "cert_status")!;
     const body = Object.fromEntries(Object.entries(message).filter(([k]) => k !== "type"));

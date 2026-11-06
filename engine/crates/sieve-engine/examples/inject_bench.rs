@@ -4,11 +4,12 @@
 //! 1 MB page (100 MB/s or more), and the generic stylesheet's bytes and render
 //! time at 30k synthetic selectors. Medians, so a watchdog pause moves them little.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use sieve_engine::inject::{InjectLimits, PageRequest, begin};
-use sieve_filter::rules::{ListText, RuleEngine};
+use sieve_filter::rules::{ListText, RuleEngine, RuleSet};
 
 const SELECTORS: usize = 30_000;
 const SITE_RULES: usize = 2_000;
@@ -50,7 +51,7 @@ fn headers() -> HeaderMap {
 }
 
 /// Runs one page: returns time to the first output byte and the whole time.
-fn run_once(engine: &RuleEngine, body: &[u8]) -> (Duration, Duration, usize) {
+fn run_once(engine: &RuleSet, body: &[u8]) -> (Duration, Duration, usize) {
     let get = Method::GET;
     let request = PageRequest { url: URL, method: &get, is_document: true };
     let mut response_headers = headers();
@@ -72,7 +73,7 @@ fn run_once(engine: &RuleEngine, body: &[u8]) -> (Duration, Duration, usize) {
 fn main() {
     let compile_start = Instant::now();
     let text = rules_text("");
-    let engine = RuleEngine::compile(&[ListText { id: "bench", text: &text, trusted: true }]);
+    let engine = RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(RuleEngine::compile(&[ListText { id: "bench", text: &text, trusted: true }])) };
     println!("compile, {SELECTORS} generic + {SITE_RULES} site rules: {:?}", compile_start.elapsed());
 
     let body = page();

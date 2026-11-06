@@ -192,7 +192,7 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
       if (https && !policy.https) cert = "policy_off";
       if (!https && policy.https && (cert === "policy_off" || cert === "not_installed")) cert = "installed";
       https = policy.https;
-      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists, https: policy.https, user_rules: policy.user_rules, exclusions: policy.exclusions };
+      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists, https: policy.https, content: policy.content, user_rules: policy.user_rules, exclusions: policy.exclusions };
       return echo(statusOf(scenario));
     },
     dnsUpstreams: async () => {

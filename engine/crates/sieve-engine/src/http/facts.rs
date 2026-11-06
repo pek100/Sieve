@@ -9,6 +9,7 @@ const DEST: &str = "sec-fetch-dest";
 const MODE: &str = "sec-fetch-mode";
 const WEBSOCKET: &str = "websocket";
 const DOCUMENT: &str = "document";
+const SUB_FRAME: &str = "sub_frame";
 const NO_ORIGIN: &str = "null";
 
 /// A request as the rule engine and the content hook read it.
@@ -21,6 +22,14 @@ pub struct RequestFacts<'a> {
     pub request_type: &'a str,
     /// The page that made it; empty for a navigation.
     pub initiator: &'a str,
+}
+
+impl RequestFacts<'_> {
+    /// A top-level navigation or a frame: what gets a page's cosmetics (plan 5.6).
+    /// A service worker's fetch of a page reads as `xhr`, so it gets none.
+    pub fn is_page(&self) -> bool {
+        self.request_type == DOCUMENT || self.request_type == SUB_FRAME
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +55,7 @@ fn header(headers: &HeaderMap, name: impl ::http::header::AsHeaderName) -> Optio
 fn from_dest(dest: &str) -> Option<&'static str> {
     Some(match dest {
         DOCUMENT => DOCUMENT,
-        "iframe" | "frame" | "fencedframe" => "sub_frame",
+        "iframe" | "frame" | "fencedframe" => SUB_FRAME,
         "script" | "worker" | "sharedworker" | "serviceworker" | "audioworklet" | "paintworklet" => "script",
         "style" | "xslt" => "stylesheet",
         "image" => "image",

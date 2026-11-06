@@ -2,6 +2,7 @@
 //! both ways, a hyper origin behind a test chain.
 
 use std::convert::Infallible;
+use std::io::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,7 +26,11 @@ use super::facts::{self, RequestFacts};
 use super::hook::{BodyRewrite, HookError, NoRewrite, ResponseHook};
 use super::serve::{CLOSE_GRACE, Proto, Serve, serve};
 use super::upgrade::{is_upgrade, strip_hop_by_hop};
+use crate::domain::{DomainFilter, FilterSlot};
+use crate::inject::InjectLimits;
+use crate::inject::content::ContentHook;
 use crate::policy::wall_ms;
+use crate::stack::Meters;
 use crate::tls::intercept::{NoWatch, Outcome};
 use crate::tls::tests::{Arm, ClientTls, GOOD, HOST, Pki, Rig, RigOpts, TestDial, arms, client_tls, connect, flow_opts, list_rules, server_tls, shown_is_sieves, tls_server};
 
@@ -67,6 +72,9 @@ impl Origin {
 async fn origin_answer(origin: Origin, req: Request<Incoming>) -> Result<Response<UnsyncBoxBody<Bytes, BoxError>>, Infallible> {
     let path = req.uri().path_and_query().map_or("/".to_string(), |p| p.to_string());
     origin.requests.lock().unwrap().push((req.method().clone(), path.clone(), req.headers().clone()));
+    if let Some(response) = page_answer(&origin, &path) {
+        return Ok(response);
+    }
     let body: UnsyncBoxBody<Bytes, BoxError> = match path.as_str() {
         "/stream" => {
             // The second chunk waits for the client to have the first, so a
@@ -103,6 +111,100 @@ async fn origin_answer(origin: Origin, req: Request<Incoming>) -> Result<Respons
         response.headers_mut().insert("trailer", "x-sum".parse().unwrap());
     }
     Ok(response)
+}
+
+const PAGE: &str = "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'\"><title>t</title></head><body>hello</body></html>";
+const PAGE_CSP: &str = "default-src 'self'";
+const BOMB_BYTES: usize = 1024 * 1024;
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+fn compressed(encoding: &str, data: &[u8]) -> Vec<u8> {
+    match encoding {
+        "gzip" => gzip(data),
+        "deflate" => {
+            let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(data).unwrap();
+            e.finish().unwrap()
+        }
+        "br" => {
+            let mut out = Vec::new();
+            brotli::CompressorWriter::new(&mut out, 4096, 5, 22).write_all(data).unwrap();
+            out
+        }
+        "zstd" => zstd::stream::encode_all(data, 3).unwrap(),
+        other => panic!("no fixture encoder for {other}"),
+    }
+}
+
+/// Frames, sent apart, so the path sees the transport's cut.
+fn in_frames(frames: Vec<Vec<u8>>) -> UnsyncBoxBody<Bytes, BoxError> {
+    let (mut tx, rx) = Channel::<Bytes, BoxError>::new(4);
+    tokio::spawn(async move {
+        for frame in frames {
+            let _ = tx.send_data(Bytes::from(frame)).await;
+        }
+    });
+    UnsyncBoxBody::new(rx)
+}
+
+fn html_response(body: UnsyncBoxBody<Bytes, BoxError>, encoding: Option<&str>, length: Option<usize>) -> Response<UnsyncBoxBody<Bytes, BoxError>> {
+    let mut response = Response::new(body);
+    let headers = response.headers_mut();
+    headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+    headers.insert("content-security-policy", PAGE_CSP.parse().unwrap());
+    headers.insert("etag", "\"origin\"".parse().unwrap());
+    if let Some(encoding) = encoding {
+        headers.insert("content-encoding", encoding.parse().unwrap());
+    }
+    if let Some(length) = length {
+        headers.insert("content-length", length.into());
+    }
+    response
+}
+
+/// The content tests' pages: `/page/<what>`.
+fn page_answer(origin: &Origin, path: &str) -> Option<Response<UnsyncBoxBody<Bytes, BoxError>>> {
+    let what = path.strip_prefix("/page/")?;
+    let whole = |bytes: Vec<u8>| Full::new(Bytes::from(bytes)).map_err(|e: Infallible| match e {}).boxed_unsync();
+    let gz = gzip(PAGE.as_bytes());
+    let member = gzip(b"<p>second member</p>");
+    Some(match what {
+        "identity" => html_response(whole(PAGE.as_bytes().to_vec()), None, Some(PAGE.len())),
+        "gzip" | "deflate" | "br" | "zstd" => {
+            let body = compressed(what, PAGE.as_bytes());
+            let length = body.len();
+            html_response(whole(body), Some(what), Some(length))
+        }
+        "bomb" => html_response(whole(gzip(&vec![b' '; BOMB_BYTES])), Some("gzip"), None),
+        "truncated" => html_response(whole(gz[..gz.len() / 2].to_vec()), Some("gzip"), None),
+        "tail-junk-one-frame" => html_response(whole([&gz[..], b"\0\0junk"].concat()), Some("gzip"), None),
+        "tail-junk-own-frame" => html_response(in_frames(vec![gz, b"\0\0junk".to_vec()]), Some("gzip"), None),
+        "tail-member-one-frame" => html_response(whole([gz, member].concat()), Some("gzip"), None),
+        "tail-member-own-frame" => html_response(in_frames(vec![gz, member]), Some("gzip"), None),
+        "not-modified" => {
+            let mut response = html_response(whole(Vec::new()), None, None);
+            *response.status_mut() = StatusCode::NOT_MODIFIED;
+            response
+        }
+        "events" => {
+            // The first event waits for the client to have the head.
+            let (mut tx, rx) = Channel::<Bytes, BoxError>::new(4);
+            let release = origin.release.clone();
+            tokio::spawn(async move {
+                release.notified().await;
+                let _ = tx.send_data(Bytes::from_static(b"data: 1\n\n")).await;
+            });
+            let mut response = Response::new(UnsyncBoxBody::new(rx));
+            response.headers_mut().insert("content-type", "text/event-stream".parse().unwrap());
+            response
+        }
+        _ => return None,
+    })
 }
 
 /// The origin's WebSocket stand-in: 101, then an echo over the upgrade.
@@ -682,6 +784,287 @@ arms!(user_allow_beats_a_list_block, |arm| async move {
     drop(s.client);
     s.task.await.unwrap();
 });
+
+/// A decrypted page through the real hook, with the slot the test can swap.
+struct ContentSetup {
+    s: Setup,
+    slot: Arc<FilterSlot>,
+    meters: Arc<Meters>,
+}
+
+const CONTENT_RULES: &str = "##.hidden\nsite.example##.gone:has-text(ad)\n";
+const NAVIGATION: [(&str, &str); 1] = [("sec-fetch-dest", "document")];
+
+fn content_policy(content: bool) -> sieve_ipc::Policy {
+    sieve_ipc::Policy { sieving: true, https: true, content, ..sieve_ipc::Policy::default() }
+}
+
+async fn content_setup_with(arm: Arm, alpn: &str, rules: RuleSet, policy: sieve_ipc::Policy, limits: InjectLimits) -> ContentSetup {
+    let slot = Arc::new(FilterSlot::new(DomainFilter::new(&policy, rules)));
+    let meters = Arc::new(Meters::default());
+    let hook = Arc::new(ContentHook::new(slot.clone(), meters.clone(), limits));
+    let pki = Pki::new("Test Public Root");
+    let origin = Origin::default();
+    let dial = origin_dial(arm, &pki, &[alpn], origin.clone());
+    let rig = Rig::new(dial, RigOpts { hook, filter: Some(slot.clone()), ..RigOpts::new(pki.roots()) });
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (config, _) = client_tls(&[alpn], None);
+    let tls = connect(app, config, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    let client = Client::start(tls).await;
+    ContentSetup { s: Setup { rig, client, task, origin }, slot, meters }
+}
+
+async fn content_setup(arm: Arm, alpn: &str, content: bool) -> ContentSetup {
+    content_setup_with(arm, alpn, list_rules(CONTENT_RULES), content_policy(content), InjectLimits::default()).await
+}
+
+impl ContentSetup {
+    async fn end(self) {
+        drop(self.s.client);
+        self.s.task.await.unwrap();
+    }
+
+    /// The origin's last request's Accept-Encoding.
+    fn asked_encoding(&self) -> Option<String> {
+        let requests = self.s.origin.requests.lock().unwrap();
+        requests.last().unwrap().2.get("accept-encoding").map(|v| v.to_str().unwrap().to_string())
+    }
+}
+
+/// The page as an unrewritten response must have it: the origin's head and bytes.
+#[track_caller]
+fn assert_untouched(head: &HeaderMap, body: &[u8], label: &str) {
+    assert_eq!(head.get("content-length").map(|v| v.to_str().unwrap().to_string()), Some(PAGE.len().to_string()), "{label}: the length stands");
+    assert_eq!(head.get("content-security-policy").unwrap(), PAGE_CSP, "{label}");
+    assert_eq!(head.get("etag").unwrap(), "\"origin\"", "{label}");
+    assert_eq!(body, PAGE.as_bytes(), "{label}");
+}
+
+/// Style, then script, then the page's own meta CSP, with the header's nonce.
+#[track_caller]
+fn assert_injected(head: &HeaderMap, body: &[u8], label: &str) {
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    let policy = head.get("content-security-policy").unwrap().to_str().unwrap();
+    let nonce = policy.split("'nonce-").nth(1).unwrap_or_else(|| panic!("{label}: no nonce in {policy}")).split('\'').next().unwrap();
+    let style = html.find(&format!("<style nonce=\"{nonce}\">")).unwrap_or_else(|| panic!("{label}: {html}"));
+    let script = html.find(&format!("<script nonce=\"{nonce}\">")).unwrap_or_else(|| panic!("{label}: {html}"));
+    let meta = html.find("<meta").unwrap();
+    assert!(style < script && script < meta, "{label}: {html}");
+    assert!(html.contains(".hidden{display:none!important}"), "{label}");
+    assert!(html.ends_with("<title>t</title></head><body>hello</body></html>"), "{label}: {html}");
+    for gone in ["content-encoding", "content-length", "etag"] {
+        assert!(head.get(gone).is_none(), "{label}: {gone}");
+    }
+}
+
+arms!(content_off_leaves_every_byte_and_header_alone, |arm| async move {
+    for alpn in BOTH {
+        let mut c = content_setup(arm, alpn, false).await;
+        let response = c.s.client.get(HOST, "/page/identity", &[("sec-fetch-dest", "document"), ("accept-encoding", "gzip, br, dcb")]).await;
+        let head = response.headers().clone();
+        assert_untouched(&head, &body_of(response).await, alpn);
+        assert_eq!(c.asked_encoding().as_deref(), Some("gzip, br, dcb"), "{alpn}: the origin hears what the browser said");
+        assert_eq!(c.meters.content.rewritten.load(Ordering::Relaxed), 0);
+        c.end().await;
+    }
+});
+
+arms!(content_on_injects_before_the_meta_csp_for_each_encoding, |arm| async move {
+    for alpn in BOTH {
+        let mut c = content_setup(arm, alpn, true).await;
+        for encoding in ["identity", "gzip", "deflate", "br", "zstd"] {
+            let response = c.s.client.get(HOST, &format!("/page/{encoding}"), &NAVIGATION).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let head = response.headers().clone();
+            assert_injected(&head, &body_of(response).await, &format!("{alpn} {encoding}"));
+        }
+        c.end().await;
+    }
+});
+
+arms!(global_switch_off_rewrites_nothing, |arm| async move {
+    for alpn in BOTH {
+        let policy = sieve_ipc::Policy { sieving: false, ..content_policy(true) };
+        let mut c = content_setup_with(arm, alpn, list_rules(CONTENT_RULES), policy, InjectLimits::default()).await;
+        let response = c.s.client.get(HOST, "/page/identity", &NAVIGATION).await;
+        let head = response.headers().clone();
+        assert_untouched(&head, &body_of(response).await, alpn);
+        c.end().await;
+    }
+});
+
+arms!(content_needs_a_document_rule_to_rewrite, |arm| async move {
+    for alpn in BOTH {
+        let mut c = content_setup_with(arm, alpn, list_rules("||ads.invalid^\n"), content_policy(true), InjectLimits::default()).await;
+        let response = c.s.client.get(HOST, "/page/identity", &NAVIGATION).await;
+        let head = response.headers().clone();
+        assert_untouched(&head, &body_of(response).await, alpn);
+        // Compressed and untouched: never decoded, so its bytes are the origin's.
+        let response = c.s.client.get(HOST, "/page/gzip", &NAVIGATION).await;
+        assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip", "{alpn}");
+        assert_eq!(body_of(response).await, gzip(PAGE.as_bytes()), "{alpn}");
+        c.end().await;
+    }
+});
+
+arms!(an_iframe_response_is_injected, |arm| async move {
+    for alpn in BOTH {
+        let mut c = content_setup(arm, alpn, true).await;
+        let response = c.s.client.get(HOST, "/page/identity", &[("sec-fetch-dest", "iframe")]).await;
+        let head = response.headers().clone();
+        assert_injected(&head, &body_of(response).await, alpn);
+        c.end().await;
+    }
+});
+
+arms!(a_script_response_is_not, |arm| async move {
+    for alpn in BOTH {
+        let mut c = content_setup(arm, alpn, true).await;
+        let response = c.s.client.get(HOST, "/page/identity", &[("sec-fetch-dest", "script")]).await;
+        let head = response.headers().clone();
+        assert_untouched(&head, &body_of(response).await, alpn);
+        c.end().await;
+    }
+});
+
+arms!(a_server_sent_stream_is_not_held, |arm| async move {
+    for alpn in BOTH {
+        let mut c = content_setup(arm, alpn, true).await;
+        // The first event waits for this client to have the head: a held head deadlocks.
+        let response = tokio::time::timeout(Duration::from_secs(10), c.s.client.get(HOST, "/page/events", &NAVIGATION)).await.unwrap_or_else(|_| panic!("{alpn}: the head was held for a body"));
+        c.s.origin.release.notify_one();
+        assert_eq!(body_of(response).await, b"data: 1\n\n", "{alpn}");
+        c.end().await;
+    }
+});
+
+const SMALL_DECODE: InjectLimits = InjectLimits { max_decoded_bytes: 64 * 1024, max_ratio: 256, ratio_floor_bytes: 1024 * 1024, zstd_window_log_max: 23, rewriter_max_memory_bytes: 1024 * 1024 };
+
+arms!(a_cap_breach_resets_the_stream, |arm| async move {
+    for alpn in BOTH {
+        let mut c = content_setup_with(arm, alpn, list_rules(CONTENT_RULES), content_policy(true), SMALL_DECODE).await;
+        let req = c.s.client.request(Method::GET, HOST, "/page/bomb").header("sec-fetch-dest", "document").body(empty()).unwrap();
+        if let Ok(response) = c.s.client.send(req).await {
+            assert!(response.into_body().collect().await.is_err(), "{alpn}: no clean end");
+        }
+        assert_eq!(c.meters.content.resets.load(Ordering::Relaxed), 1, "{alpn}");
+        if c.s.client.version() == Version::HTTP_2 {
+            let response = c.s.client.get(HOST, "/page/identity", &NAVIGATION).await;
+            let head = response.headers().clone();
+            assert_injected(&head, &body_of(response).await, "h2: the next stream works");
+        }
+        c.end().await;
+    }
+});
+
+arms!(a_truncated_gzip_page_resets_rather_than_ending_clean, |arm| async move {
+    for alpn in BOTH {
+        let mut c = content_setup(arm, alpn, true).await;
+        let req = c.s.client.request(Method::GET, HOST, "/page/truncated").header("sec-fetch-dest", "document").body(empty()).unwrap();
+        if let Ok(response) = c.s.client.send(req).await {
+            assert!(response.into_body().collect().await.is_err(), "{alpn}: no clean end");
+        }
+        assert_eq!(c.meters.content.resets.load(Ordering::Relaxed), 1, "{alpn}");
+        c.end().await;
+    }
+});
+
+arms!(content_gzip_tail_does_not_reset_the_page, |arm| async move {
+    for alpn in BOTH {
+        // One connection per page: h1 ends with a reset, and none may happen here.
+        for what in ["tail-junk-one-frame", "tail-junk-own-frame", "tail-member-one-frame", "tail-member-own-frame"] {
+            let mut c = content_setup(arm, alpn, true).await;
+            let response = c.s.client.get(HOST, &format!("/page/{what}"), &NAVIGATION).await;
+            let head = response.headers().clone();
+            let body = response.into_body().collect().await.unwrap_or_else(|e| panic!("{alpn} {what}: reset: {e}")).to_bytes();
+            assert_injected(&head, &body, &format!("{alpn} {what}"));
+            assert_eq!(c.meters.content.resets.load(Ordering::Relaxed), 0, "{alpn} {what}");
+            c.end().await;
+        }
+    }
+});
+
+arms!(switching_content_off_applies_to_the_next_response, |arm| async move {
+    for alpn in BOTH {
+        let mut c = content_setup(arm, alpn, true).await;
+        let response = c.s.client.get(HOST, "/page/identity", &NAVIGATION).await;
+        let head = response.headers().clone();
+        assert_injected(&head, &body_of(response).await, alpn);
+        c.slot.update(|f| DomainFilter::new(&content_policy(false), f.rules.clone()));
+        let response = c.s.client.get(HOST, "/page/identity", &NAVIGATION).await;
+        let head = response.headers().clone();
+        assert_untouched(&head, &body_of(response).await, alpn);
+        c.slot.update(|f| DomainFilter::new(&content_policy(true), f.rules.clone()));
+        let response = c.s.client.get(HOST, "/page/identity", &NAVIGATION).await;
+        let head = response.headers().clone();
+        assert_injected(&head, &body_of(response).await, alpn);
+        c.end().await;
+    }
+});
+
+arms!(meters_count_rewrites_and_resets, |arm| async move {
+    const BUNDLE: &[u8] = include_bytes!("../../../sieve-filter/testdata/resources-fixture.json");
+    let mut lists = RuleEngine::compile(&[sieve_filter::rules::ListText { id: "fixture", text: "##.hidden\nsite.example##.gone:has-text(ad)\nsite.example##+js(sieve-set-flag, a, b)\n", trusted: false }]);
+    lists.use_resources(&load_bundle(BUNDLE, &sha256_hex(BUNDLE)).unwrap());
+    let rules = RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(lists) };
+    let mut c = content_setup_with(arm, H2, rules, content_policy(true), InjectLimits::default()).await;
+    let count = |c: &ContentSetup| {
+        let m = &c.meters.content;
+        [&m.rewritten, &m.with_scriptlets, &m.with_procedural, &m.resets].map(|n| n.load(Ordering::Relaxed))
+    };
+    assert_eq!(count(&c), [0, 0, 0, 0]);
+    let response = c.s.client.get(HOST, "/page/identity", &NAVIGATION).await;
+    body_of(response).await;
+    assert_eq!(count(&c), [1, 1, 1, 0]);
+    let response = c.s.client.get(HOST, "/page/identity", &[("sec-fetch-dest", "script")]).await;
+    body_of(response).await;
+    assert_eq!(count(&c), [1, 1, 1, 0], "a script is no page");
+    let req = c.s.client.request(Method::GET, HOST, "/page/truncated").header("sec-fetch-dest", "document").body(empty()).unwrap();
+    if let Ok(response) = c.s.client.send(req).await {
+        let _ = response.into_body().collect().await;
+    }
+    assert_eq!(count(&c), [2, 2, 2, 1]);
+    c.end().await;
+});
+
+arms!(accept_encoding_is_narrowed_for_pages_only, |arm| async move {
+    const OFFERED: &str = "gzip, deflate, br, zstd, dcb, dcz";
+    const NARROWED: &str = "gzip, deflate, br, zstd";
+    for alpn in BOTH {
+        let mut c = content_setup(arm, alpn, true).await;
+        for (dest, heard) in [("document", NARROWED), ("iframe", NARROWED), ("script", OFFERED), ("image", OFFERED)] {
+            let response = c.s.client.get(HOST, "/plain", &[("sec-fetch-dest", dest), ("accept-encoding", OFFERED)]).await;
+            body_of(response).await;
+            assert_eq!(c.asked_encoding().as_deref(), Some(heard), "{alpn} {dest}");
+        }
+        c.slot.update(|f| DomainFilter::new(&content_policy(false), f.rules.clone()));
+        let response = c.s.client.get(HOST, "/plain", &[("sec-fetch-dest", "document"), ("accept-encoding", OFFERED)]).await;
+        body_of(response).await;
+        assert_eq!(c.asked_encoding().as_deref(), Some(OFFERED), "{alpn}: off");
+        c.end().await;
+    }
+});
+
+arms!(a_304_passes_through_untouched, |arm| async move {
+    for alpn in BOTH {
+        let mut c = content_setup(arm, alpn, true).await;
+        let response = c.s.client.get(HOST, "/page/not-modified", &NAVIGATION).await;
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED, "{alpn}");
+        assert_eq!(response.headers().get("etag").unwrap(), "\"origin\"", "{alpn}");
+        assert_eq!(response.headers().get("content-security-policy").unwrap(), PAGE_CSP, "{alpn}");
+        assert!(body_of(response).await.is_empty(), "{alpn}");
+        assert_eq!(c.meters.content.rewritten.load(Ordering::Relaxed), 0, "{alpn}");
+        c.end().await;
+    }
+});
+
+/// The bar for `filtering.content`: law 4 reads this name. It proves a real browser
+/// on a real page, which only the runbook can.
+#[test]
+#[ignore = "live: docs/live/engine-slice-9.md, run by the user with the switch driven by scripts/live/engine-content.ps1"]
+fn live_content_injects_into_test_page() {
+    panic!("this check is the runbook: docs/live/engine-slice-9.md");
+}
 
 #[test]
 fn request_type_table() {

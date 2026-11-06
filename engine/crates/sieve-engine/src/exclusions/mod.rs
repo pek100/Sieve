@@ -612,7 +612,8 @@ mod tests {
     fn the_seed_loads_by_default_and_holds_nothing_up() {
         let slot = ExclusionSlot::new(None, &[], NOW);
         assert!(slot.switches(true, true).lists_ready);
-        assert_eq!(find(&slot, "www.paypal.com", NOW), Some(Src::List("sensitive".into())));
+        let first_entry = include_str!("../../../sieve-filter/data/sensitive.txt").lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("//")).unwrap();
+        assert_eq!(find(&slot, &format!("www.{first_entry}"), NOW), Some(Src::List("sensitive".into())));
         assert!(!slot.fetches());
     }
 

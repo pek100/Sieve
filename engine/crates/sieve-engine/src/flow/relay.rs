@@ -393,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_that_closes_without_reply_gives_the_app_eof_not_a_hang() {
-        // quic.nginx.org on port 80 (2026-10-17): reads the request, closes.
+        // A real host on port 80, seen 2026-10-17: reads the request, closes.
         let (up, server) = upstream(|s| async move {
             let (mut r, mut w) = tokio::io::split(s);
             let mut buf = vec![0u8; REQUEST.len()];

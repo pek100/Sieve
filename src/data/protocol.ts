@@ -281,6 +281,8 @@ export interface EnginePolicy {
   domain_lists: EngineDomainList[];
   /** `filtering.https`: hold a root certificate. Off removes it. */
   https: boolean;
+  /** `filtering.content`: decrypted pages get cosmetics. The engine leaves it out while false, so absent is off. */
+  content?: boolean;
   /** `filtering.userRules`: rule lines, compiled untrusted beside `domain_lists`. */
   user_rules: string[];
   /** `filtering.exclusions`: sites never decrypted. Nothing decrypts before slice 6. */
@@ -550,6 +552,7 @@ function policy(raw: unknown): EnginePolicy {
     lists: orDefault<string[] | null>(p.lists, (v) => (v === null ? null : strings(v, "policy.lists")), null),
     domain_lists: orDefault(p.domain_lists, domainLists, []),
     https: orDefault(p.https, (v) => bool(v, "policy.https"), false),
+    ...(p.content === undefined ? {} : { content: bool(p.content, "policy.content") }),
     user_rules: orDefault(p.user_rules, (v) => strings(v, "policy.user_rules"), []),
     exclusions: orDefault(p.exclusions, (v) => strings(v, "policy.exclusions"), []),
   };

@@ -1,9 +1,10 @@
 //! Content injection (plan 5.6, slice 9): given a rule snapshot, a page URL and a
-//! response, produce the rewritten response. A pure library: slice 9 implements
-//! `http::hook::ResponseHook` over it, calling [`begin`], then
-//! [`PageRewriter::push`] per body chunk, then [`PageRewriter::finish`]. Nothing
-//! here carries traffic.
+//! response, produce the rewritten response: [`begin`], then
+//! [`PageRewriter::push`] per body chunk, then [`PageRewriter::finish`]. Decrypted
+//! responses reach it through [`content::ContentHook`], while `filtering.content`
+//! is on; everything but that one type is a pure library.
 //!
+//! - [`content`]: the HTTP path's hook, and the one consumer of [`begin`];
 //! - [`response`]: which responses qualify, and which headers a rewrite falsifies;
 //! - [`decode`]: streaming, capped decoding;
 //! - [`html`]: where the payload goes, with lol_html;
@@ -13,6 +14,7 @@
 //! On an [`InjectError`] the caller resets the connection: part of a rewritten
 //! body has gone out, so it can neither pass the original nor finish cleanly.
 
+pub mod content;
 pub mod csp;
 pub mod decode;
 pub mod html;
@@ -22,7 +24,7 @@ pub mod response;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use http::{HeaderMap, StatusCode};
-use sieve_filter::rules::RuleEngine;
+use sieve_filter::rules::RuleSet;
 
 use self::decode::{BodyDecoder, ContentEncoding};
 use self::html::{HtmlInjector, has_utf16_bom};
@@ -78,9 +80,21 @@ impl InjectError {
 pub struct PageRewriter {
     decoder: BodyDecoder,
     html: HtmlInjector,
+    has_scriptlets: bool,
+    has_procedural: bool,
 }
 
 impl PageRewriter {
+    /// This page gets scriptlets.
+    pub fn has_scriptlets(&self) -> bool {
+        self.has_scriptlets
+    }
+
+    /// This page gets the procedural applier.
+    pub fn has_procedural(&self) -> bool {
+        self.has_procedural
+    }
+
     /// Feeds one body chunk and returns what is ready to send.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, InjectError> {
         let decoded = self.decoder.push(chunk)?;
@@ -111,7 +125,7 @@ fn fresh_nonce() -> Option<String> {
 /// overrides the header. A compressed body's start says nothing, so there the
 /// BOM is caught once decoded, and the body then passes through uninjected.
 pub fn begin(
-    rules: &RuleEngine,
+    rules: &RuleSet,
     request: &PageRequest<'_>,
     status: StatusCode,
     headers: &mut HeaderMap,
@@ -131,14 +145,15 @@ pub fn begin(
     let html = HtmlInjector::new(payload::render(&cosmetics, &nonce), format.charset, limits);
     csp::rewrite_headers(headers, &nonce);
     response::strip_falsified_headers(headers);
-    Some(PageRewriter { decoder, html })
+    Some(PageRewriter { decoder, html, has_scriptlets: !cosmetics.scriptlets.is_empty(), has_procedural: !cosmetics.procedural.is_empty() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use http::header::CONTENT_SECURITY_POLICY;
-    use sieve_filter::rules::ListText;
+    use sieve_filter::rules::{ListText, RuleEngine};
+    use std::sync::Arc;
 
     #[test]
     fn a_page_rewriter_is_send() {
@@ -155,7 +170,7 @@ mod tests {
 
     #[test]
     fn a_rewrite_end_to_end_decodes_injects_and_adds_the_nonce() {
-        let engine = RuleEngine::compile(&[ListText { id: "l", text: "##.x\n", trusted: true }]);
+        let engine = RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(RuleEngine::compile(&[ListText { id: "l", text: "##.x\n", trusted: true }])) };
         let get = http::Method::GET;
         let request = PageRequest { url: "https://sieve-test.invalid/", method: &get, is_document: true };
         let mut headers = HeaderMap::new();

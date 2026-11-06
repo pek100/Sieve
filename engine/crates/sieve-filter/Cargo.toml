@@ -25,3 +25,9 @@ thiserror.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 serde_json.workspace = true
+
+# The law for site names in engine source. It lives beside the workspace, which
+# is virtual: this, the cheapest crate, compiles it (std only).
+[[test]]
+name = "no_site_names"
+path = "../../tests/no_site_names.rs"
