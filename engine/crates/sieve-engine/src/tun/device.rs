@@ -4,8 +4,9 @@
 //! A plain thread blocks in `receive_blocking` (no CPU while idle). Each
 //! packet it admits ([`super::admit`]) goes to the stack through a bounded
 //! channel; the TUN heartbeat is pending from the packet's arrival until the
-//! stack took it, so a runtime that stops taking packets stalls the reader
-//! and the watchdog sees it. `Session::shutdown` ends the thread.
+//! channel took it. The watchdog separately compares admitted arrivals with
+//! ipstack's consumed packets, without waiting for the channel to fill.
+//! `Session::shutdown` ends the thread.
 
 use std::path::Path;
 use std::pin::Pin;
@@ -154,7 +155,10 @@ impl AsyncRead for TunDevice {
         loop {
             match ready!(self.rx.poll_recv(cx)) {
                 // Larger than ipstack's buffer: dropped rather than truncated.
-                Some(packet) if packet.len() > buf.remaining() => continue,
+                Some(packet) if packet.len() > buf.remaining() => {
+                    Meters::bump(&self.meters.oversized);
+                    continue;
+                }
                 Some(packet) => {
                     buf.put_slice(&packet);
                     return Poll::Ready(Ok(()));

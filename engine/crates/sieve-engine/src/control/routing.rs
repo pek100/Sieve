@@ -328,11 +328,13 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
         relay.experiments = engine.experiments.settings.clone();
         Arc::new(relay)
     };
+    let input_baseline = engine.meters.stack_offered();
     #[cfg(feature = "relay-experiments")]
     let device = TunDevice::experimental(tun.session.clone(), engine.meters.clone(), engine.beats.clone(), &engine.experiments.settings);
     #[cfg(not(feature = "relay-experiments"))]
     let device = TunDevice::new(tun.session.clone(), engine.meters.clone(), engine.beats.clone());
     let stack = IpStack::new(config, device);
+    *super::lock(&engine.beats.path) = Some(crate::watchdog::PathWatch::new(engine.meters.clone(), stack.progress(), input_baseline));
     let lists = tokio::spawn(engine.lists.clone().run(HttpsFetcher::new(relay.clone())));
     let exclusions = tokio::spawn(refresh_exclusions(engine.exclusions.clone(), HttpsFetcher::new(relay.clone()), engine.validation.clone(), engine.dir.clone()));
     let (stop_accept, stopped) = oneshot::channel();
@@ -459,6 +461,7 @@ async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiv
 /// goes with the last reference to it, the relay's, when this returns.
 async fn take_down(engine: &Engine, up: Up) {
     engine.arm.set(false);
+    *super::lock(&engine.beats.path) = None;
     let _ = up.tun.session.shutdown();
     engine.https.set(None);
     let _ = up.stop_accept.send(());
