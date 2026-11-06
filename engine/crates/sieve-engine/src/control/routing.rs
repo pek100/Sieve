@@ -35,7 +35,8 @@ use crate::flow::etw::os::{self as etw_os, EtwSession};
 use crate::flow::etw::{RingWitness, Sinks, Unwitnessed};
 use crate::flow::nat::{NatTable, os as nat_os};
 use crate::flow::tasks::FlowTasks;
-use crate::http::hook::NoRewrite;
+use crate::inject::InjectLimits;
+use crate::inject::content::ContentHook;
 use crate::lists::https::HttpsFetcher;
 use crate::policy::wall_ms;
 use crate::route::apply::{self, SieveLuid};
@@ -351,7 +352,7 @@ fn build_interception(engine: &Engine, egress: &Arc<Egress>) -> Result<Intercept
         book: engine.book.clone(),
         meters: engine.meters.clone(),
         watch: Arc::new(NoWatch),
-        hook: Arc::new(NoRewrite),
+        hook: Arc::new(ContentHook::new(engine.filter.clone(), engine.meters.clone(), InjectLimits::default())),
         clock: wall_ms,
     })
 }

@@ -31,6 +31,7 @@ use super::{InjectError, InjectLimits};
 
 /// brotli-decompressor's internal buffer; its own examples use this size.
 const BROTLI_BUFFER_BYTES: usize = 4096;
+const IDENTITY: &str = "identity";
 /// One inflate step's output, then it goes through the sink.
 const INFLATE_STEP_BYTES: usize = 32 * 1024;
 /// RFC 1950: a zlib header has method 8 in the low nibble, a window of at most
@@ -62,6 +63,19 @@ impl ContentEncoding {
             _ => None,
         }
     }
+}
+
+/// An `Accept-Encoding` value narrowed to what [`ContentEncoding::from_header`]
+/// reads, plus `identity`, each with its `q`. A body in anything else would pass
+/// through uninjected, a page silently filtered less (plan 5.6 item 1). `*` goes
+/// too, since it would invite any of those. Nothing left asks for `identity`.
+pub fn readable_accept_encoding(value: &str) -> String {
+    let readable = value.split(',').map(str::trim).filter(|token| {
+        let name = token.split(';').next().unwrap_or_default().trim();
+        name.eq_ignore_ascii_case(IDENTITY) || ContentEncoding::from_header(name).is_some()
+    });
+    let narrowed = readable.collect::<Vec<_>>().join(", ");
+    if narrowed.is_empty() { IDENTITY.to_string() } else { narrowed }
 }
 
 /// Collects decoded bytes and enforces the size cap as they come, which is what
@@ -301,6 +315,23 @@ mod tests {
     /// so that error is not a Sieve-only breakage (module doc).
     const ENDS_AT_STREAM_END: [ContentEncoding; 3] = [ContentEncoding::Gzip, ContentEncoding::Deflate, ContentEncoding::Brotli];
     const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn readable_accept_encoding_table() {
+        for (offered, narrowed) in [
+            ("gzip, deflate, br, zstd, dcb, dcz", "gzip, deflate, br, zstd"),
+            ("*", "identity"),
+            ("identity;q=0", "identity;q=0"),
+            ("br;q=1.0, gzip;q=0.8", "br;q=1.0, gzip;q=0.8"),
+            ("", "identity"),
+            ("dcb, dcz", "identity"),
+            ("GZIP ;q=0.5,dcz", "GZIP ;q=0.5"),
+            ("x-gzip", "x-gzip"),
+            ("gzip, *;q=0.1", "gzip"),
+        ] {
+            assert_eq!(readable_accept_encoding(offered), narrowed, "{offered}");
+        }
+    }
 
     fn gzip(data: &[u8]) -> Vec<u8> {
         let mut e = GzEncoder::new(Vec::new(), Compression::default());

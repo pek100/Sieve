@@ -81,6 +81,9 @@ impl<'a> Flow<'a> {
 pub struct DomainFilter {
     /// The global Sieve switch.
     pub enabled: bool,
+    /// `filtering.content`: decrypted pages get their cosmetics. In this snapshot
+    /// so the switch and the rules it applies are read as one.
+    pub content: bool,
     off: HashSet<String>,
     pub rules: RuleSet,
 }
@@ -106,12 +109,12 @@ pub fn user_rules_changed(before: &Policy, now: &Policy) -> bool {
 
 impl DomainFilter {
     pub fn new(policy: &Policy, rules: RuleSet) -> Self {
-        Self { enabled: policy.sieving, off: off_keys(policy), rules }
+        Self { enabled: policy.sieving, content: policy.content, off: off_keys(policy), rules }
     }
 
     /// A snapshot that blocks nothing (the switch reads off).
     pub fn inert() -> Self {
-        Self { enabled: false, off: HashSet::new(), rules: RuleSet::empty() }
+        Self { enabled: false, content: false, off: HashSet::new(), rules: RuleSet::empty() }
     }
 
     /// The same snapshot with newly compiled lists.

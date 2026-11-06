@@ -1,5 +1,6 @@
-//! The response-body hook. Content filtering (slice 9) implements it over
-//! `inject::begin`; production today is [`NoRewrite`], and no HTML changes.
+//! The response-body hook. Production is `inject::content::ContentHook`, which
+//! rewrites nothing while `filtering.content` is off; [`NoRewrite`] is for tests
+//! of the path.
 //!
 //! The contract is the one in `inject/mod.rs`: a [`HookError`] resets, RST_STREAM
 //! on h2 and a close on h1, because part of a rewritten body has gone out, so
@@ -31,6 +32,10 @@ pub trait BodyRewrite: Send {
 
 /// Asked about every decrypted response.
 pub trait ResponseHook: Send + Sync {
+    /// The request's headers before they go upstream, for what a response this
+    /// hook will rewrite needs asked of the origin. No change by default.
+    fn prepare_request(&self, _req: &RequestFacts<'_>, _headers: &mut HeaderMap) {}
+
     /// Whether [`ResponseHook::begin`] should see this response at all. False
     /// streams it as it comes: `begin` needs the first data frame, and holding
     /// the head for that would stall a server-sent stream that stays quiet
@@ -42,7 +47,7 @@ pub trait ResponseHook: Send + Sync {
     fn begin(&self, req: &RequestFacts<'_>, status: StatusCode, headers: &mut HeaderMap, body_start: &[u8]) -> Option<Box<dyn BodyRewrite>>;
 }
 
-/// Production until slice 9.
+/// Every response streams as it comes.
 pub struct NoRewrite;
 
 impl ResponseHook for NoRewrite {

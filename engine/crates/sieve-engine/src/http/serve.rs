@@ -288,6 +288,7 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
     }
     let upgrading = is_upgrade(req.headers());
     let on_client_upgrade = upgrading.then(|| hyper::upgrade::on(&mut req));
+    ctx.hook.prepare_request(&f.borrowed(), req.headers_mut());
     strip_hop_by_hop(req.headers_mut(), upgrading);
     let req = req.map(hook::boxed);
     let stream = ctx.stream_in_flight();

@@ -55,6 +55,7 @@ pub struct Meters {
     pub etw_disagreed: AtomicU64,
     pub etw_dropped: AtomicU64,
     pub https: HttpsMeters,
+    pub content: ContentMeters,
 }
 
 /// The key exchange groups the engine speaks, in `tls::kx_groups` order.
@@ -83,6 +84,28 @@ impl HttpsMeters {
             "passed": self.passed.load(Ordering::Relaxed),
             "upstream_groups": groups(&self.upstream_groups),
             "client_groups": groups(&self.client_groups),
+        })
+    }
+}
+
+/// What `filtering.content` did (task D7). A proxy cannot count hidden elements,
+/// so these count pages. No host, and not on the pipe, as [`HttpsMeters`].
+#[derive(Debug, Default)]
+pub struct ContentMeters {
+    pub rewritten: AtomicU64,
+    pub with_scriptlets: AtomicU64,
+    pub with_procedural: AtomicU64,
+    pub resets: AtomicU64,
+}
+
+impl ContentMeters {
+    /// The `content` section of `status.json`, without the book's `list_hits`.
+    pub fn report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "rewritten": self.rewritten.load(Ordering::Relaxed),
+            "with_scriptlets": self.with_scriptlets.load(Ordering::Relaxed),
+            "with_procedural": self.with_procedural.load(Ordering::Relaxed),
+            "resets": self.resets.load(Ordering::Relaxed),
         })
     }
 }

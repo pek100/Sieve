@@ -5,7 +5,7 @@
 //! injection would corrupt). The document/subdocument classification is the
 //! caller's (plan 5.2).
 
-use http::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderName};
+use http::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HeaderName, LAST_MODIFIED};
 use http::{HeaderMap, Method, StatusCode};
 use lol_html::AsciiCompatibleEncoding;
 
@@ -14,8 +14,7 @@ use super::decode::ContentEncoding;
 const HTML_MEDIA_TYPE: &str = "text/html";
 const CHARSET_PARAMETER: &str = "charset";
 const INLINE_DISPOSITION: &str = "inline";
-/// Headers a rewritten body falsifies. `Content-Digest` and `Repr-Digest` have
-/// no constant in the `http` crate.
+/// Headers a rewritten body falsifies, beside the ones `http` has constants for.
 const FALSIFIED_NAMES: [&str; 2] = ["content-digest", "repr-digest"];
 
 /// What the request side knows about a response being considered.
@@ -93,9 +92,11 @@ pub fn body_format(request: &PageRequest<'_>, status: StatusCode, headers: &Head
     Some(BodyFormat { encoding, charset })
 }
 
-/// Removes every header the rewritten body falsifies. The CSP is `csp`'s.
+/// Removes every header the rewritten body falsifies. The CSP is `csp`'s. A
+/// validator describes the origin's bytes, and the bytes differ per response by
+/// the nonce: a 304 would reuse a page whose nonce matches no CSP in that 304.
 pub fn strip_falsified_headers(headers: &mut HeaderMap) {
-    for name in [CONTENT_ENCODING, CONTENT_LENGTH, ACCEPT_RANGES] {
+    for name in [CONTENT_ENCODING, CONTENT_LENGTH, ACCEPT_RANGES, ETAG, LAST_MODIFIED] {
         headers.remove(name);
     }
     for name in FALSIFIED_NAMES {
@@ -108,12 +109,17 @@ mod tests {
     use super::super::{InjectLimits, begin};
     use super::*;
     use http::HeaderValue;
-    use sieve_filter::rules::{ListText, RuleEngine};
+    use sieve_filter::rules::{ListText, RuleEngine, RuleSet};
+    use std::sync::Arc;
 
     const URL: &str = "https://sieve-test.invalid/";
 
-    fn rules() -> RuleEngine {
-        RuleEngine::compile(&[ListText { id: "l", text: "##.x\n", trusted: true }])
+    fn list_rules(text: &str) -> RuleSet {
+        RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(RuleEngine::compile(&[ListText { id: "l", text, trusted: true }])) }
+    }
+
+    fn rules() -> RuleSet {
+        list_rules("##.x\n")
     }
 
     fn headers_of(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
@@ -131,14 +137,14 @@ mod tests {
     }
 
     /// `begin` on this head: the rewriter's existence, and the head afterwards.
-    fn attempt(request: &PageRequest<'_>, engine: &RuleEngine, status: u16, pairs: &[(&'static str, &'static str)], start: &[u8]) -> (bool, HeaderMap) {
+    fn attempt(request: &PageRequest<'_>, engine: &RuleSet, status: u16, pairs: &[(&'static str, &'static str)], start: &[u8]) -> (bool, HeaderMap) {
         let mut headers = headers_of(pairs);
         let rewriter = begin(engine, request, StatusCode::from_u16(status).unwrap(), &mut headers, start, &InjectLimits::default());
         (rewriter.is_some(), headers)
     }
 
     #[track_caller]
-    fn assert_passes_through(request: &PageRequest<'_>, engine: &RuleEngine, status: u16, pairs: &[(&'static str, &'static str)], start: &[u8]) {
+    fn assert_passes_through(request: &PageRequest<'_>, engine: &RuleSet, status: u16, pairs: &[(&'static str, &'static str)], start: &[u8]) {
         let (rewriting, headers) = attempt(request, engine, status, pairs, start);
         assert!(!rewriting, "{status} {pairs:?}");
         assert_eq!(headers, headers_of(pairs), "headers must not change");
@@ -261,13 +267,13 @@ mod tests {
 
     #[test]
     fn a_document_exception_passes_through() {
-        let engine = RuleEngine::compile(&[ListText { id: "l", text: "##.x\n@@||sieve-test.invalid^$document\n", trusted: true }]);
+        let engine = list_rules("##.x\n@@||sieve-test.invalid^$document\n");
         assert_passes_through(&request(&Method::GET), &engine, 200, &[HTML, ("content-encoding", "gzip")], b"");
     }
 
     #[test]
     fn a_page_with_nothing_to_inject_passes_through() {
-        let engine = RuleEngine::compile(&[ListText { id: "l", text: "||ads.invalid^\n", trusted: true }]);
+        let engine = list_rules("||ads.invalid^\n");
         assert_passes_through(&request(&Method::GET), &engine, 200, &[HTML, ("content-encoding", "gzip"), ("content-length", "9")], b"");
     }
 
@@ -284,7 +290,9 @@ mod tests {
                 ("accept-ranges", "bytes"),
                 ("content-digest", "sha-256=:x:"),
                 ("repr-digest", "sha-256=:x:"),
-                ("etag", "\"keep\""),
+                ("etag", "\"gone\""),
+                ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                ("cache-control", "max-age=60"),
                 ("set-cookie", "a=b"),
                 ("content-security-policy-report-only", "script-src 'self'"),
             ],
@@ -293,7 +301,7 @@ mod tests {
         assert!(rewriting);
         let mut names: Vec<&str> = headers.keys().map(|k| k.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["content-security-policy-report-only", "content-type", "etag", "set-cookie"]);
+        assert_eq!(names, ["cache-control", "content-security-policy-report-only", "content-type", "set-cookie"]);
         assert_eq!(headers.get("content-security-policy-report-only").unwrap(), "script-src 'self'");
     }
 }

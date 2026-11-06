@@ -1,18 +1,19 @@
 //! Slice 9 integration, loopback only: a server on `127.0.0.1:0` serves one
 //! fixture page per encoding, with a strict header CSP, a meta CSP and Trusted
 //! Types. The response is read over a raw socket and rewritten by the library,
-//! as the HTTP path will (`http::hook`). Structure is proved by parsing the output; the script is
+//! as the HTTP path does (`inject::content`). Structure is proved by parsing the output; the script is
 //! run under node. What a browser does with it stays UNVERIFIED (task doc).
 
 use std::cell::RefCell;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use sieve_engine::inject::{InjectLimits, PageRequest, begin};
 use sieve_filter::resources::{load_bundle, sha256_hex};
-use sieve_filter::rules::{ListText, RuleEngine};
+use sieve_filter::rules::{ListText, RuleEngine, RuleSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -40,10 +41,10 @@ fn page() -> String {
     format!("<!doctype html><html lang=\"en\">{HEAD_OPEN}{AFTER_HEAD}")
 }
 
-fn engine() -> RuleEngine {
+fn engine() -> RuleSet {
     let mut rules = RuleEngine::compile(&[ListText { id: "fixture", text: RULES, trusted: false }]);
     rules.use_resources(&load_bundle(BUNDLE, &sha256_hex(BUNDLE)).unwrap());
-    rules
+    RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(rules) }
 }
 
 fn compress(encoding: &str, body: &[u8]) -> Vec<u8> {
@@ -111,7 +112,7 @@ struct Fetched {
 }
 
 /// One response through the library, chunk by chunk as it arrives.
-async fn fetch_and_rewrite(port: u16, encoding: &str, rules: &RuleEngine) -> Fetched {
+async fn fetch_and_rewrite(port: u16, encoding: &str, rules: &RuleSet) -> Fetched {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     stream.write_all(format!("GET /{encoding} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes()).await.unwrap();
 

@@ -72,6 +72,9 @@ pub struct FlowBook {
     next_log_id: u64,
     /// Log rows since the last batch.
     log: Vec<LogRow>,
+    /// Requests a list's rule acted on since the engine started, by list id: what a
+    /// live check can read of the rules without a log on disk (plan 7.1).
+    list_hits: BTreeMap<String, u64>,
 }
 
 impl FlowBook {
@@ -164,12 +167,21 @@ impl FlowBook {
     /// One decrypted request (task D13). Only what `RequestRow` holds reaches
     /// the log: bodies, cookies and auth headers never do (plan 7.1).
     pub fn log_request(&mut self, id: u64, request: RequestRow<'_>, t: u64) {
+        if matches!(request.outcome, LogOutcome::Blocked | LogOutcome::Redirected | LogOutcome::ParamsRemoved)
+            && let Some(list) = request.list
+        {
+            *self.list_hits.entry(list.to_string()).or_default() += 1;
+        }
         self.push_row(id, t, Some((request.url, request.request_type)), request.outcome, request.rule, request.list);
     }
 
     /// A flow that goes on undecrypted, and why (plan 4.1).
     pub fn log_not_decrypted(&mut self, id: u64, reason: &str, t: u64) {
         self.push_row(id, t, None, LogOutcome::NotDecrypted { reason: reason.to_string() }, None, None);
+    }
+
+    pub fn list_hits(&self) -> &BTreeMap<String, u64> {
+        &self.list_hits
     }
 
     /// The log rows since the last batch.
@@ -331,6 +343,22 @@ mod tests {
         assert_eq!(b.live(), 1);
         b.log_decision(id, &decided(Reason::NamedNoRule, None, None), 1);
         assert_eq!(b.take_log()[0].id, MAX_PENDING_LOG as u64 + 6, "the five lost rows are a gap in the ids");
+    }
+
+    #[test]
+    fn list_hits_count_acted_requests_by_list() {
+        let mut b = FlowBook::default();
+        let id = b.open(event(Some(1))).unwrap();
+        let row = |outcome, list| RequestRow { url: "https://x.example/a", request_type: "script", outcome, rule: None, list };
+        for outcome in [LogOutcome::Blocked, LogOutcome::Redirected, LogOutcome::ParamsRemoved] {
+            b.log_request(id, row(outcome, Some("a")), 1);
+        }
+        b.log_request(id, row(LogOutcome::Blocked, Some("b")), 1);
+        b.log_request(id, row(LogOutcome::Blocked, None), 1);
+        b.log_request(id, row(LogOutcome::Passed { reason: "exception".into() }, Some("a")), 1);
+        assert_eq!(b.list_hits().iter().map(|(k, v)| (k.as_str(), *v)).collect::<Vec<_>>(), [("a", 3), ("b", 1)]);
+        assert_eq!(b.take_log().len(), 6, "the rows are the log's whatever is counted");
+        assert_eq!(b.list_hits().len(), 2, "taking the log leaves the counts");
     }
 
     #[test]

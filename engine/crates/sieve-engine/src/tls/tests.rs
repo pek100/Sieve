@@ -391,11 +391,13 @@ pub(crate) struct RigOpts {
     pub(crate) ca_made_ms: u64,
     pub(crate) watch: Arc<dyn ClientWatch>,
     pub(crate) clock: fn() -> u64,
+    /// A slot the test also holds, to swap the snapshot; else one made of `rules`.
+    pub(crate) filter: Option<Arc<FilterSlot>>,
 }
 
 impl RigOpts {
     pub(crate) fn new(roots: Arc<RootCertStore>) -> Self {
-        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), clock: wall_ms }
+        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), clock: wall_ms, filter: None }
     }
 }
 
@@ -422,7 +424,7 @@ impl Rig {
             verdicts: VerdictCache::default(),
             active: Active::default(),
             minter: Box::new(move || if minted.1 { minted.0.minter() } else { None }),
-            filter: Arc::new(FilterSlot::new(DomainFilter::new(&policy, opts.rules))),
+            filter: opts.filter.unwrap_or_else(|| Arc::new(FilterSlot::new(DomainFilter::new(&policy, opts.rules)))),
             names: Arc::new(Mutex::new(NameMap::default())),
             book: Arc::new(Mutex::new(FlowBook::default())),
             meters: Arc::new(Meters::default()),

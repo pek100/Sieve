@@ -17,7 +17,8 @@
 //!   commit (v3, the wave after slice 3: blocked flows, the grown policy, the
 //!   list report, forwarded flows and guests, the `log` message, the status's filter
 //!   facts, the certificate's status with its `removal_pending` state,
-//!   `InstallRoot`, `Policy.https`, `request_update` and the `update` status).
+//!   `InstallRoot`, `Policy.https`, `Policy.content`, `request_update` and the
+//!   `update` status).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -194,6 +195,12 @@ pub struct Policy {
     /// before slice 5 must keep its engine switch rather than read as off.
     #[serde(default)]
     pub https: bool,
+    /// `filtering.content`: decrypted pages get cosmetics and scriptlets. Needs
+    /// `https`, whose interception is what carries it. Defaulted for a file from
+    /// before slice 9, and left out while false, so an old reader of the file sees
+    /// what it always saw.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub content: bool,
     /// `filtering.userRules`: rule lines in the lists' language, compiled
     /// untrusted beside `domain_lists`.
     #[serde(default)]
@@ -1155,6 +1162,17 @@ mod tests {
                 FirefoxTrust::NotInstalled | FirefoxTrust::UsesWindows | FirefoxTrust::NotUsingWindows => (),
             },
         };
+    }
+
+    #[test]
+    fn the_policy_without_content_loads_and_serializes_without_it() {
+        let old: Policy = serde_json::from_str(r#"{"revision":4,"engine":true,"https":true}"#).unwrap();
+        assert!(!old.content);
+        assert!(serde_json::to_value(&old).unwrap().get("content").is_none(), "false is left out");
+        let on = Policy { content: true, ..old };
+        let wire = serde_json::to_value(&on).unwrap();
+        assert_eq!(wire["content"], true);
+        assert_eq!(serde_json::from_value::<Policy>(wire).unwrap(), on, "the round trip");
     }
 
     #[test]
