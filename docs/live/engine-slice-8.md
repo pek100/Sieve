@@ -1,6 +1,6 @@
 # Live check: slice 8, QUIC per-flow refusal (`live_quic_refused_falls_back_to_tcp`)
 
-Run by the user, from an admin prompt. Nothing here was run by the stream that built it: every item is UNVERIFIED until you run it. `filtering.https` stays hidden in the app, so the switch is driven the way slice 6 drives it: with the app closed, `scripts/live/engine-ca.ps1` writes `https: true` into `policy.json`. Read that script before running it. Slice 6's live check (`docs/live/engine-slice-6.md`) passes first: without interception there is nothing to fall back to.
+Run by the user, from an admin prompt. Nothing here was run by the stream that built it: every item is UNVERIFIED until you run it. `filtering.https` stays hidden in the app, so the switch is driven the way slice 6 drives it: with the app closed, `scripts/live/engine-ca.ps1 -Step intercept` writes `https`, `sieving` and `engine` true into `policy.json`. Read that script before running it. Slice 6's live check (`docs/live/engine-slice-6.md`) passes first: without interception there is nothing to fall back to.
 
 Traffic really goes through the engine during this check. Do it when nothing else on this PC depends on the network. Before you start, record `route print`, `Get-DnsClientServerAddress`, `netsh winhttp show proxy` and the firewall rule list. The way out at any point is the engine switch off, or `sieve-engine.exe restore`. This check never changes a firewall rule.
 

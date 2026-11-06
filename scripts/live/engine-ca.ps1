@@ -17,12 +17,16 @@
   restart, off, on, uninstall. The check names are read by the Rust test
   `live_root_ca_trust_and_removal`, which passes only when each passed.
 
+  `-Step intercept` is the route of slice 6 and later (docs/live/engine-slice-6.md):
+  `-Step on` changes only `https` and moves no traffic, while this one also turns
+  `engine` and `sieving` on, so flows reach interception.
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\live\engine-ca.ps1 -Step before
 #>
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("before", "on", "restart", "off", "uninstall")]
+  [ValidateSet("before", "on", "intercept", "restart", "off", "uninstall")]
   [string]$Step,
   [string]$Out = (Join-Path $env:PUBLIC "sieve-engine-live")
 )
@@ -33,6 +37,7 @@ $EngineDir = Join-Path $env:ProgramData "Sieve\engine"
 $SieveDir = Join-Path $env:ProgramData "Sieve"
 $CaFile = Join-Path $EngineDir "ca.json"
 $PolicyFile = Join-Path $EngineDir "policy.json"
+$StatusFile = Join-Path $EngineDir "status.json"
 $FirefoxKey = "HKLM:\SOFTWARE\Policies\Mozilla\Firefox\Certificates"
 $Results = Join-Path $Out "results-ca.txt"
 $ServerAuthOid = "1.3.6.1.5.5.7.3.1"
@@ -87,12 +92,21 @@ function Start-Engine {
 }
 
 # Written with no BOM: the engine's JSON reader refuses one, and a refused file reads as off.
-function Set-HttpsSwitch([bool]$on) {
+function Write-PolicyWith([scriptblock]$json) {
   Stop-Engine
   $policy = if (Test-Path $PolicyFile) { Get-Content -Raw $PolicyFile | ConvertFrom-Json } else { [pscustomobject]@{ revision = 0; engine = $false } }
   $encoding = New-Object Text.UTF8Encoding($false)
-  [IO.File]::WriteAllText($PolicyFile, (New-HttpsPolicyJson $policy $on), $encoding)
+  [IO.File]::WriteAllText($PolicyFile, (& $json $policy), $encoding)
   Start-Engine
+}
+
+function Set-HttpsSwitch([bool]$on) {
+  Write-PolicyWith { param($policy) New-HttpsPolicyJson $policy $on }
+}
+
+# The engine rewrites the file by rename, so a read can miss it for a moment.
+function Read-Status {
+  try { return Get-Content -Raw $StatusFile | ConvertFrom-Json } catch { return $null }
 }
 
 function Wait-Until([scriptblock]$test) {
@@ -201,6 +215,15 @@ switch ($Step) {
     Check-Key $record.active.key_name
     Check-NoKeyMaterial
     Check-Firefox $record
+  }
+  "intercept" {
+    if ((Get-Process sieve -ErrorAction SilentlyContinue)) { throw "Close the Sieve app first: it sends https false whenever it runs." }
+    Write-PolicyWith { param($policy) New-InterceptionPolicyJson $policy }
+    if (-not (Wait-Until { $r = Read-Record; $r -and $r.active })) { throw "The engine recorded no active root within $WaitSeconds s. See $EngineDir." }
+    $up = Wait-Until { $s = Read-Status; $s -and $s.routes_up -and $s.policy.https -and $s.policy.sieving }
+    $status = Read-Status
+    Check "the engine holds interception on with routes up" $up "routes_up: $($status.routes_up), blocker: $($status.blocker | ConvertTo-Json -Compress), intercepted: $($status.https.intercepted)"
+    Write-Host "Next: step 0 of docs/live/engine-slice-6.md. Nothing else there counts until https.intercepted grows."
   }
   "restart" {
     $record = Read-Record

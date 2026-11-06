@@ -1,10 +1,19 @@
 # Live check: slice 6, TLS interception (`live_https_intercepts_public_and_passes_floor`)
 
-Run by the user, from an admin prompt. Nothing here was run by the stream that built it: every item is UNVERIFIED until you run it. `filtering.https` stays hidden in the app, so the switch is driven the way slice 5 drives it: with the app closed, `scripts/live/engine-ca.ps1` writes `https: true` into `policy.json`. Read that script before running it.
+Run by the user, from an admin prompt. Nothing here was run by the stream that built it: every item is UNVERIFIED until you run it. `filtering.https` stays hidden in the app, so the script drives the switch: with the app closed, `scripts/live/engine-ca.ps1 -Step intercept` writes `https`, `sieving` and `engine` true into `policy.json`, leaving every other field as it was. Slice 5's `-Step on` changes only `https`, which holds a root and intercepts nothing: interception needs `sieving` too (`wanted()` in `tls/intercept.rs`), and no flow reaches it without `engine`. Read that script before running it.
 
-Traffic really goes through the engine during this check. Do it when nothing else on this PC depends on the network. Before you start, record `route print`, `Get-DnsClientServerAddress`, `netsh winhttp show proxy` and the firewall rule list. The way out at any point is the engine switch off, or `sieve-engine.exe restore`.
+Traffic really goes through the engine during this check. Do it when nothing else on this PC depends on the network. Before you start, record `route print`, `Get-DnsClientServerAddress`, `netsh winhttp show proxy` and the firewall rule list. The way out at any point is the engine switch off, or `sieve-engine.exe restore`. When you are done, `-Step off` takes the root away, and opening the app sends your own switches back, `engine` and `sieving` included.
 
 `status.json` (admin-only, `C:\ProgramData\Sieve\engine\`) gains `https`: `intercepted`, `passed`, `upstream_groups`, `client_groups`. No host is ever in it (plan 7.1), so to read one site, read the numbers, load that site alone, read them again.
+
+## Step 0: interception is really on
+
+Believe no floor check before this passes. U4, U5, U6 and U8 pass when the browser shows its own verdict, and a flow nothing intercepted shows exactly that, so with interception off they pass and prove nothing.
+
+1. `powershell -ExecutionPolicy Bypass -File scripts\live\engine-ca.ps1 -Step intercept`. It must print PASS for `the engine holds interception on with routes up`. A FAIL names the blocker: AdGuard running is the usual one.
+2. Note `https.intercepted` in `status.json`, load a plain public site in Edge or Chrome (no exclusion, not a bank or a `.gov`), wait for the 30 s rewrite, and note it again.
+
+Pass when `https.intercepted` grew. If it did not, stop and read `routes_up`, `blocker`, `policy.sieving`, `policy.https` and `last_error` in `status.json`, then `https.passed` and the log's reason slugs (see Reading a result).
 
 ## Checks
 

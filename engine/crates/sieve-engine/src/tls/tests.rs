@@ -2082,6 +2082,38 @@ fn live_self_healing_excludes_a_pinning_client() {
     panic!("this check is the runbook: docs/live/engine-slice-7.md");
 }
 
+/// What `scripts/live/engine-ca-checks.ps1` writes for one call, through the
+/// engine's own reader of `policy.json`. Touches only a temporary folder.
+#[cfg(windows)]
+fn live_script_writes(before: &Policy, call: &str) -> Policy {
+    const CHECKS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../scripts/live/engine-ca-checks.ps1");
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.json");
+    std::fs::write(&source, serde_json::to_vec(before).unwrap()).unwrap();
+    let script = format!("$ErrorActionPreference = 'Stop'; . '{CHECKS}'; $policy = Get-Content -Raw '{}' | ConvertFrom-Json; {call}", source.display());
+    let out = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    std::fs::write(dir.path().join(crate::policy::POLICY_FILE), &out.stdout).unwrap();
+    let (written, refused) = crate::policy::load(dir.path());
+    assert_eq!(refused, None, "the engine reads what the script writes");
+    written
+}
+
+/// The slice 6 route must reach interception, or the floor checks pass with
+/// nothing intercepted.
+#[cfg(windows)]
+#[test]
+fn the_policy_the_live_script_writes_is_one_interception_wants() {
+    let list = sieve_ipc::DomainList { kind: sieve_ipc::DomainListKind::Block, entries: vec!["a.example".into()], enabled: true };
+    let before = Policy { revision: 7, off_apps: vec!["chrome".into()], lists: Some(vec!["adguard-dns".into()]), domain_lists: vec![list], user_rules: vec!["||x.example^".into()], ..Policy::default() };
+    let written = live_script_writes(&before, "New-InterceptionPolicyJson $policy");
+    assert!(super::intercept::wanted(&written) && written.engine, "{written:?}");
+    assert_eq!(written, Policy { revision: 8, engine: true, sieving: true, https: true, ..before.clone() }, "nothing else moved");
+    // The control: slice 5's route holds a root and intercepts nothing.
+    let root_only = live_script_writes(&before, "New-HttpsPolicyJson $policy $true");
+    assert!(root_only.https && !super::intercept::wanted(&root_only) && !root_only.engine, "{root_only:?}");
+}
+
 /// Slice 6's live check (`docs/live/engine-slice-6.md`), run by the user: U1 to
 /// U14. Offline it cannot pass and claims nothing.
 #[test]

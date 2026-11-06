@@ -1,6 +1,6 @@
 # Live check: engine slice 7, self-healing exclusions
 
-Run by the user. None of this has run. `filtering.https` stays unavailable; this runbook does not unlock it. It needs the slice 6 live route first (`docs/live/engine-slice-6.md`), with the switch driven as in `scripts/live/engine-ca.ps1`, app closed.
+Run by the user. None of this has run. `filtering.https` stays unavailable; this runbook does not unlock it. It needs the slice 6 live route first (`docs/live/engine-slice-6.md`), with the switch driven by `scripts/live/engine-ca.ps1 -Step intercept`, app closed.
 
 The ignored test is `live_self_healing_excludes_a_pinning_client`. It holds no check of its own; this page is the check. A verifier reads the evidence.
 

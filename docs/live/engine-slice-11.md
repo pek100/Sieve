@@ -1,6 +1,6 @@
 # Live check: slice 11, CT, CRLite and upstream ECH
 
-Run by the user, from an admin prompt. Nothing here was run by the stream that built it: every item is UNVERIFIED until you run it. Slice 6's own live check (`docs/live/engine-slice-6.md`) must have passed first, and it uses the same route: with the app closed, `scripts/live/engine-ca.ps1` writes `https: true` into `policy.json`. There is no new switch. CT, CRLite and ECH are part of `filtering.https`, which stays hidden in the app.
+Run by the user, from an admin prompt. Nothing here was run by the stream that built it: every item is UNVERIFIED until you run it. Slice 6's own live check (`docs/live/engine-slice-6.md`) must have passed first, and it uses the same route: with the app closed, `scripts/live/engine-ca.ps1 -Step intercept` writes `https`, `sieving` and `engine` true into `policy.json`. There is no new switch. CT, CRLite and ECH are part of `filtering.https`, which stays hidden in the app.
 
 Traffic really goes through the engine during this check. Do it when nothing else on this PC depends on the network. Before you start, record `route print`, `Get-DnsClientServerAddress`, `netsh winhttp show proxy` and the firewall rule list. The way out at any point is the engine switch off, or `sieve-engine.exe restore`.
 

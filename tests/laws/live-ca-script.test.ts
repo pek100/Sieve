@@ -5,7 +5,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { ROOT } from "./files";
+import { ROOT, read } from "./files";
 
 const CHECKS = "scripts/live/engine-ca-checks.ps1";
 
@@ -37,6 +37,25 @@ describe("the policy the script writes", () => {
 
   it("adds the switch to a policy older than it", () => {
     expect(JSON.parse(powershell(`New-HttpsPolicyJson ('{"revision":1,"engine":true}' | ConvertFrom-Json) $false`))).toEqual({ revision: 2, engine: true, https: false });
+  });
+});
+
+describe("the slice 6 route", () => {
+  const OFF = { ...POLICY, engine: false, sieving: false };
+  const source = JSON.stringify(OFF).replaceAll("'", "''");
+
+  it("ends with engine and sieving on, dropping nothing", () => {
+    const written = JSON.parse(powershell(`New-InterceptionPolicyJson ('${source}' | ConvertFrom-Json)`));
+    expect(written).toEqual({ ...OFF, revision: 8, https: true, engine: true, sieving: true });
+  });
+
+  it("is what the script's own step writes, and what the runbook names", () => {
+    const script = read("scripts/live/engine-ca.ps1");
+    expect(script).toContain('"intercept" {');
+    expect(script).toContain("New-InterceptionPolicyJson $policy");
+    const runbook = read("docs/live/engine-slice-6.md");
+    expect(runbook).toContain("-Step intercept");
+    expect(runbook).toContain("https.intercepted");
   });
 });
 

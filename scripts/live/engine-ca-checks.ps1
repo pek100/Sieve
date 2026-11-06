@@ -12,6 +12,16 @@ function New-HttpsPolicyJson($policy, [bool]$on) {
   return $policy | ConvertTo-Json -Depth 10
 }
 
+# The policy of the slice 6 route: with `sieving` off `wanted()` in tls/intercept.rs
+# is false, and with `engine` off no flow reaches the relay, so the floor checks would
+# pass with nothing intercepted. These two, the switch and the revision change;
+# every other field is the user's.
+function New-InterceptionPolicyJson($policy) {
+  $policy | Add-Member -Force -NotePropertyName engine -NotePropertyValue $true
+  $policy | Add-Member -Force -NotePropertyName sieving -NotePropertyValue $true
+  return New-HttpsPolicyJson $policy $true
+}
+
 # What certutil's answer about the key says: "refused", "missing", "readable" or "error".
 function Get-KeyAnswer([string]$text, [int]$exitCode) {
   if ($exitCode -eq 0) { return "readable" }
