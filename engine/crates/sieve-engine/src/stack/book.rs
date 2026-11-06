@@ -72,8 +72,9 @@ pub struct FlowBook {
     next_log_id: u64,
     /// Log rows since the last batch.
     log: Vec<LogRow>,
-    /// Requests a list's rule acted on since the engine started, by list id: what a
-    /// live check can read of the rules without a log on disk (plan 7.1).
+    /// Connections and decrypted requests a list's rule acted on since the engine
+    /// started, by list id: what a live check can read of the rules without a log on
+    /// disk (plan 7.1).
     list_hits: BTreeMap<String, u64>,
 }
 
@@ -161,18 +162,23 @@ impl FlowBook {
     /// the wall clock.
     pub fn log_decision(&mut self, id: u64, decision: &Decision, t: u64) {
         let Some(outcome) = log_outcome(decision) else { return };
+        self.count_hit(&outcome, decision.list.as_deref());
         self.push_row(id, t, None, outcome, decision.rule.as_deref(), decision.list.as_deref());
     }
 
     /// One decrypted request (task D13). Only what `RequestRow` holds reaches
     /// the log: bodies, cookies and auth headers never do (plan 7.1).
     pub fn log_request(&mut self, id: u64, request: RequestRow<'_>, t: u64) {
-        if matches!(request.outcome, LogOutcome::Blocked | LogOutcome::Redirected | LogOutcome::ParamsRemoved)
-            && let Some(list) = request.list
+        self.count_hit(&request.outcome, request.list);
+        self.push_row(id, t, Some((request.url, request.request_type)), request.outcome, request.rule, request.list);
+    }
+
+    fn count_hit(&mut self, outcome: &LogOutcome, list: Option<&str>) {
+        if matches!(outcome, LogOutcome::Blocked | LogOutcome::Redirected | LogOutcome::ParamsRemoved)
+            && let Some(list) = list
         {
             *self.list_hits.entry(list.to_string()).or_default() += 1;
         }
-        self.push_row(id, t, Some((request.url, request.request_type)), request.outcome, request.rule, request.list);
     }
 
     /// A flow that goes on undecrypted, and why (plan 4.1).
@@ -359,6 +365,20 @@ mod tests {
         assert_eq!(b.list_hits().iter().map(|(k, v)| (k.as_str(), *v)).collect::<Vec<_>>(), [("a", 3), ("b", 1)]);
         assert_eq!(b.take_log().len(), 6, "the rows are the log's whatever is counted");
         assert_eq!(b.list_hits().len(), 2, "taking the log leaves the counts");
+    }
+
+    /// A plain `||host^` is blocked at the connection and never reaches `log_request`.
+    #[test]
+    fn list_hits_count_a_connection_a_list_blocked() {
+        let mut b = FlowBook::default();
+        let id = b.open(event(Some(1))).unwrap();
+        b.log_decision(id, &decided(Reason::NamedBlock, Some("||ads.example^"), Some("a")), 1);
+        b.log_decision(id, &decided(Reason::AllResolvedNamesBlocked, Some("||ads.example^"), Some("a")), 1);
+        b.log_decision(id, &decided(Reason::NamedBlock, Some("||ads.example^"), None), 1);
+        b.log_decision(id, &decided(Reason::NamedAllow, Some("@@||ads.example^"), Some("a")), 1);
+        b.log_decision(id, &decided(Reason::NamedNoRule, None, None), 1);
+        b.log_decision(id, &decided(Reason::Disabled, None, Some("a")), 1);
+        assert_eq!(b.list_hits().iter().map(|(k, v)| (k.as_str(), *v)).collect::<Vec<_>>(), [("a", 2)]);
     }
 
     #[test]
