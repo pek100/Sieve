@@ -91,6 +91,9 @@ bytes = "1"
 # Userspace TCP/IP stack (vendored, see engine/vendor/ipstack/Cargo.toml).
 ipstack = "1.0.1"
 socket2 = "0.6"
+# The packets a refused QUIC flow is answered with (`quic::icmp`): the version
+# and features ipstack builds every packet it writes with. Also the benchmark's.
+etherparse = { version = "0.20", default-features = false, features = ["std"] }
 
 # Encrypted DNS upstreams (plan 1.4) and the one TLS owner (plan 2.7, `tls`):
 # rustls on aws-lc-rs, X25519MLKEM768 preferred. hyper speaks DoH over HTTP/2,
@@ -167,7 +170,5 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 hyper = { version = "1", features = ["server"] }
 # A body fed from a test, for streaming and trailers (`http::tests`).
 http-body-util = { version = "0.1", features = ["channel"] }
-# Benchmark only: craft packets for ipstack (same version ipstack uses).
-etherparse = "0.20"
 # The test encoder for the brotli decode path.
 brotli = "8"

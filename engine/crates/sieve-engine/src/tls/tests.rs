@@ -396,11 +396,13 @@ pub(crate) struct RigOpts {
     /// The real `heal::Heal` as the watch, in place of `watch`.
     pub(crate) heals: bool,
     pub(crate) clock: fn() -> u64,
+    /// The exclusion lists the store loads.
+    pub(crate) sources: Vec<crate::exclusions::lists::Source>,
 }
 
 impl RigOpts {
     pub(crate) fn new(roots: Arc<RootCertStore>) -> Self {
-        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, clock: wall_ms }
+        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, clock: wall_ms, sources: Vec::new() }
     }
 }
 
@@ -413,7 +415,7 @@ impl Rig {
         let (ca, ca_dir) = test_ca(opts.ca_made_ms);
         let minter = ca.minter().expect("a root");
         let store_dir = tempfile::tempdir().unwrap();
-        let mut slot = ExclusionSlot::with_sources(Some(store_dir.path()), &[], Vec::new(), wall_ms());
+        let mut slot = ExclusionSlot::with_sources(Some(store_dir.path()), &[], opts.sources, wall_ms());
         if !opts.skip_ev {
             slot = slot.without_ev_skip();
         }
@@ -443,7 +445,7 @@ impl Rig {
     }
 
     /// An open flow in the book, as `admit` makes it.
-    fn open_flow(&self) -> u64 {
+    pub(crate) fn open_flow(&self) -> u64 {
         let event = sieve_ipc::FlowEvent {
             id: 0,
             pid: Some(42),

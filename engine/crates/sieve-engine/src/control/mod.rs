@@ -318,10 +318,12 @@ impl Engine {
         self.write_dns_status_file();
     }
 
-    /// The Status plus what stays local: the key exchange evidence (task D18).
+    /// The Status plus what stays local: the key exchange evidence (task D18) and
+    /// the QUIC fallback evidence (slice 8).
     fn status_value(&self) -> Result<serde_json::Value, serde_json::Error> {
         let mut status = serde_json::to_value(self.status_saying(self.updates.status()))?;
         status["https"] = self.meters.https.report();
+        status["quic"] = self.meters.quic.report(crate::quic::REFUSAL);
         Ok(status)
     }
 
@@ -1010,6 +1012,27 @@ mod tests {
         assert_eq!(status["https"]["upstream_groups"]["X25519MLKEM768"], 1);
         assert_eq!(status["https"]["client_groups"]["X25519"], 0);
         assert!(serde_json::to_value(e.status()).unwrap().get("https").is_none(), "IPC protocol unchanged");
+    }
+
+    #[test]
+    fn status_reports_the_arm_and_holds_no_host() {
+        const HOST: &str = "refused.example";
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        e.meters.quic.refused(42, HOST, 1_000);
+        e.meters.quic.tcp_seen(42, HOST, 1_037);
+        e.meters.quic.refused(42, HOST, 2_000);
+        e.write_status_file();
+        let text = std::fs::read_to_string(dir.path().join(STATUS_FILE)).unwrap();
+        assert!(!text.contains(HOST), "no host on disk");
+        let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(status["quic"]["refusal"], "port_unreachable");
+        assert_eq!(status["quic"]["refused"], 2);
+        assert_eq!(status["quic"]["replies"], 0);
+        assert_eq!(status["quic"]["send_failed"], 0);
+        assert_eq!(status["quic"]["raced"], 0);
+        assert_eq!(status["quic"]["fallback_ms"], serde_json::json!([37]));
+        assert!(serde_json::to_value(e.status()).unwrap().get("quic").is_none(), "IPC protocol unchanged");
     }
 
     /// Off closes every decrypted flow at once: it does not wait for the routing

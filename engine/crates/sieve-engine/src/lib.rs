@@ -11,6 +11,7 @@
 //!   answers read into the IP-to-names map (slices 3, 4);
 //! - [`tls`]: the one owner of how the engine speaks TLS (plan 2.7), and
 //!   interception behind `filtering.https` (slice 6);
+//! - [`quic`]: the per-flow refusal behind the same switch (slice 8);
 //! - [`http`]: decrypted requests through hyper, with full-URL rules (slice 6);
 //! - [`exclusions`]: the store behind `sieve_filter::exclusions::decrypt`;
 //! - [`heal`]: self-healing exclusions and their notices (slice 7);
@@ -44,6 +45,7 @@ pub mod ipc;
 pub mod lists;
 pub mod lru;
 pub mod policy;
+pub mod quic;
 pub mod route;
 pub mod service;
 pub mod stack;

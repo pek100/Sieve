@@ -1,6 +1,8 @@
 // Source-only preservation audit. This does not compile Rust or run an engine.
-// Supply the pre-experiment revision explicitly so the comparison stays useful
-// after the implementation is committed.
+// Supply the revision to compare against explicitly: the commit a stream branched
+// from, so the audit proves that stream left these paths alone. The pre-experiment
+// 4328141 no longer passes, and rightly: f171c44, 1deb54c, 4ca9c54 and fd337fd
+// changed relay_tcp and flows.rs on purpose after it.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -18,10 +20,10 @@ const block = (text, start, end) => {
   return text.slice(from, to).trim();
 };
 const relay = engine + "flow/relay.rs";
-assert.equal(
-  block(read(relay), "pub async fn relay_tcp<", "/// Diagnostic counterpart"),
-  block(before(relay), "pub async fn relay_tcp<", "#[cfg(test)]"),
-);
+// A baseline older than the experiments has no diagnostic counterpart after relay_tcp.
+const relayTcp = (text) =>
+  block(text, "pub async fn relay_tcp<", text.includes("/// Diagnostic counterpart") ? "/// Diagnostic counterpart" : "#[cfg(test)]");
+assert.equal(relayTcp(read(relay)), relayTcp(before(relay)));
 console.log("PASS: original relay_tcp source unchanged");
 
 const device = engine + "tun/device.rs";

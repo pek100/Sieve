@@ -9,7 +9,7 @@
 
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -20,6 +20,7 @@ use wintun_bindings::{Adapter, Session, Wintun};
 use super::MTU;
 use super::{ADAPTER_GUID, RING_BYTES, TUNNEL_TYPE, admit, dll_beside, verify_dll};
 use crate::flow::packet;
+use crate::quic::PacketSink;
 use crate::route::ADAPTER_NAME;
 use crate::route::apply::SieveLuid;
 use crate::stack::Meters;
@@ -164,13 +165,41 @@ impl AsyncRead for TunDevice {
     }
 }
 
+/// One IP packet onto the adapter. Wintun documents allocate and send as safe to
+/// call from several threads, so the stack and [`TunSink`] can both write.
+fn write_packet(session: &Arc<Session>, meters: &Meters, bytes: &[u8]) -> std::io::Result<()> {
+    let len = u16::try_from(bytes.len()).map_err(|_| std::io::Error::other("packet larger than 65535"))?;
+    let mut packet = session.allocate_send_packet(len).map_err(std::io::Error::other)?;
+    packet.bytes_mut().copy_from_slice(bytes);
+    session.send_packet(packet);
+    Meters::bump(&meters.packets_out);
+    Ok(())
+}
+
+/// What a refused QUIC flow answers through. It does not keep the session alive:
+/// `control::routing::take_down` closes the adapter with the flows' relay still
+/// held, and the order there is what keeps the network.
+pub struct TunSink {
+    session: Weak<Session>,
+    meters: Arc<Meters>,
+}
+
+impl TunSink {
+    pub fn new(session: &Arc<Session>, meters: Arc<Meters>) -> Self {
+        Self { session: Arc::downgrade(session), meters }
+    }
+}
+
+impl PacketSink for TunSink {
+    fn send(&self, ip_packet: &[u8]) -> std::io::Result<()> {
+        let session = self.session.upgrade().ok_or_else(|| std::io::Error::other("the session is gone"))?;
+        write_packet(&session, &self.meters, ip_packet)
+    }
+}
+
 impl AsyncWrite for TunDevice {
     fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        let len = u16::try_from(buf.len()).map_err(|_| std::io::Error::other("packet larger than 65535"))?;
-        let mut packet = self.session.allocate_send_packet(len).map_err(std::io::Error::other)?;
-        packet.bytes_mut().copy_from_slice(buf);
-        self.session.send_packet(packet);
-        Meters::bump(&self.meters.packets_out);
+        write_packet(&self.session, &self.meters, buf)?;
         Poll::Ready(Ok(buf.len()))
     }
 
