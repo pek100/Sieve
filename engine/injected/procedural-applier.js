@@ -15,9 +15,9 @@ const _asHTMLElement = (node) => {
     return node instanceof HTMLElement ? node : null;
 };
 const _compileRegEx = (regexText) => {
-    const regexParts = regexText.split('/');
-    const regexPattern = regexParts[1];
-    const regexArgs = regexParts[2];
+    const regexEnd = regexText.lastIndexOf('/');
+    const regexPattern = regexText.slice(1, regexEnd);
+    const regexArgs = regexText.slice(regexEnd + 1);
     const regex = new W.RegExp(regexPattern, regexArgs);
     return regex;
 };
@@ -134,7 +134,8 @@ const _allOtherSiblings = (element) => {
     if (!element.parentNode) {
         return [];
     }
-    const siblings = Array.from(element.parentNode.children);
+    const children = Array.from(element.parentNode.children);
+    const siblings = children.slice(children.indexOf(element) + 1);
     const otherHTMLElements = [];
     for (const sib of siblings) {
         if (sib === element) {

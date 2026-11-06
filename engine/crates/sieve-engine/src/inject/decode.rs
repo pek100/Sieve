@@ -64,7 +64,10 @@ impl ContentEncoding {
     }
 }
 
-/// Collects decoded bytes and enforces the caps. The ratio cap applies only
+/// Collects decoded bytes and enforces the size cap as they come, which is what
+/// bounds a bomb's cost. The ratio is asked once, of the whole body
+/// ([`BodyDecoder::finish`]): mid-stream it would judge how the transport cut the
+/// body, so the same bytes would pass or reset by chunk size. It applies only
 /// above the floor, so a small repetitive page is never reset.
 #[derive(Default)]
 struct CappedSink {
@@ -80,10 +83,7 @@ impl CappedSink {
         Self { out: Vec::new(), decoded: 0, encoded: 0, limits, tripped: None }
     }
 
-    fn cap_exceeded(&self) -> Option<InjectError> {
-        if self.decoded > self.limits.max_decoded_bytes {
-            return Some(InjectError::DecodedTooLarge { cap: self.limits.max_decoded_bytes });
-        }
+    fn ratio_exceeded(&self) -> Option<InjectError> {
         let over_ratio = self.decoded > self.limits.ratio_floor_bytes && self.decoded / self.encoded.max(1) >= self.limits.max_ratio;
         over_ratio.then_some(InjectError::RatioExceeded { cap: self.limits.max_ratio })
     }
@@ -92,7 +92,8 @@ impl CappedSink {
 impl Write for CappedSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.decoded += buf.len() as u64;
-        if let Some(error) = self.cap_exceeded() {
+        if self.decoded > self.limits.max_decoded_bytes {
+            let error = InjectError::DecodedTooLarge { cap: self.limits.max_decoded_bytes };
             let message = error.to_string();
             self.tripped = Some(error);
             return Err(io::Error::other(message));
@@ -281,6 +282,9 @@ impl BodyDecoder {
             Decoder::Zstd(d) => d.do_finish(),
         };
         finished.map_err(|e| self.failure(&e))?;
+        if let Some(error) = self.sink_mut().and_then(|sink| sink.ratio_exceeded()) {
+            return Err(error);
+        }
         Ok(self.take_output())
     }
 }
@@ -399,6 +403,26 @@ mod tests {
         for encoding in ENCODINGS {
             let error = decode_chunks(encoding, [&encode(encoding, &plain)[..]], limits);
             assert!(matches!(error, Err(InjectError::RatioExceeded { .. })), "{encoding:?}: {error:?}");
+        }
+    }
+
+    /// A long compressible prefix, then noise: a low ratio overall that a mid-stream
+    /// test would call a bomb or not by where the transport cut. The verdict is
+    /// the same for every cut, and so is a real bomb's.
+    #[test]
+    fn the_verdict_does_not_depend_on_the_chunk_size() {
+        const CUTS: [usize; 6] = [1024 * 1024, 64 * 1024, 16 * 1024, 8 * 1024, 4 * 1024, 1460];
+        let prefix_then_noise = [vec![b' '; 2 * MIB as usize], noise(2 * MIB as usize)].concat();
+        let bomb = vec![0u8; 8 * MIB as usize];
+        for encoding in ENCODINGS {
+            let page = encode(encoding, &prefix_then_noise);
+            assert_eq!(decode(encoding, &page).unwrap().len(), prefix_then_noise.len(), "{encoding:?} whole");
+            let bombed = encode(encoding, &bomb);
+            for cut in CUTS {
+                assert_eq!(decode_chunks(encoding, page.chunks(cut), InjectLimits::default()).unwrap().len(), prefix_then_noise.len(), "{encoding:?} {cut}");
+                let error = decode_chunks(encoding, bombed.chunks(cut), InjectLimits::default());
+                assert!(matches!(error, Err(InjectError::RatioExceeded { .. })), "{encoding:?} {cut}: {error:?}");
+            }
         }
     }
 

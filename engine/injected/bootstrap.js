@@ -5,9 +5,16 @@
 function sieveRunProcedural(applier, filters) {
   const THROTTLE_MS = 100;
   const compiled = [];
+  // A style action's declarations, read once by the browser's own parser.
+  const declaredStyle = (action) => {
+    if (action?.type !== "style") return null;
+    const declared = document.createElement("div").style;
+    declared.cssText = action.arg;
+    return declared;
+  };
   for (const filter of filters) {
     try {
-      compiled.push({ selector: applier.compileProceduralSelector(filter.selector), action: filter.action, styled: new WeakSet() });
+      compiled.push({ selector: applier.compileProceduralSelector(filter.selector), action: filter.action, declared: declaredStyle(filter.action) });
     } catch {
       // One filter the applier cannot compile must not cost the others.
     }
@@ -20,16 +27,26 @@ function sieveRunProcedural(applier, filters) {
     }
   };
 
+  // Writes only what differs, as `hide` does: a page that overrides the style gets
+  // it put back, and a pass with nothing to do changes nothing.
+  const applyStyle = (element, declared) => {
+    const { style } = element;
+    for (const name of declared) {
+      const value = declared.getPropertyValue(name);
+      const priority = declared.getPropertyPriority(name);
+      if (style.getPropertyValue(name) !== value || style.getPropertyPriority(name) !== priority) {
+        style.setProperty(name, value, priority);
+      }
+    }
+  };
+
   const act = (element, filter) => {
     const action = filter.action;
     if (!action) return hide(element);
     if (action.type === "remove") return element.remove();
     if (action.type === "remove-attr") return element.removeAttribute(action.arg);
     if (action.type === "remove-class") return element.classList.remove(action.arg);
-    if (action.type === "style" && !filter.styled.has(element)) {
-      filter.styled.add(element);
-      element.style.cssText += ";" + action.arg;
-    }
+    if (filter.declared) applyStyle(element, filter.declared);
   };
 
   const pass = () => {
