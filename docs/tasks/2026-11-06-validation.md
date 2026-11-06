@@ -268,6 +268,7 @@ Every D-number holds. What the build settled or added:
 - A missing file means no data, also after a good one was loaded, so deleting a file takes a bad artefact back. Only a refused file keeps what was loaded. An empty bundle is zero filters.
 - `issuer_hash_of_an_intermediate_matches_the_recorded_issuer`: the recorded issuer has no recorded root, so no path through it as an intermediate can be built. The test shows the leaf's direct issuer on a built path, and webpki's rewrap of the recorded issuer against x509-parser's bytes. Its SCTs verifying under that hash is the `ct` test.
 - Meters live behind `ValidationSlot`, which holds the engine's `Arc<Meters>`; `Engine.validation` outlives the switch, so data loaded once stays across an off and on.
+- `bench_validation_local_checks`, in memory, recorded leaf, one builder-made filter, the second path build included: 1.14 ms per connection in a release build, 15.3 ms in a debug one. D1 assumed microseconds. The checks still run inline on a worker, and this is more than half of plan section 6's 2 ms for a new connection, so U5 decides whether they move off the runtime.
 - Step 7: `wf2-dns-extras` held no SvcParams reader on 2026-11-06 (commit 3cf9784 and its worktree), so `Message.https` and `https_rdata` land here. Whichever merges second makes one reader of the two.
 
 ## Cross-stream note
