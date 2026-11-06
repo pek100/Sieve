@@ -32,6 +32,10 @@ const SETTLE_MS = 5_000;
 const CALL_TIMEOUT_MS = 30_000;
 const START_TIMEOUT_MS = 30_000;
 const NEXT_VIDEO_TIMEOUT_MS = 30_000;
+/** A player that rose in fewer than this share of its intervals froze, whatever its range. */
+const MIN_ADVANCING_SHARE = 0.5;
+/** Past the engine's rewrite of status.json (STATUS_FILE_EVERY_MS, held by a law). */
+export const STATUS_SETTLE_MS = 35_000;
 const SEEK_BY_S = 30;
 const LOWER_QUALITY = "small";
 const DAY_CHECKS = ["seek", "quality", "autoplay"];
@@ -45,8 +49,12 @@ const PLAYER_STATE = `(() => {
     enforcement: Boolean(document.querySelector("ytd-enforcement-message-view-model, tp-yt-paper-dialog ytd-enforcement-message-view-model")),
   };
 })()`;
-const HOME_ADS = `document.querySelectorAll("ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, #masthead-ad, ytd-banner-promo-renderer").length`;
-const FIRST_HEAD_SCRIPT = `(document.head && document.head.querySelector("script") && document.head.querySelector("script").textContent) || ""`;
+// Ads a person can see. A rule's display:none and a blocked fetch's empty slot leave the
+// node in the DOM. Its children are measured too: a display:contents wrapper has no box.
+export const HOME_ADS = `[...document.querySelectorAll("ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, #masthead-ad, ytd-banner-promo-renderer")].filter((ad) => [ad, ...ad.querySelectorAll("*")].some((el) => {
+  const box = el.getBoundingClientRect();
+  return box.width > 0 && box.height > 0 && getComputedStyle(el).visibility === "visible";
+})).length`;
 const SEEK = `(() => { const v = document.querySelector("video"); const before = v.currentTime; v.currentTime = before + ${SEEK_BY_S}; return before; })()`;
 const CURRENT_TIME = `document.querySelector("video").currentTime`;
 const SET_QUALITY = `(() => { const p = document.querySelector("#movie_player"); p.setPlaybackQualityRange("${LOWER_QUALITY}"); return true; })()`;
@@ -85,6 +93,10 @@ export function videoVerdict(samples) {
   if (samples.some((s) => s.enforcement)) return { verdict: "fail", reason: "an enforcement message showed" };
   if (times.length === 0 || Math.max(...times) === 0) return { verdict: "unplayed", reason: "no playback seen" };
   if (Math.max(...times) - Math.min(...times) < MIN_ADVANCE_S) return { verdict: "fail", reason: "currentTime stuck" };
+  // A page slow to start is not a stall, so the intervals count from the first rise.
+  const playing = times.slice(times.findIndex((t) => t !== times[0]) - 1);
+  const rose = playing.slice(1).filter((t, i) => t > playing[i]).length;
+  if (rose < (playing.length - 1) * MIN_ADVANCING_SHARE) return { verdict: "fail", reason: "currentTime stuck" };
   return { verdict: "pass", reason: "advancing and clean" };
 }
 
@@ -97,17 +109,29 @@ function sameLists(wanted, held) {
   return held !== null && held.length === wanted.length && wanted.every((id) => held.includes(id));
 }
 
+/** How many documents the engine put scriptlets in between two statuses. Unknown, not
+ *  a number, when either cannot say or the meter went back: the engine restarted. */
+export function scriptletDocuments(before, after) {
+  const from = before?.content?.with_scriptlets;
+  const to = after?.content?.with_scriptlets;
+  return typeof from === "number" && typeof to === "number" && to >= from ? to - from : null;
+}
+
 /** What a run can claim. Without the engine in the path, the arm's lists held from
  *  start to end, and a scriptlet served, an ad-free video says nothing about Sieve or
  *  this arm, so that is inconclusive before any fail. A failure seen comes next. Then
- *  whatever is unknown keeps it from a pass: a check that could not run is not clean. */
-export function runVerdict(videos, day, lists) {
+ *  whatever is unknown keeps it from a pass: a check that could not run is not clean.
+ *  The witness of scriptlets is the engine's own meter (`run.scriptletDocuments`),
+ *  which no site's script can move. It counts the machine, not this browser. */
+export function runVerdict(videos, day, run) {
   const reasons = [];
-  if (videos.some((v) => v.issuer !== SIEVE_ISSUER)) reasons.push("a document's issuer is not Sieve's");
+  if (run.readsIssuer !== false && videos.some((v) => v.issuer !== SIEVE_ISSUER)) reasons.push("a document's issuer is not Sieve's");
   if (videos.some((v) => v.protocol === "h3")) reasons.push("a document came over HTTP/3, which is never decrypted");
-  if (videos.some((v) => v.verdict !== "unplayed" && !v.scriptletPayload)) reasons.push("no scriptlet payload in a served document");
+  const watched = videos.filter((v) => v.verdict !== "unplayed").length;
+  if (typeof run.scriptletDocuments !== "number") reasons.push("the engine's scriptlet meter could not be read");
+  else if (run.scriptletDocuments < watched) reasons.push(`the engine put scriptlets in ${run.scriptletDocuments} document(s) for ${watched} video(s) played`);
   for (const moment of ["start", "end"]) {
-    if (!sameLists(lists.wanted, lists[moment])) reasons.push(`at the ${moment} the engine held ${lists[moment]?.join(", ") ?? "an unknown set"}, not this arm's ${lists.wanted.join(", ")}`);
+    if (!sameLists(run.wanted, run[moment])) reasons.push(`at the ${moment} the engine held ${run[moment]?.join(", ") ?? "an unknown set"}, not this arm's ${run.wanted.join(", ")}`);
   }
   if (reasons.length > 0) return { verdict: "inconclusive", reasons };
 
@@ -121,13 +145,6 @@ export function runVerdict(videos, day, lists) {
   if (typeof day.homeAds !== "number") reasons.push("the home page could not be checked");
   for (const check of DAY_CHECKS) if (typeof day[check] !== "boolean") reasons.push(`${check} could not be checked`);
   return reasons.length > 0 ? { verdict: "inconclusive", reasons } : { verdict: "pass", reasons };
-}
-
-/** True when the first script of a page is the engine's and holds scriptlets, not
- *  only the applier (the shape inject/payload.rs writes). */
-export function scriptletPayload(scriptText) {
-  const body = /^\(function\(\)\{\n([\s\S]*?)(?:\nvar sieveApplier=|\n\}\)\(\);$)/.exec(scriptText);
-  return body !== null && body[1].trim().length > 0;
 }
 
 /** Counts per list across a run. Unknown stays null, never 0. */
@@ -152,6 +169,12 @@ function readStatus() {
   } catch {
     return null;
   }
+}
+
+/** The file once the engine has rewritten it, so its meters hold what just happened. */
+async function settledStatus() {
+  await sleep(STATUS_SETTLE_MS);
+  return readStatus();
 }
 
 /** What a driver knows of the page's document before its response is seen. */
@@ -205,6 +228,8 @@ class Rpc {
 
 /** Chrome and Edge. */
 export class CdpDriver {
+  static readsIssuer = true;
+
   static launch(executable, profile) {
     return spawn(executable, [`--user-data-dir=${profile}`, "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check", "--autoplay-policy=no-user-gesture-required", "about:blank"], { stdio: "ignore" });
   }
@@ -263,9 +288,12 @@ export class CdpDriver {
   }
 }
 
-/** Firefox has no CDP. BiDi reports no certificate, so the issuer is witnessed by the
- *  engine's own script being in the page: nothing else can have put it there. */
+/** Firefox has no CDP. BiDi reports no certificate, so the issuer stays unknown and the
+ *  engine's scriptlet meter stands in for it (runVerdict): what is in the page cannot,
+ *  since a site's own script can have the same shape. */
 export class BidiDriver {
+  static readsIssuer = false;
+
   static launch(executable, profile) {
     return spawn(executable, ["--profile", profile, "--no-remote", "--remote-debugging-port=0", "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
   }
@@ -316,9 +344,8 @@ export class BidiDriver {
     return Buffer.from(data, "base64");
   }
 
-  async documentFacts() {
-    const script = await this.evaluate(FIRST_HEAD_SCRIPT);
-    return { issuer: script.startsWith("(function(){\n") ? SIEVE_ISSUER : null, protocol: this.document.protocol };
+  documentFacts() {
+    return this.document;
   }
 }
 
@@ -367,12 +394,11 @@ async function watch(driver, video, out, errors) {
     await sleep(SAMPLE_MS);
   }
   const { verdict, reason } = videoVerdict(samples);
-  const facts = await driver.documentFacts();
-  const payload = scriptletPayload(await driver.evaluate(FIRST_HEAD_SCRIPT));
+  const facts = driver.documentFacts();
   if (verdict !== "pass") {
     await attempt("screenshot", errors, async () => writeFileSync(join(out, `${video}.png`), await driver.screenshot()));
   }
-  return { id: video, verdict, reason, issuer: facts.issuer, protocol: facts.protocol, scriptletPayload: payload, samples };
+  return { id: video, verdict, reason, issuer: facts.issuer, protocol: facts.protocol, samples };
 }
 
 async function dayOneChecks(driver, videos, errors) {
@@ -410,7 +436,7 @@ async function main() {
   mkdirSync(args.out, { recursive: true });
   console.log(`Arm ${args.arm}: the engine must hold ${lists.join(", ")}.`);
 
-  const before = readStatus();
+  const before = await settledStatus();
   const profile = mkdtempSync(join(tmpdir(), "sieve-youtube-"));
   const errors = [];
   try {
@@ -419,9 +445,10 @@ async function main() {
       const played = [];
       for (const video of videos) played.push(await watch(driver, video, args.out, errors));
       const day = await dayOneChecks(driver, videos, errors);
-      const after = readStatus();
+      const after = await settledStatus();
       const start = heldLists(before);
       const end = heldLists(after);
+      const served = scriptletDocuments(before, after);
       const result = {
         browser: args.browser,
         arm: args.arm,
@@ -429,10 +456,11 @@ async function main() {
         listsHeldAtStart: start,
         listsHeld: end,
         listHits: hitsDelta(before?.content?.list_hits ?? null, after?.content?.list_hits ?? null),
+        scriptletDocuments: served,
         day,
         videos: played,
         errors,
-        ...runVerdict(played, day, { wanted: lists, start, end }),
+        ...runVerdict(played, day, { wanted: lists, start, end, readsIssuer: Driver.readsIssuer, scriptletDocuments: served }),
       };
       writeFileSync(join(args.out, `youtube-${args.browser}-${args.arm}.json`), JSON.stringify(result, null, 2));
       console.log(`${result.verdict}: ${result.reasons.join("; ") || "every check held"}`);

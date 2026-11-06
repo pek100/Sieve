@@ -30,17 +30,18 @@ import * as script from "../../scripts/live/youtube.mjs";
 
 const startedAtImport = { spawn: started.spawn, spawnSync: started.spawnSync.length };
 
-const { BidiDriver, CdpDriver, SIEVE_ISSUER, VIDEOS_REQUIRED, armLists, heldLists, hitsDelta, normalProtocol, parseArgs, runVerdict, scriptletPayload, videoVerdict, withBrowser } = script;
+const { BidiDriver, CdpDriver, SIEVE_ISSUER, STATUS_SETTLE_MS, VIDEOS_REQUIRED, armLists, heldLists, hitsDelta, normalProtocol, parseArgs, runVerdict, scriptletDocuments, videoVerdict, withBrowser } = script;
 const SCRIPT = "scripts/live/youtube.mjs";
 
 const sample = (currentTime: number | null, extra = {}) => ({ currentTime, adShowing: false, enforcement: false, ...extra });
-const advancing = [sample(1), sample(5), sample(9)];
+const times = (...at: number[]) => at.map((t) => sample(t));
+const advancing = times(1, 5, 9);
 
-const video = (extra = {}) => ({ id: "v", verdict: "pass", reason: "", issuer: SIEVE_ISSUER, protocol: "h2", scriptletPayload: true, ...extra });
+const video = (extra = {}) => ({ id: "v", verdict: "pass", reason: "", issuer: SIEVE_ISSUER, protocol: "h2", ...extra });
 const tenPasses = () => Array.from({ length: VIDEOS_REQUIRED }, () => video());
 const cleanDay = { homeAds: 0, seek: true, quality: true, autoplay: true };
 const WANTED = ["a", "b"];
-const armHeld = { wanted: WANTED, start: WANTED, end: WANTED };
+const armHeld = { wanted: WANTED, start: WANTED, end: WANTED, readsIssuer: true, scriptletDocuments: VIDEOS_REQUIRED };
 
 describe("the video site live script", () => {
   it("importing it starts nothing", () => {
@@ -59,6 +60,10 @@ describe("the video site live script", () => {
     ["ad state seen", [sample(1), sample(5, { adShowing: true }), sample(9)], "fail"],
     ["an enforcement message", [sample(1), sample(5, { enforcement: true }), sample(9)], "fail"],
     ["time stuck", [sample(4), sample(4), sample(4)], "fail"],
+    ["a freeze after the first samples, past the range check", times(0, ...Array<number>(14).fill(6)), "fail"],
+    ["playing, then frozen for most of the watch", times(1, 3, 5, 7, 9, 11, ...Array<number>(9).fill(11)), "fail"],
+    ["slow to start, then playing to the end", times(...Array<number>(9).fill(0), 1, 3, 5, 7, 9, 11), "pass"],
+    ["a short buffering pause", times(1, 3, 5, 5, 7, 9), "pass"],
     ["never played", [sample(0), sample(0)], "unplayed"],
     ["no player", [sample(null), sample(null)], "unplayed"],
     ["no samples", [], "unplayed"],
@@ -69,7 +74,7 @@ describe("the video site live script", () => {
   it("a run passes only with ten played, through the engine, with a scriptlet served", () => {
     expect(runVerdict(tenPasses(), cleanDay, armHeld).verdict).toBe("pass");
     expect(runVerdict(tenPasses().slice(1), cleanDay, armHeld).verdict).toBe("inconclusive");
-    const withUnplayed = [...tenPasses().slice(1), video({ verdict: "unplayed", scriptletPayload: false })];
+    const withUnplayed = [...tenPasses().slice(1), video({ verdict: "unplayed" })];
     expect(runVerdict(withUnplayed, cleanDay, armHeld).verdict).toBe("inconclusive");
   });
 
@@ -77,10 +82,60 @@ describe("the video site live script", () => {
     ["the wrong issuer", { issuer: "A Public CA" }],
     ["no issuer known", { issuer: null }],
     ["http/3", { protocol: "h3" }],
-    ["no scriptlet payload", { scriptletPayload: false }],
   ])("a run with %s is inconclusive, never pass, and never a fail either", (_, extra) => {
     expect(runVerdict([...tenPasses().slice(1), video(extra)], cleanDay, armHeld).verdict).toBe("inconclusive");
     expect(runVerdict([...tenPasses().slice(1), video({ verdict: "fail", ...extra })], cleanDay, armHeld).verdict).toBe("inconclusive");
+  });
+
+  it.each([
+    ["one document short of the videos played", VIDEOS_REQUIRED - 1],
+    ["none served", 0],
+    ["a meter that could not be read", null],
+    ["a meter not reported at all", undefined],
+  ])("the engine's meter is the scriptlet witness: %s is inconclusive, never pass, never a fail", (_, scriptlets) => {
+    const run = { ...armHeld, scriptletDocuments: scriptlets };
+    const said = runVerdict(tenPasses(), cleanDay, run);
+    expect(said.verdict).toBe("inconclusive");
+    expect(said.reasons.join()).toMatch(/scriptlet/);
+    expect(runVerdict([...tenPasses().slice(1), video({ verdict: "fail" })], cleanDay, run).verdict).toBe("inconclusive");
+  });
+
+  it("the meter is held to the videos that played, so an unplayed one does not ask for a document", () => {
+    const nine = [...tenPasses().slice(1), video({ verdict: "unplayed" })];
+    expect(runVerdict(nine, cleanDay, { ...armHeld, scriptletDocuments: 9 }).reasons).toEqual(["9 of 10 videos played"]);
+  });
+
+  it("a browser that reports no issuer is witnessed by the meter alone; one that does is still held to it", () => {
+    const firefox = tenPasses().map((v) => ({ ...v, issuer: null }));
+    expect(runVerdict(firefox, cleanDay, { ...armHeld, readsIssuer: false }).verdict).toBe("pass");
+    expect(runVerdict(firefox, cleanDay, { ...armHeld, readsIssuer: false, scriptletDocuments: 0 }).verdict).toBe("inconclusive");
+    expect(runVerdict(firefox, cleanDay, armHeld).verdict).toBe("inconclusive");
+    expect(runVerdict(firefox, cleanDay, { ...armHeld, readsIssuer: undefined }).verdict, "not saying is not leave").toBe("inconclusive");
+    expect(BidiDriver.readsIssuer).toBe(false);
+    expect(CdpDriver.readsIssuer).toBe(true);
+  });
+
+  it("the documents served are the meter's growth; unread, or a meter that went back, is unknown", () => {
+    const status = (n: unknown) => ({ content: { with_scriptlets: n } });
+    expect(scriptletDocuments(status(4), status(14))).toBe(10);
+    expect(scriptletDocuments(status(4), status(4))).toBe(0);
+    expect(scriptletDocuments(status(14), status(1)), "the engine restarted during the run").toBeNull();
+    expect(scriptletDocuments(null, status(1))).toBeNull();
+    expect(scriptletDocuments(status(1), null)).toBeNull();
+    expect(scriptletDocuments({}, status(1))).toBeNull();
+    expect(read("engine/crates/sieve-engine/src/stack/mod.rs")).toContain('"with_scriptlets": self.with_scriptlets');
+    expect(read("engine/crates/sieve-engine/src/control/mod.rs"), "it is the status file's section").toContain('status["content"]');
+  });
+
+  it("nothing a page's own script can write is read as a witness", () => {
+    const source = read(SCRIPT);
+    expect(source).not.toContain("document.head");
+    expect(source).not.toContain("textContent");
+  });
+
+  it("a status is read only after the engine has had time to rewrite the file", () => {
+    const every = /STATUS_FILE_EVERY_MS: u64 = ([\d_]+)/.exec(read("engine/crates/sieve-engine/src/control/mod.rs"));
+    expect(STATUS_SETTLE_MS).toBeGreaterThan(Number(every?.[1].replaceAll("_", "")));
   });
 
   it.each([
@@ -92,13 +147,13 @@ describe("the video site live script", () => {
     ["another arm's lists", { start: ["x", "y"], end: ["x", "y"] }],
     ["the lists swapped during the run", { start: ["x", "y"], end: WANTED }],
   ])("a run with %s is not evidence about the arm: inconclusive, never pass, never a fail", (_, held) => {
-    const lists = { wanted: WANTED, ...held };
+    const lists = { ...armHeld, ...held };
     expect(runVerdict(tenPasses(), cleanDay, lists).verdict).toBe("inconclusive");
     expect(runVerdict([...tenPasses().slice(1), video({ verdict: "fail" })], cleanDay, lists).verdict).toBe("inconclusive");
   });
 
   it("the lists the engine holds may come in any order", () => {
-    expect(runVerdict(tenPasses(), cleanDay, { wanted: WANTED, start: ["b", "a"], end: ["b", "a"] }).verdict).toBe("pass");
+    expect(runVerdict(tenPasses(), cleanDay, { ...armHeld, start: ["b", "a"], end: ["b", "a"] }).verdict).toBe("pass");
   });
 
   it("the held lists are read from the shape the engine writes; absent is unknown, not none", () => {
@@ -140,17 +195,6 @@ describe("the video site live script", () => {
     expect(() => parseArgs(["--browser", "chrome", "--arm", "ubo", "--out", "x"])).toThrow(/arm/);
     expect(() => parseArgs(["--browser", "chrome", "--arm", "adguard"])).toThrow(/out/);
     expect(() => parseArgs([...good, "--nope", "1"])).toThrow(/nope/);
-  });
-
-  it("a scriptlet payload is told from the applier alone, in the shape the engine writes", () => {
-    const shape = read("engine/crates/sieve-engine/src/inject/payload.rs");
-    expect(shape).toContain('String::from("(function(){\\n")');
-    expect(shape).toContain("\\nvar sieveApplier=");
-    expect(scriptletPayload("(function(){\ntry{flag()}catch(e){}\n})();")).toBe(true);
-    expect(scriptletPayload("(function(){\ntry{flag()}catch(e){}\nvar sieveApplier=(function(){})();\n})();")).toBe(true);
-    expect(scriptletPayload("(function(){\n\nvar sieveApplier=(function(){})();\n})();")).toBe(false);
-    expect(scriptletPayload("window.pageOwn = 1;")).toBe(false);
-    expect(scriptletPayload("")).toBe(false);
   });
 
   it("the issuer is the engine's own", () => {
@@ -219,7 +263,6 @@ const CDP_ANSWERS = {
 };
 const BIDI_ANSWERS = {
   "browsingContext.getTree": { contexts: [{ context: "top" }] },
-  "script.evaluate": { type: "success", result: { value: JSON.stringify("(function(){\nx") } },
 };
 const PID = 4242;
 const KILLED = [["/PID", String(PID), "/T", "/F"]];
@@ -353,12 +396,12 @@ describe("the script's drivers, against a fake socket", () => {
     const driver = await connecting;
     FakeSocket.last.deliver(bidiDocument("top", "h3"));
     FakeSocket.last.deliver(bidiDocument("an-iframe", "h2"));
-    expect(await driver.documentFacts()).toEqual({ issuer: SIEVE_ISSUER, protocol: "h3" });
+    expect(driver.documentFacts()).toEqual({ issuer: null, protocol: "h3" });
     vi.useFakeTimers();
     const navigated = driver.navigate("https://x.example/");
     await vi.advanceTimersByTimeAsync(60_000);
     await navigated;
     vi.useRealTimers();
-    expect((await driver.documentFacts()).protocol).toBeNull();
+    expect(driver.documentFacts()).toEqual({ issuer: null, protocol: null });
   });
 });
