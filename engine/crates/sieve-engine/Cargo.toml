@@ -168,3 +168,4 @@ http-body-util = { version = "0.1", features = ["channel"] }
 etherparse = "0.20"
 # The test encoder for the brotli decode path.
 brotli = "8"
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }

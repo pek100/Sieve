@@ -9,7 +9,9 @@
 //! - [`upstream`]: the resolver list, failover and the split-horizon rules;
 //! - [`pool`]: one kept-open session per upstream, over [`doh`], [`dot`], [`doq`];
 //! - [`lan`]: the one plain exchange, to a LAN server;
-//! - [`config`]: the list as `dns.json` holds it.
+//! - [`config`]: the list as `dns.json` holds it;
+//! - [`ech`]: `ech` parameters taken out of HTTPS and SVCB answers;
+//! - [`reverse`]: which reverse lookups name a private range.
 //!
 //! [`Connector`] is the only way this code opens a socket, so the production
 //! connector's pinning and the tests' recording cover every socket.
@@ -31,8 +33,10 @@ pub mod config;
 pub mod doh;
 pub mod doq;
 pub mod dot;
+pub mod ech;
 pub mod lan;
 pub mod pool;
+pub mod reverse;
 pub mod service;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -43,6 +47,8 @@ pub(crate) const TYPE_AAAA: u16 = 28;
 const TYPE_CNAME: u16 = 5;
 /// EDNS's pseudo-record (RFC 6891).
 const TYPE_OPT: u16 = 41;
+pub(crate) const TYPE_SVCB: u16 = 64;
+pub(crate) const TYPE_HTTPS: u16 = 65;
 const CLASS_IN: u16 = 1;
 /// Pointer hops allowed in one name (a loop guard).
 const MAX_POINTERS: usize = 16;
@@ -61,7 +67,12 @@ const FLAG_OPCODE: u16 = 0x7800;
 const FLAG_TC: u16 = 0x0200;
 const FLAG_RD: u16 = 0x0100;
 const FLAG_RA: u16 = 0x0080;
+/// The resolver says it validated the data (RFC 4035).
+const FLAG_AD: u16 = 0x0020;
+/// In a query's EDNS TTL: the client asks for DNSSEC records (RFC 3225).
+const EDNS_DO: u32 = 0x0000_8000;
 const RCODE_SERVFAIL: u16 = 2;
+const RCODE_NXDOMAIN: u16 = 3;
 const RCODE_NOTIMP: u16 = 4;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -183,6 +194,12 @@ pub fn notimp(query: &[u8]) -> Option<Vec<u8>> {
     error_reply(query, RCODE_NOTIMP)
 }
 
+/// NXDOMAIN with the client's ID and question: no such name, said here. It has
+/// no SOA, so a client does not cache it (RFC 2308).
+pub fn nxdomain(query: &[u8]) -> Option<Vec<u8>> {
+    error_reply(query, RCODE_NXDOMAIN)
+}
+
 /// `reply` as header and question with TC set: the client retries over TCP.
 pub fn truncated(reply: &[u8]) -> Option<Vec<u8>> {
     answer_without_records(reply, flags_of(reply)? | FLAG_TC)
@@ -192,8 +209,15 @@ pub fn is_truncated(reply: &[u8]) -> bool {
     flags_of(reply).is_some_and(|f| f & FLAG_TC != 0)
 }
 
-/// The payload size a query's EDNS record announces.
-fn edns_payload(msg: &[u8]) -> Option<usize> {
+/// What a query's EDNS record says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edns {
+    pub payload: usize,
+    pub dnssec_ok: bool,
+}
+
+/// A query's EDNS record, when it has one that can be read.
+pub fn edns(msg: &[u8]) -> Option<Edns> {
     let count = |at: usize| Some(usize::from(u16::from_be_bytes([*msg.get(at)?, *msg.get(at + 1)?])));
     let before = count(6)? + count(8)?;
     let total = before + count(10)?;
@@ -201,9 +225,9 @@ fn edns_payload(msg: &[u8]) -> Option<usize> {
     for index in 0..total {
         let start = skip_name(msg, pos)?;
         let mut r = Reader::new(msg.get(start..)?);
-        let (ty, class, _ttl, len) = (r.u16()?, r.u16()?, r.u32()?, usize::from(r.u16()?));
+        let (ty, class, ttl, len) = (r.u16()?, r.u16()?, r.u32()?, usize::from(r.u16()?));
         if ty == TYPE_OPT && index >= before {
-            return Some(usize::from(class));
+            return Some(Edns { payload: usize::from(class), dnssec_ok: ttl & EDNS_DO != 0 });
         }
         pos = start + 10 + len;
     }
@@ -213,7 +237,7 @@ fn edns_payload(msg: &[u8]) -> Option<usize> {
 /// The largest UDP reply this query's client accepts: its EDNS payload size or
 /// 512, and never more than one packet of the adapter can carry.
 pub fn udp_limit(query: &[u8], mtu: usize) -> usize {
-    edns_payload(query).map_or(UDP_DEFAULT, |p| p.max(UDP_DEFAULT)).min(mtu.saturating_sub(UDP_OVERHEAD))
+    edns(query).map_or(UDP_DEFAULT, |e| e.payload.max(UDP_DEFAULT)).min(mtu.saturating_sub(UDP_OVERHEAD))
 }
 
 /// True when `reply` can stand as the answer to `query`: a response with its
@@ -667,6 +691,25 @@ mod tests {
         let mut cut = query_with_edns(1, "a.example", 1232);
         cut.truncate(cut.len() - 3);
         assert_eq!(udp_limit(&cut, 1500), 512, "a broken record reads as no EDNS");
+    }
+
+    #[test]
+    fn the_edns_record_says_its_size_and_whether_dnssec_is_asked_for() {
+        assert_eq!(edns(&query(1, "a.example")), None);
+        let mut q = query_with_edns(1, "a.example", 1232);
+        assert_eq!(edns(&q), Some(Edns { payload: 1232, dnssec_ok: false }));
+        let ttl_at = q.len() - 6;
+        q[ttl_at + 2] = 0x80; // DO, the top bit of the flags
+        assert_eq!(edns(&q), Some(Edns { payload: 1232, dnssec_ok: true }));
+    }
+
+    #[test]
+    fn nxdomain_keeps_the_id_and_the_question_and_holds_no_records() {
+        let q = query(7, "use-application-dns.net");
+        let reply = nxdomain(&q).unwrap();
+        assert_eq!((id_of(&reply), flags_of(&reply).unwrap() & 0xf), (Some(7), RCODE_NXDOMAIN));
+        assert_eq!(parse(&reply).unwrap().question.as_deref(), Some("use-application-dns.net"));
+        assert_eq!(reply[6..12], [0; 6]);
     }
 
     #[test]

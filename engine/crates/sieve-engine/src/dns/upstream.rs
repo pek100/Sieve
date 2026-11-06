@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::reverse;
 use crate::route::plan;
 use crate::route::prefix::Prefix;
-use crate::route::table::NetTables;
+use crate::route::table::{Adapter, NetTables};
 
 /// One default resolver: where it is, and its addresses, so reaching it never
 /// asks plain DNS (or the DNS it is about to serve).
@@ -223,12 +224,24 @@ impl SplitHorizon {
     /// when a caller accidentally supplies a default route as its LAN.
     pub fn new(suffix: &str, server: IpAddr, lan_prefixes: &[Prefix]) -> Option<Self> {
         let suffix = crate::flow::sni::host_name(suffix.as_bytes())?;
-        let private = match server {
-            IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
-            IpAddr::V6(ip) => (ip.segments()[0] & 0xfe00 == 0xfc00) || (ip.segments()[0] & 0xffc0 == 0xfe80),
-        };
-        (private && lan_prefixes.iter().any(|p| p.contains(server))).then_some(Self {suffix, server})
+        private_inside(server, lan_prefixes).then_some(Self {suffix, server})
     }
+}
+
+/// True for a private address inside these prefixes.
+fn private_inside(server: IpAddr, prefixes: &[Prefix]) -> bool {
+    let private = match server {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => (ip.segments()[0] & 0xfe00 == 0xfc00) || (ip.segments()[0] & 0xffc0 == 0xfe80),
+    };
+    private && prefixes.iter().any(|p| p.contains(server))
+}
+
+/// An adapter's first DNS server that plain DNS may reach: private, inside a
+/// hole, not a link-local IPv6 one (its address has no scope, and pinning refuses
+/// a link-local source).
+fn lan_server(adapter: &Adapter, holes: &[Prefix]) -> Option<IpAddr> {
+    adapter.dns.iter().copied().find(|ip| !is_v6_link_local(*ip) && private_inside(*ip, holes))
 }
 
 /// Match only exact suffixes or complete child labels, longest suffix first.
@@ -241,23 +254,43 @@ pub fn split_server(name: &str, rules: &[SplitHorizon]) -> Option<IpAddr> {
 }
 
 /// The rules these tables imply, computed per query (few adapters, no cache):
-/// each suffix of each other up adapter, with the adapter's first server that
-/// qualifies against the route plan's holes. A link-local IPv6 server is
-/// skipped: its address has no scope, and pinning refuses a link-local source.
+/// each suffix of each other up adapter, with [`lan_server`].
 pub fn split_rules(tables: &NetTables) -> Vec<SplitHorizon> {
     let holes = plan::holes(tables);
     let mut rules = Vec::new();
     for adapter in tables.others() {
-        for suffix in &adapter.dns_suffixes {
-            let server = adapter.dns.iter().filter(|ip| !is_v6_link_local(**ip)).find_map(|ip| SplitHorizon::new(suffix, *ip, &holes));
-            rules.extend(server);
-        }
+        let Some(server) = lan_server(adapter, &holes) else { continue };
+        rules.extend(adapter.dns_suffixes.iter().filter_map(|suffix| SplitHorizon::new(suffix, server, &holes)));
     }
     rules
 }
 
 fn is_v6_link_local(ip: IpAddr) -> bool {
     matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80)
+}
+
+/// Where one question goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Path {
+    /// To this LAN server and nowhere else.
+    Lan(IpAddr),
+    /// A private reverse name with no LAN server to ask: answered here.
+    NoServer,
+    Encrypted,
+}
+
+/// The route of a question. A configured suffix wins. A private reverse name goes
+/// to the server of the adapter whose on-link prefix holds the address, else to
+/// the first server of any other adapter, and never to the public upstream.
+pub fn path_of(name: &str, tables: &NetTables) -> Path {
+    if let Some(server) = split_server(name, &split_rules(tables)) {
+        return Path::Lan(server);
+    }
+    let Some(address) = reverse::private_address(name) else { return Path::Encrypted };
+    let holes = plan::holes(tables);
+    let holds_address = |a: &&Adapter| a.addresses.iter().filter_map(|addr| addr.on_link()).any(|p| p.contains(address));
+    let covering = tables.others().filter(holds_address).find_map(|a| lan_server(a, &holes));
+    covering.or_else(|| tables.others().find_map(|a| lan_server(a, &holes))).map_or(Path::NoServer, Path::Lan)
 }
 
 #[cfg(test)]
@@ -424,6 +457,70 @@ mod tests {
     fn with_suffix(tables: &mut NetTables, alias: &str, suffix: &str) {
         let adapter = tables.adapters.iter_mut().find(|a| a.alias == alias).unwrap();
         adapter.dns_suffixes.push(suffix.into());
+    }
+
+    const ROUTER_REVERSE: &str = "7.168.192.in-addr.arpa";
+
+    fn wifi(tables: &mut NetTables) -> &mut Adapter {
+        tables.adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap()
+    }
+
+    #[test]
+    fn a_private_reverse_name_goes_to_the_adapter_that_covers_it() {
+        use crate::route::table::fixtures::*;
+        let router = "192.168.7.1".parse().unwrap();
+        assert_eq!(path_of(ROUTER_REVERSE, &load(HOME)), Path::Lan(router));
+        // Another adapter holds the address and has its own private server.
+        let mut two = load(HOME);
+        let default_switch = two.adapters.iter_mut().find(|a| a.alias.starts_with("vEthernet")).unwrap();
+        let on_link = default_switch.addresses[0].on_link().unwrap();
+        let other_dns = on_link.addr();
+        default_switch.dns = vec![other_dns];
+        let octets = match on_link.addr() {
+            IpAddr::V4(ip) => ip.octets(),
+            IpAddr::V6(_) => panic!("the fixture's first address is IPv4"),
+        };
+        let name = format!("{}.{}.{}.{}.in-addr.arpa", octets[3], octets[2], octets[1], octets[0]);
+        assert_eq!(path_of(&name, &two), Path::Lan(other_dns));
+        assert_eq!(path_of(ROUTER_REVERSE, &two), Path::Lan(router), "each to its own");
+    }
+
+    #[test]
+    fn with_no_covering_adapter_any_adapters_private_server_answers() {
+        use crate::route::table::fixtures::*;
+        assert_eq!(path_of("5.0.0.10.in-addr.arpa", &load(HOME)), Path::Lan("192.168.7.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn with_no_private_server_a_private_reverse_name_has_no_path() {
+        use crate::route::table::fixtures::*;
+        let others_empty = |dns: Vec<IpAddr>| {
+            let mut t = load(HOME);
+            wifi(&mut t).dns = dns;
+            t
+        };
+        for dns in [vec!["8.8.8.8".parse().unwrap()], vec!["fe80::1".parse().unwrap()], vec![]] {
+            assert_eq!(path_of(ROUTER_REVERSE, &others_empty(dns.clone())), Path::NoServer, "{dns:?}");
+        }
+    }
+
+    #[test]
+    fn public_names_go_encrypted() {
+        use crate::route::table::fixtures::*;
+        for name in ["www.example", "8.8.8.8.in-addr.arpa", "192.in-addr.arpa", "in-addr.arpa", "example.arpa"] {
+            assert_eq!(path_of(name, &load(HOME)), Path::Encrypted, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_configured_suffix_wins_over_the_reverse_rule() {
+        use crate::route::table::fixtures::*;
+        let mut tables = load(HOME);
+        let default_switch = tables.adapters.iter_mut().find(|a| a.alias.starts_with("vEthernet")).unwrap();
+        let server = default_switch.addresses[0].on_link().unwrap().addr();
+        default_switch.dns = vec![server];
+        default_switch.dns_suffixes = vec!["168.192.in-addr.arpa".into()];
+        assert_eq!(path_of(ROUTER_REVERSE, &tables), Path::Lan(server), "not the Wi-Fi router, which covers the address");
     }
 
     #[test]

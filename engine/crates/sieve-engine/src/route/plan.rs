@@ -58,7 +58,7 @@ pub struct RoutePlan {
     pub holes: Vec<Prefix>,
 }
 
-fn declared() -> Vec<Prefix> {
+pub(crate) fn declared() -> Vec<Prefix> {
     // The table is a constant checked by `the_declared_exclusions_parse`.
     EXCLUDED.iter().filter_map(|(p, _)| p.parse().ok()).collect()
 }
