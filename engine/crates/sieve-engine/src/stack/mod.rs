@@ -55,6 +55,7 @@ pub struct Meters {
     pub etw_disagreed: AtomicU64,
     pub etw_dropped: AtomicU64,
     pub https: HttpsMeters,
+    pub quic: crate::quic::fallback::QuicMeters,
 }
 
 /// The key exchange groups the engine speaks, in `tls::kx_groups` order.
