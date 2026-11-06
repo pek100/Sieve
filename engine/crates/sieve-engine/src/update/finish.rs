@@ -95,6 +95,13 @@ impl Supervisor<'_> {
         if let Err(why) = swap::set_aside(self.fs, &self.install_dir, &pending.aside) {
             return self.give_up(format!("could not set the current files aside: {why}"));
         }
+        // From here a reboot can leave the old engine beside new files, and only
+        // this mark tells a whole `.old` from a copy that was cut short.
+        let pending = Pending { swap_started: true, ..pending };
+        if let Err(why) = state::save_pending(&self.engine_dir, &pending) {
+            let _ = swap::clear_leftovers(self.fs, &self.install_dir);
+            return self.give_up(format!("could not record the swap: {why}"));
+        }
         if let Err(why) = self.replace_set(&kind, &pending) {
             return self.roll_back(&kind, &pending, &format!("the swap failed: {why}"));
         }
@@ -225,7 +232,7 @@ enum Health {
 #[cfg(test)]
 mod tests {
     use super::super::state::tests::MemLog;
-    use super::super::state::{Record, Recovery, installed, load_record, recover};
+    use super::super::state::{Record, installed, load_record};
     use super::super::swap::tests::{FailingFs, NEW_ENGINE, OLD_ENGINE};
     use super::super::swap::{FAILED_SUFFIX, OLD_SUFFIX, RealFs};
     use super::super::testing::listing;
@@ -311,12 +318,8 @@ mod tests {
                 }
                 Engine::Report(own) => own,
             };
-            if let Some(p) = state::load_pending(self.engine_dir).unwrap() {
-                match recover(&p, own) {
-                    Recovery::Probe => state::commit_healthy(self.engine_dir, &p).unwrap(),
-                    Recovery::NotSwapped | Recovery::Mislabelled => state::clear_pending(self.engine_dir).unwrap(),
-                    Recovery::FinishRollback => {}
-                }
+            if let Some(p) = state::on_service_start(self.engine_dir, self.install_dir, own, &MemLog::default()) {
+                state::commit_healthy(self.engine_dir, &p).unwrap();
             }
             Ok(())
         }
@@ -399,6 +402,7 @@ mod tests {
                 staged: STAGED.into(),
                 aside: aside.iter().map(ToString::to_string).collect(),
                 rolling_back: false,
+                swap_started: false,
             };
             state::save_pending(&engine, &pending).unwrap();
             Self { _dir: dir, engine, install, pending }
@@ -744,6 +748,107 @@ mod tests {
         assert_eq!(std::fs::read(w.install.join("sieve.exe")).unwrap(), b"old app");
         assert!(!w.install.join("added.dll").exists(), "what it added goes too");
         assert!(log.0.lock().unwrap().iter().any(|l| l.contains("exit code 2")));
+    }
+
+    /// The installer's first file must find the mark on disk and every `.old` whole.
+    #[test]
+    fn the_swap_is_marked_once_the_set_aside_is_whole_and_before_the_installer() {
+        /// The mark, then the bytes of both `.old` files, as the installer found them.
+        type Seen = (bool, Vec<u8>, Vec<u8>);
+        struct Watching<'a>(&'a World, RefCell<Option<Seen>>);
+        impl Installer for Watching<'_> {
+            fn run(&self, _: &Path, install: &Path, _: &Path) -> Result<(), String> {
+                let marked = state::load_pending(&self.0.engine).unwrap().unwrap().swap_started;
+                let read = |name: &str| std::fs::read(install.join(format!("{name}{OLD_SUFFIX}"))).unwrap();
+                *self.1.borrow_mut() = Some((marked, read(ENGINE_EXE), read("sieve.exe")));
+                std::fs::write(install.join(ENGINE_EXE), NEW_ENGINE).unwrap();
+                Ok(())
+            }
+        }
+        let w = World::new("app", &[ENGINE_EXE, "sieve.exe"]);
+        let installer = Watching(&w, RefCell::default());
+        let service = FakeService::new(&w, Engine::Report(TO));
+        let (out, _) = w.run_with(&RealFs, &service, &installer);
+        assert_eq!(out, Ok(Outcome::Healthy));
+        assert_eq!(installer.1.into_inner(), Some((true, OLD_ENGINE.to_vec(), b"old app".to_vec())));
+    }
+
+    #[test]
+    fn a_set_aside_that_fails_never_marks_the_swap() {
+        let w = World::new("app", &[ENGINE_EXE, "sieve.exe"]);
+        let seen = RefCell::new(None);
+        let (out, _) = {
+            let probe = FailingFsWatching { inner: FailingFs::at(1), engine: &w.engine, seen: &seen };
+            let service = FakeService::new(&w, Engine::Report(FROM));
+            w.run_with(&probe, &service, &FakeInstaller::default())
+        };
+        assert!(matches!(out, Ok(Outcome::NotStarted(_))), "{out:?}");
+        assert_eq!(seen.into_inner(), Some(false));
+    }
+
+    /// Reads the pending file at the moment the failing step fires.
+    struct FailingFsWatching<'a> {
+        inner: FailingFs,
+        engine: &'a Path,
+        seen: &'a RefCell<Option<bool>>,
+    }
+
+    impl Fs for FailingFsWatching<'_> {
+        fn copy(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            let out = self.inner.copy(from, to);
+            if out.is_err() {
+                *self.seen.borrow_mut() = state::load_pending(self.engine).unwrap().map(|p| p.swap_started);
+            }
+            out
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+        fn files(&self, dir: &Path) -> std::io::Result<Vec<String>> {
+            self.inner.files(dir)
+        }
+    }
+
+    /// Without the mark a reboot could not be told from no swap at all, so no
+    /// real file may change.
+    #[test]
+    fn a_mark_that_cannot_be_written_changes_no_real_file() {
+        let w = World::new("app", &[ENGINE_EXE, "sieve.exe"]);
+        std::fs::create_dir(w.engine.join(state::PENDING_FILE).with_extension("tmp")).unwrap();
+        let service = FakeService::new(&w, Engine::Report(FROM));
+        let installer = FakeInstaller::default();
+        let (out, _) = w.run_with(&RealFs, &service, &installer);
+        assert!(matches!(&out, Ok(Outcome::NotStarted(why)) if why.contains("record the swap")), "{out:?}");
+        assert!(installer.calls.borrow().is_empty());
+        assert_eq!(w.exe(), OLD_ENGINE);
+        assert!(!w.install.join(format!("{ENGINE_EXE}{OLD_SUFFIX}")).exists());
+        assert_eq!(state::load_pending(&w.engine).unwrap(), None);
+        assert_eq!(service.starts.get(), 1, "the old engine runs again");
+    }
+
+    /// An installer that finished but left the old engine: the started old build
+    /// marks it, and the supervisor still ends on the whole old set.
+    #[test]
+    fn an_installer_that_leaves_the_old_engine_rolls_back() {
+        struct AppOnly;
+        impl Installer for AppOnly {
+            fn run(&self, _: &Path, install: &Path, _: &Path) -> Result<(), String> {
+                std::fs::write(install.join("sieve.exe"), b"new app").unwrap();
+                Ok(())
+            }
+        }
+        let w = World::new("app", &[ENGINE_EXE, "sieve.exe"]);
+        let service = FakeService::new(&w, Engine::Report(FROM));
+        let (out, _) = w.run_with(&RealFs, &service, &AppOnly);
+        assert_eq!(out, Ok(Outcome::RolledBack));
+        w.assert_rolled_back();
+        assert_eq!(std::fs::read(w.install.join("sieve.exe")).unwrap(), b"old app");
     }
 
     #[test]

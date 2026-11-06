@@ -155,7 +155,9 @@ fn install_panic_cleanup(journal_dir: std::path::PathBuf) {
 /// failure code, so the SCM's recovery restarts it.
 fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
     let dir = state::engine_dir(&state::program_data()?);
-    let release = update::state::on_service_start(&dir, OWN_RELEASE, &FileLog::new(&dir));
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let install = exe.parent().ok_or_else(|| format!("{} has no folder", exe.display()))?;
+    let release = update::state::on_service_start(&dir, install, OWN_RELEASE, &FileLog::new(&dir));
     let journal = Journal::new(&dir);
     let cleaned = clear_stale(&journal);
     install_panic_cleanup(dir.clone());
@@ -167,8 +169,7 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
 
     let owner = state::read(&dir)?.owner_sid;
     let sddl = pipe_sddl(owner.as_deref())?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let engine = Arc::new(Engine::new(Some(dir.clone()), exe, policy, runs, crash));
+    let engine =Arc::new(Engine::new(Some(dir.clone()), exe, policy, runs, crash));
     update::win::start_worker(&engine.updates, &dir, &engine.exe);
     engine.set_facts(|f| f.last_error = policy_error.or_else(|| cleaned.contains("FAILED").then(|| format!("start-up cleanup: {cleaned}"))));
 

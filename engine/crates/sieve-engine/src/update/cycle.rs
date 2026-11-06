@@ -263,12 +263,14 @@ impl Updater {
         over
     }
 
-    /// The old build still runs, so nothing was stopped and no file changed: the
-    /// release ends here. The new build runs unwatched and unproven, which is a
-    /// health timeout with no one to act on it: it becomes a rollback.
+    /// The old build still runs and the swap never began, so nothing was stopped
+    /// and no file changed: the release ends here. The new build runs unwatched and
+    /// unproven, which is a health timeout with no one to act on it: it becomes a
+    /// rollback. So does a swap that began, whose start could not write its mark:
+    /// its `.old` files may be the only whole set.
     fn supervisor_never_finished(&self, pending: Pending) {
         self.log.line(&format!("{} {}: no supervisor took over", pending.kind, pending.to_version));
-        if self.own != pending.from_version {
+        if self.own != pending.from_version || pending.swap_started {
             if let Err(why) = state::save_pending(&self.engine_dir, &Pending { rolling_back: true, ..pending }) {
                 self.log.line(&why);
             }
@@ -421,6 +423,7 @@ impl Updater {
             staged: entry.file.clone(),
             aside: swap::release_set(&RealFs, &self.install_dir, &kind)?,
             rolling_back: false,
+            swap_started: false,
         };
         state::save_pending(&self.engine_dir, &pending)?;
         if let Err(why) = self.starter.start(&self.install_dir) {
@@ -594,7 +597,7 @@ mod tests {
     }
 
     fn engine_release() -> Pending {
-        Pending { kind: "engine".into(), from_version: OWN, to_version: NEXT, staged: "new.exe".into(), aside: vec![ENGINE_EXE.into()], rolling_back: false }
+        Pending { kind: "engine".into(), from_version: OWN, to_version: NEXT, staged: "new.exe".into(), aside: vec![ENGINE_EXE.into()], rolling_back: false, swap_started: false }
     }
 
     fn unfinished_rollback() -> UpdateStatus {
@@ -999,6 +1002,60 @@ mod tests {
         w.updater.settle(SUPERVISOR_WAIT_MS);
         assert_eq!(state::load_pending(w.engine_dir()).unwrap(), Some(Pending { rolling_back: true, ..engine_release() }));
         assert_eq!(w.starter.calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// A reboot in the middle of an app install: the installer copied `sieve.exe`
+    /// and the engine is still the old one. From that start to the end, the same
+    /// path a real boot takes: the check must not take the `.old` files for
+    /// leftovers, and the set ends wholly old, byte for byte.
+    #[test]
+    fn a_reboot_during_an_app_install_ends_on_the_whole_old_set() {
+        let w = World::new();
+        let install = w.install_dir().to_path_buf();
+        let before = listing(&install);
+        let aside = swap::release_set(&RealFs, &install, &Kind::App).unwrap();
+        assert_eq!(aside, [ENGINE_EXE, "sieve.exe"]);
+        swap::set_aside(&RealFs, &install, &aside).unwrap();
+        let in_flight = Pending { kind: "app".into(), aside, swap_started: true, ..engine_release() };
+        state::save_pending(w.engine_dir(), &in_flight).unwrap();
+        std::fs::write(install.join("sieve.exe"), b"new app").unwrap();
+        std::fs::write(install.join("added.dll"), b"new").unwrap();
+        w.publish(7, &[]);
+
+        assert_eq!(state::on_service_start(w.engine_dir(), &install, OWN, &MemLog::default()), None, "the old build reports nothing healthy");
+        assert_eq!(state::load_pending(w.engine_dir()).unwrap(), Some(Pending { rolling_back: true, ..in_flight }));
+
+        assert_eq!(w.run(Job::Check), unfinished_rollback());
+        assert_eq!(std::fs::read(install.join("sieve.exe.old")).unwrap(), b"app", "the only copy stays");
+
+        w.updater.settle(0);
+        assert_eq!(w.updater.control.status(), UpdateStatus::RolledBack { version: "0.2.0".into() });
+        assert_eq!(state::load_pending(w.engine_dir()).unwrap(), None);
+        assert_eq!(w.record().rolled_back["app"], NEXT);
+        assert_eq!(w.record().versions.get("app"), None, "the record did not rise");
+
+        assert_eq!(w.run(Job::Check), UpdateStatus::RolledBack { version: "0.2.0".into() });
+        assert_eq!(listing(&install), before);
+    }
+
+    /// The same install, but the start could not write its mark. The wait for a
+    /// supervisor must not end by dropping the release.
+    #[test]
+    fn a_swap_that_began_is_never_dropped_as_a_supervisor_that_never_came() {
+        let w = World::new();
+        let install = w.install_dir().to_path_buf();
+        let aside = swap::release_set(&RealFs, &install, &Kind::App).unwrap();
+        swap::set_aside(&RealFs, &install, &aside).unwrap();
+        let in_flight = Pending { kind: "app".into(), aside, swap_started: true, ..engine_release() };
+        state::save_pending(w.engine_dir(), &in_flight).unwrap();
+        std::fs::write(install.join("sieve.exe"), b"new app").unwrap();
+
+        w.updater.control.set_status(UpdateStatus::Applying { version: "0.2.0".into() });
+        w.updater.settle(0);
+        w.updater.settle(SUPERVISOR_WAIT_MS);
+        assert_eq!(state::load_pending(w.engine_dir()).unwrap(), Some(Pending { rolling_back: true, ..in_flight }));
+        w.updater.settle(SUPERVISOR_WAIT_MS + 1);
+        assert_eq!(std::fs::read(install.join("sieve.exe")).unwrap(), b"app");
     }
 
     /// The old engine is back but a later file of an app release was locked. The

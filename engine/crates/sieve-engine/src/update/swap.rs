@@ -35,13 +35,23 @@ pub trait Fs {
     fn exists(&self, path: &Path) -> bool;
     /// The regular files directly inside `dir`, by name.
     fn files(&self, dir: &Path) -> io::Result<Vec<String>>;
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
 }
 
 pub struct RealFs;
 
 impl Fs for RealFs {
+    /// On disk before it returns: a `.old` may be all that is left after a power
+    /// loss. A copy that cannot be opened for writing (a read-only source's
+    /// attribute comes along) is kept unflushed rather than failing the update.
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::copy(from, to).map(|_| ())
+        std::fs::copy(from, to)?;
+        match std::fs::OpenOptions::new().write(true).open(to) {
+            Ok(file) => file.sync_all(),
+            Err(_) => Ok(()),
+        }
     }
 
     /// `MoveFileExW` with replace, atomic on one volume.
@@ -79,6 +89,30 @@ fn is_leftover(name: &str) -> bool {
 
 fn named(path: &Path, e: &io::Error) -> String {
     format!("{}: {e}", path.display())
+}
+
+/// What an `app` release put in the folder that the set as listed did not have.
+fn added<'a>(names: &'a [String], aside: &'a [String]) -> impl Iterator<Item = &'a String> {
+    names.iter().filter(|n| !n.eq_ignore_ascii_case(MARKER_FILE) && !is_leftover(n) && !aside.contains(n))
+}
+
+/// Whether the real files are still the set that was set aside. Asked only once
+/// the set-aside finished, so every `.old` is whole. A file that cannot be read
+/// counts as changed: restoring from a whole `.old` is safe either way, and
+/// dropping the release would delete the only copy.
+pub fn set_changed(fs: &dyn Fs, install: &Path, kind: &Kind, aside: &[String]) -> bool {
+    let differs = |name: &String| {
+        let old = with_suffix(install, name, OLD_SUFFIX);
+        fs.exists(&old) && !matches!((fs.read(&install.join(name)), fs.read(&old)), (Ok(real), Ok(kept)) if real == kept)
+    };
+    if aside.iter().any(differs) {
+        return true;
+    }
+    *kind == Kind::App
+        && match fs.files(install) {
+            Ok(names) => added(&names, aside).next().is_some(),
+            Err(_) => true,
+        }
 }
 
 /// The files a release replaces, derived from the kind and the listing: `engine`
@@ -131,8 +165,7 @@ pub fn rollback(fs: &dyn Fs, install: &Path, kind: &Kind, aside: &[String]) -> R
     }
     if *kind == Kind::App {
         let names = fs.files(install).map_err(|e| named(install, &e))?;
-        let added = names.iter().filter(|n| !n.eq_ignore_ascii_case(MARKER_FILE) && !is_leftover(n) && !aside.contains(n));
-        for name in added {
+        for name in added(&names, aside) {
             let failed = with_suffix(install, name, FAILED_SUFFIX);
             fs.rename(&install.join(name), &failed).map_err(|e| named(&failed, &e))?;
         }
@@ -350,6 +383,50 @@ pub(crate) mod tests {
             }
             k += 1;
         }
+    }
+
+    /// What each part of an interrupted `app` install looks like, from a whole
+    /// set-aside: an untouched set, each kind of change, and a file nobody can read.
+    #[test]
+    fn set_changed_reads_the_real_files_against_the_set_aside() {
+        struct Unreadable(&'static str);
+        impl Fs for Unreadable {
+            fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
+                RealFs.copy(from, to)
+            }
+            fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+                RealFs.rename(from, to)
+            }
+            fn remove_file(&self, path: &Path) -> io::Result<()> {
+                RealFs.remove_file(path)
+            }
+            fn exists(&self, path: &Path) -> bool {
+                RealFs.exists(path)
+            }
+            fn files(&self, dir: &Path) -> io::Result<Vec<String>> {
+                RealFs.files(dir)
+            }
+            fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+                if path.ends_with(self.0) { Err(io::Error::other("sharing violation")) } else { RealFs.read(path) }
+            }
+        }
+
+        let changed = |change: &dyn Fn(&Path), kind: &Kind| {
+            let (_guard, install, set) = app_setup();
+            set_aside(&RealFs, &install, &set).unwrap();
+            change(&install);
+            set_changed(&RealFs, &install, kind, &set)
+        };
+        assert!(!changed(&|_| {}, &Kind::App), "untouched");
+        assert!(changed(&|i| std::fs::write(i.join("sieve.exe"), NEW_APP).unwrap(), &Kind::App), "one file new");
+        assert!(changed(&|i| std::fs::remove_file(i.join("uninstall.exe")).unwrap(), &Kind::App), "one file gone");
+        assert!(changed(&|i| std::fs::write(i.join("added.dll"), NEW_APP).unwrap(), &Kind::App), "one file added");
+        assert!(!changed(&|i| std::fs::write(i.join("added.dll"), NEW_APP).unwrap(), &Kind::Engine), "an engine release sets aside the exe only");
+        assert!(!changed(&|i| std::fs::write(i.join("sieve.exe.failed"), NEW_APP).unwrap(), &Kind::App), "a leftover is not part of the set");
+
+        let (_guard, install, set) = app_setup();
+        set_aside(&RealFs, &install, &set).unwrap();
+        assert!(set_changed(&Unreadable("sieve.exe"), &install, &Kind::App, &set), "unknown is not unchanged");
     }
 
     #[test]
