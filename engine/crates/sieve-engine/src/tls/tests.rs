@@ -1827,7 +1827,18 @@ fn healing_rig(arm: Arm, alpn: &[&str]) -> (Rig, Arc<Heal>, Vec<u8>) {
     let pki = Pki::new("Test Public Root");
     let chain = pki.leaf(HOST, GOOD);
     let upstream_leaf = chain.0[0].to_vec();
-    let handler = tls_server(vec![server_tls(chain, alpn, None)], Arc::default(), |_, tls| echo(tls));
+    // Echoing Sieve's h2 client preface back kills the upstream connection and ends the
+    // flow before a client's late alert arrives, so that one stays quiet. A pass-through
+    // retry still echoes.
+    let handler = tls_server(vec![server_tls(chain, alpn, None)], Arc::default(), |_, mut tls| async move {
+        let mut first = [0u8; 4096];
+        let Ok(n) = tls.read(&mut first).await else { return };
+        if first[..n].starts_with(b"PRI ") {
+            let _ = tokio::io::copy(&mut tls, &mut tokio::io::sink()).await;
+        } else if tls.write_all(&first[..n]).await.is_ok() && tls.flush().await.is_ok() {
+            echo(tls).await;
+        }
+    });
     let rig = Rig::new(TestDial::new(arm, handler), RigOpts { heals: true, ..RigOpts::new(pki.roots()) });
     let heal = rig.heal.clone().expect("heals");
     (rig, heal, upstream_leaf)
