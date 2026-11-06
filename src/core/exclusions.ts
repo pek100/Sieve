@@ -48,8 +48,15 @@ const APP_MODIFIER = "app=";
 const MAX_HOST_LEN = 253;
 const MAX_LABEL_LEN = 63;
 
+/**
+ * Lower case as the engine folds names (`to_ascii_lowercase`): everything compared
+ * with what it sends goes through this. `toLowerCase` also folds non-ASCII capitals,
+ * and then a path with one matches nothing the engine said.
+ */
+const asciiLower = (s: string) => s.replace(/[A-Z]/g, (c) => c.toLowerCase());
+
 function hostName(raw: string, glob: boolean): string | null {
-  const host = (raw.endsWith(".") ? raw.slice(0, -1) : raw).toLowerCase();
+  const host = asciiLower(raw.endsWith(".") ? raw.slice(0, -1) : raw);
   const letters = glob ? /^[a-z0-9_*-]+$/ : /^[a-z0-9_-]+$/;
   const labelOk = (l: string) => l.length > 0 && l.length <= MAX_LABEL_LEN && !l.startsWith("-") && !l.endsWith("-") && letters.test(l);
   return host !== "" && host.length <= MAX_HOST_LEN && host.split(".").every(labelOk) ? host : null;
@@ -85,7 +92,7 @@ export function parseExclusionLine(raw: string): ParsedLine | { refused: LineRef
     if (!modifier.startsWith(APP_MODIFIER)) return { refused: "UnknownModifier" };
     const list = modifier.slice(APP_MODIFIER.length);
     if (list.trim() === "") return { refused: "EmptyAppList" };
-    apps = list.split("|").map((a) => a.trim().toLowerCase());
+    apps = list.split("|").map((a) => asciiLower(a.trim()));
     if (apps.some((a) => a === "" || /[\\/ *$"]/.test(a))) return { refused: "BadAppName" };
   }
   if (body.startsWith('"')) {
@@ -269,7 +276,7 @@ export const rejectedFiles = (rows: readonly ExclusionView[], files: readonly st
 // ---- Names.
 
 /** An exe path as a line names it: the file name, lower case. */
-export const exeFileName = (exe: string) => (exe.split(/[\\/]/).pop() ?? "").toLowerCase();
+export const exeFileName = (exe: string) => asciiLower(exe.split(/[\\/]/).pop() ?? "");
 
 /** A running app that has this exe file, for its name and icon. */
 export function runningApp(snapshot: Snapshot | null | undefined, exe: string): { key: string; name: string; exe: string } | null {
@@ -300,7 +307,7 @@ export function exclusionsLink(search: string): { apps: string[]; group: ReasonG
   const q = new URLSearchParams(search);
   const reason = q.get(REASON_PARAM);
   return {
-    apps: [...new Set(q.getAll(APP_PARAM).map((a) => a.toLowerCase()))].filter(Boolean),
+    apps: [...new Set(q.getAll(APP_PARAM).map(asciiLower))].filter(Boolean),
     group: (REASON_GROUPS as readonly string[]).includes(reason ?? "") ? (reason as ReasonGroup) : "all",
   };
 }
@@ -321,7 +328,7 @@ export type AppDecryption = { line: null } | { line: string; count: number; apps
 export function appDecryption(e: EngineSlice, app: { on: boolean; exes: readonly string[] }, rows: readonly Pick<ExclusionView, "apps" | "refused">[]): AppDecryption {
   const facts = e.exclusions;
   if (!app.on || !httpsInForce(e) || !facts) return { line: null };
-  const inScope = facts.scope === "all" || app.exes.some((x) => facts.browsers.includes(x.toLowerCase()));
+  const inScope = facts.scope === "all" || app.exes.some((x) => facts.browsers.includes(asciiLower(x)));
   if (!inScope) return { line: DOES_NOT_DECRYPT_TEXT, count: 0, apps: [] };
   const files = [...new Set(app.exes.map(exeFileName))];
   const count = rows.filter((r) => appliesTo(r, ...files)).length;

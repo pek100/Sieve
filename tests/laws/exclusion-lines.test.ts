@@ -4,7 +4,7 @@
  * too), and every reason the engine can give has words here.
  */
 import { describe, expect, it } from "vitest";
-import { FLOOR_WORDS, exclusionReasonWords, parseExclusionLine } from "@/core/exclusions";
+import { APP_PARAM, FLOOR_WORDS, exclusionReasonWords, exclusionsLink, exeFileName, parseExclusionLine } from "@/core/exclusions";
 import table from "@/data/fixtures/exclusion-lines.json";
 import { read, walk } from "./files";
 
@@ -26,6 +26,15 @@ describe("exclusion line law", () => {
 
   it("the Rust test reads the same table", () => {
     expect(read("engine/crates/sieve-filter/tests/exclusion_lines.rs")).toContain("exclusion-lines.json");
+    expect(read("engine/crates/sieve-engine/src/exclusions/browsers.rs")).toContain("exclusion-lines.json");
+  });
+
+  it("an exe folds as the engine folds it: ASCII only, so a non-ASCII capital stays", () => {
+    expect(table.exes.some((c) => /[^\x00-\x7f]/.test(c.exe))).toBe(true);
+    for (const c of table.exes) {
+      expect(exeFileName(c.exe), c.exe).toBe(c.file);
+      expect(exclusionsLink(`?${APP_PARAM}=${encodeURIComponent(c.exe)}`).apps, c.exe).toEqual([c.folded]);
+    }
   });
 
   it("every floor fact the crate declares has words, and no words are left over", () => {

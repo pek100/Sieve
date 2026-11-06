@@ -3,6 +3,7 @@ import type { EngineSlice } from "@/core/engine";
 import { EMPTY_ENGINE } from "@/core/engine";
 import { reasonWords } from "@/core/log";
 import ipc from "@/data/fixtures/engine-ipc-v3.json";
+import lines from "@/data/fixtures/exclusion-lines.json";
 import probe from "@/data/fixtures/engine-probe-v3.json";
 import { parseEngineProbe, parseExclusionsPage, parseHealNotices, type EngineProbe, type ExclusionRow } from "@/data/protocol";
 import {
@@ -42,6 +43,12 @@ const slice = (https: boolean, scope: "browsers" | "all" = "browsers", browsers 
   ...EMPTY_ENGINE,
   probe: welcome(https),
   exclusions: { revision: 1, rows: [], scope, browsers, skipped: 0 },
+});
+
+describe("a browser path as the engine folds it", () => {
+  it.each(lines.exes)("$exe reads as in scope", ({ exe, folded }) => {
+    expect(appDecryption(slice(true, "browsers", [folded]), { on: true, exes: [exe] }, []).line).toBe(DECRYPTS_TEXT);
+  });
 });
 
 describe("reason words", () => {

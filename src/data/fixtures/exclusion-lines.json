@@ -13,6 +13,8 @@
     { "line": "1:2:3:4:5:6:7:8", "kind": "ip", "value": "1:2:3:4:5:6:7:8", "apps": [] },
     { "line": "updates.example$app=updater.exe|Helper.EXE", "kind": "subdomains", "value": "updates.example", "apps": ["updater.exe", "helper.exe"] },
     { "line": "\"pinned.example\"$app=client.exe", "kind": "exact", "value": "pinned.example", "apps": ["client.exe"] },
+    { "line": "accent.example$app=ÉDITEUR.EXE", "kind": "subdomains", "value": "accent.example", "apps": ["Éditeur.exe"] },
+    { "line": "K.example", "refused": "BadHost" },
     { "line": "bad host.example", "refused": "BadHost" },
     { "line": "-dash.example", "refused": "BadHost" },
     { "line": "dash-.example", "refused": "BadHost" },
@@ -27,5 +29,10 @@
     { "line": "empty.example$app=", "refused": "EmptyAppList" },
     { "line": "path.example$app=C:\\x\\y.exe", "refused": "BadAppName" },
     { "line": "space.example$app=a b.exe", "refused": "BadAppName" }
+  ],
+  "exes": [
+    { "exe": "C:\\Program Files\\Google\\Chrome\\Application\\CHROME.EXE", "folded": "c:\\program files\\google\\chrome\\application\\chrome.exe", "file": "chrome.exe" },
+    { "exe": "C:\\Users\\Émilie\\AppData\\Local\\Chromium\\Chrome.exe", "folded": "c:\\users\\Émilie\\appdata\\local\\chromium\\chrome.exe", "file": "chrome.exe" },
+    { "exe": "C:\\Apps\\ÉDITEUR.EXE", "folded": "c:\\apps\\Éditeur.exe", "file": "Éditeur.exe" }
   ]
 }

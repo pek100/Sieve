@@ -137,6 +137,14 @@ mod tests {
         }
     }
 
+    struct Registered(String);
+
+    impl BrowserRegistry for Registered {
+        fn commands(&self) -> Vec<String> {
+            vec![self.0.clone()]
+        }
+    }
+
     const CHROME: &str = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
 
     #[test]
@@ -152,6 +160,20 @@ mod tests {
         assert!(set.contains(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"));
         assert!(set.contains(r"c:\program files\mozilla firefox\FIREFOX.EXE"), "case folded");
         assert_eq!(set.0.len(), 3);
+    }
+
+    /// One table with the app's reader (`tests/laws/exclusion-lines.test.ts`): what
+    /// `paths` sends is what the app folds an exe to, or it says "does not decrypt".
+    #[test]
+    fn the_paths_sent_to_the_app_fold_as_the_shared_table_says() {
+        const TABLE: &str = include_str!("../../../../../src/data/fixtures/exclusion-lines.json");
+        let table: serde_json::Value = serde_json::from_str(TABLE).unwrap();
+        for case in table["exes"].as_array().unwrap() {
+            let exe = case["exe"].as_str().unwrap().to_string();
+            let set = BrowserSet::read(&Registered(format!("\"{exe}\"")));
+            assert_eq!(set.paths(), [case["folded"].as_str().unwrap()], "{exe}");
+            assert!(set.contains(&exe), "{exe}");
+        }
     }
 
     #[test]
