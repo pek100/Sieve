@@ -1,11 +1,14 @@
 //! One client connection and its one upstream connection (plan 2.8, task D15):
 //! the same protocol on each side, since the ALPN came from the server. There is
 //! no pool to fall back on, so either side ending ends the other, by GOAWAY or
-//! a close. Connection settings and errors stay one-to-one.
+//! a close; an end of the upstream's lets the streams it accepted finish first.
+//! Connection settings and errors stay one-to-one.
 
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use ::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, HeaderValue, LOCATION};
@@ -14,11 +17,12 @@ use ::http::{Request, Response, StatusCode};
 use bytes::Bytes;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use sieve_ipc::LogOutcome;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::watch;
 
 use super::facts;
 use super::hook::{self, ResponseHook};
@@ -36,7 +40,9 @@ pub type ResponseBody = UnsyncBoxBody<Bytes, BodyError>;
 /// (`docs/live/engine-slice-6.md`, U10).
 pub const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 pub const H2_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
-/// How long requests in flight get after the upstream's end.
+/// After the upstream's end and its last stream, how long the client gets to
+/// finish the close (an h2 GOAWAY needs its PING answered). Streams in flight do
+/// not count against it: they run until the upstream ends them.
 pub const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// The CORS and cross-origin headers a served resource carries.
 const CROSS_ORIGIN_RESOURCE_POLICY: &str = "cross-origin-resource-policy";
@@ -65,16 +71,28 @@ pub struct Serve {
     clock: fn() -> u64,
     seen: AtomicBool,
     splice: Mutex<Option<AbortOnDrop<()>>>,
+    in_flight: Arc<watch::Sender<usize>>,
 }
 
 impl Serve {
     #[allow(clippy::too_many_arguments)]
     pub fn new(filter: Arc<FilterSlot>, book: Arc<Mutex<FlowBook>>, hook: Arc<dyn ResponseHook>, watch: Arc<dyn ClientWatch>, flow_id: u64, pair: Pair, sni: String, port: u16, clock: fn() -> u64) -> Self {
-        Self { filter, book, hook, watch, flow_id, pair, sni, port, clock, seen: AtomicBool::new(false), splice: Mutex::new(None) }
+        Self { filter, book, hook, watch, flow_id, pair, sni, port, clock, seen: AtomicBool::new(false), splice: Mutex::new(None), in_flight: Arc::new(watch::Sender::new(0)) }
     }
 
     pub fn request_was_seen(&self) -> bool {
         self.seen.load(Ordering::Relaxed)
+    }
+
+    fn stream_in_flight(&self) -> InFlight {
+        self.in_flight.send_modify(|n| *n += 1);
+        InFlight(self.in_flight.clone())
+    }
+
+    /// Resolves once no stream is in flight and the close has had its grace.
+    async fn settled(&self) {
+        let _ = self.in_flight.subscribe().wait_for(|n| *n == 0).await;
+        tokio::time::sleep(CLOSE_GRACE).await;
     }
 
     fn log(&self, facts: &facts::OwnedFacts, outcome: LogOutcome, rule: Option<&str>, list: Option<&str>) {
@@ -88,6 +106,52 @@ pub struct Ended {
     /// What ended the upstream, when something did. `tls::intercept` looks in
     /// it for a post-handshake certificate request.
     pub upstream_error: Option<hyper::Error>,
+    /// The client's side ended first, and not by the engine's timeout. What
+    /// `ClientWatch` may read as evidence about the client.
+    pub client_ended: bool,
+}
+
+impl Ended {
+    pub fn without_error(client_ended: bool) -> Self {
+        Self { upstream_error: None, client_ended }
+    }
+}
+
+/// One stream open toward the upstream. Gone when that stream ends.
+struct InFlight(Arc<watch::Sender<usize>>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
+}
+
+/// A response body that holds its stream in flight until the body ends. Hints
+/// pass through: hyper reads `Content-Length` and END_STREAM from them.
+struct Counted {
+    body: ResponseBody,
+    stream: Option<InFlight>,
+}
+
+impl Body for Counted {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        let frame = ready!(Pin::new(&mut self.body).poll_frame(cx));
+        if matches!(frame, None | Some(Err(_))) {
+            self.stream = None;
+        }
+        Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
 }
 
 enum Upstream {
@@ -109,6 +173,20 @@ impl Upstream {
                 sender.send_request(req).await
             }
         }
+    }
+
+    /// On h2, a failure that proves the origin did not process the request
+    /// (RFC 9113 8.7), so the client may send it again: the connection was gone
+    /// before it went out, the stream is above the origin's GOAWAY, or the
+    /// origin refused it. hyper hides an origin's graceful GOAWAY until a request
+    /// wakes its task, so this is how such a request first learns of it. A
+    /// stream at or below the GOAWAY is not in this set: it keeps running.
+    fn refused(&self, error: &hyper::Error) -> bool {
+        if matches!(self, Self::H1(_)) {
+            return false;
+        }
+        let stream = std::error::Error::source(error).and_then(|e| e.downcast_ref::<h2::Error>());
+        error.is_closed() || error.is_canceled() || stream.is_some_and(|e| (e.is_go_away() && e.is_remote()) || e.reason() == Some(h2::Reason::REFUSED_STREAM))
     }
 }
 
@@ -180,8 +258,10 @@ fn with_path_of(uri: &Uri, url: &str) -> Option<Uri> {
     Uri::from_parts(parts).ok()
 }
 
-/// The per-request path. It never fails: what cannot be answered is a 502.
-async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incoming>) -> Result<Response<ResponseBody>, Infallible> {
+/// The per-request path. What the origin did not process is refused as a stream,
+/// which a client retries by itself (hyper resets with the reason in the error);
+/// anything else that cannot be answered is a 502.
+async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incoming>) -> Result<Response<ResponseBody>, BodyError> {
     ctx.seen.store(true, Ordering::Relaxed);
     ctx.watch.request_seen(&ctx.pair);
     let authority = facts::authority_of(&req);
@@ -210,8 +290,10 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
     let on_client_upgrade = upgrading.then(|| hyper::upgrade::on(&mut req));
     strip_hop_by_hop(req.headers_mut(), upgrading);
     let req = req.map(hook::boxed);
+    let stream = ctx.stream_in_flight();
     let mut response = match upstream.send(req).await {
         Ok(response) => response,
+        Err(e) if upstream.refused(&e) => return Err(Box::new(h2::Error::from(h2::Reason::REFUSED_STREAM))),
         Err(_) => return Ok(answer(StatusCode::BAD_GATEWAY)),
     };
     if let (StatusCode::SWITCHING_PROTOCOLS, Some(client)) = (response.status(), on_client_upgrade) {
@@ -222,7 +304,7 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
     strip_hop_by_hop(response.headers_mut(), false);
     let (mut parts, body) = response.into_parts();
     let body = hook::apply(ctx.hook.as_ref(), &f.borrowed(), parts.status, &mut parts.headers, body).await;
-    Ok(Response::from_parts(parts, body))
+    Ok(Response::from_parts(parts, UnsyncBoxBody::new(Counted { body, stream: Some(stream) })))
 }
 
 /// Takes the pair to its end, however it ends.
@@ -242,26 +324,32 @@ where
             let mut connection = AbortOnDrop(tokio::spawn($connection));
             let server = $server(service);
             tokio::pin!(server);
-            let upstream_error = tokio::select! {
-                _ = &mut server => None,
+            let ended = tokio::select! {
+                // hyper's own header timeout ends the server too; the client is still there.
+                served = &mut server => Ended::without_error(!served.is_err_and(|e: hyper::Error| e.is_timeout())),
                 result = &mut connection.0 => {
-                    let error = result.ok().and_then(Result::err);
+                    let upstream_error = result.ok().and_then(Result::err);
+                    // The client hears it, and what the origin accepted runs on:
+                    // hyper drives those streams apart from this future.
                     server.as_mut().graceful_shutdown();
-                    let _ = tokio::time::timeout(CLOSE_GRACE, &mut server).await;
-                    error
+                    tokio::select! {
+                        _ = &mut server => {}
+                        () = ctx.settled() => {}
+                    }
+                    Ended { upstream_error, client_ended: false }
                 }
             };
             let upgraded = ctx.splice.lock().unwrap_or_else(|p| p.into_inner()).take();
             if let Some(mut task) = upgraded {
                 let _ = (&mut task.0).await;
             }
-            Ended { upstream_error }
+            ended
         }};
     }
     match proto {
         Proto::H1 => {
             let Ok((sender, connection)) = hyper::client::conn::http1::Builder::new().preserve_header_case(true).handshake(upstream).await else {
-                return Ended { upstream_error: None };
+                return Ended::without_error(false);
             };
             let builder = {
                 let mut b = hyper::server::conn::http1::Builder::new();
@@ -277,7 +365,7 @@ where
                 .handshake(upstream)
                 .await
             else {
-                return Ended { upstream_error: None };
+                return Ended::without_error(false);
             };
             let builder = {
                 let mut b = hyper::server::conn::http2::Builder::new(TokioExecutor::new());

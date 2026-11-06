@@ -4,6 +4,7 @@
 //! CA runs on fakes; the trust verifier is a fake (task D3): a real
 //! `rustls-platform-verifier` call could ask Windows Update for roots.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -321,11 +322,17 @@ pub(crate) struct FakeTrust {
     pub(crate) answer: Mutex<TrustAnswer>,
     pub(crate) calls: AtomicUsize,
     pub(crate) blocks: Duration,
+    /// Calls that wait for a release and then give their own answer, in order.
+    pub(crate) held: Mutex<VecDeque<(std::sync::mpsc::Receiver<()>, TrustAnswer)>>,
 }
 
 impl FakeTrust {
     pub(crate) fn says(answer: TrustAnswer) -> Arc<Self> {
-        Arc::new(Self { answer: Mutex::new(answer), calls: AtomicUsize::new(0), blocks: Duration::ZERO })
+        Self::blocking(answer, Duration::ZERO)
+    }
+
+    pub(crate) fn blocking(answer: TrustAnswer, blocks: Duration) -> Arc<Self> {
+        Arc::new(Self { answer: Mutex::new(answer), calls: AtomicUsize::new(0), blocks, held: Mutex::default() })
     }
 
     fn calls(&self) -> usize {
@@ -337,6 +344,11 @@ impl TrustVerifier for FakeTrust {
     fn verify(&self, _chain: &Chain, _host: &ServerName<'static>) -> TrustAnswer {
         self.calls.fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(self.blocks);
+        let held = self.held.lock().unwrap().pop_front();
+        if let Some((release, answer)) = held {
+            let _ = release.recv_timeout(LIMIT);
+            return answer;
+        }
         *self.answer.lock().unwrap()
     }
 }
@@ -677,7 +689,7 @@ arms!(revoked_passes_through_and_closes_open_flows_to_that_host, |arm| async mov
 
 arms!(trust_timeout_passes_through_and_is_not_cached, |arm| async move {
     let pki = Pki::new("Test Public Root");
-    let trust = Arc::new(FakeTrust { answer: Mutex::new(TrustAnswer::Trusted), calls: AtomicUsize::new(0), blocks: Duration::from_millis(400) });
+    let trust = FakeTrust::blocking(TrustAnswer::Trusted, Duration::from_millis(400));
     let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
     let rig = Rig::new(dial, RigOpts { trust, trust_timeout: SHORT, ..RigOpts::new(pki.roots()) });
     let (app, task) = rig.flow(flow_opts()).await;
@@ -695,7 +707,7 @@ arms!(trust_timeout_passes_through_and_is_not_cached, |arm| async move {
 async fn the_trust_call_does_not_block_the_runtime() {
     // One worker: if the call ran on it, nothing else could.
     let pki = Pki::new("Test Public Root");
-    let trust = Arc::new(FakeTrust { answer: Mutex::new(TrustAnswer::Trusted), calls: AtomicUsize::new(0), blocks: Duration::from_millis(300) });
+    let trust = FakeTrust::blocking(TrustAnswer::Trusted, Duration::from_millis(300));
     let verifier = Verifier::new(pki.roots(), trust, Duration::from_secs(10)).unwrap();
     let (chain, _) = pki.leaf(HOST, GOOD);
     let chain = Chain { end_entity: chain[0].clone(), intermediates: Vec::new(), ocsp: Vec::new() };
@@ -716,7 +728,7 @@ async fn the_trust_call_does_not_block_the_runtime() {
 
 arms!(no_client_byte_reaches_upstream_before_the_verdict, |arm| async move {
     let pki = Pki::new("Test Public Root");
-    let trust = Arc::new(FakeTrust { answer: Mutex::new(TrustAnswer::Trusted), calls: AtomicUsize::new(0), blocks: Duration::from_millis(300) });
+    let trust = FakeTrust::blocking(TrustAnswer::Trusted, Duration::from_millis(300));
     let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
     let rig = Rig::new(dial, RigOpts { trust: trust.clone(), ..RigOpts::new(pki.roots()) });
     let (app, task) = rig.flow(flow_opts()).await;
@@ -898,7 +910,7 @@ arms!(a_cached_trust_ends_at_24h_however_often_the_host_is_visited, |arm| async 
 /// A flow held inside its trust call; `during` runs while it is there.
 async fn close_during_the_trust_call(arm: Arm, during: impl FnOnce(&Rig), reason: &str) {
     let pki = Pki::new("Test Public Root");
-    let trust = Arc::new(FakeTrust { answer: Mutex::new(TrustAnswer::Trusted), calls: AtomicUsize::new(0), blocks: Duration::from_millis(300) });
+    let trust = FakeTrust::blocking(TrustAnswer::Trusted, Duration::from_millis(300));
     let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
     let rig = Rig::new(dial, RigOpts { trust: trust.clone(), ..RigOpts::new(pki.roots()) });
     let (app, task) = rig.flow(flow_opts()).await;
@@ -933,6 +945,49 @@ arms!(off_during_the_trust_call_never_decrypts, |arm| async move {
 
 arms!(a_revocation_found_during_the_trust_call_reaches_the_flow, |arm| async move {
     close_during_the_trust_call(arm, |rig| rig.deps.active.close_host(HOST), "floor:upstream-revoked").await;
+});
+
+arms!(a_late_trusted_answer_does_not_replace_a_revoked_verdict, |arm| async move {
+    let pki = Pki::new("Test Public Root");
+    let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let trust = FakeTrust::says(TrustAnswer::Revoked);
+    let (release, held) = std::sync::mpsc::channel();
+    trust.held.lock().unwrap().push_back((held, TrustAnswer::Trusted));
+    let rig = Rig::new(dial, RigOpts { trust: trust.clone(), trust_timeout: LIMIT, ..RigOpts::new(pki.roots()) });
+    // The late flow asks first, and its answer waits (no staple, a soft fail).
+    let (app, late_task) = rig.flow(flow_opts()).await;
+    let (client, late_shown) = client_tls(&[], None);
+    let late = tokio::spawn(connect(app, client, HOST));
+    while trust.calls() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Meanwhile another flow to the host finds it revoked.
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    expect_real(&shown, &rig);
+    round_trip(&mut tls).await;
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(rig.deps.verdicts.get(HOST, 443, wall_ms()).unwrap().verdict, UpstreamVerdict::Revoked);
+    release.send(()).unwrap();
+    let mut tls = late.await.unwrap().unwrap_or_else(|(e, _)| panic!("{e}"));
+    expect_real(&late_shown, &rig);
+    round_trip(&mut tls).await;
+    drop(tls);
+    late_task.await.unwrap();
+    assert_eq!(rig.deps.verdicts.get(HOST, 443, wall_ms()).unwrap().verdict, UpstreamVerdict::Revoked, "the late answer stored nothing");
+    // A flow after both reads the revocation: no trust call, no decryption.
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    expect_real(&shown, &rig);
+    round_trip(&mut tls).await;
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(trust.calls(), 2);
+    assert_eq!(rig.deps.meters.https.intercepted.load(Ordering::Relaxed), 0);
+    assert_eq!(rig.reasons(), ["floor:upstream-revoked"; 3]);
 });
 
 arms!(off_during_the_client_handshake_closes_it_without_blaming_the_client, |arm| async move {
@@ -1366,6 +1421,72 @@ arms!(client_watch_hears_a_refusal_and_a_silent_close, |arm| async move {
     task.await.unwrap();
     assert_eq!(watched.silent.load(Ordering::Relaxed), 1);
     assert_eq!(watched.requests.load(Ordering::Relaxed), 0);
+});
+
+/// An upstream on a negotiated protocol: holds its session, or ends it at once.
+fn watched_rig(arm: Arm, alpn: &str, holds: bool, watched: Arc<Watched>) -> Rig {
+    let pki = Pki::new("Test Public Root");
+    let handler = tls_server(vec![server_tls(pki.leaf(HOST, GOOD), &[alpn], None)], Arc::default(), move |_, mut tls| async move {
+        if holds {
+            let _ = tls.read_to_end(&mut Vec::new()).await;
+        }
+    });
+    Rig::new(TestDial::new(arm, handler), RigOpts { watch: watched, ..RigOpts::new(pki.roots()) })
+}
+
+/// A flow past the local handshake, its client still open.
+async fn intercepted(rig: &Rig, alpn: &str) -> (ClientTls, JoinHandle<Outcome>) {
+    let before = rig.deps.meters.https.intercepted.load(Ordering::Relaxed);
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[alpn], None);
+    let tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert!(shown_is_sieves(&shown, rig));
+    while rig.deps.meters.https.intercepted.load(Ordering::Relaxed) == before {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    (tls, task)
+}
+
+arms!(only_a_close_by_the_client_counts_as_a_silent_client, |arm| async move {
+    for alpn in ["h2", "http/1.1"] {
+        // The engine ends it: a revocation, or the switch.
+        let watched = Arc::new(Watched::default());
+        let rig = watched_rig(arm, alpn, true, watched.clone());
+        let (tls, task) = intercepted(&rig, alpn).await;
+        rig.deps.active.close_host(HOST);
+        task.await.unwrap();
+        assert_eq!(watched.silent.load(Ordering::Relaxed), 0, "{alpn}: closed by the engine");
+        drop(tls);
+        // The upstream ends it: an origin closing an idle preconnect.
+        let watched = Arc::new(Watched::default());
+        let rig = watched_rig(arm, alpn, false, watched.clone());
+        let (tls, task) = intercepted(&rig, alpn).await;
+        task.await.unwrap();
+        assert_eq!(watched.silent.load(Ordering::Relaxed), 0, "{alpn}: closed by the upstream");
+        drop(tls);
+        // The control: the client ends it.
+        let watched = Arc::new(Watched::default());
+        let rig = watched_rig(arm, alpn, true, watched.clone());
+        let (tls, task) = intercepted(&rig, alpn).await;
+        drop(tls);
+        task.await.unwrap();
+        assert_eq!(watched.silent.load(Ordering::Relaxed), 1, "{alpn}: closed by the client");
+    }
+});
+
+arms!(a_client_that_spoke_on_a_plain_copy_is_not_silent, |arm| async move {
+    let pki = Pki::new("Test Public Root");
+    let watched = Arc::new(Watched::default());
+    let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let rig = Rig::new(dial, RigOpts { watch: watched.clone(), ..RigOpts::new(pki.roots()) });
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert!(shown_is_sieves(&shown, &rig));
+    round_trip(&mut tls).await;
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(watched.silent.load(Ordering::Relaxed), 0);
 });
 
 // ---- Key exchange.

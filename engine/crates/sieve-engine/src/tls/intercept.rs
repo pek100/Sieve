@@ -43,7 +43,7 @@ use crate::flow::classify::{Decoded, Kind};
 use crate::flow::flows::Action;
 use crate::flow::relay::relay_tcp;
 use crate::http::hook::ResponseHook;
-use crate::http::serve::{Proto, Serve, serve};
+use crate::http::serve::{Ended, Proto, Serve, serve};
 use crate::stack::Meters;
 use crate::stack::book::FlowBook;
 
@@ -317,15 +317,19 @@ where
             let leaf = facts_of_leaf.map(|l| l.hash);
             let known = cached.is_some_and(|c| c.verdict == UpstreamVerdict::Eligible && c.leaf.is_some() && c.leaf == leaf);
             let verdict = deps.verifier.verify(&shaken.chain, host, known).await;
-            // A known leaf keeps its expiry: the 24 h run from the trust call
-            // that was really made, or a visited host would never reach it again.
-            if !(known && verdict == UpstreamVerdict::Eligible) {
+            // Whoever closed this flow knows better than its `Eligible`, which
+            // is then not a fact to keep. A known leaf keeps its expiry: the 24 h
+            // run from the trust call that was really made, or a visited host
+            // would never reach it again.
+            let closed = registered.is_closed();
+            if !(verdict == UpstreamVerdict::Eligible && (known || closed)) {
                 deps.verdicts.put(host, flow.remote.port(), verdict, leaf, facts_of_leaf.map(|l| l.not_after_ms), (deps.clock)());
             }
             if verdict == UpstreamVerdict::Revoked {
                 deps.active.close_host(host);
             }
             if verdict == UpstreamVerdict::Eligible
+                && !closed
                 && let Some(l) = facts_of_leaf.filter(|l| l.ev)
             {
                 deps.exclude(host, AutoReason::Ev, Some(l.not_after_ms));
@@ -427,11 +431,12 @@ where
     let ctx = Arc::new(Serve::new(deps.filter.clone(), deps.book.clone(), deps.hook.clone(), deps.watch.clone(), flow.id, pair.clone(), host.to_string(), flow.remote.port(), deps.clock));
     let ended = tokio::select! {
         biased;
-        () = registered.closed() => None,
+        () = registered.closed() => Ended::without_error(false),
         ended = run_protocol(ctx.clone(), client, shaken.tls, shaken.alpn.as_deref()) => ended,
     };
-    deps.after_serve(host, ended.as_ref());
-    if !ctx.request_was_seen() {
+    deps.after_serve(host, ended.upstream_error.as_ref());
+    // Evidence about the client only if the client did it (task D17, plan 4.3).
+    if ended.client_ended && !ctx.request_was_seen() {
         deps.watch.closed_without_request(&pair, started.elapsed());
     }
     FlowAction::Relayed
@@ -439,28 +444,29 @@ where
 
 /// Which protocol the pair of sessions speaks: what the server chose. With no
 /// ALPN at all, HTTP/1.1 only if the first decrypted bytes parse as HTTP; else
-/// the two sessions are copied as plain bytes (plan 2.8).
-async fn run_protocol<C, U>(ctx: Arc<Serve>, mut client: C, mut upstream: U, alpn: Option<&[u8]>) -> Option<hyper::Error>
+/// the two sessions are copied as plain bytes (plan 2.8), and a copy cannot say
+/// which side ended it, so it is no evidence about the client.
+async fn run_protocol<C, U>(ctx: Arc<Serve>, mut client: C, mut upstream: U, alpn: Option<&[u8]>) -> Ended
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match alpn {
-        Some(H2) => serve(ctx, client, upstream, Proto::H2).await.upstream_error,
-        Some(HTTP1) => serve(ctx, client, upstream, Proto::H1).await.upstream_error,
-        Some(_) => None,
+        Some(H2) => serve(ctx, client, upstream, Proto::H2).await,
+        Some(HTTP1) => serve(ctx, client, upstream, Proto::H1).await,
+        Some(_) => Ended::without_error(false),
         None => match read_first(&mut client, &mut upstream, FIRST_BYTES_WAIT).await {
-            First::ClientGone => None,
-            First::Decoded { decoded, held } if decoded.kind == Some(Kind::Http) && decoded.domain.is_some() => serve(ctx, Prefixed::new(held, client), upstream, Proto::H1).await.upstream_error,
+            First::ClientGone => Ended::without_error(true),
+            First::Decoded { decoded, held } if decoded.kind == Some(Kind::Http) && decoded.domain.is_some() => serve(ctx, Prefixed::new(held, client), upstream, Proto::H1).await,
             First::Decoded { held, .. } => {
                 let _ = splice(&mut client, upstream, &held).await;
-                None
+                Ended::without_error(false)
             }
             First::ServerSpoke { server, held } => {
                 if client.write_all(&server).await.is_ok() {
                     let _ = splice(&mut client, upstream, &held).await;
                 }
-                None
+                Ended::without_error(false)
             }
         },
     }

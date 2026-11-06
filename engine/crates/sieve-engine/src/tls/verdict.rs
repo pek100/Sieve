@@ -2,8 +2,9 @@
 //! nothing (plan 2.6, task D5). A rejection skips the upstream handshake. An
 //! `Eligible` with the same leaf skips only the trust call: the handshake and
 //! eligibility always run, since each client connection has its own upstream.
-//! `Unavailable` is never cached. EV and client-certificate facts live in the
-//! exclusion store (one owner per fact, S29), not here.
+//! `Unavailable` is never cached, and a late `Eligible` never replaces a
+//! revocation in date. EV and client-certificate facts live in the exclusion
+//! store (one owner per fact, S29), not here.
 
 use std::sync::Mutex;
 
@@ -50,14 +51,23 @@ impl VerdictCache {
         hit
     }
 
-    /// Holds a verdict until the earlier of the certificate's end and 24 h.
+    /// Holds a verdict until the earlier of the certificate's end and 24 h. An
+    /// `Eligible` never replaces a revocation still in date, for any leaf: it
+    /// can only come from a flow that was asking when the revocation landed, and
+    /// its trust call may simply have soft-failed. Checked here, under the lock,
+    /// because a flow's own closed signal can still be unset at this instant.
     pub fn put(&self, host: &str, port: u16, verdict: UpstreamVerdict, leaf: Option<LeafHash>, not_after_ms: Option<u64>, now_ms: u64) {
         if verdict == UpstreamVerdict::Unavailable {
             return;
         }
         let cap = now_ms.saturating_add(MAX_AGE_MS);
         let expires_ms = not_after_ms.map_or(cap, |end| end.min(cap));
-        self.lock().insert((host.to_string(), port), Cached { verdict, leaf, expires_ms });
+        let key = (host.to_string(), port);
+        let mut cache = self.lock();
+        if verdict == UpstreamVerdict::Eligible && cache.get(&key, |c| c.verdict == UpstreamVerdict::Revoked && now_ms < c.expires_ms).is_some() {
+            return;
+        }
+        cache.insert(key, Cached { verdict, leaf, expires_ms });
     }
 }
 
@@ -79,6 +89,24 @@ mod tests {
         assert!(cache.get(HOST, 443, NOW + MAX_AGE_MS).is_none(), "24 h");
         cache.put(HOST, 443, UpstreamVerdict::Protocol, None, None, NOW);
         assert_eq!(cache.get(HOST, 443, NOW + 1).unwrap().expires_ms, NOW + MAX_AGE_MS, "no certificate at all");
+    }
+
+    #[test]
+    fn an_in_date_revocation_is_not_replaced_by_eligible() {
+        const LEAF: Option<LeafHash> = Some([7; 32]);
+        const OTHER_LEAF: Option<LeafHash> = Some([8; 32]);
+        let cache = VerdictCache::default();
+        cache.put(HOST, 443, UpstreamVerdict::Revoked, LEAF, None, NOW);
+        for leaf in [LEAF, OTHER_LEAF] {
+            cache.put(HOST, 443, UpstreamVerdict::Eligible, leaf, None, NOW + 1);
+            assert_eq!(cache.get(HOST, 443, NOW + 1).unwrap(), Cached { verdict: UpstreamVerdict::Revoked, leaf: LEAF, expires_ms: NOW + MAX_AGE_MS });
+        }
+        cache.put(HOST, 443, UpstreamVerdict::Invalid, LEAF, None, NOW + 1);
+        assert_eq!(cache.get(HOST, 443, NOW + 1).unwrap().verdict, UpstreamVerdict::Invalid, "a rejection may replace it");
+        // Out of date, the OS may be asked again and may answer otherwise.
+        cache.put(HOST, 443, UpstreamVerdict::Revoked, LEAF, None, NOW);
+        cache.put(HOST, 443, UpstreamVerdict::Eligible, LEAF, None, NOW + MAX_AGE_MS);
+        assert_eq!(cache.get(HOST, 443, NOW + MAX_AGE_MS).unwrap().verdict, UpstreamVerdict::Eligible);
     }
 
     #[test]

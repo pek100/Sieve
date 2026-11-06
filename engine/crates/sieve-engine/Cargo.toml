@@ -77,6 +77,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# hyper's own h2, named only for the reason a stream is refused with (`http::serve`).
+h2 = "0.4"
 webpki-roots = "1"
 # Slice 6: the trust half of upstream validation (plan 2.6), Windows' chain
 # engine, called off the runtime (task D2). Offline tests never call it (D3).

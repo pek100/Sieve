@@ -121,5 +121,7 @@ pub fn authority_of<B>(req: &Request<B>) -> Option<String> {
 pub fn of<B>(req: &Request<B>, authority: &str) -> OwnedFacts {
     let path = req.uri().path_and_query().map_or("/", ::http::uri::PathAndQuery::as_str);
     let request_type = request_type(req.headers(), path);
-    OwnedFacts { url: format!("https://{authority}{path}"), method: req.method().as_str().to_string(), request_type, initiator: initiator(req.headers(), request_type) }
+    // What the page asked for, which rules anchor on: a socket's scheme is `wss`.
+    let scheme = if request_type == WEBSOCKET { "wss" } else { "https" };
+    OwnedFacts { url: format!("{scheme}://{authority}{path}"), method: req.method().as_str().to_string(), request_type, initiator: initiator(req.headers(), request_type) }
 }

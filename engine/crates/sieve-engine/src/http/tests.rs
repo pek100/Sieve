@@ -23,8 +23,10 @@ use tokio::task::JoinHandle;
 
 use super::facts::{self, RequestFacts};
 use super::hook::{BodyRewrite, HookError, NoRewrite, ResponseHook};
+use super::serve::{CLOSE_GRACE, Proto, Serve, serve};
 use super::upgrade::{is_upgrade, strip_hop_by_hop};
-use crate::tls::intercept::Outcome;
+use crate::policy::wall_ms;
+use crate::tls::intercept::{NoWatch, Outcome};
 use crate::tls::tests::{Arm, ClientTls, GOOD, HOST, Pki, Rig, RigOpts, TestDial, arms, client_tls, connect, flow_opts, list_rules, server_tls, shown_is_sieves, tls_server};
 
 type Body = UnsyncBoxBody<Bytes, Infallible>;
@@ -52,6 +54,8 @@ struct Origin {
     connections: Arc<AtomicUsize>,
     /// `/stream` holds its second chunk until the client saw the first.
     release: Arc<Notify>,
+    /// Starts a graceful GOAWAY on the h2 connection that is open.
+    goaway: Arc<Notify>,
 }
 
 impl Origin {
@@ -129,9 +133,18 @@ fn origin_dial(arm: Arm, pki: &Pki, alpn: &[&str], origin: Origin) -> TestDial {
             origin.connections.fetch_add(1, Ordering::Relaxed);
             let h2 = tls.get_ref().1.alpn_protocol() == Some(H2.as_bytes());
             let io = TokioIo::new(tls);
+            let goaway = origin.goaway.clone();
             let service = service_fn(move |req| origin_upgrade(origin.clone(), req));
             if h2 {
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(io, service).await;
+                let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(io, service);
+                tokio::pin!(connection);
+                tokio::select! {
+                    _ = &mut connection => {}
+                    () = goaway.notified() => {
+                        connection.as_mut().graceful_shutdown();
+                        let _ = connection.await;
+                    }
+                }
             } else {
                 let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).with_upgrades().await;
             }
@@ -319,6 +332,166 @@ arms!(upstream_end_ends_the_client_connection, |arm| async move {
     }
 });
 
+fn h2_reason(error: &hyper::Error) -> Option<h2::Reason> {
+    std::error::Error::source(error)?.downcast_ref::<h2::Error>()?.reason()
+}
+
+arms!(origin_goaway_refuses_the_next_request_and_keeps_the_stream_in_flight, |arm| async move {
+    let mut s = setup(arm, H2, "").await;
+    let mut in_flight = s.client.get(HOST, "/stream", &[]).await.into_body();
+    assert_eq!(&in_flight.frame().await.unwrap().unwrap().into_data().unwrap()[..], b"first");
+    s.origin.goaway.notify_one();
+    // Requests the origin took before its GOAWAY arrived are fine; none is a 502.
+    let (refused_path, refusal) = {
+        let mut n = 0;
+        loop {
+            n += 1;
+            let path = format!("/next{n}");
+            let req = s.client.request(Method::GET, HOST, &path).body(empty()).unwrap();
+            match s.client.send(req).await {
+                Ok(response) => {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => break (path, e),
+            }
+        }
+    };
+    assert_eq!(h2_reason(&refusal), Some(h2::Reason::REFUSED_STREAM), "{refusal}: a client retries this by itself");
+    assert!(!s.origin.paths().contains(&refused_path), "the refused request never went upstream");
+    // The retry, on a new connection, as a browser does it.
+    let (app, retry_task) = s.rig.flow(flow_opts()).await;
+    let (config, _) = client_tls(&[H2], None);
+    let tls = connect(app, config, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    let mut retry = Client::start(tls).await;
+    assert_eq!(body_of(retry.get(HOST, &refused_path, &[]).await).await, format!("origin:{refused_path}").into_bytes());
+    drop(retry);
+    retry_task.await.unwrap();
+    // The stream the origin accepted outlives any fixed grace.
+    tokio::time::sleep(CLOSE_GRACE + Duration::from_millis(500)).await;
+    s.origin.release.notify_one();
+    let mut data = Vec::new();
+    while let Some(frame) = in_flight.frame().await {
+        if let Ok(d) = frame.unwrap().into_data() {
+            data.extend_from_slice(&d);
+        }
+    }
+    assert_eq!(data, b"second");
+    // Nothing left in flight: the flow ends though the client has not left.
+    tokio::time::timeout(CLOSE_GRACE * 2, s.task).await.expect("the flow ended").unwrap();
+});
+
+#[tokio::test(start_paused = true)]
+async fn the_engine_timing_out_a_head_is_not_a_client_close() {
+    let pki = Pki::new("Test Public Root");
+    let rig = Rig::new(origin_dial(Arm::Duplex, &pki, &[H1], Origin::default()), RigOpts::new(pki.roots()));
+    let run = |client| {
+        let (far, upstream) = tokio::io::duplex(1024);
+        let pair = crate::tls::intercept::Pair { exe: None, host: HOST.to_string() };
+        let ctx = Arc::new(Serve::new(rig.deps.filter.clone(), rig.deps.book.clone(), Arc::new(NoRewrite), Arc::new(NoWatch), 0, pair, HOST.to_string(), 443, wall_ms));
+        async move {
+            let ended = serve(ctx, client, upstream, Proto::H1).await;
+            drop(far);
+            ended
+        }
+    };
+    let (mut open, near) = tokio::io::duplex(1024);
+    open.write_all(b"GET / HTTP/1.1\r\nHo").await.unwrap();
+    assert!(!run(near).await.client_ended, "hyper's header timeout, the client still open");
+    // The control: the same head, and the client leaves.
+    let (mut leaving, near) = tokio::io::duplex(1024);
+    leaving.write_all(b"GET / HTTP/1.1\r\nHo").await.unwrap();
+    drop(leaving);
+    assert!(run(near).await.client_ended);
+    drop(open);
+}
+
+/// An HTTP/2 origin by hand: `on_headers` gives the bytes to answer a stream's
+/// HEADERS with, so a test can name what hyper's server does not expose.
+fn raw_h2_dial(arm: Arm, pki: &Pki, on_headers: impl Fn(u32) -> Vec<u8> + Send + Sync + Clone + 'static) -> TestDial {
+    const SETTINGS: u8 = 4;
+    const HEADERS: u8 = 1;
+    const ACK: u8 = 1;
+    let handler = tls_server(vec![server_tls(pki.leaf(HOST, GOOD), &[H2], None)], Arc::default(), move |_, mut tls| {
+        let on_headers = on_headers.clone();
+        async move {
+            let mut preface = [0u8; 24];
+            if tls.read_exact(&mut preface).await.is_err() {
+                return;
+            }
+            let _ = tls.write_all(&[0, 0, 0, SETTINGS, 0, 0, 0, 0, 0]).await;
+            let _ = tls.flush().await;
+            let mut head = [0u8; 9];
+            while tls.read_exact(&mut head).await.is_ok() {
+                let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+                let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+                let mut payload = vec![0u8; len];
+                if tls.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                let answer = match head[3] {
+                    SETTINGS if head[4] & ACK == 0 => vec![0, 0, 0, SETTINGS, ACK, 0, 0, 0, 0],
+                    HEADERS => on_headers(id),
+                    _ => continue,
+                };
+                let _ = tls.write_all(&answer).await;
+                let _ = tls.flush().await;
+            }
+        }
+    });
+    TestDial::new(arm, handler)
+}
+
+async fn raw_h2_flow(pki: &Pki, dial: TestDial) -> (Rig, hyper::client::conn::http2::SendRequest<Body>, JoinHandle<Outcome>) {
+    let rig = Rig::new(dial, RigOpts::new(pki.roots()));
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (config, _) = client_tls(&[H2], None);
+    let tls = connect(app, config, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    let Client::H2(sender) = Client::start(tls).await else { panic!("h2 was negotiated") };
+    (rig, sender, task)
+}
+
+fn raw_h2_get(path: &str) -> Request<Body> {
+    Request::builder().uri(format!("https://{HOST}{path}")).body(empty()).unwrap()
+}
+
+arms!(a_stream_above_the_goaway_is_refused_and_the_one_below_it_finishes, |arm| async move {
+    // GOAWAY with last stream 1, then stream 1's answer: `:status 200`, ended.
+    const GOAWAY_LAST_1: [u8; 17] = [0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+    const ANSWER_1: [u8; 10] = [0, 0, 1, 1, 5, 0, 0, 0, 1, 0x88];
+    let pki = Pki::new("Test Public Root");
+    let took_first = Arc::new(Notify::new());
+    let took = took_first.clone();
+    let dial = raw_h2_dial(arm, &pki, move |id| {
+        if id == 1 {
+            took.notify_one();
+            return Vec::new();
+        }
+        [GOAWAY_LAST_1.as_slice(), ANSWER_1.as_slice()].concat()
+    });
+    let (_rig, sender, task) = raw_h2_flow(&pki, dial).await;
+    let mut below = sender.clone();
+    let below = tokio::spawn(async move { below.send_request(raw_h2_get("/below")).await });
+    took_first.notified().await;
+    let mut above = sender;
+    let refusal = above.send_request(raw_h2_get("/above")).await.expect_err("above the GOAWAY");
+    assert_eq!(h2_reason(&refusal), Some(h2::Reason::REFUSED_STREAM), "{refusal}");
+    assert_eq!(below.await.unwrap().unwrap().status(), StatusCode::OK);
+    drop(above);
+    tokio::time::timeout(CLOSE_GRACE * 2, task).await.expect("the flow ended").unwrap();
+});
+
+arms!(an_upstream_refused_stream_reaches_the_client_as_a_refusal, |arm| async move {
+    const RST_REFUSED_1: [u8; 13] = [0, 0, 4, 3, 0, 0, 0, 0, 1, 0, 0, 0, 7];
+    let pki = Pki::new("Test Public Root");
+    let dial = raw_h2_dial(arm, &pki, |_| RST_REFUSED_1.to_vec());
+    let (_rig, mut sender, task) = raw_h2_flow(&pki, dial).await;
+    let refusal = sender.send_request(raw_h2_get("/")).await.expect_err("refused");
+    assert_eq!(h2_reason(&refusal), Some(h2::Reason::REFUSED_STREAM), "{refusal}");
+    drop(sender);
+    task.await.unwrap();
+});
+
 arms!(h2_coalescing_produces_421_and_nothing_goes_upstream, |arm| async move {
     let mut s = setup(arm, H2, "").await;
     assert_eq!(s.client.get("bank.example", "/", &[]).await.status(), StatusCode::MISDIRECTED_REQUEST);
@@ -371,15 +544,19 @@ arms!(websocket_upgrade_is_spliced_after_the_url_rule, |arm| async move {
     assert_eq!(&got, b"frame", "bytes cross the splice");
     let row = rows(&s.rig).into_iter().find(|r| r.url.as_deref().is_some_and(|u| u.ends_with("/socket"))).expect("a row");
     assert_eq!(row.request_type.as_deref(), Some("websocket"));
+    assert_eq!(row.url.as_deref(), Some("wss://site.example/socket"), "the socket's real scheme");
+    assert_eq!(s.origin.paths(), ["/socket"], "the upstream's request line has no scheme of ours");
     drop(io);
     drop(s.client);
     s.task.await.unwrap();
 });
 
 arms!(blocked_websocket_never_reaches_upstream, |arm| async move {
-    let mut s = setup(arm, H1, "||site.example/blocked^$websocket\n").await;
+    let mut s = setup(arm, H1, "||site.example/blocked^$websocket\n|wss://site.example/anchored^\n").await;
     let response = upgrade_request(&mut s, "/blocked").await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = upgrade_request(&mut s, "/anchored").await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN, "a rule anchored on the socket's scheme");
     assert!(s.origin.paths().is_empty());
     drop(s.client);
     s.task.await.unwrap();
