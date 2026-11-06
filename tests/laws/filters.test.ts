@@ -101,4 +101,18 @@ describe("filter list law", () => {
     expect(plan.refused).toEqual([{ key: "filters.userRules", reason: expect.stringContaining("trusted scriptlet") }]);
     expect(plan.next.values["filters.userRules"]).toEqual(["||kept.example^"]);
   });
+
+  it.each(["! note\nexample.com##+js(trusted-x)", "example.com##.ad\n||evil.example^$important", "! note\r||evil.example^", "||a.example^\n"])(
+    "one element is one line: an import cannot carry a second rule inside %j",
+    (smuggled) => {
+      expect(isValidValue("filters.userRules", [smuggled])).toBe(false);
+      const current = { schema: EMPTY_DOC.schema, values: { "filters.userRules": ["||kept.example^"] } };
+      const plan = planImport(current, JSON.stringify({ kind: EXPORT_KIND, schema: EMPTY_DOC.schema, values: { "filters.userRules": ["||fine.example^", smuggled] } }));
+      expect(plan.ok).toBe(true);
+      if (!plan.ok) return;
+      expect(plan.refused).toEqual([{ key: "filters.userRules", reason: expect.stringContaining("line break") }]);
+      expect(plan.changes).toEqual([]);
+      expect(plan.next.values["filters.userRules"]).toEqual(["||kept.example^"]);
+    },
+  );
 });

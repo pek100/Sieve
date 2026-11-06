@@ -13,7 +13,9 @@
     { "line": "||", "ts": "error", "parser": null },
     { "line": "##+js(trusted-x)", "ts": "error", "parser": "cosmetic filter error: generic script inject" },
     { "line": "example.com##+js(trusted-x)", "ts": "error", "parser": null },
-    { "line": "##+js(", "ts": "error", "parser": null }
+    { "line": "##+js(", "ts": "error", "parser": null },
+    { "line": "! note\nexample.com##+js(trusted-x)", "ts": "error", "parser": null },
+    { "line": "example.com##.ad\n||evil.example^$important", "ts": "error", "parser": null }
   ],
   "domains": [
     { "raw": "https://WWW.Example.com/a?b", "host": "www.example.com" },

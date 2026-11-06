@@ -48,7 +48,12 @@ const SCRIPTLET = /#@?#\+js\(/;
 const TRUSTED_SCRIPTLET = /#@?#\+js\(\s*trusted-/;
 const NO_TARGET = /^(@@)?\|\|\^?(\$.*)?$/;
 
+/** What ends a line. The parser reads a text by lines, so a line break inside one stored rule is a second rule. */
+const LINE_BREAK = /\r\n|\r|\n/;
+
 export function checkRuleLine(raw: string): RuleCheck {
+  // First, on the raw text: a comment's mark or a cosmetic separator must not vouch for what follows a break.
+  if (LINE_BREAK.test(raw)) return { kind: "error", message: "One rule fits on one line, and this one holds a line break." };
   const line = raw.trim();
   if (line === "") return { kind: "blank" };
   if (isComment(line)) return { kind: "comment" };
@@ -68,7 +73,7 @@ export function checkRuleLine(raw: string): RuleCheck {
 }
 
 export function checkRuleText(text: string): RuleText {
-  const raw = text.split(/\r?\n/);
+  const raw = text.split(LINE_BREAK);
   const lines = raw.map((line, i) => ({ n: i + 1, line, check: checkRuleLine(line) }));
   const notes = lines.filter((l) => l.check.kind === "error" || l.check.kind === "hint");
   const stored = lines.filter((l) => l.check.kind !== "blank").map((l) => l.line.trim());

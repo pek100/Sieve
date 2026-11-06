@@ -54,6 +54,22 @@ describe("a rule text", () => {
     expect(checkRuleText("  ||a.example^  \n\r\n! note\n").stored).toEqual(["||a.example^", "! note"]);
     expect(checkRuleText("").stored).toEqual([]);
   });
+
+  it("every line break ends a line, so a line never holds one", () => {
+    const t = checkRuleText("||a.example^\r||b.example^\r\n||c.example^\n");
+    expect(t.stored).toEqual(["||a.example^", "||b.example^", "||c.example^"]);
+    expect(t.canSave).toBe(true);
+  });
+});
+
+describe("one line is one rule", () => {
+  // The comment check must not hide what follows a line break, nor a cosmetic rule hide a second rule.
+  it.each(["! note\nexample.com##+js(trusted-x)", "example.com##.ad\n||evil.example^$important", "||a.example^\r||b.example^", "! note\r\n||b.example^", "||a.example^\n", "\n"])(
+    "%j is an error that says why",
+    (line) => {
+      expect(checkRuleLine(line)).toMatchObject({ kind: "error", message: expect.stringContaining("line break") });
+    },
+  );
 });
 
 describe("the parser's words", () => {
