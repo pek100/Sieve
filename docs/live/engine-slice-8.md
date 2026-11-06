@@ -29,7 +29,7 @@ The arm is one word: `REFUSAL` in `engine/crates/sieve-engine/src/quic/mod.rs`. 
 - The log shows a refused flow as "Not decrypted (quic refused)". It is not a block: the `blocked` figure does not move, and the flow's event closes with 0 bytes.
 - A host with a cached rejection is relayed, as TCP passes it through. A first visit to a host whose verdict is not known yet is refused, and TCP then learns the verdict.
 - A browser on its own DoH keeps QUIC for a name the engine did not resolve (`floor:ech`). A non-browser's QUIC is relayed (`floor:app-scope`). Both are by design under browsers first.
-- `raced` counts TCP flows accepted before the QUIC Initial: a browser that raced the two. They are not samples.
+- `raced` counts TCP flows accepted before the QUIC Initial: a browser that raced the two. They are not samples. A limit of the number: a racing TCP flow decided before the QUIC flow was refused leaves nothing to count, so the next TCP flow of that pair inside 10 s is taken as the sample and reads long. Fresh profiles and one site at a time keep this rare; treat a long tail with that in mind.
 - `send_failed` means the ring was full or the session was closing. The flow then behaves as a drop.
 
 ## Not here
