@@ -76,9 +76,9 @@ pub fn is_tunnel(if_type: u32, description: &str) -> bool {
 /// VirtualBox adapters are not VPNs and are not listed.
 pub const VIRTUAL_ETHERNET_VPNS: &[&str] = &["TAP-Windows", "ZeroTier"];
 
-/// The routes for these tables. The engine's own adapter (named "Sieve")
-/// is left out wherever it appears.
-pub fn plan(tables: &NetTables) -> RoutePlan {
+/// What is never routed into the engine, for these tables: the one definition
+/// of "excluded from routing", which DNS's split-horizon rules read too.
+pub fn holes(tables: &NetTables) -> Vec<Prefix> {
     let mut holes = declared();
     for a in tables.others() {
         holes.extend(a.addresses.iter().filter_map(|addr| addr.on_link()).filter(|p| p.length() > 0));
@@ -88,6 +88,13 @@ pub fn plan(tables: &NetTables) -> RoutePlan {
     }
     holes.sort();
     holes.dedup();
+    holes
+}
+
+/// The routes for these tables. The engine's own adapter (named "Sieve")
+/// is left out wherever it appears.
+pub fn plan(tables: &NetTables) -> RoutePlan {
+    let holes = holes(tables);
 
     let mut routes = Vec::new();
     for (v4, universe) in [(true, UNIVERSE_V4), (false, UNIVERSE_V6)] {

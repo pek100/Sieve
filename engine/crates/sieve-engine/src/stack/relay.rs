@@ -2,9 +2,7 @@
 //! with its live lessons kept):
 //! - only unicast reaches the stack (`tun::admit`);
 //! - a flow owned by the engine itself is refused and counted (loop guard);
-//! - every upstream socket is bound to the egress interface's own source
-//!   address and pinned with IP_UNICAST_IF / IPV6_UNICAST_IF, both computed
-//!   with Sieve's routes ignored (`route::pin`); "would loop" is refused;
+//! - every upstream socket comes from [`Egress`], pinned outside Sieve's routes;
 //! - a failed connect closes the app side with a FIN at once (live run 1:
 //!   a dropped ipstack stream left curl waiting 20 s).
 //!
@@ -12,25 +10,26 @@
 //! once, client bytes are held until decoded and decided, then relayed or the
 //! flow is closed with nothing sent). UDP holds datagrams until decoded and
 //! decided; a blocked UDP flow's book entry closes and its datagrams are
-//! swallowed until idle. Port 53 is DNS: the query goes to the server it was
-//! sent to, every answer is recorded in the IP-to-names map, and a lookup is
-//! never blocked. The upstream TCP connect happens before the decision, so
+//! swallowed until idle. Port 53 goes to `stack::dns_flow` instead and is never
+//! relayed or blocked. The upstream TCP connect happens before the decision, so
 //! server-first bytes may reach an app: a decoded name beats the IP map, so
 //! the decision cannot be earlier.
 
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use ipstack::{IpStackTcpStream, IpStackUdpStream};
 use sieve_ipc::{FlowAction, FlowEvent, FlowKind, FlowProto};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 
 use super::attribution::{Attribution, decide, is_own};
 use super::book::FlowBook;
+use super::dns_flow;
+use super::egress::Egress;
 use super::{DNS_PORT, Meters, close_blocked, drain_udp, kind_of, record_decision};
-use crate::dns::{self, NameMap};
+use crate::dns::NameMap;
+use crate::dns::service::Service;
 use crate::domain::{FilterSlot, Flow, Owner as FlowOwner};
 use crate::flow::classify::{Decoded, UdpClassifier};
 use crate::flow::etw::PidWitness;
@@ -39,27 +38,21 @@ use crate::flow::flows::{Action, AppKeys, Attributor, ExeCache, FiveTuple, Owner
 use crate::flow::nat::NatTable;
 use crate::flow::packet::Proto;
 use crate::flow::relay::relay_tcp;
-use crate::route::pin;
 use crate::route::table::NetTables;
 use crate::watchdog::monotonic_ms;
 
 /// A TCP flow that sends nothing this long is decided without a name.
 pub const FIRST_BYTES_WAIT: Duration = Duration::from_secs(5);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A UDP flow idle this long ends (ipstack's own UDP timeout is the same).
 pub const UDP_IDLE: Duration = Duration::from_secs(30);
-/// A DNS flow is one query and its answer: it ends this long after the last
-/// datagram, so the DNS Client's one-port-per-query traffic holds no socket
-/// for half a minute.
-pub const DNS_IDLE: Duration = Duration::from_secs(5);
 const DATAGRAM: usize = 65_535;
 
 type ExeLookup = fn(u32) -> Option<String>;
 type ProductLookup = fn(&str) -> Option<String>;
 
 /// A flow the book took: its id and its app's key, when it has one.
-struct Admitted {
-    id: u64,
+pub(super) struct Admitted {
+    pub(super) id: u64,
     app: Option<String>,
 }
 
@@ -80,7 +73,6 @@ pub struct Relay {
     #[cfg(feature = "relay-experiments")]
     pub experiments: crate::experiments::Settings,
     pub own_pid: u32,
-    pub tun_index: u32,
     pub attributor: Mutex<Attributor<IpHelper, Witness>>,
     /// The NAT state that proves a guest's flow.
     pub nat: Arc<NatTable>,
@@ -88,14 +80,18 @@ pub struct Relay {
     pub keys: AppKeys<ProductLookup>,
     /// The decision snapshot, read once per flow.
     pub filter: Arc<FilterSlot>,
-    /// Re-read on every route change (control); pinning asks it.
-    pub tables: RwLock<NetTables>,
-    pub book: Arc<Mutex<FlowBook>>,
+    /// Re-read on every route change (control); pinning and DNS's split rules
+    /// read this same table.
+    pub tables: Arc<RwLock<NetTables>>,
+    pub egress: Arc<Egress>,
+    pub dns: Arc<Service>,
+    /// The IP-to-names map the decision reads for an unnamed flow.
     pub names: Arc<Mutex<NameMap>>,
+    pub book: Arc<Mutex<FlowBook>>,
     pub meters: Arc<Meters>,
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -109,8 +105,9 @@ pub fn session_of(pid: u32) -> Option<u32> {
 
 impl Relay {
     pub fn new(
-        tun_index: u32,
-        tables: NetTables,
+        tables: Arc<RwLock<NetTables>>,
+        egress: Arc<Egress>,
+        dns: Arc<Service>,
         book: Arc<Mutex<FlowBook>>,
         names: Arc<Mutex<NameMap>>,
         meters: Arc<Meters>,
@@ -122,15 +119,16 @@ impl Relay {
             #[cfg(feature = "relay-experiments")]
             experiments: crate::experiments::Settings::default(),
             own_pid: std::process::id(),
-            tun_index,
             attributor: Mutex::new(Attributor::new(IpHelper, witness)),
             nat,
             exes: Mutex::new(ExeCache::new(crate::flow::flows::os::exe_path as ExeLookup)),
             keys: AppKeys::new(crate::flow::flows::os::product_name as ProductLookup),
             filter,
-            tables: RwLock::new(tables),
-            book,
+            tables,
+            egress,
+            dns,
             names,
+            book,
             meters,
         }
     }
@@ -157,7 +155,7 @@ impl Relay {
     /// that check. A fresh read here would add a WMI round trip to every host
     /// DNS lookup, which is not acceptable. On a machine with an active VM,
     /// its own misses keep the index fresh; live proof L3 counts collisions.
-    async fn attribute(&self, flow: FiveTuple) -> Attributed {
+    pub(super) async fn attribute(&self, flow: FiveTuple) -> Attributed {
         #[cfg(feature = "attribution-diagnostics")]
         let started = monotonic_ms();
         let owner = self.owner(flow).await;
@@ -193,7 +191,7 @@ impl Relay {
 
     /// Counts the flow and registers it in the book; None when it is the
     /// engine's own (refused) or the book is full.
-    fn admit(&self, flow: &FiveTuple, attributed: &Attributed, proto: FlowProto, kind: FlowKind) -> Option<Admitted> {
+    pub(super) fn admit(&self, flow: &FiveTuple, attributed: &Attributed, proto: FlowProto, kind: FlowKind) -> Option<Admitted> {
         if attributed.own {
             Meters::bump(&self.meters.own_refused);
             return None;
@@ -228,48 +226,28 @@ impl Relay {
     }
 
     /// The one decision for a flow whose first bytes were decoded, in the book.
-    /// The snapshot is read here, so a flow decided keeps its decision.
-    fn decide(&self, admitted: &Admitted, d: &Decoded, dns: bool, flow: &FiveTuple) -> Action {
+    /// The snapshot is read here, so a flow decided keeps its decision. Port 53
+    /// never comes here (`dns_flow`), so `dns` is false.
+    fn decide(&self, admitted: &Admitted, d: &Decoded, flow: &FiveTuple) -> Action {
         let owner = admitted.app.as_deref().map_or(FlowOwner::Unknown, |key| FlowOwner::App { key });
-        let decision = self.filter.get().decide(Flow::from_decoded(d, dns, flow.remote.ip(), owner), &self.names, monotonic_ms());
-        lock(&self.book).update(admitted.id, |e| record_decision(e, d, dns, &decision));
+        let decision = self.filter.get().decide(Flow::from_decoded(d, false, flow.remote.ip(), owner), &self.names, monotonic_ms());
+        lock(&self.book).update(admitted.id, |e| record_decision(e, d, false, &decision));
         decision.action
-    }
-
-    /// A socket for `target`, bound to the egress source and pinned to the
-    /// egress interface (never the engine's adapter).
-    fn egress_socket(&self, target: SocketAddr, udp: bool) -> Result<socket2::Socket, String> {
-        let e = {
-            let tables = self.tables.read().unwrap_or_else(|p| p.into_inner());
-            pin::egress(&tables, Some(self.tun_index), target.ip()).map_err(|e| e.to_string())?
-        };
-        pin::egress_socket(e, target, udp)
-    }
-
-    /// A connected TCP stream on the egress interface (flows and the engine's
-    /// own downloads alike).
-    pub async fn connect(&self, target: SocketAddr) -> Result<TcpStream, String> {
-        let sock = self.egress_socket(target, false)?;
-        let socket = TcpSocket::from_std_stream(sock.into());
-        match tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(target)).await {
-            Ok(Ok(s)) => Ok(s),
-            Ok(Err(e)) => Err(format!("connect {target}: {e}")),
-            Err(_) => Err(format!("connect {target}: timeout")),
-        }
     }
 }
 
 /// Closes the app side promptly (FIN).
-async fn close_app(app: &mut IpStackTcpStream) {
+pub(super) async fn close_app(app: &mut IpStackTcpStream) {
     let _ = tokio::time::timeout(Duration::from_secs(1), app.shutdown()).await;
 }
 
 pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
     let flow = FiveTuple { proto: Proto::Tcp, local: app.local_addr(), remote: app.peer_addr() };
-    let dns = flow.remote.port() == DNS_PORT;
-    let (attributed, upstream) = tokio::join!(ctx.attribute(flow), ctx.connect(flow.remote));
-    let kind = if dns { FlowKind::Dns } else { FlowKind::Other };
-    let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Tcp, kind) else { return close_app(&mut app).await };
+    if flow.remote.port() == DNS_PORT {
+        return dns_flow::tcp(ctx, app, flow).await;
+    }
+    let (attributed, upstream) = tokio::join!(ctx.attribute(flow), ctx.egress.connect(flow.remote));
+    let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Tcp, FlowKind::Other) else { return close_app(&mut app).await };
     let upstream = match upstream {
         Ok(u) => u,
         Err(_) => {
@@ -277,7 +255,7 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
             return close_app(&mut app).await;
         }
     };
-    let decide = |d: &Decoded| ctx.decide(&admitted, d, dns, &flow);
+    let decide = |d: &Decoded| ctx.decide(&admitted, d, &flow);
     #[cfg(feature = "relay-experiments")]
     let out = if let Some(capacity) = ctx.experiments.copy_buffer_bytes {
         crate::flow::relay::relay_tcp_buffered(&mut app, upstream, FIRST_BYTES_WAIT, decide, capacity).await
@@ -299,13 +277,15 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
 
 pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
     let flow = FiveTuple { proto: Proto::Udp, local: app.local_addr(), remote: app.peer_addr() };
-    let dns = flow.remote.port() == DNS_PORT;
+    if flow.remote.port() == DNS_PORT {
+        return dns_flow::udp(ctx, app, flow).await;
+    }
     let attribution = {
         let c = ctx.clone();
         tokio::spawn(async move { c.attribute(flow).await })
     };
     // Datagrams are held until the flow is decoded (a QUIC ClientHello can
-    // span two Initials); a DNS query is decoded by its question.
+    // span two Initials).
     let mut classifier = UdpClassifier::new();
     let mut held: Vec<Vec<u8>> = Vec::new();
     let mut buf = vec![0u8; DATAGRAM];
@@ -313,9 +293,6 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         match tokio::time::timeout(UDP_IDLE, app.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
                 held.push(buf[..n].to_vec());
-                if dns {
-                    break Decoded { domain: dns::parse(&buf[..n]).and_then(|m| m.question), ..Decoded::default() };
-                }
                 if let Some(d) = classifier.push(&buf[..n]) {
                     break d;
                 }
@@ -324,13 +301,13 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         }
     };
     let Ok(attributed) = attribution.await else { return };
-    let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Udp, if dns { FlowKind::Dns } else { kind_of(&decided) }) else { return };
+    let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Udp, kind_of(&decided)) else { return };
     let id = admitted.id;
-    if ctx.decide(&admitted, &decided, dns, &flow) == Action::Drop {
+    if ctx.decide(&admitted, &decided, &flow) == Action::Drop {
         close_blocked(&ctx.book, &ctx.meters, id);
         return drain_udp(&mut app, UDP_IDLE).await;
     }
-    let up = match ctx.egress_socket(flow.remote, true).and_then(|s| UdpSocket::from_std(s.into()).map_err(|e| e.to_string())) {
+    let up = match ctx.egress.socket(flow.remote, true).and_then(|s| UdpSocket::from_std(s.into()).map_err(|e| e.to_string())) {
         Ok(u) => u,
         Err(_) => return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0),
     };
@@ -338,32 +315,24 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0);
     }
     let (mut bytes_up, mut bytes_down) = (0u64, 0u64);
-    let mut transactions = dns::Transactions::default();
     for d in &held {
         if up.send(d).await.is_err() {
             return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0);
         }
         bytes_up += d.len() as u64;
-        if dns { transactions.remember(d, monotonic_ms()); }
     }
     let mut down = vec![0u8; DATAGRAM];
-    let idle = if dns { DNS_IDLE } else { UDP_IDLE };
     loop {
         tokio::select! {
-            r = tokio::time::timeout(idle, app.read(&mut buf)) => match r {
+            r = tokio::time::timeout(UDP_IDLE, app.read(&mut buf)) => match r {
                 Ok(Ok(n)) if n > 0 => {
                     if up.send(&buf[..n]).await.is_err() { break; }
                     bytes_up += n as u64;
-                    if dns { transactions.remember(&buf[..n], monotonic_ms()); }
                 }
                 _ => break,
             },
-            r = tokio::time::timeout(idle, up.recv(&mut down)) => match r {
+            r = tokio::time::timeout(UDP_IDLE, up.recv(&mut down)) => match r {
                 Ok(Ok(n)) => {
-                    if dns && let Some(m) = transactions.answer(&down[..n], monotonic_ms()) {
-                        lock(&ctx.names).record_message(&m, monotonic_ms());
-                        Meters::bump(&ctx.meters.dns_answers);
-                    }
                     if app.write_all(&down[..n]).await.is_err() { break; }
                     bytes_down += n as u64;
                 }

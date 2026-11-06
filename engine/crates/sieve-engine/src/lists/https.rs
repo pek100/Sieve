@@ -1,9 +1,9 @@
 //! The real list download: one HTTPS/1.1 GET over a socket pinned off Sieve's
-//! adapter (`Relay::connect`), validated by rustls on aws-lc-rs with
+//! adapter (`Egress::connect`), validated by rustls on aws-lc-rs with
 //! X25519MLKEM768 preferred. Redirects are refused, not followed (S24): a
 //! catalogue URL is what the user's lists come from, and a redirect shows up
 //! as a recorded failure. The name is looked up through Windows like any app's
-//! lookup, so it follows the DNS the engine relays.
+//! lookup, so it follows the DNS the engine answers.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,15 +31,7 @@ const ALPN_HTTP1: &[u8] = b"http/1.1";
 /// set. Not the Windows store: the engine's own downloads must not trust
 /// whatever a local filter (AdGuard's or anyone's root) put there.
 pub fn client_config() -> Result<ClientConfig, String> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS versions: {e}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![ALPN_HTTP1.to_vec()];
-    Ok(config)
+    crate::tls::client_config(crate::tls::public_roots(), &[ALPN_HTTP1])
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -121,7 +113,7 @@ impl HttpsFetcher {
         let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, HTTPS_PORT)).await.map_err(|e| format!("lookup {host}: {e}"))?.collect();
         let mut last = format!("lookup {host}: no address");
         for addr in addrs {
-            match self.relay.connect(addr).await {
+            match self.relay.egress.connect(addr).await {
                 Ok(stream) => return Ok(stream),
                 Err(why) => last = why,
             }

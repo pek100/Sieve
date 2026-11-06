@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sieve_ipc::nonblocking::{read_frame, write_frame};
-use sieve_ipc::{ClientMessage, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, ListStatus, Policy, answer_hello};
+use sieve_ipc::{ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, FLOWS_PER_FRAME, FlowEvent, FrameError, ListStatus, Policy, answer_hello};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 
@@ -34,6 +34,8 @@ pub trait Backend: Send + Sync + 'static {
     fn status(&self) -> EngineStatus;
     /// Applies a newer policy and answers the Status after it.
     fn set_policy(&self, policy: Policy) -> Result<EngineStatus, String>;
+    /// Applies a newer, valid resolver list and answers the list then held.
+    fn set_dns_upstreams(&self, list: DnsUpstreams) -> Result<DnsUpstreams, String>;
     /// The open flows now, every batch from now on, and whether routes are
     /// up (a subscription ends when they go down: the app then reads the
     /// connection tables again).
@@ -105,6 +107,10 @@ where
             Ok(ClientMessage::Status) => EngineMessage::Status(backend.status()),
             Ok(ClientMessage::SetPolicy(p)) => match backend.set_policy(p) {
                 Ok(status) => EngineMessage::Status(status),
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::SetDnsUpstreams(list)) => match backend.set_dns_upstreams(list) {
+                Ok(held) => EngineMessage::DnsUpstreams(held),
                 Err(message) => EngineMessage::Error { message },
             },
             Ok(ClientMessage::Subscribe) => return stream_flows(stream, session_id, backend).await,
@@ -240,6 +246,9 @@ mod tests {
             let next = crate::policy::accept(&self.policy.lock().unwrap(), p)?;
             *self.policy.lock().unwrap() = next;
             Ok(self.status())
+        }
+        fn set_dns_upstreams(&self, list: DnsUpstreams) -> Result<DnsUpstreams, String> {
+            Ok(list)
         }
         fn subscribe(&self) -> Subscription {
             Subscription { open: self.open.clone(), batches: self.flows.subscribe(), routes_up: self.routes.subscribe() }

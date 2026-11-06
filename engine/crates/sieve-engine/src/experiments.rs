@@ -67,12 +67,7 @@ fn bounded(name: &str, field: Field, min: usize, max: usize) -> Result<Option<us
 pub const FILE_MAX: u64 = 4 * 1024;
 
 pub fn parse(bytes: &[u8]) -> Result<Settings, String> {
-    // Windows PowerShell writes UTF-8 with a BOM, and UTF-16 with `>`. A BOM
-    // is not content; UTF-16 is refused by name so the cause is visible.
-    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
-        return Err("experiments.json is UTF-16; save it as UTF-8".into());
-    }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let bytes = crate::hand_file::content(bytes).map_err(|why| format!("{FILE}: {why}"))?;
     // Serde structs can also deserialize sequences. The file contract is an
     // object, so reject arrays before applying field defaults.
     if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
@@ -104,16 +99,11 @@ pub struct Loaded {
 
 impl Loaded {
     pub fn load(dir: &Path) -> Self {
-        use std::io::Read;
-        let read = std::fs::File::open(dir.join(FILE)).and_then(|f| {
-            let mut bytes = Vec::new();
-            f.take(FILE_MAX + 1).read_to_end(&mut bytes).map(|_| bytes)
-        });
-        match read {
-            Ok(bytes) if bytes.len() as u64 > FILE_MAX => Self::refused(format!("{FILE} is larger than {FILE_MAX} bytes")),
-            Ok(bytes) => Self::from_bytes(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::absent(),
-            Err(e) => Self::refused(format!("{}: {e}", dir.join(FILE).display())),
+        let path = dir.join(FILE);
+        match crate::hand_file::read_capped(&path, FILE_MAX) {
+            Ok(Some(bytes)) => Self::from_bytes(&bytes),
+            Ok(None) => Self::absent(),
+            Err(why) => Self::refused(format!("{}: {why}", path.display())),
         }
     }
 

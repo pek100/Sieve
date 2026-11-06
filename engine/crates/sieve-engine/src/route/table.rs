@@ -36,6 +36,10 @@ pub struct Adapter {
     pub addresses: Vec<AddressOnLink>,
     /// DNS servers in force for the adapter.
     pub dns: Vec<IpAddr>,
+    /// The adapter's connection-specific suffix and search list, read only,
+    /// for DNS's split-horizon rules (plan 1.4).
+    #[serde(default)]
+    pub dns_suffixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +84,15 @@ impl NetTables {
     /// Routes on `adapter`.
     pub fn routes_on(&self, adapter: &Adapter) -> impl Iterator<Item = &RouteRow> {
         self.routes.iter().filter(move |r| r.if_index == adapter.index)
+    }
+
+    /// These tables without Sieve's adapter and its routes: the network as it
+    /// would be without Sieve, so Sieve's own route changes do not look like a
+    /// network change.
+    pub fn outside_sieve(&self) -> NetTables {
+        let adapters: Vec<Adapter> = self.adapters.iter().filter(|a| !is_sieve_interface(&a.alias)).cloned().collect();
+        let routes = self.routes.iter().filter(|r| adapters.iter().any(|a| a.index == r.if_index)).cloned().collect();
+        NetTables { adapters, routes }
     }
 
     /// True when some up adapter other than Sieve holds a default route of this family.
@@ -168,6 +181,17 @@ pub mod read {
                         }
                         d = (*d).Next;
                     }
+                    let mut dns_suffixes = vec![wide(a.DnsSuffix)];
+                    let mut s = a.FirstDnsSuffix;
+                    while !s.is_null() {
+                        // A fixed array, NUL-terminated within.
+                        let text = &(*s).String;
+                        let len = text.iter().position(|c| *c == 0).unwrap_or(text.len());
+                        dns_suffixes.push(String::from_utf16_lossy(&text[..len]));
+                        s = (*s).Next;
+                    }
+                    dns_suffixes.retain(|suffix| !suffix.is_empty());
+                    dns_suffixes.dedup();
                     out.push(Adapter {
                         index: if a.Anonymous1.Anonymous.IfIndex != 0 { a.Anonymous1.Anonymous.IfIndex } else { a.Ipv6IfIndex },
                         luid: a.Luid.Value,
@@ -177,6 +201,7 @@ pub mod read {
                         up: a.OperStatus == IfOperStatusUp,
                         addresses,
                         dns,
+                        dns_suffixes,
                     });
                     cur = a.Next;
                 }
@@ -267,5 +292,12 @@ mod tests {
         assert!(home.has_default(true) && home.has_default(false));
         assert!(home.others().all(|a| a.alias != "Sieve"));
         assert!(load(SIEVE_UP).adapters.iter().any(|a| a.alias == "Sieve"));
+    }
+
+    #[test]
+    fn sieves_own_adapter_and_routes_are_no_network_change_and_old_fixtures_parse() {
+        assert_eq!(load(SIEVE_UP).outside_sieve(), load(HOME).outside_sieve());
+        assert_ne!(load(VPN_SPLIT).outside_sieve(), load(HOME).outside_sieve());
+        assert!(load(HOME).adapters.iter().all(|a| a.dns_suffixes.is_empty()), "no fixture states suffixes");
     }
 }

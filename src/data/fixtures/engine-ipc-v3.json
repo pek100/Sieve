@@ -22,7 +22,12 @@
     },
     { "type": "subscribe" },
     { "type": "lists" },
-    { "type": "lists_refresh" }
+    { "type": "lists_refresh" },
+    {
+      "type": "set_dns_upstreams",
+      "revision": 4,
+      "upstreams": ["https://cloudflare-dns.com/dns-query", "tls://dns.quad9.net", "quic://dns.example:8853"]
+    }
   ],
   "engine": [
     { "type": "welcome", "protocol": 3, "engine_version": "0.1.0", "session_id": 1 },
@@ -247,6 +252,11 @@
         }
       ],
       "compile_ms": 840
+    },
+    {
+      "type": "dns_upstreams",
+      "revision": 0,
+      "upstreams": ["https://cloudflare-dns.com/dns-query", "https://dns.quad9.net/dns-query"]
     }
   ],
   "blockers": [

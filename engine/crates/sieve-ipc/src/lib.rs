@@ -11,9 +11,13 @@
 //! - [`ClientMessage::SetPolicy`] is answered with the Status after the
 //!   change; [`ClientMessage::Subscribe`] turns the connection into an event
 //!   stream of [`EngineMessage::Flows`] batches, every [`FLOWS_BATCH_MS`].
+//! - [`ClientMessage::SetDnsUpstreams`] is answered with
+//!   [`EngineMessage::DnsUpstreams`], the list the engine then holds.
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
 //!   commit (v3, the wave after slice 3: blocked flows, the grown policy, the
 //!   list report, forwarded flows and guests, and the streams after them).
+//!   A new message type is no shape change: a peer that never sends it is
+//!   unaffected, and the app and engine ship together.
 //!
 //! There is no operation that signs anything, exports a key or names a
 //! certificate to mint (plan 7.2), and there never will be.
@@ -53,9 +57,9 @@ pub fn vm_key(vm: Option<&str>) -> String {
 }
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams"];
 /// The `type` names of [`EngineMessage`], in declaration order.
-pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists"];
+pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams"];
 /// A flow event's rule text is cut to this many bytes: a list rule can run to
 /// kilobytes, and at this cap a full `flows` frame stays under [`MAX_FRAME`].
 pub const MAX_RULE_BYTES: usize = 256;
@@ -82,6 +86,10 @@ pub enum ClientMessage {
     /// Downloads every selected list now, whatever its age; answered with
     /// [`EngineMessage::Lists`] as it stands (the refresh runs on).
     ListsRefresh,
+    /// The encrypted DNS resolvers (`filtering.upstreams`). Applied only when
+    /// `revision` is above the engine's and every address is valid, persisted,
+    /// answered with [`EngineMessage::DnsUpstreams`]; a refusal is an Error.
+    SetDnsUpstreams(DnsUpstreams),
 }
 
 /// Engine to app.
@@ -103,6 +111,19 @@ pub enum EngineMessage {
     /// What the lists are doing. `compile_ms` is the last compile's time,
     /// None before the first.
     Lists { lists: Vec<ListStatus>, compile_ms: Option<u64> },
+    /// The encrypted DNS resolvers the engine holds.
+    DnsUpstreams(DnsUpstreams),
+}
+
+/// The encrypted DNS resolvers as the engine holds them (`dns.json`). The
+/// engine validates the addresses; this crate only carries them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsUpstreams {
+    /// Raised by the app on every change; 0 is the engine's default list.
+    pub revision: u64,
+    /// `https://`, `tls://` or `quic://` addresses, tried in order.
+    pub upstreams: Vec<String>,
 }
 
 /// The user's switches as the engine holds them (`policy.json`). Every field
@@ -202,7 +223,8 @@ pub struct Counters {
     pub attributed: u64,
     /// Flows owned by the engine itself, refused (loop guard).
     pub own_refused: u64,
-    /// DNS answers relayed from the original server.
+    /// DNS answers read for the IP-to-names map, from an encrypted upstream or
+    /// a LAN server.
     pub dns_answers: u64,
     /// Packets read from and written to the adapter.
     pub packets_in: u64,
@@ -542,6 +564,7 @@ mod tests {
             ClientMessage::Subscribe => "subscribe",
             ClientMessage::Lists => "lists",
             ClientMessage::ListsRefresh => "lists_refresh",
+            ClientMessage::SetDnsUpstreams(_) => "set_dns_upstreams",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -550,6 +573,7 @@ mod tests {
             EngineMessage::Error { .. } => "error",
             EngineMessage::Flows { .. } => "flows",
             EngineMessage::Lists { .. } => "lists",
+            EngineMessage::DnsUpstreams(_) => "dns_upstreams",
         };
         let f = fixture();
         for m in f["client"].as_array().unwrap() {
