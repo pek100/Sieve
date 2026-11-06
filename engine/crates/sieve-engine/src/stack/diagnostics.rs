@@ -71,6 +71,8 @@ pub struct Report {
     pub forwarded_exact_nat: u64,
     pub host_unknown: u64,
     pub unexplained: u64,
+    /// Host flows by protocol; a forwarded flow is in neither known nor
+    /// unknown, only in `forwarded_exact_nat`.
     pub known_tcp: u64,
     pub unknown_tcp: u64,
     pub known_udp: u64,
@@ -84,7 +86,7 @@ pub struct Report {
     pub raw_events: VecDeque<RawEvent>,
 }
 
-/// The evidence of one flow that did not get a host owner.
+/// The evidence of one flow left unknown.
 #[derive(Debug, Serialize)]
 pub struct Sample {
     pub at_ms: u64,
@@ -179,19 +181,22 @@ impl Report {
     /// One admitted flow. `same` and `other` are the tables read after the
     /// decision, for an unknown flow only.
     pub fn observe(&mut self, flow: FiveTuple, attribution: &Attribution, now_ms: u64, same: Option<&[OwnerRow]>, other: Option<&[OwnerRow]>, lookup_elapsed_ms: u64) {
-        let known = attribution.pid().is_some();
-        match (flow.proto, known) {
-            (Proto::Tcp, true) => self.known_tcp += 1,
-            (Proto::Tcp, false) => self.unknown_tcp += 1,
-            (Proto::Udp, true) => self.known_udp += 1,
-            (Proto::Udp, false) => self.unknown_udp += 1,
-        }
         let category = category(attribution, &flow, same);
         match category {
             Category::HostAttributed => self.host_attributed += 1,
             Category::ForwardedExactNat => self.forwarded_exact_nat += 1,
             Category::HostUnknown => self.host_unknown += 1,
             Category::Unexplained => self.unexplained += 1,
+        }
+        // Explained by its exact NAT match: not unknown, and its table reads
+        // are empty, so a sample would only evict the evidence L1 needs.
+        if category == Category::ForwardedExactNat { return; }
+        let known = attribution.pid().is_some();
+        match (flow.proto, known) {
+            (Proto::Tcp, true) => self.known_tcp += 1,
+            (Proto::Tcp, false) => self.unknown_tcp += 1,
+            (Proto::Udp, true) => self.known_udp += 1,
+            (Proto::Udp, false) => self.unknown_udp += 1,
         }
         if known { return; }
         self.unknown_dns += u64::from(flow.remote.port() == 53);
@@ -276,6 +281,29 @@ mod tests {
         assert_eq!((report.host_attributed, report.forwarded_exact_nat, report.host_unknown, report.unexplained), (2, 2, 3, 1));
         let sum = report.host_attributed + report.forwarded_exact_nat + report.host_unknown + report.unexplained;
         assert_eq!(sum, meters.counters().flows);
+    }
+
+    #[test]
+    fn forwarded_flows_cannot_evict_an_unexplained_sample_or_count_as_unknown() {
+        let mut report = Report::default();
+        let dns = udp53();
+        report.observe(dns, &no_answer(), 1, Some(&[]), None, 256);
+        let named = decide(Owner::Unknown, Some(Forwarded {vm: Some("DevBox".into())}));
+        let unnamed = decide(Owner::Unknown, Some(Forwarded {vm: None}));
+        for i in 0..SAMPLE_CAP {
+            report.observe(dns, &named, 2, None, None, 0);
+            report.observe(tcp(), if i % 2 == 0 {&named} else {&unnamed}, 2, None, None, 0);
+        }
+        assert_eq!(report.samples.len(), 1, "a forwarded flow is explained: it takes no sample");
+        let kept = report.samples.front().unwrap();
+        assert_eq!((kept.at_ms, kept.category), (1, Category::Unexplained));
+        assert_eq!(report.forwarded_exact_nat, 2 * SAMPLE_CAP as u64);
+        assert_eq!((report.known_tcp, report.unknown_tcp, report.known_udp, report.unknown_udp, report.unknown_dns), (0, 0, 0, 1, 1));
+
+        // An owner and a NAT match both answering is unknown, not forwarded: its evidence stays.
+        report.observe(tcp(), &decide(Owner::Pid(7), Some(Forwarded {vm: None})), 3, Some(&[]), None, 0);
+        assert_eq!(report.samples.back().unwrap().category, Category::HostUnknown);
+        assert_eq!((report.samples.len(), report.unknown_tcp), (2, 1));
     }
 
     #[test]
