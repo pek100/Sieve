@@ -117,7 +117,8 @@ pub enum HandshakeEnd<S> {
     Done(Box<Handshaken<S>>),
     /// The server asked for a client certificate.
     ClientCertificate,
-    /// `Protocol` (it needs less than rustls offers) or `Unavailable` (timeout).
+    /// `Protocol` (it needs less than rustls offers) or `Unavailable` (a timeout
+    /// or a dropped connection).
     Failed(UpstreamVerdict),
 }
 
@@ -151,8 +152,10 @@ where
     }
     let tls = match answer {
         Ok(Ok(tls)) => tls,
-        Ok(Err(_)) => return HandshakeEnd::Failed(UpstreamVerdict::Protocol),
-        Err(_) => return HandshakeEnd::Failed(UpstreamVerdict::Unavailable),
+        // TLS itself said no: it needs less than rustls offers.
+        Ok(Err(e)) if rustls_error(&e).is_some() => return HandshakeEnd::Failed(UpstreamVerdict::Protocol),
+        // A reset or a timeout says nothing about the server, so it is not cached.
+        Ok(Err(_)) | Err(_) => return HandshakeEnd::Failed(UpstreamVerdict::Unavailable),
     };
     let chain = capture.chain.lock().unwrap_or_else(|p| p.into_inner()).take();
     let Some(chain) = chain else { return HandshakeEnd::Failed(UpstreamVerdict::Protocol) };

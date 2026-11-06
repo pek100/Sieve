@@ -688,6 +688,24 @@ fn the_plain_lists_are_not_consulted_when_filtering_is_off() {
     assert_eq!(rule(&on, &f).action, Action::Block, "the control");
 }
 
+/// A client that handshakes and leaves, many times: the shape of a preconnect.
+/// Each flow must end by itself, in both protocols.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn silent_closes_end_every_flow() {
+    const ROUNDS: usize = 40;
+    for alpn in BOTH {
+        let pki = Pki::new("Test Public Root");
+        let rig = Rig::new(origin_dial(Arm::Duplex, &pki, &[alpn], Origin::default()), RigOpts::new(pki.roots()));
+        let (config, _) = client_tls(&[alpn], None);
+        for round in 0..ROUNDS {
+            let (app, task) = rig.flow(flow_opts()).await;
+            let tls = tokio::time::timeout(Duration::from_secs(20), connect(app, config.clone(), HOST)).await.unwrap_or_else(|_| panic!("{alpn} round {round}: handshake")).unwrap_or_else(|(e, _)| panic!("{e}"));
+            drop(tls);
+            tokio::time::timeout(Duration::from_secs(20), task).await.unwrap_or_else(|_| panic!("{alpn} round {round}: the flow stayed open")).unwrap();
+        }
+    }
+}
+
 /// Evidence, not a gate, and in memory: the signer is in memory and nothing
 /// crosses a network. Run with `--ignored --nocapture`; the live budgets are U10.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -719,6 +737,8 @@ async fn bench_intercepted_h1_h2_in_memory() {
         }
         let seconds = started.elapsed().as_secs_f64();
         println!("{alpn}: a {got} byte response through both sessions, in memory: {:.0} Mbit/s", (got * 8) as f64 / seconds / 1e6);
+        // A held stream keeps an h2 connection, and so this flow, open.
+        drop(body);
         drop(client);
         let _ = task.await;
     }

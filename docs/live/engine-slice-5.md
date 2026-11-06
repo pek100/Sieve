@@ -34,4 +34,4 @@ What slice 5 changes: while `policy.https` is on, one CNG key (`Sieve root <16 h
 
 ## Not here
 
-Interception by browsers is slice 6, and the empty-subject leaf is first seen by real clients there. `live_https_intercepts_public_and_passes_floor` is a stub that fails until then.
+Interception by browsers is slice 6, and the empty-subject leaf is first seen by real clients there. Its check is `live_https_intercepts_public_and_passes_floor`, with the runbook in `docs/live/engine-slice-6.md`.

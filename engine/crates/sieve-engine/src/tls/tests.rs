@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use super::active::Active;
-use super::intercept::{Dial, DialFuture, FlowMeta, HttpsSlot, Interception, NoWatch, Outcome, run};
+use super::intercept::{ClientWatch, Dial, DialFuture, FlowMeta, HttpsSlot, Interception, NoWatch, Outcome, Pair, run};
 use super::upstream::{Chain, PlatformTrust, TRUST_TIMEOUT, TrustAnswer, TrustVerifier, Verifier, filter_alpn, handshake, is_post_handshake_auth, rustls_error};
 use super::verdict::VerdictCache;
 use super::{provider, public_roots};
@@ -368,11 +368,12 @@ pub(crate) struct RigOpts {
     pub(crate) minter: bool,
     pub(crate) skip_ev: bool,
     pub(crate) ca_made_ms: u64,
+    pub(crate) watch: Arc<dyn ClientWatch>,
 }
 
 impl RigOpts {
     pub(crate) fn new(roots: Arc<RootCertStore>) -> Self {
-        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms() }
+        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch) }
     }
 }
 
@@ -403,7 +404,7 @@ impl Rig {
             names: Arc::new(Mutex::new(NameMap::default())),
             book: Arc::new(Mutex::new(FlowBook::default())),
             meters: Arc::new(Meters::default()),
-            watch: Arc::new(NoWatch),
+            watch: opts.watch,
             hook: opts.hook,
             clock: wall_ms,
         };
@@ -1127,6 +1128,49 @@ arms!(early_data_is_refused_and_replayed_after_the_handshake, |arm| async move {
     }
     let config = super::server::server_config(rig.minter.leaf(crate::ca::LeafRequest { host: HOST, upstream_not_after_ms: u64::MAX }, wall_ms()).unwrap().der.clone(), rig.minter.root_der().to_vec(), rig.minter.leaf_key_pkcs8().to_vec(), Vec::new()).unwrap();
     assert_eq!((config.max_early_data_size, config.send_tls13_tickets), (0, 0));
+});
+
+/// What slice 7's evidence will read.
+#[derive(Default)]
+struct Watched {
+    refused: Mutex<Vec<(String, Option<rustls::AlertDescription>)>>,
+    requests: AtomicUsize,
+    silent: AtomicUsize,
+}
+
+impl ClientWatch for Watched {
+    fn handshake_failed(&self, pair: &Pair, alert: Option<rustls::AlertDescription>) {
+        self.refused.lock().unwrap().push((pair.host.clone(), alert));
+    }
+
+    fn request_seen(&self, _: &Pair) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn closed_without_request(&self, _: &Pair, _: Duration) {
+        self.silent.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+arms!(client_watch_hears_a_refusal_and_a_silent_close, |arm| async move {
+    let pki = Pki::new("Test Public Root");
+    let watched = Arc::new(Watched::default());
+    let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let rig = Rig::new(dial, RigOpts { watch: watched.clone(), ..RigOpts::new(pki.roots()) });
+    // A client that trusts only its own bundle: the pinning case of plan 4.3.
+    let (app, task) = rig.flow(flow_opts()).await;
+    let pinned = super::client_config(Pki::new("Its Own Bundle").roots(), &[]).unwrap();
+    assert!(tokio_rustls::TlsConnector::from(Arc::new(pinned)).connect(ServerName::try_from(HOST).unwrap(), app).await.is_err());
+    assert_eq!(task.await.unwrap().action, FlowAction::Failed);
+    assert_eq!(*watched.refused.lock().unwrap(), [(HOST.to_string(), Some(rustls::AlertDescription::UnknownCA))]);
+    // A client that handshakes and leaves.
+    let (app, task) = rig.flow(flow_opts()).await;
+    let (client, _) = client_tls(&[], None);
+    let tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(watched.silent.load(Ordering::Relaxed), 1);
+    assert_eq!(watched.requests.load(Ordering::Relaxed), 0);
 });
 
 // ---- Key exchange.
