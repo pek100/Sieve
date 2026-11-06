@@ -204,8 +204,12 @@ pub fn adguard_service_state() -> Result<(&'static str, AdguardService), String>
 
 /// One connect within `window`, then one read of the probe's family's owner
 /// table. The pending connect, or the stream it finished with, keeps the socket
-/// open through the read; it closes on return. A refused or failed connect is
-/// an answer (not connected); a table that cannot be read is an error.
+/// open through the read; it closes on return. A connect still pending at the
+/// window's end, or refused by the other end, is an answer (not connected). A
+/// connect that failed any other way never reached a redirect to say anything
+/// about (Windows retries a refusal for about 2 s, so what ends inside the window
+/// is local: access denied, a source address gone). That is an error, as is a
+/// table that cannot be read.
 #[cfg(windows)]
 async fn observe<S: crate::flow::flows::OwnerSource>(
     socket: socket2::Socket,
@@ -220,7 +224,12 @@ async fn observe<S: crate::flow::flows::OwnerSource>(
     let connect = tokio::net::TcpSocket::from_std_stream(socket.into()).connect(dest);
     tokio::pin!(connect);
     let outcome = tokio::time::timeout(window, &mut connect).await;
-    let connected = matches!(outcome, Ok(Ok(_)));
+    let connected = match outcome {
+        Ok(Ok(_)) => true,
+        Err(_) => false,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => false,
+        Ok(Err(e)) => return Err(format!("the probe's connect failed: {e}")),
+    };
     let table = Table::of(&FiveTuple { proto: Proto::Tcp, local, remote: dest });
     let rows = source.read(table).ok_or_else(|| format!("the owner table {table:?} could not be read"))?;
     Ok(ProbeObservation { local, dest, connected, rows })
@@ -522,6 +531,25 @@ mod tests {
             if adguard_stays_out() {
                 assert!(!obs.connected, "{obs:?}");
                 assert!(!intercepted(&obs, None));
+            }
+        }
+
+        /// Port 0 fails at once, on this machine: the kind of failure a local
+        /// denial is. It must not read as "AdGuard is not intercepting".
+        #[tokio::test]
+        async fn a_connect_that_fails_locally_is_an_error_not_an_answer() {
+            let nowhere = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+            let failed = observe(loopback_socket(), nowhere, LOOPBACK_WINDOW, &mut IpHelper).await;
+            assert!(failed.unwrap_err().contains("connect failed"));
+        }
+
+        /// The other end said no: an answer.
+        #[tokio::test]
+        async fn a_refused_connect_is_an_answer() {
+            let dest = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
+            let obs = observe(loopback_socket(), dest, LOOPBACK_WINDOW, &mut IpHelper).await.unwrap();
+            if adguard_stays_out() {
+                assert!(!obs.connected, "{obs:?}");
             }
         }
 
