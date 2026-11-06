@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 use super::Engine;
 use crate::coexist::{self, Coexistence};
 use crate::flow::tasks::FlowTasks;
+use crate::lists::https::HttpsFetcher;
 use crate::route::apply::{self, SieveLuid};
 use crate::route::journal::Journal;
 use crate::route::plan::{self, RoutePlan};
@@ -52,6 +53,7 @@ struct Up {
     stop_accept: oneshot::Sender<()>,
     accept: JoinHandle<()>,
     batches: JoinHandle<()>,
+    lists: JoinHandle<()>,
 }
 
 fn journal(engine: &Engine) -> Option<Journal> {
@@ -191,10 +193,10 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     }
 
     #[cfg(not(feature = "relay-experiments"))]
-    let relay = Arc::new(Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone()));
+    let relay = Arc::new(Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone(), engine.filter.clone()));
     #[cfg(feature = "relay-experiments")]
     let relay = {
-        let mut relay = Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone());
+        let mut relay = Relay::new(tun.index, tables.clone(), engine.book.clone(), engine.names.clone(), engine.meters.clone(), engine.filter.clone());
         relay.experiments = engine.experiments.settings.clone();
         Arc::new(relay)
     };
@@ -203,6 +205,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     #[cfg(not(feature = "relay-experiments"))]
     let device = TunDevice::new(tun.session.clone(), engine.meters.clone(), engine.beats.clone());
     let stack = IpStack::new(config, device);
+    let lists = tokio::spawn(engine.lists.clone().run(HttpsFetcher::new(relay.clone())));
     let (stop_accept, stopped) = oneshot::channel();
     let accept = tokio::spawn(accept(stack, relay.clone(), stopped));
     let batches = {
@@ -228,7 +231,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     engine.beats.relay.end();
     engine.beats.tun.end();
     engine.arm.set(true);
-    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches })
+    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists })
 }
 
 async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiver<()>) {
@@ -258,6 +261,7 @@ async fn take_down(engine: &Engine, up: Up) {
     let _ = up.stop_accept.send(());
     let _ = up.accept.await;
     up.batches.abort();
+    up.lists.abort();
     for p in &up.routes {
         let _ = apply::delete_route(up.luid.value(), *p);
     }

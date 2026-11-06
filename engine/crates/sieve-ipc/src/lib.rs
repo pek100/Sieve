@@ -1,6 +1,6 @@
 //! The pipe protocol between the Sieve app and its engine (plan 1.3). One
 //! owner for the shape (S29): the engine and src-tauri both use this crate,
-//! and `src/data/fixtures/engine-ipc-v2.json` is the shared fixture the TS
+//! and `src/data/fixtures/engine-ipc-v3.json` is the shared fixture the TS
 //! side reads too (law `tests/laws/engine-ipc.test.ts`).
 //!
 //! - One named pipe, [`PIPE_NAME`], carrying frames: a u32 little-endian
@@ -12,20 +12,21 @@
 //!   change; [`ClientMessage::Subscribe`] turns the connection into an event
 //!   stream of [`EngineMessage::Flows`] batches, every [`FLOWS_BATCH_MS`].
 //! - Changing any message shape bumps [`PROTOCOL`] and the fixture in one
-//!   commit (v2, slice 3: policy, flows, coexistence and counters).
+//!   commit (v3, slice 4: blocked flows, the grown policy, the list report).
 //!
 //! There is no operation that signs anything, exports a key or names a
 //! certificate to mint (plan 7.2), and there never will be.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this build speaks.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 /// The oldest and newest protocol versions this build accepts.
-pub const SUPPORTED: [u32; 2] = [2, 2];
+pub const SUPPORTED: [u32; 2] = [3, 3];
 pub const PIPE_NAME: &str = r"\\.\pipe\sieve-engine";
 /// Largest frame body in bytes (1 MiB).
 pub const MAX_FRAME: usize = 1 << 20;
@@ -36,9 +37,19 @@ pub const FLOWS_BATCH_MS: u64 = 250;
 pub const FLOWS_PER_FRAME: usize = 500;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh"];
 /// The `type` names of [`EngineMessage`], in declaration order.
-pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows"];
+pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists"];
+/// A flow event's rule text is cut to this many bytes: a list rule can run to
+/// kilobytes, and at this cap a full `flows` frame stays under [`MAX_FRAME`].
+pub const MAX_RULE_BYTES: usize = 256;
+/// A skipped exception line in the list report is cut to this many bytes: 200
+/// lines of each list, JSON-escaped at worst twice over, fit one frame.
+pub const MAX_LISTED_LINE_BYTES: usize = 180;
+/// The key of a guest's own row in `off_apps`, for a VM whose name is known
+/// (`vm:<name>`) or not ([`VM_UNIDENTIFIED`]).
+pub const VM_PREFIX: &str = "vm:";
+pub const VM_UNIDENTIFIED: &str = "vm:unidentified";
 
 /// App to engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +65,11 @@ pub enum ClientMessage {
     /// From now on the engine pushes [`EngineMessage::Flows`] batches of this
     /// client's session (and session 0, the services) on this connection.
     Subscribe,
+    /// Asks for [`EngineMessage::Lists`].
+    Lists,
+    /// Downloads every selected list now, whatever its age; answered with
+    /// [`EngineMessage::Lists`] as it stands (the refresh runs on).
+    ListsRefresh,
 }
 
 /// Engine to app.
@@ -72,10 +88,14 @@ pub enum EngineMessage {
     Error { message: String },
     /// Flows that opened, moved bytes or closed since the last batch.
     Flows { flows: Vec<FlowEvent> },
+    /// What the lists are doing. `compile_ms` is the last compile's time,
+    /// None before the first.
+    Lists { lists: Vec<ListStatus>, compile_ms: Option<u64> },
 }
 
-/// The user's switches as the engine holds them (`policy.json`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The user's switches as the engine holds them (`policy.json`). Every field
+/// after `engine` defaults, so a file written before it loads (S39).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     /// Raised by the app on every change; 0 is the engine's default.
@@ -83,6 +103,62 @@ pub struct Policy {
     /// `filtering.engine`: route this computer's traffic through the engine.
     /// Off (the default) means the engine adds no adapter and no route.
     pub engine: bool,
+    /// `sampling.enabled`: the global Sieve switch. Off relays every flow.
+    /// Defaults off: after an upgrade nothing is blocked until the app has
+    /// sent the Off list, so an Off app is never blocked by a missing field.
+    #[serde(default)]
+    pub sieving: bool,
+    /// App keys ([`app_key`]) and guest keys ([`VM_PREFIX`]) the user turned off.
+    #[serde(default)]
+    pub off_apps: Vec<String>,
+    /// Catalogue ids of the selected lists; None means the catalogue's defaults.
+    #[serde(default)]
+    pub lists: Option<Vec<String>>,
+    /// The user's own domain lists (B6).
+    #[serde(default)]
+    pub domain_lists: Vec<DomainList>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainListKind {
+    Block,
+    Allow,
+}
+
+/// One user domain list (B6): entries are host names, a subdomain included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DomainList {
+    pub kind: DomainListKind,
+    pub entries: Vec<String>,
+    pub enabled: bool,
+}
+
+/// One list as the engine holds it, for the per-list report (plan 5.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListStatus {
+    pub id: String,
+    /// In the policy's selection (the user's rules always are).
+    pub enabled: bool,
+    /// Milliseconds since the Unix epoch of the last good download or 304.
+    pub fetched_at_ms: Option<u64>,
+    /// The refresh interval read from the copy, None with no copy.
+    pub refresh_s: Option<u64>,
+    /// Why the last attempt failed; the last good copy stays in use.
+    pub last_error: Option<String>,
+    /// Network rules compiled. Those with a type or party constraint and all
+    /// `$removeparam` rules do not act on a bare host before decryption.
+    pub network: u64,
+    /// Cosmetic rules parsed; they do nothing before slice 9.
+    pub cosmetic: u64,
+    pub skipped: u64,
+    pub skip_reasons: BTreeMap<String, u64>,
+    /// The first 200 skipped exception lines, each cut to
+    /// [`MAX_LISTED_LINE_BYTES`].
+    pub skipped_exceptions: Vec<String>,
+    pub skipped_exceptions_total: u64,
 }
 
 /// Why the engine does not route although its switch is on (plan 1.6, 1.7).
@@ -119,6 +195,8 @@ pub struct Counters {
     pub packets_out: u64,
     /// Multicast, broadcast and link-local packets dropped before the stack.
     pub not_unicast: u64,
+    /// Flows closed by a block decision.
+    pub blocked: u64,
 }
 
 /// What the engine is doing, from facts it holds (the `status` message).
@@ -129,6 +207,8 @@ pub struct EngineStatus {
     pub filtering: bool,
     /// Sieve's routes are installed.
     pub routes_up: bool,
+    /// A compiled snapshot with at least one rule decides flows right now.
+    pub blocking: bool,
     /// Flows the engine holds right now.
     pub flows: u32,
     /// HTTPS is being decrypted.
@@ -163,13 +243,40 @@ pub enum FlowKind {
     Other,
 }
 
-/// What the engine did with the flow. Slice 3 filters nothing.
+/// What the engine did with the flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowAction {
     Relayed,
     /// The upstream could not be reached; the app side was closed.
     Failed,
+    /// A rule decided against the flow: nothing went upstream, the app was closed.
+    Blocked,
+}
+
+/// Why a flow was decided the way it was (one owner: the engine's decision
+/// and the log read these names).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowReason {
+    /// The global switch is off.
+    Disabled,
+    /// A DNS flow: a lookup is never a blocking decision.
+    Dns,
+    /// The app's or guest's row is Off.
+    AppExempt,
+    /// A rule blocks the name the flow carries.
+    NamedBlock,
+    /// An exception rule allows the name the flow carries.
+    NamedAllow,
+    /// No rule for the name the flow carries.
+    NamedNoRule,
+    /// The flow carries no name and every live name of its address blocks.
+    AllResolvedNamesBlocked,
+    /// The flow carries no name and some live name of its address does not block.
+    MixedResolvedNames,
+    /// The flow carries no name and its address has none alive.
+    UnknownDomain,
 }
 
 /// One flow as the engine saw it (plan 1.3 `Flows`).
@@ -194,6 +301,45 @@ pub struct FlowEvent {
     pub bytes_down: u64,
     /// False in the last event of a flow.
     pub open: bool,
+    /// Why it was decided so; None before the decision.
+    pub reason: Option<FlowReason>,
+    /// The rule that decided it, cut to [`MAX_RULE_BYTES`].
+    pub rule: Option<String>,
+    /// The id of the list holding that rule.
+    pub list: Option<String>,
+}
+
+/// `text` cut to at most `max` bytes, on a character boundary.
+pub fn cap_text(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// File name without directory and extension.
+fn exe_stem(path: &str) -> &str {
+    let base = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    match base.rsplit_once('.') {
+        Some((stem, ext)) if !ext.is_empty() => stem,
+        _ => base,
+    }
+}
+
+/// An app's identity, the settings key of `apps.levels`: lower-case product
+/// name, else exe stem, else process name. The same rule as `appIdentity` in
+/// `src/core/apps.ts`; `src/data/fixtures/app-keys-v1.json` ties the two.
+///
+/// TENSION: a key from a ProductName can be spoofed, so an exe that names
+/// itself like an Off product gets its exemption. Ad blocking is no boundary
+/// against local code, and this is how the Apps page already groups apps.
+pub fn app_key(product: Option<&str>, exe: Option<&str>, process_name: &str) -> String {
+    let product = product.map(str::trim).filter(|p| !p.is_empty());
+    product.or(exe.map(exe_stem)).unwrap_or(process_name).to_lowercase()
 }
 
 /// The engine's answer to a client's Hello.
@@ -287,7 +433,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    const FIXTURE: &str = include_str!("../../../../src/data/fixtures/engine-ipc-v2.json");
+    const FIXTURE: &str = include_str!("../../../../src/data/fixtures/engine-ipc-v3.json");
 
     fn fixture() -> Value {
         serde_json::from_str(FIXTURE).unwrap()
@@ -340,6 +486,8 @@ mod tests {
             ClientMessage::Status => "status",
             ClientMessage::SetPolicy(_) => "set_policy",
             ClientMessage::Subscribe => "subscribe",
+            ClientMessage::Lists => "lists",
+            ClientMessage::ListsRefresh => "lists_refresh",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -347,6 +495,7 @@ mod tests {
             EngineMessage::Status(_) => "status",
             EngineMessage::Error { .. } => "error",
             EngineMessage::Flows { .. } => "flows",
+            EngineMessage::Lists { .. } => "lists",
         };
         let f = fixture();
         for m in f["client"].as_array().unwrap() {
@@ -438,9 +587,61 @@ mod tests {
             Blocker::Adguard { .. } | Blocker::Vpn { .. } | Blocker::CrashLoop { .. } | Blocker::Setup { .. } => (),
         };
         kinds(&Blocker::CrashLoop { starts: 3 });
-        for name in ["relayed", "failed", "tls", "http", "quic", "dns", "other", "tcp", "udp"] {
+        for name in ["relayed", "failed", "blocked", "tls", "http", "quic", "dns", "other", "tcp", "udp", "named_block", "app_exempt"] {
             assert!(f.contains(&format!(r#""{name}""#)), "{name}");
         }
+    }
+
+    /// A policy file written by protocol 2 has only `revision` and `engine`.
+    #[test]
+    fn a_v2_policy_loads_with_sieving_off_and_no_lists_chosen() {
+        let p: Policy = serde_json::from_str(r#"{"revision":4,"engine":true}"#).unwrap();
+        assert_eq!(p, Policy { revision: 4, engine: true, ..Policy::default() });
+        assert!(!p.sieving && p.off_apps.is_empty() && p.lists.is_none() && p.domain_lists.is_empty());
+        assert!(serde_json::from_str::<Policy>(r#"{"engine":true}"#).is_err(), "still no revision, no policy");
+    }
+
+    /// Both this test and `tests/laws/app-key.test.ts` read this fixture.
+    #[test]
+    fn app_keys_match_the_shared_fixture() {
+        let f: Value = serde_json::from_str(include_str!("../../../../src/data/fixtures/app-keys-v1.json")).unwrap();
+        let cases = f["cases"].as_array().unwrap();
+        assert!(cases.len() >= 8);
+        for c in cases {
+            let key = app_key(c["product"].as_str(), c["exe"].as_str(), c["name"].as_str().unwrap());
+            assert_eq!(key, c["key"].as_str().unwrap(), "{c}");
+        }
+    }
+
+    #[test]
+    fn cap_text_cuts_on_a_character_boundary() {
+        assert_eq!(cap_text("abc", 3), "abc");
+        assert_eq!(cap_text("abcd", 3), "abc");
+        assert_eq!(cap_text("aé", 2), "a", "é is two bytes");
+    }
+
+    /// The worst case: every selected list (more than the catalogue holds)
+    /// with its 200 lines at their cap, all of it JSON-escaped.
+    #[test]
+    fn a_full_lists_frame_stays_under_the_frame_limit() {
+        const LISTS_AT_WORST: usize = 14;
+        const LISTED_LINES: usize = 200;
+        let reasons = (0..16).map(|i| (format!("network filter error: reason {i} worded at some length"), u64::MAX)).collect();
+        let list = ListStatus {
+            id: "i".repeat(32),
+            enabled: true,
+            fetched_at_ms: Some(u64::MAX),
+            refresh_s: Some(u64::MAX),
+            last_error: Some("e".repeat(256)),
+            network: u64::MAX,
+            cosmetic: u64::MAX,
+            skipped: u64::MAX,
+            skip_reasons: reasons,
+            skipped_exceptions: vec!["\"".repeat(MAX_LISTED_LINE_BYTES); LISTED_LINES],
+            skipped_exceptions_total: u64::MAX,
+        };
+        let msg = EngineMessage::Lists { lists: vec![list; LISTS_AT_WORST], compile_ms: Some(u64::MAX) };
+        assert!(encode(&msg).is_ok(), "{:?}", encode(&msg).err());
     }
 
     #[test]
@@ -459,6 +660,9 @@ mod tests {
             bytes_up: u64::MAX,
             bytes_down: u64::MAX,
             open: true,
+            reason: Some(FlowReason::AllResolvedNamesBlocked),
+            rule: Some("\"".repeat(MAX_RULE_BYTES)),
+            list: Some("l".repeat(32)),
         };
         let msg = EngineMessage::Flows { flows: vec![ev; FLOWS_PER_FRAME] };
         assert!(encode(&msg).is_ok());
@@ -470,7 +674,7 @@ mod tests {
             answer_hello(PROTOCOL, "0.1.0", 3),
             EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 3 }
         );
-        for v in [0, 1, 3, u32::MAX] {
+        for v in [0, 1, 2, 4, u32::MAX] {
             assert_eq!(answer_hello(v, "0.1.0", 3), EngineMessage::Incompatible { supported: SUPPORTED }, "v{v}");
         }
     }

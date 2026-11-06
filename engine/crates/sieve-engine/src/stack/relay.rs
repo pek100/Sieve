@@ -9,10 +9,14 @@
 //!   a dropped ipstack stream left curl waiting 20 s).
 //!
 //! TCP uses the offline-tested `flow::relay::relay_tcp` (server bytes flow at
-//! once, client bytes are held until decoded, then relayed). UDP holds
-//! datagrams until decoded, then relays both ways. Port 53 is DNS: the query
-//! goes to the server it was sent to, and every answer is recorded in the
-//! IP-to-names map. Nothing is dropped for its content in slice 3.
+//! once, client bytes are held until decoded and decided, then relayed or the
+//! flow is closed with nothing sent). UDP holds datagrams until decoded and
+//! decided; a blocked UDP flow's book entry closes and its datagrams are
+//! swallowed until idle. Port 53 is DNS: the query goes to the server it was
+//! sent to, every answer is recorded in the IP-to-names map, and a lookup is
+//! never blocked. The upstream TCP connect happens before the decision, so
+//! server-first bytes may reach an app: a decoded name beats the IP map, so
+//! the decision cannot be earlier.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
@@ -24,11 +28,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 use super::book::FlowBook;
-use super::{DNS_PORT, Meters, kind_of};
+use super::{DNS_PORT, Meters, close_blocked, drain_udp, kind_of, record_decision};
 use crate::dns::{self, NameMap};
+use crate::domain::{FilterSlot, Flow, Owner as FlowOwner};
 use crate::flow::classify::{Decoded, UdpClassifier};
 use crate::flow::flows::os::IpHelper;
-use crate::flow::flows::{Action, Attributor, ExeCache, FiveTuple, Owner, REFRESH_MIN_MS};
+use crate::flow::flows::{Action, AppKeys, Attributor, ExeCache, FiveTuple, Owner, REFRESH_MIN_MS};
 use crate::flow::packet::Proto;
 use crate::flow::relay::relay_tcp;
 use crate::route::pin::{self, unicast_if_value};
@@ -47,6 +52,13 @@ pub const DNS_IDLE: Duration = Duration::from_secs(5);
 const DATAGRAM: usize = 65_535;
 
 type ExeLookup = fn(u32) -> Option<String>;
+type ProductLookup = fn(&str) -> Option<String>;
+
+/// A flow the book took: its id and its app's key, when it has one.
+struct Admitted {
+    id: u64,
+    app: Option<String>,
+}
 
 /// What every flow task shares.
 pub struct Relay {
@@ -56,6 +68,9 @@ pub struct Relay {
     pub tun_index: u32,
     pub attributor: Mutex<Attributor<IpHelper>>,
     pub exes: Mutex<ExeCache<ExeLookup>>,
+    pub keys: AppKeys<ProductLookup>,
+    /// The decision snapshot, read once per flow.
+    pub filter: Arc<FilterSlot>,
     /// Re-read on every route change (control); pinning asks it.
     pub tables: RwLock<NetTables>,
     pub book: Arc<Mutex<FlowBook>>,
@@ -76,7 +91,7 @@ pub fn session_of(pid: u32) -> Option<u32> {
 }
 
 impl Relay {
-    pub fn new(tun_index: u32, tables: NetTables, book: Arc<Mutex<FlowBook>>, names: Arc<Mutex<NameMap>>, meters: Arc<Meters>) -> Self {
+    pub fn new(tun_index: u32, tables: NetTables, book: Arc<Mutex<FlowBook>>, names: Arc<Mutex<NameMap>>, meters: Arc<Meters>, filter: Arc<FilterSlot>) -> Self {
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: crate::experiments::Settings::default(),
@@ -84,6 +99,8 @@ impl Relay {
             tun_index,
             attributor: Mutex::new(Attributor::new(IpHelper)),
             exes: Mutex::new(ExeCache::new(crate::flow::flows::os::exe_path as ExeLookup)),
+            keys: AppKeys::new(crate::flow::flows::os::product_name as ProductLookup),
+            filter,
             tables: RwLock::new(tables),
             book,
             names,
@@ -126,7 +143,7 @@ impl Relay {
 
     /// Counts the flow and registers it in the book; None when it is the
     /// engine's own (refused) or the book is full.
-    fn admit(&self, flow: &FiveTuple, pid: Option<u32>, proto: FlowProto, kind: FlowKind) -> Option<u64> {
+    fn admit(&self, flow: &FiveTuple, pid: Option<u32>, proto: FlowProto, kind: FlowKind) -> Option<Admitted> {
         if pid == Some(self.own_pid) {
             Meters::bump(&self.meters.own_refused);
             return None;
@@ -136,6 +153,7 @@ impl Relay {
             Meters::bump(&self.meters.attributed);
         }
         let exe = pid.and_then(|p| lock(&self.exes).exe(p, monotonic_ms()));
+        let app = pid.and_then(|p| self.keys.of_pid(p, exe.as_deref()));
         let event = FlowEvent {
             id: 0,
             pid,
@@ -150,15 +168,20 @@ impl Relay {
             bytes_up: 0,
             bytes_down: 0,
             open: true,
+            reason: None,
+            rule: None,
+            list: None,
         };
-        lock(&self.book).open(event)
+        lock(&self.book).open(event).map(|id| Admitted { id, app })
     }
 
-    fn decided(&self, id: u64, d: &Decoded, dns: bool) {
-        lock(&self.book).update(id, |e| {
-            e.kind = if dns { FlowKind::Dns } else { kind_of(d) };
-            e.host.clone_from(&d.domain);
-        });
+    /// The one decision for a flow whose first bytes were decoded, in the book.
+    /// The snapshot is read here, so a flow decided keeps its decision.
+    fn decide(&self, admitted: &Admitted, d: &Decoded, dns: bool, flow: &FiveTuple) -> Action {
+        let owner = admitted.app.as_deref().map_or(FlowOwner::Unknown, |key| FlowOwner::App { key });
+        let decision = self.filter.get().decide(Flow::from_decoded(d, dns, flow.remote.ip(), owner), &self.names, monotonic_ms());
+        lock(&self.book).update(admitted.id, |e| record_decision(e, d, dns, &decision));
+        decision.action
     }
 
     /// A socket for `target`, bound to the egress source and pinned to the
@@ -178,7 +201,9 @@ impl Relay {
         Ok(sock)
     }
 
-    async fn connect(&self, target: SocketAddr) -> Result<TcpStream, String> {
+    /// A connected TCP stream on the egress interface (flows and the engine's
+    /// own downloads alike).
+    pub async fn connect(&self, target: SocketAddr) -> Result<TcpStream, String> {
         let sock = self.egress_socket(target, false)?;
         let socket = TcpSocket::from_std_stream(sock.into());
         match tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(target)).await {
@@ -210,34 +235,29 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
     let dns = flow.remote.port() == DNS_PORT;
     let (pid, upstream) = tokio::join!(ctx.owner(flow), ctx.connect(flow.remote));
     let kind = if dns { FlowKind::Dns } else { FlowKind::Other };
-    let Some(id) = ctx.admit(&flow, pid, FlowProto::Tcp, kind) else { return close_app(&mut app).await };
+    let Some(admitted) = ctx.admit(&flow, pid, FlowProto::Tcp, kind) else { return close_app(&mut app).await };
     let upstream = match upstream {
         Ok(u) => u,
         Err(_) => {
-            lock(&ctx.book).close(id, FlowAction::Failed, 0, 0);
+            lock(&ctx.book).close(admitted.id, FlowAction::Failed, 0, 0);
             return close_app(&mut app).await;
         }
     };
+    let decide = |d: &Decoded| ctx.decide(&admitted, d, dns, &flow);
     #[cfg(feature = "relay-experiments")]
     let out = if let Some(capacity) = ctx.experiments.copy_buffer_bytes {
-        crate::flow::relay::relay_tcp_buffered(&mut app, upstream, FIRST_BYTES_WAIT, |d| {
-            ctx.decided(id, d, dns);
-            Action::Pass
-        }, capacity).await
+        crate::flow::relay::relay_tcp_buffered(&mut app, upstream, FIRST_BYTES_WAIT, decide, capacity).await
     } else {
-        relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, |d| {
-            ctx.decided(id, d, dns);
-            Action::Pass
-        }).await
+        relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, decide).await
     };
     #[cfg(not(feature = "relay-experiments"))]
-    let out = relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, |d| {
-        ctx.decided(id, d, dns);
-        Action::Pass
-    })
-    .await;
-    let action = if out.upstream_write_failed { FlowAction::Failed } else { FlowAction::Relayed };
-    lock(&ctx.book).close(id, action, out.bytes_up, out.bytes_down);
+    let out = relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, decide).await;
+    if out.dropped {
+        close_blocked(&ctx.book, &ctx.meters, admitted.id);
+    } else {
+        let action = if out.upstream_write_failed { FlowAction::Failed } else { FlowAction::Relayed };
+        lock(&ctx.book).close(admitted.id, action, out.bytes_up, out.bytes_down);
+    }
     if out.stop {
         close_app(&mut app).await;
     }
@@ -270,8 +290,12 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         }
     };
     let pid = owner.await.unwrap_or(None);
-    let Some(id) = ctx.admit(&flow, pid, FlowProto::Udp, if dns { FlowKind::Dns } else { kind_of(&decided) }) else { return };
-    ctx.decided(id, &decided, dns);
+    let Some(admitted) = ctx.admit(&flow, pid, FlowProto::Udp, if dns { FlowKind::Dns } else { kind_of(&decided) }) else { return };
+    let id = admitted.id;
+    if ctx.decide(&admitted, &decided, dns, &flow) == Action::Drop {
+        close_blocked(&ctx.book, &ctx.meters, id);
+        return drain_udp(&mut app, UDP_IDLE).await;
+    }
     let up = match ctx.egress_socket(flow.remote, true).and_then(|s| UdpSocket::from_std(s.into()).map_err(|e| e.to_string())) {
         Ok(u) => u,
         Err(_) => return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0),

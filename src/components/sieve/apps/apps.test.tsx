@@ -63,7 +63,7 @@ describe("apps screen", () => {
     expect(toggle).toBeChecked();
     expect(toggle).toHaveAccessibleDescription(APP_OFF_MEANS);
     expect(APP_OFF_MEANS).toMatch(/stops tracking and charting/);
-    // Nothing is blocked before the engine, so the copy must not claim blocking.
+    // Whether anything is blocked is the engine's fact, so this copy must not claim blocking.
     expect(APP_OFF_MEANS).not.toMatch(/block/i);
     // No Watch level and no locked per-app filtering anywhere.
     expect(document.body.textContent).not.toMatch(/Watch|network driver|Per-app filtering/);

@@ -12,11 +12,14 @@ pub mod routing;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use sieve_ipc::{Blocker, EngineStatus, FlowEvent, Policy};
+use sieve_filter::rules::{RuleEngine, RuleSet};
+use sieve_ipc::{Blocker, EngineStatus, FlowEvent, ListStatus, Policy};
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::dns::NameMap;
+use crate::domain::{DomainFilter, FilterSlot, user_engine};
 use crate::ipc::{Backend, Subscription};
+use crate::lists::Lists;
 use crate::policy::{self, Runs};
 use crate::stack::Meters;
 use crate::stack::book::FlowBook;
@@ -58,6 +61,10 @@ pub struct Engine {
     pub book: Arc<Mutex<FlowBook>>,
     pub names: Arc<Mutex<NameMap>>,
     pub meters: Arc<Meters>,
+    /// The decision snapshot the relay reads; rebuilt off the hot path.
+    pub filter: Arc<FilterSlot>,
+    /// The default lists: download state, cache and compile.
+    pub lists: Arc<Lists>,
     pub flows: broadcast::Sender<Arc<Vec<FlowEvent>>>,
     /// Whether routes are up, for subscriptions (they end when it turns false).
     routes_up: watch::Sender<bool>,
@@ -73,6 +80,11 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl Engine {
     pub fn new(dir: Option<PathBuf>, exe: PathBuf, policy: Policy, runs: Runs, crash_loop: Option<u32>) -> Self {
+        // Flows pass until the lists' first snapshot lands (D13); the user's
+        // own rules are small and hold from the start.
+        let rules = RuleSet { user: Arc::new(user_engine(&policy)), lists: Arc::new(RuleEngine::empty()) };
+        let filter = Arc::new(FilterSlot::new(DomainFilter::new(&policy, rules)));
+        let lists = Arc::new(Lists::new(dir.as_deref(), filter.clone(), policy.lists.clone()));
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: dir.as_deref().map(crate::experiments::Loaded::load).unwrap_or_else(crate::experiments::Loaded::absent),
@@ -87,6 +99,8 @@ impl Engine {
             book: Arc::default(),
             names: Arc::default(),
             meters: Arc::default(),
+            filter,
+            lists,
             flows: broadcast::channel(FLOWS_BACKLOG).0,
             routes_up: watch::channel(false).0,
             wake: Arc::default(),
@@ -96,7 +110,19 @@ impl Engine {
     }
 
     pub fn policy(&self) -> Policy {
-        *lock(&self.policy)
+        lock(&self.policy).clone()
+    }
+
+    /// A changed policy reaches the decision: an Off-app or switch change
+    /// recompiles nothing, the user's rules recompile their small engine, and
+    /// a new list selection wakes the refresh task.
+    fn apply_to_filter(&self, before: &Policy, now: &Policy) {
+        let user = (before.domain_lists != now.domain_lists).then(|| Arc::new(user_engine(now)));
+        self.filter.update(|f| {
+            let rules = RuleSet { user: user.unwrap_or_else(|| f.rules.user.clone()), lists: f.rules.lists.clone() };
+            DomainFilter::new(now, rules)
+        });
+        self.lists.set_selection(now.lists.clone());
     }
 
     /// Restarts that stopped routing, when this run is a crash loop.
@@ -190,9 +216,10 @@ impl Backend for Engine {
         EngineStatus {
             filtering: f.routes_up,
             routes_up: f.routes_up,
+            blocking: f.routes_up && self.filter.get().blocks_anything(),
             flows: u32::try_from(lock(&self.book).live()).unwrap_or(u32::MAX),
             decrypting: false,
-            last_error: f.last_error,
+            last_error: f.last_error.or_else(|| self.lists.compile_error()),
             policy,
             blocker,
             split_tunnels: f.split_tunnels,
@@ -203,7 +230,7 @@ impl Backend for Engine {
     fn set_policy(&self, asked: Policy) -> Result<EngineStatus, String> {
         {
             let mut current = lock(&self.policy);
-            let next = policy::accept(*current, asked)?;
+            let next = policy::accept(&current, asked)?;
             if let Some(dir) = &self.dir {
                 policy::save(dir, &next)?;
             }
@@ -214,6 +241,7 @@ impl Backend for Engine {
                     let _ = policy::save_runs(dir, &runs);
                 }
             }
+            self.apply_to_filter(&current, &next);
             *current = next;
         }
         self.wake.notify_one();
@@ -224,6 +252,14 @@ impl Backend for Engine {
         let book = lock(&self.book);
         // Subscribed under the book's lock: no batch slips between the two.
         Subscription { open: book.snapshot(), batches: self.flows.subscribe(), routes_up: self.routes_up.subscribe() }
+    }
+
+    fn lists(&self) -> (Vec<ListStatus>, Option<u64>) {
+        self.lists.report()
+    }
+
+    fn lists_refresh(&self) {
+        self.lists.refresh_now();
     }
 }
 
@@ -337,30 +373,84 @@ mod tests {
         assert_eq!(s.blocker, None);
     }
 
+    fn switches(revision: u64, engine: bool) -> Policy {
+        Policy { revision, engine, ..Policy::default() }
+    }
+
     #[test]
     fn a_stale_policy_is_refused_and_a_newer_one_wakes_the_loop() {
-        let e = engine(Policy { revision: 2, engine: false }, None);
-        assert!(e.set_policy(Policy { revision: 2, engine: true }).unwrap_err().contains("stale"));
+        let e = engine(switches(2, false), None);
+        assert!(e.set_policy(switches(2, true)).unwrap_err().contains("stale"));
         assert!(!e.policy().engine);
-        let s = e.set_policy(Policy { revision: 3, engine: true }).unwrap();
-        assert_eq!(s.policy, Policy { revision: 3, engine: true });
+        let s = e.set_policy(switches(3, true)).unwrap();
+        assert_eq!(s.policy, switches(3, true));
+    }
+
+    fn sees(e: &Engine, host: &str, key: &str) -> crate::flow::flows::Action {
+        use crate::domain::{Flow, Owner};
+        let flow = Flow { dns: false, name: Some(host), remote: "192.0.2.1".parse().unwrap(), owner: Owner::App { key } };
+        e.filter.get().decide(flow, &e.names, 0).action
+    }
+
+    /// The acceptance chain through the policy: the user's rule blocks a
+    /// sieved app, an Off change alone relays it with no recompile, and the
+    /// global switch relays everyone.
+    #[test]
+    fn a_policy_change_reaches_the_decision_without_a_recompile() {
+        use crate::flow::flows::Action;
+        use sieve_ipc::{DomainList, DomainListKind};
+        let user = vec![DomainList { kind: DomainListKind::Block, entries: vec!["ads.example".into()], enabled: true }];
+        let e = engine(Policy { revision: 1, sieving: true, domain_lists: user.clone(), ..Policy::default() }, None);
+        assert_eq!(sees(&e, "ads.example", "browser"), Action::Drop);
+        assert_eq!(sees(&e, "news.example", "browser"), Action::Pass);
+        let compiled = e.filter.get().rules.user.clone();
+        e.set_policy(Policy { revision: 2, sieving: true, domain_lists: user.clone(), off_apps: vec!["browser".into()], ..Policy::default() }).unwrap();
+        assert_eq!(sees(&e, "ads.example", "browser"), Action::Pass);
+        assert_eq!(sees(&e, "ads.example", "other"), Action::Drop);
+        assert!(Arc::ptr_eq(&compiled, &e.filter.get().rules.user), "nothing recompiled");
+        e.set_policy(Policy { revision: 3, sieving: false, domain_lists: user, ..Policy::default() }).unwrap();
+        assert_eq!(sees(&e, "ads.example", "other"), Action::Pass);
+        e.set_policy(Policy { revision: 4, sieving: true, ..Policy::default() }).unwrap();
+        assert_eq!(sees(&e, "ads.example", "other"), Action::Pass, "the rule went with the list");
+    }
+
+    #[test]
+    fn blocking_is_its_own_fact_and_routing_alone_does_not_claim_it() {
+        use sieve_ipc::{DomainList, DomainListKind};
+        let user = vec![DomainList { kind: DomainListKind::Block, entries: vec!["ads.example".into()], enabled: true }];
+        let e = engine(Policy { revision: 1, sieving: true, ..Policy::default() }, None);
+        e.set_facts(|f| f.routes_up = true);
+        let s = e.status();
+        assert!(s.filtering && !s.blocking, "routes up, but no rule yet");
+        e.set_policy(Policy { revision: 2, sieving: true, domain_lists: user, ..Policy::default() }).unwrap();
+        assert!(e.status().blocking);
+        e.set_facts(|f| f.routes_up = false);
+        assert!(!e.status().blocking, "no routes, nothing can be blocked");
+    }
+
+    #[test]
+    fn the_report_lists_every_catalogue_row_and_the_users_rules() {
+        let (rows, compile_ms) = Backend::lists(&engine(Policy::default(), None));
+        assert_eq!(rows.len(), sieve_filter::catalogue::LISTS.len() + 1);
+        assert_eq!(rows.last().unwrap().id, sieve_filter::rules::USER_LIST);
+        assert_eq!(compile_ms, None);
     }
 
     #[test]
     fn a_crash_loop_blocks_until_the_user_turns_the_engine_on_again() {
-        let e = engine(Policy { revision: 1, engine: true }, Some(3));
+        let e = engine(switches(1, true), Some(3));
         assert_eq!(e.status().blocker, Some(Blocker::CrashLoop { starts: 3 }));
-        e.set_policy(Policy { revision: 2, engine: false }).unwrap();
+        e.set_policy(switches(2, false)).unwrap();
         assert_eq!(e.status().blocker, None, "off: nothing to explain");
         assert_eq!(e.crash_loop(), Some(3), "turning off does not forgive");
-        e.set_policy(Policy { revision: 3, engine: true }).unwrap();
+        e.set_policy(switches(3, true)).unwrap();
         assert_eq!(e.crash_loop(), None);
         assert_eq!(e.status().blocker, None);
     }
 
     #[test]
     fn a_routing_engine_reports_routes_and_split_tunnels() {
-        let e = engine(Policy { revision: 1, engine: true }, None);
+        let e = engine(switches(1, true), None);
         e.set_facts(|f| {
             f.routes_up = true;
             f.split_tunnels = vec!["Corp VPN".into()];

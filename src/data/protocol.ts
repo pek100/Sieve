@@ -367,10 +367,11 @@ export function parseWindowsDns(raw: unknown): WindowsDns {
  * `src/data/fixtures/engine-probe-v2.json`): the filtering engine from
  * facts. `service` is the Windows service's state ("missing" when not
  * installed); `pipe` is the engine's own answer, asked only while the service
- * runs. `status` is the engine's `sieve-ipc` Status (protocol 2, fixture
- * `engine-ipc-v2.json`). v2: the status carries the policy, the blocker, the
+ * runs. `status` is the engine's `sieve-ipc` Status (protocol 3, fixture
+ * `engine-ipc-v3.json`). The status carries the policy, the blocker, the
  * split tunnels and the engine's counters; the probe also reads AdGuard's
- * service state (`adguard`), for the pause offer.
+ * service state (`adguard`), for the pause offer. Fields protocol 3 added read
+ * as their typed defaults when absent, so an older answer degrades, not throws.
  */
 export const ENGINE_PROBE_VERSION = 2 as const;
 export const SERVICE_FACTS = ["missing", "stopped", "starting", "stopping", "running", "other"] as const;
@@ -385,9 +386,24 @@ export type EngineBlocker =
   | { kind: "crash_loop"; starts: number }
   | { kind: "setup"; message: string };
 
+export type DomainListKind = "block" | "allow";
+
+export interface EngineDomainList {
+  kind: DomainListKind;
+  entries: string[];
+  enabled: boolean;
+}
+
 export interface EnginePolicy {
   revision: number;
   engine: boolean;
+  /** The global Sieve switch; off relays every flow. */
+  sieving: boolean;
+  /** App keys (`appIdentity`) and guest keys (`vm:<name>`) the user turned off. */
+  off_apps: string[];
+  /** Catalogue ids; null means the catalogue's defaults. */
+  lists: string[] | null;
+  domain_lists: EngineDomainList[];
 }
 
 export interface EngineCounters {
@@ -398,11 +414,14 @@ export interface EngineCounters {
   packets_in: number;
   packets_out: number;
   not_unicast: number;
+  blocked: number;
 }
 
 export interface EngineStatus {
   filtering: boolean;
   routes_up: boolean;
+  /** A compiled snapshot with at least one rule decides flows right now. */
+  blocking: boolean;
   flows: number;
   decrypting: boolean;
   last_error: string | null;
@@ -413,6 +432,31 @@ export interface EngineStatus {
 }
 
 const COUNTER_KEYS = ["flows", "attributed", "own_refused", "dns_answers", "packets_in", "packets_out", "not_unicast"] as const;
+
+/** `raw` read by `parse`, or `fallback` when the field is absent (an older engine). */
+function orDefault<T>(raw: unknown, parse: (v: unknown) => T, fallback: T): T {
+  return raw === undefined ? fallback : parse(raw);
+}
+
+function domainLists(raw: unknown): EngineDomainList[] {
+  if (!Array.isArray(raw)) throw new ProtocolError("policy.domain_lists must be an array");
+  return raw.map((v, i) => {
+    const d = rec(v, `domain_lists[${i}]`);
+    return { kind: oneOf(d.kind, ["block", "allow"] as const, `domain_lists[${i}].kind`), entries: strings(d.entries, `domain_lists[${i}].entries`), enabled: bool(d.enabled, `domain_lists[${i}].enabled`) };
+  });
+}
+
+function policy(raw: unknown): EnginePolicy {
+  const p = rec(raw, "status.policy");
+  return {
+    revision: int(p.revision, "policy.revision"),
+    engine: bool(p.engine, "policy.engine"),
+    sieving: orDefault(p.sieving, (v) => bool(v, "policy.sieving"), false),
+    off_apps: orDefault(p.off_apps, (v) => strings(v, "policy.off_apps"), []),
+    lists: orDefault<string[] | null>(p.lists, (v) => (v === null ? null : strings(v, "policy.lists")), null),
+    domain_lists: orDefault(p.domain_lists, domainLists, []),
+  };
+}
 
 function blocker(raw: unknown): EngineBlocker {
   const b = rec(raw, "status.blocker");
@@ -430,22 +474,76 @@ function blocker(raw: unknown): EngineBlocker {
   }
 }
 
-/** Validate an untrusted engine Status (sieve-ipc v2). Throws ProtocolError. */
+/** Validate an untrusted engine Status (sieve-ipc v3). Throws ProtocolError. */
 export function parseEngineStatus(raw: unknown): EngineStatus {
   const s = rec(raw, "status");
-  const p = rec(s.policy, "status.policy");
   const c = rec(s.counters, "status.counters");
   return {
     filtering: bool(s.filtering, "status.filtering"),
     routes_up: bool(s.routes_up, "status.routes_up"),
+    blocking: orDefault(s.blocking, (v) => bool(v, "status.blocking"), false),
     flows: int(s.flows, "status.flows"),
     decrypting: bool(s.decrypting, "status.decrypting"),
     last_error: strOrNull(s.last_error, "status.last_error"),
-    policy: { revision: int(p.revision, "policy.revision"), engine: bool(p.engine, "policy.engine") },
+    policy: policy(s.policy),
     blocker: s.blocker === null ? null : blocker(s.blocker),
     split_tunnels: strings(s.split_tunnels, "status.split_tunnels"),
-    counters: Object.fromEntries(COUNTER_KEYS.map((k) => [k, int(c[k], `counters.${k}`)])) as unknown as EngineCounters,
+    counters: {
+      ...(Object.fromEntries(COUNTER_KEYS.map((k) => [k, int(c[k], `counters.${k}`)])) as Omit<EngineCounters, "blocked">),
+      blocked: orDefault(c.blocked, (v) => int(v, "counters.blocked"), 0),
+    },
   };
+}
+
+/** One list in the engine's per-list report (sieve-ipc `ListStatus`). */
+export interface EngineListStatus {
+  id: string;
+  enabled: boolean;
+  fetched_at_ms: number | null;
+  refresh_s: number | null;
+  last_error: string | null;
+  network: number;
+  cosmetic: number;
+  skipped: number;
+  skip_reasons: Record<string, number>;
+  /** The first 200 skipped exception lines, each cut short. */
+  skipped_exceptions: string[];
+  skipped_exceptions_total: number;
+}
+
+export interface EngineLists {
+  lists: EngineListStatus[];
+  compile_ms: number | null;
+}
+
+function absentOrInt(raw: unknown, what: string): number | null {
+  return raw === null || raw === undefined ? null : int(raw, what);
+}
+
+function listStatus(raw: unknown, i: number): EngineListStatus {
+  const w = `lists[${i}]`;
+  const l = rec(raw, w);
+  const reasons = l.skip_reasons === undefined ? {} : rec(l.skip_reasons, `.skip_reasons`);
+  return {
+    id: str(l.id, `.id`),
+    enabled: bool(l.enabled, `.enabled`),
+    fetched_at_ms: absentOrInt(l.fetched_at_ms, `.fetched_at_ms`),
+    refresh_s: absentOrInt(l.refresh_s, `.refresh_s`),
+    last_error: l.last_error === undefined ? null : strOrNull(l.last_error, `.last_error`),
+    network: orDefault(l.network, (v) => int(v, `.network`), 0),
+    cosmetic: orDefault(l.cosmetic, (v) => int(v, `.cosmetic`), 0),
+    skipped: orDefault(l.skipped, (v) => int(v, `.skipped`), 0),
+    skip_reasons: Object.fromEntries(Object.entries(reasons).map(([why, n]) => [why, int(n, `.skip_reasons`)])),
+    skipped_exceptions: orDefault(l.skipped_exceptions, (v) => strings(v, `.skipped_exceptions`), []),
+    skipped_exceptions_total: orDefault(l.skipped_exceptions_total, (v) => int(v, `.skipped_exceptions_total`), 0),
+  };
+}
+
+/** Validate an untrusted `engine_lists` answer. Throws ProtocolError. */
+export function parseEngineLists(raw: unknown): EngineLists {
+  const x = rec(raw, "engine lists");
+  if (!Array.isArray(x.lists)) throw new ProtocolError("lists must be an array");
+  return { lists: x.lists.map(listStatus), compile_ms: absentOrInt(x.compile_ms, "compile_ms") };
 }
 
 export type PipeFact =

@@ -53,12 +53,17 @@ describe("engine phase", () => {
     expect(enginePhase(starting)).toBe("starting");
   });
 
-  it("never claims filtering or blocking: slice 3 relays every flow", () => {
+  it("claims no blocking unless the engine says it blocks", () => {
     for (const s of [EMPTY_ENGINE, { probe: null, error: "e" }, ...ALL.map(facts)]) {
       expect(ENGINE_STATE_TEXT[enginePhase(s)]).not.toMatch(/filtering|blocked|blocking/i);
       expect(engineDetail(s)).not.toMatch(/is filtering|blocks |are blocked|blocked for/i);
     }
     expect(engineDetail(facts("filtering"))).toContain("Nothing is blocked yet");
+    const routing = facts("filtering");
+    const pipe = routing.probe!.pipe as Extract<NonNullable<NonNullable<EngineSlice["probe"]>["pipe"]>, { kind: "welcome" }>;
+    const blocking: EngineSlice = { ...routing, probe: { ...routing.probe!, pipe: { ...pipe, status: { ...pipe.status, blocking: true } } } };
+    expect(enginePhase(blocking)).toBe("routing");
+    expect(engineDetail(blocking)).toMatch(/closes connections to blocked hosts/);
   });
 
   it("names the blocker: AdGuard's service, the VPN adapter, the restarts, the setup error", () => {

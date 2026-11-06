@@ -118,6 +118,9 @@ mod tests {
             bytes_up: 0,
             bytes_down: 0,
             open: false,
+            reason: None,
+            rule: None,
+            list: None,
         }
     }
 

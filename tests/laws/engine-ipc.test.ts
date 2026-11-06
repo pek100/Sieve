@@ -1,14 +1,14 @@
 /**
  * Law 9, engine IPC: the app and the engine speak one pipe protocol, owned by
  * the Rust crate `engine/crates/sieve-ipc`. Its fixture
- * `src/data/fixtures/engine-ipc-v1.json` is read by the Rust tests
+ * `src/data/fixtures/engine-ipc-v3.json` is read by the Rust tests
  * (`cargo test -p sieve-ipc`: every message round trips) and here: the
  * version, the limits and every message type name agree with the crate.
  * Changing a message shape bumps PROTOCOL and the fixture in one commit.
  */
 import { describe, expect, it } from "vitest";
-import fixture from "@/data/fixtures/engine-ipc-v2.json";
-import { BLOCKER_KINDS, parseEngineStatus } from "@/data/protocol";
+import fixture from "@/data/fixtures/engine-ipc-v3.json";
+import { BLOCKER_KINDS, parseEngineLists, parseEngineStatus } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -33,7 +33,7 @@ describe("engine IPC law", () => {
     expect(fixture.flowsPerFrame).toBe(Number(rustConst("FLOWS_PER_FRAME")));
   });
 
-  it("the app reads the engine's v2 status and every blocker kind the crate declares", () => {
+  it("the app reads the engine's status and every blocker kind the crate declares", () => {
     const status = fixture.engine.find((m) => m.type === "status")!;
     const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
     expect(parseEngineStatus(body)).toEqual(body);
@@ -47,6 +47,20 @@ describe("engine IPC law", () => {
   it("fixture names every message type of the crate, in order", () => {
     expect(fixture.client.map((m) => m.type)).toEqual(rustNames("CLIENT_TYPES"));
     expect(fixture.engine.map((m) => m.type)).toEqual(rustNames("ENGINE_TYPES"));
+  });
+
+  it("the app reads the list report; a partial row degrades, a wrong shape throws", () => {
+    const body = Object.fromEntries(Object.entries(fixture.engine.find((m) => m.type === "lists")!).filter(([k]) => k !== "type"));
+    expect(parseEngineLists(body)).toEqual(body);
+    expect(parseEngineLists({ lists: [{ id: "x", enabled: false }] })).toEqual({
+      lists: [{ id: "x", enabled: false, fetched_at_ms: null, refresh_s: null, last_error: null, network: 0, cosmetic: 0, skipped: 0, skip_reasons: {}, skipped_exceptions: [], skipped_exceptions_total: 0 }],
+      compile_ms: null,
+    });
+    expect(() => parseEngineLists({})).toThrow(/lists/);
+    expect(() => parseEngineLists(null)).toThrow();
+    expect(() => parseEngineLists({ lists: [{ enabled: true }] })).toThrow(/id/);
+    expect(() => parseEngineLists({ lists: [{ id: "x", enabled: true, network: -1 }] })).toThrow(/network/);
+    expect(() => parseEngineLists({ lists: [{ id: "x", enabled: true, skipped_exceptions: [1] }] })).toThrow(/skipped_exceptions/);
   });
 
   it("no message can sign, export or mint", () => {

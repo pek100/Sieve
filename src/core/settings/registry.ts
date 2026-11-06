@@ -133,7 +133,7 @@ export const REGISTRY = {
     kind: "boolean",
     section: "sampling",
     label: "Sieving",
-    help: "On: Sieve charts which apps talk to the network. Off pauses it. Nothing is blocked yet; filtering arrives with the engine.",
+    help: "On: Sieve charts which apps talk to the network and, while the engine routes, closes their connections to blocked hosts. Off pauses both.",
     default: true,
   } satisfies BooleanSetting,
   "sampling.intervalMs": {
@@ -163,7 +163,7 @@ export const REGISTRY = {
     kind: "map",
     section: "apps",
     label: "Apps turned off",
-    help: "Apps Sieve leaves out of its charts, counts and history. Every other app is sieved.",
+    help: "Apps Sieve leaves out of its charts, counts and history. While the engine routes, their traffic is relayed untouched. Every other app is sieved.",
     default: {} as Readonly<Record<string, AppState>>,
     of: { type: "enum", options: APP_STATES },
   } satisfies MapSetting<AppState>,
@@ -193,7 +193,7 @@ export const REGISTRY = {
   } satisfies DataSwitchSetting,
   // The engine's switch (docs/plans/2026-10-17-https-filtering.md, slice 3):
   // on, the engine brings up its Wintun adapter and routes this computer's
-  // traffic through itself; it relays every flow and blocks nothing yet. The
+  // traffic through itself; it relays each flow or closes one to a blocked host. The
   // app sends it to the engine (the engine controller, `SetPolicy`); off, the
   // engine has no adapter and no route. The live check is run by the user
   // (docs/live/engine-slice-3.md) and read back by the ignored test of its name.
@@ -201,11 +201,30 @@ export const REGISTRY = {
     kind: "dataSwitch",
     section: "filtering",
     label: "Route traffic through the engine",
-    help: "Sends this computer's traffic through Sieve's engine, so Home and Apps show each app's connections as the engine sees them. Nothing is blocked yet. Off: the engine adds no adapter and no route, and your network is as it was.",
+    help: "Sends this computer's traffic through Sieve's engine, so Home and Apps show each app's connections as the engine sees them and connections to blocked hosts are closed. Off: the engine adds no adapter and no route, and your network is as it was.",
     default: false,
     liveCheck: "live_engine_full_route_relays_and_restores",
     needsEngine: true,
   } satisfies DataSwitchSetting,
+  // The user's own rules (B6), sent whole in the engine's policy. The engine
+  // takes host names only and counts anything else as skipped; they beat the
+  // lists both ways.
+  "filtering.blockedDomains": {
+    kind: "list",
+    section: "filtering",
+    label: "Blocked domains",
+    help: "Hosts the engine closes for every sieved app, with their subdomains, whatever the filter lists say.",
+    default: [] as readonly string[],
+    of: { type: "string" },
+  } satisfies ListSetting<string>,
+  "filtering.allowedDomains": {
+    kind: "list",
+    section: "filtering",
+    label: "Allowed domains",
+    help: "Hosts the engine never closes, with their subdomains, whatever the filter lists say.",
+    default: [] as readonly string[],
+    of: { type: "string" },
+  } satisfies ListSetting<string>,
   // Edited only by the DNS filter's card, so unavailable with it.
   "filtering.upstreams": {
     kind: "list",

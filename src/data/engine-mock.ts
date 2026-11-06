@@ -8,12 +8,14 @@
  * The actions move between the fixture's examples the way the engine would:
  * turning routing on from `idle` routes; off from any welcome state is idle;
  * pausing AdGuard lets a waiting engine route (the `filtering` example has
- * AdGuard's service stopped); starting it again makes the engine wait.
- * Nothing else is invented.
+ * AdGuard's service stopped); starting it again makes the engine wait. The
+ * rest of a sent policy is held and echoed, as the engine would, so the
+ * controller sees it in force. Nothing else is invented.
  */
 import fixture from "./fixtures/engine-probe-v2.json";
+import ipc from "./fixtures/engine-ipc-v3.json";
 import type { EngineSource } from "./engine-source";
-import { parseEngineProbe, parseEngineStatus, type EnginePolicy, type EngineStatus } from "./protocol";
+import { parseEngineLists, parseEngineProbe, parseEngineStatus, type EngineLists, type EnginePolicy, type EngineStatus } from "./protocol";
 
 export const ENGINE_SCENARIOS = [
   "missing",
@@ -45,21 +47,31 @@ function statusOf(scenario: EngineScenario): EngineStatus {
 
 export function createMockEngine(start: EngineScenario = "missing"): EngineSource {
   let scenario = start;
+  let held: Omit<EnginePolicy, "revision" | "engine"> | null = null;
+  const echo = (status: EngineStatus): EngineStatus => (held ? { ...status, policy: { ...status.policy, ...held } } : status);
   const requireWelcome = () => {
     if (!WELCOME.includes(scenario)) throw new Error("The system cannot find the file specified. (os error 2)");
+  };
+  const lists = async (): Promise<EngineLists> => {
+    requireWelcome();
+    return parseEngineLists(ipc.engine.find((m) => m.type === "lists"));
   };
   return {
     kind: "mock",
     probe: async () => {
       if (scenario === "error") throw new Error(MOCK_ENGINE_ERROR);
-      return parseEngineProbe(fixture.examples[scenario]);
+      const probe = parseEngineProbe(fixture.examples[scenario]);
+      return probe.pipe?.kind === "welcome" ? { ...probe, pipe: { ...probe.pipe, status: echo(probe.pipe.status) } } : probe;
     },
     setPolicy: async (policy: EnginePolicy) => {
       requireWelcome();
       if (!policy.engine) scenario = "idle";
       else if (scenario === "idle" || scenario === "crash_loop") scenario = "filtering";
-      return statusOf(scenario);
+      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists };
+      return echo(statusOf(scenario));
     },
+    lists,
+    listsRefresh: lists,
     stopAdguard: async () => {
       if (scenario !== "adguard") throw new Error(MOCK_ADGUARD_ERROR);
       scenario = "filtering";

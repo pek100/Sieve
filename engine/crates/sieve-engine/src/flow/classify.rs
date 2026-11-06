@@ -10,8 +10,8 @@
 //! Caps: TCP keeps at most [`crate::flow::stream::MAX_STREAM_BYTES`] and
 //! [`MAX_TCP_CHUNKS`] reads; UDP looks at most at [`MAX_UDP_DATAGRAMS`].
 //! A cap, a parse failure or an unknown protocol all end in a `Decoded`
-//! with `domain: None` (the verdict then passes the flow, reason
-//! UnknownDomain) and the reason recorded for the probe's counters.
+//! with `domain: None` (`crate::domain` then asks the shared IP map) and
+//! the reason recorded for the probe's counters.
 //!
 //! The forwarder never waits on the classifier for server-first protocols:
 //! it connects upstream at once and relays server bytes; only client bytes

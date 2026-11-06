@@ -8,8 +8,8 @@
 //! - [`stream`]: per-flow TCP payload reassembly with a size cap.
 //! - [`packet`]: IPv4/IPv6 + TCP/UDP header parsing of a raw IP packet.
 //! - [`flows`]: flow -> pid from the IP Helper owner-pid tables, pid -> exe,
-//!   and the pure per-app verdict, which asks the one rule engine
-//!   (`sieve_filter::rules`; the spike's copied DNS rule matcher is retired).
+//!   exe -> app key. The decision itself is `crate::domain`, which asks the
+//!   one rule engine (`sieve_filter::rules`).
 //! - [`classify`]: one flow's first client bytes in, one decision out.
 //! - [`relay`]: the TCP relay between the app side and the upstream.
 //! - [`tasks`]: flow tasks with a bounded shutdown.

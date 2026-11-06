@@ -10,7 +10,7 @@ publish.workspace = true
 [dependencies]
 # brave/adblock-rust (MPL-2.0), the one rule engine (plan 5.1). Without the
 # default `single-thread` feature, so a compiled engine is Send + Sync and can
-# sit behind an ArcSwap shared by the flow tasks.
+# be shared by the flow tasks through the engine's snapshot.
 adblock = { version = "0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 sha2.workspace = true
 serde.workspace = true
@@ -18,3 +18,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+serde_json.workspace = true

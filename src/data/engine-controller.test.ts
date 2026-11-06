@@ -3,6 +3,7 @@ import { createPassedChecks } from "@/core/checks";
 import { ENGINE_POLL_MS, ENGINE_SWITCH, engineLockReason, enginePhase } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
 import type { SettingKey } from "@/core/settings/registry";
+import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
 import { CRASH_LOOP_BANNER, createEngineController } from "./engine-controller";
 import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_ENGINE_ERROR, type EngineScenario } from "./engine-mock";
@@ -12,6 +13,9 @@ import type { EnginePolicy, EngineProbe } from "./protocol";
 import { createSettingsStore, memoryBackend, type SettingsBackend } from "./settings-store";
 
 const SWITCH = ENGINE_SWITCH as SettingKey;
+
+/** What the settings' defaults ask of the engine, at a revision and switch. */
+const policy = (revision: number, engine: boolean): EnginePolicy => ({ revision, engine, sieving: true, off_apps: [], lists: null, domain_lists: [] });
 
 function fakeClock() {
   let now = 0;
@@ -63,6 +67,8 @@ function fakeEngine(start: EngineScenario) {
       policies.push(p);
       return mock.setPolicy(p);
     },
+    lists: () => mock.lists(),
+    listsRefresh: () => mock.listsRefresh(),
     stopAdguard: () => mock.stopAdguard(),
     startAdguard: () => mock.startAdguard(),
   };
@@ -143,14 +149,14 @@ describe("engine controller", () => {
     await s.fc.flush();
     await s.settings.set(SWITCH, true);
     await s.fc.flush();
-    expect(s.fake.policies).toEqual([{ revision: 1, engine: true }]);
+    expect(s.fake.policies).toEqual([policy(1, true)]);
     expect(s.phase()).toBe("routing");
     expect(s.checks.has(ENGINE_SWITCH)).toBe(true);
     await s.fc.advance(ENGINE_POLL_MS * 2);
     expect(s.fake.policies).toHaveLength(1);
     await s.settings.set(SWITCH, false);
     await s.fc.flush();
-    expect(s.fake.policies[1]).toEqual({ revision: 3, engine: false });
+    expect(s.fake.policies[1]).toEqual(policy(3, false));
     expect(s.phase()).toBe("idle");
     expect(s.checks.has(ENGINE_SWITCH)).toBe(false);
     s.undo();
@@ -164,14 +170,87 @@ describe("engine controller", () => {
     expect(s.fake.policies).toEqual([]);
     release({ schema: 4, values: {} });
     await s.fc.flush();
-    expect(s.fake.policies).toEqual([{ revision: 3, engine: false }]);
+    expect(s.fake.policies).toEqual([policy(3, false)]);
     s.undo();
   });
 
   it("a stored on reaches an idle engine after load", async () => {
     const s = setup("idle", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
     await s.fc.flush();
-    expect(s.fake.policies).toEqual([{ revision: 1, engine: true }]);
+    expect(s.fake.policies).toEqual([policy(1, true)]);
+    s.undo();
+  });
+
+  it("sends_the_whole_policy", async () => {
+    const values = {
+      [ENGINE_SWITCH]: true,
+      [GLOBAL_SWITCH]: false,
+      "apps.levels": { firefox: "off", chrome: "sieve" },
+      "filtering.blockedDomains": ["ads.example"],
+      "filtering.allowedDomains": ["ok.ads.example"],
+    };
+    const s = setup("idle", memoryBackend({ schema: 4, values }));
+    await s.fc.flush();
+    expect(s.fake.policies).toEqual([
+      {
+        revision: 1,
+        engine: true,
+        sieving: false,
+        off_apps: ["firefox"],
+        lists: null,
+        domain_lists: [
+          { kind: "block", entries: ["ads.example"], enabled: true },
+          { kind: "allow", entries: ["ok.ads.example"], enabled: true },
+        ],
+      },
+    ]);
+    await s.fc.advance(ENGINE_POLL_MS * 2);
+    expect(s.fake.policies, "the engine holds it now: nothing more to send").toHaveLength(1);
+    s.undo();
+  });
+
+  it("an_off_app_change_alone_is_sent", async () => {
+    const s = setup("filtering", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+    await s.fc.flush();
+    expect(s.fake.policies).toEqual([]);
+    await s.settings.set("apps.levels", { firefox: "off" });
+    await s.fc.flush();
+    expect(s.fake.policies).toEqual([{ ...policy(3, true), off_apps: ["firefox"] }]);
+    await s.fc.advance(ENGINE_POLL_MS * 2);
+    expect(s.fake.policies).toHaveLength(1);
+    s.undo();
+  });
+
+  it("same_policy_in_another_order_sends_nothing", async () => {
+    const values = { [ENGINE_SWITCH]: true, "apps.levels": { b: "off", a: "off" }, "filtering.blockedDomains": ["y.example", "x.example"] };
+    const s = setup("filtering", memoryBackend({ schema: 4, values }));
+    await s.fc.flush();
+    expect(s.fake.policies).toHaveLength(1);
+    await s.settings.set("apps.levels", { a: "off", b: "off" });
+    await s.settings.set("filtering.blockedDomains", ["x.example", "y.example"]);
+    await s.fc.flush();
+    await s.fc.advance(ENGINE_POLL_MS * 2);
+    expect(s.fake.policies, "order means nothing to the engine").toHaveLength(1);
+    s.undo();
+  });
+
+  it("a refused policy is said and retried at the next probe, never in a loop", async () => {
+    const s = setup("idle", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+    const accepting = s.fake.source.setPolicy;
+    let refused = 0;
+    s.fake.source.setPolicy = async () => {
+      refused++;
+      throw new Error("a policy of 900000 bytes is over the 524288 byte limit");
+    };
+    await s.fc.flush();
+    await s.fc.flush();
+    expect(refused).toBe(1);
+    expect(s.store.getState().engine.actionError).toMatch(/over the/);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(refused).toBe(2);
+    s.fake.source.setPolicy = accepting;
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.store.getState().engine.actionError).toBeNull();
     s.undo();
   });
 
@@ -205,7 +284,7 @@ describe("engine controller", () => {
     // The installed copy's turn: the engine answers, and the stored value goes once.
     s.fake.set("idle");
     await s.fc.advance(ENGINE_POLL_MS);
-    expect(s.fake.policies).toEqual([{ revision: 1, engine: true }]);
+    expect(s.fake.policies).toEqual([policy(1, true)]);
     expect(s.phase()).toBe("routing");
     s.undo();
   });
