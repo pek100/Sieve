@@ -283,8 +283,8 @@ fn rule_for<'a>(labels: &[Vec<u8>], rules: &'a [SplitHorizon]) -> Option<&'a Spl
 /// every encrypted upstream is unavailable. One whose names all have the same
 /// LAN server goes there. Anything that might carry a LAN name and has no one
 /// server for it is refused: the public upstream would publish that name. With
-/// no rules at all there is no LAN name to protect, and an unreadable query goes
-/// encrypted, opaque.
+/// no rules at all there is no suffix to protect, and a query goes encrypted here,
+/// opaque; private reverse names are [`path_of`]'s.
 pub fn split_route(query: &[u8], rules: &[SplitHorizon]) -> Path {
     if rules.is_empty() {
         return Path::Encrypted;
@@ -325,16 +325,16 @@ fn is_v6_link_local(ip: IpAddr) -> bool {
     matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80)
 }
 
-/// The route of a query, `name` being its one question as [`parse`](super::parse)
-/// reads it. A configured suffix wins. A private reverse name goes
-/// to the server of the adapter whose on-link prefix holds the address, else to
-/// the first server of any other adapter, and never to the public upstream.
-pub fn path_of(query: &[u8], name: Option<&str>, tables: &NetTables) -> Path {
+/// The route of a query, read from the wire. A configured suffix wins. A private
+/// reverse name goes to the server of the adapter whose on-link prefix holds the
+/// address, else to the first server of any other adapter, and never to the public
+/// upstream.
+pub fn path_of(query: &[u8], tables: &NetTables) -> Path {
     let configured = split_route(query, &split_rules(tables));
     if configured != Path::Encrypted {
         return configured;
     }
-    let Some(address) = name.and_then(reverse::private_address) else { return Path::Encrypted };
+    let Some(address) = reverse::private_question(query) else { return Path::Encrypted };
     let holes = plan::holes(tables);
     let holds_address = |a: &&Adapter| a.addresses.iter().filter_map(|addr| addr.on_link()).any(|p| p.contains(address));
     let covering = tables.others().filter(holds_address).find_map(|a| lan_server(a, &holes));
@@ -550,7 +550,7 @@ mod tests {
     }
 
     fn path_for(name: &str, tables: &NetTables) -> Path {
-        path_of(&crate::dns::query_for(name, crate::dns::TYPE_A).unwrap(), Some(name), tables)
+        path_of(&crate::dns::query_for(name, crate::dns::TYPE_A).unwrap(), tables)
     }
 
     const ROUTER_REVERSE: &str = "7.168.192.in-addr.arpa";

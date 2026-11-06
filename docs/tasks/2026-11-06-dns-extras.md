@@ -64,7 +64,7 @@ Sieve off, killed or uninstalled still means a normal network: all of this is in
   - **Labels left of the walk do not free a name.** `b._dns-sd._udp.7.168.192.in-addr.arpa` (DNS-SD domain enumeration) and `300.168.192.in-addr.arpa` are both under the zone.
   - Any query type counts: PTR, SOA (Windows' dynamic-update discovery), NS.
   - `plan::holes`' live prefixes are not used. A split-tunnel VPN can route public space, and that is not a private reverse zone.
-  - An opaque name (one `parse` refuses, or several questions) stays on the encrypted path as today. Accepted: no resolver or OS sends one, and the disclosure goes only to the user's chosen upstream.
+  - An opaque name (one `parse` refuses, or several questions) is read from the wire like the suffix rule (`reverse::private_question`), so it stays off the public upstream too. Only a query that cannot be walked at all, with no suffix rules, stays on the encrypted path. (2026-11-06: this replaces an accepted carve-out that sent them to the upstream; a second review found the premise "no resolver or OS sends one" unprobed and contradicting the flat "never" everywhere else.)
 
 - **D11. Which LAN server.** First the server of the adapter whose on-link prefix holds the address, then the first server of any other adapter that qualifies. Qualifying is the existing rule, in one helper shared with `SplitHorizon::new`: private, inside a hole, not v6 link-local. No qualifying server (including when the adapter's DNS is a public resolver): NXDOMAIN locally, not cached by the client (no SOA, RFC 2308). A LAN server that fails gets SERVFAIL, never the public upstream, the same as D11 of the encrypted-DNS task. A configured split suffix (`split_server`) is checked first and wins. `upstream::path_of(name, tables) -> Path { Lan(ip), NoServer, Encrypted }` is the pure routing decision, and `Service::resolve` reads it. Recorded for review as Q1.
 
@@ -195,7 +195,7 @@ Commands (PowerShell; `$env:CARGO_BUILD_JOBS='8'` first):
 
 Runbook `docs/live/dns-extras.md`; ignored test `live_dns_extras_on_the_real_path` in `dns/service.rs`, which panics pointing at the runbook, as `live_https_intercepts_public_and_passes_floor` does.
 
-1. **ECH, with `filtering.https` on, after its own check:** `Resolve-DnsName -Type HTTPS` for a name that publishes ECH shows no `ech`; `ech_stripped` rises; Chrome and Edge show Sieve's issuer there. With the switch off the same query shows `ech`.
+1. **ECH, with `filtering.https` on, after its own check:** `scripts/live/https-record.ps1` for a name that publishes ECH shows no `ech` (`Resolve-DnsName` refuses `-Type HTTPS`); `ech_stripped` rises; Chrome and Edge show Sieve's issuer there. With the switch off the same query shows `ech`.
 2. **Which clients ask where.** That Chrome's and Edge's HTTPS queries reach port 53 on the TUN when Secure DNS is off. Whether Firefox asks the OS for HTTPS records at all. Whether Windows' DNS Client sets DO.
 3. **Address hints.** `ipv4hint` and `ipv6hint` are not recorded in the name map. A client connecting from a hint alone, with no A query, reads as "not resolved here" under plan 2.9's GREASE rule and passes through. Safe; how often it happens is not known.
 4. **Canary:** `Resolve-DnsName use-application-dns.net` is NXDOMAIN, and Firefox in its default mode uses system DNS (`about:networking`). A user who chose Max Protection is not affected, by Firefox's own design. How soon Firefox re-enables DoH with the engine off.

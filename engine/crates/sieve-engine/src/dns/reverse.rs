@@ -14,6 +14,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use super::question_names;
 use crate::route::plan::declared;
 use crate::route::prefix::Prefix;
 
@@ -70,6 +71,18 @@ fn prefix_of(name: &str) -> Option<Prefix> {
 pub fn private_address(name: &str) -> Option<IpAddr> {
     let prefix = prefix_of(name)?;
     declared().iter().any(|range| range.covers(&prefix)).then(|| prefix.addr())
+}
+
+/// The address of the first private reverse name among a query's questions, read
+/// from the wire as `upstream::split_route` reads suffixes: a query's destination
+/// must not depend on what `dns::parse` accepts. A raw label holding a dot reads as
+/// two labels, which can only err towards private. None for a query that cannot be
+/// walked: nothing says it holds such a name.
+pub fn private_question(query: &[u8]) -> Option<IpAddr> {
+    question_names(query)?.iter().find_map(|labels| {
+        let name: Vec<String> = labels.iter().map(|label| String::from_utf8_lossy(label).to_ascii_lowercase()).collect();
+        private_address(&name.join("."))
+    })
 }
 
 #[cfg(test)]

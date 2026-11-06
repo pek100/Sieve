@@ -206,12 +206,12 @@ impl Service {
             Meters::bump(&self.facts.canary);
             return nxdomain(query).map(|reply| Answered { reply, resolved: true });
         }
-        let path = self.path(query, name);
+        let path = self.path(query);
         if path == Path::NoServer {
             Meters::bump(&self.facts.reverse_local);
             return nxdomain(query).map(|reply| Answered { reply, resolved: true });
         }
-        if matches!(path, Path::Lan(_)) && name.and_then(reverse::private_address).is_some() {
+        if matches!(path, Path::Lan(_)) && reverse::private_question(query).is_some() {
             Meters::bump(&self.facts.reverse_lan);
         }
         let Ok(reply) = self.exchange(path, query).await else {
@@ -239,12 +239,12 @@ impl Service {
         let mut id = [0u8; 2];
         getrandom::fill(&mut id).map_err(|e| e.to_string())?;
         let query = with_id(&query_for(name, TYPE_HTTPS).ok_or("a name that cannot be sent")?, u16::from_be_bytes(id));
-        let reply = self.exchange(self.path(&query, Some(name)), &query).await?;
+        let reply = self.exchange(self.path(&query), &query).await?;
         Ok(reply_answers(&query, &reply).ok_or("an answer to another question")?.https)
     }
 
-    fn path(&self, query: &[u8], name: Option<&str>) -> Path {
-        upstream::path_of(query, name, &self.tables.read().unwrap_or_else(|p| p.into_inner()))
+    fn path(&self, query: &[u8]) -> Path {
+        upstream::path_of(query, &self.tables.read().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// The one exchange on a path. A path with nowhere to go is an error here.
@@ -623,6 +623,62 @@ mod tests {
         let answered = b.ask(&two, Transport::Datagram).await;
         assert_eq!((rcode(&answered.reply), answered.resolved), (2, false), "the questions disagree");
         assert!(doh.seen().is_empty());
+    }
+
+    /// A query on the wire: these names' labels as they are, any octets, type A.
+    fn raw_query(names: &[&[&[u8]]]) -> Vec<u8> {
+        let mut query = vec![0, 7, 1, 0, 0, u8::try_from(names.len()).unwrap(), 0, 0, 0, 0, 0, 0];
+        for labels in names {
+            for label in labels.iter() {
+                query.push(u8::try_from(label.len()).unwrap());
+                query.extend_from_slice(label);
+            }
+            query.extend_from_slice(b"\0\0\x01\0\x01");
+        }
+        query
+    }
+
+    /// What `parse` refuses: a label outside a hostname's, or several questions.
+    #[tokio::test]
+    async fn a_private_reverse_name_the_parser_refuses_stays_off_the_public_upstream() {
+        const ZONE: [&[u8]; 5] = [b"7", b"168", b"192", b"in-addr", b"arpa"];
+        const PUBLIC: [&[u8]; 2] = [b"a", b"example"];
+        let star: Vec<&[u8]> = [&b"*"[..]].into_iter().chain(ZONE).collect();
+        let not_utf8: Vec<&[u8]> = [&b"\xff"[..]].into_iter().chain(ZONE).collect();
+        let upper: Vec<&[u8]> = [&b"*"[..], b"7", b"168", b"192", b"IN-ADDR", b"ARPA"].to_vec();
+        let queries = [raw_query(&[&star]), raw_query(&[&not_utf8]), raw_query(&[&upper]), raw_query(&[&PUBLIC, &ZONE])];
+        for query in &queries {
+            assert!(parse(query).is_none_or(|m| m.question.is_none()), "the parser refuses each");
+        }
+        let echo: Script = Arc::new(|query| {
+            let mut reply = query.to_vec();
+            reply[2] |= 0x80;
+            Step::Answer(reply)
+        });
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options { script: echo.clone(), ..Options::default() }).await;
+        let router = Plain::start(echo.clone(), echo).await;
+        let b = bed(&ca, &[doh.url()], None, connector_with(&router));
+        for query in &queries {
+            let answered = b.ask(query, Transport::Datagram).await;
+            assert_eq!((id_of(&answered.reply), answered.resolved), (Some(7), true));
+        }
+        assert_eq!(b.connector.udp_recorded().len(), queries.len(), "each to the LAN server");
+        assert!(doh.seen().is_empty(), "nothing went public");
+        assert_eq!(b.service.counts().reverse_lan, queries.len() as u64);
+
+        b.service.tables.write().unwrap().adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap().dns = vec!["8.8.8.8".parse().unwrap()];
+        for query in &queries {
+            let answered = b.ask(query, Transport::Datagram).await;
+            assert_eq!((rcode(&answered.reply), answered.resolved), (3, true), "NXDOMAIN here, with no LAN server");
+        }
+        assert!(doh.seen().is_empty(), "nothing went public");
+        assert_eq!(b.service.counts().reverse_local, queries.len() as u64);
+
+        // The control: the same shapes with no private name still go encrypted.
+        let public_star: [&[u8]; 3] = [b"*", b"a", b"example"];
+        b.ask(&raw_query(&[&public_star]), Transport::Datagram).await;
+        assert_eq!(doh.seen().len(), 1);
     }
 
     #[tokio::test]
