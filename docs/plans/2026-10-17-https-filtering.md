@@ -443,7 +443,7 @@ YouTube ad removal comes from lists and scriptlets only. No YouTube-specific cod
 - Seeking, quality change and autoplay of the next video work.
 
 **How breakage is detected:**
-1. **Live check `scripts/live/youtube.mjs`,** run by a verifier with the user, under the GPU lease. It drives the installed Chrome through CDP with a temporary profile, over the real network, through the engine. It asserts that the player's `currentTime` advances and that the player never carries its ad-showing state, over a fixed set of 10 videos. It records which list rules and scriptlets applied (from the engine log) and the failure screenshots. Site knowledge lives in this test only, never in the product.
+1. **Live check `scripts/live/youtube.mjs`,** run by a verifier with the user, under the GPU lease. It drives the installed Chrome through CDP with a temporary profile, over the real network, through the engine. It asserts that the player's `currentTime` advances and that the player never carries its ad-showing state, over a fixed set of 10 videos. It records which list rules and scriptlets applied (from the engine log) and the failure screenshots. Site knowledge lives in this test only, never in the product. (As built, task D11 of `docs/tasks/2026-11-06-content-wire.md`: the engine log cannot be read by a script, so it records counts per list from `status.json`, and rule text stays on the Log screen.)
 2. **In the product,** the filtering log shows per-page rule hits, so "the scriptlet stopped matching" is visible as missing hits.
 3. **Lists refresh** on their own `Expires` (quick fixes expire in hours), so fixes arrive without a Sieve release.
 4. **Report a broken site** (8.4), user initiated.
@@ -777,6 +777,8 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
 
 ### Slice 9: content: HTML injection, cosmetics, scriptlets
 
+**Status (2026-11-06), stream content-wire:** wired on branch `wf2-content-wire`, offline tests only. `inject::content::ContentHook` is what `build_interception` installs; with `filtering.content` off (the default, and unavailable to users) `wants` answers false and bytes are unchanged. A flow asks `RuleSet::page_cosmetics`, so the user's rules count and win both ways. As built beside 5.6: a rewrite also removes `ETag` and `Last-Modified` (task D6). Live-unverified: `live_content_injects_into_test_page` (`docs/live/engine-slice-9.md`), the budgets, and Q1 to Q3 of `docs/tasks/2026-11-06-content-wire.md`, all the user's.
+
 **Status (2026-11-06), wave-1 wiring:** the library is built and tested offline on branch `wave-1`; nothing feeds it traffic, because interception (slice 6) does not exist. The compile prefers `updates\resources` for the bundle (`lists::resources`) and reports its hash as `resource_pin`; `RESOURCE_PIN`, the fallback, is None until a real bundle is reviewed (`docs/tasks/2026-11-02-content.md`, Q1), so today no bundle loads on a real machine. Live-unverified: `live_content_injects_into_test_page` and its budgets.
 
 - **Spec.** Streaming decode and lol_html rewriting with caps, the CSP nonce rules (5.6), site-specific and generic CSS, scriptlets from the pinned uBO resource archive via adblock-rust's assembler, the vendored procedural applier, and `$generichide`/`$elemhide`/`$specifichide` honoured.
@@ -787,6 +789,12 @@ They retire `filtering.dns` and the never-available `filtering.perApp` gate (in 
 - **Files:** `engine/crates/sieve-engine/src/inject/**`, `engine/crates/sieve-filter/src/resources.rs`, `engine/injected/**` (the applier, MPL header kept). **Live:** yes. **Switch:** `filtering.content`.
 
 ### Slice 10: YouTube acceptance and the default list set
+
+**Status (2026-11-06), stream content-wire:** the script is written and syntax-checked, its pure parts tested, its drivers never run (`docs/live/engine-slice-10.md`). `engine/tests/no_site_names.rs` is the law, compiled through `sieve-filter` because the workspace root is virtual. The default list set is not decided: `Default::Gated` stays until the two arms (`catalogue::ListArm`) have run. As built beside 5.7: rule hits come as counts per list from `status.json`, because the log is memory-only and the pipe admits only `sieve.exe`; per-rule text stays on the Log screen.
+
+| Browser | Arm | Videos played | Ads seen | Per-list hits | Verdict |
+|---|---|---|---|---|---|
+| not run | | | | | |
 
 - **Spec.** `scripts/live/youtube.mjs` (5.7), run in two arms (AdGuard lists only; plus uBO filters, quick fixes and unbreak). The default list set is set from the result. The law test that no site name appears in engine source.
 - **Acceptance.** Day-one items of 5.7 pass in Chrome, Edge and Firefox for the chosen arm. The results (videos, ads seen, rules hit, arm) are recorded in the plan.

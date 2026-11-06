@@ -1,0 +1,4 @@
+{
+  "note": "The fixed set for scripts/live/youtube.mjs. Written from memory and never checked: review them before a run (docs/live/engine-slice-10.md). An unavailable video counts as not played.",
+  "videos": ["jNQXAC9IVRw", "dQw4w9WgXcQ", "9bZkp7q19f0", "kJQP7kiw5Fk", "JGwWNGJdvx8", "OPf0YbXqDm0", "RgKAFK5djSk", "CevxZvSJLk8", "fJ9rUzIMcZQ", "hT_nvWreIhg"]
+}

@@ -234,6 +234,22 @@ Commit at each green point on `wf2-content-wire`, explicit paths, each message e
 12. **Docs.** Comments list above, conventions, plan status notes, results table. Bench. Full suites. Kill anything started.
 13. **Report.** Evidence per checkbox, red-first notes, bench numbers, UNVERIFIED unchanged, every deviation named.
 
+## As built (2026-11-06)
+
+Where the build differs from the design above, and why.
+
+- **`EnginePolicy.content` is optional in TS, not `orDefault` false.** The fixture laws read a status losslessly, and the engine leaves a false value out, so a parser adding `content: false` fails them, and filling 15 fixture rows is the diff D1 set out to avoid. Absent means off: the parser leaves it absent, `normalised` reads `?? false`, `wantedPolicy` always sends it.
+- **The `set_policy` example is the fixture's `policyWithContent` key, not a second row of `client`.** The law "fixture names every message type of the crate, in order" holds one row per type. A round trip in `sieve-ipc` and a read in `engine-ipc.test.ts` keep it honest.
+- **`page_cosmetics_under` takes `&UserGates`, with the default as the no-gates case,** instead of `Option<&UserGates>`: one code path, and an empty `HashSet` allocates nothing.
+- **A half's test compares masks:** the half's types against the bare pattern's. D8's "`FROM_NETWORK_TYPES` and the document bit" would give a half to `@@||x^$elemhide`, because adblock-rust gives `||host^` the document bit implicitly (`filters/network.rs` 864). Consequence: `@@||x^$all,elemhide` on a bare host has no half and opens no network, which is the safe side.
+- **A user's `#@#` on a list's procedural rule cuts nothing.** adblock-rust reports procedural exceptions to no caller. Stated in the `cosmetic.rs` header, and left as a follow-up with the user's own `##+js()`.
+- **Under the user's `$generichide` alone, a selector a list holds both generic and specific is dropped too:** the library's mix cannot be told apart from outside. The page is changed less, never more.
+- **`write_status_file` keeps main's plain update state** when merging main (O1): `status_value` calls `status_saying(self.updates.status())`, not `status()`, so a file writer never says a release is available.
+- **Laws beyond the list:** `a_selector_both_engines_except_is_cut_once` (a dedupe a cut's slicing depends on), `list_hits_count_acted_requests_by_list`, `runVerdict`'s day-one items, and the issuer and payload shape read against engine source in `youtube-live.test.ts`.
+- **`engine-content.ps1 -Step on` takes `-Lists`,** so an arm of slice 10 goes through the same one script. `exclusions/mod.rs` 381 reads its host from the shipped seed instead of `.example`, since a seed entry is its subject.
+
+Not a change, a fact for slice 10's reader: `check_request` re-asks a block as a `document` request of the initiator, and the library matches any exception on such a request (pinned in `other_constraints_on_a_host_rule`). So `@@||x^$elemhide,script` opens more than scripts on `x`'s own pages, exactly as a plain `@@||x^$script` already does there.
+
 ## Open questions
 
 Decisions for the user:
