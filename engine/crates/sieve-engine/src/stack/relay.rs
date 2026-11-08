@@ -31,6 +31,7 @@ use super::attribution::{Attribution, HeldOwner, decide, is_own};
 use super::book::FlowBook;
 use super::dns_flow;
 use super::egress::Egress;
+use super::path_mtu::{self, TooBig};
 use super::{DNS_PORT, Meters, close_blocked, kind_of, record_decision};
 use crate::dns::NameMap;
 use crate::dns::service::Service;
@@ -409,28 +410,33 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
             UdpPath::Relay => break id,
         }
     };
-    let up = match ctx.egress.socket(flow.remote, true).and_then(|s| UdpSocket::from_std(s.into()).map_err(|e| e.to_string())) {
+    let ipv4 = flow.remote.is_ipv4();
+    let socket = ctx.egress.socket(flow.remote, true).and_then(|s| path_mtu::discover(&s, ipv4).map(|()| s));
+    let up = match socket.and_then(|s| UdpSocket::from_std(s.into()).map_err(|e| e.to_string())) {
         Ok(u) => u,
         Err(_) => return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0),
     };
     if up.connect(flow.remote).await.is_err() {
         return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0);
     }
+    // The adapter's MTU is larger than the real path: see `path_mtu`.
+    let too_big = TooBig { ends: (flow.local, flow.remote), sink: &*ctx.sink, meters: &ctx.meters };
+    let send_up = async |d: &[u8]| too_big.after_send(up.send(d).await, d, || path_mtu::of(&up, ipv4));
     let (mut bytes_up, mut bytes_down) = (0u64, 0u64);
     for d in &held {
-        if up.send(d).await.is_err() {
-            return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0);
+        match send_up(d).await {
+            Ok(sent) => bytes_up += sent as u64,
+            Err(_) => return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0),
         }
-        bytes_up += d.len() as u64;
     }
     let mut down = vec![0u8; DATAGRAM];
     loop {
         tokio::select! {
             r = tokio::time::timeout(UDP_IDLE, app.read(&mut buf)) => match r {
-                Ok(Ok(n)) if n > 0 => {
-                    if up.send(&buf[..n]).await.is_err() { break; }
-                    bytes_up += n as u64;
-                }
+                Ok(Ok(n)) if n > 0 => match send_up(&buf[..n]).await {
+                    Ok(sent) => bytes_up += sent as u64,
+                    Err(_) => break,
+                },
                 _ => break,
             },
             r = tokio::time::timeout(UDP_IDLE, up.recv(&mut down)) => match r {

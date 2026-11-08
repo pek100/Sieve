@@ -28,6 +28,9 @@ use crate::stack::Meters;
 use crate::watchdog::{Beats, monotonic_ms};
 
 /// Packets waiting for the stack at most; a full channel makes the reader wait.
+/// Each is held at its own length, so at the 9000-byte MTU the queue holds at most
+/// 36 MiB, and only while the stack falls behind (what the watchdog reports as a
+/// stall). The depth is the one E2 was measured with, so it is kept in packets.
 const QUEUE: usize = 4096;
 
 /// The adapter, its session, and the DLL that serves both (kept loaded).

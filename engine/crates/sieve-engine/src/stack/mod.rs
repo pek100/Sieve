@@ -9,7 +9,8 @@
 //! - [`book`]: the flows as the app sees them, batched for the pipe;
 //! - [`Meters`]: the engine's own counters (attribution is read from them);
 //! - `relay` (Windows): the per-flow tasks; `dns_flow` (Windows): port 53;
-//! - `egress` (Windows): the pinned sockets both of them leave through.
+//! - `egress` (Windows): the pinned sockets both of them leave through;
+//! - `path_mtu` (Windows): a relayed UDP datagram too big for the real path.
 
 pub mod attribution;
 pub mod book;
@@ -19,6 +20,8 @@ pub mod diagnostics;
 pub mod dns_flow;
 #[cfg(windows)]
 pub mod egress;
+#[cfg(windows)]
+pub mod path_mtu;
 #[cfg(windows)]
 pub mod relay;
 #[cfg(all(windows, test))]
@@ -52,6 +55,10 @@ pub struct Meters {
     /// Packets to the adapter dropped because Wintun's send ring was full.
     /// `status.json` only: not on the pipe.
     pub tun_write_dropped: AtomicU64,
+    /// Relayed UDP datagrams larger than the real path, dropped (`path_mtu`), and
+    /// those of them the app got no packet too big for. `status.json` only.
+    pub udp_too_big: AtomicU64,
+    pub udp_too_big_unanswered: AtomicU64,
     pub blocked: AtomicU64,
     pub forwarded: AtomicU64,
     pub forwarded_named: AtomicU64,
