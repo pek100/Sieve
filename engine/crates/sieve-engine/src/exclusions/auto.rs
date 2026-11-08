@@ -21,11 +21,23 @@ use crate::policy::write_atomic;
 pub const FILE: &str = "exclusions.json";
 const VERSION: u32 = 1;
 /// The evidence rule of `heal::score` that this engine writes `auto:pinning`
-/// entries by. An entry of an older rule is dropped at load: that rule took what
-/// is now no evidence for a rejection, so its entries cannot be believed. Raise it
-/// whenever that rule starts excluding on less. 0 is a file from before rules
-/// were recorded, whose rule excluded browsers' unused preconnects (2026-11-08).
+/// entries by. A browser's entries of an older rule are dropped once (see
+/// [`RULE_FILE`] and `ExclusionSlot::set_browsers`): that rule took what browsers
+/// do for a rejection, so they cannot be believed. Raise it whenever that rule
+/// starts excluding on less. 0 is an entry from before rules were recorded, whose
+/// rule excluded browsers' unused preconnects (2026-11-08).
 pub const PINNING_RULE: u32 = 1;
+/// Beside [`FILE`]: the newest [`PINNING_RULE`] whose one-time drop has run, so
+/// it runs once per rule and not at every start.
+///
+/// Its own file, not a field of [`FILE`]: an older engine rewrites [`FILE`] in its
+/// own shape, losing what it does not know (each entry's `rule` with it) and refusing
+/// a file with a field at the top it does not know, but it leaves this file alone.
+/// So after a rollback and a roll forward the drop has run and does not run again,
+/// and the entries the newer engine wrote survive although their `rule` is gone.
+/// The cost, accepted: entries the rolled-back engine wrote by its own older rule
+/// are kept too, until "Try decrypting again".
+pub const RULE_FILE: &str = "exclusions-rule.json";
 /// Entries kept per reason. A budget for each, so a flood of one reason cannot
 /// push out the others. An evicted entry costs one more upstream handshake at
 /// that host's next visit, which writes it again, so this is a memory and disk
@@ -56,7 +68,8 @@ pub struct AutoEntry {
     #[serde(default)]
     pub retrying: bool,
     /// The [`PINNING_RULE`] it was written by; defaulted to 0, so a file without it
-    /// loads, and a rolled-back engine reads it too (S39). Read for `auto:pinning` only.
+    /// loads, and a rolled-back engine reads it too (S39), though it does not keep it
+    /// ([`RULE_FILE`]). Read for `auto:pinning` only.
     #[serde(default)]
     pub rule: u32,
 }
@@ -68,7 +81,7 @@ impl AutoEntry {
     }
 
     /// Written by an evidence rule this engine no longer believes.
-    fn outdated(&self) -> bool {
+    pub fn outdated(&self) -> bool {
         self.reason == AutoReason::Pinning && self.rule < PINNING_RULE
     }
 
@@ -136,10 +149,28 @@ pub fn load(engine_dir: &Path) -> Result<Vec<AutoEntry>, String> {
         return Err(format!("{FILE}: version {} is not {VERSION}", file.v));
     }
     let mut entries = file.entries;
-    // Gone from the file at the store's next write; until then each load drops them again.
-    entries.retain(|e| !e.outdated());
     cap(&mut entries);
     Ok(entries)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleRecord {
+    pinning_rule: u32,
+}
+
+/// The newest rule whose drop has run: 0 with no [`RULE_FILE`], or one that cannot
+/// be read, so a damaged record runs the drop again, which takes only entries of an
+/// older rule.
+pub fn rule_applied(engine_dir: &Path) -> u32 {
+    let record = std::fs::read(engine_dir.join(RULE_FILE)).ok().and_then(|bytes| serde_json::from_slice::<RuleRecord>(&bytes).ok());
+    record.map_or(0, |r| r.pinning_rule)
+}
+
+/// Records that the drop for [`PINNING_RULE`] has run.
+pub fn record_rule(engine_dir: &Path) -> Result<(), String> {
+    let json = serde_json::to_vec(&RuleRecord { pinning_rule: PINNING_RULE }).map_err(|e| format!("{RULE_FILE}: {e}"))?;
+    write_atomic(&engine_dir.join(RULE_FILE), &json).map_err(|e| format!("{RULE_FILE}: {e}"))
 }
 
 pub fn save(engine_dir: &Path, entries: &[AutoEntry]) -> Result<(), String> {
@@ -386,8 +417,8 @@ mod tests {
     }
 
     /// S39: both ways, so a rollback of the engine reads a new file too. Changed
-    /// 2026-11-08: this file's entry was `pinning`, which a file with no rule now
-    /// drops (the next test); `client-cert` is kept whatever its rule.
+    /// 2026-11-08: this file's entry was `pinning`, which with no rule is outdated
+    /// (the next test); `client-cert` is kept whatever its rule.
     #[test]
     fn a_file_without_the_new_fields_loads() {
         let dir = tempfile::tempdir().unwrap();
@@ -397,19 +428,30 @@ mod tests {
         assert_eq!((loaded[0].retries, loaded[0].retrying), (0, false));
     }
 
+    /// Changed 2026-11-08: the drop of an older rule's entries is the slot's, once
+    /// (`exclusions::tests`); load itself drops nothing.
     #[test]
-    fn pinning_entries_of_an_older_rule_are_dropped_at_load_and_nothing_else() {
+    fn only_pinning_entries_of_an_older_rule_are_outdated_and_load_keeps_them() {
         let dir = tempfile::tempdir().unwrap();
         let old = |host: &str, reason| AutoEntry { rule: PINNING_RULE - 1, ..AutoEntry::for_app(host, "msedge.exe", reason, NOW) };
         let current = AutoEntry::for_app("pinned.example", "client.exe", AutoReason::Pinning, NOW);
-        let kept = [old("cert.example", AutoReason::ClientCert), old("ev.example", AutoReason::Ev), current.clone()];
-        let mut all = vec![old("search.example", AutoReason::Pinning), AutoEntry { retrying: true, ..old("cdn.example", AutoReason::Pinning) }];
-        all.extend(kept.iter().cloned());
+        let all = [old("search.example", AutoReason::Pinning), old("cert.example", AutoReason::ClientCert), old("ev.example", AutoReason::Ev), current.clone()];
+        assert_eq!(all.iter().map(AutoEntry::outdated).collect::<Vec<_>>(), [true, false, false, false]);
         save(dir.path(), &all).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), kept, "the old rule's pinning entries, held or retrying, are gone");
-        save(dir.path(), &load(dir.path()).unwrap()).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), kept, "and a file this engine wrote keeps its own");
+        assert_eq!(load(dir.path()).unwrap(), all);
         assert_eq!(current.rule, PINNING_RULE, "a new entry records the rule");
+    }
+
+    #[test]
+    fn the_rule_record_reads_back_and_a_missing_or_damaged_one_is_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(rule_applied(dir.path()), 0, "none");
+        record_rule(dir.path()).unwrap();
+        assert_eq!(rule_applied(dir.path()), PINNING_RULE);
+        for damaged in ["", "not json", r#"{"pinning_rule":1,"x":2}"#, r#"{"pinning_rule":"1"}"#] {
+            std::fs::write(dir.path().join(RULE_FILE), damaged).unwrap();
+            assert_eq!(rule_applied(dir.path()), 0, "{damaged}");
+        }
     }
 
     #[test]

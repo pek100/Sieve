@@ -146,7 +146,7 @@ mod tests {
 
     use sieve_filter::exclusions::Source as Src;
 
-    use super::dials::{FATAL_ALERTS, NOTICE_WINDOW_MS};
+    use super::dials::{BURST_MS, FATAL_ALERTS, NOTICE_WINDOW_MS, USED_QUIET_CLOSES};
     use super::*;
 
     const NOW: u64 = 1_793_000_000_000;
@@ -266,25 +266,27 @@ mod tests {
     }
 
     /// Changed 2026-11-08 with the quiet-close rule: a pair that carried a request
-    /// is no longer excluded by closes at all, so what follows the request here is
-    /// refused handshakes, which the request's credit delays by one.
+    /// takes `USED_QUIET_CLOSES` closes, so what follows the request here is fewer
+    /// closes, then refused handshakes, which the request's credit delays by one.
     #[test]
     fn retry_then_a_used_connection_stays_decrypted() {
+        let burst = |n: u64| NOW + n * (BURST_MS + 1);
         let h = heal();
         h.hear(&pair(CLIENT, HOST), refused(), NOW);
         h.try_again(&one_row(), NOW);
         h.hear(&pair(CLIENT, HOST), Evidence::Used, NOW);
         assert_eq!(found(&h, CLIENT, NOW), None);
-        for _ in 0..10 {
-            handshake_then_close(&h, CLIENT, HOST, NOW);
+        for n in 1..u64::from(USED_QUIET_CLOSES) {
+            handshake_then_close(&h, CLIENT, HOST, burst(n));
         }
-        assert_eq!(found(&h, CLIENT, NOW), None, "closes say nothing now");
-        for _ in 0..2 {
-            h.hear(&pair(CLIENT, HOST), Evidence::Refused(None), NOW);
+        let at = burst(u64::from(USED_QUIET_CLOSES));
+        assert_eq!(found(&h, CLIENT, at), None, "the seed's closes are gone, and a used pair takes more");
+        for n in 0..2 {
+            h.hear(&pair(CLIENT, HOST), Evidence::Refused(None), at + burst(n) - NOW);
         }
-        assert_eq!(found(&h, CLIENT, NOW), None, "and it takes three refusals");
-        h.hear(&pair(CLIENT, HOST), Evidence::Refused(None), NOW);
-        assert_eq!(found(&h, CLIENT, NOW), Some(Src::Auto(AutoReason::Pinning)));
+        assert_eq!(found(&h, CLIENT, at), None, "and it takes three refusals");
+        h.hear(&pair(CLIENT, HOST), Evidence::Refused(None), at + burst(2) - NOW);
+        assert_eq!(found(&h, CLIENT, at), Some(Src::Auto(AutoReason::Pinning)));
     }
 
     #[test]

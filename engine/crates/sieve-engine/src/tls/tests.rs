@@ -47,7 +47,7 @@ use crate::exclusions::{AutoEntry, ExclusionSlot};
 use crate::flow::classify::Decoded;
 use crate::flow::flows::Action;
 use crate::heal::Heal;
-use crate::heal::dials::QUIET_CLOSES;
+use crate::heal::dials::{BURST_MS, QUIET_CLOSES};
 use crate::http::hook::{NoRewrite, ResponseHook};
 use crate::policy::wall_ms;
 use crate::stack::Meters;
@@ -465,7 +465,7 @@ impl Rig {
         if !opts.skip_ev {
             slot = slot.without_ev_skip();
         }
-        slot.set_browsers(BrowserSet::read(&FakeBrowsers));
+        slot.set_browsers(BrowserSet::read(&FakeBrowsers), wall_ms());
         let policy = Policy { sieving: true, https: true, ..Policy::default() };
         let minted = (ca.clone(), opts.minter);
         let slot = Arc::new(slot);
@@ -1975,12 +1975,19 @@ async fn silent_client(rig: &Rig, alpn: &[&str]) {
     task.await.unwrap();
 }
 
+/// Past the burst the last piece of evidence opened: the next is evidence of its own.
+async fn next_burst() {
+    tokio::time::sleep(Duration::from_millis(BURST_MS + 1)).await;
+}
+
 // Was `two_silent_clients_exclude_and_the_third_passes_through`; since 2026-11-08 a
-// handshake then a close counts only when it repeats `QUIET_CLOSES` times at once.
+// handshake then a close counts only when it repeats `QUIET_CLOSES` times, in
+// separate bursts, within the window.
 arms!(repeated_silent_clients_exclude_and_the_next_passes_through, |arm| async move {
     let (rig, heal, upstream_leaf) = healing_rig(arm, &[]);
     for _ in 1..QUIET_CLOSES {
         silent_client(&rig, &[]).await;
+        next_burst().await;
     }
     assert!(heal.notices(0).1.is_empty(), "one fewer is not enough");
     silent_client(&rig, &[]).await;
@@ -2006,6 +2013,7 @@ arms!(a_client_that_closes_during_the_handshake_again_is_excluded, |arm| async m
     let (rig, heal, upstream_leaf) = healing_rig(arm, &[]);
     closes_during_the_handshake(&rig, &[]).await;
     assert!(heal.notices(0).1.is_empty(), "once is not enough");
+    next_burst().await;
     closes_during_the_handshake(&rig, &[]).await;
     assert_eq!(heal.notices(0).1.len(), 1);
     passes_untouched(&rig, &upstream_leaf).await;
@@ -2026,6 +2034,7 @@ arms!(preconnects_beside_a_held_connection_never_exclude, |arm| async move {
         let mut closes = 0;
         while heal.notices(0).1.is_empty() {
             assert!(closes < QUIET_CLOSES, "{alpn}: excluded within {QUIET_CLOSES}");
+            next_burst().await;
             silent_client(&rig, &[alpn]).await;
             closes += 1;
         }
@@ -2082,16 +2091,17 @@ arms!(a_used_connection_between_silent_closes_stays_decrypted, |arm| async move 
     for alpn in ["h2", "http/1.1"] {
         let (rig, heal) = answering_rig(arm, alpn);
         silent_client(&rig, &[alpn]).await;
+        next_burst().await;
         used_client(&rig, alpn).await;
-        silent_client(&rig, &[alpn]).await;
-        assert!(heal.notices(0).1.is_empty(), "{alpn}");
-        for _ in 0..2 * QUIET_CLOSES {
+        for _ in 0..QUIET_CLOSES {
+            next_burst().await;
             silent_client(&rig, &[alpn]).await;
         }
-        assert!(heal.notices(0).1.is_empty(), "{alpn}: a pair that carried a request is not excluded by closes");
+        assert!(heal.notices(0).1.is_empty(), "{alpn}: a pair that carried a request takes more closes");
         // The control: without the used connection, the same closes exclude it.
         let (bare, bare_heal) = answering_rig(arm, alpn);
         for _ in 0..QUIET_CLOSES {
+            next_burst().await;
             silent_client(&bare, &[alpn]).await;
         }
         assert_eq!(bare_heal.notices(0).1.len(), 1, "{alpn}: the control");
@@ -2181,6 +2191,10 @@ arms!(an_alert_right_after_the_handshake_is_strong_evidence, |arm| async move {
         let (rig, heal, _) = healing_rig(arm, alpn);
         alert_after_handshake(&rig, alpn, rustls::AlertDescription::HandshakeFailure).await;
         assert!(heal.notices(0).1.is_empty(), "{alpn:?}: weak evidence");
+        // But a refusal, as one during the handshake: the second excludes.
+        next_burst().await;
+        alert_after_handshake(&rig, alpn, rustls::AlertDescription::HandshakeFailure).await;
+        assert_eq!(heal.notices(0).1.len(), 1, "{alpn:?}: two weak alerts exclude");
     }
 });
 

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sieve_filter::exclusions::{AutoReason, Exclusion, ExclusionSet, Pattern, Scope, Source as EntrySource, Switches, parse_line};
+use sieve_filter::exclusions::{AutoReason, Exclusion, ExclusionSet, Pattern, Scope, Source as EntrySource, Switches, exe_file_name, parse_line};
 use sieve_ipc::{ExclusionRow, ExclusionScope, ExclusionsView};
 
 pub use auto::AutoEntry;
@@ -72,6 +72,11 @@ struct Layers {
     /// Why `exclusions.json` cannot be believed: the floor holds (S24).
     auto_error: Option<String>,
     browsers: BrowserSet,
+    /// The drop of an older rule's browser entries has not run on this folder
+    /// ([`auto::RULE_FILE`]); until it has, they hold.
+    old_rule_pending: bool,
+    /// Why the drop could not be recorded; it runs again at the next browser read.
+    rule_error: Option<String>,
 }
 
 impl Layers {
@@ -160,7 +165,8 @@ impl ExclusionSlot {
             })
             .collect();
         let writer = dir.filter(|_| auto_error.is_none()).map(auto::Writer::for_dir);
-        let layers = Layers { user: user_entries(policy_exclusions), lists: list_layers, auto, auto_error, browsers: BrowserSet::default() };
+        let old_rule_pending = writer.is_some() && dir.is_some_and(|d| auto::rule_applied(d) < auto::PINNING_RULE);
+        let layers = Layers { user: user_entries(policy_exclusions), lists: list_layers, auto, auto_error, browsers: BrowserSet::default(), old_rule_pending, rule_error: None };
         let (set, next_expiry) = layers.build(now_ms);
         Self { dir: dir.map(Path::to_path_buf), writer, sources: enabled, skip_ev: SKIP_EV, scope: start_scope(dir), layers: Mutex::new(layers), snapshot: Mutex::new(Snapshot { set: Arc::new(set), next_expiry }), revision: AtomicU64::new(0) }
     }
@@ -223,19 +229,55 @@ impl ExclusionSlot {
     /// What is wrong with the file, for the status file: why the store holds the
     /// floor, or why the last write failed (which holds nothing up).
     pub fn error(&self) -> Option<String> {
-        lock(&self.layers).auto_error.clone().or_else(|| self.writer.as_ref().and_then(auto::Writer::failure))
+        let layers = lock(&self.layers);
+        layers.auto_error.clone().or_else(|| self.writer.as_ref().and_then(auto::Writer::failure)).or_else(|| layers.rule_error.clone())
     }
 
     pub fn in_scope(&self, exe: Option<&str>) -> bool {
         exe.is_some_and(|e| lock(&self.layers).browsers.contains(e))
     }
 
-    /// A changed set is news to the app's "in scope" line.
-    pub fn set_browsers(&self, browsers: BrowserSet) {
+    /// A changed set is news to the app's "in scope" line. The first set read also
+    /// runs the one-time drop of an older rule's entries.
+    pub fn set_browsers(&self, browsers: BrowserSet, now_ms: u64) {
         let mut layers = lock(&self.layers);
         if layers.browsers != browsers {
             layers.browsers = browsers;
             self.revision.fetch_add(1, Ordering::Relaxed);
+        }
+        self.drop_old_rule(&mut layers, now_ms);
+    }
+
+    /// Drops the `auto:pinning` entries of browsers that an older evidence rule
+    /// wrote ([`auto::PINNING_RULE`]), once per folder and rule.
+    ///
+    /// Browsers only, by exe file name, the safe side for each: what that rule
+    /// misread was browsers' own behaviour, and a release engine decrypts only
+    /// browsers ([`SCOPE`]), so its entries are all browsers'. An entry for another
+    /// app came from a diagnostic build that decrypted it and may be a real pin; kept,
+    /// it costs nothing where only browsers are decrypted. Waits for a browser set:
+    /// until one is read the entries hold, and nothing is decrypted then anyway.
+    fn drop_old_rule(&self, layers: &mut Layers, now_ms: u64) {
+        let (Some(dir), Some(writer)) = (&self.dir, &self.writer) else { return };
+        let browsers: std::collections::HashSet<String> = layers.browsers.paths().iter().map(|p| exe_file_name(p)).collect();
+        if !layers.old_rule_pending || browsers.is_empty() {
+            return;
+        }
+        let before = layers.auto.len();
+        layers.auto.retain(|e| !(e.outdated() && e.app.as_ref().is_none_or(|app| browsers.contains(app))));
+        if layers.auto.len() != before {
+            self.rebuild(layers, now_ms);
+            self.write(layers);
+        }
+        // On the disk before it is recorded: a record ahead of the file would keep
+        // the entries for ever.
+        writer.flush();
+        if writer.failure().is_some() {
+            return;
+        }
+        match auto::record_rule(dir) {
+            Ok(()) => (layers.old_rule_pending, layers.rule_error) = (false, None),
+            Err(why) => layers.rule_error = Some(why),
         }
     }
 
@@ -500,9 +542,71 @@ mod tests {
         let slot = ExclusionSlot::new(None, &[], NOW);
         assert_eq!(slot.view(NOW).scope, ExclusionScope::Browsers);
         let before = slot.revision();
-        slot.set_browsers(BrowserSet::read(&One));
+        slot.set_browsers(BrowserSet::read(&One), NOW);
         assert_eq!(slot.view(NOW).browsers, [r"c:\b\browser.exe"]);
         assert!(slot.view(NOW).revision > before, "the app's in-scope line reads it");
+    }
+
+    /// The browser `find` asks for, as Windows registers it.
+    struct TheBrowser;
+    impl browsers::BrowserRegistry for TheBrowser {
+        fn commands(&self) -> Vec<String> {
+            vec![r#""C:\b\browser.exe" -- %1"#.to_string()]
+        }
+    }
+
+    fn of_old_rule(entry: AutoEntry) -> AutoEntry {
+        AutoEntry { rule: auto::PINNING_RULE - 1, ..entry }
+    }
+
+    #[test]
+    fn a_browsers_pinning_entries_of_an_older_rule_go_once_the_browsers_are_known_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_pin = |host: &str, exe: &str| of_old_rule(AutoEntry::for_app(host, exe, AutoReason::Pinning, NOW));
+        let kept = vec![
+            old_pin("pinned.example", r"C:\Apps\Client.exe"),
+            of_old_rule(AutoEntry::for_app("cert.example", r"C:\b\browser.exe", AutoReason::ClientCert, NOW)),
+            AutoEntry::for_app("current.example", r"C:\b\browser.exe", AutoReason::Pinning, NOW),
+        ];
+        let mut all = vec![old_pin("search.example", r"C:\b\browser.exe"), AutoEntry { retrying: true, ..old_pin("cdn.example", r"C:\b\browser.exe") }];
+        all.extend(kept.iter().cloned());
+        auto::save(dir.path(), &all).unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        assert_eq!(find(&slot, "search.example", NOW), Some(Src::Auto(AutoReason::Pinning)), "held until the browsers are known");
+        slot.set_browsers(BrowserSet::default(), NOW);
+        assert_eq!(find(&slot, "search.example", NOW), Some(Src::Auto(AutoReason::Pinning)), "an empty read knows none");
+        slot.set_browsers(BrowserSet::read(&TheBrowser), NOW);
+        assert_eq!(find(&slot, "search.example", NOW), None, "the browser's, held or retrying, are gone");
+        assert_eq!(auto::load(dir.path()).unwrap(), kept, "from the disk too; another app's, another reason's and the current rule's stay");
+        assert_eq!(auto::rule_applied(dir.path()), auto::PINNING_RULE, "recorded");
+        assert_eq!(slot.error(), None);
+    }
+
+    /// P3 of the 2026-11-08 review: an older engine rewrites the file without `rule`.
+    #[test]
+    fn a_rollback_and_back_keeps_what_the_newer_engine_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        slot.set_browsers(BrowserSet::read(&TheBrowser), NOW);
+        slot.add_auto(AutoEntry::for_app("pin.example", r"C:\b\browser.exe", AutoReason::Pinning, NOW), NOW);
+        slot.flush();
+        drop(slot);
+        // The older engine's write: its own shape, no `rule` in any entry.
+        let file = auto::path(dir.path());
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        for entry in json["entries"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("rule");
+        }
+        std::fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        let again = ExclusionSlot::new(Some(dir.path()), &[], NOW + DAY);
+        again.set_browsers(BrowserSet::read(&TheBrowser), NOW + DAY);
+        assert_eq!(find(&again, "pin.example", NOW + DAY), Some(Src::Auto(AutoReason::Pinning)), "the drop ran once, before the rollback");
+        // The control: on a folder where it never ran, the same file loses the entry.
+        let fresh = tempfile::tempdir().unwrap();
+        std::fs::write(auto::path(fresh.path()), serde_json::to_vec(&json).unwrap()).unwrap();
+        let first = ExclusionSlot::new(Some(fresh.path()), &[], NOW + DAY);
+        first.set_browsers(BrowserSet::read(&TheBrowser), NOW + DAY);
+        assert_eq!(find(&first, "pin.example", NOW + DAY), None);
     }
 
     #[cfg(feature = "live-scope")]
@@ -714,7 +818,7 @@ mod tests {
         }
         let slot = ExclusionSlot::new(None, &[], NOW);
         assert!(!slot.in_scope(Some(r"C:\b\browser.exe")), "nothing read yet");
-        slot.set_browsers(BrowserSet::read(&One));
+        slot.set_browsers(BrowserSet::read(&One), NOW);
         assert!(slot.in_scope(Some(r"c:\B\browser.exe")));
         assert!(!slot.in_scope(Some(r"C:\b\other.exe")) && !slot.in_scope(None));
     }
