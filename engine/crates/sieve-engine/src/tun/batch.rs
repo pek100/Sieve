@@ -7,21 +7,11 @@
 
 use std::io;
 use std::sync::mpsc as sync;
-#[cfg(any(windows, test))]
-use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
-use crate::flow::packet;
-use crate::stack::Meters;
+use super::{Input, PacketSource};
 use crate::watchdog::Beats;
-
-pub trait PacketSource {
-    type Packet;
-    fn receive_blocking(&mut self) -> io::Result<Option<Self::Packet>>;
-    fn try_receive(&mut self) -> io::Result<Option<Self::Packet>>;
-    fn bytes(packet: &Self::Packet) -> &[u8];
-}
 
 struct Batch {
     bytes: Vec<u8>,
@@ -36,18 +26,14 @@ impl Batch {
         Self { bytes: vec![0; mtu * limit], lengths: vec![0; limit], count: 0, cursor: 0, mtu }
     }
 
-    fn push(&mut self, bytes: &[u8], meters: &Meters) {
-        Meters::bump(&meters.packets_in);
-        #[cfg(feature = "attribution-diagnostics")]
-        super::record_fingerprint(bytes, meters);
-        if !packet::dst_ip(bytes).is_some_and(super::admit) {
-            Meters::bump(&meters.not_unicast);
+    fn push(&mut self, bytes: &[u8], input: &Input) {
+        if !input.arrive(bytes) {
             return;
         }
         if bytes.len() > self.mtu {
             // The legacy device also discards packets that cannot fit the
             // stack's MTU-sized ReadBuf. Never truncate a packet into the slab.
-            Meters::bump(&meters.oversized);
+            input.oversized();
             return;
         }
         let offset = self.count * self.mtu;
@@ -64,21 +50,26 @@ pub struct Sender {
     max_slabs: usize,
     mtu: usize,
     limit: usize,
+    input: Input,
 }
 
 pub struct Receiver {
     rx: mpsc::Receiver<Batch>,
     recycle: sync::SyncSender<Batch>,
     current: Option<Batch>,
+    input: Input,
 }
 
-pub fn channel(packet_budget: usize, mtu: u16, limit: usize) -> (Sender, Receiver) {
+/// Both ends count into the same routing run's `input`: the sender its
+/// arrivals, the receiver what the stack's buffer cannot take.
+pub fn channel(packet_budget: usize, mtu: u16, limit: usize, input: Input) -> (Sender, Receiver) {
     let queued = packet_budget.div_ceil(limit);
     // One slab may be in the reader, one in poll_read, besides queued slabs.
     let max_slabs = queued + 2;
     let (tx, rx) = mpsc::channel(queued);
     let (recycle, recycled) = sync::sync_channel(max_slabs);
-    (Sender { tx, recycled, allocated: 0, max_slabs, mtu: usize::from(mtu), limit }, Receiver { rx, recycle, current: None })
+    let sender = Sender { tx, recycled, allocated: 0, max_slabs, mtu: usize::from(mtu), limit, input: input.clone() };
+    (sender, Receiver { rx, recycle, current: None, input })
 }
 
 impl Sender {
@@ -96,28 +87,28 @@ impl Sender {
 
     /// Idle waits have no pending beat. Pool waits, draining and channel
     /// backpressure all occur inside the beat, so a stalled stack is visible.
-    pub fn run<S: PacketSource>(mut self, source: &mut S, meters: &Meters, beats: &Beats, now: impl Fn() -> u64) -> io::Result<()> {
+    pub fn run<S: PacketSource>(mut self, source: &mut S, beats: &Beats, now: impl Fn() -> u64) -> io::Result<()> {
         while let Some(first) = source.receive_blocking()? {
             beats.tun.begin(now());
-            let result = self.send_batch(source, first, meters);
+            let result = self.send_batch(source, first);
             beats.tun.end();
             result?;
         }
         Ok(())
     }
 
-    fn send_batch<S: PacketSource>(&mut self, source: &mut S, first: S::Packet, meters: &Meters) -> io::Result<()> {
+    fn send_batch<S: PacketSource>(&mut self, source: &mut S, first: S::Packet) -> io::Result<()> {
         let mut batch = self.take()?;
         batch.count = 0;
         batch.cursor = 0;
-        batch.push(S::bytes(&first), meters);
+        batch.push(S::bytes(&first), &self.input);
         let mut result = Ok(());
         drop(first); // Release the Wintun ring slot before waiting on the stack.
         // Count every received packet, including multicast, toward the wake
         // limit. An error after a valid prefix still delivers that prefix.
         for _ in 1..self.limit {
             match source.try_receive() {
-                Ok(Some(packet)) => batch.push(S::bytes(&packet), meters),
+                Ok(Some(packet)) => batch.push(S::bytes(&packet), &self.input),
                 Ok(None) => break,
                 Err(e) => { result = Err(e); break; }
             }
@@ -135,8 +126,11 @@ impl Receiver {
                     let i = batch.cursor;
                     batch.cursor += 1;
                     let len = batch.lengths[i];
-                    // Same whole-packet rule as the original TunDevice.
-                    if len > buf.remaining() { continue; }
+                    // Same whole-packet rule, and count, as the original TunDevice.
+                    if len > buf.remaining() {
+                        self.input.oversized();
+                        continue;
+                    }
                     buf.put_slice(&batch.bytes[i * batch.mtu..i * batch.mtu + len]);
                     return Poll::Ready(Ok(()));
                 }
@@ -157,25 +151,6 @@ impl Receiver {
     }
 }
 
-#[cfg(windows)]
-impl PacketSource for Arc<wintun_bindings::Session> {
-    type Packet = wintun_bindings::Packet;
-
-    fn receive_blocking(&mut self) -> io::Result<Option<Self::Packet>> {
-        match wintun_bindings::Session::receive_blocking(self) {
-            Ok(packet) => Ok(Some(packet)),
-            Err(wintun_bindings::Error::ShuttingDown) => Ok(None),
-            Err(e) => Err(io::Error::other(e)),
-        }
-    }
-
-    fn try_receive(&mut self) -> io::Result<Option<Self::Packet>> {
-        wintun_bindings::Session::try_receive(self).map_err(io::Error::other)
-    }
-
-    fn bytes(packet: &Self::Packet) -> &[u8] { packet.bytes() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,7 +158,11 @@ mod tests {
     use crate::watchdog::{Arm, STALL_MS, check};
     use std::collections::{BTreeSet, VecDeque};
     use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use tokio::io::{AsyncRead, AsyncReadExt};
+
+    fn input() -> Input { Input::new(Arc::default()) }
 
     struct Fake(VecDeque<Vec<u8>>);
     impl PacketSource for Fake {
@@ -215,10 +194,10 @@ mod tests {
                 let expected: Vec<_> = (0..n).map(|id| packet(id, MTU_MAX - id % 2)).collect();
                 let mut source = Fake(expected.clone().into());
                 // One queued batch forces recycling and backpressure.
-                let (tx, mut rx) = channel(limit, MTU_MAX as u16, limit);
+                let (tx, mut rx) = channel(limit, MTU_MAX as u16, limit, input());
                 let beats = Arc::new(Beats::default());
                 let reader_beats = beats.clone();
-                let reader = std::thread::spawn(move || tx.run(&mut source, &Meters::default(), &reader_beats, || 0));
+                let reader = std::thread::spawn(move || tx.run(&mut source, &reader_beats, || 0));
                 let mut buf = vec![0; MTU_MAX];
                 let mut actual = Vec::new();
                 let mut slabs = BTreeSet::new();
@@ -253,10 +232,10 @@ mod tests {
         filtered[16..20].copy_from_slice(&[224, 0, 0, 1]);
         let oversized = packet(0, usize::from(crate::tun::MTU) + 1);
         let mut source = Bursty(Fake([good.clone(), filtered, oversized, good.clone()].into()));
-        let (tx, mut rx) = channel(BATCH_MAX, crate::tun::MTU, BATCH_MAX);
-        let meters = Arc::new(Meters::default());
-        let m = meters.clone();
-        let reader = std::thread::spawn(move || tx.run(&mut source, &m, &Beats::default(), || 0));
+        let input = input();
+        let (tx, mut rx) = channel(BATCH_MAX, crate::tun::MTU, BATCH_MAX, input.clone());
+        let meters = input.meters.clone();
+        let reader = std::thread::spawn(move || tx.run(&mut source, &Beats::default(), || 0));
         let mut got = Vec::new();
         let mut buf = vec![0; usize::from(crate::tun::MTU)];
         loop {
@@ -266,9 +245,28 @@ mod tests {
         }
         reader.join().unwrap().unwrap();
         assert_eq!(got, [good.as_slice(), good.as_slice()].concat());
-        assert_eq!(meters.not_unicast.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(meters.oversized.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(meters.stack_offered(), 2);
+        assert_eq!(meters.not_unicast.load(Ordering::Relaxed), 1);
+        assert_eq!(meters.oversized.load(Ordering::Relaxed), 1);
+        assert_eq!(input.offered.get(), 2);
+    }
+
+    /// A slab packet the stack's buffer cannot take (an MTU mismatch between
+    /// the slab and ipstack) is dropped whole, and counted as not offered.
+    #[tokio::test]
+    async fn a_packet_larger_than_the_read_buffer_is_counted_oversized_and_not_offered() {
+        let small = packet(0, usize::from(crate::tun::MTU));
+        let large = packet(1, MTU_MAX);
+        let mut source = Fake([large, small.clone()].into());
+        let input = input();
+        let (tx, mut rx) = channel(BATCH_MAX, MTU_MAX as u16, BATCH_MAX, input.clone());
+        let reader = std::thread::spawn(move || tx.run(&mut source, &Beats::default(), || 0));
+        let mut buf = vec![0; usize::from(crate::tun::MTU)];
+        let n = rx.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], small.as_slice());
+        assert_eq!(rx.read(&mut buf).await.unwrap(), 0);
+        reader.join().unwrap().unwrap();
+        assert_eq!(input.meters.oversized.load(Ordering::Relaxed), 1);
+        assert_eq!(input.offered.get(), 1, "only the delivered packet is the stack's work");
     }
 
     #[test]
@@ -295,9 +293,9 @@ mod tests {
         let beats = Arc::new(Beats::default());
         let (observed, events) = sync::sync_channel(limit);
         let mut source = Observe { source: Fake((0..limit * 2).map(|id| packet(id, usize::from(crate::tun::MTU))).collect()), beats: beats.clone(), observed };
-        let (tx, rx) = channel(limit, crate::tun::MTU, limit);
+        let (tx, rx) = channel(limit, crate::tun::MTU, limit, input());
         let reader_beats = beats.clone();
-        let reader = std::thread::spawn(move || tx.run(&mut source, &Meters::default(), &reader_beats, || 0));
+        let reader = std::thread::spawn(move || tx.run(&mut source, &reader_beats, || 0));
         events.recv().unwrap();
         events.recv().unwrap(); // First batch queued, second cannot be sent.
         let arm = Arm::default();

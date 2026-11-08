@@ -1,9 +1,31 @@
 //! Follow admitted adapter packets through the stack, independently of pings.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use ipstack::{Progress, ProgressSnapshot};
-use crate::stack::Meters;
 use super::{STALL_MS, Stall};
+
+const WORKER_EXITED: &str = "ipstack worker exited";
+
+/// One routing run's adapter arrivals the stack should receive: admitted
+/// packets less those dropped as too large. Owned by that run's reader, so a
+/// previous run's reader still draining the ring cannot count here.
+#[derive(Debug, Default)]
+pub struct Offered {
+    admitted: AtomicU64,
+    dropped: AtomicU64,
+}
+
+impl Offered {
+    pub fn admit(&self) { self.admitted.fetch_add(1, Ordering::Relaxed); }
+    pub fn drop_oversized(&self) { self.dropped.fetch_add(1, Ordering::Relaxed); }
+
+    /// Admitted is read first, so a racing drop can only make this low for one sample.
+    pub fn get(&self) -> u64 {
+        let admitted = self.admitted.load(Ordering::Relaxed);
+        admitted.saturating_sub(self.dropped.load(Ordering::Relaxed))
+    }
+}
 
 /// A stage with work outstanding must complete something within STALL_MS.
 /// Reuse the existing watchdog outage budget: these are local queue/dispatch/
@@ -24,7 +46,7 @@ impl Waiting {
         }
         self.completed = completed;
         let ms = now.saturating_sub(self.since?);
-        (ms >= STALL_MS).then_some(Stall { what, ms })
+        (ms >= STALL_MS).then_some(Stall { what, ms, detail: None })
     }
 }
 
@@ -40,7 +62,7 @@ impl Stages {
     fn check(&mut self, offered: u64, p: ProgressSnapshot, now: u64) -> Option<Stall> {
         // Evaluate every stage even when another has tripped. More specific
         // downstream failures take precedence over the backlog they cause.
-        let exited = self.exited.check(p.exited, 0, now, "ipstack worker exited");
+        let exited = self.exited.check(p.exited, 0, now, WORKER_EXITED);
         let output = self.output.check(p.writes_started > p.writes_finished, p.writes_finished, now, "ipstack to TUN write");
         let dispatch = self.dispatch.check(p.received > p.dispatched, p.dispatched, now, "ipstack dispatch");
         let input = self.input.check(offered > p.received, p.received, now, "TUN to ipstack queue");
@@ -48,7 +70,7 @@ impl Stages {
     }
 
     fn waiting_stage(&self) -> Option<&'static str> {
-        if self.exited.since.is_some() { Some("ipstack worker exited") }
+        if self.exited.since.is_some() { Some(WORKER_EXITED) }
         else if self.output.since.is_some() { Some("ipstack to TUN write") }
         else if self.dispatch.since.is_some() { Some("ipstack dispatch") }
         else if self.input.since.is_some() { Some("TUN to ipstack queue") }
@@ -58,35 +80,37 @@ impl Stages {
 
 #[derive(Debug)]
 pub struct PathWatch {
-    meters: Arc<Meters>,
+    offered: Arc<Offered>,
     progress: Arc<Progress>,
-    baseline: u64,
     stages: Stages,
 }
 
 impl PathWatch {
-    /// Capture baseline BEFORE starting this run's TUN reader. Counters are
-    /// process-wide, but ipstack's counters belong to just this routing run.
-    pub fn new(meters: Arc<Meters>, progress: Arc<Progress>, baseline: u64) -> Self {
-        Self { meters, progress, baseline, stages: Stages::default() }
+    /// Both sides belong to one routing run: its TUN device's arrivals and its stack.
+    pub fn new(offered: Arc<Offered>, progress: Arc<Progress>) -> Self {
+        Self { offered, progress, stages: Stages::default() }
     }
 
-    fn offered(&self) -> u64 { self.meters.stack_offered().saturating_sub(self.baseline) }
-
+    /// A worker exit names the worker's own error, so the trip's record keeps it.
     pub fn check(&mut self, now: u64) -> Option<Stall> {
-        self.stages.check(self.offered(), self.progress.snapshot(), now)
+        let stall = self.stages.check(self.offered.get(), self.progress.snapshot(), now)?;
+        let detail = if stall.what == WORKER_EXITED { self.progress.exit_reason() } else { None };
+        Some(Stall { detail, ..stall })
     }
 
-    /// Counts only. `waiting_stage` is the watchdog's last sample, not a cause.
+    /// Counts, plus the worker's device error. ipstack's worker fails only on
+    /// device reads and writes, whose errors carry no flow address.
+    /// `waiting_stage` is the watchdog's last sample, not a cause.
     pub fn report(&self) -> serde_json::Value {
         let p = self.progress.snapshot();
         serde_json::json!({
-            "offered": self.offered(),
+            "offered": self.offered.get(),
             "received": p.received,
             "dispatched": p.dispatched,
             "writes_started": p.writes_started,
             "writes_finished": p.writes_finished,
             "worker_exited": p.exited,
+            "exit_reason": self.progress.exit_reason(),
             "waiting_stage": self.stages.waiting_stage(),
             "stall_ms": STALL_MS,
         })
@@ -130,7 +154,7 @@ mod tests {
         for (p, expected) in [
             (ProgressSnapshot { received: 1, ..Default::default() }, "ipstack dispatch"),
             (ProgressSnapshot { writes_started: 1, ..Default::default() }, "ipstack to TUN write"),
-            (ProgressSnapshot { exited: true, ..Default::default() }, "ipstack worker exited"),
+            (ProgressSnapshot { exited: true, ..Default::default() }, WORKER_EXITED),
         ] {
             let mut stages = Stages::default();
             assert_eq!(stages.check(1, p, 0), None);

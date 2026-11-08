@@ -330,7 +330,9 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let exit = progress::ExitGuard(progress.clone());
     tokio::spawn(async move {
         let _exit = exit;
-        loop {
+        // The loop borrows `accept_sender`, so the reason is recorded before
+        // the owner's accept() can observe the worker gone.
+        let result: Result<()> = async { loop {
             select! {
                 read = device.read(&mut buffer) => {
                     // A packet device's EOF/error is terminal, not an empty
@@ -361,7 +363,12 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     progress.writes_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+        } }.await;
+        if let Err(e) = &result {
+            log::error!("packet worker exited: {e}");
+            progress.record_exit(e.to_string());
         }
+        result
     })
 }
 

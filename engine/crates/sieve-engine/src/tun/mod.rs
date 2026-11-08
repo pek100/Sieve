@@ -17,10 +17,17 @@ pub mod device;
 #[cfg(feature = "relay-experiments")]
 pub mod batch;
 
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+
+use crate::flow::packet;
+use crate::stack::Meters;
+use crate::watchdog::{Beats, Offered};
 
 pub const WINTUN_DLL: &str = "wintun.dll";
 /// SHA-256 of Wintun 0.14.1's `bin/amd64/wintun.dll` (the project's download, 2026-10-17,
@@ -74,6 +81,65 @@ pub fn admit(dst: IpAddr) -> bool {
         IpAddr::V6(v6) => v6.is_multicast() || v6.is_unspecified() || v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
     };
     !not_unicast && !own_addresses().contains(&dst)
+}
+
+/// Where packets come from: the Wintun session, or a test's queue. `Ok(None)`
+/// is the session shutting down; an error ends the reader.
+pub trait PacketSource {
+    type Packet;
+    fn receive_blocking(&mut self) -> io::Result<Option<Self::Packet>>;
+    fn try_receive(&mut self) -> io::Result<Option<Self::Packet>>;
+    fn bytes(packet: &Self::Packet) -> &[u8];
+}
+
+/// What one routing run's reader counts into: the process-wide meters and
+/// this run's [`Offered`] arrivals, which the packet-path watchdog follows.
+#[derive(Debug, Clone)]
+pub struct Input {
+    pub meters: Arc<Meters>,
+    pub offered: Arc<Offered>,
+}
+
+impl Input {
+    pub fn new(meters: Arc<Meters>) -> Self {
+        Self { meters, offered: Arc::default() }
+    }
+
+    /// Counts one packet from the adapter; true when it goes to the stack.
+    pub fn arrive(&self, bytes: &[u8]) -> bool {
+        Meters::bump(&self.meters.packets_in);
+        #[cfg(feature = "attribution-diagnostics")]
+        record_fingerprint(bytes, &self.meters);
+        if !packet::dst_ip(bytes).is_some_and(admit) {
+            Meters::bump(&self.meters.not_unicast);
+            return false;
+        }
+        self.offered.admit();
+        true
+    }
+
+    /// An admitted packet too large for the stack's buffer, dropped whole.
+    pub fn oversized(&self) {
+        Meters::bump(&self.meters.oversized);
+        self.offered.drop_oversized();
+    }
+}
+
+/// The default reader: one packet per wake, whole, into the stack's bounded
+/// channel. The TUN heartbeat is pending from arrival until the channel took
+/// it. Ends with `Ok` when the session shuts down or the stack has closed,
+/// and returns a receive error for the caller to report.
+pub fn read_packets<S: PacketSource>(source: &mut S, tx: &mpsc::Sender<Vec<u8>>, input: &Input, beats: &Beats, now: impl Fn() -> u64) -> io::Result<()> {
+    while let Some(p) = source.receive_blocking()? {
+        beats.tun.begin(now());
+        let bytes = S::bytes(&p);
+        let sent = !input.arrive(bytes) || tx.blocking_send(bytes.to_vec()).is_ok();
+        beats.tun.end();
+        if !sent {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// A diagnostic build's look at a packet from the adapter, on both reader

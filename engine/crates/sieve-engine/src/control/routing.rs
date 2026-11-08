@@ -328,13 +328,15 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
         relay.experiments = engine.experiments.settings.clone();
         Arc::new(relay)
     };
-    let input_baseline = engine.meters.stack_offered();
     #[cfg(feature = "relay-experiments")]
     let device = TunDevice::experimental(tun.session.clone(), engine.meters.clone(), engine.beats.clone(), &engine.experiments.settings);
     #[cfg(not(feature = "relay-experiments"))]
     let device = TunDevice::new(tun.session.clone(), engine.meters.clone(), engine.beats.clone());
+    // This run's own arrivals: a previous run's reader, never joined, may still
+    // drain its ring into the process-wide meters.
+    let offered = device.offered();
     let stack = IpStack::new(config, device);
-    *super::lock(&engine.beats.path) = Some(crate::watchdog::PathWatch::new(engine.meters.clone(), stack.progress(), input_baseline));
+    *super::lock(&engine.beats.path) = Some(crate::watchdog::PathWatch::new(offered, stack.progress()));
     let lists = tokio::spawn(engine.lists.clone().run(HttpsFetcher::new(relay.clone())));
     let exclusions = tokio::spawn(refresh_exclusions(engine.exclusions.clone(), HttpsFetcher::new(relay.clone()), engine.validation.clone(), engine.dir.clone()));
     let (stop_accept, stopped) = oneshot::channel();
@@ -446,7 +448,12 @@ async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiv
                 Ok(IpStackStream::Udp(u)) => tasks.spawn(handle_udp(relay.clone(), u)),
                 // ICMP and other transports are not relayed (slice 3).
                 Ok(_) => {}
-                Err(_) => break,
+                Err(_) => {
+                    // The worker is gone; the watchdog trips on it. Its error, if any, was recorded first.
+                    let reason = stack.progress().exit_reason().unwrap_or_else(|| "no error recorded".into());
+                    eprintln!("sieve-engine: the packet worker ended: {reason}");
+                    break;
+                }
             },
         }
     }
