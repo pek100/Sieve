@@ -40,14 +40,17 @@ struct Bed {
     local: SocketAddr,
     remote: SocketAddr,
     window: u16,
-    /// The next server byte in order, and the server's first data byte.
+    /// The next server byte in order, the latest ACK sent, and the server's first data byte.
     rcv_nxt: u32,
+    acked: u32,
     first: u32,
     /// Server bytes in order, and those that came early, by offset.
     data: Vec<u8>,
     early: BTreeMap<u32, Vec<u8>>,
     /// Data segments seen, lost ones included.
     arrivals: usize,
+    /// Bytes sent past the window the app had advertised in its latest ACK.
+    beyond_window: usize,
     writer: JoinHandle<()>,
 }
 
@@ -72,8 +75,8 @@ impl Bed {
         let rcv_nxt = header.sequence_number.wrapping_add(1);
         let mut bed = Self {
             to_stack, from_stack, _stack: stack, local, remote, window,
-            rcv_nxt, first: rcv_nxt,
-            data: Vec::new(), early: BTreeMap::new(), arrivals: 0,
+            rcv_nxt, acked: rcv_nxt, first: rcv_nxt,
+            data: Vec::new(), early: BTreeMap::new(), arrivals: 0, beyond_window: 0,
             writer: tokio::spawn(write_all(app)),
         };
         bed.ack();
@@ -81,6 +84,7 @@ impl Bed {
     }
 
     fn ack(&mut self) {
+        self.acked = self.rcv_nxt;
         let flags = Flags { ack: Some(self.rcv_nxt), window: Some(self.window), ..Flags::default() };
         self.to_stack.send(segment(self.local, self.remote, CLIENT_ISN + 1, flags, &[])).unwrap();
     }
@@ -111,6 +115,11 @@ impl Bed {
     }
 
     fn take(&mut self, header: &TcpHeader, payload: Vec<u8>) {
+        let end = header.sequence_number.wrapping_add(u32::try_from(payload.len()).unwrap());
+        let edge = self.acked.wrapping_add(u32::from(self.window));
+        if is_after(end, edge) {
+            self.beyond_window += usize::try_from(end.wrapping_sub(edge)).unwrap();
+        }
         self.early.entry(header.sequence_number.wrapping_sub(self.first)).or_insert(payload);
         while let Some(bytes) = self.early.remove(&u32::try_from(self.data.len()).unwrap()) {
             self.data.extend_from_slice(&bytes);
@@ -136,6 +145,11 @@ impl Drop for Bed {
     fn drop(&mut self) {
         self.writer.abort();
     }
+}
+
+/// `a` is after `b` in sequence space.
+fn is_after(a: u32, b: u32) -> bool {
+    a != b && a.wrapping_sub(b) < u32::MAX / 2
 }
 
 fn tcp(packet: &[u8]) -> (TcpHeader, Vec<u8>) {
@@ -227,5 +241,22 @@ async fn a_closed_window_is_waited_out_not_reset() {
         bed.ack();
         bed.receive(RECOVERY, |_| false, |_| false).await;
         assert_eq!(bed.data, transfer(), "{flow:?}");
+    }
+}
+
+/// An app window smaller than the cap: the first flight, sent before any data ACK,
+/// fills that window and goes no byte past it, at either MTU.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_flight_fills_the_apps_window_and_no_more() {
+    const SMALL_WINDOW: u16 = 10_000;
+    /// Under ipstack's 1 s RTO, so no retransmission is in the flight.
+    const FLIGHT: Duration = Duration::from_millis(300);
+    for mtu in [ENGINE_MTU, JUMBO_MTU] {
+        for flow in FLOWS {
+            let mut bed = Bed::new(flow, mtu, SMALL_WINDOW).await;
+            bed.receive(FLIGHT, |_| false, |_| true).await;
+            assert_eq!(bed.beyond_window, 0, "MTU {mtu} {flow:?}: bytes past the window");
+            assert_eq!(bed.data, transfer()[..usize::from(SMALL_WINDOW)], "MTU {mtu} {flow:?}");
+        }
     }
 }

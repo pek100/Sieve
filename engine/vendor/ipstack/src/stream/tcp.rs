@@ -999,7 +999,7 @@ pub(crate) fn write_packet_to_device(
     let seq = seq.unwrap_or(tcb.get_seq()).0;
     let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window().max(tcb.get_mtu()));
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
-    let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);
+    let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(SeqNum(seq), ip_header_len, tcp_header_len);
     let packet = create_raw_packet(
         src,
         dst,

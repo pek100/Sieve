@@ -98,10 +98,17 @@ impl Tcb {
         }
     }
 
-    pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
-        let send_window = self.get_send_window() as usize;
+    /// The most payload a segment starting at `seq` may carry: one MTU's worth, and
+    /// nothing past the right edge of the usable window (the last ACK plus the smaller
+    /// of the peer's window and the unacknowledged-byte cap). Sieve (2026-11-08):
+    /// upstream capped it at the whole window from `seq`, so the segment after a full
+    /// one went past the peer's window by up to an MTU.
+    pub fn calculate_payload_max_len(&self, seq: SeqNum, ip_header_size: usize, tcp_header_size: usize) -> usize {
+        let window = self.max_unacked_bytes.min(self.get_send_window() as u32);
+        let right_edge = self.get_last_received_ack() + window;
+        let room = if seq < right_edge { right_edge.distance(seq) as usize } else { 0 };
         let mtu = self.get_mtu() as usize;
-        std::cmp::min(send_window, mtu.saturating_sub(ip_header_size + tcp_header_size))
+        room.min(mtu.saturating_sub(ip_header_size + tcp_header_size))
     }
 
     pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
@@ -534,4 +541,20 @@ mod tests {
         assert_eq!(tcb.inflight_packets.values().next().unwrap().retransmit_count, 0);
     }
 
+    #[test]
+    fn test_payload_stops_at_the_usable_windows_right_edge() {
+        const HEADERS: usize = 40;
+        let mut tcb = Tcb::new(SeqNum(1000), 9000, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, RTO, MAX_RETRANSMIT_COUNT);
+        let una = tcb.get_seq();
+        tcb.update_last_received_ack(una);
+        tcb.update_send_window(10_000);
+        assert_eq!(tcb.calculate_payload_max_len(una, 20, 20), 9000 - HEADERS, "one MTU first");
+        tcb.add_inflight_packet(vec![1; 8192]).unwrap();
+        assert_eq!(tcb.calculate_payload_max_len(tcb.get_seq(), 20, 20), 10_000 - 8192, "then what is left");
+        assert_eq!(tcb.calculate_payload_max_len(una, 20, 20), 9000 - HEADERS, "a resend from the last ACK");
+        tcb.update_send_window(u16::MAX);
+        assert_eq!(tcb.calculate_payload_max_len(tcb.get_seq(), 20, 20), MAX_UNACK as usize - 8192, "the cap, when smaller");
+        tcb.update_send_window(0);
+        assert_eq!(tcb.calculate_payload_max_len(una, 20, 20), 0, "a closed window");
+    }
 }
