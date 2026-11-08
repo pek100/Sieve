@@ -146,7 +146,10 @@ export function AppProblems({ appKey, name, exes = NO_EXES, canTurnOff, turnOff 
   // note and buttons read the exclusion rows, by the problems' exe or the app's own.
   const names = [issues?.exe ?? null, ...(Array.isArray(exes) ? exes : []).filter((p) => typeof p === "string").map(exeFileName)];
   const untouched = failingOpen(rows, names);
-  const exe = issues?.exe ?? untouched?.apps.find((a) => names.includes(a)) ?? null;
+  // The row's own exe: an app of several exes may pass one through while its
+  // problems were last heard from another. Keep and try again act on the row.
+  const untouchedExe = untouched?.apps.find((a) => names.includes(a)) ?? null;
+  const exe = issues?.exe ?? untouchedExe;
 
   const copyReport = (a: AppIssues) => {
     void (async () => navigator.clipboard.writeText(reportText(a, name, engineVersion(e))))().then(
@@ -157,8 +160,8 @@ export function AppProblems({ appKey, name, exes = NO_EXES, canTurnOff, turnOff 
   const fix = (f: Fix, p: Problem | null) => {
     if (f === "turn_off") return turnOff();
     if (f === "report") return issues && copyReport(issues);
-    if (f === "try_again") return void (exe && tryDecryptAgain("*", exe, "auto:failing"));
-    const line = fixPreview(f, p?.host ?? null, exe);
+    if (f === "try_again") return void (untouchedExe && tryDecryptAgain("*", untouchedExe, "auto:failing"));
+    const line = fixPreview(f, p?.host ?? null, f === "keep_untouched" ? untouchedExe : exe);
     if (line) preview.ask(line);
   };
 

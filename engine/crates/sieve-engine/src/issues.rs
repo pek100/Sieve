@@ -127,7 +127,9 @@ impl Issues {
     /// One problem of one flow. At the app's bound what Sieve meant goes first
     /// (P2-3 of the 2026-11-08 second review): blocks and QUIC refusals come by the
     /// dozen and must not push out the one failure the user needs to see. A new
-    /// intended one finding the slots all failures is the one let go.
+    /// intended one finding the slots all failures is the one let go, and it is not
+    /// counted in [`Self::dropped`]: nothing the app holds was lost, and the count says
+    /// what the user could have seen and cannot. Nothing changed, so no revision.
     pub fn problem(&mut self, app: &AppId, exe: Option<&str>, signal: Signal, host: Option<&str>, now_ms: u64) {
         let host = host.map(|h| cap_text(h, ISSUE_HOST_MAX).to_string());
         let record = self.record(app, exe, now_ms);
@@ -141,18 +143,15 @@ impl Issues {
             let full = record.problems.len() >= MAX_APP_PROBLEMS;
             // Intended first, then the oldest: (false, ..) sorts before (true, ..).
             let victim = if full { record.problems.iter().enumerate().min_by_key(|(_, p)| (!p.signal.intended(), p.last_ms)).map(|(i, p)| (i, p.signal.intended())) } else { None };
-            let keep_new = match victim {
-                Some((_, false)) if signal.intended() => false,
+            match victim {
+                Some((_, false)) if signal.intended() => return,
                 Some((at, _)) => {
                     record.problems.swap_remove(at);
-                    true
+                    lost = 1;
                 }
-                None => true,
-            };
-            lost = u64::from(victim.is_some());
-            if keep_new {
-                record.problems.push(Problem { signal, cause: signal.cause(), host, count: 1, first_ms: now_ms, last_ms: now_ms });
+                None => {}
             }
+            record.problems.push(Problem { signal, cause: signal.cause(), host, count: 1, first_ms: now_ms, last_ms: now_ms });
         }
         let old_at = now_ms.saturating_add(KEEP_MS);
         self.next_old_ms = Some(self.next_old_ms.map_or(old_at, |at| at.min(old_at)));
@@ -292,11 +291,13 @@ mod tests {
         let long = "h".repeat(ISSUE_HOST_MAX + 100);
         let apps = MAX_TRACKED_APPS * 2;
         let per_app = MAX_APP_PROBLEMS * 3;
+        // Failures only: a block let go at full slots is not counted (the test below).
+        let failures: Vec<Signal> = Signal::ALL.into_iter().filter(|s| !s.intended()).collect();
         for a in 0..apps {
             let id = AppId { key: format!("{a}-{}", "k".repeat(ISSUE_NAME_MAX)), session: Some(1) };
             for p in 0..per_app {
                 let host = format!("{p}{long}");
-                i.problem(&id, Some(&"e".repeat(ISSUE_NAME_MAX + 9)), Signal::ALL[p % Signal::ALL.len()], Some(&host), NOW + (a * per_app + p) as u64);
+                i.problem(&id, Some(&"e".repeat(ISSUE_NAME_MAX + 9)), failures[p % failures.len()], Some(&host), NOW + (a * per_app + p) as u64);
             }
         }
         assert_eq!(i.apps.len(), MAX_TRACKED_APPS);
@@ -329,14 +330,15 @@ mod tests {
         for f in 0..MAX_APP_PROBLEMS as u64 {
             full.problem(&app("game"), None, Signal::Stall, Some(&format!("s{f}.example")), NOW + f);
         }
-        let dropped = full.dropped();
+        let (dropped, revision) = (full.dropped(), full.revision());
         full.problem(&app("game"), None, Signal::Blocked, Some("ads.example"), NOW + 50);
         let problems = &full.view(everyone, NOW + 60)[0].problems;
         assert!(problems.iter().all(|p| p.signal == Signal::Stall) && problems.len() == MAX_APP_PROBLEMS);
-        assert_eq!(full.dropped(), dropped + 1, "counted");
-        // The control: a new failure takes the oldest failure's place.
+        assert_eq!((full.dropped(), full.revision()), (dropped, revision), "the block let go is no problem lost, and nothing changed");
+        // The control: a new failure takes the oldest failure's place, and that is counted.
         full.problem(&app("game"), None, Signal::ConnectRefused, Some("x.example"), NOW + 70);
         assert!(full.view(everyone, NOW + 80)[0].problems.iter().any(|p| p.signal == Signal::ConnectRefused));
+        assert_eq!(full.dropped(), dropped + 1);
     }
 
     #[test]

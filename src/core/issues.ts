@@ -23,6 +23,8 @@ export const SIGNAL_TEXT: Readonly<Record<Signal, string>> = {
   blocked: "Sieve blocked it with a filter rule",
   quic_refused: "Sieve asked it to use a regular connection, so it can be filtered",
   handshake_abandoned: "It stopped before its secure connection with Sieve was set up",
+  // A kind of problem this version of Sieve does not know yet: said plainly, no fix offered.
+  unknown: "A connection had a problem this version of Sieve cannot name",
 };
 
 /** Sieve meant these: a rule's block, a QUIC refusal the app answers by falling back. The engine's `Signal::intended`. */
@@ -186,7 +188,7 @@ export function fixPreview(fix: Fix, host: string | null, exe: string | null): L
         key: "filtering.exclusions",
         line,
         title: `Never decrypt ${exe}`,
-        body: "This goes in the sites Sieve leaves encrypted: every site, for this app only. Its blocked sites stay blocked.",
+        body: `This goes in the sites Sieve leaves encrypted: every site, for every program named ${exe}, wherever it is installed, for everyone who uses this PC. Its blocked sites stay blocked.`,
         added: `Added ${line} to the sites not decrypted.`,
         already: `${line} is already in the sites not decrypted.`,
       };

@@ -79,6 +79,15 @@ describe("one-step fixes", () => {
     expect(problemFixes(problem("handshake_abandoned", "unknown"), "launcher.exe"), "a handshake given up on: cause unknown, nothing to fix").toEqual([]);
   });
 
+  it("a problem a newer engine named reads as unknown: said plainly, nothing to fix", () => {
+    const frame = { run: 1, revision: 2, dropped: 0, apps: [{ key: "game", exe: "launcher.exe", session: 1, since_ms: T, flows: 3, retried: 0, recovered: 0, problems: [{ signal: "unknown", cause: "unknown", host: "x.example", count: 2, first_ms: T, last_ms: T }] }] };
+    const [p] = parseIssues(frame)!.apps[0].problems;
+    expect([p.signal, p.cause]).toEqual(["unknown", "unknown"]);
+    expect(problemText(p)).toBe("A connection had a problem this version of Sieve cannot name: x.example, 2 times");
+    expect(problemFixes(p, "launcher.exe")).toEqual([]);
+    expect(outcomeWords({ kind: "problem", signal: "unknown", cause: "network" } as LogOutcome)).toMatch(/^A connection had a problem/);
+  });
+
   it("the untouched row is found by any of the app's exes, problems or none", () => {
     const untouched = failingOpen(rows("auto:failing", ["launcher.exe"]), [null, "helper.exe", "launcher.exe"]);
     expect(untouched?.reason).toBe("auto:failing");
@@ -104,6 +113,7 @@ describe("one-step fixes", () => {
     expect([stop?.key, stop?.line]).toEqual(["filtering.exclusions", "cdn.game.example$app=launcher.exe"]);
     const keep = fixPreview("keep_untouched", null, "launcher.exe");
     expect([keep?.key, keep?.line]).toEqual(["filtering.exclusions", "*$app=launcher.exe"]);
+    expect(keep?.body, "the line is machine-wide: it says so").toMatch(/every program named launcher\.exe, wherever it is installed, for everyone who uses this PC/);
     for (const p of [stop, keep]) expect(parseExclusionLine(p!.line), p!.line).not.toHaveProperty("refused");
     expect(fixPreview("keep_untouched", null, null)).toBeNull();
     expect(fixPreview("turn_off", "x.example", "launcher.exe"), "Off is the switch's own write").toBeNull();

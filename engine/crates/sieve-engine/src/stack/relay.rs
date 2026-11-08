@@ -289,7 +289,7 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
         return dns_flow::tcp(ctx, app, flow).await;
     }
     let accepted_ms = monotonic_ms();
-    // The name map is read only once the connect failed (`retry`).
+    // The name map is read only once the connect failed or its race is due (`retry`).
     let alternates = || {
         let filter = ctx.filter.get();
         retry::alternates(&lock(&ctx.names), flow.remote.ip(), monotonic_ms(), |name| filter.blocks_name(name))

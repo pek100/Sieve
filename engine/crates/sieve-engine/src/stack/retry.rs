@@ -5,23 +5,29 @@
 //!
 //! What is tried, within one [`BUDGET`] for all of it, and at most
 //! [`MAX_ATTEMPTS`] connects:
+//! - a first connect still unanswered after [`RACE_AFTER`] is raced by one
+//!   address of the other family, the first to connect wins (happy eyeballs);
 //! - once a connect has failed, the next address its name resolved to, the other
 //!   family first (as happy eyeballs orders them);
 //! - a connect the server reset is tried once more after [`RECONNECT_AFTER`].
 //!
-//! Only after a failure, never beside a connect that is merely slow (P2-4 of the
-//! 2026-11-08 second review): an address's name comes from the shared name map,
-//! and nothing says the flow's own app resolved it, since the DNS Client service
-//! resolves for most apps and an app may have resolved its own name elsewhere. A
-//! slow connect raced by another site's address could carry the app's bytes to that
-//! site while its own server would have answered; after a failure the app has
-//! nothing left to lose, and its own TLS still checks whom it reached. The switch to
-//! the other family first is kept as happy eyeballs orders it.
+//! Why Sieve races at all: ipstack completes the app's handshake before this runs
+//! (`vendor/ipstack/src/stream/tcp.rs`), so the app's own happy eyeballs sees its
+//! first address connect at once and never tries the other family. Without the race,
+//! a network that drops IPv6 would hold every IPv6 flow for the whole budget.
 //!
-//! Never more: no attempt is made past the budget or the count, an address is
-//! reconnected once, a name the filter blocks gets no other address, and nothing
-//! here runs once the flow is decided or a byte was delivered, so a block always
-//! holds and nothing loops.
+//! Every other address, raced or after a failure, comes from [`alternates`]: only
+//! the addresses recorded for the one name the flow's address maps to, never for an
+//! address several names share, and none for a name the filter blocks (P2-4 of the
+//! 2026-11-08 second review). The name map is shared, and nothing says the flow's
+//! own app resolved that name, but an address only one name ever resolved to is that
+//! name's server, and the other family's address of the same name is the same site
+//! by another road. The app's own TLS still checks whom it reached.
+//!
+//! Never more: no attempt is made past the budget or the count, the race is run
+//! once, an address is reconnected once, and nothing here runs once the flow is
+//! decided or a byte was delivered: no byte moves before [`connect`] returns, and the
+//! connects that lost are dropped then. So a block always holds and nothing loops.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -42,6 +48,10 @@ pub const BUDGET: Duration = Duration::from_secs(10);
 /// A reset to the connect is tried once more this much later: a server that is
 /// restarting or shedding load often takes the next one.
 pub const RECONNECT_AFTER: Duration = Duration::from_millis(250);
+/// A first connect not answered this long is raced by the other family. Longer
+/// than a connect to a far server takes on a working network, so a working family is
+/// almost never doubled, and short beside the budget a dropped family would cost.
+pub const RACE_AFTER: Duration = Duration::from_secs(2);
 /// Connects per flow at most, the first one included.
 pub const MAX_ATTEMPTS: u32 = 3;
 
@@ -146,7 +156,7 @@ struct Running<'a, S> {
 }
 
 /// Connects to `target` as the module says. `alternates` is asked at most once,
-/// and only once a connect failed.
+/// and only once a connect failed or the race is due.
 pub async fn connect<A: Attempt>(dialer: &A, target: SocketAddr, alternates: impl FnOnce() -> Vec<IpAddr>) -> Connected<A::Stream> {
     let start = Instant::now();
     let deadline = start + BUDGET;
@@ -154,13 +164,20 @@ pub async fn connect<A: Attempt>(dialer: &A, target: SocketAddr, alternates: imp
     let mut attempts = 1;
     let mut alternates = Some(alternates);
     let mut addresses: VecDeque<SocketAddr> = VecDeque::new();
+    let mut ask = |addresses: &mut VecDeque<SocketAddr>| {
+        if let Some(ask) = alternates.take() {
+            addresses.extend(ask().into_iter().map(|ip| SocketAddr::new(ip, target.port())));
+        }
+    };
     let mut reconnects: Vec<(Instant, SocketAddr)> = Vec::new();
     let mut reconnected: Vec<SocketAddr> = Vec::new();
-    // Set by a failure only: the next address is tried then, never on a timer.
+    // Set by a failure: the next address is tried then.
     let mut next_address: Option<Instant> = None;
+    // Once, while the first connect is still waiting.
+    let mut race: Option<Instant> = Some(start + RACE_AFTER);
     let mut last = (Failure::Timeout, None);
     loop {
-        let wake = [Some(deadline), next_address, reconnects.iter().map(|(at, _)| *at).min()].into_iter().flatten().min().unwrap_or(deadline);
+        let wake = [Some(deadline), next_address, race, reconnects.iter().map(|(at, _)| *at).min()].into_iter().flatten().min().unwrap_or(deadline);
         let answered = tokio::select! {
             answered = std::future::poll_fn(|cx| {
                 for (i, r) in running.iter_mut().enumerate() {
@@ -195,10 +212,21 @@ pub async fn connect<A: Attempt>(dialer: &A, target: SocketAddr, alternates: imp
             }
             return Connected { result: Err(last.0), attempts, how: last.1 };
         }
-        if attempts < MAX_ATTEMPTS && next_address.is_some_and(|at| now >= at) {
-            if let Some(ask) = alternates.take() {
-                addresses.extend(ask().into_iter().map(|ip| SocketAddr::new(ip, target.port())));
+        if race.is_some_and(|at| now >= at) {
+            race = None;
+            // Only beside the first connect, and only by the other family: the same
+            // family's next address most likely goes the same dropped way.
+            if attempts < MAX_ATTEMPTS && running.iter().any(|r| r.how.is_none()) {
+                ask(&mut addresses);
+                if let Some(at) = addresses.iter().position(|a| a.is_ipv4() != target.is_ipv4()) {
+                    let other = addresses.remove(at).expect("a position in the queue");
+                    running.push(Running { target: other, how: Some(RetryHow::NextAddress), connect: dialer.attempt(other) });
+                    attempts += 1;
+                }
             }
+        }
+        if attempts < MAX_ATTEMPTS && next_address.is_some_and(|at| now >= at) {
+            ask(&mut addresses);
             next_address = None;
             if let Some(next) = addresses.pop_front() {
                 running.push(Running { target: next, how: Some(RetryHow::NextAddress), connect: dialer.attempt(next) });
@@ -310,30 +338,69 @@ mod tests {
         assert!(!asked_alternates.get(), "the name map is read only on trouble");
     }
 
-    /// P2-4 of the 2026-11-08 second review: a slow connect is never raced, since
-    /// the other address may be another site's; the app's own happy eyeballs, its
-    /// own connect per family, is left to it.
+    /// ipstack answered the app's handshake, so its own happy eyeballs never runs:
+    /// a family the network drops is raced by the other at [`RACE_AFTER`], not
+    /// waited on for the whole budget (2026-11-09 verifier of bdd761a, P2).
     #[tokio::test(start_paused = true)]
-    async fn a_silent_connect_is_not_raced() {
+    async fn a_silent_first_address_loses_to_the_other_family_at_the_race() {
         let fake = Fake::new(&[(V6, &[Script::Never]), (V4, &[OK_FAST])]);
-        let asked_alternates = std::cell::Cell::new(false);
         let start = Instant::now();
-        let out = connect(&fake, addr(V6), || {
-            asked_alternates.set(true);
-            v4_alternate()
-        })
-        .await;
-        assert_eq!((out.retry(), out.attempts, out.result.unwrap_err()), (None, 1, Failure::Timeout));
-        assert_eq!(Instant::now() - start, BUDGET, "as long as the one connect always had");
-        assert!(!asked_alternates.get());
+        let out = connect(&fake, addr(V6), v4_alternate).await;
+        assert_eq!((out.retry(), out.attempts, out.result), (Some(RetryHow::NextAddress), 2, Ok(addr(V4))));
+        assert_eq!(fake.asked()[1], (addr(V4), RACE_AFTER));
+        assert_eq!(Instant::now() - start, RACE_AFTER + Duration::from_millis(30));
+    }
+
+    /// The race takes the other family only, and only once: the same family's
+    /// next address waits for a failure.
+    #[tokio::test(start_paused = true)]
+    async fn the_race_takes_only_the_other_family() {
+        let fake = Fake::new(&[(V6, &[Script::Never]), ("[2001:db8::2]:443", &[OK_FAST])]);
+        let start = Instant::now();
+        let out = connect(&fake, addr(V6), || vec!["2001:db8::2".parse().unwrap()]).await;
+        assert_eq!((out.attempts, out.result.unwrap_err()), (1, Failure::Timeout));
+        assert_eq!(Instant::now() - start, BUDGET);
+    }
+
+    /// The race asks the same rule as a failure does: an address several names
+    /// share, or a blocked name, gets no other address, so the one connect waits
+    /// the budget as it always did.
+    #[tokio::test(start_paused = true)]
+    async fn an_ambiguous_address_or_a_blocked_name_is_not_raced() {
+        let ip6 = addr(V6).ip();
+        let mut names = NameMap::default();
+        for ip in [ip6, addr(V4).ip()] {
+            names.record("cdn.example", ip, 300, 0);
+        }
+        // The control: one name, not blocked, races.
+        let fake = Fake::new(&[(V6, &[Script::Never]), (V4, &[OK_FAST])]);
+        let out = connect(&fake, addr(V6), || alternates(&names, ip6, 1, |_| false)).await;
+        assert_eq!(out.result, Ok(addr(V4)));
+
+        let fake = Fake::new(&[(V6, &[Script::Never]), (V4, &[OK_FAST])]);
+        let out = connect(&fake, addr(V6), || alternates(&names, ip6, 1, |n| n == "cdn.example")).await;
+        assert_eq!((out.attempts, out.result.unwrap_err()), (1, Failure::Timeout), "a blocked name");
+
+        names.record("other.example", ip6, 300, 0);
+        let fake = Fake::new(&[(V6, &[Script::Never]), (V4, &[OK_FAST])]);
+        let start = Instant::now();
+        let out = connect(&fake, addr(V6), || alternates(&names, ip6, 1, |_| false)).await;
+        assert_eq!((out.attempts, out.result.unwrap_err()), (1, Failure::Timeout), "an address two names share");
+        assert_eq!(Instant::now() - start, BUDGET);
+        assert_eq!(fake.asked().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_slow_first_connect_that_answers_is_no_retry() {
-        let slow = Script::After(Duration::from_secs(5), Ok(()));
+        let slow = Script::After(RACE_AFTER - Duration::from_millis(1), Ok(()));
         let fake = Fake::new(&[(V6, &[slow]), (V4, &[OK_FAST])]);
         let out = connect(&fake, addr(V6), v4_alternate).await;
         assert_eq!((out.retry(), out.attempts, out.result), (None, 1, Ok(addr(V6))));
+        // Raced, and the first still wins: no retry either.
+        let later = Script::After(RACE_AFTER + Duration::from_millis(500), Ok(()));
+        let fake = Fake::new(&[(V6, &[later]), (V4, &[Script::Never])]);
+        let out = connect(&fake, addr(V6), v4_alternate).await;
+        assert_eq!((out.retry(), out.attempts, out.result), (None, 2, Ok(addr(V6))));
     }
 
     #[test]

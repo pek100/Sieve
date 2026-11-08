@@ -276,6 +276,12 @@ pub enum Signal {
     /// `QuicRefused` (the TENSION at [`LogOutcome`] holds for it too: an older app
     /// and this engine ship together).
     HandshakeAbandoned,
+    /// Decode only: a signal a newer engine sent that this build does not know. It
+    /// reads as this, so one new kind never fails a whole `Log` or `Issues` frame
+    /// for an app and engine out of step. The engine never sends it; not in
+    /// [`Signal::ALL`].
+    #[serde(other)]
+    Unknown,
 }
 
 /// Who most likely caused a problem.
@@ -286,7 +292,9 @@ pub enum Cause {
     Sieve,
     /// The same would happen without Sieve: the server or the network refused it.
     Network,
-    /// The signal cannot tell.
+    /// The signal cannot tell. A cause a newer engine sent that this build does not
+    /// know reads as this too, as [`Signal::Unknown`] does.
+    #[serde(other)]
     Unknown,
 }
 
@@ -318,7 +326,7 @@ impl Signal {
         match self {
             Self::EgressFailed | Self::AppRefusedCertificate | Self::Blocked | Self::QuicRefused => Cause::Sieve,
             Self::ConnectRefused | Self::ConnectTimeout | Self::Unreachable => Cause::Network,
-            Self::ConnectFailed | Self::ConnectionLost | Self::Stall | Self::DnsUnanswered | Self::HandshakeAbandoned => Cause::Unknown,
+            Self::ConnectFailed | Self::ConnectionLost | Self::Stall | Self::DnsUnanswered | Self::HandshakeAbandoned | Self::Unknown => Cause::Unknown,
         }
     }
 
@@ -1890,6 +1898,22 @@ mod tests {
             assert_eq!((signal.cause(), signal.intended()), (cause, intended), "{signal:?}");
         }
         assert!(Signal::ALL.iter().filter(|s| s.intended()).all(|s| s.cause() == Sieve), "only Sieve means anything");
+        assert_eq!((Signal::Unknown.cause(), Signal::Unknown.intended()), (Unknown, false), "decode only: says nothing");
+    }
+
+    /// The fixture's `Issues` and a `Log` row, each with a signal and a cause a
+    /// newer engine might send: they read as `Unknown`, and the rest of the frame
+    /// with them (2026-11-09 verifier of bdd761a, P3).
+    #[test]
+    fn a_signal_or_cause_from_a_newer_engine_reads_as_unknown() {
+        let mut issues = fixture()["engine"].as_array().unwrap().iter().find(|m| m["type"] == "issues").cloned().unwrap();
+        let known = issues["apps"][0]["problems"].as_array().unwrap().len();
+        issues["apps"][0]["problems"].as_array_mut().unwrap().push(serde_json::json!({ "signal": "teleported", "cause": "the_moon", "host": "x.example", "count": 1, "first_ms": 1, "last_ms": 2 }));
+        let EngineMessage::Issues { apps, .. } = serde_json::from_value(issues).unwrap() else { unreachable!() };
+        assert_eq!(apps[0].problems.len(), known + 1, "the whole frame is read");
+        assert_eq!((apps[0].problems[known].signal, apps[0].problems[known].cause), (Signal::Unknown, Cause::Unknown));
+        let outcome: LogOutcome = serde_json::from_value(serde_json::json!({ "kind": "problem", "signal": "teleported", "cause": "network" })).unwrap();
+        assert_eq!(outcome, LogOutcome::Problem { signal: Signal::Unknown, cause: Cause::Network });
     }
 
     #[test]

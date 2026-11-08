@@ -698,6 +698,8 @@ export const SIGNALS = [
   "blocked",
   "quic_refused",
   "handshake_abandoned",
+  // What the Rust reader makes of a signal a newer engine sent that this build does not know.
+  "unknown",
 ] as const;
 export type Signal = (typeof SIGNALS)[number];
 /** sieve-ipc `Cause`: who most likely caused it. The engine decides; the app only says it. */
