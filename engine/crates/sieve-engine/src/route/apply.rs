@@ -13,9 +13,15 @@ use std::net::IpAddr;
 
 use windows::Win32::Foundation::{ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR, WIN32_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DeleteIpForwardEntry2, InitializeIpForwardEntry,
-    InitializeUnicastIpAddressEntry, MIB_IPFORWARD_ROW2, MIB_UNICASTIPADDRESS_ROW,
+    CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER,
+    DeleteIpForwardEntry2, GetIpInterfaceEntry, GetUnicastIpAddressEntry, InitializeIpForwardEntry, InitializeIpInterfaceEntry,
+    InitializeUnicastIpAddressEntry, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW, SetInterfaceDnsSettings,
+    SetIpInterfaceEntry,
 };
+use windows::Win32::Networking::WinSock::{IpDadStatePreferred, IpDadStateTentative};
+use windows::core::{GUID, HSTRING, PWSTR};
+
+use crate::tun::ADAPTER_GUID;
 use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
@@ -103,6 +109,82 @@ pub fn add_address(luid: SieveLuid, ip: IpAddr) -> Result<(), String> {
     row.OnLinkPrefixLength = Prefix::host(ip).length();
     // SAFETY: `row` is a valid, initialised row.
     check(unsafe { CreateUnicastIpAddressEntry(&row) }, &format!("CreateUnicastIpAddressEntry {ip}"))
+}
+
+/// Where duplicate address detection stands for one of the adapter's addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressState {
+    /// A packet may leave with it as its source.
+    Preferred,
+    /// Still being checked: Windows refuses it as a source (a send through the
+    /// adapter's routes fails with "host unreachable").
+    Tentative,
+    /// It can never be used.
+    Unusable(i32),
+}
+
+/// Reads the state of one of the adapter's addresses.
+pub fn address_state(luid: SieveLuid, ip: IpAddr) -> Result<AddressState, String> {
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    // SAFETY: initialises a row this function owns.
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceLuid = NET_LUID_LH { Value: luid.0 };
+    row.Address = sockaddr_inet(ip);
+    // SAFETY: `row` names the address and the interface, as the call requires.
+    let code = unsafe { GetUnicastIpAddressEntry(&mut row) };
+    if code != NO_ERROR {
+        return Err(format!("GetUnicastIpAddressEntry {ip} failed: Win32 error {}", code.0));
+    }
+    Ok(match row.DadState {
+        state if state == IpDadStatePreferred => AddressState::Preferred,
+        state if state == IpDadStateTentative => AddressState::Tentative,
+        other => AddressState::Unusable(other.0),
+    })
+}
+
+/// The interface metric that makes the adapter the DNS Client's first network
+/// (`route::capture`). Routes are unaffected: none of the engine's has the same
+/// prefix as a route of another adapter.
+pub const DNS_FIRST_METRIC: u32 = 1;
+
+/// Gives the adapter [`DNS_FIRST_METRIC`] in both families. IPv6 is best effort:
+/// with IPv6 off the adapter has no IPv6 interface.
+pub fn put_first_for_dns(luid: SieveLuid) -> Result<(), String> {
+    for family in [AF_INET, AF_INET6] {
+        let mut row = MIB_IPINTERFACE_ROW::default();
+        // SAFETY: initialises a row this function owns.
+        unsafe { InitializeIpInterfaceEntry(&mut row) };
+        row.Family = family;
+        row.InterfaceLuid = NET_LUID_LH { Value: luid.0 };
+        // SAFETY: the row names the interface and its family, as the call requires.
+        let read = unsafe { GetIpInterfaceEntry(&mut row) };
+        if read != NO_ERROR {
+            if family == AF_INET6 {
+                continue;
+            }
+            return Err(format!("GetIpInterfaceEntry failed: Win32 error {}", read.0));
+        }
+        row.UseAutomaticMetric = false;
+        row.Metric = DNS_FIRST_METRIC;
+        // Left as read, the call refuses the row on IPv4.
+        row.SitePrefixLength = 0;
+        // SAFETY: a row read back above, changed in two fields.
+        check(unsafe { SetIpInterfaceEntry(&mut row) }, "SetIpInterfaceEntry")?;
+    }
+    Ok(())
+}
+
+/// Names `server` as the DNS server of the engine's own adapter, or none. The only
+/// DNS setting the engine writes, and only on its adapter's GUID ([`ADAPTER_GUID`]).
+/// Windows keeps it in that interface's registry key, which it deletes when the
+/// adapter is removed; after a kill the key stays until the next clean removal, and
+/// names a server only an adapter that no longer exists would use (live check of
+/// 2026-11-09). Called only while the adapter exists, so it creates no key.
+pub fn set_adapter_dns(server: Option<std::net::Ipv4Addr>) -> Result<(), String> {
+    let text = HSTRING::from(server.map(|s| s.to_string()).unwrap_or_default());
+    let settings = DNS_INTERFACE_SETTINGS { Version: DNS_INTERFACE_SETTINGS_VERSION1, Flags: u64::from(DNS_SETTING_NAMESERVER), NameServer: PWSTR(text.as_ptr().cast_mut()), ..Default::default() };
+    // SAFETY: `settings` and the string it points at outlive the call, which only reads them.
+    check(unsafe { SetInterfaceDnsSettings(GUID::from_u128(ADAPTER_GUID), &settings) }, "SetInterfaceDnsSettings")
 }
 
 /// The start-up and off-path cleanup: every route on an adapter named

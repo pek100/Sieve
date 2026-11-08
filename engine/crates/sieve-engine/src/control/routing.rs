@@ -7,8 +7,9 @@
 //! at all (plan 6: idle CPU 0).
 //!
 //! Bringing up: build the DNS service's TLS, load the pinned wintun.dll, create
-//! the adapter, start the DNS service, give the adapter its addresses, journal
-//! and add each planned route, start the stack, arm the watchdog. Any failure
+//! the adapter and give it its addresses, start the DNS service, wait until
+//! the addresses may be a source ([`ADDRESSES_READY_WITHIN`]), journal and add
+//! each planned route, start the stack, arm the watchdog. Any failure
 //! takes down what was added and
 //! reports a Setup blocker: the network stays as it was. While up, a route
 //! change re-reads the tables (pinning follows them), drops DNS's sessions when
@@ -17,6 +18,7 @@
 //! service, so its connections end with the routes.
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -41,7 +43,9 @@ use crate::inject::InjectLimits;
 use crate::inject::content::ContentHook;
 use crate::lists::https::HttpsFetcher;
 use crate::policy::wall_ms;
-use crate::route::apply::{self, SieveLuid};
+use crate::route::apply::{self, AddressState, SieveLuid};
+use crate::route::capture;
+use crate::route::wfp;
 use crate::route::journal::Journal;
 use crate::route::plan::{self, RoutePlan};
 use crate::route::prefix::Prefix;
@@ -58,7 +62,7 @@ use crate::tls::verdict::VerdictCache;
 use crate::tun::device::{Tun, TunDevice, TunSink};
 #[cfg(not(feature = "relay-experiments"))]
 use crate::tun::MTU;
-use crate::tun::{TUN_V4, TUN_V6};
+use crate::tun::{TUN_DNS, TUN_V4, TUN_V6};
 use crate::watchdog::monotonic_ms;
 
 /// While the switch is on, AdGuard is checked this often (it has no route
@@ -81,6 +85,8 @@ struct Up {
     exclusions: JoinHandle<()>,
     /// Lives exactly as long as the routes; None when it could not start.
     etw: Option<EtwSession>,
+    /// None when it could not open; routing goes on without it.
+    capture: Option<Capture>,
 }
 
 fn journal(engine: &Engine) -> Option<Journal> {
@@ -209,24 +215,89 @@ async fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
     if network_moved {
         up.relay.dns.reset();
     }
-    if routes == up.routes {
+    let up = if routes == up.routes {
         engine.routes_settled();
+        up
+    } else {
+        let mut kept: Vec<Prefix> = Vec::new();
+        for p in &up.routes {
+            if routes.contains(p) {
+                kept.push(*p);
+            } else {
+                let _ = apply::delete_route(up.luid.value(), *p);
+            }
+        }
+        if let Some(j) = journal(engine) {
+            let missing = routes.iter().copied().filter(|p| !up.routes.contains(p));
+            kept.extend(add_missing(engine, missing, |p| apply::add_route(&j, up.luid, p)));
+        }
+        kept.sort();
+        Up { routes: kept, ..up }
+    };
+    follow_capture(engine, up).await
+}
+
+/// The DNS Client capture of one routing run (`route::capture`): its filter
+/// session and the blocks it holds.
+struct Capture {
+    session: wfp::Session,
+    blocks: Vec<capture::Block>,
+}
+
+/// Names the adapter's server and puts it first for the DNS Client, then blocks
+/// the leak, in that order: the block never holds without a server to answer.
+/// A failure undoes the server and is the caller's to report; routing goes on.
+async fn open_capture(luid: SieveLuid, blocks: Vec<capture::Block>) -> Result<Capture, String> {
+    apply::put_first_for_dns(luid)?;
+    apply::set_adapter_dns(Some(TUN_DNS))?;
+    let opened = tokio::task::spawn_blocking(move || {
+        let mut session = wfp::open()?;
+        session.set(&blocks)?;
+        Ok::<_, String>(Capture { session, blocks })
+    })
+    .await
+    .map_err(|e| format!("the DNS capture's filter task: {e}"))
+    .and_then(|r| r);
+    if opened.is_err() {
+        let _ = apply::set_adapter_dns(None);
+    }
+    opened
+}
+
+/// Closes the session (its block goes with it) off the runtime, then the adapter's server.
+async fn close_capture(capture: Capture) {
+    let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
+    let _ = apply::set_adapter_dns(None);
+}
+
+/// Keeps the block on what the fresh tables and routes say. A failed change
+/// closes the capture (the DNS Client then goes as it would without it) and says why.
+async fn follow_capture(engine: &Engine, mut up: Up) -> Up {
+    let Some(mut held) = up.capture.take() else { return up };
+    let tables = up.relay.tables.read().unwrap_or_else(|p| p.into_inner()).clone();
+    let blocks = capture::blocks(&tables, &up.routes);
+    if blocks == held.blocks {
+        up.capture = Some(held);
         return up;
     }
-    let mut kept: Vec<Prefix> = Vec::new();
-    for p in &up.routes {
-        if routes.contains(p) {
-            kept.push(*p);
-        } else {
-            let _ = apply::delete_route(up.luid.value(), *p);
+    let changed = tokio::task::spawn_blocking(move || {
+        let done = held.session.set(&blocks);
+        held.blocks = blocks;
+        (held, done)
+    })
+    .await;
+    match changed {
+        Ok((held, Ok(()))) => up.capture = Some(held),
+        Ok((held, Err(why))) => {
+            engine.add_error(format!("the DNS Client's queries are no longer caught: {why}"));
+            close_capture(held).await;
+        }
+        Err(e) => {
+            engine.add_error(format!("the DNS Client's queries are no longer caught: {e}"));
+            let _ = apply::set_adapter_dns(None);
         }
     }
-    if let Some(j) = journal(engine) {
-        let missing = routes.iter().copied().filter(|p| !up.routes.contains(p));
-        kept.extend(add_missing(engine, missing, |p| apply::add_route(&j, up.luid, p)));
-    }
-    kept.sort();
-    Up { routes: kept, ..up }
+    up
 }
 
 /// Adds the routes the plan lacks and returns those that went in. A pass with no
@@ -249,20 +320,99 @@ pub(super) fn add_missing(engine: &Engine, missing: impl Iterator<Item = Prefix>
     added
 }
 
-/// Gives the adapter its addresses and journals and adds each route. A failed
-/// route removes the ones added before it.
-fn route_adapter(journal: &Journal, luid: SieveLuid, routes: &[Prefix]) -> Result<Vec<Prefix>, String> {
-    apply::add_address(luid, TUN_V4.into())?;
-    if routes.iter().any(|p| !p.is_ipv4()) {
-        apply::add_address(luid, TUN_V6.into())?;
+/// A new address is tentative while Windows runs duplicate address detection on
+/// it (3 probes, about 3 s, for IPv4 on this adapter). Until then a send through
+/// the adapter's routes fails with "host unreachable", so a route added earlier
+/// takes every lookup and connection into a hole. Bounded: an adapter whose
+/// address never settles is a Setup blocker, and the network stays as it was.
+pub(super) const ADDRESSES_READY_WITHIN: Duration = Duration::from_secs(10);
+const ADDRESS_POLL: Duration = Duration::from_millis(50);
+
+/// What bringing the adapter up does to the system, apart from the order it is
+/// done in, which the tests check (`routing_tests`).
+pub(super) trait AdapterOps {
+    fn add_address(&mut self, ip: IpAddr) -> Result<(), String>;
+    fn address_state(&mut self, ip: IpAddr) -> Result<AddressState, String>;
+    fn add_route(&mut self, prefix: Prefix) -> Result<(), String>;
+    fn delete_route(&mut self, prefix: Prefix);
+    fn forget_routes(&mut self);
+}
+
+/// The adapter, its journal: the system's side of [`AdapterOps`].
+struct Os<'a> {
+    journal: &'a Journal,
+    luid: SieveLuid,
+}
+
+impl AdapterOps for Os<'_> {
+    fn add_address(&mut self, ip: IpAddr) -> Result<(), String> {
+        apply::add_address(self.luid, ip)
     }
+
+    fn address_state(&mut self, ip: IpAddr) -> Result<AddressState, String> {
+        apply::address_state(self.luid, ip)
+    }
+
+    fn add_route(&mut self, prefix: Prefix) -> Result<(), String> {
+        apply::add_route(self.journal, self.luid, prefix)
+    }
+
+    fn delete_route(&mut self, prefix: Prefix) {
+        let _ = apply::delete_route(self.luid.value(), prefix);
+    }
+
+    fn forget_routes(&mut self) {
+        let _ = self.journal.truncate();
+    }
+}
+
+/// The adapter's own addresses for these routes: IPv6 only when IPv6 is routed.
+pub(super) fn adapter_addresses(routes: &[Prefix]) -> Vec<IpAddr> {
+    let mut addresses = vec![IpAddr::V4(TUN_V4)];
+    if routes.iter().any(|p| !p.is_ipv4()) {
+        addresses.push(IpAddr::V6(TUN_V6));
+    }
+    addresses
+}
+
+/// Gives the adapter its addresses. Done first, so their detection runs while
+/// the rest of the bring-up does.
+pub(super) fn add_addresses(ops: &mut impl AdapterOps, addresses: &[IpAddr]) -> Result<(), String> {
+    addresses.iter().try_for_each(|ip| ops.add_address(*ip))
+}
+
+/// Returns once every address may be a source, or says why it never will.
+pub(super) async fn addresses_ready(ops: &mut impl AdapterOps, addresses: &[IpAddr]) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + ADDRESSES_READY_WITHIN;
+    loop {
+        let mut tentative = None;
+        for ip in addresses {
+            match ops.address_state(*ip)? {
+                AddressState::Preferred => {}
+                AddressState::Tentative => tentative = Some(*ip),
+                AddressState::Unusable(state) => return Err(format!("Sieve's adapter cannot use its address {ip} (state {state})")),
+            }
+        }
+        let Some(ip) = tentative else { return Ok(()) };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("Sieve's adapter address {ip} was still tentative after {} s", ADDRESSES_READY_WITHIN.as_secs()));
+        }
+        tokio::time::sleep(ADDRESS_POLL).await;
+    }
+}
+
+/// Journals and adds each route once the adapter's addresses are usable, so no
+/// route points at an adapter that cannot send yet. A failed route removes the
+/// ones added before it.
+pub(super) async fn route_adapter(ops: &mut impl AdapterOps, addresses: &[IpAddr], routes: &[Prefix]) -> Result<Vec<Prefix>, String> {
+    addresses_ready(ops, addresses).await?;
     let mut added = Vec::new();
     for p in routes {
-        if let Err(e) = apply::add_route(journal, luid, *p) {
+        if let Err(e) = ops.add_route(*p) {
             for a in &added {
-                let _ = apply::delete_route(luid.value(), *a);
+                ops.delete_route(*a);
             }
-            let _ = journal.truncate();
+            ops.forget_routes();
             return Err(e);
         }
         added.push(*p);
@@ -291,6 +441,9 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     #[cfg(feature = "relay-experiments")]
     let tun = crate::tun::device::open(&engine.exe, engine.experiments.settings.tun_mtu)?;
     let luid = tun.luid;
+    let mut os = Os { journal: &journal, luid };
+    let addresses = adapter_addresses(&plan.routes);
+    add_addresses(&mut os, &addresses)?;
     let shared_tables = Arc::new(RwLock::new(tables.clone()));
     let egress = Arc::new(Egress::new(tun.index, shared_tables.clone()));
     let context = Context { connector: egress.clone(), tls: resolver_tls, resolvers };
@@ -309,7 +462,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     }
     // Before the routes, so a hang starting it cannot hold a route.
     let (etw, witness, nat) = start_attribution(engine);
-    let added = match route_adapter(&journal, luid, &plan.routes) {
+    let added = match route_adapter(&mut os, &addresses, &plan.routes).await {
         Ok(added) => added,
         Err(e) => {
             engine.stop_dns_service();
@@ -341,6 +494,14 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     let exclusions = tokio::spawn(refresh_exclusions(engine.exclusions.clone(), HttpsFetcher::new(relay.clone()), engine.validation.clone(), engine.dir.clone()));
     let (stop_accept, stopped) = oneshot::channel();
     let accept = tokio::spawn(accept(stack, relay.clone(), stopped));
+    // Last: the DNS Client is sent here only once the stack answers.
+    let capture = match open_capture(luid, capture::blocks(tables, &added)).await {
+        Ok(c) => Some(c),
+        Err(why) => {
+            engine.add_error(format!("the DNS Client's queries are not caught: {why}"));
+            None
+        }
+    };
     let batches = {
         let e = engine.clone();
         tokio::spawn(async move {
@@ -364,7 +525,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     engine.beats.relay.end();
     engine.beats.tun.end();
     engine.arm.set(true);
-    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, exclusions, etw })
+    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, exclusions, etw, capture })
 }
 
 /// Interception as this engine run wires it (task D1, D2). Nothing here runs
@@ -461,12 +622,16 @@ async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiv
     drop(stack);
 }
 
-/// The order that keeps the network: disarm, close the session (the reader
+/// The order that keeps the network: close the DNS capture, disarm, close the session (the reader
 /// returns), cancel the flows while the runtime runs, delete the routes,
 /// empty the journal, close the adapter (Wintun removes it). The ETW session
 /// stops only after that, so a hang there cannot hold a route. The DNS service
 /// goes with the last reference to it, the relay's, when this returns.
-async fn take_down(engine: &Engine, up: Up) {
+async fn take_down(engine: &Engine, mut up: Up) {
+    // First, so the DNS Client is never sent to a server that is going away.
+    if let Some(c) = up.capture.take() {
+        close_capture(c).await;
+    }
     engine.arm.set(false);
     *super::lock(&engine.beats.path) = None;
     let _ = up.tun.session.shutdown();

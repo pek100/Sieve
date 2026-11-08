@@ -19,7 +19,8 @@
 //!   Sieve, plan 1.7, even where a cut-out piece would be more specific).
 //!
 //! Additions: each DNS server that sits in a hole gets a host route into the
-//! adapter, so DNS is caught on the TUN without touching any DNS setting.
+//! adapter, so DNS is caught on the TUN. So does the adapter's own DNS server
+//! (`TUN_DNS`, `route::capture`), whenever anything is routed.
 //! IPv6 is routed only when another adapter holds an IPv6 default route, and
 //! only global unicast (2000::/3) is ever in its universe.
 
@@ -28,6 +29,7 @@ use std::net::IpAddr;
 use super::is_sieve_interface;
 use super::prefix::{Prefix, complement};
 use super::table::NetTables;
+use crate::tun::TUN_DNS;
 
 /// Never routed into the engine. Each entry says why (plan 1.4, E4).
 pub const EXCLUDED: &[(&str, &str)] = &[
@@ -115,6 +117,10 @@ pub fn plan(tables: &NetTables) -> RoutePlan {
             }
         }
     }
+    // The adapter's own DNS server (`route::capture`), whatever the families routed.
+    if !routes.is_empty() {
+        routes.push(Prefix::host(IpAddr::V4(TUN_DNS)));
+    }
     routes.sort();
     routes.dedup();
     RoutePlan { routes, holes }
@@ -184,7 +190,20 @@ mod tests {
         let mut t = load(HOME);
         t.adapters[0].dns = vec!["1.1.1.1".parse().unwrap(), "127.0.0.1".parse().unwrap(), "fe80::1".parse().unwrap()];
         let plan = plan(&t);
-        assert!(plan.routes.iter().all(|r| !r.is_host()), "{:?}", plan.routes);
+        let sieves = Prefix::host(IpAddr::V4(TUN_DNS));
+        assert!(plan.routes.iter().all(|r| !r.is_host() || *r == sieves), "{:?}", plan.routes);
+    }
+
+    #[test]
+    fn the_adapters_own_dns_server_is_routed_whenever_anything_is() {
+        let sieves = Prefix::host(IpAddr::V4(TUN_DNS));
+        assert!(plan(&load(HOME)).routes.contains(&sieves));
+        let mut v6_only = load(HOME);
+        v6_only.routes.retain(|r| r.dest.length() != 0 || !r.dest.is_ipv4());
+        assert!(plan(&v6_only).routes.contains(&sieves), "reached over the adapter's own IPv4 address");
+        let mut none = load(HOME);
+        none.routes.retain(|r| r.dest.length() != 0);
+        assert!(plan(&none).routes.is_empty());
     }
 
     #[test]

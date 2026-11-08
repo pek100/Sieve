@@ -44,6 +44,7 @@ use super::upstream::{self, Health, Path, REQUEST_BUDGET, Upstream};
 use super::{FLAG_OPCODE, FLAG_QR, HttpsRecord, MAX_MESSAGE, NameMap, TYPE_HTTPS, TYPE_SVCB, edns, flags_of, notimp, nxdomain, parse, plain, query_for, reply_answers, reverse, servfail, truncated, udp_limit, with_id};
 use crate::route::table::NetTables;
 use crate::stack::Meters;
+use crate::tun::TUN_DNS;
 use crate::watchdog::monotonic_ms;
 
 /// Queries one service works on at once. Past it a datagram is dropped (the
@@ -251,7 +252,23 @@ impl Service {
 
     /// The reply to one message, or None when it is not worth one: shorter than
     /// a header, or itself a response.
+    ///
+    /// A query to the adapter's own server ([`TUN_DNS`]) comes from the Windows
+    /// DNS Client while its queries are caught (`route::capture`). It asks every
+    /// network at once, and after an NXDOMAIN from one it waits out the others'
+    /// retries, 12 s, for a network whose queries the capture blocks (live,
+    /// 2026-11-09). So that NXDOMAIN goes back as an empty NOERROR with the same
+    /// records (NODATA), which it takes as final: the name still resolves to
+    /// nothing, at once. Every other asker gets the reply as it came.
     pub async fn answer(&self, query: &[u8], transport: Transport, asker: Asker) -> Option<Answered> {
+        let mut answered = self.answer_as_asked(query, transport, asker).await?;
+        if asker.addressed == IpAddr::V4(TUN_DNS) {
+            as_nodata(&mut answered.reply);
+        }
+        Some(answered)
+    }
+
+    async fn answer_as_asked(&self, query: &[u8], transport: Transport, asker: Asker) -> Option<Answered> {
         let flags = flags_of(query).filter(|_| query.len() >= MIN_MESSAGE)?;
         if flags & FLAG_QR != 0 {
             return None;
@@ -307,9 +324,16 @@ impl Service {
 
     /// `upstream::path_of`, the one routing decision, with the user's mode applied
     /// to what it sends encrypted. Plain with no server to send to goes nowhere.
+    /// A query to the adapter's own server ([`TUN_DNS`], the DNS Client's while
+    /// routes are up) has no server outside Sieve: it takes the one Windows would
+    /// ask without Sieve ([`upstream::first_server`]), never that address itself.
     fn path(&self, query: &[u8], addressed: Option<IpAddr>) -> Path {
-        match upstream::path_of(query, &self.tables.read().unwrap_or_else(|p| p.into_inner())) {
-            Path::Encrypted if self.mode() == Mode::Plain => addressed.map_or(Path::Refused, Path::Plain),
+        let tables = self.tables.read().unwrap_or_else(|p| p.into_inner());
+        match upstream::path_of(query, &tables) {
+            Path::Encrypted if self.mode() == Mode::Plain => {
+                let server = addressed.filter(|ip| *ip != IpAddr::V4(TUN_DNS)).or_else(|| upstream::first_server(&tables));
+                server.map_or(Path::Refused, Path::Plain)
+            }
             path => path,
         }
     }
@@ -369,6 +393,14 @@ impl Service {
         }
         Meters::bump(&self.facts.ech_left);
         reply
+    }
+}
+
+/// An NXDOMAIN reply's code made NOERROR, its records left as they are.
+fn as_nodata(reply: &mut [u8]) {
+    const NXDOMAIN: u8 = 3;
+    if let Some(low) = reply.get_mut(3).filter(|low| **low & 0x0f == NXDOMAIN) {
+        *low &= 0xf0;
     }
 }
 
@@ -717,6 +749,50 @@ mod tests {
         b.service.tables.write().unwrap().adapters.iter_mut().for_each(|a| a.dns.clear());
         assert!(b.service.https_records("www.example").await.is_err(), "no server: no lookup");
         assert!(doh.seen().is_empty(), "never encrypted instead");
+    }
+
+    /// The DNS Client asks the adapter's own server while it is captured. In plain
+    /// mode that query goes where Windows would send it without Sieve, never back
+    /// into the adapter; encrypted, it goes encrypted like any other.
+    #[tokio::test]
+    async fn a_query_to_the_adapters_own_server_in_plain_mode_asks_the_first_server_windows_names() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let router = Plain::start(answering(), answering()).await;
+        let b = bed(&ca, &[doh.url()], None, connector_with(&router));
+        let captured = Asker { addressed: IpAddr::V4(TUN_DNS), ..HOST };
+        b.service.set_mode(Mode::Plain);
+        let answered = b.ask_as(&client_query(9, "www.example"), Transport::Datagram, captured).await;
+        assert_eq!((rcode(&answered.reply), answered.resolved), (0, true));
+        assert_eq!(b.connector.udp_recorded(), [lan_target()], "the Wi-Fi's server, as Windows would ask");
+        assert!(doh.seen().is_empty(), "plain, as the user chose");
+        b.service.set_mode(Mode::Encrypted);
+        b.ask_as(&client_query(10, "www.example"), Transport::Datagram, captured).await;
+        assert_eq!(doh.seen().len(), 1);
+        assert_eq!(b.connector.udp_recorded().len(), 1, "no plain query once encryption is on");
+    }
+
+    /// The DNS Client waits 12 s after an NXDOMAIN from Sieve's network for the
+    /// network the capture blocks; it takes NODATA as final.
+    #[tokio::test]
+    async fn an_nxdomain_for_the_dns_client_goes_back_as_nodata_and_for_anyone_else_as_it_came() {
+        let ca = Ca::new();
+        let script: Script = Arc::new(|query| Step::Answer(crate::dns::nxdomain(query).unwrap()));
+        let doh = Server::start(Kind::Https, &ca, Options { script, ..Options::default() }).await;
+        let b = bed(&ca, &[doh.url()], None, Arc::new(Loopback::default()));
+        let captured = Asker { addressed: IpAddr::V4(TUN_DNS), ..HOST };
+        let answered = b.ask_as(&client_query(9, "missing.example"), Transport::Datagram, captured).await;
+        assert_eq!((id_of(&answered.reply), rcode(&answered.reply), answered.resolved), (Some(9), 0, true));
+        let message = crate::dns::parse(&answered.reply).unwrap();
+        assert!(message.answers.is_empty(), "still no address");
+        assert_eq!(message.question.as_deref(), Some("missing.example"));
+        let canary = b.ask_as(&client_query(10, CANARY_DOMAIN), Transport::Datagram, captured).await;
+        assert_eq!(rcode(&canary.reply), 0, "the engine's own NXDOMAIN too");
+        assert_eq!(rcode(&b.ask(&client_query(11, "missing.example"), Transport::Datagram).await.reply), 3, "another asker gets NXDOMAIN");
+        let servfail: Script = Arc::new(|_| Step::Close);
+        let failing = Server::start(Kind::Https, &ca, Options { script: servfail, ..Options::default() }).await;
+        let b = bed(&ca, &[failing.url()], None, Arc::new(Loopback::default()));
+        assert_eq!(rcode(&b.ask_as(&client_query(12, "www.example"), Transport::Datagram, captured).await.reply), 2, "SERVFAIL stays a failure");
     }
 
     /// The other half of the owner's rule: with encryption on, no failure of any

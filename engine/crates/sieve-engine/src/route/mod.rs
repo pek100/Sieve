@@ -9,8 +9,11 @@
 //! - [`plan`]: which prefixes to route, derived from those tables;
 //! - [`pin`]: the egress interface and source address of an upstream socket;
 //! - [`journal`]: routes recorded on disk before they are added;
-//! - `apply` and `watch` (Windows): the writes and `NotifyRouteChange2`.
+//! - `apply` and `watch` (Windows): the writes and `NotifyRouteChange2`;
+//! - [`capture`]: what catches the DNS Client's queries while routes are up, and
+//!   `wfp` (Windows), the dynamic filter session it blocks their leak with.
 
+pub mod capture;
 pub mod journal;
 pub mod pin;
 pub mod plan;
@@ -21,6 +24,8 @@ pub mod table;
 pub mod apply;
 #[cfg(windows)]
 pub mod watch;
+#[cfg(windows)]
+pub mod wfp;
 
 /// The engine's adapter (plan 1.4).
 pub const ADAPTER_NAME: &str = "Sieve";

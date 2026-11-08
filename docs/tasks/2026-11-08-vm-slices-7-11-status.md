@@ -1,12 +1,48 @@
 # VM live run 2026-11-08: status at the stop
 
+## Run 3 (2026-11-09): the DNS gap after a start, the DNS Client leak
+
+Branch `worktree-agent-acd57d2c31e644f62` on main 8abf3bf. VM 23:57 to 01:21 local (1.4 h), stopped at the end. Engine under test 1B5C3A1A (release); "before" is main 0ea3303 (3940237E), whose bring-up and DNS code are the same as 8abf3bf's.
+
+**The gap after a start: Sieve's address was still tentative.** Sampled every 100 to 300 ms after `Start-Service`: the engine added its routes at 0.27 to 0.39 s while 198.18.0.1 was `Tentative` (duplicate address detection, `DAD Transmits: 3` on the adapter). Until it turned `Preferred` at 3.3 to 3.4 s, every send through those routes failed at once with `HostUnreachable` (own socket to 10.128.0.1 and to 1.1.1.1), so lookups got no answer for 3.0 s each round. Fix: the addresses go on right after the adapter is created, and no route is added before every address is `Preferred` (bounded at 10 s, then a Setup blocker; `routing::route_adapter`, tests in `routing_tests.rs` that fail without the wait). After: 3 rounds, 0 failed probes of 75 to 120 per round through the own socket and the DNS Client; the routes go in at 3.4 to 4.8 s, and until then traffic takes the normal path. One 300 ms probe to 1.1.1.1 timed out in two of six rounds while only Windows' own routes were on the adapter (the probe went out of the NIC), not explained.
+
+**The DNS Client leak.** DNS Client ETW (events 3009, 3010, 3020): it asks every network's servers at once, binding each query to that adapter's address, and Sieve's adapter had no server (its query returned 1460 at once). Server 2025 never asks `fec0:0:0:ffff::1-3`. Measured on the VM with temporary settings, then built:
+
+| Setup | Plain queries out of the NIC | Lookup |
+|---|---|---|
+| main, no server on Sieve | 40 for 20 lookups (all) | 17 to 36 ms |
+| a server on Sieve (198.18.0.53), metric 5 or 1, no block | 40 for 20 lookups | 38 ms |
+| server, metric 5, Dnscache's port 53 on Ethernet blocked | 2 | 12 s (it waits out the blocked first network) |
+| server, metric 1, blocked | 0 | 44 to 143 ms; an NXDOMAIN 12 s (it waits for the blocked network after a negative) |
+| blocking Dnscache's binds to 10.128.0.2 instead | 0 | every lookup fails at once (WSAEACCES) |
+| **built: server, metric 1, block, NXDOMAIN to the DNS Client as NODATA** | **0 for 30 fresh names** | 38 ms median; NXDOMAIN 39 ms, NODATA 46, real 31 (off: 16, 18, 2) |
+
+Built (`route::capture`, `route::wfp`, `apply::set_adapter_dns`, `apply::put_first_for_dns`): the adapter names `TUN_DNS` 198.18.0.53 (host route in the plan), interface metric 1, and a dynamic WFP session blocks port 53 from the DNS Client's service SID only, leaving the default-route adapters, to what the engine routes. The DNS service answers the DNS Client's NXDOMAIN as NODATA (same records, rcode 0) so it does not wait 12 s; that is a change of what the DNS Client sees, and needs the owner's yes.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Leak, 30 fresh names (Resolve-DnsName, .NET, curl) | PASS | pktmon on the NIC: 0 plain port-53 packets; 51 queries to 198.18.0.53. In other runs the only ones were the internal suffix's names (`_ldap._tcp.dc._msdcs.<suffix>` SRV, `<host>.<suffix>`), which the engine itself sends to the LAN server by its split-horizon rule |
+| Lookups | PASS | 10 real names over three resolvers 10/10; the internal suffix name resolved to 10.128.0.2; 20 uncached lookups median 38 ms, p90 53 (Sieve off 18 / 20) |
+| NRPT `.example.org` to 8.8.8.8 | PASS | www.example.org resolved; rule removed |
+| `plain_dns` | PASS | lookups 10/10, NXDOMAIN 22 ms; encrypted upstream answers 311 -> 0 during plain mode; queries left to 10.128.0.1 in plain text, as the user chose |
+| Kill (`taskkill /F`) | PASS | capture filters 0 right after; Resolve-DnsName 0.02 s, curl https 0.24 s; route, DNS, proxy, firewall, adapter listings 0 lines different; metrics as before |
+| `sc stop` | PASS | filters 0; listings 0 lines different; Sieve's Tcpip interface key gone |
+| Reboot after a kill | PASS, one residue | DNS 0.82 s after boot, listings 0 lines different. The kill leaves `Tcpip\Parameters\Interfaces\{5e7e5e7e-...0003}` with `NameServer=198.18.0.53`; it survives the reboot, no adapter reads it, and the next clean stop deletes it (seen) |
+| IPv6 disabled (`DisabledComponents` 0xFF, reboot) | PASS | routes up, 198.18.0.1 Preferred, capture on, lookups 10/10, real names 10/10, curl 200, 0 public names leaked; reverted and rebooted |
+| Uninstall (`uninstall.exe /S`, exit 0 in 3.4 s, capture on) | PASS | filters 0, service absent, no adapter, no Sieve key in the registry, listings 0 lines different; lookups 0.02 s |
+| Dnscache restart | SKIP | Windows refuses to stop it |
+| IPv6 block | SKIP | the VM has no IPv6 default route, so only the IPv4 filter was made |
+| VPN, Wi-Fi to Ethernet switch | SKIP | none on the VM |
+
+VM state at the stop: `setup-cur.exe` reinstalled, engine main 0ea3303 (3940237E) put back, policy `engine` false, `DisabledComponents` absent, no NRPT rule, no test firewall rule.
+
 ## Run 2 (second session, same day)
 
 Branch `live-vm-2026-11-08` with main 8d1d873 merged. VM 20:10 to 23:50 local (3.7 h; 5.1 h today with run 1), stopped at the end.
 
 Fixes on this branch, each with a test that fails without it: 5a6d8af (Version Negotiation is the QUIC refusal), 6dc6a8d (bundle script marks `trusted-*` resources trusted), 3850222 (a user's `+js()` rules get the bundle), 8726598 (`scriptletGlobals` declared for uBO scriptlets).
 
-Still open, in order: the DNS Client leak (run 1; the fec0 capture does not engage on Server 2025, below); lookups with no answer for about 3 s after each engine start; slice 7 U1 (curl with its own CA bundle is never healed); the uBO list arm of slice 10; slice 9 U6 and the meta-CSP row; slice 11 U9 and U12; video playback (needs a residential IP); the runbooks' `example.com##h1` (the page has no h1 now).
+Still open, in order: the DNS Client leak and the 3 s gap after a start (both fixed in run 3 above, not merged); slice 7 U1 (curl with its own CA bundle is never healed); the uBO list arm of slice 10; slice 9 U6 and the meta-CSP row; slice 11 U9 and U12; video playback (needs a residential IP); the runbooks' `example.com##h1` (the page has no h1 now).
 
 VM state at the stop: Sieve installed from `setup-cur.exe`, engine main 0ea3303 release (3940237E), the real app in place, policy `engine` false, no `live-scope.json`, IPv6 enabled again, no test firewall rule or NRPT rule left. Scripts in the session scratchpad: `d-s8b.ps1`, `d-s9.ps1`, `d-s10.ps1`, `d-s11.ps1`, `d-real2.ps1`, `k-*.ps1`, `content.mjs`, `text.mjs`.
 
