@@ -16,7 +16,6 @@ pub mod notices;
 pub mod score;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use rustls::AlertDescription;
 use sieve_filter::exclusions::{AutoReason, Pattern, exe_file_name};
@@ -25,7 +24,7 @@ use sieve_ipc::HealNotice;
 use crate::exclusions::{AutoEntry, ExclusionSlot};
 use crate::policy::wall_ms;
 use crate::stack::Meters;
-use crate::tls::intercept::{ClientWatch, Pair};
+use crate::tls::intercept::{ClientWatch, Pair, Silence};
 
 use notices::Notices;
 use score::{Evidence, Ledger};
@@ -128,12 +127,16 @@ impl ClientWatch for Heal {
         self.hear(pair, Evidence::Refused(alert), wall_ms());
     }
 
+    fn accepted(&self, pair: &Pair) {
+        self.hear(pair, Evidence::Accepted, wall_ms());
+    }
+
     fn request_seen(&self, pair: &Pair) {
         self.hear(pair, Evidence::Used, wall_ms());
     }
 
-    fn closed_without_request(&self, pair: &Pair, after: Duration) {
-        self.hear(pair, Evidence::Closed { after_ms: u64::try_from(after.as_millis()).unwrap_or(u64::MAX) }, wall_ms());
+    fn ended(&self, pair: &Pair, silence: Option<Silence>) {
+        self.hear(pair, Evidence::Ended(silence), wall_ms());
     }
 }
 
@@ -163,8 +166,10 @@ mod tests {
         Evidence::Refused(Some(FATAL_ALERTS[0]))
     }
 
-    fn closed() -> Evidence {
-        Evidence::Closed { after_ms: 0 }
+    /// A connection that completes its handshake and is closed at once, unused.
+    fn handshake_then_close(h: &Heal, exe: &str, host: &str, at: u64) {
+        h.hear(&pair(exe, host), Evidence::Accepted, at);
+        h.hear(&pair(exe, host), Evidence::Ended(Some(Silence { after: std::time::Duration::ZERO, alert: None })), at);
     }
 
     fn found(heal: &Heal, exe: &str, at: u64) -> Option<Src> {
@@ -256,10 +261,13 @@ mod tests {
         let h = heal();
         h.hear(&pair(CLIENT, HOST), refused(), NOW);
         h.try_again(&one_row(), NOW);
-        h.hear(&pair(CLIENT, HOST), closed(), NOW);
+        handshake_then_close(&h, CLIENT, HOST, NOW);
         assert_eq!(found(&h, CLIENT, NOW), Some(Src::Auto(AutoReason::Pinning)));
     }
 
+    /// Changed 2026-11-08 with the quiet-close rule: a pair that carried a request
+    /// is no longer excluded by closes at all, so what follows the request here is
+    /// refused handshakes, which the request's credit delays by one.
     #[test]
     fn retry_then_a_used_connection_stays_decrypted() {
         let h = heal();
@@ -267,9 +275,15 @@ mod tests {
         h.try_again(&one_row(), NOW);
         h.hear(&pair(CLIENT, HOST), Evidence::Used, NOW);
         assert_eq!(found(&h, CLIENT, NOW), None);
-        h.hear(&pair(CLIENT, HOST), closed(), NOW);
-        assert_eq!(found(&h, CLIENT, NOW), None, "and then it takes two closes");
-        h.hear(&pair(CLIENT, HOST), closed(), NOW);
+        for _ in 0..10 {
+            handshake_then_close(&h, CLIENT, HOST, NOW);
+        }
+        assert_eq!(found(&h, CLIENT, NOW), None, "closes say nothing now");
+        for _ in 0..2 {
+            h.hear(&pair(CLIENT, HOST), Evidence::Refused(None), NOW);
+        }
+        assert_eq!(found(&h, CLIENT, NOW), None, "and it takes three refusals");
+        h.hear(&pair(CLIENT, HOST), Evidence::Refused(None), NOW);
         assert_eq!(found(&h, CLIENT, NOW), Some(Src::Auto(AutoReason::Pinning)));
     }
 
@@ -285,7 +299,7 @@ mod tests {
         let rows = h.exclusions.rows(NOW);
         let lines: Vec<(&str, &[String])> = rows.iter().filter(|r| r.reason.starts_with("auto:")).map(|r| (r.line.as_str(), r.apps.as_slice())).collect();
         assert_eq!(lines, [("\"a.example\"", &["other.exe".to_string()][..]), ("\"cert.example\"", &[][..])]);
-        h.hear(&pair(CLIENT, "b.example"), closed(), NOW);
+        handshake_then_close(&h, CLIENT, "b.example", NOW);
         assert_eq!(h.exclusions.rows(NOW).iter().filter(|r| r.line == "\"b.example\"").count(), 1, "seeded, as one row's try");
     }
 

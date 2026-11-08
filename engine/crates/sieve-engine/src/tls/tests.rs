@@ -47,6 +47,7 @@ use crate::exclusions::{AutoEntry, ExclusionSlot};
 use crate::flow::classify::Decoded;
 use crate::flow::flows::Action;
 use crate::heal::Heal;
+use crate::heal::dials::QUIET_CLOSES;
 use crate::http::hook::{NoRewrite, ResponseHook};
 use crate::policy::wall_ms;
 use crate::stack::Meters;
@@ -1595,6 +1596,8 @@ struct Watched {
     refused: Mutex<Vec<(String, Option<rustls::AlertDescription>)>>,
     requests: AtomicUsize,
     silent: AtomicUsize,
+    accepted: AtomicUsize,
+    ended: AtomicUsize,
 }
 
 impl ClientWatch for Watched {
@@ -1602,12 +1605,19 @@ impl ClientWatch for Watched {
         self.refused.lock().unwrap().push((pair.host.clone(), alert));
     }
 
+    fn accepted(&self, _: &Pair) {
+        self.accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn request_seen(&self, _: &Pair) {
         self.requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn closed_without_request(&self, _: &Pair, _: Duration) {
-        self.silent.fetch_add(1, Ordering::Relaxed);
+    fn ended(&self, _: &Pair, silence: Option<super::intercept::Silence>) {
+        self.ended.fetch_add(1, Ordering::Relaxed);
+        if silence.is_some() {
+            self.silent.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1630,6 +1640,7 @@ arms!(client_watch_hears_a_refusal_and_a_silent_close, |arm| async move {
     task.await.unwrap();
     assert_eq!(watched.silent.load(Ordering::Relaxed), 1);
     assert_eq!(watched.requests.load(Ordering::Relaxed), 0);
+    assert_eq!((watched.accepted.load(Ordering::Relaxed), watched.ended.load(Ordering::Relaxed)), (1, 1), "the refused one was never open");
 });
 
 /// An upstream on a negotiated protocol: holds its session, or ends it at once.
@@ -1669,6 +1680,7 @@ arms!(only_a_close_by_the_client_counts_as_a_silent_client, |arm| async move {
         rig.deps.active.close_host(HOST);
         task.await.unwrap();
         assert_eq!(watched.silent.load(Ordering::Relaxed), 0, "{alpn}: closed by the engine");
+        assert_eq!(watched.ended.load(Ordering::Relaxed), 1, "{alpn}: and still heard as ended, so the pair holds no open connection");
         drop(tls);
         // The upstream ends it: an origin closing an idle preconnect.
         let watched = Arc::new(Watched::default());
@@ -1958,16 +1970,66 @@ async fn silent_client(rig: &Rig, alpn: &[&str]) {
     let (app, task) = rig.flow(flow_opts()).await;
     let (client, shown) = client_tls(alpn, None);
     let tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
-    assert!(shown_is_sieves(&shown, rig), "still decrypted");
+    assert!(shown_is_sieves(&shown, rig), "still decrypted; passed through for {:?}", rig.reasons());
     drop(tls);
     task.await.unwrap();
 }
 
-arms!(two_silent_clients_exclude_and_the_third_passes_through, |arm| async move {
-    let (rig, _heal, upstream_leaf) = healing_rig(arm, &[]);
-    silent_client(&rig, &[]).await;
+// Was `two_silent_clients_exclude_and_the_third_passes_through`; since 2026-11-08 a
+// handshake then a close counts only when it repeats `QUIET_CLOSES` times at once.
+arms!(repeated_silent_clients_exclude_and_the_next_passes_through, |arm| async move {
+    let (rig, heal, upstream_leaf) = healing_rig(arm, &[]);
+    for _ in 1..QUIET_CLOSES {
+        silent_client(&rig, &[]).await;
+    }
+    assert!(heal.notices(0).1.is_empty(), "one fewer is not enough");
     silent_client(&rig, &[]).await;
     passes_untouched(&rig, &upstream_leaf).await;
+});
+
+/// A client that sends its hello, reads the start of Sieve's answer and closes:
+/// the handshake never completes.
+async fn closes_during_the_handshake(rig: &Rig, alpn: &[&str]) {
+    let (mut app, task) = rig.flow(flow_opts()).await;
+    let (client, _) = client_tls(alpn, None);
+    let mut conn = rustls::ClientConnection::new(client, ServerName::try_from(HOST).unwrap()).unwrap();
+    let mut hello = Vec::new();
+    conn.write_tls(&mut hello).unwrap();
+    app.write_all(&hello).await.unwrap();
+    let mut answer = [0u8; 1];
+    app.read_exact(&mut answer).await.unwrap();
+    drop(app);
+    assert_eq!(tokio::time::timeout(LIMIT, task).await.expect("ended").unwrap().action, FlowAction::Failed);
+}
+
+arms!(a_client_that_closes_during_the_handshake_again_is_excluded, |arm| async move {
+    let (rig, heal, upstream_leaf) = healing_rig(arm, &[]);
+    closes_during_the_handshake(&rig, &[]).await;
+    assert!(heal.notices(0).1.is_empty(), "once is not enough");
+    closes_during_the_handshake(&rig, &[]).await;
+    assert_eq!(heal.notices(0).1.len(), 1);
+    passes_untouched(&rig, &upstream_leaf).await;
+});
+
+arms!(preconnects_beside_a_held_connection_never_exclude, |arm| async move {
+    for alpn in ["h2", "http/1.1"] {
+        let (rig, heal) = answering_rig(arm, alpn);
+        let (held, held_task) = intercepted(&rig, alpn).await;
+        for _ in 0..2 * QUIET_CLOSES {
+            silent_client(&rig, &[alpn]).await;
+            closes_during_the_handshake(&rig, &[alpn]).await;
+        }
+        assert!(heal.notices(0).1.is_empty(), "{alpn}: the client accepts the leaf on the held one");
+        drop(held);
+        held_task.await.unwrap();
+        // The control: alone, the same closes exclude. The held one's own close may be the first.
+        let mut closes = 0;
+        while heal.notices(0).1.is_empty() {
+            assert!(closes < QUIET_CLOSES, "{alpn}: excluded within {QUIET_CLOSES}");
+            silent_client(&rig, &[alpn]).await;
+            closes += 1;
+        }
+    }
 });
 
 /// One GET over the negotiated protocol, and the client closes.
@@ -2023,10 +2085,15 @@ arms!(a_used_connection_between_silent_closes_stays_decrypted, |arm| async move 
         used_client(&rig, alpn).await;
         silent_client(&rig, &[alpn]).await;
         assert!(heal.notices(0).1.is_empty(), "{alpn}");
+        for _ in 0..2 * QUIET_CLOSES {
+            silent_client(&rig, &[alpn]).await;
+        }
+        assert!(heal.notices(0).1.is_empty(), "{alpn}: a pair that carried a request is not excluded by closes");
         // The control: without the used connection, the same closes exclude it.
         let (bare, bare_heal) = answering_rig(arm, alpn);
-        silent_client(&bare, &[alpn]).await;
-        silent_client(&bare, &[alpn]).await;
+        for _ in 0..QUIET_CLOSES {
+            silent_client(&bare, &[alpn]).await;
+        }
         assert_eq!(bare_heal.notices(0).1.len(), 1, "{alpn}: the control");
     }
 });

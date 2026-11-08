@@ -82,24 +82,59 @@ pub struct Pair {
     pub session: Option<u32>,
 }
 
+/// How a client ended an accepted connection on which it sent no request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Silence {
+    /// Since the local handshake completed.
+    pub after: Duration,
+    /// The alert it ended with, when it sent one.
+    pub alert: Option<AlertDescription>,
+}
+
 /// What the client side did, for self-healing (`heal::Heal` in production; the
-/// plain `NoWatch` in tests that do not read it).
+/// plain `NoWatch` in tests that do not read it). Every connection is heard as
+/// either `handshake_failed`, or `accepted` and later exactly one `ended`.
 pub trait ClientWatch: Send + Sync {
-    /// The client refused our handshake, or sent a fatal alert right after it, with
-    /// its alert when it sent one.
+    /// The local handshake did not complete: the client refused it, with its alert
+    /// when it sent one, closed during it, or let it time out.
     fn handshake_failed(&self, pair: &Pair, alert: Option<AlertDescription>);
-    /// The first request of an intercepted connection arrived.
+    /// The local handshake completed: one more connection of the pair is open.
+    fn accepted(&self, pair: &Pair);
+    /// The first request of an accepted connection arrived.
     fn request_seen(&self, pair: &Pair);
-    /// The client closed after the handshake without one request.
-    fn closed_without_request(&self, pair: &Pair, after: Duration);
+    /// An accepted connection ended. `silence` is there only when the client ended
+    /// it without one request; an end by the engine or the upstream has none.
+    fn ended(&self, pair: &Pair, silence: Option<Silence>);
 }
 
 pub struct NoWatch;
 
 impl ClientWatch for NoWatch {
     fn handshake_failed(&self, _: &Pair, _: Option<AlertDescription>) {}
+    fn accepted(&self, _: &Pair) {}
     fn request_seen(&self, _: &Pair) {}
-    fn closed_without_request(&self, _: &Pair, _: Duration) {}
+    fn ended(&self, _: &Pair, _: Option<Silence>) {}
+}
+
+/// An accepted connection as the watch counts it: `ended` is heard once, also when
+/// the flow's task is dropped, so no pair keeps a connection that is gone.
+struct Open<'a> {
+    watch: &'a dyn ClientWatch,
+    pair: &'a Pair,
+    silence: Option<Silence>,
+}
+
+impl<'a> Open<'a> {
+    fn new(watch: &'a dyn ClientWatch, pair: &'a Pair) -> Self {
+        watch.accepted(pair);
+        Self { watch, pair, silence: None }
+    }
+}
+
+impl Drop for Open<'_> {
+    fn drop(&mut self) {
+        self.watch.ended(self.pair, self.silence.take());
+    }
 }
 
 /// What every intercepted flow shares. Built only with the switch on.
@@ -535,6 +570,7 @@ where
             return FlowAction::Failed;
         }
     };
+    let mut open = Open::new(deps.watch.as_ref(), &pair);
     Meters::bump(&deps.meters.https.intercepted);
     count_group(&deps.meters.https.upstream_groups, shaken.group);
     count_group(&deps.meters.https.client_groups, client.get_ref().1.negotiated_key_exchange_group().map(|g| g.name()));
@@ -549,11 +585,9 @@ where
     deps.after_serve(host, ended.upstream_error.as_ref());
     // Evidence about the client only if the client did it (task D17, plan 4.3).
     if ended.client_ended && !ctx.request_was_seen() {
-        match ended.client_alert {
-            Some(alert) => deps.watch.handshake_failed(&pair, Some(alert)),
-            None => deps.watch.closed_without_request(&pair, started.elapsed()),
-        }
+        open.silence = Some(Silence { after: started.elapsed(), alert: ended.client_alert });
     }
+    drop(open);
     FlowAction::Relayed
 }
 
