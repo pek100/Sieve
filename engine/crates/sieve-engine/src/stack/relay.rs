@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use ipstack::{IpStackTcpStream, IpStackUdpStream};
-use sieve_ipc::{FlowAction, FlowEvent, FlowKind, FlowProto};
+use sieve_ipc::{FlowAction, FlowEvent, FlowKind, FlowProto, Signal};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -33,6 +33,8 @@ use super::book::FlowBook;
 use super::dns_flow;
 use super::egress::Egress;
 use super::path_mtu::{self, TooBig};
+use super::progress::{Progress, Watched};
+use super::retry;
 use super::{DNS_PORT, Meters, close_blocked, kind_of, record_decision};
 use crate::dns::NameMap;
 use crate::dns::service::Service;
@@ -253,7 +255,9 @@ impl Relay {
         };
         let mut book = lock(&self.book);
         let id = book.open(event)?;
-        Some(Admitted { id, owner: attribution.row_owner(app, &book) })
+        let owner = attribution.row_owner(app, &book);
+        book.own(id, owner.row_key());
+        Some(Admitted { id, owner })
     }
 
     /// The one decision for a flow whose first bytes were decoded, in the book.
@@ -285,15 +289,24 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
         return dns_flow::tcp(ctx, app, flow).await;
     }
     let accepted_ms = monotonic_ms();
-    let (attributed, upstream) = tokio::join!(ctx.attribute(flow), ctx.egress.connect(flow.remote));
+    // The name map is read only when the connect is in trouble (`retry`).
+    let alternates = || retry::alternates(&lock(&ctx.names), flow.remote.ip(), monotonic_ms());
+    let (attributed, connected) = tokio::join!(ctx.attribute(flow), retry::connect(&*ctx.egress, flow.remote, alternates));
     if guard_tcp(attributed.own, flow.remote.port()) == Guard::RelayOwn {
-        return relay_own(app, upstream).await;
+        return relay_own(app, connected.result).await;
     }
     let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Tcp, FlowKind::Other) else { return close_app(&mut app).await };
-    let upstream = match upstream {
+    if let Some(how) = connected.retry() {
+        lock(&ctx.book).retried(admitted.id, how, connected.result.is_ok());
+    }
+    let upstream = match connected.result {
         Ok(u) => u,
-        Err(_) => {
-            lock(&ctx.book).close(admitted.id, FlowAction::Failed, 0, 0);
+        Err(failure) => {
+            {
+                let mut book = lock(&ctx.book);
+                book.problem(admitted.id, failure.signal());
+                book.close(admitted.id, FlowAction::Failed, 0, 0);
+            }
             return close_app(&mut app).await;
         }
     };
@@ -302,7 +315,7 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
 
 /// The engine's own plain HTTP ([`guard_tcp`]): not the user's flow, so no book
 /// entry and no decision, only the copy.
-async fn relay_own(mut app: IpStackTcpStream, upstream: Result<TcpStream, String>) {
+async fn relay_own(mut app: IpStackTcpStream, upstream: Result<TcpStream, retry::Failure>) {
     if let Ok(upstream) = upstream {
         splice(&mut app, upstream, &[]).await;
     }
@@ -339,6 +352,8 @@ pub(super) async fn serve_admitted(ctx: Arc<Relay>, mut app: IpStackTcpStream, f
         }
         return;
     }
+    let progress = Progress::new(monotonic_ms);
+    let upstream = Watched::new(upstream, progress.clone());
     #[cfg(feature = "relay-experiments")]
     let out = if let Some(capacity) = ctx.experiments.copy_buffer_bytes {
         crate::flow::relay::relay_tcp_buffered(&mut app, upstream, FIRST_BYTES_WAIT, decide, capacity).await
@@ -352,7 +367,11 @@ pub(super) async fn serve_admitted(ctx: Arc<Relay>, mut app: IpStackTcpStream, f
         app.abort();
     } else {
         let action = if out.upstream_write_failed { FlowAction::Failed } else { FlowAction::Relayed };
-        lock(&ctx.book).close(admitted.id, action, out.bytes_up, out.bytes_down);
+        let mut book = lock(&ctx.book);
+        if progress.stalled() {
+            book.problem(admitted.id, Signal::Stall);
+        }
+        book.close(admitted.id, action, out.bytes_up, out.bytes_down);
     }
     if out.stop {
         close_app(&mut app).await;

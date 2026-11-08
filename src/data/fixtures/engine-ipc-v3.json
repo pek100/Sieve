@@ -94,7 +94,8 @@
     { "type": "heal_notices", "after": 0 },
     { "type": "list_refresh", "id": "custom-a1" },
     { "type": "list_import", "id": "custom-b2", "text": "! Title: Mine\n||ads.example^\n" },
-    { "type": "list_rules", "id": "adguard-dns", "query": "ads" }
+    { "type": "list_rules", "id": "adguard-dns", "query": "ads" },
+    { "type": "issues", "after": 0 }
   ],
   "engine": [
     { "type": "welcome", "protocol": 3, "engine_version": "0.1.0", "session_id": 1 },
@@ -382,6 +383,38 @@
           "rule": "||guest.example^",
           "list": "user",
           "forwarded": { "vm": "DevBox" }
+        },
+        {
+          "id": 4,
+          "t": 1760000003000,
+          "flow_id": 10,
+          "pid": 5150,
+          "exe": "C:\\Games\\Launcher\\launcher.exe",
+          "session": 1,
+          "kind": "other",
+          "host": "203.0.113.9",
+          "remote": "203.0.113.9:443",
+          "url": null,
+          "request_type": null,
+          "outcome": { "kind": "problem", "signal": "connect_timeout", "cause": "network" },
+          "rule": null,
+          "list": null
+        },
+        {
+          "id": 5,
+          "t": 1760000004000,
+          "flow_id": 11,
+          "pid": 5150,
+          "exe": "C:\\Games\\Launcher\\launcher.exe",
+          "session": 1,
+          "kind": "other",
+          "host": "203.0.113.10",
+          "remote": "203.0.113.10:443",
+          "url": null,
+          "request_type": null,
+          "outcome": { "kind": "retried", "how": "next_address", "recovered": true },
+          "rule": null,
+          "list": null
         }
       ]
     },
@@ -418,7 +451,48 @@
       ]
     },
     { "type": "list_imported", "id": "custom-b2", "rules": 1, "skipped": 0 },
-    { "type": "list_rules", "id": "adguard-dns", "lines": ["||ads.example^", "||ads.other.example^"], "matched": 2, "total": 7 }
+    { "type": "list_rules", "id": "adguard-dns", "lines": ["||ads.example^", "||ads.other.example^"], "matched": 2, "total": 7 },
+    {
+      "type": "issues",
+      "run": 1793000000000,
+      "revision": 9,
+      "apps": [
+        {
+          "key": "game launcher",
+          "exe": "launcher.exe",
+          "session": 1,
+          "since_ms": 1793000000000,
+          "flows": 40,
+          "retried": 3,
+          "recovered": 2,
+          "problems": [
+            { "signal": "app_refused_certificate", "cause": "sieve", "host": "cdn.game.example", "count": 4, "first_ms": 1793000060000, "last_ms": 1793000120000 },
+            { "signal": "blocked", "cause": "sieve", "host": "updates.game.example", "count": 6, "first_ms": 1793000010000, "last_ms": 1793000110000 },
+            { "signal": "connect_timeout", "cause": "network", "host": "203.0.113.9", "count": 2, "first_ms": 1793000020000, "last_ms": 1793000100000 },
+            { "signal": "connect_refused", "cause": "network", "host": "203.0.113.11", "count": 1, "first_ms": 1793000090000, "last_ms": 1793000090000 },
+            { "signal": "unreachable", "cause": "network", "host": "203.0.113.12", "count": 1, "first_ms": 1793000080000, "last_ms": 1793000080000 },
+            { "signal": "stall", "cause": "unknown", "host": "patch.game.example", "count": 1, "first_ms": 1793000070000, "last_ms": 1793000070000 }
+          ]
+        },
+        {
+          "key": "vm:devbox",
+          "exe": null,
+          "session": null,
+          "since_ms": 1793000000000,
+          "flows": 12,
+          "retried": 0,
+          "recovered": 0,
+          "problems": [
+            { "signal": "quic_refused", "cause": "sieve", "host": "video.example", "count": 3, "first_ms": 1793000030000, "last_ms": 1793000050000 },
+            { "signal": "connect_failed", "cause": "unknown", "host": "192.0.2.40", "count": 1, "first_ms": 1793000040000, "last_ms": 1793000040000 },
+            { "signal": "egress_failed", "cause": "sieve", "host": "2001:db8::40", "count": 1, "first_ms": 1793000041000, "last_ms": 1793000041000 },
+            { "signal": "connection_lost", "cause": "unknown", "host": "files.example", "count": 2, "first_ms": 1793000042000, "last_ms": 1793000043000 },
+            { "signal": "dns_unanswered", "cause": "unknown", "host": null, "count": 5, "first_ms": 1793000044000, "last_ms": 1793000045000 }
+          ]
+        }
+      ],
+      "dropped": 0
+    }
   ],
   "outcomes": [
     { "kind": "blocked" },
@@ -429,7 +503,9 @@
     { "kind": "passed", "reason": "no_rule" },
     { "kind": "passed", "reason": "exception" },
     { "kind": "passed", "reason": "app_off" },
-    { "kind": "not_decrypted", "reason": "no_rule" }
+    { "kind": "not_decrypted", "reason": "no_rule" },
+    { "kind": "problem", "signal": "blocked", "cause": "sieve" },
+    { "kind": "retried", "how": "reconnect", "recovered": false }
   ],
   "certStatuses": {
     "installed": {

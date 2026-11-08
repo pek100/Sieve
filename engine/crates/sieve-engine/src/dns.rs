@@ -653,6 +653,17 @@ impl NameMap {
             .unwrap_or_default()
     }
 
+    /// Every address `name` (as recorded) is live for at `now_ms`, an ambiguous
+    /// one included only once its ambiguity ended. A scan of the whole map, so it
+    /// is asked only when a connect is in trouble (`stack::retry`), never per flow.
+    pub fn addresses(&self, name: &str, now_ms: u64) -> Vec<IpAddr> {
+        self.entries
+            .iter()
+            .filter(|(_, v)| v.ambiguous_until <= now_ms && v.live.iter().any(|(n, exp)| n == name && *exp > now_ms))
+            .map(|(ip, _)| *ip)
+            .collect()
+    }
+
     /// Drops every expired name and every address left with none.
     pub fn prune(&mut self, now_ms: u64) {
         self.entries.retain(|_, v| {

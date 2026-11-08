@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use sieve_ipc::nonblocking::{read_frame, write_frame};
 use sieve_filter::exclusions::{AutoReason, exe_file_name, parse_line};
-use sieve_ipc::{CertStatus, ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, ExclusionsView, FLOWS_PER_FRAME, FlowEvent, FrameError, HealNotice, ListStatus, LogRow, Policy, answer_hello, exclusions_page, log_frames};
+use sieve_ipc::{AppIssues, CertStatus, ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, ExclusionsView, FLOWS_PER_FRAME, FlowEvent, FrameError, HealNotice, ListStatus, LogRow, Policy, answer_hello, exclusions_page, log_frames};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 
@@ -77,6 +77,25 @@ pub trait Backend: Send + Sync + 'static {
     fn try_decrypt_again(&self, retry: Retry);
     /// This run's self-healing notices newer than `after`, of every session.
     fn heal_notices(&self, after: u64) -> HealAnswer;
+    /// The apps of `session` (and the services' and the VMs') with recent problems.
+    fn issues(&self, session: u32) -> IssuesAnswer;
+}
+
+/// What [`Backend::issues`] answers; the fields of `EngineMessage::Issues`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuesAnswer {
+    pub run: u64,
+    pub revision: u64,
+    pub apps: Vec<AppIssues>,
+    pub dropped: u64,
+}
+
+/// The `issues` message for a client that last read `after`: the apps only when
+/// something changed since (an `after` of 0 always gets them).
+pub fn issues_message(answer: IssuesAnswer, after: u64) -> EngineMessage {
+    let IssuesAnswer { run, revision, apps, dropped } = answer;
+    let apps = if after == 0 || revision > after { apps } else { Vec::new() };
+    EngineMessage::Issues { run, revision, apps, dropped }
 }
 
 /// What [`Backend::heal_notices`] answers; the fields of `EngineMessage::HealNotices`.
@@ -197,6 +216,7 @@ where
                 let HealAnswer { run, revision, exclusions_revision, notices } = backend.heal_notices(after);
                 EngineMessage::HealNotices { run, revision, exclusions_revision, notices: notices.into_iter().filter(|n| notice_visible_to(n, session_id)).collect() }
             }
+            Ok(ClientMessage::Issues { after }) => issues_message(backend.issues(session_id), after),
             Ok(ClientMessage::Hello { .. }) => return refuse(stream, HELLO_ONCE).await,
             Err(FrameError::Closed) => return Ok(()),
             Err(e) => return refuse(stream, &e.to_string()).await,
@@ -339,12 +359,13 @@ mod tests {
         update_requests: Mutex<u32>,
         retries: Mutex<Vec<Retry>>,
         notices: Mutex<Vec<HealNotice>>,
+        book: Mutex<crate::stack::book::FlowBook>,
     }
 
     impl Fake {
         fn new(open: Vec<FlowEvent>) -> Arc<Self> {
             let routes = tokio::sync::watch::channel(true).0;
-            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, log: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0), retries: Mutex::default(), notices: Mutex::default() })
+            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, log: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0), retries: Mutex::default(), notices: Mutex::default(), book: Mutex::default() })
         }
     }
 
@@ -411,6 +432,38 @@ mod tests {
             let notices = self.notices.lock().unwrap();
             HealAnswer { run: 7, revision: notices.iter().map(|n| n.rev).max().unwrap_or(0), exclusions_revision: 4, notices: notices.iter().filter(|n| n.rev > after).cloned().collect() }
         }
+        fn issues(&self, session: u32) -> IssuesAnswer {
+            let book = self.book.lock().unwrap();
+            IssuesAnswer { run: 7, revision: book.issues_revision(), apps: book.issues(session), dropped: book.issues_dropped() }
+        }
+    }
+
+    /// The whole way: a flow's problem in a real book, over the pipe, to the
+    /// client of its session only, and nothing again until something changed.
+    #[tokio::test]
+    async fn issues_reach_their_session_over_the_pipe_and_repeat_only_on_change() {
+        use crate::stack::book::FlowBook;
+        use sieve_ipc::{Cause, Signal};
+        let fake = Fake::new(vec![]);
+        {
+            let mut book = fake.book.lock().unwrap();
+            *book = FlowBook::with_clock(|| 1_793_000_000_000);
+            for (session, key) in [(1, "launcher"), (2, "theirs")] {
+                let id = book.open(FlowEvent { session: Some(session), ..crate::stack::book::tests_event(Some(session)) }).unwrap();
+                book.own(id, Some(key.into()));
+                book.problem(id, Signal::AppRefusedCertificate);
+            }
+        }
+        let (mut c, task) = welcomed(fake.clone(), 1).await;
+        send(&mut c, &ClientMessage::Issues { after: 0 }).await;
+        let EngineMessage::Issues { run, revision, apps, dropped } = recv(&mut c).await else { panic!("not issues") };
+        assert_eq!((run, revision, dropped), (7, 2, 0));
+        assert_eq!(apps.iter().map(|a| a.key.as_str()).collect::<Vec<_>>(), ["launcher"], "its own session's");
+        assert_eq!((apps[0].problems[0].signal, apps[0].problems[0].cause), (Signal::AppRefusedCertificate, Cause::Sieve));
+        send(&mut c, &ClientMessage::Issues { after: revision }).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Issues { apps, revision: 2, .. } if apps.is_empty()), "nothing new");
+        drop(c);
+        task.await.unwrap().unwrap();
     }
 
     fn notice(id: u64, session: u32) -> HealNotice {

@@ -13,7 +13,8 @@ use crate::dns::{BoxFuture, Connector};
 use crate::route::pin;
 use crate::route::table::NetTables;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The relay's flows take theirs from `stack::retry::BUDGET`, the same value.
+const CONNECT_TIMEOUT: Duration = crate::stack::retry::BUDGET;
 
 pub struct Egress {
     tun_index: u32,
@@ -44,6 +45,20 @@ impl Egress {
             Ok(Err(e)) => Err(format!("connect {target}: {e}")),
             Err(_) => Err(format!("connect {target}: timeout")),
         }
+    }
+}
+
+/// One relay connect with no deadline of its own: `stack::retry` holds the
+/// budget for all of a flow's connects.
+impl crate::stack::retry::Attempt for Egress {
+    type Stream = TcpStream;
+
+    fn attempt(&self, target: SocketAddr) -> crate::stack::retry::AttemptFuture<'_, TcpStream> {
+        use crate::stack::retry::Failure;
+        Box::pin(async move {
+            let sock = self.socket(target, false).map_err(Failure::Egress)?;
+            TcpSocket::from_std_stream(sock.into()).connect(target).await.map_err(|e| Failure::from_io(&e))
+        })
     }
 }
 

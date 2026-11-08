@@ -1632,6 +1632,8 @@ arms!(client_watch_hears_a_refusal_and_a_silent_close, |arm| async move {
     assert!(tokio_rustls::TlsConnector::from(Arc::new(pinned)).connect(ServerName::try_from(HOST).unwrap(), app).await.is_err());
     assert_eq!(task.await.unwrap().action, FlowAction::Failed);
     assert_eq!(*watched.refused.lock().unwrap(), [(HOST.to_string(), Some(rustls::AlertDescription::UnknownCA))]);
+    let problems: Vec<LogOutcome> = rig.deps.book.lock().unwrap().take_log().into_iter().map(|r| r.outcome).filter(|o| matches!(o, LogOutcome::Problem { .. })).collect();
+    assert_eq!(problems, [LogOutcome::Problem { signal: sieve_ipc::Signal::AppRefusedCertificate, cause: sieve_ipc::Cause::Sieve }], "the refusal is the flow's problem, named once");
     // A client that handshakes and leaves.
     let (app, task) = rig.flow(flow_opts()).await;
     let (client, _) = client_tls(&[], None);

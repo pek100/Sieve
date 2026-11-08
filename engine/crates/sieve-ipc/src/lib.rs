@@ -75,9 +75,21 @@ pub const LOG_URL_MAX: usize = 2048;
 pub const LOG_RULE_MAX: usize = 1024;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices", "list_refresh", "list_import", "list_rules"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices", "list_refresh", "list_import", "list_rules", "issues"];
 /// The `type` names of [`EngineMessage`], in declaration order.
-pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status", "exclusions", "heal_notices", "list_imported", "list_rules"];
+pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status", "exclusions", "heal_notices", "list_imported", "list_rules", "issues"];
+/// At most this many apps in [`EngineMessage::Issues`]: past it the app whose
+/// newest problem is oldest makes room, counted in `dropped`. Far more apps than
+/// have trouble at once on one PC; it bounds the frame, not a tuned value.
+pub const MAX_ISSUE_APPS: usize = 64;
+/// At most this many [`Problem`]s per app (one per signal and host): past it the
+/// one heard longest ago makes room, counted in `dropped`.
+pub const MAX_APP_PROBLEMS: usize = 8;
+/// A problem's host is cut to this many bytes (a DNS name is at most 253).
+pub const ISSUE_HOST_MAX: usize = 253;
+/// An app's key and exe in [`AppIssues`] are cut to this many bytes, so the
+/// answer stays within a frame. A product name that long cannot be read anyway.
+pub const ISSUE_NAME_MAX: usize = 256;
 /// At most this many of the user's own lists ([`Policy::custom_lists`]).
 pub const MAX_CUSTOM_LISTS: usize = 20;
 /// Every custom list's id starts so; no catalogue id does, and the rest is
@@ -171,6 +183,9 @@ pub enum ClientMessage {
     /// The rules in the engine's copy of list `id` that contain `query` (case
     /// folded; empty for all), answered with [`EngineMessage::ListRules`].
     ListRules { id: String, query: String },
+    /// Asks for [`EngineMessage::Issues`]: the apps' recent problems, when their
+    /// revision is above `after` (0 asks for them whatever it is).
+    Issues { after: u64 },
 }
 
 /// Engine to app. Read and written one frame at a time and never stored, so the
@@ -218,6 +233,139 @@ pub enum EngineMessage {
     /// Rules of one list: the first [`LIST_RULES_SHOWN`] that match, how many
     /// match, and how many rules the copy holds.
     ListRules { id: String, lines: Vec<String>, matched: u64, total: u64 },
+    /// The apps of this client's session (and the services' and the VMs') that had
+    /// problems recently, at most [`MAX_ISSUE_APPS`]. `apps` is empty when
+    /// `revision` is not above the asked `after`: nothing changed. `run` names the
+    /// engine's run, as in [`EngineMessage::HealNotices`]. `dropped` counts the apps
+    /// and problems let go to keep the bounds since the run started. Local only:
+    /// nothing here ever leaves the PC.
+    Issues { run: u64, revision: u64, apps: Vec<AppIssues>, dropped: u64 },
+}
+
+/// What went wrong for a flow, as the engine saw it (plan: "Sieve must never
+/// break other apps"). The one classification is [`Signal::cause`]; the app only
+/// puts it in words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Signal {
+    /// The server refused the connection (a reset to the connect).
+    ConnectRefused,
+    /// The server did not answer the connect in time.
+    ConnectTimeout,
+    /// The network said the server cannot be reached.
+    Unreachable,
+    /// The connect failed some other way.
+    ConnectFailed,
+    /// Sieve had no way out for the connection (its own routing refused it).
+    EgressFailed,
+    /// The connection broke while Sieve was relaying it.
+    ConnectionLost,
+    /// The app sent data and nothing came back for a long time, until it ended.
+    Stall,
+    /// Sieve's DNS got no answer from any resolver for the app's lookups.
+    DnsUnanswered,
+    /// The app refused Sieve's certificate: decrypting it failed.
+    AppRefusedCertificate,
+    /// A filter rule blocked the connection.
+    Blocked,
+    /// Sieve refused QUIC so the app falls back to TCP, where it is filtered.
+    QuicRefused,
+}
+
+/// Who most likely caused a problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cause {
+    /// Something Sieve did: a block, a decryption the app refused, Sieve's own error.
+    Sieve,
+    /// The same would happen without Sieve: the server or the network refused it.
+    Network,
+    /// The signal cannot tell.
+    Unknown,
+}
+
+impl Signal {
+    pub const ALL: [Self; 11] = [
+        Self::ConnectRefused,
+        Self::ConnectTimeout,
+        Self::Unreachable,
+        Self::ConnectFailed,
+        Self::EgressFailed,
+        Self::ConnectionLost,
+        Self::Stall,
+        Self::DnsUnanswered,
+        Self::AppRefusedCertificate,
+        Self::Blocked,
+        Self::QuicRefused,
+    ];
+
+    /// The classification table, the only one: a signal decides its cause.
+    /// - Sieve: it blocked, refused or failed to decrypt, or had no way out.
+    /// - Network: the connect failed the way a direct one would; Sieve's connect is
+    ///   the app's own, to the same address, from the interface Windows would use.
+    /// - Unknown: a broken or stalled connection reads the same whichever side
+    ///   broke it, and a lookup with no answer may be the resolvers Sieve asks or
+    ///   the network that blocks them.
+    pub fn cause(self) -> Cause {
+        match self {
+            Self::EgressFailed | Self::AppRefusedCertificate | Self::Blocked | Self::QuicRefused => Cause::Sieve,
+            Self::ConnectRefused | Self::ConnectTimeout | Self::Unreachable => Cause::Network,
+            Self::ConnectFailed | Self::ConnectionLost | Self::Stall | Self::DnsUnanswered => Cause::Unknown,
+        }
+    }
+
+    /// Sieve meant it: a rule's block, or a QUIC refusal the app answers by
+    /// falling back to TCP. Shown, but never read as the app failing.
+    pub fn intended(self) -> bool {
+        matches!(self, Self::Blocked | Self::QuicRefused)
+    }
+}
+
+/// One kind of problem of one app with one host, since it was first heard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Problem {
+    pub signal: Signal,
+    /// [`Signal::cause`], carried so the app never keeps a copy of the table.
+    pub cause: Cause,
+    /// The name, else the remote IP; None for a lookup with no question read.
+    pub host: Option<String>,
+    pub count: u32,
+    /// Wall ms of the first and the newest.
+    pub first_ms: u64,
+    pub last_ms: u64,
+}
+
+/// One app's recent problems.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppIssues {
+    /// The app's [`app_key`], or a VM row's [`vm_key`]: its `apps.levels` key.
+    pub key: String,
+    /// The exe's file name, lower case; None for a VM.
+    pub exe: Option<String>,
+    /// The flows' Windows session; None for a VM's.
+    pub session: Option<u32>,
+    /// Wall ms of the app's first flow since Sieve last started routing.
+    pub since_ms: u64,
+    /// The app's flows that ended since `since_ms`.
+    pub flows: u64,
+    /// Connections Sieve tried again before the app saw anything, and how many
+    /// of them then connected.
+    pub retried: u64,
+    pub recovered: u64,
+    /// Newest first, at most [`MAX_APP_PROBLEMS`].
+    pub problems: Vec<Problem>,
+}
+
+/// How Sieve tried a connection again, before any byte reached the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryHow {
+    /// Another address the same name resolved to (IPv6 and IPv4 alike).
+    NextAddress,
+    /// The same address again, after a short wait, after a reset.
+    Reconnect,
 }
 
 /// How far decryption reaches. The same two values as the engine's decision.
@@ -831,6 +979,12 @@ pub fn service_label(mut names: Vec<String>) -> Option<String> {
 
 /// What the filter did with one request or flow (plan 8.3). A reason is a
 /// slug the app turns into words; later slices add reasons with no bump.
+///
+/// TENSION (protocol rule): `Problem` and `Retried` were appended after v3
+/// shipped, with no bump. A new kind at the end changes no existing byte, the
+/// app's reader skips and counts a row it cannot read (`parseLogTail`), and app
+/// and engine ship together, as for a new message type. `FlowAction` took the
+/// other choice because the app reads flows whole.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LogOutcome {
@@ -841,6 +995,10 @@ pub enum LogOutcome {
     Scriptlets { count: u32 },
     Passed { reason: String },
     NotDecrypted { reason: String },
+    /// The flow had a problem ([`Signal`]), with its [`Signal::cause`].
+    Problem { signal: Signal, cause: Cause },
+    /// Sieve's connect failed and was tried again before the app saw anything.
+    Retried { how: RetryHow, recovered: bool },
 }
 
 /// One row of the filtering log. A host-level row leaves `url` and
@@ -1115,6 +1273,7 @@ mod tests {
             ClientMessage::ListRefresh { .. } => "list_refresh",
             ClientMessage::ListImport { .. } => "list_import",
             ClientMessage::ListRules { .. } => "list_rules",
+            ClientMessage::Issues { .. } => "issues",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -1130,6 +1289,7 @@ mod tests {
             EngineMessage::HealNotices { .. } => "heal_notices",
             EngineMessage::ListImported { .. } => "list_imported",
             EngineMessage::ListRules { .. } => "list_rules",
+            EngineMessage::Issues { .. } => "issues",
         };
         let f = fixture();
         for m in f["client"].as_array().unwrap() {
@@ -1299,6 +1459,8 @@ mod tests {
             LogOutcome::Scriptlets { .. } => "scriptlets",
             LogOutcome::Passed { .. } => "passed",
             LogOutcome::NotDecrypted { .. } => "not_decrypted",
+            LogOutcome::Problem { .. } => "problem",
+            LogOutcome::Retried { .. } => "retried",
         };
         let mut seen = Vec::new();
         for o in outcomes {
@@ -1308,7 +1470,7 @@ mod tests {
             seen.push(name(&parsed));
         }
         seen.dedup();
-        assert_eq!(seen, ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted"]);
+        assert_eq!(seen, ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted", "problem", "retried"]);
     }
 
     /// The status's filter facts are additive: without them the wire is as
@@ -1692,5 +1854,64 @@ mod tests {
                 assert!(!name.contains(banned), "{name}");
             }
         }
+    }
+
+    /// The classification table, written out once more by hand: a change to
+    /// `cause` or `intended` has to change this table too.
+    #[test]
+    fn every_signal_has_its_cause() {
+        use Cause::{Network, Sieve, Unknown};
+        let table = [
+            (Signal::ConnectRefused, Network, false),
+            (Signal::ConnectTimeout, Network, false),
+            (Signal::Unreachable, Network, false),
+            (Signal::ConnectFailed, Unknown, false),
+            (Signal::EgressFailed, Sieve, false),
+            (Signal::ConnectionLost, Unknown, false),
+            (Signal::Stall, Unknown, false),
+            (Signal::DnsUnanswered, Unknown, false),
+            (Signal::AppRefusedCertificate, Sieve, false),
+            (Signal::Blocked, Sieve, true),
+            (Signal::QuicRefused, Sieve, true),
+        ];
+        assert_eq!(table.map(|(s, _, _)| s), Signal::ALL, "every signal, in order");
+        for (signal, cause, intended) in table {
+            assert_eq!((signal.cause(), signal.intended()), (cause, intended), "{signal:?}");
+        }
+        assert!(Signal::ALL.iter().filter(|s| s.intended()).all(|s| s.cause() == Sieve), "only Sieve means anything");
+    }
+
+    #[test]
+    fn the_fixture_shows_every_signal_and_cause() {
+        let issues = fixture()["engine"].as_array().unwrap().iter().find(|m| m["type"] == "issues").cloned().unwrap();
+        let EngineMessage::Issues { apps, .. } = serde_json::from_value(issues).unwrap() else { unreachable!() };
+        for p in apps.iter().flat_map(|a| &a.problems) {
+            assert_eq!(p.cause, p.signal.cause(), "the fixture's causes are the table's: {p:?}");
+        }
+        let f = fixture().to_string();
+        for s in Signal::ALL {
+            assert!(f.contains(&serde_json::to_string(&s).unwrap()), "{s:?}");
+        }
+        for c in [Cause::Sieve, Cause::Network, Cause::Unknown] {
+            assert!(f.contains(&serde_json::to_string(&c).unwrap()), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_full_issues_answer_at_the_caps_fits_one_frame() {
+        let problem = |i: usize| Problem { signal: Signal::ALL[i % Signal::ALL.len()], cause: Cause::Unknown, host: Some("h".repeat(ISSUE_HOST_MAX)), count: u32::MAX, first_ms: u64::MAX, last_ms: u64::MAX };
+        let app = AppIssues {
+            key: "k".repeat(ISSUE_NAME_MAX),
+            exe: Some("e".repeat(ISSUE_NAME_MAX)),
+            session: Some(u32::MAX),
+            since_ms: u64::MAX,
+            flows: u64::MAX,
+            retried: u64::MAX,
+            recovered: u64::MAX,
+            problems: (0..MAX_APP_PROBLEMS).map(problem).collect(),
+        };
+        let message = EngineMessage::Issues { run: u64::MAX, revision: u64::MAX, apps: vec![app; MAX_ISSUE_APPS], dropped: u64::MAX };
+        let len = encode(&message).unwrap().len();
+        assert!(len <= MAX_FRAME, "{len}");
     }
 }

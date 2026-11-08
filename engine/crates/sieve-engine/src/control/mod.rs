@@ -27,7 +27,7 @@ use crate::dns::{NameMap, config};
 use crate::domain::{DomainFilter, FilterSlot, user_engine, user_rules_changed};
 use crate::exclusions::ExclusionSlot;
 use crate::heal::{Heal, Retry};
-use crate::ipc::{Backend, HealAnswer, Subscription};
+use crate::ipc::{Backend, HealAnswer, IssuesAnswer, Subscription};
 use crate::lists::Lists;
 use crate::policy::{self, Runs};
 use crate::stack::Meters;
@@ -611,6 +611,12 @@ impl Backend for Engine {
     fn heal_notices(&self, after: u64) -> HealAnswer {
         let (revision, notices) = self.heal.notices(after);
         HealAnswer { run: self.heal.run(), revision, exclusions_revision: self.exclusions.revision(), notices }
+    }
+
+    /// The book's revisions start at this run's start, as heal's do.
+    fn issues(&self, session: u32) -> IssuesAnswer {
+        let book = lock(&self.book);
+        IssuesAnswer { run: self.heal.run(), revision: book.issues_revision(), apps: book.issues(session), dropped: book.issues_dropped() }
     }
 }
 
