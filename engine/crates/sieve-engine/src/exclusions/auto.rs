@@ -403,7 +403,7 @@ mod tests {
         let old = |host: &str, reason| AutoEntry { rule: PINNING_RULE - 1, ..AutoEntry::for_app(host, "msedge.exe", reason, NOW) };
         let current = AutoEntry::for_app("pinned.example", "client.exe", AutoReason::Pinning, NOW);
         let kept = [old("cert.example", AutoReason::ClientCert), old("ev.example", AutoReason::Ev), current.clone()];
-        let mut all = vec![old("www.google.com", AutoReason::Pinning), AutoEntry { retrying: true, ..old("cdn.discordapp.com", AutoReason::Pinning) }];
+        let mut all = vec![old("search.example", AutoReason::Pinning), AutoEntry { retrying: true, ..old("cdn.example", AutoReason::Pinning) }];
         all.extend(kept.iter().cloned());
         save(dir.path(), &all).unwrap();
         assert_eq!(load(dir.path()).unwrap(), kept, "the old rule's pinning entries, held or retrying, are gone");

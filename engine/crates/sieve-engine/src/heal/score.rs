@@ -349,8 +349,8 @@ mod tests {
         }
     }
 
-    /// The Edge and Chrome 157 patterns that excluded www.google.com,
-    /// static.cdninstagram.com and cdn.discordapp.com under the old rule: rounds of
+    /// The Edge and Chrome 157 patterns that excluded a search engine, a photo CDN
+    /// and a chat app's CDN under the old rule (plan 4.3, 2026-11-08): rounds of
     /// several handshakes, one held idle and closed later, the rest dropped at once,
     /// none carrying a request, on hosts the user never opens and on hosts they use.
     #[test]

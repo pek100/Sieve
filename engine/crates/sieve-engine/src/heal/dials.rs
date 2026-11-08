@@ -16,7 +16,7 @@ pub const SILENT_CLOSE_MS: u64 = 2_000;
 /// connection of the pair is open, by a pair that never carried a request this run.
 /// A browser's unused preconnects and the sockets it drops at a tab's or its own
 /// close were taken for rejections by the rule before this one (2026-11-08: Edge
-/// and Chrome 157 excluded www.google.com); what is left is an app that checks
+/// and Chrome 157 excluded a search engine; plan 4.3); what is left is an app that checks
 /// its pin after TLS and drops the socket, which retries within seconds.
 pub const QUIET_CLOSES: u32 = 3;
 /// See [`QUIET_CLOSES`]. A fixed window from the first quiet close, so closes
