@@ -236,7 +236,7 @@ describe("list switches", () => {
     const gated = within(list("ubo-filters"));
     expect(gated.getByRole("switch")).toBeDisabled();
     expect(gated.getByRole("switch")).not.toBeChecked();
-    expect(gated.getByText("Waiting on testing")).toBeInTheDocument();
+    expect(gated.getByText(/Waiting on testing/)).toBeInTheDocument();
   });
 
   it("the group switch changes its lists and its state is derived", async () => {
@@ -341,15 +341,35 @@ describe("user rules", () => {
     expect(rt.settings.get("filtering.userRules")).toEqual([]);
   });
 
-  it("Block a site appends its rule to the editor, once, and refuses junk with a sentence", async () => {
-    await setup("pending", { schema: 4, values: { "filtering.userRules": ["||a.example^"] } });
-    const site = screen.getByRole("textbox", { name: "Block a site" });
-    await userEvent.type(site, "https://Ads.Example.com/x{Enter}");
-    expect(editor()).toHaveValue("||a.example^\n||ads.example.com^");
-    await userEvent.type(site, "ads.example.com{Enter}");
-    expect(editor()).toHaveValue("||a.example^\n||ads.example.com^");
-    await userEvent.type(site, "localhost{Enter}");
+  const site = () => screen.getByRole("textbox", { name: "Site" });
+
+  it("the rule form says what it will do, saves its rule at once, once, and refuses junk with a sentence", async () => {
+    const rt = await setup("pending", { schema: 4, values: { "filtering.userRules": ["||a.example^"] } });
+    await userEvent.type(site(), "https://Ads.Example.com/x");
+    expect(document.querySelector("[data-rule-meaning]")).toHaveTextContent("Blocks ads.example.com and every address under it");
+    await userEvent.type(screen.getByRole("textbox", { name: "Note (optional)" }), "Pop-ups");
+    await userEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    await waitFor(() => expect(rt.settings.get("filtering.userRules")).toEqual(["||a.example^", "! Pop-ups", "||ads.example.com^"]));
+    expect(editor()).toHaveValue("||a.example^\n! Pop-ups\n||ads.example.com^");
+    expect(screen.getByRole("status")).toHaveTextContent("Rule added.");
+    await userEvent.type(site(), "ads.example.com{Enter}");
+    expect(screen.getByRole("status")).toHaveTextContent("already there");
+    expect(rt.settings.get("filtering.userRules")).toHaveLength(3);
+    await userEvent.type(site(), "localhost{Enter}");
     expect(screen.getByRole("alert")).toHaveTextContent("needs a dot");
+  });
+
+  it("an allow rule for one site alone writes the exact rules, and joins unsaved edits instead of saving them", async () => {
+    const rt = await setup();
+    fireEvent.change(editor(), { target: { value: "||typed.example^" } });
+    await userEvent.click(screen.getByRole("radio", { name: "Allow" }));
+    await userEvent.click(screen.getByRole("switch", { name: "Include subdomains" }));
+    await userEvent.type(site(), "shop.example");
+    expect(document.querySelector("[data-rule-meaning]")).toHaveTextContent("Lets shop.example through, but not its subdomains");
+    await userEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    expect(editor()).toHaveValue("||typed.example^\n@@|https://shop.example^\n@@|http://shop.example^");
+    expect(screen.getByRole("status")).toHaveTextContent("Save them to apply it");
+    expect(rt.settings.get("filtering.userRules"), "nothing typed was saved behind the person's back").toEqual([]);
   });
 });
 
@@ -372,5 +392,221 @@ describe("allowlist", () => {
     expect(rt.settings.get("filtering.allowedDomains")).toEqual(["b.example"]);
     await userEvent.click(await screen.findByRole("button", { name: "Undo" }));
     expect(rt.settings.get("filtering.allowedDomains")).toEqual(["b.example", "a.example"]);
+  });
+});
+
+const radio = (name: RegExp) => within(screen.getByRole("radiogroup", { name: "Protection level" })).getByRole("radio", { name });
+
+describe("protection level", () => {
+  it("a person who changed nothing is on Balanced, the recommended level, and each level is said in a sentence", async () => {
+    await setup();
+    expect(radio(/^Balanced/)).toHaveAttribute("aria-checked", "true");
+    expect(radio(/^Balanced/)).toHaveTextContent("Recommended");
+    expect(radio(/^Strict/)).toHaveTextContent("Some sites may not work");
+    expect(radio(/^Minimal/)).toHaveTextContent("Blocks ads only");
+    expect(document.querySelector("[data-profile-custom]")).toBeNull();
+  });
+
+  it("picking Strict turns on exactly its lists, says so with an Undo, and the Undo restores Balanced", async () => {
+    const rt = await setup();
+    await userEvent.click(radio(/^Strict/));
+    expect(radio(/^Strict/)).toHaveAttribute("aria-checked", "true");
+    expect(group("annoyances")).toHaveTextContent("5 of 5 on");
+    expect(list("adguard-german"), "a language list is not part of a level: still off, still folded away").toBeNull();
+    await userEvent.click(await screen.findByRole("button", { name: "Undo" }));
+    await waitFor(() => expect(rt.settings.get("filters.lists")).toEqual({}));
+    expect(radio(/^Balanced/)).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("changing any list under it shows Custom by itself; Back to recommended restores the lists in one action, a language kept", async () => {
+    const rt = await setup();
+    await userEvent.click(screen.getByRole("button", { name: /Show \d+ languages/ }));
+    await userEvent.click(within(list("adguard-german")).getByRole("switch"));
+    expect(radio(/^Balanced/), "a language list keeps the level").toHaveAttribute("aria-checked", "true");
+    await userEvent.click(within(list("adguard-cookies")).getByRole("switch"));
+    expect(document.querySelector("[data-profile-custom]")).toHaveTextContent("Custom");
+    for (const name of [/^Balanced/, /^Strict/, /^Minimal/]) expect(radio(name)).toHaveAttribute("aria-checked", "false");
+    // Said where the person is, far below the level, with the way back in the notice too.
+    expect(rt.notices.list().map((n) => n.text)).toContain("Protection level is now Custom: Balanced with your change");
+    await userEvent.click(within(document.querySelector<HTMLElement>("[data-profile-custom]")!).getByRole("button", { name: "Back to recommended" }));
+    await waitFor(() => expect(rt.settings.get("filters.lists")).toEqual({ "adguard-german": "on" }));
+    expect(radio(/^Balanced/)).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("arrows move along the levels as in any radio group", async () => {
+    const rt = await setup();
+    radio(/^Balanced/).focus();
+    await userEvent.keyboard("{ArrowDown}");
+    expect(radio(/^Strict/)).toHaveFocus();
+    expect(radio(/^Strict/)).toHaveAttribute("aria-checked", "true");
+    expect(Object.keys(rt.settings.get("filters.lists")).length).toBeGreaterThan(0);
+  });
+
+  it("a catalogue that cannot be read is said once, by the lists, and no level can be picked", async () => {
+    await setup("error");
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(document.querySelector("[data-protection-level]")).toHaveTextContent("none can be picked now");
+    expect(screen.queryByRole("radio", { name: /^Balanced/ })).toBeNull();
+  });
+});
+
+describe("languages", () => {
+  it("suggests the list of the computer's language first, and keeps the other languages one click away", async () => {
+    const languages = vi.spyOn(navigator, "languages", "get").mockReturnValue(["de-DE", "en-US"]);
+    cleanups.push(() => languages.mockRestore());
+    await setup();
+    expect(list("adguard-german")).toHaveTextContent("Suggested for your language");
+    expect(list("adguard-french")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: /Show 8 more languages/ }));
+    expect(list("adguard-french")).toBeInTheDocument();
+  });
+});
+
+describe("a list's menu", () => {
+  it("shows a list's rules from the engine's copy, searchable, with how many there are", async () => {
+    await setup("loaded", { schema: 5, values: { "filtering.engine": true } }, createMockEngine("filtering"));
+    await settled();
+    await userEvent.click(within(list("adguard-base")).getByRole("button", { name: /Actions for/ }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "View rules" }));
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog.querySelector("[data-rules-caption]")).toHaveTextContent("420 rules. The first 200 are shown; search to find others."));
+    expect(within(dialog).getByRole("list", { name: /Rules of/ }).children).toHaveLength(200);
+    await userEvent.type(within(dialog).getByRole("searchbox"), "pixel1");
+    await waitFor(() => expect(dialog.querySelector("[data-rules-caption]")).toHaveTextContent(/^\d+ of 420 rules match\.$/));
+    expect(dialog.querySelector("[data-rules-caption]")!.textContent, "the caption is the search's own answer").not.toMatch(/^420 of/);
+    for (const li of within(dialog).getByRole("list", { name: /Rules of/ }).children) expect(li.textContent).toContain("pixel1");
+  });
+
+  it("with no engine, View rules and Update now are disabled and the menu says why", async () => {
+    await setup("loaded", undefined, createMockEngine("missing"));
+    await settled();
+    await userEvent.click(within(list("adguard-base")).getByRole("button", { name: /Actions for/ }));
+    const menu = await screen.findByRole("menu");
+    expect(within(menu).getByRole("menuitem", { name: "View rules" })).toHaveAttribute("aria-disabled", "true");
+    expect(menu).toHaveTextContent("Sieve's engine is not running");
+  });
+
+  it("Update now asks the engine for that one list", async () => {
+    const mock = createMockEngine("filtering");
+    const asked: string[] = [];
+    await setup("loaded", { schema: 5, values: { "filtering.engine": true } }, { ...mock, listRefresh: (id) => (asked.push(id), mock.listRefresh(id)) });
+    await settled();
+    await userEvent.click(within(list("adguard-base")).getByRole("button", { name: /Actions for/ }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Update now" }));
+    expect(asked).toEqual(["adguard-base"]);
+  });
+});
+
+describe("your own lists", () => {
+  const address = () => screen.getByRole("textbox", { name: "List address" });
+  const own = (id: string) => document.querySelector<HTMLElement>(`[data-own-list="${id}"]`);
+
+  it("adds a list by address, named after its file, and refuses an address the engine would not download", async () => {
+    const rt = await setup();
+    await userEvent.type(address(), "http://lists.example/mine.txt{Enter}");
+    expect(screen.getByRole("alert")).toHaveTextContent("https only");
+    await userEvent.clear(address());
+    await userEvent.type(address(), "lists.example/My%20blocklist.txt{Enter}");
+    await waitFor(() => expect(rt.settings.get("filters.custom")).toHaveLength(1));
+    const [added] = rt.settings.get("filters.custom");
+    expect(added).toMatchObject({ title: "My blocklist", url: "https://lists.example/My%20blocklist.txt", enabled: true });
+    expect(added.id).toMatch(/^custom-[a-z0-9]{8}$/);
+    expect(own(added.id)).toHaveTextContent("lists.example");
+    expect(own(added.id), "no engine report: nothing is claimed").toHaveTextContent("Not loaded yet");
+    await userEvent.type(address(), "https://lists.example/My%20blocklist.txt{Enter}");
+    expect(screen.getByRole("alert")).toHaveTextContent("already one of yours");
+  });
+
+  it("shows what the engine says of each: counts and when, or why it refused, in words and its own", async () => {
+    const values = {
+      "filtering.engine": true,
+      "filters.custom": [
+        { id: "custom-a1", title: "Good", url: "https://lists.example/good.txt", enabled: true },
+        { id: "custom-b2", title: "Portal", url: "https://lists.example/broken.txt", enabled: true },
+      ],
+    };
+    await setup("pending", { schema: 5, values }, createMockEngine("filtering"));
+    await settled();
+    await waitFor(() => expect(own("custom-a1")).toHaveTextContent("1,204 applied, 0 skipped"));
+    expect(own("custom-a1")).toHaveTextContent(/Updated/);
+    expect(own("custom-b2")).toHaveTextContent("The address gave a web page, not a filter list");
+    expect(own("custom-b2")).toHaveTextContent("an HTML page, not a filter list");
+  });
+
+  it("imports a file through the engine; a closed picker adds nothing; a refused file says why", async () => {
+    const rt = await setup("pending", { schema: 5, values: { "filtering.engine": true } }, createMockEngine("filtering"));
+    await settled();
+    await userEvent.click(screen.getByRole("button", { name: "Import a file" }));
+    await waitFor(() => expect(rt.settings.get("filters.custom")).toEqual([expect.objectContaining({ title: "My blocklist", url: null, enabled: true })]));
+    cleanup();
+    const closed = await setup("pending", { schema: 5, values: { "filtering.engine": true } }, createMockEngine("filtering", { importAnswer: "cancel" }));
+    await settled();
+    await userEvent.click(screen.getByRole("button", { name: "Import a file" }));
+    expect(closed.settings.get("filters.custom")).toEqual([]);
+    expect(screen.queryByRole("alert")).toBeNull();
+    cleanup();
+    const refused = await setup("pending", { schema: 5, values: { "filtering.engine": true } }, createMockEngine("filtering", { importAnswer: "refused" }));
+    await settled();
+    await userEvent.click(screen.getByRole("button", { name: "Import a file" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("an HTML page");
+    expect(refused.settings.get("filters.custom")).toEqual([]);
+  });
+
+  it("with no engine, importing is disabled with the reason, and a list by address can still be added", async () => {
+    const rt = await setup("pending", undefined, createMockEngine("missing"));
+    await settled();
+    expect(screen.getByRole("button", { name: "Import a file" })).toBeDisabled();
+    expect(document.querySelector("[data-own-lists]")).toHaveTextContent("Importing a file needs the engine");
+    await userEvent.type(address(), "https://lists.example/a.txt{Enter}");
+    await waitFor(() => expect(rt.settings.get("filters.custom")).toHaveLength(1));
+  });
+
+  it("a list is turned off and on by its switch, and removed with an Undo", async () => {
+    const values = { "filters.custom": [{ id: "custom-a1", title: "Mine", url: "https://lists.example/a.txt", enabled: true }] };
+    const rt = await setup("pending", { schema: 5, values });
+    await userEvent.click(within(own("custom-a1")!).getByRole("switch", { name: "Mine" }));
+    expect(rt.settings.get("filters.custom")[0].enabled).toBe(false);
+    await userEvent.click(within(own("custom-a1")!).getByRole("button", { name: "Actions for Mine" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Remove" }));
+    await waitFor(() => expect(rt.settings.get("filters.custom")).toEqual([]));
+    const toast = (await screen.findAllByRole("listitem")).find((li) => li.textContent?.includes("Removed Mine"))!;
+    await userEvent.click(within(toast).getByRole("button", { name: "Undo" }));
+    await waitFor(() => expect(rt.settings.get("filters.custom")).toHaveLength(1));
+  });
+
+  it("a stored list that is broken or from an older build reads as none, never a crash", async () => {
+    await setup("pending", { schema: 5, values: { "filters.custom": [{ id: "custom-a1", title: "x" }, "junk"] } });
+    expect(document.querySelector("[data-own-lists]")).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Your own lists" })).toBeNull();
+  });
+});
+
+describe("tracking protection", () => {
+  it("is at Standard, the recommended level, every option locked with the reason once, and nothing can change it", async () => {
+    await setup();
+    const block = document.querySelector<HTMLElement>("[data-tracking]")!;
+    expect(within(block).getByRole("radio", { name: /^Standard/ })).toHaveAttribute("aria-checked", "true");
+    expect(within(block).getByRole("radio", { name: /^Standard/ })).toBeDisabled();
+    expect(block.querySelectorAll("[data-lock]")).toHaveLength(1);
+    expect(block.querySelector("[data-tracking-locked]")).toHaveTextContent("which this version of Sieve does not offer yet");
+    expect(block.querySelector("[data-tracking-locked]")).toHaveTextContent("None of these is in effect yet");
+    for (const s of within(block).getAllByRole("switch")) expect(s).toBeDisabled();
+  });
+
+  it("says what each option off at Standard can break", async () => {
+    await setup();
+    const webRtc = document.querySelector<HTMLElement>('[data-tracking-option="tracking.webRtc"]')!;
+    expect(webRtc).toHaveTextContent("Can break: Video calls");
+    expect(within(webRtc).getByRole("switch")).not.toBeChecked();
+  });
+
+  it("a stored custom choice reads Custom and stays a wish: never sent while locked", async () => {
+    const sent: EnginePolicy[] = [];
+    const mock = createMockEngine("idle");
+    await setup("pending", { schema: 5, values: { "filtering.engine": true, "tracking.webRtc": true } }, { ...mock, setPolicy: (p) => (sent.push(p), mock.setPolicy(p)) });
+    await settled();
+    expect(document.querySelector("[data-tracking-custom]")).toHaveTextContent("Your own choice");
+    expect(sent.length).toBeGreaterThan(0);
+    for (const p of sent) expect(p.tracking ?? []).toEqual([]);
   });
 });

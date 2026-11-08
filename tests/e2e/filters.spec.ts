@@ -40,6 +40,7 @@ test.describe("filters", () => {
     await expect(list(page, "adguard-cookies").getByRole("switch")).toBeChecked();
     await expect(list(page, "ubo-filters").getByRole("switch")).toBeDisabled();
     await expect(list(page, "ubo-filters")).toContainText("Waiting on testing");
+    await expect(page.locator('[data-choice="balanced"]').first(), "turning one more list on is no longer Balanced").toHaveAttribute("aria-checked", "false");
   });
 
   test("the group switch changes its lists", async ({ page }) => {
@@ -78,9 +79,11 @@ test.describe("filters", () => {
     await editor.fill("! note\n||good.example^");
     await page.getByRole("button", { name: "Save rules" }).click();
     await expect(page.getByRole("button", { name: "Save rules" })).toBeDisabled();
-    await page.getByRole("textbox", { name: "Block a site" }).fill("https://ads.example.com/x");
+    await page.getByRole("textbox", { name: "Site" }).fill("https://ads.example.com/x");
+    await expect(page.locator("[data-rule-meaning]")).toContainText("Blocks ads.example.com and every address under it");
     await page.getByRole("button", { name: "Add rule" }).click();
     await expect(editor).toHaveValue("! note\n||good.example^\n||ads.example.com^");
+    await expect(page.locator("[data-rule-added]")).toContainText("Rule added.");
 
     await page.getByRole("textbox", { name: "Add to Allowlist" }).fill("WWW.Example.com");
     await page.locator("[data-domain-list]", { has: page.getByRole("textbox", { name: "Add to Allowlist" }) }).getByRole("button", { name: "Add", exact: true }).click();
@@ -89,7 +92,7 @@ test.describe("filters", () => {
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
     await page.screenshot({ path: `test-results/screens/filters-rules-${info.project.name}.png`, fullPage: true });
     await page.reload();
-    await expect(page.getByRole("textbox", { name: "User rules" })).toHaveValue("! note\n||good.example^");
+    await expect(page.getByRole("textbox", { name: "User rules" })).toHaveValue("! note\n||good.example^\n||ads.example.com^");
     await expect(entry).toBeVisible();
     await entry.getByRole("button", { name: "Remove www.example.com" }).click();
     await expect(entry).toHaveCount(0);
@@ -116,5 +119,66 @@ test.describe("filters", () => {
     await expect(editor).toHaveValue(new RegExp(`number-${lines.length - 1}\\.`));
     await page.reload();
     await expect(page.getByRole("textbox", { name: "User rules" })).toHaveValue("");
+  });
+
+  test("the protection level: Balanced first, Strict in one click with an Undo, Custom by itself, back in one action", async ({ page }, info) => {
+    const errors = await open(page);
+    const levels = page.getByRole("radiogroup", { name: "Protection level", exact: true });
+    const level = (name: RegExp) => levels.getByRole("radio", { name });
+    await expect(level(/^Balanced/)).toHaveAttribute("aria-checked", "true");
+    await expect(level(/^Balanced/)).toContainText("Recommended");
+    const top = await levels.boundingBox();
+    expect(top, "the level is the first thing under the title").not.toBeNull();
+    expect(top!.y).toBeLessThan(info.project.name === "mobile" ? 400 : 260);
+    await level(/^Strict/).click();
+    await expect(group(page, "annoyances")).toContainText("5 of 5 on");
+    await page.getByRole("listitem").filter({ hasText: "Using Strict" }).getByRole("button", { name: "Undo" }).click();
+    await expect(level(/^Balanced/)).toHaveAttribute("aria-checked", "true");
+    await list(page, "adguard-tracking").getByRole("switch").click();
+    await expect(page.locator("[data-profile-custom]")).toContainText("Custom");
+    await page.screenshot({ path: `test-results/screens/filters-custom-${info.project.name}.png` });
+    await page.locator("[data-profile-custom]").getByRole("button", { name: "Back to recommended" }).click();
+    await expect(level(/^Balanced/)).toHaveAttribute("aria-checked", "true");
+    await expect(list(page, "adguard-tracking").getByRole("switch")).toBeChecked();
+    expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
+    expect(errors).toEqual([]);
+  });
+
+  test("tracking protection is shown locked with its reason, and says what each option can break", async ({ page }, info) => {
+    await open(page);
+    const block = page.locator("[data-tracking]");
+    await expect(block.locator("[data-tracking-locked]")).toContainText("does not offer yet");
+    await expect(block.getByRole("radio", { name: /^Standard/ })).toHaveAttribute("aria-checked", "true");
+    await expect(block.getByRole("radio", { name: /^Standard/ })).toBeDisabled();
+    await expect(block.locator('[data-tracking-option="tracking.webRtc"]')).toContainText("Can break: Video calls");
+    await block.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: `test-results/screens/filters-tracking-${info.project.name}.png` });
+  });
+
+  test("an own list by address: added, refused with a sentence when it is not https, its rules viewable with the engine", async ({ page }, info) => {
+    const errors = await open(page, "&engine=filtering");
+    const address = page.getByRole("textbox", { name: "List address" });
+    await address.fill("http://lists.example/mine.txt");
+    await page.getByRole("button", { name: "Add list" }).click();
+    await expect(page.locator("[data-own-error]")).toContainText("https only");
+    await address.fill("https://lists.example/My%20blocklist.txt");
+    await page.getByRole("button", { name: "Add list" }).click();
+    const own = page.locator("[data-own-list]");
+    await expect(own).toHaveCount(1);
+    await expect(own).toContainText("My blocklist");
+    await own.getByRole("button", { name: "Actions for My blocklist" }).click();
+    await page.getByRole("menuitem", { name: "View rules" }).click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.locator("[data-rules-caption]")).toContainText("rules");
+    await dialog.getByRole("searchbox").fill("pixel");
+    await expect(dialog.locator("[data-rules-caption]")).toHaveText(/^105 of 420 rules match\.$/);
+    await expect(dialog.getByRole("listitem").first()).toContainText("pixel");
+    expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
+    await page.screenshot({ path: `test-results/screens/filters-rules-view-${info.project.name}.png` });
+    await page.keyboard.press("Escape");
+    expect(errors, "before the reload").toEqual([]);
+    await page.reload();
+    await expect(page.locator("[data-own-list]")).toContainText("My blocklist");
+    expect(errors).toEqual([]);
   });
 });

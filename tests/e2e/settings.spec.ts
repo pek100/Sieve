@@ -21,12 +21,15 @@ test.describe("settings", () => {
     await expect(page.getByRole("link", { name: "Settings" })).toHaveAttribute("aria-current", "page");
     const rail = page.getByRole("navigation", { name: "Settings sections" });
     // Filtering stays: it carries the engine.
-    await expect(rail.getByRole("link")).toHaveText(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Notifications", "Filter lists", "Password"]);
-    // Eighteen rows: theme, sieving, interval, launch at startup, welcome guide finished, apps turned
+    await expect(rail.getByRole("link")).toHaveText(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Notifications", "Filter lists", "Tracking protection", "Password"]);
+    // Twenty-five rows (since 2026-11-08 your own lists and the eight tracking protections too): theme, sieving, interval, launch at startup, welcome guide finished, apps turned
     // off, my apps, the engine's switch, the blocked and allowed domains, the encrypted upstreams, your
     // rules and the sites not decrypted, desktop notifications, lists changed, user rules, allowlist,
     // lock again after. There is no Windows DNS row: Sieve never changes Windows DNS.
-    await expect(page.locator("[data-setting]")).toHaveCount(16);
+    await expect(page.locator("[data-setting]")).toHaveCount(25);
+    await expect(row(page, "tracking.webRtc"), "locked, with the reason and what it can break").toContainText("does not offer yet");
+    await expect(row(page, "tracking.webRtc")).toContainText("Can break:");
+    await expect(row(page, "tracking.webRtc").getByRole("switch")).toBeDisabled();
     await expect(row(page, "filtering.engine").getByRole("switch")).not.toBeChecked();
     await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(1);
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
@@ -111,7 +114,7 @@ test.describe("settings", () => {
       }),
     );
     // Five registry sections with rows (Filtering's is the engine's switch, slice 3), then the engine, its certificate and what is not decrypted, then the backlog's sections.
-    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Engine", "Certificate", "Not decrypted", "Notifications", "Filter lists", "Password"]);
+    expect(gaps.map((g) => g.name)).toEqual(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Engine", "Certificate", "Not decrypted", "Notifications", "Filter lists", "Tracking protection", "Password"]);
     // Was 686 px of empty space under Filtering's rows: its card took the height of its wrapper (Card h-full).
     // Allowed: a row's own bottom padding (16) and at most a section's padding.
     for (const g of gaps) expect(g.gap, `${g.name} ends ${g.gap}px below its content`).toBeLessThanOrEqual(40);
