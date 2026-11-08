@@ -78,11 +78,11 @@ describe("the vendored applier", () => {
 });
 
 /** Runs the script as a user would, under plain node: vitest's import would rewrite `fn.toString()`. */
-function assembleFixtureTree(): string {
+function assembleFixtureTree(tree = "tests/fixtures/ubo-tree"): string {
   const dir = mkdtempSync(join(tmpdir(), "sieve-assemble-"));
   try {
     const out = join(dir, "bundle.json");
-    execFileSync("node", ["scripts/resources/assemble-ubo.mjs", "tests/fixtures/ubo-tree", out], { cwd: ROOT, stdio: "pipe" });
+    execFileSync("node", ["scripts/resources/assemble-ubo.mjs", tree, out], { cwd: ROOT, stdio: "pipe" });
     return readFileSync(out, "utf8");
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -108,6 +108,15 @@ describe("the bundle script", () => {
     expect(named("sieve-flag-name.fn")?.kind.mime).toBe("fn/javascript");
     expect(named("sieve-pixel.gif")?.kind.mime).toBe("image/gif");
     expect(named("sieve-parameterised.js")).toBeUndefined();
+  });
+
+  it("takes dependencies declared as a class or an async function, as current uBO has them", () => {
+    const resources = JSON.parse(assembleFixtureTree("tests/fixtures/ubo-tree-declarations")) as { name: string; kind: { mime: string }; content: string }[];
+    const source = (name: string) => Buffer.from(resources.find((r) => r.name === name)?.content ?? "", "base64").toString("utf8");
+    expect(resources.map((r) => r.name)).toEqual(["sieve-later.fn", "sieve-list-parser.fn", "sieve-set-list.js"]);
+    expect(resources.filter((r) => r.name.endsWith(".fn")).every((r) => r.kind.mime === "fn/javascript")).toBe(true);
+    expect(source("sieve-list-parser.fn")).toMatch(/^class SieveListParser /);
+    expect(source("sieve-later.fn")).toMatch(/^async function sieveLaterFn\(/);
   });
 });
 

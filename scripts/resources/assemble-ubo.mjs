@@ -18,6 +18,9 @@ const REDIRECT_FILES_DIR = "src/web_accessible_resources";
 const TRUST_PERMISSION = 1;
 // What adblock-rust's extract_function_name needs to call a resource with arguments.
 const NAMED_FUNCTION = /^function\s+[^(){}\s]+\s*\(/;
+// A dependency is only prepended, never called, so any named declaration will do:
+// current uBO declares some as classes (ArglistParser) and async functions.
+const NAMED_DECLARATION = /^(?:(?:async\s+)?function\s*\*?\s*[^(){}\s]+\s*\(|class\s+[^\s{]+)/;
 const MIME_BY_EXTENSION = new Map([
   ["css", "text/css"],
   ["gif", "image/gif"],
@@ -38,13 +41,14 @@ const moduleUrl = (root, path) => pathToFileURL(join(root, path)).href;
 
 function scriptletResource(entry, nameOf) {
   const source = entry.fn.toString();
-  if (!NAMED_FUNCTION.test(source)) {
-    throw new Error(`scriptlet ${entry.name} is not a named function declaration`);
+  const dependency = entry.name.endsWith(FUNCTION_SUFFIX);
+  if (!(dependency ? NAMED_DECLARATION : NAMED_FUNCTION).test(source)) {
+    throw new Error(`scriptlet ${entry.name} is not a named ${dependency ? "declaration" : "function declaration"}`);
   }
   const resource = {
     name: entry.name,
     aliases: asArray(entry.aliases),
-    kind: { mime: entry.name.endsWith(FUNCTION_SUFFIX) ? "fn/javascript" : "application/javascript" },
+    kind: { mime: dependency ? "fn/javascript" : "application/javascript" },
     content: encodeText(source),
   };
   const dependencies = asArray(entry.dependencies).map(nameOf);
