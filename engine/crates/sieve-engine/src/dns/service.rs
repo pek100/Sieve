@@ -10,7 +10,9 @@
 //! - [`Mode`] is the user's choice (`Policy::plain_dns`). In [`Mode::Plain`] a query
 //!   that would go encrypted goes in plain text to the server the client addressed
 //!   instead (the one Windows uses for that adapter without Sieve); every other
-//!   rule here holds as it is. Nothing else picks plain: no list, no failure.
+//!   rule here holds as it is. Nothing else picks plain: no list, no failure. A
+//!   plain query still in flight when encryption comes back on sends nothing
+//!   more (not its datagram, not its TCP retry) and gets SERVFAIL.
 //! - A reverse lookup for a private range goes to a LAN server, or gets NXDOMAIN
 //!   here when there is none. It never reaches the public upstream
 //!   (`upstream::path_of`).
@@ -189,10 +191,15 @@ impl Service {
         Self { context, active, tables, names, meters, mtu, in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)), may_intercept, facts: Facts::default(), plain: AtomicBool::new(false), failed_in_a_row: AtomicU64::new(0) }
     }
 
-    /// The next query takes this mode; queries in flight finish as they began.
+    /// The next query takes this mode. A plain query in flight sends nothing more
+    /// once the mode is encrypted ([`Service::exchange`]); an encrypted one finishes.
+    /// A change of mode starts the unreachable count over; setting the mode it
+    /// already has (every policy sets it) leaves the count alone.
     pub fn set_mode(&self, mode: Mode) {
-        self.plain.store(mode == Mode::Plain, Ordering::SeqCst);
-        self.failed_in_a_row.store(0, Ordering::SeqCst);
+        let plain = mode == Mode::Plain;
+        if self.plain.swap(plain, Ordering::SeqCst) != plain {
+            self.failed_in_a_row.store(0, Ordering::SeqCst);
+        }
     }
 
     pub fn mode(&self) -> Mode {
@@ -216,10 +223,12 @@ impl Service {
 
     /// Sessions are pinned to the old egress: a network change drops them all.
     /// The list is read and replaced under one lock, so a list set meanwhile is
-    /// never written over with the one it replaced.
+    /// never written over with the one it replaced. The unreachable count starts
+    /// over too: the old network's failures say nothing about the new one.
     pub fn reset(&self) {
         let mut active = self.active.write().unwrap_or_else(|p| p.into_inner());
         *active = Arc::new(Active::new(active.endpoints.clone(), &self.context));
+        self.failed_in_a_row.store(0, Ordering::SeqCst);
     }
 
     pub fn report(&self) -> Vec<UpstreamReport> {
@@ -283,7 +292,7 @@ impl Service {
 
     /// The engine's own HTTPS lookup, for its upstream hello (task D9). The same
     /// paths as a client's: encrypted, or LAN for a matched suffix, or with
-    /// encryption off plain to the first server Windows names
+    /// encryption off plain to the server of the adapter Windows sends through
     /// ([`upstream::first_server`]). It takes no permit a client is waiting for:
     /// past the bound it fails, and the flow goes on without ECH.
     pub async fn https_records(&self, name: &str) -> Result<Vec<HttpsRecord>, String> {
@@ -306,12 +315,12 @@ impl Service {
     }
 
     /// The one exchange on a path. A path with nowhere to go is an error here.
+    /// The plain path was chosen in [`Mode::Plain`]; it sends only while the mode
+    /// still is, so a query in flight when encryption comes back on fails instead.
     async fn exchange(&self, path: Path, query: &[u8]) -> Result<Vec<u8>, String> {
         match path {
-            Path::Lan(server) | Path::Plain(server) => match tokio::time::timeout(REQUEST_BUDGET, plain::exchange(self.context.connector.as_ref(), server, query)).await {
-                Ok(reply) => reply,
-                Err(_) => Err(format!("{server} did not answer in time")),
-            },
+            Path::Lan(server) => self.plain_exchange(server, query, || true).await,
+            Path::Plain(server) => self.plain_exchange(server, query, || self.mode() == Mode::Plain).await,
             Path::Refused => Err("it may be a LAN name, and no LAN server can take it".to_string()),
             Path::NoServer => Err("a private reverse name, and no LAN server to ask".to_string()),
             Path::Encrypted => {
@@ -323,6 +332,13 @@ impl Service {
                 }
                 resolved
             }
+        }
+    }
+
+    async fn plain_exchange(&self, server: IpAddr, query: &[u8], may_send: impl Fn() -> bool) -> Result<Vec<u8>, String> {
+        match tokio::time::timeout(REQUEST_BUDGET, plain::exchange(self.context.connector.as_ref(), server, query, may_send)).await {
+            Ok(reply) => reply,
+            Err(_) => Err(format!("{server} did not answer in time")),
         }
     }
 
@@ -611,6 +627,47 @@ mod tests {
     }
 
     /// Plain mode changes where encrypted lookups go and nothing else.
+    /// A path chosen while plain does not send once encryption is back on.
+    #[tokio::test]
+    async fn a_plain_path_chosen_before_encryption_came_back_sends_nothing() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let original = Plain::start(answering(), answering()).await;
+        let b = bed(&ca, &[doh.url()], None, connector_for(&[(ORIGINAL, &original)]));
+        b.service.set_mode(Mode::Plain);
+        let query = client_query(9, "www.example");
+        let path = b.service.path(&query, Some(ORIGINAL));
+        assert_eq!(path, Path::Plain(ORIGINAL));
+        b.service.set_mode(Mode::Encrypted);
+        assert!(b.service.exchange(path, &query).await.is_err());
+        assert!(b.connector.udp_recorded().is_empty() && b.connector.tcp_recorded().is_empty(), "no plain socket");
+        assert_eq!(queries(&original), 0);
+        assert!(doh.seen().is_empty(), "nor rerouted encrypted: it fails");
+    }
+
+    /// The mode turns encrypted between the truncated datagram and its TCP retry.
+    #[tokio::test]
+    async fn the_tcp_retry_of_a_plain_query_is_not_sent_once_encryption_is_back_on() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let service: Arc<std::sync::OnceLock<Arc<Service>>> = Arc::default();
+        let turned = service.clone();
+        let cut: Script = Arc::new(move |query| {
+            turned.get().unwrap().set_mode(Mode::Encrypted);
+            Step::Answer(crate::dns::truncated(&answer_to(query)).unwrap())
+        });
+        let original = Plain::start(cut, answering()).await;
+        let b = bed(&ca, &[doh.url()], None, connector_for(&[(ORIGINAL, &original)]));
+        _ = service.set(b.service.clone());
+        b.service.set_mode(Mode::Plain);
+        let answered = b.ask(&client_query(9, "big.example"), Transport::Stream).await;
+        assert_eq!((rcode(&answered.reply), answered.resolved), (2, false), "SERVFAIL");
+        assert_eq!(original.udp_queries.load(Ordering::SeqCst), 1);
+        assert!(b.connector.tcp_recorded().is_empty(), "no TCP retry, not even a connect");
+        assert_eq!(original.tcp_queries.load(Ordering::SeqCst), 0);
+        assert!(doh.seen().is_empty());
+    }
+
     #[tokio::test]
     async fn plain_mode_keeps_the_split_horizon_the_private_reverse_and_the_local_answers() {
         let ca = Ca::new();
@@ -693,6 +750,38 @@ mod tests {
         b.service.set_list(vec![doh.url().parse().unwrap()]);
         b.ask(&client_query(9, "www.example"), Transport::Datagram).await;
         assert!(!b.service.unreachable());
+    }
+
+    /// A bed whose one upstream refuses every lookup, already past
+    /// [`UNREACHABLE_AFTER`].
+    async fn unreachable_bed(ca: &Ca) -> (Bed, Server) {
+        let refusing = Server::start(Kind::Https, ca, Options { status: 500, ..Options::default() }).await;
+        let b = bed(ca, &[refusing.url()], None, Arc::new(Loopback::default()));
+        for id in 0..UNREACHABLE_AFTER as u16 {
+            b.ask(&client_query(id, "www.example"), Transport::Datagram).await;
+        }
+        assert!(b.service.unreachable());
+        (b, refusing)
+    }
+
+    /// Every policy sets the mode; only a change of it starts the count over.
+    #[tokio::test]
+    async fn setting_the_mode_it_already_has_keeps_the_unreachable_notice() {
+        let ca = Ca::new();
+        let (b, _refusing) = unreachable_bed(&ca).await;
+        b.service.set_mode(Mode::Encrypted);
+        assert!(b.service.unreachable(), "the same mode again: the count stands");
+        b.service.set_mode(Mode::Plain);
+        b.service.set_mode(Mode::Encrypted);
+        assert!(!b.service.unreachable(), "a real change starts it over");
+    }
+
+    #[tokio::test]
+    async fn a_network_change_ends_the_unreachable_notice() {
+        let ca = Ca::new();
+        let (b, _refusing) = unreachable_bed(&ca).await;
+        b.service.reset();
+        assert!(!b.service.unreachable(), "the old network's failures say nothing of the new one");
     }
 
     #[tokio::test]

@@ -324,10 +324,16 @@ pub fn split_rules(tables: &NetTables) -> Vec<SplitHorizon> {
 }
 
 /// Where the engine's own lookup goes in plain mode, having no client whose server
-/// to use: the first DNS server of the other up adapters, in the tables' order.
-/// A link-local IPv6 one is skipped, as [`lan_server`] does.
+/// to use: the first DNS server of the other up adapters, the one that holds the
+/// lowest-metric default route first (the adapter Windows sends through), then
+/// the rest in the tables' order. A link-local IPv6 one is skipped, as
+/// [`lan_server`] does.
 pub fn first_server(tables: &NetTables) -> Option<IpAddr> {
-    tables.others().flat_map(|a| a.dns.iter().copied()).find(|ip| !is_v6_link_local(*ip))
+    let default_metric = |a: &Adapter| tables.routes_on(a).filter(|r| r.dest.length() == 0).map(|r| r.metric).min();
+    let mut adapters: Vec<&Adapter> = tables.others().collect();
+    // Stable: equal keys keep the tables' order.
+    adapters.sort_by_key(|a| default_metric(a).map_or((1, 0), |metric| (0, metric)));
+    adapters.into_iter().flat_map(|a| a.dns.iter().copied()).find(|ip| !is_v6_link_local(*ip))
 }
 
 fn is_v6_link_local(ip: IpAddr) -> bool {
@@ -645,6 +651,29 @@ mod tests {
         none.adapters.iter_mut().find(|a| a.alias == "Sieve").unwrap().dns = vec!["192.168.7.1".parse().unwrap()];
         assert_eq!(first_server(&none), None, "Sieve's own adapter names none");
         assert!(path_for("www.example", &load(HOME)) == Path::Encrypted, "path_of never says plain");
+    }
+
+    #[test]
+    fn the_first_server_is_the_one_on_the_lowest_metric_default_route() {
+        use crate::route::table::fixtures::*;
+        use crate::route::table::RouteRow;
+        let router: IpAddr = "192.168.7.1".parse().unwrap();
+        let host_only: IpAddr = "192.168.56.1".parse().unwrap();
+        let switch: IpAddr = "172.27.16.1".parse().unwrap();
+        // The Default Switch listed first with a server, but no default route.
+        let mut tables = load(HOME);
+        let wifi_at = tables.adapters.iter().position(|a| a.alias == "Wi-Fi").unwrap();
+        let moved = tables.adapters.remove(wifi_at);
+        tables.adapters.push(moved);
+        tables.adapters.iter_mut().find(|a| a.alias.starts_with("vEthernet")).unwrap().dns = vec![switch];
+        assert_eq!(first_server(&tables), Some(router), "the adapter with the default route, not the first listed");
+        // A second default route with a lower metric wins.
+        tables.adapters.iter_mut().find(|a| a.alias == "Ethernet 2").unwrap().dns = vec![host_only];
+        tables.routes.push(RouteRow { dest: "0.0.0.0/0".parse().unwrap(), if_index: 8, next_hop: Some("192.168.56.254".parse().unwrap()), metric: 25 });
+        assert_eq!(first_server(&tables), Some(host_only), "the lower metric");
+        // No default route anywhere: the tables' order.
+        tables.routes.retain(|r| r.dest.length() != 0);
+        assert_eq!(first_server(&tables), Some(switch), "list order without a default route");
     }
 
     #[test]
