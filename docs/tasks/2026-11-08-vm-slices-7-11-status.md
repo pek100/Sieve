@@ -37,9 +37,50 @@ Engine 709C9CAA (this branch at 3850222 with the TEST bundle pinned: uBO 3762a26
 | U7 cached page after off | SKIP | the reload after content off failed with `ERR_NAME_NOT_RESOLVED` (see "DNS just after a start") |
 | U8 plain http, service worker | PASS | http://neverssl.com/ not injected (twice); squoosh.app injected on the network load and not on the service worker's (`fromServiceWorker` true) |
 
+**Found and fixed: no uBO scriptlet ever ran.** uBO's scriptlets read `scriptletGlobals`, which uBO's own injector declares; adblock-rust does not, and Sieve's payload did not. Each scriptlet threw a ReferenceError inside its own `try` and did nothing, silently (`with_scriptlets` still counted the page). Seen with a user `+js(set-attr, html, data-sieve-probe, 1)`: the attribute appeared only on www.youtube.com (not explained), not on example.com, github.com, accounts.google.com, MDN or web.dev; the same scriptlet under jsdom and node read the undeclared name. Fixed in 8726598 (`var scriptletGlobals={};` first in the scriptlets' scope); test `scriptlets_run_in_a_scope_that_declares_scriptlet_globals`, failing before the fix. The slice 10 content arms below ran before it and are rerun after it.
+
 ### DNS just after a start
 
 `d-dnsstart.ps1`, three engine restarts, `nslookup` every 150 ms: for about 3 s after `routes_up` lookups through the TUN got no address (rounds: 2.4 to 5.6 s, 0.5 to 3.8 s, 0.3 to 3.9 s after the start), then answered. A browser opened right after a policy restart fails its first names (`ERR_NAME_NOT_RESOLVED`). Not investigated further yet.
+
+### Real use
+
+Engine 709C9CAA (before the scriptletGlobals fix, so no scriptlet ran), default lists, `https`, `content` and encrypted DNS on. 20 sites, Edge 157 and Chrome 157, a fresh profile per load, rounds off, on, on, off. Medians of two loads, ms (`load` event):
+
+| Site | Edge off | Edge on | Chrome off | Chrome on |
+|---|---|---|---|---|
+| wikipedia.org | 567 | 839 | 566 | 698 |
+| google.com search | 1206 | 1259 | 1117 | 1198 |
+| youtube.com | 1826 | 2113 | 1825 | 1934 |
+| bbc.com/news | 1903 | 1711 | 1661 | 1550 |
+| nytimes.com (403 to this IP) | 491 | 718 | 442 | 668 |
+| amazon.com | 332 | 406 | 402 | 334 |
+| ebay.com (403) | 289 | 315 | 257 | 277 |
+| github.com | 1384 | 1944 | 1339 | 1426 |
+| stackoverflow.com (403) | 531 | 528 | 393 | 478 |
+| microsoft.com | 3527 | 4321 | 3499 | 3598 |
+| apple.com (EV, passed through) | 795 | 797 | 895 | 729 |
+| twitch.tv | 1684 | 1797 | 1610 | 1640 |
+| imdb.com (403) | 143 | 176 | 121 | 152 |
+| espn.com | 307 | 425 | 275 | 450 |
+| reddit.com (403) | 107 | 169 | 115 | 152 |
+| linkedin.com | 561 | 1416 | 511 | 666 |
+| netflix.com | 3598 | 3464 | 3577 | 3380 |
+| accounts.google.com | 1088 | 1350 | 326 | 337 |
+| login.microsoftonline.com | 656 | 815 | 414 | 529 |
+| instagram.com | 669 | 858 | 655 | 972 |
+
+The median of the per-site differences is about +115 ms in Edge and +85 ms in Chrome. Broken pages: none seen. Every page had the same status off and on, its visible text within a few percent except linkedin.com (2,114 and 2,137 characters on against 2,839 off in Edge, one of two loads in Chrome; not checked against the screenshots), and the extra failed requests on are blocked ad and tracker requests (microsoft.com 22, netflix 16, twitch 11). A screenshot of each load of round 1 is on the VM (`C:\sieve\logs\real2\shots-*`). The 403s are this data-centre IP, off and on alike.
+
+30-minute browsing soak, same switches, Edge and Chrome alternating (21 passes, 420 loads, 1 without a load event), sampled every minute: engine CPU 7.1 to 9.6 % of one core (average 8.12 %), working set 131 MB at the start, 184 to 223 MB after the first minute and flat (217 MB at the end), private 195 to 202 MB, handles 650 to 770, threads 16 to 31. `intercepted` +5429, `rewritten` +669, `resets` 0, `blocked` +2592, no `last_error`.
+
+**Heal false positives, large (slice 7, fixed on main 0ea3303 meanwhile):** after these runs `exclusions.json` held 32 `auto:pinning` rows for msedge and chrome on hosts that do not pin (www.google.com, www.facebook.com, github.githubassets.com, static.cdninstagram.com, bbci, espncdn, twitch, licdn, microsoft CDNs). This build has the old heal rule; slice 7 is checked with main's build below.
+
+### Kill, reboot, uninstall (section 0) with interception, content and encrypted DNS on
+
+| Check | Result | Evidence |
+|---|---|---|
+| Kill (`taskkill /F`), slice 6 U12, encrypted-dns 9, dns-extras 14 | PASS | after the kill: Resolve-DnsName 0.38 s, nslookup 0.07 s, curl https 0.18 s; routes on Sieve 0, adapter gone; route, DNS, proxy, firewall and adapter listings 0 lines different from the before-listing. The service's own recovery restarted the engine within 70 s with routes up. The download in flight was not measured cleanly (the curl arguments broke) |
 
 ### Slice 11: CT, CRLite, upstream ECH
 
