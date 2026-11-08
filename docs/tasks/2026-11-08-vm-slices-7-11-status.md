@@ -1,5 +1,25 @@
 # VM live run 2026-11-08: status at the stop
 
+## Run 2 (second session, same day)
+
+Branch `live-vm-2026-11-08` with main 8d1d873 merged. VM started 2026-11-08 20:10 local. Slice 7 skipped (self-healing is being fixed elsewhere). Scripts in the session scratchpad: `d-s8b.ps1`, `d-s9.ps1`, `d-s10.ps1`, `d-s11.ps1`, `d-real2.ps1`, `k-*.ps1`, `content.mjs`, `text.mjs`.
+
+Engines: `engine-cur-pin.exe` (C26FD6DE) is this branch with Version Negotiation as `REFUSAL` and a VM-only pin of the TEST scriptlet bundle (uBO 3762a26, sha256 9527a0b5...a385, placed as `lists\resources.json`). The pin is never committed. The slice 8 arms ran on the earlier pin builds (c4f9e87), whose QUIC code is the same.
+
+### Slice 8: refusal arms (decided)
+
+| Check | Result | Evidence |
+|---|---|---|
+| VN arm unit test | PASS | `version_negotiation_answers_each_initial_through_the_stream` (91ceb55), `a_sealed_initial_through_ipstack_is_answered_by_version_negotiation` (5a6d8af) |
+| U2 fallback time, Edge and Chrome | PASS for VN | 3 rounds per arm, alternating order. VN median 1 ms in both browsers, 89 % (Edge) and 80 % (Chrome) within 100 ms, 0 samples at the 300 ms TCP delay. PU: Edge median 301 ms, 34 of 77 samples at 295 to 310 ms. Drop: 23 of 159 there. Table in `docs/live/engine-slice-8.md` |
+| U1 ICMP reached the app | PASS in part | `replies` +270 to +300 per run with PU; Chrome moved to TCP early (81 % within 100 ms), Edge did not (44 %) |
+| U2 Firefox | SKIP | playwright-core 1.48 cannot drive the installed Firefox 159 |
+| U9 refused per load | Reported | 35 to 51 refused flows per 16 loads (8 sites twice) per browser and arm |
+
+Decision: `REFUSAL = Refusal::VersionNegotiation` (5a6d8af). The Chrome VN tail is longer than ICMP's (p90 705 ms against 368 ms; 5 of 60 over 1 s), most likely later TCP flows inside the 10 s window, which this run did not tell apart.
+
+Heal false positives seen again (slice 7, not fixed here): `auto:pinning` for msedge on cdn.discordapp.com and static.cdninstagram.com, chrome on static.cdninstagram.com, during these runs. Each run cleared `exclusions.json` first.
+
 The run stopped early because the owner's PC was restarting. Branch `live-vm-2026-11-08`. VM: `sieve-test-vm`, 1.4 h used (started 18:39, stopped 20:03), stopped at the end. The evidence logs are on the VM under `C:\sieve\logs\` (`dnsa`, `dnsb`, `dnsc`, `extras`, `yt1`, `ytp`, `s8`, `g`). The scripts are in the session scratchpad (`d-*.ps1`, `lib.ps1`, `browse.mjs`, `yt.mjs`, `dnsbench.mjs`).
 
 Engine under test: main c4f9e87. For slices 9 and 10 a VM-only build pinned a TEST scriptlet bundle (uBO 3762a26, sha256 9527a0b5...a385). That pin was never committed.
