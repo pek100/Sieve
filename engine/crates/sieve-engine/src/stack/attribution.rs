@@ -88,7 +88,7 @@ pub enum Guard {
 /// runs CryptoAPI in this process, and its revocation and AIA fetches use unpinned
 /// sockets that the adapter's routes catch. Refused, revocation soft-fails to
 /// unknown and a revoked certificate is intercepted (task F4, Q3; live U5,
-/// 2026-11-08: `own_refused` grew by 2 while revoked.badssl.com was minted a leaf).
+/// 2026-11-08: `own_refused` grew by 2 while a revoked-certificate test site was minted a leaf).
 /// The copy's upstream is an `Egress` socket, pinned outside Sieve's routes, so it
 /// cannot come back to the adapter.
 pub fn guard_tcp(own: bool, remote_port: u16) -> Guard {

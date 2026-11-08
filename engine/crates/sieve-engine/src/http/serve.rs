@@ -44,7 +44,7 @@ pub const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 pub const H2_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 /// The largest header list either h2 side takes: what Chromium advertises
 /// (`kSpdyMaxHeaderListSize`), so a head a browser takes without Sieve passes with
-/// it. hyper's default is 16 KiB, and www.youtube.com's response head is about
+/// it. hyper's default is 16 KiB, and a large video site's response head is about
 /// 20 KiB (live run 2026-11-08: every load a 502 from the engine, so Edge showed
 /// ERR_HTTP_RESPONSE_CODE_FAILURE).
 pub const H2_MAX_HEADER_LIST: u32 = 256 * 1024;
