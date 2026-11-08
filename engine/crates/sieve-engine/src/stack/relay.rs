@@ -1,7 +1,8 @@
 //! Windows: one task per flow the stack accepts (the spike's forwarder,
 //! with its live lessons kept):
 //! - only unicast reaches the stack (`tun::admit`);
-//! - a flow owned by the engine itself is refused and counted (loop guard);
+//! - a flow owned by the engine itself is refused and counted (loop guard),
+//!   except its plain HTTP, CryptoAPI's revocation fetches (`guard_tcp`);
 //! - every upstream socket comes from [`Egress`], pinned outside Sieve's routes;
 //! - a failed connect closes the app side with a FIN at once (live run 1:
 //!   a dropped ipstack stream left curl waiting 20 s).
@@ -27,7 +28,7 @@ use sieve_ipc::{FlowAction, FlowEvent, FlowKind, FlowProto};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-use super::attribution::{Attribution, HeldOwner, decide, is_own};
+use super::attribution::{Attribution, Guard, HeldOwner, decide, guard_tcp, is_own};
 use super::book::FlowBook;
 use super::dns_flow;
 use super::egress::Egress;
@@ -47,7 +48,7 @@ use crate::policy::wall_ms;
 use crate::quic::{self, PacketSink, Reply, UdpPath};
 use crate::route::table::NetTables;
 use crate::tls::intercept::{FlowMeta, HttpsSlot, Who, run as run_intercepted};
-use crate::tls::splice::Abort;
+use crate::tls::splice::{Abort, splice};
 use crate::watchdog::monotonic_ms;
 
 /// A TCP flow that sends nothing this long is decided without a name.
@@ -285,6 +286,9 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
     }
     let accepted_ms = monotonic_ms();
     let (attributed, upstream) = tokio::join!(ctx.attribute(flow), ctx.egress.connect(flow.remote));
+    if guard_tcp(attributed.own, flow.remote.port()) == Guard::RelayOwn {
+        return relay_own(app, upstream).await;
+    }
     let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Tcp, FlowKind::Other) else { return close_app(&mut app).await };
     let upstream = match upstream {
         Ok(u) => u,
@@ -294,6 +298,15 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
         }
     };
     serve_admitted(ctx, app, flow, admitted, upstream, accepted_ms).await;
+}
+
+/// The engine's own plain HTTP ([`guard_tcp`]): not the user's flow, so no book
+/// entry and no decision, only the copy.
+async fn relay_own(mut app: IpStackTcpStream, upstream: Result<TcpStream, String>) {
+    if let Ok(upstream) = upstream {
+        splice(&mut app, upstream, &[]).await;
+    }
+    close_app(&mut app).await;
 }
 
 /// An admitted flow with its SYN-time socket, to its end.
