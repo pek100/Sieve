@@ -12,6 +12,9 @@ pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 /// The longest a doubled retransmission timeout grows (RFC 6298 2.5 allows 60 s).
 const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// What a zero-window probe carries: the first unacknowledged byte (RFC 9293 3.8.6.1).
+pub(super) const ZERO_WINDOW_PROBE_BYTES: usize = 1;
+
 /// Maximum count of retransmissions before dropping the packet
 pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
 
@@ -98,15 +101,27 @@ impl Tcb {
         }
     }
 
+    /// The right edge of the usable window: the last ACK plus the smaller of the peer's
+    /// window and the unacknowledged-byte cap. No byte at or past it is sent, except a
+    /// zero-window probe.
+    fn usable_right_edge(&self) -> SeqNum {
+        self.get_last_received_ack() + self.max_unacked_bytes.min(self.get_send_window() as u32)
+    }
+
     /// The most payload a segment starting at `seq` may carry: one MTU's worth, and
-    /// nothing past the right edge of the usable window (the last ACK plus the smaller
-    /// of the peer's window and the unacknowledged-byte cap). Sieve (2026-11-08):
-    /// upstream capped it at the whole window from `seq`, so the segment after a full
-    /// one went past the peer's window by up to an MTU.
+    /// nothing past the usable window's right edge. Sieve (2026-11-08): upstream capped
+    /// it at the whole window from `seq`, so the segment after a full one went past the
+    /// peer's window by up to an MTU. A closed window still admits one byte at the last
+    /// ACK, the zero-window probe of RFC 9293 3.8.6.1.
     pub fn calculate_payload_max_len(&self, seq: SeqNum, ip_header_size: usize, tcp_header_size: usize) -> usize {
-        let window = self.max_unacked_bytes.min(self.get_send_window() as u32);
-        let right_edge = self.get_last_received_ack() + window;
-        let room = if seq < right_edge { right_edge.distance(seq) as usize } else { 0 };
+        let right_edge = self.usable_right_edge();
+        let room = if seq < right_edge {
+            right_edge.distance(seq) as usize
+        } else if seq == self.get_last_received_ack() {
+            ZERO_WINDOW_PROBE_BYTES
+        } else {
+            0
+        };
         let mtu = self.get_mtu() as usize;
         room.min(mtu.saturating_sub(ip_header_size + tcp_header_size))
     }
@@ -237,7 +252,14 @@ impl Tcb {
                         PacketType::KeepAlive
                     } else if !payload.is_empty() {
                         PacketType::NewPacket
-                    } else if self.get_send_window() == rcvd_window && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
+                    // Sieve (2026-11-08): not into a closed window. The peer answers each
+                    // zero-window probe with the same ACK, and a fast retransmit of the
+                    // probe byte would draw the next one at once.
+                    } else if rcvd_window != 0
+                        && self.get_send_window() == rcvd_window
+                        && self.seq != rcvd_ack
+                        && self.is_duplicate_ack_count_exceeded()
+                    {
                         PacketType::RetransmissionRequest
                     } else {
                         PacketType::WindowUpdate
@@ -271,6 +293,22 @@ impl Tcb {
         self.last_received_ack = ack;
     }
 
+    /// Takes the peer's latest ACK and window. Every held segment, one that started at
+    /// or past the old right edge, that the new edge lets in is due at once.
+    ///
+    /// Sieve (2026-11-08): upstream only woke the writer, so a segment held during a
+    /// zero window waited out its timer, by then up to a minute, after the window opened.
+    pub(super) fn update_peer_window(&mut self, ack: SeqNum, window: u16) {
+        let old_edge = self.usable_right_edge();
+        self.last_received_ack = ack;
+        self.send_window = window;
+        let new_edge = self.usable_right_edge();
+        let now = std::time::Instant::now();
+        for packet in self.inflight_packets.values_mut().filter(|p| p.seq >= old_edge && p.seq < new_edge) {
+            packet.due = now;
+        }
+    }
+
     pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
         match self.inflight_packets.first_key_value() {
             None => return,
@@ -294,13 +332,18 @@ impl Tcb {
         self.inflight_packets.retain(|_, p| ack < p.seq + p.payload.len() as u32);
     }
 
-    pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
-        self.inflight_packets.get(&seq)
+    /// The segment at `seq`, for a fast retransmit, its timer restarted so the RTO
+    /// does not resend it again straight after. Sieve (2026-11-08): upstream left the
+    /// timer as it was.
+    pub(crate) fn fast_retransmit(&mut self, seq: SeqNum) -> Option<InflightPacket> {
+        let packet = self.inflight_packets.get_mut(&seq)?;
+        packet.retime();
+        Some(packet.clone())
     }
 
     /// When the earliest unacknowledged segment's retransmission timer runs out.
     pub(crate) fn next_retransmission_deadline(&self) -> Option<std::time::Instant> {
-        self.inflight_packets.values().map(InflightPacket::deadline).min()
+        self.inflight_packets.values().map(|p| p.due).min()
     }
 
     /// The segments whose timer ran out, each timed again with a doubled timeout.
@@ -308,15 +351,23 @@ impl Tcb {
     /// peer is gone and the connection must be reset.
     ///
     /// Sieve (2026-11-08): upstream silently dropped such a segment and kept the
-    /// connection, so the peer could never receive those bytes. While the peer's
-    /// window is zero nothing fits, so nothing is resent or counted, only timed again.
+    /// connection, so the peer could never receive those bytes. A segment that starts
+    /// at or past the usable window's right edge sends nothing, so it is only timed
+    /// again, not counted and not doubled (`update_peer_window` makes it due when the
+    /// window lets it in). The one at the last ACK of a closed window goes out as the
+    /// zero-window probe, so a lost window update cannot hold the flow until its
+    /// session timeout.
     #[must_use]
     pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> Option<Vec<InflightPacket>> {
-        let window_closed = self.get_send_window() == 0;
+        let right_edge = self.usable_right_edge();
+        let last_ack = self.get_last_received_ack();
         let mut retransmit_list = Vec::new();
         for packet in self.inflight_packets.values_mut().filter(|p| p.is_timed_out()) {
-            if window_closed {
-                packet.back_off();
+            if packet.seq >= right_edge {
+                packet.retime();
+                if packet.seq == last_ack {
+                    retransmit_list.push(packet.clone());
+                }
                 continue;
             }
             if packet.retransmit_count >= self.max_retransmit_count {
@@ -350,7 +401,9 @@ impl Tcb {
 pub struct InflightPacket {
     pub seq: SeqNum,
     pub payload: Vec<u8>,
-    pub send_time: std::time::Instant,
+    /// When the retransmission timer runs out. Sieve (2026-11-08): a deadline rather
+    /// than upstream's send time, so a segment can be made due at once.
+    pub due: std::time::Instant,
     pub retransmit_count: usize,
     pub retransmit_timeout: std::time::Duration, // current retransmission timeout
 }
@@ -360,7 +413,7 @@ impl InflightPacket {
         Self {
             seq,
             payload,
-            send_time: std::time::Instant::now(),
+            due: std::time::Instant::now() + rto,
             retransmit_count: 0,
             retransmit_timeout: rto,
         }
@@ -369,15 +422,16 @@ impl InflightPacket {
         self.seq <= seq && seq < self.seq + self.payload.len() as u32
     }
     pub(crate) fn is_timed_out(&self) -> bool {
-        self.send_time.elapsed() >= self.retransmit_timeout
+        std::time::Instant::now() >= self.due
     }
-    fn deadline(&self) -> std::time::Instant {
-        self.send_time + self.retransmit_timeout
+    /// Times the segment again from now with the same timeout.
+    fn retime(&mut self) {
+        self.due = std::time::Instant::now() + self.retransmit_timeout;
     }
     /// Times the segment again from now, with the timeout doubled up to [`MAX_RTO`].
     fn back_off(&mut self) {
         self.retransmit_timeout = (self.retransmit_timeout * 2).min(MAX_RTO);
-        self.send_time = std::time::Instant::now();
+        self.retime();
     }
 }
 
@@ -508,10 +562,6 @@ mod tests {
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 
-        let sleep_past_deadline = |tcb: &Tcb| {
-            let deadline = tcb.next_retransmission_deadline().unwrap();
-            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(5));
-        };
         // Simulate retransmission timeouts
         for i in 0..MAX_RETRANSMIT_COUNT {
             sleep_past_deadline(&tcb);
@@ -527,18 +577,74 @@ mod tests {
         assert!(tcb.collect_timed_out_inflight_packets().is_none(), "out of retransmissions");
     }
 
+    fn sleep_past_deadline(tcb: &Tcb) {
+        let deadline = tcb.next_retransmission_deadline().unwrap();
+        std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(5));
+    }
+
     #[test]
-    fn test_closed_window_times_again_without_counting() {
+    fn test_closed_window_probes_without_counting_or_doubling() {
         let rto = Duration::from_millis(10);
         let mut tcb = Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, rto, MAX_RETRANSMIT_COUNT);
+        let una = tcb.get_seq();
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        tcb.add_inflight_packet(vec![2; 500]).unwrap();
         tcb.update_send_window(0);
         for _ in 0..=MAX_RETRANSMIT_COUNT {
-            let deadline = tcb.next_retransmission_deadline().unwrap();
-            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(5));
-            assert!(tcb.collect_timed_out_inflight_packets().unwrap().is_empty());
+            sleep_past_deadline(&tcb);
+            let probes = tcb.collect_timed_out_inflight_packets().unwrap();
+            assert_eq!(probes.iter().map(|p| p.seq).collect::<Vec<_>>(), [una], "one probe, at the last ACK");
+            assert_eq!(tcb.calculate_payload_max_len(una, 20, 20), ZERO_WINDOW_PROBE_BYTES, "of one byte");
         }
-        assert_eq!(tcb.inflight_packets.values().next().unwrap().retransmit_count, 0);
+        for packet in tcb.inflight_packets.values() {
+            assert_eq!((packet.retransmit_count, packet.retransmit_timeout), (0, rto), "{:?}", packet.seq);
+        }
+    }
+
+    #[test]
+    fn test_a_window_that_opens_makes_held_segments_due() {
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, RTO, MAX_RETRANSMIT_COUNT);
+        let una = tcb.get_seq();
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        tcb.add_inflight_packet(vec![2; 500]).unwrap();
+        tcb.update_peer_window(una, 0);
+        assert!(tcb.next_retransmission_deadline().unwrap() > std::time::Instant::now(), "held");
+        tcb.update_peer_window(una, 700);
+        let now = std::time::Instant::now();
+        let due: Vec<_> = tcb.inflight_packets.values().map(|p| p.due <= now).collect();
+        assert_eq!(due, [true, true], "both start inside the new edge");
+        tcb.inflight_packets.values_mut().for_each(InflightPacket::retime);
+        tcb.update_peer_window(una, 700);
+        assert!(tcb.next_retransmission_deadline().unwrap() > std::time::Instant::now(), "an unchanged edge makes nothing due");
+    }
+
+    #[test]
+    fn test_a_segment_past_a_shrunken_window_is_not_counted() {
+        let rto = Duration::from_millis(10);
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, rto, MAX_RETRANSMIT_COUNT);
+        let una = tcb.get_seq();
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        tcb.add_inflight_packet(vec![2; 500]).unwrap();
+        tcb.update_peer_window(una, 400);
+        sleep_past_deadline(&tcb);
+        let resent = tcb.collect_timed_out_inflight_packets().unwrap();
+        assert_eq!(resent.iter().map(|p| p.seq).collect::<Vec<_>>(), [una], "only the segment inside the window");
+        let held = tcb.inflight_packets.get(&(una + 500)).unwrap();
+        assert_eq!((held.retransmit_count, held.retransmit_timeout), (0, rto));
+    }
+
+    #[test]
+    fn test_a_fast_retransmit_restarts_the_segments_timer() {
+        let rto = Duration::from_millis(200);
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, rto, MAX_RETRANSMIT_COUNT);
+        let una = tcb.get_seq();
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        std::thread::sleep(rto / 2);
+        let resent = tcb.fast_retransmit(una).unwrap();
+        let left = tcb.next_retransmission_deadline().unwrap().saturating_duration_since(std::time::Instant::now());
+        assert!(left > rto * 3 / 4, "{left:?} left of a {rto:?} timer");
+        assert_eq!((resent.seq, resent.retransmit_count), (una, 0));
+        assert!(tcb.fast_retransmit(una + 500).is_none());
     }
 
     #[test]
@@ -555,6 +661,7 @@ mod tests {
         tcb.update_send_window(u16::MAX);
         assert_eq!(tcb.calculate_payload_max_len(tcb.get_seq(), 20, 20), MAX_UNACK as usize - 8192, "the cap, when smaller");
         tcb.update_send_window(0);
-        assert_eq!(tcb.calculate_payload_max_len(una, 20, 20), 0, "a closed window");
+        assert_eq!(tcb.calculate_payload_max_len(una, 20, 20), ZERO_WINDOW_PROBE_BYTES, "a closed window: the probe");
+        assert_eq!(tcb.calculate_payload_max_len(una + 1, 20, 20), 0, "and nothing past it");
     }
 }

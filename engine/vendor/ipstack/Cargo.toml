@@ -14,6 +14,11 @@
 # zero window is waited out without counting. Law: sieve-engine `stack::tcp_send_tests`.
 # A segment's payload also stops at the usable window's right edge (upstream sized it
 # from the whole window, so the segment after a full one overran the peer's window).
+# Window follow-ups (2026-11-08): a segment that starts at or past that edge is timed
+# again without counting or doubling and is made due the moment an ACK lets it in; a
+# closed window is probed with one byte at the last ACK each RTO (RFC 9293 3.8.6.1);
+# a fast retransmit restarts the segment's timer; the handshake starts the window
+# after the SYN with the SYN's own window, and data waits for ESTABLISHED.
 #
 # The criterion benchmark in `packet.rs` builds only under `--cfg ipstack_bench`, so
 # `cargo test --manifest-path engine/vendor/ipstack/Cargo.toml --lib` runs the crate's

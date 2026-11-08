@@ -31,6 +31,8 @@ const RECOVERY: Duration = Duration::from_secs(5);
 const SHORT_RTO: Duration = Duration::from_millis(20);
 /// Well past those four timeouts.
 const PAST_GIVING_UP: Duration = Duration::from_secs(1);
+/// What a zero-window probe carries (RFC 9293 3.8.6.1).
+const PROBE: usize = 1;
 
 /// One accepted flow, the app-side end of it, and what reached the app so far.
 struct Bed {
@@ -39,7 +41,10 @@ struct Bed {
     _stack: IpStack,
     local: SocketAddr,
     remote: SocketAddr,
+    /// The app's receive window now, and the one its latest ACK advertised: a window
+    /// can open without the stack hearing of it (a lost update).
     window: u16,
+    advertised: u16,
     /// The next server byte in order, the latest ACK sent, and the server's first data byte.
     rcv_nxt: u32,
     acked: u32,
@@ -60,6 +65,13 @@ impl Bed {
     }
 
     async fn with_tcp(flow: (&str, &str), mtu: u16, window: u16, tcp_config: TcpConfig) -> Self {
+        let mut bed = Self::before_handshake_ack(flow, mtu, window, tcp_config).await;
+        bed.ack();
+        bed
+    }
+
+    /// The SYN sent and the SYN-ACK taken; the handshake's last ACK not yet sent.
+    async fn before_handshake_ack(flow: (&str, &str), mtu: u16, window: u16, tcp_config: TcpConfig) -> Self {
         let (local, remote): (SocketAddr, SocketAddr) = (flow.0.parse().unwrap(), flow.1.parse().unwrap());
         let (to_stack, rx) = mpsc::unbounded_channel();
         let (tx, mut from_stack) = mpsc::unbounded_channel();
@@ -73,18 +85,17 @@ impl Bed {
         let (header, _) = tcp(&syn_ack);
         assert!(header.syn && header.ack, "{header:?}");
         let rcv_nxt = header.sequence_number.wrapping_add(1);
-        let mut bed = Self {
-            to_stack, from_stack, _stack: stack, local, remote, window,
+        Self {
+            to_stack, from_stack, _stack: stack, local, remote, window, advertised: window,
             rcv_nxt, acked: rcv_nxt, first: rcv_nxt,
             data: Vec::new(), early: BTreeMap::new(), arrivals: 0, beyond_window: 0,
             writer: tokio::spawn(write_all(app)),
-        };
-        bed.ack();
-        bed
+        }
     }
 
     fn ack(&mut self) {
         self.acked = self.rcv_nxt;
+        self.advertised = self.window;
         let flags = Flags { ack: Some(self.rcv_nxt), window: Some(self.window), ..Flags::default() };
         self.to_stack.send(segment(self.local, self.remote, CLIENT_ISN + 1, flags, &[])).unwrap();
     }
@@ -114,10 +125,20 @@ impl Bed {
         }
     }
 
+    /// A one-byte segment at the last ACK of a closed window: RFC 9293 3.8.6.1.
+    fn is_probe(&self, header: &TcpHeader, payload: &[u8]) -> bool {
+        self.advertised == 0 && payload.len() == PROBE && header.sequence_number == self.acked
+    }
+
     fn take(&mut self, header: &TcpHeader, payload: Vec<u8>) {
         let end = header.sequence_number.wrapping_add(u32::try_from(payload.len()).unwrap());
-        let edge = self.acked.wrapping_add(u32::from(self.window));
-        if is_after(end, edge) {
+        let edge = self.acked.wrapping_add(u32::from(self.advertised));
+        if self.is_probe(header, &payload) {
+            // The probe's byte is kept only once the window is open again.
+            if self.window == 0 {
+                return;
+            }
+        } else if is_after(end, edge) {
             self.beyond_window += usize::try_from(end.wrapping_sub(edge)).unwrap();
         }
         self.early.entry(header.sequence_number.wrapping_sub(self.first)).or_insert(payload);
@@ -226,7 +247,7 @@ async fn a_segment_out_of_retransmissions_resets_the_flow() {
 }
 
 /// While the app's window is zero no bytes fit, so the timer counts nothing toward
-/// giving up: the flow waits, and resumes when the window opens.
+/// giving up: the flow waits, probing, and resumes when the window opens.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_closed_window_is_waited_out_not_reset() {
     for flow in FLOWS {
@@ -236,8 +257,62 @@ async fn a_closed_window_is_waited_out_not_reset() {
         bed.receive(PAST_GIVING_UP / 4, |_| false, |i| i > 0).await;
         assert_eq!(bed.data.len(), 2 * RELAY_WRITE, "{flow:?}: both segments were out before the window closed");
         let sent = bed.listen(PAST_GIVING_UP).await;
-        assert!(sent.iter().all(|(h, payload)| !h.rst && payload.is_empty()), "{flow:?}: data or a reset into a closed window");
+        assert!(sent.iter().any(|(h, payload)| bed.is_probe(h, payload)), "{flow:?}: no zero-window probe");
+        let into_window = |(h, payload): &&(TcpHeader, Vec<u8>)| h.rst || !(payload.is_empty() || bed.is_probe(h, payload));
+        assert_eq!(sent.iter().find(into_window), None, "{flow:?}: data or a reset into a closed window");
         bed.window = u16::MAX;
+        bed.ack();
+        bed.receive(RECOVERY, |_| false, |_| false).await;
+        assert_eq!(bed.data, transfer(), "{flow:?}");
+    }
+}
+
+/// A segment held while the window was closed goes out as soon as an ACK opens it,
+/// not when its timer, doubled meanwhile, runs out. The app answers each probe.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_segment_is_resent_once_the_window_opens() {
+    /// Past ipstack's 1 s RTO and the 2 s it doubled to before the fix: its resend was
+    /// then due 7 s in, and with the fix but no catch-up at the next 1 s probe tick.
+    const CLOSED: Duration = Duration::from_millis(3_300);
+    const PROMPT: Duration = Duration::from_millis(400);
+    for flow in FLOWS {
+        let mut bed = Bed::new(flow, JUMBO_MTU, u16::MAX).await;
+        bed.window = 0;
+        // The first segment's ACK closes the window; the second is lost.
+        bed.receive(CLOSED, |i| i == 1, |_| false).await;
+        assert_eq!(bed.data.len(), RELAY_WRITE, "{flow:?}");
+        bed.window = u16::MAX;
+        bed.ack();
+        bed.receive(PROMPT, |_| false, |_| false).await;
+        assert_eq!(bed.data.len(), TRANSFER, "{flow:?}: the held segment waited on its timer");
+        assert_eq!(bed.data, transfer());
+    }
+}
+
+/// The app's window opens but its update is lost: everything was acknowledged, so
+/// only the stack's zero-window probe can learn of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_window_update_is_found_by_the_probe() {
+    for flow in FLOWS {
+        let mut bed = Bed::new(flow, JUMBO_MTU, u16::MAX).await;
+        bed.window = 0;
+        bed.receive(PAST_GIVING_UP / 4, |_| false, |_| false).await;
+        assert_eq!(bed.data.len(), 2 * RELAY_WRITE, "{flow:?}: both segments acknowledged, the window closed");
+        bed.window = u16::MAX;
+        bed.receive(RECOVERY, |_| false, |_| false).await;
+        assert_eq!(bed.data.len(), TRANSFER, "{flow:?}: no probe found the open window");
+        assert_eq!(bed.data, transfer());
+    }
+}
+
+/// The relay's bytes wait for the handshake's last ACK: none go out in SYN-RECEIVED.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_data_goes_out_before_the_handshake_completes() {
+    const WAIT: Duration = Duration::from_millis(300);
+    for flow in FLOWS {
+        let mut bed = Bed::before_handshake_ack(flow, JUMBO_MTU, u16::MAX, TcpConfig::default()).await;
+        let early = bed.listen(WAIT).await;
+        assert!(early.iter().all(|(_, payload)| payload.is_empty()), "{flow:?}: data before the ACK");
         bed.ack();
         bed.receive(RECOVERY, |_| false, |_| false).await;
         assert_eq!(bed.data, transfer(), "{flow:?}");

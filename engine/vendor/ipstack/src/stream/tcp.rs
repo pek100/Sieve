@@ -7,7 +7,9 @@ use crate::{
         tcp_flags::{ACK, FIN, PSH, RST, SYN},
         tcp_header_flags, tcp_header_fmt,
     },
-    stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, RTO, Tcb, TcpState},
+    stream::tcb::{
+        MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, RTO, Tcb, TcpState, ZERO_WINDOW_PROBE_BYTES,
+    },
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
 use std::{
@@ -187,7 +189,7 @@ impl IpStackTcpStream {
         destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
         config: Arc<TcpConfig>,
     ) -> Result<IpStackTcpStream, IpStackError> {
-        let tcb = Tcb::new(
+        let mut tcb = Tcb::new(
             SeqNum(tcp.sequence_number),
             mtu,
             config.max_unacked_bytes,
@@ -196,6 +198,9 @@ impl IpStackTcpStream {
             config.rto,
             config.max_retransmit_count,
         );
+        // Sieve (2026-11-08): the SYN's window is the peer's first; upstream assumed
+        // u16::MAX until the next ACK. No window scale is negotiated, so it is in bytes.
+        tcb.update_send_window(tcp.window_size);
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
             if !tcp.rst
@@ -375,15 +380,25 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
 
-        if send_window == 0 || is_full {
+        // Sieve (2026-11-08): data waits for the handshake's last ACK (RFC 9293 3.10.2:
+        // queued until ESTABLISHED); upstream sent it in SYN-RECEIVED.
+        let handshaking = matches!(state, TcpState::Listen | TcpState::SynReceived);
+        let timer_idle = tcb.get_inflight_packets_total_len() == 0;
+        // Sieve (2026-11-08): a closed window with nothing in flight takes one byte, held
+        // unsent as the zero-window probe; upstream waited for a window update, and a
+        // lost one held the flow until its session timeout.
+        let probe = send_window == 0 && timer_idle;
+        if handshaking || (is_full && !probe) {
             self.write_notify.lock().unwrap().replace(cx.waker().clone());
             log::trace!("{nt} {state:?}: [poll_write] current send window: {send_window}, send buffer full: {is_full}, waiting for the other side to send ACK...");
             return Poll::Pending;
         }
 
-        let sender = &self.up_packet_sender;
-        let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
-        let timer_idle = tcb.get_inflight_packets_total_len() == 0;
+        let payload_len = if probe {
+            ZERO_WINDOW_PROBE_BYTES.min(buf.len())
+        } else {
+            write_packet_to_device(&self.up_packet_sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?
+        };
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
         if timer_idle {
             self.inflight_notify.notify_one();
@@ -593,6 +608,10 @@ async fn tcp_main_logic_loop(
             None,
         )?;
         tcb.increase_seq();
+        // Sieve (2026-11-08): the SYN takes one sequence number, so the window starts
+        // after it; upstream left the last ACK at the ISN, one byte short of the edge.
+        let (after_syn, syn_window) = (tcb.get_seq(), tcb.get_send_window());
+        tcb.update_peer_window(after_syn, syn_window);
         tcb.change_state(TcpState::SynReceived);
         let state = tcb.get_state();
         log::trace!("{network_tuple} {state:?}: session now in {state:?} state");
@@ -763,6 +782,7 @@ async fn tcp_main_logic_loop(
                     extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                 }
                 tcb.change_state(TcpState::Established);
+                write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
             }
             TcpState::Established => {
                 if flags == ACK {
@@ -774,7 +794,7 @@ async fn tcp_main_logic_loop(
                             write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                         }
                         PacketType::RetransmissionRequest => {
-                            if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
+                            if let Some(packet) = tcb.fast_retransmit(incoming_ack) {
                                 let (s, p) = (packet.seq, packet.payload.clone());
                                 log::debug!(
                                     "{network_tuple} {state:?}: local {{ seq: {seq}, ack: {ack} }}, {pkt_type:?}, retransmission request, seq = {s}, len = {}",
@@ -955,8 +975,7 @@ async fn tcp_main_logic_loop(
             _ => {}
         } // end of match state
 
-        tcb.update_last_received_ack(incoming_ack);
-        tcb.update_send_window(incoming_win);
+        tcb.update_peer_window(incoming_ack, incoming_win);
     } // end of loop
     Ok::<(), std::io::Error>(())
 }
