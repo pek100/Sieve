@@ -124,7 +124,8 @@ export function useFilters(): FiltersModel {
   // Stable while the engine stays answerable, so an open rules view asks only when its search changes.
   const listRules = useCallback((id: string, query: string) => (reachable ? engine.listRules(id, query) : Promise.reject(new Error(ENGINE_AWAY_TEXT))), [engine, reachable]);
   const reported = useMemo(() => (catalogue ? withEngineReports(catalogue, report) : null), [catalogue, report]);
-  const nothingInForce = reported !== null && noneApplied && nothingLoaded(reported.lists);
+  // The probe's facts hold no own list, so their counts come from the report alone.
+  const nothingInForce = reported !== null && noneApplied && nothingLoaded([...reported.lists, ...own]);
 
   // Writers read the latest stored value at call time, so undo after other edits stays correct.
   const selectionNow = () => settings.get("filters.lists");

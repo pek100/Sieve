@@ -405,7 +405,35 @@ pub fn custom_list_problem(list: &CustomList) -> Option<String> {
     if host.is_empty() || host.contains('@') || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Some("not a web address".into());
     }
-    None
+    local_host(host).then(|| LOCAL_LIST_HOST.to_string())
+}
+
+/// Why a list's address on this computer or the local network is refused.
+pub const LOCAL_LIST_HOST: &str = "a list is downloaded from the internet only, never from this computer or the local network";
+
+/// This computer or the local network, by name or by address literal (a name
+/// that resolves there is not caught here). An IPv6 literal is refused whole:
+/// no list is published at one, and judging its ranges here and again in the
+/// app's copy of this rule is where the two would drift. A host whose last
+/// label is a number that is not a plain dotted quad (`127.1`, `0x7f.1`) is one
+/// a URL parser reads as an IPv4 address in another spelling, so it is refused.
+fn local_host(host: &str) -> bool {
+    if host.starts_with('[') {
+        return true;
+    }
+    let lower = host.to_ascii_lowercase();
+    let name = lower.rsplit_once(':').map_or(lower.as_str(), |(name, _port)| name).trim_end_matches('.');
+    if name == "localhost" || name.ends_with(".localhost") {
+        return true;
+    }
+    match name.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified(),
+        Err(_) => {
+            let last = name.rsplit('.').next().unwrap_or_default();
+            let hex = last.strip_prefix("0x").is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+            hex || (!last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1017,6 +1045,14 @@ mod tests {
         assert_eq!(f["customTitleMax"], CUSTOM_TITLE_MAX);
         assert_eq!(f["listRulesShown"], LIST_RULES_SHOWN);
         assert_eq!(f["trackingNames"], serde_json::json!(TRACKING_NAMES));
+    }
+
+    #[test]
+    fn a_list_on_this_computer_or_the_local_network_is_refused_with_the_reason() {
+        for url in ["https://localhost/a.txt", "https://192.168.1.1/a.txt", "https://[::1]/a.txt", "https://127.1/a.txt"] {
+            let list = CustomList { id: "custom-a1".into(), title: "Mine".into(), url: Some(url.into()), enabled: true };
+            assert_eq!(custom_list_problem(&list).as_deref(), Some(LOCAL_LIST_HOST), "{url}");
+        }
     }
 
     /// An old policy reads, and a policy with neither new field writes exactly as before.

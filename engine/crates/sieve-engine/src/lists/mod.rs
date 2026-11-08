@@ -40,8 +40,12 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// moved wall clock delays a refresh by no more than this. Plan 6's idle cost:
 /// one wake an hour, only while routes are up.
 const MAX_SLEEP: Duration = Duration::from_secs(3_600);
+/// A copy no policy names is kept this long after it was written: an import's
+/// policy follows it, and may only arrive after the engine restarted.
+const UNNAMED_COPY_KEPT: Duration = Duration::from_secs(5 * 60);
 
 pub const UNKNOWN_LIST: &str = "the engine knows no list by that id";
+pub const LIST_OFF: &str = "the list is off: Sieve downloads a list only while it is on";
 pub const NO_COPY: &str = "Sieve has no copy of this list yet: it downloads a list while the list is on and the engine routes traffic";
 pub const FILE_NOT_DOWNLOADED: &str = "a list from a file is not downloaded: import the file again to update it";
 pub const NOTHING_USABLE: &str = "no rule Sieve can use: every line was skipped";
@@ -70,8 +74,6 @@ struct Inner {
     states: HashMap<String, FetchState>,
     /// Lists asked to download at the next look, whatever their age.
     forced: HashSet<String>,
-    /// Imported this run and not yet named by a policy: kept, not swept.
-    imported: HashSet<String>,
     compile_ms: Option<u64>,
     compile_error: Option<String>,
     /// Each compiled list's own `! Version:`.
@@ -165,8 +167,9 @@ impl Lists {
     /// The policy's own lists changed. A list that left (or whose address
     /// changed) is forgotten with its copy, so removing a list removes what the
     /// engine kept of it; so is a copy on disk no policy names, unless it was
-    /// imported this run and its policy has not arrived yet.
-    pub fn set_custom(&self, custom: Vec<CustomList>) {
+    /// written less than [`UNNAMED_COPY_KEPT`] before `now_ms` (an import whose
+    /// policy has not arrived yet, across a restart too).
+    pub fn set_custom(&self, custom: Vec<CustomList>, now_ms: u64) {
         let mut inner = self.inner();
         if inner.custom == custom {
             return;
@@ -178,16 +181,15 @@ impl Lists {
             inner.states.remove(id);
             inner.versions.remove(id);
         }
-        for c in &custom {
-            inner.imported.remove(&c.id);
-        }
         if let Some(cache) = &self.cache {
             for id in &forget {
                 cache.remove(id);
             }
+            let young = |id: &str| cache.read_state(id).fetched_at_ms.is_some_and(|at| now_ms.saturating_sub(at) < millis(UNNAMED_COPY_KEPT));
             for id in cache.ids_with_prefix(CUSTOM_LIST_PREFIX) {
-                if !custom.iter().any(|c| c.id == id) && !inner.imported.contains(&id) {
+                if !custom.iter().any(|c| c.id == id) && !young(&id) {
                     cache.remove(&id);
+                    inner.states.remove(&id);
                 }
             }
             for id in fresh {
@@ -207,15 +209,18 @@ impl Lists {
     }
 
     /// List `id` downloads at the next look, whatever its age. Refused for an
-    /// id the engine does not know, and for a list from a file.
+    /// id the engine does not know, for a list from a file, and for a list that
+    /// is off, which the loop would never ask for.
     pub fn refresh_one(&self, id: &str) -> Result<(), String> {
-        let mut inner = self.inner();
-        let url = catalogue::find(id).map(|l| Some(l.url.to_string())).or_else(|| inner.custom.iter().find(|c| c.id == id).map(|c| c.url.clone()));
-        match url {
-            None => Err(UNKNOWN_LIST.to_string()),
-            Some(None) => Err(FILE_NOT_DOWNLOADED.to_string()),
-            Some(Some(_)) => {
-                inner.forced.insert(id.to_string());
+        let known = catalogue::find(id).is_some() || self.inner().custom.iter().any(|c| c.id == id);
+        if !known {
+            return Err(UNKNOWN_LIST.to_string());
+        }
+        match self.sources().into_iter().find(|s| s.id == id) {
+            None => Err(LIST_OFF.to_string()),
+            Some(Source { url: None, .. }) => Err(FILE_NOT_DOWNLOADED.to_string()),
+            Some(_) => {
+                self.inner().forced.insert(id.to_string());
                 self.wake.notify_one();
                 Ok(())
             }
@@ -223,28 +228,29 @@ impl Lists {
     }
 
     /// Judges and keeps a list the user picked from a file, as a download is
-    /// judged, and compiles it untrusted alone to count what it holds. It takes
-    /// effect once the policy names it. The rules and skipped counts it holds.
-    pub fn import(&self, id: &str, text: &str, now_ms: u64) -> Result<(u64, u64), String> {
+    /// judged, and compiles it untrusted alone, off the runtime, to count what
+    /// it holds. It takes effect once the policy names it. The rules and
+    /// skipped counts it holds.
+    pub async fn import(&self, id: &str, text: String, now_ms: u64) -> Result<(u64, u64), String> {
         if let Some(why) = custom_id_problem(id) {
             return Err(why);
         }
-        let text = judge_text(text.as_bytes(), MAX_IMPORT_BYTES, false)?;
-        let compiled = RuleEngine::compile(&[ListText { id, text, trusted: false }]);
-        let report = compiled.reports().first().cloned().unwrap_or_default();
+        let owned_id = id.to_string();
+        let judged = tokio::task::spawn_blocking(move || {
+            let judged = judge_text(text.as_bytes(), MAX_IMPORT_BYTES, false)?.to_string();
+            let compiled = RuleEngine::compile(&[ListText { id: &owned_id, text: &judged, trusted: false }]);
+            Ok::<_, String>((judged, compiled.reports().first().cloned().unwrap_or_default()))
+        });
+        let (text, report) = judged.await.map_err(|e| format!("the list did not compile: {e}"))??;
         let rules = counted(report.network + report.cosmetic);
         if rules == 0 {
             return Err(NOTHING_USABLE.to_string());
         }
         let cache = self.cache.as_ref().ok_or(NO_STATE_FOLDER)?;
-        let state = FetchState::fetched(text, None, None, now_ms);
-        cache.write_text(id, text)?;
+        let state = FetchState::fetched(&text, None, None, now_ms);
+        cache.write_text(id, &text)?;
         cache.write_state(id, &state)?;
-        let mut inner = self.inner();
-        inner.states.insert(id.to_string(), state);
-        if !inner.custom.iter().any(|c| c.id == id) {
-            inner.imported.insert(id.to_string());
-        }
+        self.inner().states.insert(id.to_string(), state);
         self.dirty.store(true, Ordering::Relaxed);
         self.wake.notify_one();
         Ok((rules, counted(report.skipped)))
@@ -336,7 +342,10 @@ impl Lists {
     pub async fn fetch_due<F: Fetcher>(&self, fetcher: &F, now_ms: u64) -> bool {
         let force = self.force.swap(false, Ordering::Relaxed);
         let mut replaced = false;
-        for source in self.sources() {
+        let sources = self.sources();
+        // A list turned off after its "Update now" is not downloaded: forget the ask.
+        self.inner().forced.retain(|id| sources.iter().any(|s| s.id == *id && s.url.is_some()));
+        for source in sources {
             let Some(url) = source.url.as_deref() else { continue };
             let forced = self.inner().forced.remove(&source.id);
             let mut state = self.inner().states.get(&source.id).cloned().unwrap_or_default();
@@ -418,12 +427,13 @@ impl Lists {
         }
     }
 
-    /// Until the next list is due. A list from a file is never due.
+    /// Until the next list is due: now for a list asked for, if it is still on.
+    /// A list from a file is never due.
     fn next_sleep(&self, now_ms: u64) -> Duration {
         let sources = self.sources();
         let inner = self.inner();
-        let next = sources.iter().filter(|s| s.url.is_some()).map(|s| inner.states.get(&s.id).map_or(0, FetchState::due_at_ms)).min();
-        let next = if inner.forced.is_empty() { next } else { Some(0) };
+        let due = |s: &Source| if inner.forced.contains(&s.id) { 0 } else { inner.states.get(&s.id).map_or(0, FetchState::due_at_ms) };
+        let next = sources.iter().filter(|s| s.url.is_some()).map(due).min();
         next.map_or(MAX_SLEEP, |due| Duration::from_millis(due.saturating_sub(now_ms)).min(MAX_SLEEP))
     }
 
@@ -880,7 +890,7 @@ mod tests {
     async fn an_own_list_by_address_is_downloaded_compiled_untrusted_reported_and_forgotten_when_removed() {
         let dir = tempfile::tempdir().unwrap();
         let l = lists_at(dir.path(), &[]);
-        l.set_custom(vec![own("custom-a1", Some(OWN_URL))]);
+        l.set_custom(vec![own("custom-a1", Some(OWN_URL))], 0);
         assert!(l.sources().iter().all(|s| !s.trusted), "a user's list never gets trusted scriptlets");
         let f = FakeFetcher::answering_url(OWN_URL, vec![ok(BODY)]);
         assert!(l.fetch_due(&f, 1_000).await);
@@ -892,12 +902,12 @@ mod tests {
         assert_eq!((row.enabled, row.fetched_at_ms, row.network), (true, Some(1_000), 1));
         assert_eq!(rows.len(), LISTS.len() + 2, "the catalogue, the own list, the user's rules");
 
-        l.set_custom(vec![CustomList { enabled: false, ..own("custom-a1", Some(OWN_URL)) }]);
+        l.set_custom(vec![CustomList { enabled: false, ..own("custom-a1", Some(OWN_URL)) }], 1_000);
         assert!(Cache::new(dir.path()).read_text("custom-a1").is_some(), "off keeps the copy");
         l.compile_and_swap().await;
         assert!(!blocks(&l, "ads.example"), "off stops it");
-        l.set_custom(vec![]);
-        assert_eq!(Cache::new(dir.path()).read_text("custom-a1"), None, "removed, and its copy with it");
+        l.set_custom(vec![], 1_000);
+        assert_eq!(Cache::new(dir.path()).read_text("custom-a1"), None, "removed, and its copy with it, however young");
         assert!(l.report().0.iter().all(|r| r.id != "custom-a1"));
     }
 
@@ -905,7 +915,7 @@ mod tests {
     async fn an_own_list_that_is_a_web_page_is_refused_with_the_reason_and_keeps_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let l = lists_at(dir.path(), &[]);
-        l.set_custom(vec![own("custom-a1", Some(OWN_URL))]);
+        l.set_custom(vec![own("custom-a1", Some(OWN_URL))], 0);
         assert!(!l.fetch_due(&FakeFetcher::answering_url(OWN_URL, vec![ok("<!doctype html><p>sign in")]), 0).await);
         let (rows, _) = l.report();
         let row = rows.iter().find(|r| r.id == "custom-a1").unwrap();
@@ -924,16 +934,16 @@ mod tests {
             (too_big.as_str(), "byte limit"),
             ("||bad$unknown-option-xyz\n", "no rule in the response"),
         ] {
-            assert!(l.import("custom-b2", text, 5).unwrap_err().contains(why), "{why}");
+            assert!(l.import("custom-b2", text.into(), 5).await.unwrap_err().contains(why), "{why}");
         }
-        assert!(l.import("adguard-base", BODY, 5).unwrap_err().contains("custom list id"), "never over a catalogue row");
-        assert!(l.import("custom-../x", BODY, 5).is_err(), "never a path");
+        assert!(l.import("adguard-base", BODY.into(), 5).await.unwrap_err().contains("custom list id"), "never over a catalogue row");
+        assert!(l.import("custom-../x", BODY.into(), 5).await.is_err(), "never a path");
         assert_eq!(Cache::new(dir.path()).read_text("custom-b2"), None, "nothing kept from a refusal");
 
-        assert_eq!(l.import("custom-b2", "||ads.example^\n||bad$unknown-option-xyz\n", 5).unwrap(), (1, 1));
-        l.set_custom(vec![]);
+        assert_eq!(l.import("custom-b2", "||ads.example^\n||bad$unknown-option-xyz\n".into(), 5).await.unwrap(), (1, 1));
+        l.set_custom(vec![own("custom-a1", Some(OWN_URL))], 5);
         assert!(Cache::new(dir.path()).read_text("custom-b2").is_some(), "imported, its policy not here yet: kept");
-        l.set_custom(vec![own("custom-b2", None)]);
+        l.set_custom(vec![own("custom-b2", None)], 5);
         let f = FakeFetcher::default();
         assert!(!l.fetch_due(&f, 10 * HOUR_MS).await);
         assert!(f.asked_urls().is_empty(), "a file is never downloaded");
@@ -950,9 +960,66 @@ mod tests {
         cache.write_text("custom-old", BODY).unwrap();
         cache.write_text(LIST_A, BODY).unwrap();
         let l = lists_at(dir.path(), &[]);
-        l.set_custom(vec![own("custom-a1", Some(OWN_URL))]);
+        l.set_custom(vec![own("custom-a1", Some(OWN_URL))], 0);
         assert_eq!(cache.read_text("custom-old"), None, "left by an import that was never added");
         assert!(cache.read_text(LIST_A).is_some(), "a catalogue copy is never swept");
+    }
+
+    /// An import, then a restart before the policy naming it arrives.
+    #[tokio::test]
+    async fn a_fresh_import_outlives_a_restart_and_a_stale_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = 10 * HOUR_MS;
+        lists_at(dir.path(), &[]).import("custom-b2", BODY.into(), at).await.unwrap();
+        let policy = || vec![own("custom-a1", Some(OWN_URL))];
+        let minute = 60_000;
+        lists_at(dir.path(), &[]).set_custom(policy(), at + minute);
+        assert!(Cache::new(dir.path()).read_text("custom-b2").is_some(), "a minute old: its policy may still come");
+        lists_at(dir.path(), &[]).set_custom(policy(), at + millis(UNNAMED_COPY_KEPT));
+        assert_eq!(Cache::new(dir.path()).read_text("custom-b2"), None, "no policy named it in time");
+    }
+
+    /// The compile of an import must leave the pipe's runtime free: a task
+    /// beside it runs while it compiles.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_import_compiles_off_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = lists_at(dir.path(), &[]);
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        let before = ticks.load(Ordering::Relaxed);
+        let text = "||a.example^\n".repeat(MAX_IMPORT_BYTES / 13);
+        l.import("custom-b2", text, 5).await.unwrap();
+        assert!(ticks.load(Ordering::Relaxed) > before, "the runtime ran nothing else during the compile");
+        ticker.abort();
+    }
+
+    #[tokio::test]
+    async fn update_now_on_a_list_that_is_off_is_refused_and_never_spins_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = lists_at(dir.path(), &[LIST_A]);
+        l.fetch_due(&FakeFetcher::answering(LIST_A, vec![ok(BODY)]), 0).await;
+        assert_eq!(l.refresh_one(SECOND_DEFAULT).unwrap_err(), LIST_OFF, "a catalogue row not selected");
+        assert!(l.next_sleep(1) > Duration::ZERO);
+
+        l.refresh_one(LIST_A).unwrap();
+        l.set_selection(Some(vec![]));
+        assert_eq!(l.next_sleep(1), MAX_SLEEP, "asked, then turned off: nothing is due");
+        let f = FakeFetcher::default();
+        l.fetch_due(&f, 1).await;
+        assert!(f.asked_urls().is_empty());
+        assert!(l.inner().forced.is_empty(), "the ask is forgotten");
+        l.set_selection(Some(vec![LIST_A.to_string()]));
+        assert!(l.next_sleep(1) > Duration::ZERO, "on again: due when its copy says, not at once");
     }
 
     #[tokio::test]

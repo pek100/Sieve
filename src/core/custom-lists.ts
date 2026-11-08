@@ -26,6 +26,9 @@ export const MAX_LIST_BYTES = 32 * 1024 * 1024;
 
 const ID = new RegExp(`^${CUSTOM_LIST_PREFIX}[a-z0-9]{1,${CUSTOM_ID_MAX}}$`);
 const CONTROL = /\p{Cc}/u;
+const CONTROLS = /\p{Cc}/gu;
+/** A dotted quad as Rust's Ipv4Addr reads one: no leading zeros. */
+const IPV4 = /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/;
 
 /** Why the engine would refuse this list, or null: the same rule, word for word in effect. */
 export function customListProblem(list: CustomList): string | null {
@@ -40,7 +43,30 @@ function urlProblem(url: string): string | null {
   if (!url.startsWith("https://")) return "Sieve downloads lists over https only. Ask the list's owner for an https:// address.";
   const host = url.slice("https://".length).split(/[/?#]/)[0] ?? "";
   if (host === "" || host.includes("@") || /\s/.test(url) || CONTROL.test(url)) return "That is not a web address.";
+  if (localHost(host)) return "Sieve downloads lists from the internet only, never from this computer or your local network.";
   return null;
+}
+
+/** The engine's `local_host` (sieve_ipc), rule for rule: this computer or the local network, by name or address literal. */
+function localHost(host: string): boolean {
+  if (host.startsWith("[")) return true;
+  const lower = host.toLowerCase();
+  const colon = lower.lastIndexOf(":");
+  const name = (colon === -1 ? lower : lower.slice(0, colon)).replace(/\.+$/, "");
+  if (name === "localhost" || name.endsWith(".localhost")) return true;
+  const quad = IPV4.exec(name);
+  if (quad) {
+    const [a, b, c, d] = quad.slice(1).map(Number);
+    if ([a, b, c, d].some((o) => o > 255)) return numericLast(name);
+    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a + b + c + d === 0;
+  }
+  return numericLast(name);
+}
+
+/** A last label a URL parser reads as a number, so the host as an IPv4 address in another spelling. */
+function numericLast(name: string): boolean {
+  const last = name.split(".").at(-1) ?? "";
+  return /^0x[0-9a-f]*$/.test(last) || /^\d+$/.test(last);
 }
 
 /** Is this stored value one list the engine would take? The registry's element check for `filters.custom`. */
@@ -73,8 +99,12 @@ export function titleFromUrl(url: string): string {
   } catch {
     // A malformed escape is kept as written.
   }
-  return ([...(name || host)].slice(0, CUSTOM_TITLE_MAX).join("") || "My list").replace(CONTROL, "");
+  const clean = (s: string) => s.replace(CONTROLS, "").trim();
+  return [...(clean(name) || clean(host))].slice(0, CUSTOM_TITLE_MAX).join("") || "My list";
 }
+
+/** Would the engine hold these lists together: at most MAX_CUSTOM_LISTS, no id twice (sieve_engine::policy::accept)? */
+export const customListsFit = (lists: readonly CustomList[]) => lists.length <= MAX_CUSTOM_LISTS && new Set(lists.map((l) => l.id)).size === lists.length;
 
 /** A fresh id no list here has. `random` gives bytes (crypto.getRandomValues in the app). */
 export function newCustomId(existing: readonly CustomList[], random: (n: number) => Uint8Array): string {

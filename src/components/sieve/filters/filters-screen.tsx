@@ -8,6 +8,7 @@ import { Page } from "@/components/sieve/shell/page";
 import { ENGINE_HREF } from "@/core/engine";
 import { isShut } from "@/core/lock";
 import { ALLOWLIST_TEXT } from "@/core/rules";
+import { trackingOffered } from "@/core/tracking";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useFilters } from "@/hooks/use-filters";
 import { useHydrated } from "@/hooks/use-hydrated";
@@ -39,8 +40,8 @@ const useNow = () => {
 
 /**
  * Filters: one choice at the top (the protection level), every list under it
- * by what it is for, the person's own lists, then tracking protection and the
- * person's own rules. The catalogue comes from the engine's table and its
+ * by what it is for, the person's own lists, then tracking protection (once
+ * the engine carries it out) and the person's own rules. The catalogue comes from the engine's table and its
  * counts from the engine's report; every choice is a setting, the same one the
  * engine is sent, and the levels are derived from them. While the password
  * holds, all of it stays readable and no control takes a change.
@@ -75,7 +76,7 @@ export function FiltersScreen() {
         </GridRegion>
         <GridRegion span={6} className="flex flex-col gap-8">
           <OwnLists model={model} disabled={shut} nowMs={nowMs} onRules={setRulesOf} />
-          <TrackingBlock />
+          {trackingOffered() && <TrackingBlock />}
           <RulesEditor saved={model.rules} onSave={model.saveRules} disabled={shut} />
           <DomainList title="Allowlist" description={ALLOWLIST_TEXT} hosts={model.allowlist} onAdd={model.addAllowed} onRemove={model.removeAllowed} disabled={shut} />
           <DomainList title="Blocklist" description={BLOCKLIST_TEXT} hosts={model.blocklist} onAdd={model.addBlocked} onRemove={model.removeBlocked} disabled={shut} />

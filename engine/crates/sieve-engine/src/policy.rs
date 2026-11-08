@@ -15,7 +15,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 pub use sieve_ipc::MAX_POLICY_BYTES;
-use sieve_ipc::{MAX_CUSTOM_LISTS, Policy, TRACKING_NAMES, custom_list_problem};
+use sieve_ipc::{CustomList, MAX_CUSTOM_LISTS, Policy, TRACKING_NAMES, custom_list_problem};
 
 pub const POLICY_FILE: &str = "policy.json";
 pub const RUNS_FILE: &str = "runs.json";
@@ -25,12 +25,25 @@ pub const CRASH_LOOP_RESTARTS: u32 = 3;
 /// One hour.
 pub const CRASH_WINDOW_MS: u64 = 3_600_000;
 
-/// Reads the policy, and the reason when a present file was not used.
+/// Reads the policy, and the reason when a present file was not used. Own
+/// lists are judged as [`accept`] judges them, and one it would refuse is left
+/// out with the reason: the file is the engine's, but a list in it names a path
+/// in the cache and an address the engine downloads.
 pub fn load(dir: &Path) -> (Policy, Option<String>) {
     let path = dir.join(POLICY_FILE);
     match std::fs::read(&path) {
-        Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(p) => (p, None),
+        Ok(bytes) => match serde_json::from_slice::<Policy>(&bytes) {
+            Ok(mut p) => {
+                let mut dropped = Vec::new();
+                for list in std::mem::take(&mut p.custom_lists) {
+                    match own_list_problem(&p.custom_lists, &list) {
+                        None => p.custom_lists.push(list),
+                        Some(why) => dropped.push(format!("own list {}: {why}", list.id)),
+                    }
+                }
+                let why = (!dropped.is_empty()).then(|| format!("{}: {}; left out", path.display(), dropped.join("; ")));
+                (p, why)
+            }
             Err(e) => (Policy::default(), Some(format!("{}: {e}; read as off", path.display()))),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Policy::default(), None),
@@ -87,15 +100,9 @@ pub fn accept(current: &Policy, mut asked: Policy) -> Result<Policy, String> {
     if size > MAX_POLICY_BYTES {
         return Err(format!("a policy of {size} bytes is over the {MAX_POLICY_BYTES} byte limit"));
     }
-    if asked.custom_lists.len() > MAX_CUSTOM_LISTS {
-        return Err(format!("{} own lists is more than the {MAX_CUSTOM_LISTS} the engine holds", asked.custom_lists.len()));
-    }
     for (i, list) in asked.custom_lists.iter().enumerate() {
-        if let Some(why) = custom_list_problem(list) {
+        if let Some(why) = own_list_problem(&asked.custom_lists[..i], list) {
             return Err(format!("own list {}: {why}", i + 1));
-        }
-        if asked.custom_lists[..i].iter().any(|l| l.id == list.id) {
-            return Err(format!("own list {}: the id {} is used twice", i + 1, list.id));
         }
     }
     if let Some(unknown) = asked.tracking.iter().find(|t| !TRACKING_NAMES.contains(&t.as_str())) {
@@ -105,6 +112,19 @@ pub fn accept(current: &Policy, mut asked: Policy) -> Result<Policy, String> {
         asked.tracking.clear();
     }
     Ok(asked)
+}
+
+/// Why `list` cannot be held after `held`: it is invalid, its id is taken, or
+/// `held` is already [`MAX_CUSTOM_LISTS`] long. The one rule for a SetPolicy and
+/// for the file.
+fn own_list_problem(held: &[CustomList], list: &CustomList) -> Option<String> {
+    if held.len() >= MAX_CUSTOM_LISTS {
+        return Some(format!("more than the {MAX_CUSTOM_LISTS} own lists the engine holds"));
+    }
+    if let Some(why) = custom_list_problem(list) {
+        return Some(why);
+    }
+    held.iter().any(|l| l.id == list.id).then(|| format!("the id {} is used twice", list.id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +311,26 @@ mod tests {
         assert!(accept(&policy(4, true), twice).unwrap_err().contains("twice"));
         let many = Policy { custom_lists: (0..=MAX_CUSTOM_LISTS).map(|i| own(&format!("custom-{i}"), None)).collect(), ..policy(5, true) };
         assert!(accept(&policy(4, true), many).unwrap_err().contains("more than"));
+    }
+
+    /// The file is judged as a SetPolicy is: a bad own list is left out with the
+    /// reason, the good ones and every other switch load.
+    #[test]
+    fn own_lists_from_the_file_are_judged_and_a_bad_one_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = own("custom-a1", Some("https://lists.example/a.txt"));
+        let mut lists = vec![good.clone(), own("custom-..", None), own("custom-b2", Some("https://127.0.0.1/a.txt")), own("custom-a1", None)];
+        lists.extend((0..MAX_CUSTOM_LISTS).map(|i| own(&format!("custom-n{i}"), None)));
+        let on_disk = Policy { revision: 3, engine: true, custom_lists: lists, ..Policy::default() };
+        std::fs::write(dir.path().join(POLICY_FILE), serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        let (p, why) = load(dir.path());
+        assert_eq!((p.revision, p.engine), (3, true));
+        assert_eq!(p.custom_lists.len(), MAX_CUSTOM_LISTS);
+        assert_eq!(p.custom_lists[0], good);
+        let why = why.unwrap();
+        for dropped in ["custom-..", "custom-b2", "used twice", "more than the"] {
+            assert!(why.contains(dropped), "{dropped}: {why}");
+        }
     }
 
     /// The engine's own half of "a locked option is never on": with HTTPS off no
