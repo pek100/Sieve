@@ -41,6 +41,7 @@ import type { ExclusionsFacts, HealGroup } from "@/core/exclusions";
 import type { NoticeBus } from "@/core/notices";
 import { selectedListIds } from "@/core/filter-lists";
 import { GLOBAL_SWITCH, offKeys } from "@/core/policy";
+import { trackingInForce } from "@/core/tracking";
 import { MAX_POLICY_BYTES, REGISTRY, type SettingKey } from "@/core/settings/registry";
 import type { SieveStore } from "@/core/store";
 import type { EngineSource } from "./engine-source";
@@ -124,8 +125,14 @@ function wantedPolicy(settings: SettingsStore, catalogue: Pick<FilterCatalogue, 
     domain_lists: [...domainList("block", settings.get("filtering.blockedDomains")), ...domainList("allow", settings.get("filtering.allowedDomains"))],
     user_rules: [...settings.get("filtering.userRules")],
     exclusions: [...settings.get("filtering.exclusions")],
+    // Both left out while empty, as the engine writes them, so a policy without them is the one it always was.
+    ...nonEmpty("custom_lists", settings.get("filters.custom").map((l) => ({ ...l }))),
+    // In force only: an option stored on while HTTPS decryption is off or unavailable is never sent.
+    ...nonEmpty("tracking", trackingInForce((k) => settings.get(k))),
   };
 }
+
+const nonEmpty = <K extends string, T>(key: K, list: T[]): Partial<Record<K, T[]>> => (list.length > 0 ? ({ [key]: list } as Record<K, T[]>) : {});
 
 /** One form of a policy for comparing: its lists' order means nothing. */
 function normalised(p: WantedPolicy): string {
@@ -144,6 +151,9 @@ function normalised(p: WantedPolicy): string {
       .sort((a, b) => a.kind.localeCompare(b.kind)),
     user_rules: sorted(p.user_rules),
     exclusions: sorted(p.exclusions),
+    // The engine leaves both out while empty.
+    custom_lists: [...(p.custom_lists ?? [])].sort((a, b) => a.id.localeCompare(b.id)).map((l) => [l.id, l.title, l.url, l.enabled]),
+    tracking: sorted(p.tracking ?? []),
   });
 }
 
@@ -158,7 +168,7 @@ const rulesAsHeld = (want: WantedPolicy, held: WantedPolicy): WantedPolicy => ({
  */
 function policyParts(want: WantedPolicy, held: WantedPolicy): WantedPolicy[] {
   const switches = rulesAsHeld(want, held);
-  return [want, switches, { ...switches, off_apps: held.off_apps, lists: held.lists }];
+  return [want, switches, { ...switches, off_apps: held.off_apps, lists: held.lists, custom_lists: held.custom_lists ?? [], tracking: held.tracking ?? [] }];
 }
 
 export function createEngineController({ engine, store, clock, settings, checks, notices, filterLists }: EngineControllerDeps): EngineController {

@@ -18,8 +18,10 @@
 //!   list report, forwarded flows and guests, the `log` message, the status's filter
 //!   facts, the certificate's status with its `removal_pending` state,
 //!   `InstallRoot`, `Policy.https`, `Policy.content`, `request_update`, the
-//!   `update` status, and `Policy.plain_dns` with the status's `dns_unreachable`,
-//!   both left out while false so a peer from before them reads the same bytes).
+//!   `update` status, `Policy.plain_dns` with the status's `dns_unreachable`,
+//!   both left out while false so a peer from before them reads the same bytes,
+//!   and `Policy.custom_lists` and `Policy.tracking`, both defaulted and left out
+//!   while empty, so a policy without them reads and writes as before).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -73,9 +75,31 @@ pub const LOG_URL_MAX: usize = 2048;
 pub const LOG_RULE_MAX: usize = 1024;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices", "list_refresh", "list_import", "list_rules"];
 /// The `type` names of [`EngineMessage`], in declaration order.
-pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status", "exclusions", "heal_notices"];
+pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status", "exclusions", "heal_notices", "list_imported", "list_rules"];
+/// At most this many of the user's own lists ([`Policy::custom_lists`]).
+pub const MAX_CUSTOM_LISTS: usize = 20;
+/// Every custom list's id starts so; no catalogue id does, and the rest is
+/// lower-case letters and digits, so the id is a safe file name in the cache.
+pub const CUSTOM_LIST_PREFIX: &str = "custom-";
+/// The part of a custom id after the prefix is 1 to this many characters.
+pub const CUSTOM_ID_MAX: usize = 32;
+/// A custom list's address is at most this many bytes, its title this many characters.
+pub const CUSTOM_URL_MAX: usize = 512;
+pub const CUSTOM_TITLE_MAX: usize = 64;
+/// A file the user imports is at most this many bytes. Its text crosses the pipe
+/// in one frame, and half a frame leaves room for JSON escaping; a larger list is
+/// added by its address instead, which the engine downloads itself.
+pub const MAX_IMPORT_BYTES: usize = MAX_FRAME / 2;
+/// [`EngineMessage::ListRules`] holds at most this many lines, each a
+/// [`listed_line`], so the answer fits a frame whatever the list holds.
+pub const LIST_RULES_SHOWN: usize = 200;
+/// A search of a list's rules is at most this many bytes.
+pub const LIST_QUERY_MAX: usize = 256;
+/// The names of the tracking protections [`Policy::tracking`] may hold, the
+/// app's `tracking.*` settings without their prefix.
+pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location"];
 /// A flow event's rule text is cut to this many bytes: a list rule can run to
 /// kilobytes, and at this cap a full `flows` frame stays under [`MAX_FRAME`].
 pub const MAX_RULE_BYTES: usize = 256;
@@ -134,6 +158,19 @@ pub enum ClientMessage {
     TryDecryptAgain { line: Option<String>, app: Option<String>, reason: Option<String> },
     /// Asks for [`EngineMessage::HealNotices`] newer than revision `after`.
     HealNotices { after: u64 },
+    /// Downloads one list now, a catalogue row or one of the user's own by
+    /// address, whatever its age; answered with [`EngineMessage::Lists`] as it
+    /// stands. An id the engine does not know is an Error.
+    ListRefresh { id: String },
+    /// A list the user picked from a file: the engine judges the text as it does
+    /// a download (UTF-8, not a web page, at least one rule it can use, at most
+    /// [`MAX_IMPORT_BYTES`]), keeps it under `id` and answers
+    /// [`EngineMessage::ListImported`]; a refusal is an Error with the reason. The
+    /// list takes effect once the policy names it in `custom_lists`.
+    ListImport { id: String, text: String },
+    /// The rules in the engine's copy of list `id` that contain `query` (case
+    /// folded; empty for all), answered with [`EngineMessage::ListRules`].
+    ListRules { id: String, query: String },
 }
 
 /// Engine to app. Read and written one frame at a time and never stored, so the
@@ -175,6 +212,12 @@ pub enum EngineMessage {
     /// this engine run: a new one starts `revision` and the notices' ids over, so an
     /// `after` from another run means nothing.
     HealNotices { run: u64, revision: u64, exclusions_revision: u64, notices: Vec<HealNotice> },
+    /// A file's list was judged good and kept: how many rules it compiled to and
+    /// how many it skipped.
+    ListImported { id: String, rules: u64, skipped: u64 },
+    /// Rules of one list: the first [`LIST_RULES_SHOWN`] that match, how many
+    /// match, and how many rules the copy holds.
+    ListRules { id: String, lines: Vec<String>, matched: u64, total: u64 },
 }
 
 /// How far decryption reaches. The same two values as the engine's decision.
@@ -313,6 +356,56 @@ pub struct Policy {
     /// layer of the exclusion store (`sieve_engine::exclusions`).
     #[serde(default)]
     pub exclusions: Vec<String>,
+    /// `filters.custom`: the user's own lists, by address or from a file. Left
+    /// out while empty, as `content` is while false.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_lists: Vec<CustomList>,
+    /// The `tracking.*` protections on, by [`TRACKING_NAMES`]. Each works inside
+    /// decrypted traffic only, so the app sends none while `https` is off and the
+    /// engine drops them then too. Left out while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tracking: Vec<String>,
+}
+
+/// One of the user's own lists. `url` is None for a list imported from a file:
+/// the engine never downloads it, and its copy is what `ListImport` gave.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomList {
+    pub id: String,
+    pub title: String,
+    pub url: Option<String>,
+    pub enabled: bool,
+}
+
+/// Why `id` cannot name a custom list, or None. The one rule, for the policy and
+/// for an import.
+pub fn custom_id_problem(id: &str) -> Option<String> {
+    let rest = id.strip_prefix(CUSTOM_LIST_PREFIX).unwrap_or_default();
+    let ok = !rest.is_empty() && rest.len() <= CUSTOM_ID_MAX && rest.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    (!ok).then(|| format!("a custom list id is {CUSTOM_LIST_PREFIX} and 1 to {CUSTOM_ID_MAX} lower-case letters or digits"))
+}
+
+/// Why a custom list cannot be held, or None. Shared with the app's own check
+/// through the fixture's `customLists` table (`src/core/custom-lists.ts`).
+pub fn custom_list_problem(list: &CustomList) -> Option<String> {
+    if let Some(why) = custom_id_problem(&list.id) {
+        return Some(why);
+    }
+    let title = list.title.trim();
+    if title.is_empty() || list.title.chars().count() > CUSTOM_TITLE_MAX || list.title.chars().any(char::is_control) {
+        return Some(format!("a custom list's name is 1 to {CUSTOM_TITLE_MAX} characters"));
+    }
+    let url = list.url.as_deref()?;
+    if url.len() > CUSTOM_URL_MAX {
+        return Some(format!("an address of {} bytes is over the {CUSTOM_URL_MAX} byte limit", url.len()));
+    }
+    let Some(rest) = url.strip_prefix("https://") else { return Some("only https:// addresses are downloaded".into()) };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() || host.contains('@') || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("not a web address".into());
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -908,6 +1001,41 @@ mod tests {
         assert_eq!(types(&f["engine"]), ENGINE_TYPES);
     }
 
+    /// The table the app's own check reads too (src/core/custom-lists.ts).
+    #[test]
+    fn custom_lists_are_judged_as_the_fixture_table_says() {
+        let f = fixture();
+        let cases = f["customLists"].as_array().unwrap();
+        assert!(cases.len() >= 10);
+        for case in cases {
+            let list: CustomList = serde_json::from_value(case["list"].clone()).unwrap();
+            assert_eq!(custom_list_problem(&list).is_none(), case["ok"].as_bool().unwrap(), "{list:?}");
+        }
+        assert_eq!(f["maxCustomLists"], MAX_CUSTOM_LISTS);
+        assert_eq!(f["maxImportBytes"], MAX_IMPORT_BYTES);
+        assert_eq!(f["customUrlMax"], CUSTOM_URL_MAX);
+        assert_eq!(f["customTitleMax"], CUSTOM_TITLE_MAX);
+        assert_eq!(f["listRulesShown"], LIST_RULES_SHOWN);
+        assert_eq!(f["trackingNames"], serde_json::json!(TRACKING_NAMES));
+    }
+
+    /// An old policy reads, and a policy with neither new field writes exactly as before.
+    #[test]
+    fn a_policy_without_custom_lists_or_tracking_is_unchanged_on_the_wire() {
+        let old = r#"{"revision":1,"engine":true,"sieving":true,"off_apps":[],"lists":null,"domain_lists":[],"https":false,"user_rules":[],"exclusions":[]}"#;
+        let p: Policy = serde_json::from_str(old).unwrap();
+        assert!(p.custom_lists.is_empty() && p.tracking.is_empty());
+        assert_eq!(serde_json::to_string(&p).unwrap(), old);
+    }
+
+    /// A rules answer at its caps, every line at the worst escaping, fits a frame.
+    #[test]
+    fn a_full_list_rules_answer_fits_one_frame() {
+        let line = listed_line(&"\"".repeat(MAX_LISTED_LINE_BYTES * 2));
+        let msg = EngineMessage::ListRules { id: format!("{CUSTOM_LIST_PREFIX}{}", "a".repeat(CUSTOM_ID_MAX)), lines: vec![line; LIST_RULES_SHOWN], matched: u64::MAX, total: u64::MAX };
+        assert!(encode(&msg).is_ok());
+    }
+
     #[test]
     fn every_fixture_blocker_round_trips_unchanged() {
         for b in fixture()["blockers"].as_array().unwrap() {
@@ -948,6 +1076,9 @@ mod tests {
             ClientMessage::Exclusions { .. } => "exclusions",
             ClientMessage::TryDecryptAgain { .. } => "try_decrypt_again",
             ClientMessage::HealNotices { .. } => "heal_notices",
+            ClientMessage::ListRefresh { .. } => "list_refresh",
+            ClientMessage::ListImport { .. } => "list_import",
+            ClientMessage::ListRules { .. } => "list_rules",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -961,6 +1092,8 @@ mod tests {
             EngineMessage::CertStatus(_) => "cert_status",
             EngineMessage::Exclusions { .. } => "exclusions",
             EngineMessage::HealNotices { .. } => "heal_notices",
+            EngineMessage::ListImported { .. } => "list_imported",
+            EngineMessage::ListRules { .. } => "list_rules",
         };
         let f = fixture();
         for m in f["client"].as_array().unwrap() {

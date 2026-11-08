@@ -12,7 +12,29 @@
  * AdGuard's service through one command Windows asks the user to approve.
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { parseCertStatus, parseDnsUpstreams, parseEngineLists, parseEngineProbe, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseLogTail, type CertStatus, type EngineDnsUpstreams, type EngineLists, type EnginePolicy, type EngineProbe, type EngineStatus, type ExclusionsPage, type HealNotices, type LogTail } from "./protocol";
+import {
+  parseCertStatus,
+  parseDnsUpstreams,
+  parseEngineLists,
+  parseEngineProbe,
+  parseEngineStatus,
+  parseExclusionsPage,
+  parseHealNotices,
+  parseListImported,
+  parseListRules,
+  parseLogTail,
+  type CertStatus,
+  type EngineDnsUpstreams,
+  type EngineLists,
+  type EnginePolicy,
+  type EngineProbe,
+  type EngineStatus,
+  type ExclusionsPage,
+  type HealNotices,
+  type ListImported,
+  type ListRules,
+  type LogTail,
+} from "./protocol";
 
 export interface EngineSource {
   readonly kind: "mock" | "tauri";
@@ -24,6 +46,16 @@ export interface EngineSource {
   lists(): Promise<EngineLists>;
   /** Asks the engine to download every selected list now; the report as it stands. */
   listsRefresh(): Promise<EngineLists>;
+  /** Asks the engine to download one list now; the report as it stands. Rejects for a list from a file or an unknown id. */
+  listRefresh(id: string): Promise<EngineLists>;
+  /** The first rules of one list's copy that hold `query`. Rejects while the engine has no copy. */
+  listRules(id: string, query: string): Promise<ListRules>;
+  /**
+   * The person picks a list file in a dialog the desktop app opens (the window
+   * never names a path); the engine judges it and keeps it as `id`. Null when
+   * the picker was closed. Rejects with the engine's reason for a refused file.
+   */
+  listImport(id: string): Promise<ListImported | null>;
   /** The encrypted DNS resolvers the engine holds. Rejects when it did not answer. */
   dnsUpstreams(): Promise<EngineDnsUpstreams>;
   /** Sends `filtering.upstreams`; the list the engine then holds. Rejects when it refused this one. */
@@ -65,6 +97,9 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     setPolicy: async (policy) => parseEngineStatus(await invoke<unknown>("engine_set_policy", { policy })),
     lists: async () => parseEngineLists(await invoke<unknown>("engine_lists")),
     listsRefresh: async () => parseEngineLists(await invoke<unknown>("engine_lists_refresh")),
+    listRefresh: async (id) => parseEngineLists(await invoke<unknown>("engine_list_refresh", { id })),
+    listRules: async (id, query) => parseListRules(await invoke<unknown>("engine_list_rules", { id, query })),
+    listImport: async (id) => parseListImported(await invoke<unknown>("engine_list_import", { id })),
     dnsUpstreams: async () => parseDnsUpstreams(await invoke<unknown>("engine_dns_upstreams")),
     setDnsUpstreams: async (list) => parseDnsUpstreams(await invoke<unknown>("engine_set_dns_upstreams", { list })),
     requestUpdate: async () => parseEngineStatus(await invoke<unknown>("engine_request_update")),

@@ -7,8 +7,11 @@ import {
   blockRule,
   checkRuleLine,
   checkRuleText,
+  formRules,
   friendlyRuleReason,
   normalizeDomain,
+  withFormRules,
+  type RuleForm,
 } from "./rules";
 
 describe("user rule lines", () => {
@@ -114,5 +117,26 @@ describe("derived rules", () => {
     expect(allowRule(cases.allowlist.host)).toBe(cases.allowlist.rule);
     expect(blockRule("a.example")).toBe("||a.example^");
     for (const rule of [allowRule("a.example"), blockRule("a.example")]) expect(checkRuleLine(rule).kind).toBe("ok");
+  });
+});
+
+describe("the rule form", () => {
+  it.each(cases.form)("$form.host, $form.action, subdomains $form.subdomains writes the fixture's lines (Rust checks what they decide)", ({ form, rules }) => {
+    expect(formRules(form as RuleForm)).toEqual(rules);
+  });
+
+  it("writes only lines the rule layer takes, and that do what the form said", () => {
+    for (const { form } of cases.form) {
+      for (const line of formRules(form as RuleForm)) expect(["ok", "comment"], line).toContain(checkRuleLine(line).kind);
+    }
+  });
+
+  it("adds its lines at the end of the editor's text, a rule already there not twice", () => {
+    const form: RuleForm = { host: "ads.example", action: "block", subdomains: true, comment: "" };
+    expect(withFormRules("", form)).toBe("||ads.example^");
+    expect(withFormRules("! mine\n||a.example^\n\n", form)).toBe("! mine\n||a.example^\n||ads.example^");
+    expect(withFormRules("||ads.example^", form)).toBe("||ads.example^");
+    expect(withFormRules("||ads.example^", { ...form, comment: "again" }), "a note alone adds nothing").toBe("||ads.example^");
+    expect(withFormRules("x", { ...form, action: "allow", subdomains: false })).toBe("x\n@@|https://ads.example^\n@@|http://ads.example^");
   });
 });

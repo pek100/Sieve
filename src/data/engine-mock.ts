@@ -49,6 +49,8 @@ import {
   parseHealNotices,
   parseLogTail,
   type CertStatus,
+  type EngineCustomList,
+  type EngineListStatus,
   type EngineLists,
   type EnginePolicy,
   type EngineStatus,
@@ -121,7 +123,18 @@ function statusOf(scenario: EngineScenario): EngineStatus {
   return parseEngineStatus((example.pipe as { status: unknown }).status);
 }
 
-export function createMockEngine(start: EngineScenario = "missing", options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean; run?: number } = {}): EngineSource {
+/** What the mock's own lists hold, when they were downloaded, and its rules view (as the engine caps it). */
+export const MOCK_OWN_RULES = 1_204;
+export const MOCK_FETCHED_AT_MS = Date.UTC(2026, 10, 8, 9, 30);
+const MOCK_RULES_TOTAL = 420;
+const MOCK_RULES_SHOWN = 200;
+
+export const IMPORT_ANSWERS = ["ok", "cancel", "refused"] as const;
+
+export function createMockEngine(
+  start: EngineScenario = "missing",
+  options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean; run?: number; importAnswer?: (typeof IMPORT_ANSWERS)[number] } = {},
+): EngineSource {
   let scenario = start;
   let held: Omit<EnginePolicy, "revision" | "engine"> | null = null;
   const holdsHttps = options.heal === true;
@@ -156,10 +169,30 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
   const requireWelcome = () => {
     if (!WELCOME.includes(scenario)) throw new Error("The system cannot find the file specified. (os error 2)");
   };
+  // Own lists the engine was told of, and the one it was asked to download now.
+  const ownRow = (c: EngineCustomList): EngineListStatus => {
+    const refused = c.url !== null && /html|broken/i.test(c.url);
+    return {
+      id: c.id,
+      enabled: c.enabled,
+      fetched_at_ms: refused ? null : MOCK_FETCHED_AT_MS,
+      refresh_s: refused ? null : 86_400,
+      last_error: refused ? "an HTML page, not a filter list" : null,
+      network: refused || !c.enabled ? 0 : MOCK_OWN_RULES,
+      cosmetic: 0,
+      skipped: 0,
+      skip_reasons: {},
+      skipped_exceptions: [],
+      skipped_exceptions_total: 0,
+    };
+  };
   const lists = async (): Promise<EngineLists> => {
     requireWelcome();
-    return parseEngineLists(ipc.engine.find((m) => m.type === "lists"));
+    const report = parseEngineLists(ipc.engine.find((m) => m.type === "lists"));
+    return { ...report, lists: [...report.lists, ...(held?.custom_lists ?? []).map(ownRow)] };
   };
+  // A catalogue id, or one of the own lists it holds.
+  const knownList = (id: string) => !id.startsWith("custom-") || (held?.custom_lists ?? []).some((c) => c.id === id);
   const certAnswer = (): CertStatus => {
     if (cert === "error") throw new Error(MOCK_CERT_ERROR);
     return parseCertStatus(ipc.certStatuses[cert]);
@@ -194,7 +227,7 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
       if (https && !policy.https) cert = "policy_off";
       if (!https && policy.https && (cert === "policy_off" || cert === "not_installed")) cert = "installed";
       https = policy.https;
-      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists, https: policy.https, content: policy.content, plain_dns: policy.plain_dns, user_rules: policy.user_rules, exclusions: policy.exclusions };
+      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists, https: policy.https, content: policy.content, plain_dns: policy.plain_dns, user_rules: policy.user_rules, exclusions: policy.exclusions, custom_lists: policy.custom_lists ?? [], tracking: policy.https ? (policy.tracking ?? []) : [] };
       return echo(statusOf(scenario));
     },
     dnsUpstreams: async () => {
@@ -214,6 +247,24 @@ export function createMockEngine(start: EngineScenario = "missing", options: { s
     },
     lists,
     listsRefresh: lists,
+    listRefresh: async (id) => {
+      requireWelcome();
+      if (!knownList(id)) throw new Error("the engine knows no list by that id");
+      return lists();
+    },
+    listRules: async (id, query) => {
+      requireWelcome();
+      // A copy of the rules a list of this id would hold, the same on every read.
+      const all = Array.from({ length: MOCK_RULES_TOTAL }, (_, i) => `||${["ads", "track", "pixel", "banner"][i % 4]}${i}.${id}.example^`);
+      const found = all.filter((r) => r.toLowerCase().includes(query.trim().toLowerCase()));
+      return { id, lines: found.slice(0, MOCK_RULES_SHOWN), matched: found.length, total: all.length };
+    },
+    listImport: async () => {
+      requireWelcome();
+      if (options.importAnswer === "cancel") return null;
+      if (options.importAnswer === "refused") throw new Error("an HTML page, not a filter list");
+      return { name: "My blocklist", rules: MOCK_OWN_RULES, skipped: 0 };
+    },
     stopAdguard: async () => {
       if (adguardWhileIdle === "running") {
         adguardWhileIdle = "stopped";

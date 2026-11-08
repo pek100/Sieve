@@ -44,10 +44,16 @@ describe("unavailable settings law", () => {
     }
   });
 
-  it("no available setting requires an unavailable one", () => {
+  // Declared exception: the tracking protections act inside decrypted traffic.
+  // They are shown, locked with the reason, until the HTTPS switch is available
+  // (task: filter profiles), and the policy never carries one before then
+  // (src/core/tracking.test.ts). Every other available key needs an available switch.
+  it("no available setting requires an unavailable one, but the tracking protections, which require the HTTPS switch", () => {
     for (const k of SETTING_KEYS.filter(isAvailable)) {
       const req = settingDef(k).requires;
-      if (req) expect(unavailable as string[], k).not.toContain(req);
+      if (!req) continue;
+      if (settingDef(k).section === "tracking") expect(req, k).toBe(HTTPS_SWITCH);
+      else expect(unavailable as string[], k).not.toContain(req);
     }
   });
 

@@ -30,6 +30,12 @@ pub struct FilterList {
     /// `on`, `off` or `gated` (off until the named slice's live acceptance).
     pub default: &'static str,
     pub trusted: bool,
+    /// `ads`, `tracking`, `annoyances`, `security` or `language`.
+    pub kind: &'static str,
+    /// The lowest profile that turns it on: `minimal`, `balanced`, `strict`, or `optional` for none.
+    pub level: &'static str,
+    pub description: &'static str,
+    pub languages: &'static [&'static str],
     pub report: Option<ListReport>,
 }
 
@@ -47,6 +53,25 @@ const fn default_name(d: catalogue::Default) -> &'static str {
     }
 }
 
+const fn kind_name(k: catalogue::Kind) -> &'static str {
+    match k {
+        catalogue::Kind::Ads => "ads",
+        catalogue::Kind::Tracking => "tracking",
+        catalogue::Kind::Annoyances => "annoyances",
+        catalogue::Kind::Security => "security",
+        catalogue::Kind::Language => "language",
+    }
+}
+
+const fn level_name(l: catalogue::Level) -> &'static str {
+    match l {
+        catalogue::Level::Minimal => "minimal",
+        catalogue::Level::Balanced => "balanced",
+        catalogue::Level::Strict => "strict",
+        catalogue::Level::Optional => "optional",
+    }
+}
+
 /// The catalogue as the UI reads it.
 pub fn catalogue() -> FilterCatalogue {
     let lists = LISTS
@@ -58,6 +83,10 @@ pub fn catalogue() -> FilterCatalogue {
             licence: l.licence,
             default: default_name(l.default),
             trusted: l.trusted,
+            kind: kind_name(l.kind),
+            level: level_name(l.level),
+            description: l.description,
+            languages: l.languages,
             report: None,
         })
         .collect();
@@ -91,6 +120,31 @@ pub fn rule_problems(lines: &[String]) -> Vec<RuleProblem> {
         .collect()
 }
 
+/// The name an imported list starts with: the file's own name, cut to what the
+/// engine holds.
+fn import_name(path: &std::path::Path) -> String {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Imported list".into());
+    stem.chars().filter(|c| !c.is_control()).take(sieve_ipc::CUSTOM_TITLE_MAX).collect()
+}
+
+/// A file the user picked to import: its name and text, or why it cannot go to
+/// the engine. The size is read before the file is, and the words for too large
+/// and not UTF-8 are the engine's own (`sieve_filter::lists::judge_text`), so the
+/// app explains each refusal one way. The engine judges the rest.
+pub fn read_import(path: &std::path::Path) -> Result<(String, String), String> {
+    let max = sieve_ipc::MAX_IMPORT_BYTES;
+    let len = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?.len();
+    if len > max as u64 {
+        return Err(format!("{len} bytes is over the {max} byte limit"));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = String::from_utf8(bytes).map_err(|e| format!("not UTF-8: {e}"))?;
+    // The longest id there is, so a text that fits here fits under any id.
+    let longest = format!("{}{}", sieve_ipc::CUSTOM_LIST_PREFIX, "a".repeat(sieve_ipc::CUSTOM_ID_MAX));
+    sieve_ipc::encode(&sieve_ipc::ClientMessage::ListImport { id: longest, text: text.clone() }).map_err(|e| format!("{len} bytes is over the {max} byte limit once written for the engine ({e})"))?;
+    Ok((import_name(path), text))
+}
+
 #[tauri::command]
 pub async fn filter_catalogue() -> Result<FilterCatalogue, String> {
     Ok(catalogue())
@@ -118,6 +172,26 @@ mod tests {
         assert_eq!(got, lists["examples"]["pending"]);
         assert!(catalogue().lists.iter().all(|l| l.report.is_none()));
         assert_eq!(catalogue().lists.len(), LISTS.len());
+    }
+
+    #[test]
+    fn a_picked_file_is_read_by_size_first_and_named_after_itself() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let good = dir.path().join("My own list.txt");
+        std::fs::write(&good, "! Title: x\n||ads.example^\n").expect("write");
+        assert_eq!(read_import(&good).expect("read"), ("My own list".to_string(), "! Title: x\n||ads.example^\n".to_string()));
+        let big = dir.path().join("big.txt");
+        std::fs::write(&big, vec![b'a'; sieve_ipc::MAX_IMPORT_BYTES + 1]).expect("write");
+        assert!(read_import(&big).unwrap_err().contains("byte limit"));
+        let binary = dir.path().join("b.txt");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).expect("write");
+        assert!(read_import(&binary).unwrap_err().starts_with("not UTF-8"));
+        // Every byte escaped to six on the wire: within the size, over the frame.
+        let escaped = dir.path().join("e.txt");
+        std::fs::write(&escaped, "\u{1}".repeat(sieve_ipc::MAX_IMPORT_BYTES)).expect("write");
+        assert!(read_import(&escaped).unwrap_err().contains("written for the engine"));
+        assert!(read_import(&dir.path().join("missing.txt")).is_err());
+        assert_eq!(import_name(std::path::Path::new(&format!("{}.txt", "n".repeat(100)))).chars().count(), sieve_ipc::CUSTOM_TITLE_MAX);
     }
 
     #[test]
@@ -165,6 +239,33 @@ mod tests {
                 other => panic!("verdict {other}"),
             };
             assert_eq!(got, want, "{list} with {rule}, asking {ask}");
+        }
+    }
+
+    /// What the Filters page's rule form writes (formRules in src/core/rules.ts)
+    /// decides in a real engine: with subdomains the host and every name under
+    /// it, without them the host alone, for a block and for an allow.
+    #[test]
+    fn the_rule_forms_lines_decide_what_the_fixture_says_in_a_real_engine() {
+        let cases = fixture(include_str!("../../src/data/fixtures/user-rules-v1.json"));
+        let table = cases["form"].as_array().expect("form");
+        assert!(table.len() >= 4);
+        for case in table {
+            let rules: Vec<String> = case["rules"].as_array().expect("rules").iter().map(|r| r.as_str().expect("rule").to_string()).collect();
+            assert!(rule_problems(&rules).is_empty(), "the parser takes every line: {rules:?}");
+            let text = rules.join("\n");
+            let list = case["list"].as_str().expect("list");
+            let engine = RuleEngine::compile(&[ListText { id: "list", text: list, trusted: true }, ListText { id: USER_RULES, text: &text, trusted: false }]);
+            for ask in case["ask"].as_array().expect("ask") {
+                let host = ask["host"].as_str().expect("host");
+                let want = match ask["verdict"].as_str().expect("verdict") {
+                    "block" => HostVerdict::Block,
+                    "allow" => HostVerdict::Allow,
+                    "none" => HostVerdict::None,
+                    other => panic!("verdict {other}"),
+                };
+                assert_eq!(engine.check_host(host).verdict, want, "{rules:?} over {list:?}, asking {host}");
+            }
         }
     }
 

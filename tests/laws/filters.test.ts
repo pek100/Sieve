@@ -6,7 +6,8 @@
  * trusted scriptlet.
  */
 import { describe, expect, it } from "vitest";
-import { LIST_GROUPS, listGroup } from "@/core/filter-lists";
+import { LIST_GROUPS, PROFILES, RECOMMENDED_PROFILE, listGroup } from "@/core/filter-lists";
+import type { ListKind } from "@/data/protocol";
 import { EMPTY_DOC, readValue, writeValue } from "@/core/settings/document";
 import { MAX_POLICY_BYTES, POLICY_BUDGETS, budgetBytes, isSettingKey, isValidValue } from "@/core/settings/registry";
 import { EXPORT_KIND, planImport } from "@/core/settings/transfer";
@@ -21,9 +22,19 @@ interface Row {
   default: string;
   trusted: boolean;
   licence: string;
+  kind: string;
+  level: string;
+  description: string;
+  languages: string[];
 }
 
-const defaultName = (d: string) => d.replace(/^Default::/, "").replace(/\(.*\)$/, "").toLowerCase();
+/** A row's default as catalogue.rs spells it: derived from its level (`Level::X.default_of()`) or a gated `Default::Gated(...)`. */
+function defaultName(spelled: string, level: string): string {
+  if (spelled.startsWith("Default::Gated")) return "gated";
+  if (spelled.startsWith("Default::")) return spelled.replace(/^Default::/, "").toLowerCase();
+  const of = spelled.match(/^Level::(\w+)\.default_of\(\)$/)?.[1] ?? level;
+  return ["Minimal", "Balanced"].includes(of) ? "on" : "off";
+}
 
 /** The table as catalogue.rs spells it: its two macros and its plain struct rows. */
 function catalogueRows(): Row[] {
@@ -37,14 +48,20 @@ function catalogueRows(): Row[] {
   const uassetsBase = base("uassets");
   const table = src.slice(src.indexOf("pub const LISTS"), src.indexOf("/// The list with this id."));
   const rows: { at: number; row: Row }[] = [];
-  const macroRow = /(adguard|uassets)!\("([^"]+)", "([^"]+)", "([^"]+)", (Default::\w+(?:\([^)]*\))?)\)/g;
+  // adguard!(id, title, n, Kind, Level, &[langs], description) and uassets!(id, title, file, Kind, Level, default, description).
+  const macroRow = /(adguard|uassets)!\("([^"]+)", "([^"]+)", "([^"]+)", (\w+), (\w+), (&\[[^\]]*\]|Default::\w+(?:\([^)]*\))?|Level::\w+\.default_of\(\)), "([^"]+)"\)/g;
   for (const m of table.matchAll(macroRow)) {
-    const url = m[1] === "adguard" ? `${adguardBase}${m[4]}.txt` : `${uassetsBase}${m[4]}`;
-    rows.push({ at: m.index, row: { id: m[2], title: m[3], url, licence: "GPL-3.0-only", default: defaultName(m[5]), trusted: true } });
+    const [, which, id, title, n, kind, level, extra, description] = m;
+    const url = which === "adguard" ? `${adguardBase}${n}.txt` : `${uassetsBase}${n}`;
+    const languages = which === "adguard" ? [...extra.matchAll(/"([a-z]+)"/g)].map((x) => x[1]) : [];
+    const def = defaultName(which === "adguard" ? `Level::${level}.default_of()` : extra, level);
+    rows.push({ at: m.index, row: { id, title, url, licence: "GPL-3.0-only", default: def, trusted: true, kind: kind.toLowerCase(), level: level.toLowerCase(), description, languages } });
   }
-  const plainRow = /List \{\s*id: "([^"]+)",\s*title: "([^"]+)",\s*url: "([^"]+)",\s*licence: "([^"]+)",\s*default: (Default::\w+),\s*trusted: (true|false),/g;
+  const plainRow =
+    /List \{\s*id: "([^"]+)",\s*title: "([^"]+)",\s*url: "([^"]+)",\s*licence: "([^"]+)",\s*default: ([^,]+),\s*trusted: (true|false),\s*homepage: "[^"]+",\s*kind: Kind::(\w+),\s*level: Level::(\w+),\s*description: "([^"]+)",\s*languages: &\[([^\]]*)\],/g;
   for (const m of table.matchAll(plainRow)) {
-    rows.push({ at: m.index, row: { id: m[1], title: m[2], url: m[3], licence: m[4], default: defaultName(m[5]), trusted: m[6] === "true" } });
+    const languages = [...m[10].matchAll(/"([a-z]+)"/g)].map((x) => x[1]);
+    rows.push({ at: m.index, row: { id: m[1], title: m[2], url: m[3], licence: m[4], default: defaultName(m[5], m[8]), trusted: m[6] === "true", kind: m[7].toLowerCase(), level: m[8].toLowerCase(), description: m[9], languages } });
   }
   return rows.sort((a, b) => a.at - b.at).map((r) => r.row);
 }
@@ -141,7 +158,7 @@ describe("filter list law", () => {
   });
 
   /** A fixture row without its report: what catalogue.rs spells. */
-  const asRow = (l: Row & { report: unknown }): Row => ({ id: l.id, title: l.title, url: l.url, licence: l.licence, default: l.default, trusted: l.trusted });
+  const asRow = (l: Row & { report: unknown }): Row => ({ id: l.id, title: l.title, url: l.url, licence: l.licence, default: l.default, trusted: l.trusted, kind: l.kind, level: l.level, description: l.description, languages: l.languages });
 
   it("the fixture's pending example equals catalogue.rs, row by row and in order, every report null", () => {
     expect(fixture.examples.pending.lists.map(asRow)).toEqual(rows);
@@ -154,10 +171,18 @@ describe("filter list law", () => {
     for (const l of fixture.examples.loaded.lists) if (gated.includes(l.id)) expect(l.report, l.id).toBeNull();
   });
 
-  it("every list has a group; tracking and annoyances are not empty", () => {
+  it("every list has a group; every group has a list", () => {
     const groups = new Set(LIST_GROUPS.map((g) => g.id));
-    for (const r of rows) expect(groups.has(listGroup(r)), r.id).toBe(true);
-    for (const id of ["tracking", "annoyances"]) expect(rows.filter((r) => listGroup(r) === id).length, id).toBeGreaterThan(0);
+    for (const r of rows) expect(groups.has(listGroup(r as Row & { kind: ListKind })), r.id).toBe(true);
+    for (const g of LIST_GROUPS) expect(rows.filter((r) => r.kind === g.id).length, g.id).toBeGreaterThan(0);
+  });
+
+  it("the profiles the app shows are the catalogue's levels, and Balanced is the defaults", () => {
+    const levels = [...new Set(rows.map((r) => r.level))].filter((l) => l !== "optional");
+    expect([...PROFILES].sort()).toEqual(levels.sort());
+    for (const r of rows.filter((x) => x.default !== "gated" && x.kind !== "language")) {
+      expect(r.default === "on", r.id).toBe(r.level === "minimal" || r.level === RECOMMENDED_PROFILE);
+    }
   });
 
   it("no file under src/components names a list id or list title", () => {

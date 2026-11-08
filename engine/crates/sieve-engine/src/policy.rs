@@ -15,7 +15,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 pub use sieve_ipc::MAX_POLICY_BYTES;
-use sieve_ipc::Policy;
+use sieve_ipc::{MAX_CUSTOM_LISTS, Policy, TRACKING_NAMES, custom_list_problem};
 
 pub const POLICY_FILE: &str = "policy.json";
 pub const RUNS_FILE: &str = "runs.json";
@@ -74,13 +74,35 @@ pub(crate) fn write_report(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// revision is a stale write (another window, a retry) and changes nothing. A
 /// policy is sent back in every Status, so one that could not fit a frame
 /// beside the rest of a Status is refused here and not at the next answer.
-pub fn accept(current: &Policy, asked: Policy) -> Result<Policy, String> {
+///
+/// The user's own lists are held only when each is valid, with ids unique and at
+/// most [`MAX_CUSTOM_LISTS`] of them. A tracking protection works only inside
+/// decrypted traffic, so with `https` off none is held, whatever was asked, and
+/// a name the engine does not know is refused.
+pub fn accept(current: &Policy, mut asked: Policy) -> Result<Policy, String> {
     if asked.revision <= current.revision {
         return Err(format!("stale policy revision {} (the engine holds {})", asked.revision, current.revision));
     }
     let size = serde_json::to_vec(&asked).map_err(|e| e.to_string())?.len();
     if size > MAX_POLICY_BYTES {
         return Err(format!("a policy of {size} bytes is over the {MAX_POLICY_BYTES} byte limit"));
+    }
+    if asked.custom_lists.len() > MAX_CUSTOM_LISTS {
+        return Err(format!("{} own lists is more than the {MAX_CUSTOM_LISTS} the engine holds", asked.custom_lists.len()));
+    }
+    for (i, list) in asked.custom_lists.iter().enumerate() {
+        if let Some(why) = custom_list_problem(list) {
+            return Err(format!("own list {}: {why}", i + 1));
+        }
+        if asked.custom_lists[..i].iter().any(|l| l.id == list.id) {
+            return Err(format!("own list {}: the id {} is used twice", i + 1, list.id));
+        }
+    }
+    if let Some(unknown) = asked.tracking.iter().find(|t| !TRACKING_NAMES.contains(&t.as_str())) {
+        return Err(format!("no tracking protection is called {unknown}"));
+    }
+    if !asked.https {
+        asked.tracking.clear();
     }
     Ok(asked)
 }
@@ -251,6 +273,36 @@ mod tests {
     fn a_policy_too_large_for_a_status_frame_is_refused() {
         let big = Policy { off_apps: vec!["a".repeat(MAX_POLICY_BYTES)], ..policy(5, true) };
         assert!(accept(&policy(4, true), big).unwrap_err().contains("over the"));
+    }
+
+    fn own(id: &str, url: Option<&str>) -> sieve_ipc::CustomList {
+        sieve_ipc::CustomList { id: id.into(), title: "Mine".into(), url: url.map(str::to_string), enabled: true }
+    }
+
+    #[test]
+    fn own_lists_are_held_only_valid_unique_and_few() {
+        let ok = Policy { custom_lists: vec![own("custom-a1", Some("https://lists.example/a.txt")), own("custom-b2", None)], ..policy(5, true) };
+        assert_eq!(accept(&policy(4, true), ok.clone()), Ok(ok));
+        let http = Policy { custom_lists: vec![own("custom-a1", Some("http://lists.example/a.txt"))], ..policy(5, true) };
+        assert!(accept(&policy(4, true), http).unwrap_err().contains("https"));
+        let path = Policy { custom_lists: vec![own("custom-..", None)], ..policy(5, true) };
+        assert!(accept(&policy(4, true), path).is_err());
+        let twice = Policy { custom_lists: vec![own("custom-a1", None), own("custom-a1", None)], ..policy(5, true) };
+        assert!(accept(&policy(4, true), twice).unwrap_err().contains("twice"));
+        let many = Policy { custom_lists: (0..=MAX_CUSTOM_LISTS).map(|i| own(&format!("custom-{i}"), None)).collect(), ..policy(5, true) };
+        assert!(accept(&policy(4, true), many).unwrap_err().contains("more than"));
+    }
+
+    /// The engine's own half of "a locked option is never on": with HTTPS off no
+    /// tracking protection is held, whatever the app sent.
+    #[test]
+    fn tracking_is_held_only_with_https_on_and_only_by_known_names() {
+        let asked = Policy { tracking: vec!["gpc".into(), "referrer".into()], ..policy(5, true) };
+        assert!(accept(&policy(4, true), asked.clone()).unwrap().tracking.is_empty());
+        let on = Policy { https: true, ..asked };
+        assert_eq!(accept(&policy(4, true), on).unwrap().tracking, ["gpc", "referrer"]);
+        let unknown = Policy { tracking: vec!["mind-reading".into()], https: true, ..policy(5, true) };
+        assert!(accept(&policy(4, true), unknown).unwrap_err().contains("mind-reading"));
     }
 
     /// A fake clock in minutes: three crashes in an hour stop routing at the

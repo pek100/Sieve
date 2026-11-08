@@ -289,6 +289,18 @@ export interface EnginePolicy {
   user_rules: string[];
   /** `filtering.exclusions`: sites never decrypted. Nothing decrypts before slice 6. */
   exclusions: string[];
+  /** `filters.custom`: the user's own lists. The engine leaves it out while empty, so absent is none. */
+  custom_lists?: EngineCustomList[];
+  /** The `tracking.*` protections on, by name; only while HTTPS decryption is in force. Absent is none. */
+  tracking?: string[];
+}
+
+/** One of the user's own lists (sieve-ipc `CustomList`); `url` null: imported from a file. */
+export interface EngineCustomList {
+  id: string;
+  title: string;
+  url: string | null;
+  enabled: boolean;
 }
 
 /** The encrypted DNS resolvers the engine holds (sieve-ipc `DnsUpstreams`). */
@@ -560,7 +572,18 @@ function policy(raw: unknown): EnginePolicy {
     ...(p.plain_dns === undefined ? {} : { plain_dns: bool(p.plain_dns, "policy.plain_dns") }),
     user_rules: orDefault(p.user_rules, (v) => strings(v, "policy.user_rules"), []),
     exclusions: orDefault(p.exclusions, (v) => strings(v, "policy.exclusions"), []),
+    ...(p.custom_lists === undefined ? {} : { custom_lists: customLists(p.custom_lists) }),
+    ...(p.tracking === undefined ? {} : { tracking: strings(p.tracking, "policy.tracking") }),
   };
+}
+
+function customLists(raw: unknown): EngineCustomList[] {
+  if (!Array.isArray(raw)) throw new ProtocolError("policy.custom_lists must be an array");
+  return raw.map((v, i) => {
+    const w = `custom_lists[${i}]`;
+    const c = rec(v, w);
+    return { id: str(c.id, `${w}.id`), title: str(c.title, `${w}.title`), url: strOrNull(c.url, `${w}.url`), enabled: bool(c.enabled, `${w}.enabled`) };
+  });
 }
 
 function blocker(raw: unknown): EngineBlocker {
@@ -916,6 +939,23 @@ export interface FilterReport {
   reasons: Record<string, number>;
 }
 
+/** What a list is for (catalogue `Kind`). */
+export const LIST_KINDS = ["ads", "tracking", "annoyances", "security", "language"] as const;
+export type ListKind = (typeof LIST_KINDS)[number];
+/** The lowest profile that turns a list on (catalogue `Level`); `optional`: none does. */
+export const LIST_LEVELS = ["minimal", "balanced", "strict", "optional"] as const;
+export type ListLevel = (typeof LIST_LEVELS)[number];
+
+/** What the engine says about a list's copy, laid over the catalogue. Null: it said nothing. */
+export interface ListFetch {
+  /** The last good download, ms since the epoch; null: no copy yet. */
+  fetchedAtMs: number | null;
+  /** Why the last attempt failed, in the engine's words; the last good copy stays in use. */
+  lastError: string | null;
+  /** In the engine's selection now. */
+  enabled: boolean;
+}
+
 export interface FilterList {
   id: string;
   title: string;
@@ -923,7 +963,15 @@ export interface FilterList {
   licence: string;
   default: (typeof LIST_DEFAULTS)[number];
   trusted: boolean;
+  kind: ListKind;
+  level: ListLevel;
+  /** What turning it on does, in plain words. */
+  description: string;
+  /** Primary language subtags of the sites it is for; empty for every site. */
+  languages: readonly string[];
   report: FilterReport | null;
+  /** Absent until the engine's report is laid over the catalogue. */
+  fetch?: ListFetch | null;
 }
 
 export interface FilterCatalogue {
@@ -947,6 +995,9 @@ function filterList(x: unknown): FilterList | null {
   const { id, title, url, licence, trusted } = x;
   if (typeof id !== "string" || id === "" || typeof title !== "string" || title === "") return null;
   if (!(LIST_DEFAULTS as readonly unknown[]).includes(x.default)) return null;
+  // Rows from before kinds and levels (an older build's answer) read as an ad
+  // list in no profile: shown, and never taken for part of a level.
+  const pick = <T extends string>(v: unknown, of: readonly T[], fallback: T): T => ((of as readonly unknown[]).includes(v) ? (v as T) : fallback);
   return {
     id,
     title,
@@ -954,8 +1005,39 @@ function filterList(x: unknown): FilterList | null {
     licence: typeof licence === "string" ? licence : "",
     default: x.default as FilterList["default"],
     trusted: trusted === true,
+    kind: pick(x.kind, LIST_KINDS, "ads"),
+    level: pick(x.level, LIST_LEVELS, "optional"),
+    description: typeof x.description === "string" ? x.description : "",
+    languages: Array.isArray(x.languages) ? x.languages.filter((l): l is string => typeof l === "string") : [],
     report: filterReport(x.report),
   };
+}
+
+/** `engine_list_rules`: the first rules of one list's copy that hold the search. */
+export interface ListRules {
+  id: string;
+  lines: string[];
+  matched: number;
+  total: number;
+}
+
+export function parseListRules(raw: unknown): ListRules {
+  const x = rec(raw, "list rules");
+  return { id: str(x.id, "list rules.id"), lines: strings(x.lines, "list rules.lines"), matched: int(x.matched, "list rules.matched"), total: int(x.total, "list rules.total") };
+}
+
+/** `engine_list_import`: the engine kept the picked file's list. Null: the person closed the picker. */
+export interface ListImported {
+  /** The file's name, the list's name until the person gives another. */
+  name: string;
+  rules: number;
+  skipped: number;
+}
+
+export function parseListImported(raw: unknown): ListImported | null {
+  if (raw === null) return null;
+  const x = rec(raw, "list import");
+  return { name: str(x.name, "list import.name"), rules: int(x.rules, "list import.rules"), skipped: int(x.skipped, "list import.skipped") };
 }
 
 /**
