@@ -561,14 +561,18 @@ where
     };
     let client = match accepted {
         Ok(Ok(client)) => client,
+        // Only an alert says the app refused Sieve's certificate; a client that went
+        // away or ran out of time said nothing of why (P2-6 of the 2026-11-08 second
+        // review), so its problem has a cause of its own: unknown, with no fix.
         Ok(Err(e)) => {
-            deps.watch.handshake_failed(&pair, alert_in(&e));
-            lock(&deps.book).problem(flow.id, Signal::AppRefusedCertificate);
+            let alert = alert_in(&e);
+            deps.watch.handshake_failed(&pair, alert);
+            lock(&deps.book).problem(flow.id, if alert.is_some() { Signal::AppRefusedCertificate } else { Signal::HandshakeAbandoned });
             return FlowAction::Failed;
         }
         Err(_) => {
             deps.watch.handshake_failed(&pair, None);
-            lock(&deps.book).problem(flow.id, Signal::AppRefusedCertificate);
+            lock(&deps.book).problem(flow.id, Signal::HandshakeAbandoned);
             return FlowAction::Failed;
         }
     };

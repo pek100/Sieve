@@ -5,15 +5,23 @@
 //!
 //! What is tried, within one [`BUDGET`] for all of it, and at most
 //! [`MAX_ATTEMPTS`] connects:
-//! - while the first connect has not answered after [`NEXT_ADDRESS_AFTER`], or as
-//!   soon as it fails, the next address its name resolved to, the other family
-//!   first (happy eyeballs: the earlier connect keeps running, the first to
-//!   connect wins);
+//! - once a connect has failed, the next address its name resolved to, the other
+//!   family first (as happy eyeballs orders them);
 //! - a connect the server reset is tried once more after [`RECONNECT_AFTER`].
 //!
+//! Only after a failure, never beside a connect that is merely slow (P2-4 of the
+//! 2026-11-08 second review): an address's name comes from the shared name map,
+//! and nothing says the flow's own app resolved it, since the DNS Client service
+//! resolves for most apps and an app may have resolved its own name elsewhere. A
+//! slow connect raced by another site's address could carry the app's bytes to that
+//! site while its own server would have answered; after a failure the app has
+//! nothing left to lose, and its own TLS still checks whom it reached. The switch to
+//! the other family first is kept as happy eyeballs orders it.
+//!
 //! Never more: no attempt is made past the budget or the count, an address is
-//! reconnected once, and nothing here runs once the flow is decided or a byte was
-//! delivered, so a block always holds and nothing loops.
+//! reconnected once, a name the filter blocks gets no other address, and nothing
+//! here runs once the flow is decided or a byte was delivered, so a block always
+//! holds and nothing loops.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -31,10 +39,6 @@ use crate::dns::NameMap;
 /// (`egress`), so with retries the app never waits longer than it did without
 /// them, and less than Windows' own connect gives up after (about 21 s).
 pub const BUDGET: Duration = Duration::from_secs(10);
-/// A connect not answered this long has most likely lost its SYN: the next
-/// address starts beside it. Long enough that a slow but working path is never
-/// raced on a normal network.
-pub const NEXT_ADDRESS_AFTER: Duration = Duration::from_secs(2);
 /// A reset to the connect is tried once more this much later: a server that is
 /// restarting or shedding load often takes the next one.
 pub const RECONNECT_AFTER: Duration = Duration::from_millis(250);
@@ -109,17 +113,27 @@ pub struct Connected<S> {
 }
 
 impl<S> Connected<S> {
-    /// What the log says: Sieve tried again, and whether it connected.
+    /// What the log says: Sieve tried again, and whether it connected. The first
+    /// connect winning is no retry, whatever else was started beside it.
     pub fn retry(&self) -> Option<RetryHow> {
-        if self.attempts > 1 { self.how.or(Some(RetryHow::NextAddress)) } else { None }
+        match (&self.result, self.how) {
+            _ if self.attempts <= 1 => None,
+            (Ok(_), None) => None,
+            (_, how) => how.or(Some(RetryHow::NextAddress)),
+        }
     }
 }
 
 /// The other addresses of the one name `ip` was resolved for, the other family
-/// first. None when the address serves several names: the flow's own name is not
-/// known before its first bytes, and another name's address may not serve it.
-pub fn alternates(names: &NameMap, ip: IpAddr, now_ms: u64) -> Vec<IpAddr> {
+/// first. None when the address serves several names (the flow's own name is not
+/// known before its first bytes, and another name's address may not serve it), and
+/// none for a name `blocked` says the filter blocks: that flow is closed once its
+/// bytes are read, and another connect would only reach the blocked server again.
+pub fn alternates(names: &NameMap, ip: IpAddr, now_ms: u64, blocked: impl Fn(&str) -> bool) -> Vec<IpAddr> {
     let [name] = names.names(ip, now_ms)[..] else { return Vec::new() };
+    if blocked(name) {
+        return Vec::new();
+    }
     let mut all: Vec<IpAddr> = names.addresses(name, now_ms).into_iter().filter(|a| *a != ip).collect();
     all.sort_by_key(|a| (a.is_ipv4() == ip.is_ipv4(), *a));
     all
@@ -132,7 +146,7 @@ struct Running<'a, S> {
 }
 
 /// Connects to `target` as the module says. `alternates` is asked at most once,
-/// and only when the first connect is slow or failed.
+/// and only once a connect failed.
 pub async fn connect<A: Attempt>(dialer: &A, target: SocketAddr, alternates: impl FnOnce() -> Vec<IpAddr>) -> Connected<A::Stream> {
     let start = Instant::now();
     let deadline = start + BUDGET;
@@ -142,7 +156,8 @@ pub async fn connect<A: Attempt>(dialer: &A, target: SocketAddr, alternates: imp
     let mut addresses: VecDeque<SocketAddr> = VecDeque::new();
     let mut reconnects: Vec<(Instant, SocketAddr)> = Vec::new();
     let mut reconnected: Vec<SocketAddr> = Vec::new();
-    let mut next_address = Some(start + NEXT_ADDRESS_AFTER);
+    // Set by a failure only: the next address is tried then, never on a timer.
+    let mut next_address: Option<Instant> = None;
     let mut last = (Failure::Timeout, None);
     loop {
         let wake = [Some(deadline), next_address, reconnects.iter().map(|(at, _)| *at).min()].into_iter().flatten().min().unwrap_or(deadline);
@@ -174,13 +189,17 @@ pub async fn connect<A: Attempt>(dialer: &A, target: SocketAddr, alternates: imp
             }
         }
         if now >= deadline {
+            // A connect still waiting at the end is what failed last: it timed out.
+            if let Some(waiting) = running.last() {
+                return Connected { result: Err(Failure::Timeout), attempts, how: waiting.how };
+            }
             return Connected { result: Err(last.0), attempts, how: last.1 };
         }
         if attempts < MAX_ATTEMPTS && next_address.is_some_and(|at| now >= at) {
             if let Some(ask) = alternates.take() {
                 addresses.extend(ask().into_iter().map(|ip| SocketAddr::new(ip, target.port())));
             }
-            next_address = (!addresses.is_empty()).then(|| now + NEXT_ADDRESS_AFTER);
+            next_address = None;
             if let Some(next) = addresses.pop_front() {
                 running.push(Running { target: next, how: Some(RetryHow::NextAddress), connect: dialer.attempt(next) });
                 attempts += 1;
@@ -291,12 +310,40 @@ mod tests {
         assert!(!asked_alternates.get(), "the name map is read only on trouble");
     }
 
+    /// P2-4 of the 2026-11-08 second review: a slow connect is never raced, since
+    /// the other address may be another site's; the app's own happy eyeballs, its
+    /// own connect per family, is left to it.
     #[tokio::test(start_paused = true)]
-    async fn a_silent_ipv6_connect_is_raced_by_ipv4_after_the_delay() {
+    async fn a_silent_connect_is_not_raced() {
         let fake = Fake::new(&[(V6, &[Script::Never]), (V4, &[OK_FAST])]);
+        let asked_alternates = std::cell::Cell::new(false);
+        let start = Instant::now();
+        let out = connect(&fake, addr(V6), || {
+            asked_alternates.set(true);
+            v4_alternate()
+        })
+        .await;
+        assert_eq!((out.retry(), out.attempts, out.result.unwrap_err()), (None, 1, Failure::Timeout));
+        assert_eq!(Instant::now() - start, BUDGET, "as long as the one connect always had");
+        assert!(!asked_alternates.get());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_first_connect_that_answers_is_no_retry() {
+        let slow = Script::After(Duration::from_secs(5), Ok(()));
+        let fake = Fake::new(&[(V6, &[slow]), (V4, &[OK_FAST])]);
         let out = connect(&fake, addr(V6), v4_alternate).await;
-        assert_eq!((out.retry(), out.attempts, out.result), (Some(RetryHow::NextAddress), 2, Ok(addr(V4))));
-        assert_eq!(fake.asked(), [(addr(V6), Duration::ZERO), (addr(V4), NEXT_ADDRESS_AFTER)]);
+        assert_eq!((out.retry(), out.attempts, out.result), (None, 1, Ok(addr(V6))));
+    }
+
+    #[test]
+    fn the_first_connect_winning_is_reported_as_no_retry() {
+        let won = Connected { result: Ok(()), attempts: 2, how: None };
+        assert_eq!(won.retry(), None);
+        let other = Connected { result: Ok(()), attempts: 2, how: Some(RetryHow::NextAddress) };
+        assert_eq!(other.retry(), Some(RetryHow::NextAddress));
+        let failed: Connected<()> = Connected { result: Err(Failure::Timeout), attempts: 2, how: None };
+        assert_eq!(failed.retry(), Some(RetryHow::NextAddress), "tried again, and nothing connected");
     }
 
     #[tokio::test(start_paused = true)]
@@ -327,12 +374,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn nothing_answers_within_the_budget_and_no_more_than_the_attempts() {
         let many: Vec<IpAddr> = (2..10).map(|i| format!("192.0.2.{i}").parse().unwrap()).collect();
-        let fake = Fake::new(&[]);
+        let fake = Fake::new(&[(V6, &[UNREACHABLE])]);
         let start = Instant::now();
         let out = connect(&fake, addr(V6), || many.clone()).await;
         assert_eq!(Instant::now() - start, BUDGET);
-        assert_eq!((out.result.unwrap_err(), out.attempts), (Failure::Timeout, MAX_ATTEMPTS));
-        assert_eq!(fake.asked().len(), MAX_ATTEMPTS as usize);
+        assert_eq!((out.result.unwrap_err(), out.attempts), (Failure::Timeout, 2), "the next address is silent: none after it");
+        let unreachable: Vec<(&str, &[Script])> = vec![(V6, &[UNREACHABLE]), ("192.0.2.2:443", &[UNREACHABLE]), ("192.0.2.3:443", &[UNREACHABLE]), ("192.0.2.4:443", &[UNREACHABLE])];
+        let fake = Fake::new(&unreachable);
+        let out = connect(&fake, addr(V6), || many.clone()).await;
+        assert_eq!((out.result.unwrap_err(), out.attempts), (Failure::Unreachable, MAX_ATTEMPTS));
+        assert_eq!(fake.asked().len(), MAX_ATTEMPTS as usize, "failures in a row stop at the count");
     }
 
     #[tokio::test(start_paused = true)]
@@ -344,14 +395,6 @@ mod tests {
         assert_eq!(Instant::now() - start, Duration::from_millis(20), "no waiting for nothing");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn the_slow_first_connect_still_wins_when_it_answers_first() {
-        let slow = Script::After(NEXT_ADDRESS_AFTER + Duration::from_millis(10), Ok(()));
-        let fake = Fake::new(&[(V6, &[slow]), (V4, &[Script::Never])]);
-        let out = connect(&fake, addr(V6), v4_alternate).await;
-        assert_eq!((out.result, out.how), (Ok(addr(V6)), None), "the raced connect is dropped");
-    }
-
     #[test]
     fn alternates_come_only_from_an_unambiguous_name_other_family_first() {
         let mut names = NameMap::default();
@@ -359,9 +402,11 @@ mod tests {
         for ip in ["2001:db8::1", "2001:db8::2", "192.0.2.1", "192.0.2.2"] {
             names.record("cdn.example", ip.parse().unwrap(), 300, 0);
         }
-        assert_eq!(alternates(&names, ip6, 1), ["192.0.2.1", "192.0.2.2", "2001:db8::2"].map(|a| a.parse::<IpAddr>().unwrap()));
+        let none = |_: &str| false;
+        assert_eq!(alternates(&names, ip6, 1, none), ["192.0.2.1", "192.0.2.2", "2001:db8::2"].map(|a| a.parse::<IpAddr>().unwrap()));
+        assert!(alternates(&names, ip6, 1, |n| n == "cdn.example").is_empty(), "a blocked name gets no other address");
         names.record("other.example", ip6, 300, 0);
-        assert!(alternates(&names, ip6, 1).is_empty(), "a shared address could be another name's");
-        assert!(alternates(&names, "198.51.100.1".parse().unwrap(), 1).is_empty(), "no name, no alternates");
+        assert!(alternates(&names, ip6, 1, none).is_empty(), "a shared address could be another name's");
+        assert!(alternates(&names, "198.51.100.1".parse().unwrap(), 1, none).is_empty(), "no name, no alternates");
     }
 }

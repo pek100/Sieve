@@ -270,6 +270,12 @@ pub enum Signal {
     Blocked,
     /// Sieve refused QUIC so the app falls back to TCP, where it is filtered.
     QuicRefused,
+    /// The app went away in the middle of the handshake with Sieve, or did not
+    /// finish it in time, with no alert: a tab closed, a PC asleep, or an app that
+    /// gave up on Sieve's certificate without saying so. Appended after
+    /// `QuicRefused` (the TENSION at [`LogOutcome`] holds for it too: an older app
+    /// and this engine ship together).
+    HandshakeAbandoned,
 }
 
 /// Who most likely caused a problem.
@@ -285,7 +291,7 @@ pub enum Cause {
 }
 
 impl Signal {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::ConnectRefused,
         Self::ConnectTimeout,
         Self::Unreachable,
@@ -297,6 +303,7 @@ impl Signal {
         Self::AppRefusedCertificate,
         Self::Blocked,
         Self::QuicRefused,
+        Self::HandshakeAbandoned,
     ];
 
     /// The classification table, the only one: a signal decides its cause.
@@ -305,12 +312,13 @@ impl Signal {
     ///   the app's own, to the same address, from the interface Windows would use.
     /// - Unknown: a broken or stalled connection reads the same whichever side
     ///   broke it, and a lookup with no answer may be the resolvers Sieve asks or
-    ///   the network that blocks them.
+    ///   the network that blocks them; a handshake the app gave up on says nothing
+    ///   of why.
     pub fn cause(self) -> Cause {
         match self {
             Self::EgressFailed | Self::AppRefusedCertificate | Self::Blocked | Self::QuicRefused => Cause::Sieve,
             Self::ConnectRefused | Self::ConnectTimeout | Self::Unreachable => Cause::Network,
-            Self::ConnectFailed | Self::ConnectionLost | Self::Stall | Self::DnsUnanswered => Cause::Unknown,
+            Self::ConnectFailed | Self::ConnectionLost | Self::Stall | Self::DnsUnanswered | Self::HandshakeAbandoned => Cause::Unknown,
         }
     }
 
@@ -386,7 +394,9 @@ pub struct ExclusionRow {
     pub line: String,
     /// Lower-case exe file names; empty means every app.
     pub apps: Vec<String>,
-    /// `list:<id>`, `auto:pinning`, `auto:client-cert` or `auto:ev`.
+    /// `list:<id>`, `auto:pinning`, `auto:client-cert`, `auto:ev`, or `auto:failing`
+    /// (line `*`: one exe, by its full path in one session, though the row names
+    /// only the file).
     pub reason: String,
     /// When the engine first wrote it; None for a list's line.
     pub created_ms: Option<u64>,
@@ -1873,6 +1883,7 @@ mod tests {
             (Signal::AppRefusedCertificate, Sieve, false),
             (Signal::Blocked, Sieve, true),
             (Signal::QuicRefused, Sieve, true),
+            (Signal::HandshakeAbandoned, Unknown, false),
         ];
         assert_eq!(table.map(|(s, _, _)| s), Signal::ALL, "every signal, in order");
         for (signal, cause, intended) in table {

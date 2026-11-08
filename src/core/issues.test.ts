@@ -76,6 +76,15 @@ describe("one-step fixes", () => {
     expect(problemFixes(problem("app_refused_certificate", "sieve"), null), "no exe, no app-only line").toEqual([]);
     expect(problemFixes(problem("connect_timeout", "network"), "launcher.exe")).toEqual([]);
     expect(problemFixes(problem("blocked", "sieve", { host: null }), "launcher.exe")).toEqual([]);
+    expect(problemFixes(problem("handshake_abandoned", "unknown"), "launcher.exe"), "a handshake given up on: cause unknown, nothing to fix").toEqual([]);
+  });
+
+  it("the untouched row is found by any of the app's exes, problems or none", () => {
+    const untouched = failingOpen(rows("auto:failing", ["launcher.exe"]), [null, "helper.exe", "launcher.exe"]);
+    expect(untouched?.reason).toBe("auto:failing");
+    expect(failingOpen(rows("auto:failing", ["launcher.exe"]), [])).toBeNull();
+    expect(failingOpen([{ ...rows("auto:failing", [])[0], apps: undefined as unknown as string[] }], "launcher.exe"), "a degraded row").toBeNull();
+    expect(appFixes(null, untouched, true), "no problems left: keep or try again still").toEqual(["keep_untouched", "try_again"]);
   });
 
   it("the app offers Off and a report when Sieve may be why, and keep or try again while it passes untouched", () => {

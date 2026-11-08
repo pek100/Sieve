@@ -22,6 +22,7 @@ export const SIGNAL_TEXT: Readonly<Record<Signal, string>> = {
   app_refused_certificate: "It refused to let Sieve look inside its secure connection",
   blocked: "Sieve blocked it with a filter rule",
   quic_refused: "Sieve asked it to use a regular connection, so it can be filtered",
+  handshake_abandoned: "It stopped before its secure connection with Sieve was set up",
 };
 
 /** Sieve meant these: a rule's block, a QUIC refusal the app answers by falling back. The engine's `Signal::intended`. */
@@ -122,7 +123,11 @@ export const FIX_TEXT: Readonly<Record<Fix, string>> = {
   report: "Copy a report",
 };
 
-/** What fixes one problem by itself; only where Sieve is the cause and a host is named. */
+/**
+ * What fixes one problem by itself; only where Sieve is the cause and a host is
+ * named. A handshake the app gave up on (`handshake_abandoned`) has none: its cause
+ * is unknown, and a tab closed or a PC asleep needs no fix.
+ */
 export function problemFixes(p: Problem, exe: string | null): Fix[] {
   if (!p.host) return [];
   if (p.signal === "blocked") return ["unblock"];
@@ -133,17 +138,22 @@ export function problemFixes(p: Problem, exe: string | null): Fix[] {
 /** What the `auto:failing` row means, after its time. */
 export const UNTOUCHED_TEXT = "Sieve passes this app through untouched for a day, because it kept refusing Sieve's certificate right after Sieve began decrypting it. Its blocked sites stay blocked.";
 
-/** The `auto:failing` row of this app's exe: Sieve passes the whole app through untouched for now. */
-export function failingOpen(rows: readonly ExclusionView[], exe: string | null): ExclusionView | null {
-  if (!exe) return null;
-  return rows.find((r) => r.reason === "auto:failing" && r.apps.includes(exe)) ?? null;
+/**
+ * The `auto:failing` row of one of the app's exes (file names, lower case, as the
+ * row names them): Sieve passes the whole app through untouched for now. Read from
+ * the exclusion rows alone, so it holds for the row's whole day, problems or not.
+ */
+export function failingOpen(rows: readonly ExclusionView[], exes: string | null | readonly (string | null)[]): ExclusionView | null {
+  const names = (Array.isArray(exes) ? exes : [exes]).filter((e): e is string => typeof e === "string" && e !== "");
+  if (names.length === 0) return null;
+  return rows.find((r) => r.reason === "auto:failing" && (r.apps ?? []).some((a) => names.includes(a))) ?? null;
 }
 
 /** The whole app's fixes: Off and a report whenever Sieve may be the cause; keep or try again while it passes untouched. */
-export function appFixes(app: AppIssues, untouched: ExclusionView | null, canTurnOff: boolean): Fix[] {
+export function appFixes(app: AppIssues | null, untouched: ExclusionView | null, canTurnOff: boolean): Fix[] {
   const fixes: Fix[] = [];
   if (untouched) fixes.push("keep_untouched", "try_again");
-  if (verdict(app) === "sieve" || verdict(app) === "unknown") {
+  if (app && (verdict(app) === "sieve" || verdict(app) === "unknown")) {
     if (canTurnOff) fixes.push("turn_off");
     fixes.push("report");
   }
