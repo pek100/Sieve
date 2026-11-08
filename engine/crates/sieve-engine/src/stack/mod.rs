@@ -23,6 +23,8 @@ pub mod egress;
 pub mod relay;
 #[cfg(all(windows, test))]
 mod relay_tests;
+#[cfg(all(windows, test))]
+mod tcp_send_tests;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
