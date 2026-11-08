@@ -13,8 +13,15 @@ use crate::stack::DNS_PORT;
 
 /// UDP first; a truncated answer retries over TCP. The caller's deadline bounds
 /// the wait. Datagrams that do not fit the query are ignored, not failures.
-pub async fn exchange(connector: &dyn Connector, server: IpAddr, query: &[u8]) -> Result<Vec<u8>, String> {
+/// `may_send` is asked before each send, the UDP one and the TCP retry: false
+/// sends nothing more and fails the exchange (the user turned encryption back
+/// on while the query was in flight).
+pub async fn exchange(connector: &dyn Connector, server: IpAddr, query: &[u8], may_send: impl Fn() -> bool) -> Result<Vec<u8>, String> {
     let target = SocketAddr::new(server, DNS_PORT);
+    let refused = || format!("{server}: plain DNS is off now");
+    if !may_send() {
+        return Err(refused());
+    }
     let socket = crate::stack::datagram_socket(connector.udp(target)?).map_err(|e| format!("socket: {e}"))?;
     socket.connect(connector.address(target)).await.map_err(|e| format!("connect {server}: {e}"))?;
     socket.send(query).await.map_err(|e| format!("send to {server}: {e}"))?;
@@ -25,7 +32,13 @@ pub async fn exchange(connector: &dyn Connector, server: IpAddr, query: &[u8]) -
         if !reply_fits(query, reply) {
             continue;
         }
-        return if is_truncated(reply) { over_tcp(connector, target, query).await } else { Ok(reply.to_vec()) };
+        if !is_truncated(reply) {
+            return Ok(reply.to_vec());
+        }
+        if !may_send() {
+            return Err(refused());
+        }
+        return over_tcp(connector, target, query).await;
     }
 }
 
