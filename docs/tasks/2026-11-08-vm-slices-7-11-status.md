@@ -18,6 +18,46 @@ Engines: `engine-cur-pin.exe` (C26FD6DE) is this branch with Version Negotiation
 
 Decision: `REFUSAL = Refusal::VersionNegotiation` (5a6d8af). The Chrome VN tail is longer than ICMP's (p90 705 ms against 368 ms; 5 of 60 over 1 s), most likely later TCP flows inside the 10 s window, which this run did not tell apart.
 
+### Slice 9: content injection
+
+Engine 709C9CAA (this branch at 3850222 with the TEST bundle pinned: uBO 3762a26 assembled, then trusted-prevent-xhr.js marked trusted by the fixed rule of 6dc6a8d, sha256 88bc3ecc...582a). User rules: one hiding rule and `+js(set-constant, sieveProbe, 42)` per test site. Probe `content.mjs`: the delivered body, the DOM, console CSP and Trusted Types reports, page errors.
+
+| Check | Result | Evidence |
+|---|---|---|
+| U1 example.com, Edge and Chrome | PASS | `<style nonce=...>` right after `<head>`; `example.com##p` hid 6 of 6 `p`; `rewritten` +1 per load in each. Today's example.com has no `h1`, so the runbook's `example.com##h1` matches nothing (runbook to update) |
+| U1 Firefox 159 | PASS in part | headless Firefox took Sieve's certificate (`intercepted` +3) and `rewritten` +1; the screenshot is on the VM (`C:\sieve\logs\s9\ff-example2.png`), not read here |
+| U1 user scriptlet | FAIL, then fixed | Before 3850222 a user's `+js()` rule injected nothing (`with_scriptlets` +0 on example.com): only the lists' engine had the bundle. After: `with_scriptlets` +1 per load. The probe global still read `undefined` on example.com, github.com, MDN, accounts.google.com and web.dev, and 42 on www.youtube.com: not explained yet (see "Open") |
+| Bundle | FAIL, then fixed | The assembled uBO 3762a26 bundle was refused whole: "resource trusted-prevent-xhr.js is named trusted but any list could inject it" (uBO registers it without `requiresTrust`). Fixed in the bundle script (6dc6a8d) |
+| U2 header CSP, Trusted Types | PASS | github.com, www.google.com search, www.youtube.com (TT), developer.mozilla.org, accounts.google.com (TT), web.dev: 0 CSP or Trusted Types reports, and each site's hiding rule applied (footer 1/1, textarea 1/1, ytd-masthead 1/1, accounts h1 1/1). Google's results page threw `solveSimpleChallenge is not defined`: its bot challenge for this IP; not compared with Sieve off |
+| U2 meta CSP | SKIP | none of the six pages had one |
+| U3 scriptlet with Trusted Types | PASS on YouTube | `sieveProbe` = 42 on www.youtube.com (TT enforced); `undefined` on accounts.google.com (TT) as on the non-TT pages, so TT is not the cause |
+| U4 budgets | Reported | the generic stylesheet adds about 540 KB to every page (example.com: 557,840 bytes delivered); load times in "Real use" |
+| U5 skip counts | Reported | default lists: adguard-base 74,227 applied / 3,712 skipped, adguard-tracking 437,184 / 14, adguard-url-tracking 2,528 / 208, adguard-dns 190,790 / 7, ubo-badware 4,675 / 65 |
+| U6 | SKIP | no site with trailing gzip bytes or a shared dictionary was found |
+| U7 cached page after off | SKIP | the reload after content off failed with `ERR_NAME_NOT_RESOLVED` (see "DNS just after a start") |
+| U8 plain http, service worker | PASS | http://neverssl.com/ not injected (twice); squoosh.app injected on the network load and not on the service worker's (`fromServiceWorker` true) |
+
+### DNS just after a start
+
+`d-dnsstart.ps1`, three engine restarts, `nslookup` every 150 ms: for about 3 s after `routes_up` lookups through the TUN got no address (rounds: 2.4 to 5.6 s, 0.5 to 3.8 s, 0.3 to 3.9 s after the start), then answered. A browser opened right after a policy restart fails its first names (`ERR_NAME_NOT_RESOLVED`). Not investigated further yet.
+
+### Slice 11: CT, CRLite, upstream ECH
+
+Artefacts placed by hand in `ProgramData\Sieve\engine\updates\` (unsigned: the owner's key is not on the VM). Engine C26FD6DE then F17B34C7, Chrome 157, a fresh profile per load, `status.json.https` read around each load.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Artefacts loaded | PASS | `ct_list_timestamp` 1794145453000, `crlite_filters` 45, `validation_refused` 0 |
+| U1 no-sct.badssl.com | SKIP | Chrome showed `ERR_CERT_AUTHORITY_INVALID`: the host's chain is not publicly trusted any more, so it cannot exercise CT. The engine passed it through (`passed` +1), `ct_violating` +0 |
+| U1 normal site | PASS | www.wikipedia.org: Sieve's issuer, `ct_compliant` +9, `intercepted` +5 |
+| U2 CRLite revoked | PASS | revoked-rsa-dv.ssl.com, revoked-ecc-dv.ssl.com and revoked.badssl.com: each `crlite_revoked` +1 and the real issuer in Chrome (SSL.com TLS Issuing RSA CA R1, ECC CA R2, YE2); www.wikipedia.org `crlite_revoked` +0 |
+| U3 upstream ECH | PASS | crypto.cloudflare.com/cdn-cgi/trace through Sieve (Sieve's issuer): `sni=encrypted`, `tls=TLSv1.3`, `kex=X25519MLKEM768`; `ech_offered` +1, `ech_accepted` +1, `ech_failed` +0 |
+| U5 first and repeat connection | Reported | the trace page loaded in 198 ms the first time and 141 ms the next (whole page, fresh browser each); the 2 ms handshake budget needs the bench, not a page load |
+| U7 memory | PASS | engine working set 131 MB after load with the CRLite bundle, 142 MB after the loads, private 124 MB: under 300 MB |
+| U4, U6, U8, U9, U12 | SKIP | U6 is read from the real-use run below; no ECH server rejecting a stale config is known (U8); U9 and U12 not run for time |
+| U10 | see kill, reboot, uninstall below | |
+| U11 signed update cycle | SKIP | needs the owner's signing key |
+
 Heal false positives seen again (slice 7, not fixed here): `auto:pinning` for msedge on cdn.discordapp.com and static.cdninstagram.com, chrome on static.cdninstagram.com, during these runs. Each run cleared `exclusions.json` first.
 
 The run stopped early because the owner's PC was restarting. Branch `live-vm-2026-11-08`. VM: `sieve-test-vm`, 1.4 h used (started 18:39, stopped 20:03), stopped at the end. The evidence logs are on the VM under `C:\sieve\logs\` (`dnsa`, `dnsb`, `dnsc`, `extras`, `yt1`, `ytp`, `s8`, `g`). The scripts are in the session scratchpad (`d-*.ps1`, `lib.ps1`, `browse.mjs`, `yt.mjs`, `dnsbench.mjs`).
