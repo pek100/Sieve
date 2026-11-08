@@ -14,8 +14,9 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 pub use sieve_ipc::FlowReason as Reason;
+use sieve_filter::resources::ResourceBundle;
 use sieve_filter::rules::{DomainKind, HostDecision, HostVerdict, RuleEngine, RuleSet};
-use sieve_ipc::{DomainListKind, Policy, vm_key};
+use sieve_ipc::{DomainList, DomainListKind, Policy, vm_key};
 use tokio::sync::watch;
 
 use crate::dns::NameMap;
@@ -93,19 +94,33 @@ fn off_keys(policy: &Policy) -> HashSet<String> {
     policy.off_apps.iter().map(|k| k.to_lowercase()).collect()
 }
 
-/// The user's enabled domain lists and own rule lines as one engine (B6).
-pub fn user_engine(policy: &Policy) -> RuleEngine {
+/// What the user's own engine is compiled from: the policy's domain lists and
+/// own rule lines (B6).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserRules {
+    domain_lists: Vec<DomainList>,
+    rules: Vec<String>,
+}
+
+impl UserRules {
+    pub fn of(policy: &Policy) -> Self {
+        Self { domain_lists: policy.domain_lists.clone(), rules: policy.user_rules.clone() }
+    }
+}
+
+/// The user's enabled domain lists and own rule lines as one engine (B6), with
+/// the resource bundle in use, so the user's own `+js()` rules can run.
+pub fn user_engine(user: &UserRules, bundle: Option<&ResourceBundle>) -> RuleEngine {
     let kind = |k| match k {
         DomainListKind::Block => DomainKind::Block,
         DomainListKind::Allow => DomainKind::Allow,
     };
-    let enabled = policy.domain_lists.iter().filter(|l| l.enabled);
-    RuleEngine::compile_user_rules(enabled.flat_map(|l| l.entries.iter().map(move |e| (kind(l.kind), e.as_str()))), policy.user_rules.iter().map(String::as_str))
-}
-
-/// Whether going from `before` to `now` changes what [`user_engine`] compiles.
-pub fn user_rules_changed(before: &Policy, now: &Policy) -> bool {
-    before.domain_lists != now.domain_lists || before.user_rules != now.user_rules
+    let enabled = user.domain_lists.iter().filter(|l| l.enabled);
+    let mut engine = RuleEngine::compile_user_rules(enabled.flat_map(|l| l.entries.iter().map(move |e| (kind(l.kind), e.as_str()))), user.rules.iter().map(String::as_str));
+    if let Some(bundle) = bundle {
+        engine.use_resources(bundle);
+    }
+    engine
 }
 
 impl DomainFilter {
@@ -410,7 +425,7 @@ mod tests {
             sieving: true,
             ..Policy::default()
         };
-        let rules = RuleSet { user: Arc::new(user_engine(&policy)), lists: rules().lists };
+        let rules = RuleSet { user: Arc::new(user_engine(&UserRules::of(&policy), None)), lists: rules().lists };
         let f = DomainFilter::new(&policy, rules);
         let flow = |name| Flow { dns: false, name: Some(name), remote: remote(), owner: Owner::Unknown };
         assert_eq!(f.decide(flow("mine.example"), &names(), 0).list.as_deref(), Some("user"));

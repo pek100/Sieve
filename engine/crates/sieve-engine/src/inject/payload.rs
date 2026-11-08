@@ -44,9 +44,17 @@ pub fn js_text(text: &str) -> String {
     out
 }
 
+/// uBO's scriptlets read `scriptletGlobals`, which uBO's own injector declares and
+/// adblock-rust does not. Without it each scriptlet throws a ReferenceError that its
+/// own `try` swallows, and does nothing (live run 2026-11-08).
+const SCRIPTLET_GLOBALS: &str = "var scriptletGlobals={};\n";
+
 /// The script's source: one function scope, so no helper leaks into page globals.
 fn script_source(cosmetics: &PageCosmetics) -> String {
     let mut js = String::from("(function(){\n");
+    if !cosmetics.scriptlets.is_empty() {
+        js.push_str(SCRIPTLET_GLOBALS);
+    }
     js.push_str(&cosmetics.scriptlets);
     if !cosmetics.procedural.is_empty() {
         let _ = write!(js, "\nvar sieveApplier=(function(){{var exports={{}};\n{APPLIER}\nreturn exports;}})();\n{BOOTSTRAP}\nsieveRunProcedural(sieveApplier,[{}]);", cosmetics.procedural.join(","));
@@ -154,6 +162,18 @@ mod tests {
         )
         .unwrap();
         Rc::try_unwrap(parsed).unwrap().into_inner()
+    }
+
+    /// Live run 2026-11-08: every uBO scriptlet read an undeclared `scriptletGlobals`
+    /// and silently did nothing. The declaration comes first in the scriptlets' scope.
+    #[test]
+    fn scriptlets_run_in_a_scope_that_declares_scriptlet_globals() {
+        let with = parse(&rendered(&page_for("sieve-test.invalid##+js(sieve-set-flag, a, b)\n"), "n")).script_text;
+        let declared = with.find("var scriptletGlobals={};").unwrap_or_else(|| panic!("{with}"));
+        assert!(declared < with.find("sieveSetFlag").unwrap(), "declared before any scriptlet");
+        assert!(with.starts_with("(function(){\n"), "inside the scope, so no page global: {with}");
+        let without = parse(&rendered(&page_for("sieve-test.invalid#?#.x:has-text(y)\n"), "n")).script_text;
+        assert!(!without.contains("scriptletGlobals"), "no scriptlet, no declaration: {without}");
     }
 
     const ATTACK: &str = "</style><script>alert(1)</script>";

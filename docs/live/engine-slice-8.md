@@ -4,11 +4,24 @@ Run by the user, from an admin prompt. Nothing here was run by the stream that b
 
 Traffic really goes through the engine during this check. Do it when nothing else on this PC depends on the network. Before you start, record `route print`, `Get-DnsClientServerAddress`, `netsh winhttp show proxy` and the firewall rule list. The way out at any point is the engine switch off, or `sieve-engine.exe restore`. This check never changes a firewall rule.
 
-`status.json` (admin-only, `C:\ProgramData\Sieve\engine\`) gains `quic`: `refusal` (the arm this build is, `port_unreachable` or `silent_drop`), `refused`, `replies`, `send_failed`, `raced`, and `fallback_ms`, the newest 256 raw times in ms from a refused flow's first datagram to the first TCP flow of the same process and host. No host is ever in it (plan 7.1), so to read one site, read the numbers, load that site alone, wait for the 30 s rewrite, read them again. Keep the raw values and take the percentiles yourself.
+`status.json` (admin-only, `C:\ProgramData\Sieve\engine\`) gains `quic`: `refusal` (the arm this build is: `version_negotiation`, `port_unreachable` or `silent_drop`), `refused`, `replies`, `send_failed`, `raced`, and `fallback_ms`, the newest 256 raw times in ms from a refused flow's first datagram to the first TCP flow of the same process and host. No host is ever in it (plan 7.1), so to read one site, read the numbers, load that site alone, wait for the 30 s rewrite, read them again. Keep the raw values and take the percentiles yourself.
 
-## The two arms
+## The three arms
 
-The arm is one word: `REFUSAL` in `engine/crates/sieve-engine/src/quic/mod.rs`. For the drop arm set it to `Refusal::SilentDrop`, rebuild, and reinstall by the slice 6 route. `the_declared_constant_is_the_port_unreachable_arm` is expected to fail on that build: it pins the word so a flip for a measurement cannot land unnoticed. Change it in the same commit only if the numbers decide for the drop.
+The arm is one word: `REFUSAL` in `engine/crates/sieve-engine/src/quic/mod.rs`. The default is `Refusal::VersionNegotiation`: each client Initial of a refused flow gets a Version Negotiation packet through its UDP stream, as a blocked flow does. For another arm set it to `Refusal::PortUnreachable` (an ICMP port unreachable through the TUN) or `Refusal::SilentDrop`, rebuild, and reinstall by the slice 6 route. `the_declared_constant_is_the_version_negotiation_arm` is expected to fail on that build: it pins the word so a flip for a measurement cannot land unnoticed.
+
+The default was chosen by the VM run of 2026-11-08 (`docs/tasks/2026-11-08-vm-slices-7-11-status.md`): Edge 157 and Chrome 157, a warmed profile on 8 sites, three rounds per arm in alternating order, `fallback_ms` pooled per arm and browser:
+
+| Arm | Browser | n | Median | p75 | p90 | Within 100 ms | At 295 to 310 ms | Over 1 s |
+|---|---|---|---|---|---|---|---|---|
+| Version Negotiation | Edge | 66 | 1 | 1 | 111 | 89 % | 0 | 0 |
+| Version Negotiation | Chrome | 60 | 1 | 94 | 705 | 80 % | 0 | 5 |
+| Port unreachable | Edge | 77 | 301 | 302 | 305 | 44 % | 34 | 4 |
+| Port unreachable | Chrome | 77 | 1 | 2 | 368 | 81 % | 0 | 4 |
+| Silent drop | Edge | 80 | 1 | 301 | 521 | 69 % | 14 | 6 |
+| Silent drop | Chrome | 79 | 1 | 300 | 503 | 66 % | 9 | 5 |
+
+Samples of 0 to 2 ms are a TCP job the browser started beside QUIC. The cluster at about 300 ms is the browser waiting out its own delay before its TCP job, because the QUIC job had not failed. Version Negotiation never left one; the ICMP answer did not end Edge's QUIC job, and the drop left it in both. The samples over 1 s are most likely a later TCP flow of the same pair inside the 10 s window (the limit under `raced` below); this run did not tell them apart.
 
 ## Checks
 

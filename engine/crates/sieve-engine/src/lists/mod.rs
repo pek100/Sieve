@@ -29,7 +29,8 @@ use sieve_filter::rules::{ListReport, ListText, RuleEngine, USER_LIST, rule_line
 use sieve_ipc::{CUSTOM_LIST_PREFIX, CustomList, FilterFacts, LIST_QUERY_MAX, LIST_RULES_SHOWN, ListFact, ListStatus, MAX_IMPORT_BYTES, custom_id_problem, listed_line};
 use tokio::sync::Notify;
 
-use crate::domain::{DomainFilter, FilterSlot};
+use crate::domain::{DomainFilter, FilterSlot, UserRules, user_engine};
+use sieve_filter::resources::ResourceBundle;
 use crate::policy::wall_ms;
 use cache::Cache;
 
@@ -81,6 +82,10 @@ struct Inner {
     /// The resource bundle in use, as the report quotes it.
     resource_pin: Option<String>,
     resource_error: Option<String>,
+    /// The bundle itself: the user's engine gets it too.
+    bundle: Option<ResourceBundle>,
+    /// What the user's engine is compiled from, to recompile it when the bundle changes.
+    user: UserRules,
 }
 
 pub struct Lists {
@@ -153,6 +158,18 @@ impl Lists {
         let rows = catalogue::selected(inner.selection.as_deref()).into_iter().map(|l| Source { id: l.id.to_string(), url: Some(l.url.to_string()), trusted: l.trusted });
         let own = inner.custom.iter().filter(|c| c.enabled).map(|c| Source { id: c.id.clone(), url: c.url.clone(), trusted: false });
         rows.chain(own).collect()
+    }
+
+    /// The user's engine for these rules, with the bundle in use. The rules are
+    /// kept, so a bundle that changes later reaches this engine's successor at
+    /// the same swap as the lists ([`Self::compile_and_swap`]).
+    pub fn user_engine_for(&self, user: UserRules) -> RuleEngine {
+        let bundle = {
+            let mut inner = self.inner();
+            inner.user = user.clone();
+            inner.bundle.clone()
+        };
+        user_engine(&user, bundle.as_ref())
     }
 
     /// The policy's selection changed: fetch and compile what it names now.
@@ -399,24 +416,37 @@ impl Lists {
             let texts: Vec<ListText<'_>> = copies.iter().filter_map(|(s, t)| t.as_deref().map(|text| ListText { id: &s.id, text, trusted: s.trusted })).collect();
             let mut engine = compile(&texts);
             let (loaded, resource_error) = dir.as_deref().map_or((None, None), |d| resources::load(d, resources::RESOURCE_PIN));
-            let resource_pin = loaded.map(|l| {
+            if let Some(l) = &loaded {
                 engine.use_resources(&l.bundle);
-                l.pin
-            });
+            }
             let versions: HashMap<String, String> = copies.iter().filter_map(|(s, t)| Some((s.id.clone(), list_version(t.as_deref()?)?))).collect();
             let missing: Vec<String> = copies.iter().filter(|(_, t)| t.is_none()).map(|(s, _)| s.id.clone()).collect();
-            (engine, missing, versions, resource_pin, resource_error)
+            (engine, missing, versions, loaded, resource_error)
         });
         match job.await {
-            Ok((engine, missing, versions, resource_pin, resource_error)) => {
+            Ok((engine, missing, versions, loaded, resource_error)) => {
                 let engine = Arc::new(engine);
-                self.slot.update(|f| DomainFilter::with_lists(f, engine.clone()));
+                let (resource_pin, bundle) = loaded.map_or((None, None), |l| (Some(l.pin), Some(l.bundle)));
+                // The user's engine follows a changed bundle in the same swap.
+                let (user_rules, bundle_changed) = {
+                    let inner = self.inner();
+                    (inner.user.clone(), inner.resource_pin != resource_pin)
+                };
+                let user = bundle_changed.then(|| Arc::new(user_engine(&user_rules, bundle.as_ref())));
+                self.slot.update(|f| {
+                    let mut next = DomainFilter::with_lists(f, engine.clone());
+                    if let Some(user) = &user {
+                        next.rules.user = user.clone();
+                    }
+                    next
+                });
                 let mut inner = self.inner();
                 inner.compile_ms = Some(millis(started.elapsed()));
                 inner.compile_error = None;
                 inner.versions = versions;
                 inner.resource_pin = resource_pin;
                 inner.resource_error = resource_error;
+                inner.bundle = bundle;
                 for id in missing {
                     if inner.states.get(&id).is_some_and(|s| s.fetched_at_ms.is_some()) {
                         inner.states.insert(id, FetchState::default());
@@ -789,6 +819,29 @@ mod tests {
         assert_eq!(l.facts().unwrap().resource_pin, None);
         assert!(l.compile_error().unwrap().contains("signed resource library"));
         assert!(blocks(&l, "ads.example"), "the lists still decide");
+    }
+
+    /// Live run 2026-11-08: a user's `+js()` rule injected nothing, because only
+    /// the lists' engine was given the bundle.
+    #[tokio::test]
+    async fn the_users_own_scriptlet_rules_get_the_bundle_too() {
+        const URL: &str = "https://sieve-test.invalid/";
+        const FIXTURE: &[u8] = include_bytes!("../../../sieve-filter/testdata/resources-fixture.json");
+        let dir = tempfile::tempdir().unwrap();
+        let l = lists_at(dir.path(), &[]);
+        let policy = Policy { user_rules: vec!["sieve-test.invalid##+js(sieve-set-flag, a, b)".into()], ..Policy::default() };
+        let user = Arc::new(l.user_engine_for(UserRules::of(&policy)));
+        l.slot.update(|f| DomainFilter::new(&policy, RuleSet { user, lists: f.rules.lists.clone() }));
+        let scriptlets = |l: &Lists| l.slot.get().rules.page_cosmetics(URL).scriptlets;
+        l.compile_and_swap().await;
+        assert!(!scriptlets(&l).contains("sieveSetFlag"), "the control: no bundle, no scriptlet");
+
+        let path = crate::update::data_path(dir.path(), &crate::update::Kind::Resources).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, FIXTURE).unwrap();
+        l.compile_and_swap().await;
+        assert!(scriptlets(&l).contains("sieveSetFlag"), "the bundle reaches the user's engine at the swap");
+        assert!(l.user_engine_for(UserRules::of(&policy)).page_cosmetics(URL).scriptlets.contains("sieveSetFlag"), "and a later policy's engine");
     }
 
     #[tokio::test]

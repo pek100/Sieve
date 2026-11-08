@@ -35,12 +35,15 @@ use crate::stack::book::FlowBook;
 use crate::tls::intercept::{Dial, HttpsSlot, Who};
 use fallback::QuicMeters;
 
-/// How a refused flow is told. Both arms are built and tested; which one stands
-/// is decided by the live numbers, `docs/live/engine-slice-8.md`.
+/// How a refused flow is told. The three arms are built and tested; which one
+/// stands is decided by the live numbers, `docs/live/engine-slice-8.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     PortUnreachable,
     SilentDrop,
+    /// Each client Initial gets a Version Negotiation packet through its UDP stream,
+    /// as a blocked flow does ([`answer_blocked`]); other datagrams are swallowed.
+    VersionNegotiation,
 }
 
 impl Refusal {
@@ -48,12 +51,15 @@ impl Refusal {
         match self {
             Self::PortUnreachable => "port_unreachable",
             Self::SilentDrop => "silent_drop",
+            Self::VersionNegotiation => "version_negotiation",
         }
     }
 }
 
-/// Plan section 3: if ICMP proves no faster than a drop, this word changes.
-pub const REFUSAL: Refusal = Refusal::PortUnreachable;
+/// Decided by the live numbers of 2026-11-08 (`docs/live/engine-slice-8.md`): after a Version
+/// Negotiation answer neither Edge nor Chrome waited out its own delay before TCP, where ICMP and
+/// a silent drop both left samples at about 300 ms.
+pub const REFUSAL: Refusal = Refusal::VersionNegotiation;
 
 /// The log's word for a refused flow. The app shows a slug it does not know
 /// with spaces (`reasonWords` in `src/core/log.ts`), so no protocol bump.
@@ -119,12 +125,19 @@ impl Reply<'_> {
     /// At most one small packet per datagram the local app itself sent, so
     /// there is no amplification and no rate limit to invent. A failed send
     /// leaves a silent drop, the fail-open direction.
-    fn answer(&self, datagram: &[u8]) {
-        if self.refusal == Refusal::SilentDrop {
-            return;
-        }
-        let Some(packet) = icmp::port_unreachable(self.ends.0, self.ends.1, datagram) else { return };
-        match self.sink.send(&packet) {
+    async fn answer<A: AsyncWrite + Unpin>(&self, app: &mut A, datagram: &[u8]) {
+        let sent = match self.refusal {
+            Refusal::SilentDrop => return,
+            Refusal::PortUnreachable => {
+                let Some(packet) = icmp::port_unreachable(self.ends.0, self.ends.1, datagram) else { return };
+                self.sink.send(&packet)
+            }
+            Refusal::VersionNegotiation => {
+                let Some(packet) = negotiate::version_negotiation(datagram) else { return };
+                app.write_all(&packet).await
+            }
+        };
+        match sent {
             Ok(()) => Meters::bump(&self.meters.replies),
             Err(_) => Meters::bump(&self.meters.send_failed),
         }
@@ -162,12 +175,12 @@ async fn answer_initial<A: AsyncWrite + Unpin>(app: &mut A, datagram: &[u8], ans
 /// datagram: with the switch off or the app Off the refusal ends, and the datagrams
 /// not answered are returned, to be judged as a new flow. None is lost. Empty when
 /// the flow simply ended. An idle flow costs nothing and needs no wake.
-pub async fn refuse<A: AsyncRead + Unpin>(app: &mut A, reply: &Reply<'_>, held: Vec<Vec<u8>>, buf: &mut [u8], idle: Duration, still_on: impl Fn() -> bool) -> Vec<Vec<u8>> {
+pub async fn refuse<A: AsyncRead + AsyncWrite + Unpin>(app: &mut A, reply: &Reply<'_>, held: Vec<Vec<u8>>, buf: &mut [u8], idle: Duration, still_on: impl Fn() -> bool) -> Vec<Vec<u8>> {
     for (at, datagram) in held.iter().enumerate() {
         if !still_on() {
             return held[at..].to_vec();
         }
-        reply.answer(datagram);
+        reply.answer(app, datagram).await;
     }
     while let Ok(Ok(n)) = tokio::time::timeout(idle, app.read(buf)).await {
         if n == 0 {
@@ -176,7 +189,7 @@ pub async fn refuse<A: AsyncRead + Unpin>(app: &mut A, reply: &Reply<'_>, held: 
         if !still_on() {
             return vec![buf[..n].to_vec()];
         }
-        reply.answer(&buf[..n]);
+        reply.answer(app, &buf[..n]).await;
     }
     Vec::new()
 }

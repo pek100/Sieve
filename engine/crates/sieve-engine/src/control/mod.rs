@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use sieve_filter::rules::{RuleEngine, RuleSet};
+use sieve_filter::rules::RuleSet;
 use sieve_ipc::{Blocker, CertStatus, DnsUpstreams, EngineStatus, ExclusionsView, FlowEvent, ListStatus, LogRow, Policy};
 use tokio::sync::{Notify, broadcast, watch};
 
@@ -24,7 +24,7 @@ use crate::ca::Ca;
 use crate::dns::service::{Mode, Service};
 use crate::dns::upstream::Upstream;
 use crate::dns::{NameMap, config};
-use crate::domain::{DomainFilter, FilterSlot, user_engine, user_rules_changed};
+use crate::domain::{DomainFilter, FilterSlot, UserRules};
 use crate::exclusions::ExclusionSlot;
 use crate::heal::{Heal, Retry};
 use crate::ipc::{Backend, HealAnswer, IssuesAnswer, Subscription};
@@ -157,9 +157,10 @@ impl Engine {
     pub fn new(dir: Option<PathBuf>, exe: PathBuf, policy: Policy, runs: Runs, crash_loop: Option<u32>) -> Self {
         // Flows pass until the lists' first snapshot lands (D13); the user's
         // own rules are small and hold from the start.
-        let rules = RuleSet { user: Arc::new(user_engine(&policy)), lists: Arc::new(RuleEngine::empty()) };
-        let filter = Arc::new(FilterSlot::new(DomainFilter::new(&policy, rules)));
+        let filter = Arc::new(FilterSlot::new(DomainFilter::new(&policy, RuleSet::empty())));
         let lists = Arc::new(Lists::new(dir.as_deref(), filter.clone(), policy.lists.clone()));
+        let user = Arc::new(lists.user_engine_for(UserRules::of(&policy)));
+        filter.update(|f| DomainFilter::new(&policy, RuleSet { user, lists: f.rules.lists.clone() }));
         lists.set_custom(policy.custom_lists.clone(), policy::wall_ms());
         let (dns_upstreams, unused_dns_file) = dir.as_deref().map(config::load).unwrap_or_else(|| (config::defaults(), None));
         let exclusions = Arc::new(ExclusionSlot::new(dir.as_deref(), &policy.exclusions, policy::wall_ms()));
@@ -220,7 +221,8 @@ impl Engine {
     /// recompiles nothing, the user's rules recompile their small engine, and
     /// a new list selection wakes the refresh task.
     fn apply_to_filter(&self, before: &Policy, now: &Policy) {
-        let user = user_rules_changed(before, now).then(|| Arc::new(user_engine(now)));
+        let user_rules = UserRules::of(now);
+        let user = (UserRules::of(before) != user_rules).then(|| Arc::new(self.lists.user_engine_for(user_rules)));
         self.filter.update(|f| {
             let rules = RuleSet { user: user.unwrap_or_else(|| f.rules.user.clone()), lists: f.rules.lists.clone() };
             DomainFilter::new(now, rules)
@@ -1246,7 +1248,7 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join(STATUS_FILE)).unwrap();
         assert!(!text.contains(HOST), "no host on disk");
         let status: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(status["quic"]["refusal"], "port_unreachable");
+        assert_eq!(status["quic"]["refusal"], "version_negotiation");
         assert_eq!(status["quic"]["refused"], 2);
         assert_eq!(status["quic"]["replies"], 0);
         assert_eq!(status["quic"]["send_failed"], 0);
