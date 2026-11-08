@@ -84,6 +84,31 @@ The median of the per-site differences is about +115 ms in Edge and +85 ms in Ch
 | Reboot, engine set not to start | PASS | engine 82DD52A8 on with everything, start type Manual, reboot: after sign-in the service was stopped, 0 routes on Sieve, no Sieve adapter; Resolve-DnsName 1.0 s, nslookup 1.15 s, curl https 1.34 s after the check began. Listing differences: only the Ethernet interface index (7 before, 6 after the boot) and one firewall rule's display name resolved from its resource string; nothing of Sieve's. Start type restored, engine started by hand: routes up |
 | Uninstall | PASS | `setup-cur.exe` (this branch at 73b413b, `pnpm tauri build`) installed over the old one silently (exit 0), everything on (`decrypting` true), then `uninstall.exe /S` (exit 0 in 0.9 s): service gone, 0 routes, no adapter, 0 Sieve roots in LocalMachine\Root, `Program Files\Sieve` empty, `ProgramData\Sieve` gone; lookups 0.64 s, nslookup 0.76 s, curl 0.92 s; listings as after the reboot (interface index only) |
 
+### DNS Client capture (branch `worktree-agent-ac848fb4eb311e301` at 89e216c, not merged)
+
+Engine CDD4A717 built from that worktree, installed in place of this run's engine, encryption on. Checks of its `docs/plans/2026-11-08-dns-client-capture.md`:
+
+| # | Result | Evidence |
+|---|---|---|
+| 1 | PASS | `dns_capture` `waiting` with routes up; Sieve's adapter lists fec0:0:0:ffff::1..3, three /128 routes, address fd53:6965:7665:1::1/128 |
+| 2 | FAIL | after `Clear-DnsClientCache; Resolve-DnsName example.com` the capture stayed `waiting` for the whole run: Server 2025's DNS Client never sent a query to the fec0 servers. Even with its usual server (10.128.0.1) blocked by a temporary firewall rule, the lookup failed in 32 ms and no query reached fec0 |
+| 3 | not reached | no "Sieve DNS capture" object, since the session never opened (3 dynamic sessions in `netsh wfp show state`, none Sieve's) |
+| 4 | FAIL | pktmon on the NIC: 137 plain port-53 packets leaving 10.128.0.2 for 10.128.0.1, all 30 fresh names from PowerShell, curl and Firefox among them, also after a Dnscache restart |
+| 5 | Reported | uncached lookups, median / p90: Sieve off 17 / 20 ms; capture build 17 / 23 ms; Sieve's adapter metric 1 17 / 19 ms; metric 500 17 / 20 ms. No extra delay, because nothing is captured |
+| 6 | PASS in part | plain mode: lookups answer, the queries leave to 10.128.0.1; failover SKIP (one server) |
+| 7 | PASS | the `.internal` name resolved to 10.128.0.2; `nslookup example.com 8.8.8.8` answered |
+| 8 | SKIP | no VPN on the VM |
+| 9 | PASS | DisabledComponents 0xFF, reboot: routes up, wikipedia.org and github.com loaded in Edge, `dns_capture` `failed`: "no path through Sieve's adapter: CreateUnicastIpAddressEntry fd53:6965:7665:1::1 failed: Win32 error 1168"; reverted |
+| 10 | PASS | removing fec0:0:0:ffff::1/128 gave `failed` "Sieve's adapter lacks the route fec0:0:0:ffff::1/128"; DNS kept working |
+| 11 | not reached | BFE restarted; the capture was never open, so stayed `waiting`; DNS worked after |
+| 12 | PASS | AAAA answers came back; `Test-NetConnection example.com -Port 443` went over IPv4 (104.20.23.154, source 198.18.0.1) |
+| 13 | SKIP | junction install not tried |
+| 14 | PASS | an NRPT rule for .example.org to 8.8.8.8: www.example.org resolved; rule removed |
+| 15 | PASS for what it can show | after `taskkill /F`, `sc stop` and an uninstall: 0 "Sieve DNS capture" objects and DNS working (Resolve-DnsName 0.01 s, curl 0.2 s). The session had never opened, so this does not prove the session's objects go away |
+| 16 | PASS | rebooted with Sieve installed and off: 0 capture objects, lookups and HTTPS normal |
+
+So on this Windows Server 2025 VM the design's premise does not hold: the DNS Client does not use the fec0 well-known servers of an adapter with no DNS server, even when its own server fails. The leak found in run 1 stays. The normal engine was put back afterwards (the slice 7 checks below install main's build).
+
 ### Slice 10 without the video site
 
 12 ad-heavy news sites, Edge and Chrome, a fresh profile per load, 6 s watched. `ads` counts visible ad elements, `adRequests` requests to ad hosts. Off and route ran on 709C9CAA, the content arms on 82DD52A8 (scriptletGlobals fixed, TEST bundle).
