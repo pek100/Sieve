@@ -26,6 +26,8 @@
  * - "Try decrypting again", only when the user asks (`tryDecryptAgain`). Self-healing's
  *   notices are read after each probe while the engine holds HTTPS on, and the rows
  *   only when their revision moved. A failed read keeps the rows and says why;
+ * - nothing about the apps' problems: they are read after each probe while the
+ *   engine routes (`issues`), only when their revision moved, and stay local;
  * - AdGuard's service, stopped or started only when the user clicks the
  *   pause offer (`stopAdguard`, `startAdguard`; Windows asks the user first).
  *
@@ -412,6 +414,29 @@ export function createEngineController({ engine, store, clock, settings, checks,
     }
   };
 
+  // Per probe while the engine routes: the apps only come when they changed, and
+  // a new run starts its revisions over, so its answer is read from the start. A
+  // failed read keeps the apps and says why; not routing clears them (the
+  // engine sees no traffic, so there is nothing true to show).
+  const readIssues = async () => {
+    if (!engineRoutes(get())) {
+      if (get().issues || get().issuesError) set({ issues: null, issuesError: null });
+      return;
+    }
+    try {
+      const held = get().issues ?? null;
+      let answer = await engine.issues(held?.revision ?? 0);
+      if (held && answer.run !== held.run) answer = await engine.issues(0);
+      if (held && answer.run === held.run && answer.revision === held.revision) {
+        if (get().issuesError) set({ issuesError: null });
+        return;
+      }
+      set({ issues: answer, issuesError: null });
+    } catch (e) {
+      set({ issuesError: message(e) });
+    }
+  };
+
   const tryDecryptAgain = async (line: string | null, app: string | null, reason: string | null) => {
     set({ exclusionsActionError: null });
     try {
@@ -449,6 +474,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
         await syncUpstreams();
         await readCert();
         await readHeal();
+        await readIssues();
       };
       probeNow = probe;
 

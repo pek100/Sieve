@@ -18,6 +18,8 @@ export interface Notice {
   /** Where it shows. Toasts auto-dismiss; banners stay until dismissed. */
   surface: "toast" | "banner";
   action?: NoticeAction;
+  /** Also worth a desktop notification, though it is no error banner (an app failing right after Sieve began filtering it). */
+  desktop?: boolean;
 }
 
 export interface NoticeBus {
@@ -27,8 +29,8 @@ export interface NoticeBus {
   subscribe(listener: () => void): () => void;
 }
 
-/** Worth a desktop notification: an error that stays until dismissed, the problems the app already raises. */
-export const desktopWorthy = (n: Pick<Notice, "kind" | "surface">) => n.kind === "error" && n.surface === "banner";
+/** Worth a desktop notification: an error that stays until dismissed, the problems the app already raises, or a notice that asks for one. */
+export const desktopWorthy = (n: Pick<Notice, "kind" | "surface" | "desktop">) => n.desktop === true || (n.kind === "error" && n.surface === "banner");
 
 export function createNoticeBus(): NoticeBus {
   let notices: readonly Notice[] = [];

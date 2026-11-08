@@ -20,6 +20,7 @@ import {
   parseEngineStatus,
   parseExclusionsPage,
   parseHealNotices,
+  parseIssues,
   parseListImported,
   parseListRules,
   parseLogTail,
@@ -31,6 +32,7 @@ import {
   type EngineStatus,
   type ExclusionsPage,
   type HealNotices,
+  type Issues,
   type ListImported,
   type ListRules,
   type LogTail,
@@ -86,6 +88,8 @@ export interface EngineSource {
   tryDecryptAgain(line: string | null, app: string | null, reason: string | null): Promise<ExclusionsPage>;
   /** What self-healing excluded since revision `after`, and the rows' revision. */
   healNotices(after: number): Promise<HealNotices>;
+  /** The apps with recent problems, when they changed since revision `after` (0: whatever they are). Local only. */
+  issues(after: number): Promise<Issues>;
 }
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -111,5 +115,6 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     exclusions: async (after) => parseExclusionsPage(await invoke<unknown>("engine_exclusions", { after })),
     tryDecryptAgain: async (line, app, reason) => parseExclusionsPage(await invoke<unknown>("engine_try_decrypt_again", { line, app, reason })),
     healNotices: async (after) => parseHealNotices(await invoke<unknown>("engine_heal_notices", { after })),
+    issues: async (after) => parseIssues(await invoke<unknown>("engine_issues", { after })),
   };
 }

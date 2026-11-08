@@ -11,9 +11,12 @@ import { StateLayer } from "@/components/sieve/primitives/state-layer";
 import { AppIcon } from "@/components/sieve/primitives/app-icon";
 import { iconExe, isActiveFlow } from "@/core/apps";
 import type { AppEntry } from "@/core/apps-actions";
+import { issueName } from "@/core/issues";
 import { canTurnOff } from "@/core/policy";
 import type { Flow } from "@/data/protocol";
+import { useEngine } from "@/hooks/use-sieve";
 import { AppExclusionsLine } from "./app-exclusions-line";
+import { AppProblems } from "./app-issues";
 import { CATEGORY_LABEL, type RowActions } from "./app-list";
 import { AppToggle, APP_OFF_MEANS } from "./app-toggle";
 import { Monogram } from "./monogram";
@@ -159,6 +162,10 @@ function Detail({ app, actions }: { app: AppEntry; actions: RowActions }) {
         )}
       </Section>
 
+      <CardBoundary title="Problems">
+        <AppProblems appKey={app.key} name={app.name} canTurnOff={canTurnOff(app.key) && on} turnOff={() => actions.setOn(app.key, false)} />
+      </CardBoundary>
+
       <Section title={app.exes.length === 1 ? "Path" : "Paths"}>
         {app.exes.length === 0 ? (
           <p className="text-body text-on-surface-faint">Windows does not say where this one lives.</p>
@@ -205,20 +212,41 @@ function Detail({ app, actions }: { app: AppEntry; actions: RowActions }) {
   );
 }
 
+/**
+ * An app that is not running: an updater that failed has often exited by the
+ * time anyone looks, so its problems and fixes still show, under its key.
+ */
+function Gone({ appKey, name, actions }: { appKey: string; name: string; actions: RowActions }) {
+  const issues = useEngine().issues?.apps.find((a) => a.key === appKey);
+  if (!issues) return <EmptyState line="Not here right now" body="This app is not running and is not one of your apps." />;
+  return (
+    <div className="flex flex-col gap-6 overflow-y-auto px-5 pb-6">
+      <CardBoundary title="Problems">
+        <AppProblems appKey={appKey} name={name} canTurnOff={canTurnOff(appKey) && actions.isOn(appKey)} turnOff={() => actions.setOn(appKey, false)} />
+      </CardBoundary>
+    </div>
+  );
+}
+
 /** Right sheet for one app, opened from a row or straight from `?app=<key>`. */
 export function AppDetailSheet({
   appKey,
   app,
   loading,
+  known,
   actions,
   onClose,
 }: {
   appKey: string | null;
   app: AppEntry | undefined;
   loading: boolean;
+  /** Apps and VM rows by key, to name an app that only has problems left. */
+  known: readonly { key: string; name: string }[];
   actions: RowActions;
   onClose: () => void;
 }) {
+  const issue = useEngine().issues?.apps.find((a) => a.key === appKey);
+  const title = app?.name ?? (issue ? issueName(issue, known) : (appKey ?? ""));
   return (
     <Sheet open={appKey !== null} onOpenChange={(o) => !o && onClose()}>
       <SheetContent
@@ -232,7 +260,7 @@ export function AppDetailSheet({
             </AppIcon>
           )}
           <div className="min-w-0">
-            <SheetTitle className="truncate text-title text-on-surface">{app?.name ?? appKey ?? ""}</SheetTitle>
+            <SheetTitle className="truncate text-title text-on-surface">{title}</SheetTitle>
             <SheetDescription className="text-label text-on-surface-muted">
               {app
                 ? `${CATEGORY_LABEL[app.category]} · ${app.activeCount} active ${app.activeCount === 1 ? "connection" : "connections"}`
@@ -244,8 +272,8 @@ export function AppDetailSheet({
         </SheetHeader>
         {app ? (
           <Detail app={app} actions={actions} />
-        ) : loading ? null : (
-          <EmptyState line="Not here right now" body="This app is not running and is not one of your apps." />
+        ) : loading || appKey === null ? null : (
+          <Gone appKey={appKey} name={title} actions={actions} />
         )}
       </SheetContent>
     </Sheet>

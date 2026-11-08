@@ -69,7 +69,7 @@ describe("exclusion line law", () => {
   it("every auto reason the crate declares has words of its own", () => {
     const body = FILTER.match(/impl AutoReason \{[\s\S]*?\n\}/)?.[0] ?? "";
     const slugs = slugsIn(body, "auto:");
-    expect(slugs).toHaveLength(3);
+    expect(slugs).toHaveLength(4);
     for (const slug of slugs) expect(exclusionReasonWords(slug), slug).not.toBe(slug);
   });
 });

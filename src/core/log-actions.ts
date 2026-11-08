@@ -41,7 +41,8 @@ export function rowActions(row: Pick<LogRow, "url" | "kind" | "host" | "remote" 
     copy_url: rowUrl(row) !== null,
     unblock: host !== "" && unblockable && kind === "blocked" && row.rule !== null,
     block: host !== "" && kind === "passed" && outcome?.reason === BLOCK_WOULD_APPLY,
-    do_not_decrypt: kind !== "not_decrypted",
+    // A problem row offers it only when decrypting was the problem; a retry is no decision at all.
+    do_not_decrypt: kind === "problem" ? outcome.signal === "app_refused_certificate" : kind !== "not_decrypted" && kind !== "retried",
     report: true,
   };
   return LOG_ACTIONS.filter((a) => applies[a]);

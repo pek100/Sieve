@@ -7,11 +7,12 @@
  * Changing a message shape bumps PROTOCOL and the fixture in one commit.
  */
 import { describe, expect, it } from "vitest";
-import { REASON_TEXT } from "@/core/log";
+import { CAUSE_TEXT, isIntended, SIGNAL_TEXT } from "@/core/issues";
+import { REASON_TEXT, RETRY_TEXT } from "@/core/log";
 import { MAX_POLICY_BYTES } from "@/core/settings/registry";
 import fixture from "@/data/fixtures/engine-ipc-v3.json";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
-import { BLOCKER_KINDS, CERT_STATES, EXCLUSION_SCOPES, FIREFOX_TRUST, LOG_OUTCOMES, parseCertStatus, parseEngineLists, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseLogTail, UPDATE_KINDS } from "@/data/protocol";
+import { BLOCKER_KINDS, CAUSES, CERT_STATES, EXCLUSION_SCOPES, FIREFOX_TRUST, LOG_OUTCOMES, parseCertStatus, parseEngineLists, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseIssues, parseLogTail, RETRY_HOWS, SIGNALS, UPDATE_KINDS } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -178,6 +179,24 @@ describe("engine IPC law", () => {
     for (const g of status.guests) expect(g.key).toBe(`vm:${(g.vm ?? "unidentified").toLowerCase()}`);
     const flows = fixture.engine.find((m) => m.type === "flows")! as unknown as { flows: { pid: number | null; forwarded: unknown }[] };
     for (const f of flows.flows) expect(f.pid === null || f.forwarded === null).toBe(true);
+  });
+
+  it("the app's signals, causes and retries are the crate's, each has words, and the app reads the issues fixture", () => {
+    const variants = (name: string) =>
+      ((RUST.match(new RegExp(`pub enum ${name} \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? "").match(/^\s{4}([A-Z]\w+),/gm) ?? []).map((v) =>
+        v.trim().replace(",", "").replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()),
+      );
+    expect(variants("Signal")).toEqual([...SIGNALS]);
+    expect(variants("Cause")).toEqual([...CAUSES]);
+    expect(variants("RetryHow")).toEqual([...RETRY_HOWS]);
+    for (const s of SIGNALS) expect(SIGNAL_TEXT[s], s).toBeTruthy();
+    for (const c of CAUSES) expect(CAUSE_TEXT[c], c).toBeTruthy();
+    for (const h of RETRY_HOWS) expect(RETRY_TEXT[h], h).toBeTruthy();
+    const intended = RUST.match(/pub fn intended\(self\) -> bool \{([\s\S]*?)\n    \}/)?.[1] ?? "";
+    const crateIntended = [...intended.matchAll(/Self::(\w+)/g)].map((m) => m[1].replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()));
+    expect(SIGNALS.filter((s) => isIntended({ signal: s }))).toEqual(crateIntended);
+    const body = Object.fromEntries(Object.entries(fixture.engine.find((m) => m.type === "issues")!).filter(([k]) => k !== "type"));
+    expect(parseIssues(body)).toEqual(body);
   });
 
   it("no message can sign, export or mint", () => {

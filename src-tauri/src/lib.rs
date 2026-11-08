@@ -72,6 +72,7 @@ pub fn run() {
             engine::engine_exclusions,
             engine::engine_try_decrypt_again,
             engine::engine_heal_notices,
+            engine::engine_issues,
             engine::engine_request_update,
             windns::windows_dns,
             filters::filter_catalogue,

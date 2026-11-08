@@ -136,6 +136,7 @@ const AUTO_WORDS: Readonly<Record<string, string>> = {
   "auto:pinning": "Rejected Sieve's certificate (auto)",
   "auto:client-cert": "Asks for a client certificate (auto)",
   "auto:ev": "EV certificate (auto)",
+  "auto:failing": "Kept failing while decrypted, so the whole app passes untouched for a day (auto)",
 };
 
 /** Every floor fact in words: what cannot be turned off, so never a row (plan 8.2). Held to `Floor::ALL` by a law. */

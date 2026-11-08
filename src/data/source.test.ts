@@ -25,6 +25,7 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
       lock: "none",
       welcome: false,
       heal: false,
+      issues: "none",
     });
     expect(sourceOptions({ search: "?seed=abc&scenario=nope", isTauri: false })).toEqual({
       kind: "mock",
@@ -39,12 +40,15 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
       lock: "none",
       welcome: false,
       heal: false,
+      issues: "none",
     });
   });
 
   it("?engine=<scenario> picks the mock engine's answer, default not installed; Tauri asks the command", async () => {
     expect(sourceOptions({ search: "?engine=idle", isTauri: false }).engine).toBe("idle");
     expect(sourceOptions({ search: "?engine=nope", isTauri: false }).engine).toBe("missing");
+    expect(sourceOptions({ search: "?issues=partial", isTauri: false }).issues).toBe("partial");
+    expect(sourceOptions({ search: "?issues=lots", isTauri: false }).issues).toBe("none");
     const idle = await createEngineSource(sourceOptions({ search: "?engine=idle", isTauri: false })).probe();
     expect(idle.pipe?.kind).toBe("welcome");
     expect(createEngineSource(sourceOptions({ search: "", isTauri: true })).kind).toBe("tauri");

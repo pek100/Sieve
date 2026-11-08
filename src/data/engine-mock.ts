@@ -32,6 +32,8 @@
  * `filtering.https` is unavailable, so this mock refuses being told off (refused
  * policies are retried at the next probe, not at once), and it has nothing to
  * tell on the first read, then one exclusion, then a second of the same group.
+ *
+ * Apps' problems answer per `?issues=` (see ISSUES_SCENARIOS), moved to the clock.
  */
 import { hash01 } from "./prng";
 import fixture from "./fixtures/engine-probe-v3.json";
@@ -47,6 +49,7 @@ import {
   parseEngineStatus,
   parseExclusionsPage,
   parseHealNotices,
+  parseIssues,
   parseLogTail,
   type CertStatus,
   type EngineCustomList,
@@ -131,9 +134,33 @@ const MOCK_RULES_SHOWN = 200;
 
 export const IMPORT_ANSWERS = ["ok", "cancel", "refused"] as const;
 
+/**
+ * `?issues=`: `some` answers the IPC fixture's example while the engine routes,
+ * `partial` an answer with missing, unknown and broken fields (degraded data),
+ * `error` fails every read; `none`, the default, has no app in trouble.
+ */
+export const ISSUES_SCENARIOS = ["none", "some", "partial", "error"] as const;
+export type IssuesScenario = (typeof ISSUES_SCENARIOS)[number];
+export const MOCK_ISSUES_ERROR = "the engine's problems could not be read";
+
+const issuesExample = parseIssues(ipc.engine.find((m) => m.type === "issues"));
+const ISSUES_EXAMPLE_NEWEST = Math.max(...issuesExample.apps.flatMap((a) => a.problems.map((p) => p.last_ms)));
+
+/** Old-schema and broken data the parser must survive: no counts, an unknown signal, a nameless app. */
+const PARTIAL_ISSUES = {
+  run: 1,
+  revision: 3,
+  apps: [
+    { key: "game launcher", problems: [{ signal: "app_refused_certificate", cause: "sieve", host: "cdn.game.example", count: 2, last_ms: ISSUES_EXAMPLE_NEWEST }, { signal: "teleported", cause: "sieve", count: 1, last_ms: 1 }] },
+    { key: "", problems: [{ signal: "stall", cause: "unknown", count: 1, last_ms: 1 }] },
+    { key: "updater", exe: 7, problems: [{ signal: "blocked", cause: "sieve", count: 3, last_ms: ISSUES_EXAMPLE_NEWEST - 30_000 }] },
+    null,
+  ],
+};
+
 export function createMockEngine(
   start: EngineScenario = "missing",
-  options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean; run?: number; importAnswer?: (typeof IMPORT_ANSWERS)[number] } = {},
+  options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean; run?: number; importAnswer?: (typeof IMPORT_ANSWERS)[number]; issues?: IssuesScenario; now?: () => number } = {},
 ): EngineSource {
   let scenario = start;
   let held: Omit<EnginePolicy, "revision" | "engine"> | null = null;
@@ -309,6 +336,18 @@ export function createMockEngine(
         rowsRevision += 1;
       }
       return page(0);
+    },
+    issues: async (after) => {
+      requireWelcome();
+      const run = options.run ?? 1;
+      const kind = options.issues ?? "none";
+      if (kind === "error") throw new Error(MOCK_ISSUES_ERROR);
+      if (kind === "none" || !ROUTES.includes(scenario)) return { run, revision: 0, apps: [], dropped: 0 };
+      const answer = kind === "partial" ? parseIssues(PARTIAL_ISSUES) : issuesExample;
+      // The example's times moved so its newest problem was a minute ago.
+      const shift = (options.now ?? Date.now)() - ISSUES_EXAMPLE_NEWEST - 60_000;
+      const apps = answer.apps.map((a) => ({ ...a, since_ms: a.since_ms + shift, problems: a.problems.map((p) => ({ ...p, first_ms: p.first_ms + shift, last_ms: p.last_ms + shift })) }));
+      return { ...answer, run, apps: answer.revision > after || after === 0 ? apps : [] };
     },
     healNotices: async (after) => {
       requireWelcome();
