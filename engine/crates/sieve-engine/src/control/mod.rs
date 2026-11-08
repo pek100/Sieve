@@ -370,6 +370,7 @@ impl Engine {
         let mut status = serde_json::to_value(self.status_saying(self.updates.status()))?;
         status["https"] = self.meters.https.report();
         status["quic"] = self.meters.quic.report(crate::quic::REFUSAL);
+        status["counters"]["tun_write_dropped"] = self.meters.tun_write_dropped.load(std::sync::atomic::Ordering::Relaxed).into();
         status["packet_path"] = lock(&self.beats.path).as_ref().map(|p| p.report()).unwrap_or(serde_json::Value::Null);
         self.validation.report(&mut status["https"]);
         status["content"] = self.meters.content.report();
@@ -919,8 +920,10 @@ mod tests {
         let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
         assert!(e.status_value().unwrap()["packet_path"].is_null());
         let progress = Arc::new(ipstack::Progress::default());
-        let mut path = crate::watchdog::PathWatch::new(e.meters.clone(), progress, e.meters.stack_offered());
-        Meters::bump(&e.meters.packets_in);
+        let offered = Arc::new(crate::watchdog::Offered::default());
+        let mut path = crate::watchdog::PathWatch::new(offered.clone(), progress);
+        offered.admit();
+        Meters::bump(&e.meters.tun_write_dropped);
         assert!(path.check(0).is_none());
         assert_eq!(path.check(crate::watchdog::STALL_MS).unwrap().what, "TUN to ipstack queue");
         *lock(&e.beats.path) = Some(path);
@@ -930,8 +933,11 @@ mod tests {
         assert_eq!(path["offered"], 1);
         assert_eq!(path["received"], 0);
         assert_eq!(path["waiting_stage"], "TUN to ipstack queue");
-        assert!(path.as_object().unwrap().iter().all(|(key, value)| key == "waiting_stage" || value.is_u64() || value.is_boolean()));
-        assert!(serde_json::to_value(e.status()).unwrap().get("packet_path").is_none(), "IPC unchanged");
+        assert!(path["exit_reason"].is_null(), "the worker has not ended");
+        assert!(path.as_object().unwrap().iter().all(|(key, value)| ["waiting_stage", "exit_reason"].contains(&key.as_str()) || value.is_u64() || value.is_boolean()));
+        assert_eq!(status["counters"]["tun_write_dropped"], 1);
+        let ipc = serde_json::to_value(e.status()).unwrap();
+        assert!(ipc.get("packet_path").is_none() && ipc["counters"].get("tun_write_dropped").is_none(), "IPC unchanged");
     }
 
     #[test]

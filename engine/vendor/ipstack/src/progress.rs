@@ -1,7 +1,7 @@
 //! Packet-loop progress, independent of the executor and flow tasks.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
 pub struct Progress {
@@ -10,6 +10,9 @@ pub struct Progress {
     pub(crate) writes_started: AtomicU64,
     pub(crate) writes_finished: AtomicU64,
     exited: AtomicBool,
+    /// Why the worker returned an error: a device read/write error or EOF.
+    /// Set before `exited`, and never for a worker aborted by its owner.
+    exit_reason: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -30,6 +33,14 @@ impl Progress {
             writes_finished: self.writes_finished.load(Ordering::Relaxed),
             exited: self.exited.load(Ordering::Acquire),
         }
+    }
+
+    pub fn exit_reason(&self) -> Option<String> {
+        self.exit_reason.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub(crate) fn record_exit(&self, reason: String) {
+        *self.exit_reason.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
     }
 }
 

@@ -47,6 +47,9 @@ pub struct Meters {
     pub not_unicast: AtomicU64,
     /// Admitted packets too large for the stack's read buffer, intentionally dropped.
     pub oversized: AtomicU64,
+    /// Packets to the adapter dropped because Wintun's send ring was full.
+    /// `status.json` only: not on the pipe.
+    pub tun_write_dropped: AtomicU64,
     pub blocked: AtomicU64,
     pub forwarded: AtomicU64,
     pub forwarded_named: AtomicU64,
@@ -133,13 +136,6 @@ impl ContentMeters {
 }
 
 impl Meters {
-    /// The existing adapter-arrival signal, excluding intentional input drops.
-    pub fn stack_offered(&self) -> u64 {
-        self.packets_in.load(Ordering::Relaxed)
-            .saturating_sub(self.not_unicast.load(Ordering::Relaxed))
-            .saturating_sub(self.oversized.load(Ordering::Relaxed))
-    }
-
     pub fn bump(c: &AtomicU64) {
         c.fetch_add(1, Ordering::Relaxed);
     }

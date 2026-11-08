@@ -1,13 +1,13 @@
 //! Windows: the Wintun adapter and its session as a packet device for
 //! ipstack (one IP packet per read and per write).
 //!
-//! A plain thread blocks in `receive_blocking` (no CPU while idle). Each
-//! packet it admits ([`super::admit`]) goes to the stack through a bounded
-//! channel; the TUN heartbeat is pending from the packet's arrival until the
-//! channel took it. The watchdog separately compares admitted arrivals with
-//! ipstack's consumed packets, without waiting for the channel to fill.
-//! `Session::shutdown` ends the thread.
+//! A plain thread blocks in `receive_blocking` (no CPU while idle) and runs
+//! [`super::read_packets`]: each packet it admits goes to the stack through a
+//! bounded channel. The watchdog separately compares this run's admitted
+//! arrivals ([`super::Input`]) with ipstack's consumed packets, without
+//! waiting for the channel to fill. `Session::shutdown` ends the thread.
 
+use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -15,12 +15,12 @@ use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
 use wintun_bindings::{Adapter, Session, Wintun};
 
 #[cfg(not(feature = "relay-experiments"))]
 use super::MTU;
-use super::{ADAPTER_GUID, RING_BYTES, TUNNEL_TYPE, admit, dll_beside, verify_dll};
-use crate::flow::packet;
+use super::{ADAPTER_GUID, Input, PacketSource, RING_BYTES, TUNNEL_TYPE, dll_beside, read_packets, verify_dll};
 use crate::quic::PacketSink;
 use crate::route::ADAPTER_NAME;
 use crate::route::apply::SieveLuid;
@@ -63,7 +63,7 @@ pub fn open(exe: &Path, #[cfg(feature = "relay-experiments")] mtu: u16) -> Resul
 pub struct TunDevice {
     session: Arc<Session>,
     rx: mpsc::Receiver<Vec<u8>>,
-    meters: Arc<Meters>,
+    input: Input,
     #[cfg(feature = "relay-experiments")]
     batch: Option<super::batch::Receiver>,
     #[cfg(feature = "relay-experiments")]
@@ -73,31 +73,19 @@ pub struct TunDevice {
 impl TunDevice {
     pub fn new(session: Arc<Session>, meters: Arc<Meters>, beats: Arc<Beats>) -> Self {
         let (tx, rx) = mpsc::channel(QUEUE);
-        let reader = session.clone();
-        let m = meters.clone();
+        let mut source = session.clone();
+        let input = Input::new(meters);
+        let counted = input.clone();
         let spawned = std::thread::Builder::new().name("sieve-tun".into()).spawn(move || {
-            while let Ok(p) = reader.receive_blocking() {
-                beats.tun.begin(monotonic_ms());
-                let bytes = p.bytes();
-                Meters::bump(&m.packets_in);
-                #[cfg(feature = "attribution-diagnostics")]
-                super::record_fingerprint(bytes, &m);
-                let admitted = packet::dst_ip(bytes).is_some_and(admit);
-                let sent = if admitted { tx.blocking_send(bytes.to_vec()).is_ok() } else { true };
-                if !admitted {
-                    Meters::bump(&m.not_unicast);
-                }
-                beats.tun.end();
-                if !sent {
-                    break;
-                }
+            if let Err(e) = read_packets(&mut source, &tx, &counted, &beats, monotonic_ms) {
+                eprintln!("sieve-engine: TUN reader: {e}");
             }
         });
         if let Err(e) = spawned {
             eprintln!("sieve-engine: TUN reader thread: {e}");
         }
         Self {
-            session, rx, meters,
+            session, rx, input,
             #[cfg(feature = "relay-experiments")]
             batch: None,
             #[cfg(feature = "relay-experiments")]
@@ -110,11 +98,11 @@ impl TunDevice {
         if settings.tun_batch == crate::experiments::BATCH_MIN {
             return Self::new(session, meters, beats);
         }
-        let (tx, batch) = super::batch::channel(QUEUE, settings.tun_mtu, settings.tun_batch);
+        let input = Input::new(meters);
+        let (tx, batch) = super::batch::channel(QUEUE, settings.tun_mtu, settings.tun_batch, input.clone());
         let mut source = session.clone();
-        let m = meters.clone();
         let reader = match std::thread::Builder::new().name("sieve-tun".into()).spawn(move || {
-            if let Err(e) = tx.run(&mut source, &m, &beats, monotonic_ms) {
+            if let Err(e) = tx.run(&mut source, &beats, monotonic_ms) {
                 eprintln!("sieve-engine: batched TUN reader: {e}");
             }
         }) {
@@ -125,8 +113,31 @@ impl TunDevice {
             }
         };
         let (_, rx) = mpsc::channel(QUEUE);
-        Self { session, rx, meters, batch: Some(batch), reader }
+        Self { session, rx, input, batch: Some(batch), reader }
     }
+
+    /// This run's admitted arrivals, for its packet-path watchdog.
+    pub fn offered(&self) -> Arc<crate::watchdog::Offered> {
+        self.input.offered.clone()
+    }
+}
+
+impl PacketSource for Arc<Session> {
+    type Packet = wintun_bindings::Packet;
+
+    fn receive_blocking(&mut self) -> io::Result<Option<Self::Packet>> {
+        match Session::receive_blocking(self) {
+            Ok(packet) => Ok(Some(packet)),
+            Err(wintun_bindings::Error::ShuttingDown) => Ok(None),
+            Err(e) => Err(io::Error::other(e)),
+        }
+    }
+
+    fn try_receive(&mut self) -> io::Result<Option<Self::Packet>> {
+        Session::try_receive(self).map_err(io::Error::other)
+    }
+
+    fn bytes(packet: &Self::Packet) -> &[u8] { packet.bytes() }
 }
 
 #[cfg(feature = "relay-experiments")]
@@ -156,7 +167,7 @@ impl AsyncRead for TunDevice {
             match ready!(self.rx.poll_recv(cx)) {
                 // Larger than ipstack's buffer: dropped rather than truncated.
                 Some(packet) if packet.len() > buf.remaining() => {
-                    Meters::bump(&self.meters.oversized);
+                    self.input.oversized();
                     continue;
                 }
                 Some(packet) => {
@@ -171,12 +182,29 @@ impl AsyncRead for TunDevice {
 
 /// One IP packet onto the adapter. Wintun documents allocate and send as safe to
 /// call from several threads, so the stack and [`TunSink`] can both write.
-fn write_packet(session: &Arc<Session>, meters: &Meters, bytes: &[u8]) -> std::io::Result<()> {
-    let len = u16::try_from(bytes.len()).map_err(|_| std::io::Error::other("packet larger than 65535"))?;
-    let mut packet = session.allocate_send_packet(len).map_err(std::io::Error::other)?;
+/// Both TUN readers (default and batched) write through here.
+fn write_packet(session: &Arc<Session>, meters: &Meters, bytes: &[u8]) -> io::Result<()> {
+    let len = u16::try_from(bytes.len()).map_err(|_| io::Error::other("packet larger than 65535"))?;
+    let mut packet = match session.allocate_send_packet(len) {
+        Ok(packet) => packet,
+        Err(e) => return allocation_failed(e, meters),
+    };
     packet.bytes_mut().copy_from_slice(bytes);
     session.send_packet(packet);
     Meters::bump(&meters.packets_out);
+    Ok(())
+}
+
+/// `WintunAllocateSendPacket` fails with ERROR_BUFFER_OVERFLOW while the send
+/// ring is full: Windows has not yet taken earlier packets. That drops this
+/// one packet, as a full NIC queue would, and the writer carries on. Any
+/// other failure ends the writer (and with it ipstack's worker).
+fn allocation_failed(e: wintun_bindings::Error, meters: &Meters) -> io::Result<()> {
+    let ring_full = matches!(&e, wintun_bindings::Error::Io(io) if io.raw_os_error() == Some(ERROR_BUFFER_OVERFLOW.0 as i32));
+    if !ring_full {
+        return Err(io::Error::other(e));
+    }
+    Meters::bump(&meters.tun_write_dropped);
     Ok(())
 }
 
@@ -203,7 +231,7 @@ impl PacketSink for TunSink {
 
 impl AsyncWrite for TunDevice {
     fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        write_packet(&self.session, &self.meters, buf)?;
+        write_packet(&self.session, &self.input.meters, buf)?;
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -213,5 +241,29 @@ impl AsyncWrite for TunDevice {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY;
+
+    /// The error `WintunAllocateSendPacket` leaves, as wintun-bindings wraps it.
+    fn allocate_error(code: u32) -> wintun_bindings::Error {
+        wintun_bindings::Error::Io(io::Error::from_raw_os_error(code as i32))
+    }
+
+    #[test]
+    fn a_full_send_ring_drops_one_packet_and_every_other_failure_stays_terminal() {
+        let meters = Meters::default();
+        assert!(allocation_failed(allocate_error(ERROR_BUFFER_OVERFLOW.0), &meters).is_ok(), "the writer carries on");
+        assert_eq!(meters.tun_write_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(meters.packets_out.load(Ordering::Relaxed), 0, "nothing reached the adapter");
+        for e in [allocate_error(ERROR_NOT_ENOUGH_MEMORY.0), wintun_bindings::Error::ShuttingDown, "closed".into()] {
+            assert!(allocation_failed(e, &meters).is_err());
+        }
+        assert_eq!(meters.tun_write_dropped.load(Ordering::Relaxed), 1);
     }
 }

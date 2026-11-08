@@ -22,7 +22,7 @@ use std::time::Duration;
 mod path;
 #[cfg(test)]
 mod path_tests;
-pub use path::PathWatch;
+pub use path::{Offered, PathWatch};
 
 /// A component stalled when it stayed pending this long (plan
 /// `watchdog.stallMs`, declared 5000 ms: long enough for a busy relay to
@@ -84,11 +84,14 @@ pub struct Beats {
 pub struct Stall {
     pub what: &'static str,
     pub ms: u64,
+    /// The stalled component's own error, when it ended with one.
+    pub detail: Option<String>,
 }
 
 impl Stall {
     pub fn reason(&self) -> String {
-        format!("the watchdog stopped the engine: the {} did not answer for {} ms", self.what, self.ms)
+        let detail = self.detail.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
+        format!("the watchdog stopped the engine: the {} did not answer for {} ms{detail}", self.what, self.ms)
     }
 }
 
@@ -96,7 +99,7 @@ impl Stall {
 pub fn stalled(beats: &Beats, now_ms: u64, stall_ms: u64) -> Option<Stall> {
     [("TUN reader", &beats.tun), ("relay", &beats.relay)].into_iter().find_map(|(what, b)| {
         let ms = now_ms.saturating_sub(b.pending_since()?);
-        (ms >= stall_ms).then_some(Stall { what, ms })
+        (ms >= stall_ms).then_some(Stall { what, ms, detail: None })
     })
 }
 
@@ -203,7 +206,7 @@ mod tests {
         assert_eq!(check(&arm, &beats, hung_at, &ping), None);
         assert_eq!(check(&arm, &beats, hung_at + STALL_MS - 1, &ping), None);
         let stall = check(&arm, &beats, hung_at + STALL_MS, &ping).expect("tripped");
-        assert_eq!(stall, Stall { what: "relay", ms: STALL_MS });
+        assert_eq!(stall, Stall { what: "relay", ms: STALL_MS, detail: None });
 
         struct Record(RefCell<Vec<String>>);
         impl Trip for Record {
@@ -232,6 +235,6 @@ mod tests {
         let beats = Beats::default();
         let ping = || beats.relay.end();
         beats.tun.begin(100);
-        assert_eq!(check(&arm, &beats, 100 + STALL_MS, &ping), Some(Stall { what: "TUN reader", ms: STALL_MS }));
+        assert_eq!(check(&arm, &beats, 100 + STALL_MS, &ping), Some(Stall { what: "TUN reader", ms: STALL_MS, detail: None }));
     }
 }
