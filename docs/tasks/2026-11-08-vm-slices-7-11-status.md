@@ -26,11 +26,11 @@ Engine 709C9CAA (this branch at 3850222 with the TEST bundle pinned: uBO 3762a26
 |---|---|---|
 | U1 example.com, Edge and Chrome | PASS | `<style nonce=...>` right after `<head>`; `example.com##p` hid 6 of 6 `p`; `rewritten` +1 per load in each. Today's example.com has no `h1`, so the runbook's `example.com##h1` matches nothing (runbook to update) |
 | U1 Firefox 159 | PASS in part | headless Firefox took Sieve's certificate (`intercepted` +3) and `rewritten` +1; the screenshot is on the VM (`C:\sieve\logs\s9\ff-example2.png`), not read here |
-| U1 user scriptlet | FAIL, then fixed | Before 3850222 a user's `+js()` rule injected nothing (`with_scriptlets` +0 on example.com): only the lists' engine had the bundle. After: `with_scriptlets` +1 per load. The probe global still read `undefined` on example.com, github.com, MDN, accounts.google.com and web.dev, and 42 on www.youtube.com: not explained yet (see "Open") |
+| U1 user scriptlet | FAIL, then fixed | Before 3850222 a user's `+js()` rule injected nothing (`with_scriptlets` +0 on example.com): only the lists' engine had the bundle. After: `with_scriptlets` +1 per load. The page still showed nothing: the scriptletGlobals defect below. After 8726598: `data-sieve-probe` = 1 on all six pages in Edge and Chrome, 0 CSP or Trusted Types reports |
 | Bundle | FAIL, then fixed | The assembled uBO 3762a26 bundle was refused whole: "resource trusted-prevent-xhr.js is named trusted but any list could inject it" (uBO registers it without `requiresTrust`). Fixed in the bundle script (6dc6a8d) |
 | U2 header CSP, Trusted Types | PASS | github.com, www.google.com search, www.youtube.com (TT), developer.mozilla.org, accounts.google.com (TT), web.dev: 0 CSP or Trusted Types reports, and each site's hiding rule applied (footer 1/1, textarea 1/1, ytd-masthead 1/1, accounts h1 1/1). Google's results page threw `solveSimpleChallenge is not defined`: its bot challenge for this IP; not compared with Sieve off |
 | U2 meta CSP | SKIP | none of the six pages had one |
-| U3 scriptlet with Trusted Types | PASS on YouTube | `sieveProbe` = 42 on www.youtube.com (TT enforced); `undefined` on accounts.google.com (TT) as on the non-TT pages, so TT is not the cause |
+| U3 scriptlet with Trusted Types | PASS | after 8726598 a user `set-attr` scriptlet ran on www.youtube.com and accounts.google.com (both enforce Trusted Types) and on the four pages without; the uBO `world: 'ISOLATED'` question was not run |
 | U4 budgets | Reported | the generic stylesheet adds about 540 KB to every page (example.com: 557,840 bytes delivered); load times in "Real use" |
 | U5 skip counts | Reported | default lists: adguard-base 74,227 applied / 3,712 skipped, adguard-tracking 437,184 / 14, adguard-url-tracking 2,528 / 208, adguard-dns 190,790 / 7, ubo-badware 4,675 / 65 |
 | U6 | SKIP | no site with trailing gzip bytes or a shared dictionary was found |
@@ -41,7 +41,7 @@ Engine 709C9CAA (this branch at 3850222 with the TEST bundle pinned: uBO 3762a26
 
 ### DNS just after a start
 
-`d-dnsstart.ps1`, three engine restarts, `nslookup` every 150 ms: for about 3 s after `routes_up` lookups through the TUN got no address (rounds: 2.4 to 5.6 s, 0.5 to 3.8 s, 0.3 to 3.9 s after the start), then answered. A browser opened right after a policy restart fails its first names (`ERR_NAME_NOT_RESOLVED`). Not investigated further yet.
+`d-dnsstart.ps1`, three engine restarts, `nslookup` every 150 ms: for about 3 s after `routes_up` lookups through the TUN got no answer (rounds: 2.4 to 5.6 s, 0.5 to 3.8 s, 0.3 to 3.9 s after the start; a second run 0.3 to 4.1 s and 0.6 to 3.7 s), then answered. nslookup (2 s timeout, one retry) said "No response from server": the engine took the queries and answered none in time, most likely while its encrypted upstream connected. A browser opened right after a policy restart fails its first names (`ERR_NAME_NOT_RESOLVED`). Not investigated further yet.
 
 ### Real use
 
@@ -81,6 +81,25 @@ The median of the per-site differences is about +115 ms in Edge and +85 ms in Ch
 | Check | Result | Evidence |
 |---|---|---|
 | Kill (`taskkill /F`), slice 6 U12, encrypted-dns 9, dns-extras 14 | PASS | after the kill: Resolve-DnsName 0.38 s, nslookup 0.07 s, curl https 0.18 s; routes on Sieve 0, adapter gone; route, DNS, proxy, firewall and adapter listings 0 lines different from the before-listing. The service's own recovery restarted the engine within 70 s with routes up. The download in flight was not measured cleanly (the curl arguments broke) |
+| Reboot, engine set not to start | PASS | engine 82DD52A8 on with everything, start type Manual, reboot: after sign-in the service was stopped, 0 routes on Sieve, no Sieve adapter; Resolve-DnsName 1.0 s, nslookup 1.15 s, curl https 1.34 s after the check began. Listing differences: only the Ethernet interface index (7 before, 6 after the boot) and one firewall rule's display name resolved from its resource string; nothing of Sieve's. Start type restored, engine started by hand: routes up |
+| Uninstall | PASS | `setup-cur.exe` (this branch at 73b413b, `pnpm tauri build`) installed over the old one silently (exit 0), everything on (`decrypting` true), then `uninstall.exe /S` (exit 0 in 0.9 s): service gone, 0 routes, no adapter, 0 Sieve roots in LocalMachine\Root, `Program Files\Sieve` empty, `ProgramData\Sieve` gone; lookups 0.64 s, nslookup 0.76 s, curl 0.92 s; listings as after the reboot (interface index only) |
+
+### Slice 10 without the video site
+
+12 ad-heavy news sites, Edge and Chrome, a fresh profile per load, 6 s watched. `ads` counts visible ad elements, `adRequests` requests to ad hosts. Off and route ran on 709C9CAA, the content arms on 82DD52A8 (scriptletGlobals fixed, TEST bundle).
+
+| Arm | Edge ads | Edge ad requests | Chrome ads | Chrome ad requests | Loaded |
+|---|---|---|---|---|---|
+| Sieve off | 134 | 4761 | 137 | 4104 | 11/12, 12/12 |
+| Route only (DNS and connection filtering, no decryption) | 50 | 201 | 50 | 199 | 12/12 |
+| Content, default lists (`blocked` +626, `rewritten` +23 and +20, `with_scriptlets` +19 and +16) | 0 | 64 | 0 | 64 | 12/12 |
+| Content, default plus uBO lists | 0 | 57 | 0 | 57 | 12/12 |
+
+- Default list set: PASS on these sites, 0 visible ad elements in both browsers with content filtering, against 134 and 137 with Sieve off.
+- uBO arm: inconclusive. The three uBO lists were downloaded during the arm (20:55 UTC) but `status.filter.lists` still showed only the five default lists when the 300 s wait ended, so the run cannot say they were compiled. It changes nothing here: the default arm already showed 0 ads.
+- A first content run before the scriptletGlobals fix gave the same 0 ads (scriptlets did not run then), so on these sites the hiding and blocking rules alone remove what the probe counts.
+- Video playback: SKIP, YouTube blocks this data-centre IP (run 1).
+- Real use again with 82DD52A8: the same 20 sites loaded, no page broken (same status and text as off), `with_scriptlets` +13 (Edge) and +6 (Chrome); load times single samples, in the same range as above.
 
 ### Slice 11: CT, CRLite, upstream ECH
 
