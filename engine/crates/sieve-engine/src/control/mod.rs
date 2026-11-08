@@ -370,7 +370,10 @@ impl Engine {
         let mut status = serde_json::to_value(self.status_saying(self.updates.status()))?;
         status["https"] = self.meters.https.report();
         status["quic"] = self.meters.quic.report(crate::quic::REFUSAL);
-        status["counters"]["tun_write_dropped"] = self.meters.tun_write_dropped.load(std::sync::atomic::Ordering::Relaxed).into();
+        let local = |c: &std::sync::atomic::AtomicU64| serde_json::Value::from(c.load(std::sync::atomic::Ordering::Relaxed));
+        status["counters"]["tun_write_dropped"] = local(&self.meters.tun_write_dropped);
+        status["counters"]["udp_too_big"] = local(&self.meters.udp_too_big);
+        status["counters"]["udp_too_big_unanswered"] = local(&self.meters.udp_too_big_unanswered);
         status["packet_path"] = lock(&self.beats.path).as_ref().map(|p| p.report()).unwrap_or(serde_json::Value::Null);
         self.validation.report(&mut status["https"]);
         status["content"] = self.meters.content.report();
@@ -924,6 +927,7 @@ mod tests {
         let mut path = crate::watchdog::PathWatch::new(offered.clone(), progress);
         offered.admit();
         Meters::bump(&e.meters.tun_write_dropped);
+        Meters::bump(&e.meters.udp_too_big);
         assert!(path.check(0).is_none());
         assert_eq!(path.check(crate::watchdog::STALL_MS).unwrap().what, "TUN to ipstack queue");
         *lock(&e.beats.path) = Some(path);
@@ -936,8 +940,10 @@ mod tests {
         assert!(path["exit_reason"].is_null(), "the worker has not ended");
         assert!(path.as_object().unwrap().iter().all(|(key, value)| ["waiting_stage", "exit_reason"].contains(&key.as_str()) || value.is_u64() || value.is_boolean()));
         assert_eq!(status["counters"]["tun_write_dropped"], 1);
+        assert_eq!((&status["counters"]["udp_too_big"], &status["counters"]["udp_too_big_unanswered"]), (&1.into(), &0.into()));
         let ipc = serde_json::to_value(e.status()).unwrap();
         assert!(ipc.get("packet_path").is_none() && ipc["counters"].get("tun_write_dropped").is_none(), "IPC unchanged");
+        assert!(ipc["counters"].get("udp_too_big").is_none(), "IPC unchanged");
     }
 
     #[test]

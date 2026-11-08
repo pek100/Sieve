@@ -19,6 +19,9 @@
 
 # engine workspace (its own target dir); Wintun binaries are never committed
 /engine/target/
+# the vendored ipstack's own unit tests build outside the workspace
+/engine/vendor/ipstack/target/
+/engine/vendor/ipstack/Cargo.lock
 /engine/**/*.dll
 /engine/**/*.sys
 

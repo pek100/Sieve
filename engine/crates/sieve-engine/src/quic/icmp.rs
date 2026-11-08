@@ -1,10 +1,13 @@
-//! The port-unreachable a refused flow is answered with, written into the TUN.
+//! The ICMP errors the relay answers an app's datagram with, written into the TUN:
+//! port unreachable for a refused flow, packet too big for a datagram larger than
+//! the real path (`stack::path_mtu`).
 //!
 //! ipstack hands the relay the payload and the two addresses, so the app's IP
 //! and UDP headers are gone and the quote is rebuilt from them (task F1): its
 //! checksums and lengths are right, its IP id and TTL cannot match the original
 //! (live check U1). The outer packet comes from `remote` to `local`: the
-//! destination itself says the port is closed.
+//! destination itself says the port is closed, or the path that leads to it
+//! says the datagram does not fit.
 
 use std::net::SocketAddr;
 
@@ -27,17 +30,39 @@ fn written(size: usize, write: impl FnOnce(&mut Vec<u8>) -> Result<(), BuildWrit
     Some(out)
 }
 
-/// The answer to one datagram the app sent from `local` to `remote`. None for
-/// mixed families or a datagram too large to rebuild: the flow then behaves as a
-/// silent drop, so the browser's own timer takes it to TCP.
+/// What an answer tells the app about its datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unreachable {
+    Port,
+    /// Larger than the path, whose MTU it carries (RFC 1191, RFC 8201).
+    TooBig { mtu: u16 },
+}
+
+/// The port unreachable for one datagram the app sent from `local` to `remote`.
+/// None for mixed families or a datagram too large to rebuild: the flow then
+/// behaves as a silent drop, so the browser's own timer takes it to TCP.
 pub fn port_unreachable(local: SocketAddr, remote: SocketAddr, datagram: &[u8]) -> Option<Vec<u8>> {
+    answer(local, remote, datagram, Unreachable::Port)
+}
+
+/// The packet too big (ICMPv4 fragmentation needed, ICMPv6 packet too big) for
+/// one datagram larger than a path of `mtu` bytes. None as for [`port_unreachable`].
+pub fn packet_too_big(local: SocketAddr, remote: SocketAddr, datagram: &[u8], mtu: u16) -> Option<Vec<u8>> {
+    answer(local, remote, datagram, Unreachable::TooBig { mtu })
+}
+
+fn answer(local: SocketAddr, remote: SocketAddr, datagram: &[u8], why: Unreachable) -> Option<Vec<u8>> {
     match (local, remote) {
         (SocketAddr::V4(l), SocketAddr::V4(r)) => {
             let (app, far) = (l.ip().octets(), r.ip().octets());
             let quote = PacketBuilder::ipv4(app, far, TTL).udp(l.port(), r.port());
             let quote = written(quote.size(datagram.len()), |out| quote.write(out, datagram))?;
             let cut = &quote[..quote.len().min(ICMP4_MAX - IP4_HEADER - ICMP_HEADER)];
-            let error = PacketBuilder::ipv4(far, app, TTL).icmpv4(Icmpv4Type::DestinationUnreachable(icmpv4::DestUnreachableHeader::Port));
+            let header = match why {
+                Unreachable::Port => icmpv4::DestUnreachableHeader::Port,
+                Unreachable::TooBig { mtu } => icmpv4::DestUnreachableHeader::FragmentationNeeded { next_hop_mtu: mtu },
+            };
+            let error = PacketBuilder::ipv4(far, app, TTL).icmpv4(Icmpv4Type::DestinationUnreachable(header));
             written(error.size(cut.len()), |out| error.write(out, cut))
         }
         (SocketAddr::V6(l), SocketAddr::V6(r)) => {
@@ -45,7 +70,11 @@ pub fn port_unreachable(local: SocketAddr, remote: SocketAddr, datagram: &[u8]) 
             let quote = PacketBuilder::ipv6(app, far, TTL).udp(l.port(), r.port());
             let quote = written(quote.size(datagram.len()), |out| quote.write(out, datagram))?;
             let cut = &quote[..quote.len().min(ICMP6_MAX - IP6_HEADER - ICMP_HEADER)];
-            let error = PacketBuilder::ipv6(far, app, TTL).icmpv6(Icmpv6Type::DestinationUnreachable(icmpv6::DestUnreachableCode::Port));
+            let kind = match why {
+                Unreachable::Port => Icmpv6Type::DestinationUnreachable(icmpv6::DestUnreachableCode::Port),
+                Unreachable::TooBig { mtu } => Icmpv6Type::PacketTooBig { mtu: u32::from(mtu) },
+            };
+            let error = PacketBuilder::ipv6(far, app, TTL).icmpv6(kind);
             written(error.size(cut.len()), |out| error.write(out, cut))
         }
         _ => None,
@@ -97,10 +126,18 @@ pub(super) mod tests {
         p
     }
 
-    /// The whole answer by the witness: its checksums, its kind, who sent it to
-    /// whom, and the flow its quote names. Returns the quote.
+    /// The whole port unreachable by the witness: its checksums, its kind, who sent
+    /// it to whom, and the flow its quote names. Returns the quote.
     pub(in crate::quic) fn assert_answers(packet: &[u8], local: SocketAddr, remote: SocketAddr) -> Vec<u8> {
-        let (quote, kind_code) = match (local.ip(), remote.ip()) {
+        let (quote, header) = assert_error(packet, local, remote);
+        assert_eq!((header[0], header[1]), if local.is_ipv4() { (3, 3) } else { (1, 4) }, "port unreachable");
+        quote
+    }
+
+    /// Any ICMP error by the witness, its kind aside. Returns the quote and the
+    /// ICMP header.
+    fn assert_error(packet: &[u8], local: SocketAddr, remote: SocketAddr) -> (Vec<u8>, [u8; ICMP_HEADER]) {
+        let (quote, header) = match (local.ip(), remote.ip()) {
             (IpAddr::V4(l), IpAddr::V4(r)) => {
                 assert_eq!(packet[0], 0x45);
                 assert!(packet.len() <= ICMP4_MAX, "{}", packet.len());
@@ -110,7 +147,7 @@ pub(super) mod tests {
                 assert_eq!((&packet[12..16], &packet[16..20]), (&r.octets()[..], &l.octets()[..]), "from the destination to the app");
                 let icmp = &packet[IP4_HEADER..];
                 assert!(holds(&[icmp]), "the ICMP checksum");
-                (icmp[ICMP_HEADER..].to_vec(), (icmp[0], icmp[1]))
+                (icmp[ICMP_HEADER..].to_vec(), icmp[..ICMP_HEADER].try_into().unwrap())
             }
             (IpAddr::V6(l), IpAddr::V6(r)) => {
                 assert_eq!(packet[0] >> 4, 6);
@@ -120,11 +157,10 @@ pub(super) mod tests {
                 assert_eq!((&packet[8..24], &packet[24..40]), (&r.octets()[..], &l.octets()[..]), "from the destination to the app");
                 let icmp = &packet[IP6_HEADER..];
                 assert!(holds(&[&pseudo(&packet[8..24], &packet[24..40], ICMP6_NEXT_HEADER, icmp.len()), icmp]), "the ICMPv6 checksum over the pseudo-header");
-                (icmp[ICMP_HEADER..].to_vec(), (icmp[0], icmp[1]))
+                (icmp[ICMP_HEADER..].to_vec(), icmp[..ICMP_HEADER].try_into().unwrap())
             }
             _ => panic!("mixed families have no answer"),
         };
-        assert_eq!(kind_code, if local.is_ipv4() { (3, 3) } else { (1, 4) }, "port unreachable");
         let (src, dst, udp) = match local {
             SocketAddr::V4(_) => (&quote[12..16], &quote[16..20], &quote[IP4_HEADER..]),
             SocketAddr::V6(_) => (&quote[8..24], &quote[24..40], &quote[IP6_HEADER..]),
@@ -136,7 +172,29 @@ pub(super) mod tests {
         assert_eq!((src, dst), (&octets(local.ip())[..], &octets(remote.ip())[..]), "the quote is the app's flow");
         assert_eq!(u16::from_be_bytes([udp[0], udp[1]]), local.port());
         assert_eq!(u16::from_be_bytes([udp[2], udp[3]]), remote.port());
-        quote
+        (quote, header)
+    }
+
+    /// RFC 1191 section 4: type 3 code 4, the next-hop MTU in the header's low 16 bits.
+    /// RFC 4443 section 3.2: type 2 code 0, the MTU in the header's last 32 bits.
+    #[test]
+    fn packet_too_big_carries_the_path_mtu_and_quotes_the_datagram() {
+        const PATH_MTU: u16 = 1460;
+        let datagram = [5u8; 8_000];
+        for (local, remote) in [(addr(LOCAL4), addr(REMOTE4)), (addr(LOCAL6), addr(REMOTE6))] {
+            let packet = packet_too_big(local, remote, &datagram, PATH_MTU).unwrap();
+            let (quote, header) = assert_error(&packet, local, remote);
+            if local.is_ipv4() {
+                assert_eq!((header[0], header[1]), (3, 4), "fragmentation needed");
+                assert_eq!((u16::from_be_bytes([header[4], header[5]]), u16::from_be_bytes([header[6], header[7]])), (0, PATH_MTU));
+                assert_eq!(usize::from(u16::from_be_bytes([quote[2], quote[3]])), IP4_HEADER + 8 + datagram.len(), "the quote's length is the original's");
+            } else {
+                assert_eq!((header[0], header[1]), (2, 0), "packet too big");
+                assert_eq!(u32::from_be_bytes([header[4], header[5], header[6], header[7]]), u32::from(PATH_MTU));
+                assert_eq!(usize::from(u16::from_be_bytes([quote[4], quote[5]])), 8 + datagram.len(), "the quote's length is the original's");
+            }
+        }
+        assert_eq!(packet_too_big(addr(LOCAL4), addr(REMOTE6), b"x", PATH_MTU), None, "mixed families");
     }
 
     #[test]
