@@ -403,8 +403,10 @@ impl Engine {
     /// `dns-status.json`'s content: the mode the user chose, and the sessions and
     /// counts while the service is up.
     fn dns_status_value(&self) -> serde_json::Value {
+        // The policy first and on its own: `set_policy` holds it while it takes the service's lock.
+        let mode = Mode::of(&self.policy());
         let (upstreams, counts) = lock(&self.dns_service).as_ref().map(|s| (s.report(), s.counts())).unwrap_or_default();
-        serde_json::json!({ "mode": Mode::of(&self.policy()), "upstreams": upstreams, "answers": counts })
+        serde_json::json!({ "mode": mode, "upstreams": upstreams, "answers": counts })
     }
 
     #[cfg(feature = "relay-experiments")]
@@ -469,6 +471,7 @@ impl Engine {
             let book = lock(&self.book);
             (book.live(), book.guests())
         };
+        let dns_unreachable = lock(&self.dns_service).as_ref().is_some_and(|s| s.unreachable());
         EngineStatus {
             filtering: f.routes_up,
             routes_up: f.routes_up,
@@ -482,7 +485,7 @@ impl Engine {
             counters: self.meters.counters(),
             guests,
             filter: self.lists.facts(),
-            dns_unreachable: lock(&self.dns_service).as_ref().is_some_and(|s| s.unreachable()),
+            dns_unreachable,
             update,
         }
     }
@@ -967,6 +970,24 @@ mod tests {
         task.await.unwrap().unwrap();
         let reloaded = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), policy::load(dir.path()).0, Runs::default(), None);
         assert!(!reloaded.policy().plain_dns, "the saved policy is the last one");
+    }
+
+    #[tokio::test]
+    async fn the_status_says_when_no_encrypted_resolver_answers_and_the_mode_stays() {
+        use crate::dns::service::{Asker, Transport, UNREACHABLE_AFTER};
+        let e = engine(Policy::default(), None);
+        e.set_dns_upstreams(DnsUpstreams { revision: 1, upstreams: vec!["tls://127.0.0.1:1".into()] }).unwrap();
+        let service = e.start_dns_service(service_from).unwrap();
+        let asker = Asker { may_decrypt: true, addressed: "203.0.113.53".parse().unwrap() };
+        assert!(!e.status().dns_unreachable);
+        for id in 0..UNREACHABLE_AFTER as u16 {
+            service.answer(&crate::dns::testing::client_query(id, "www.example"), Transport::Datagram, asker).await.unwrap();
+        }
+        let status = e.status();
+        assert!(status.dns_unreachable && !status.policy.plain_dns, "said, and still encrypted");
+        assert_eq!(service.mode(), Mode::Encrypted);
+        e.set_policy(Policy { revision: 1, plain_dns: true, ..Policy::default() }).unwrap();
+        assert!(!e.status().dns_unreachable, "the user's plain mode is no encrypted failure");
     }
 
     #[test]
