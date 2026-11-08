@@ -142,14 +142,14 @@ function Check-Root($thumbprint) {
 }
 
 function Check-Key($keyName) {
-  $listing = Key-Listing
-  Write-Evidence "keys.txt" $listing
-  Check "the key is a machine CNG key of the software provider" ($listing -match [regex]::Escape($keyName)) $keyName
-  $detail = cmd /c "certutil -csp `"Microsoft Software Key Storage Provider`" -key `"$keyName`" 2>&1" | Out-String
-  $answer = Get-KeyAnswer $detail $LASTEXITCODE
-  Write-Evidence "key-detail.txt" $detail
-  Check "an admin is refused the key" ($answer -eq "refused") "certutil's answer: $answer"
+  Write-Evidence "keys.txt" (Key-Listing)
   $facts = Read-KeyFactsAsSystem $keyName
+  Check "the key is a machine CNG key of the software provider" ($null -ne $facts -and $facts.exists) "$keyName, opened as SYSTEM: $(if ($facts) { $facts.exists } else { 'no answer' })"
+  $detail = cmd /c "certutil -csp `"Microsoft Software Key Storage Provider`" -key `"$keyName`" 2>&1" | Out-String
+  $answer = Get-KeyAnswer $detail ($null -ne $facts -and $facts.exists)
+  $backup = Test-BackupPrivilegeEnabled (cmd /c "whoami /priv" | Out-String)
+  Write-Evidence "key-detail.txt" $detail
+  Check "an admin is refused the key" ($answer -eq "refused") "certutil's answer: $answer, SeBackupPrivilege enabled: $backup"
   Check "the key is not exportable and its DACL lists SYSTEM only" (Test-KeyFacts $facts) "read as SYSTEM: $(if ($facts) { $facts | ConvertTo-Json -Compress } else { 'no answer' })"
 }
 
@@ -169,6 +169,11 @@ function Read-KeyFactsAsSystem($keyName) {
   } finally {
     cmd /c "schtasks /Delete /TN $task /F 2>&1" | Out-Null
   }
+}
+
+# The keys SYSTEM did not positively find gone; no answer counts as left.
+function Keys-Left($keys) {
+  return $keys | Where-Object { -not (Test-KeyGone (Read-KeyFactsAsSystem $_)) }
 }
 
 function Check-NoKeyMaterial {
@@ -245,9 +250,8 @@ switch ($Step) {
     $gone = Wait-Until { -not (@($thumbprints | Where-Object { Test-Path "Cert:\LocalMachine\Root\$_" })) }
     Start-Sleep -Seconds 2
     Save-Store "store-off.txt"
-    $listing = Key-Listing
-    Write-Evidence "keys-off.txt" $listing
-    $leftKeys = @($keys | Where-Object { $listing -match [regex]::Escape($_) })
+    Write-Evidence "keys-off.txt" (Key-Listing)
+    $leftKeys = @(Keys-Left $keys)
     $policyGone = if ($wasSet) { $null -eq (Firefox-Value) } else { $true }
     Check "turning HTTPS off removes root, key and policy" ($gone -and $leftKeys.Count -eq 0 -and $policyGone) "roots gone: $gone, keys left: $($leftKeys.Count), policy gone: $policyGone"
   }
@@ -262,10 +266,9 @@ switch ($Step) {
     Write-Evidence "uninstall.txt" $text
     Write-Host $text
     Save-Store "store-uninstalled.txt"
-    $listing = Key-Listing
-    Write-Evidence "keys-uninstalled.txt" $listing
+    Write-Evidence "keys-uninstalled.txt" (Key-Listing)
     $leftRoots = @($thumbprints | Where-Object { Test-Path "Cert:\LocalMachine\Root\$_" })
-    $leftKeys = @($keys | Where-Object { $listing -match [regex]::Escape($_) })
+    $leftKeys = @(Keys-Left $keys)
     $policyGone = if ($wasSet) { $null -eq (Firefox-Value) } else { $true }
     $service = Get-Service $Service -ErrorAction SilentlyContinue
     $ok = $leftRoots.Count -eq 0 -and $leftKeys.Count -eq 0 -and $policyGone -and $null -eq $service -and -not (Test-Path $SieveDir)

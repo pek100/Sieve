@@ -71,6 +71,34 @@ pub fn is_own(owner: Owner, own_pid: u32) -> bool {
     }
 }
 
+/// Plain HTTP: where CryptoAPI fetches CRLs, OCSP answers and missing intermediates.
+pub const HTTP_PORT: u16 = 80;
+
+/// What the loop guard does with a TCP flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guard {
+    /// Not the engine's: the relay's own path.
+    Admit,
+    /// The engine's own plain HTTP, copied to an `Egress` socket with no decision.
+    RelayOwn,
+    Refuse,
+}
+
+/// The engine's own TCP flows are refused, except plain HTTP. Upstream validation
+/// runs CryptoAPI in this process, and its revocation and AIA fetches use unpinned
+/// sockets that the adapter's routes catch. Refused, revocation soft-fails to
+/// unknown and a revoked certificate is intercepted (task F4, Q3; live U5,
+/// 2026-11-08: `own_refused` grew by 2 while revoked.badssl.com was minted a leaf).
+/// The copy's upstream is an `Egress` socket, pinned outside Sieve's routes, so it
+/// cannot come back to the adapter.
+pub fn guard_tcp(own: bool, remote_port: u16) -> Guard {
+    match (own, remote_port) {
+        (false, _) => Guard::Admit,
+        (true, HTTP_PORT) => Guard::RelayOwn,
+        (true, _) => Guard::Refuse,
+    }
+}
+
 /// Who a flow belongs to, for the length of its decision. The attribution says
 /// what kind of flow it is, so a guest never reaches an app's row, and a host
 /// flow's key comes from its process.
@@ -165,6 +193,19 @@ mod tests {
 
     fn unnamed() -> Forwarded {
         Forwarded { vm: None }
+    }
+
+    /// Live U5: the engine's CryptoAPI fetches of revocation are its own port 80
+    /// flows, and refusing them let a revoked certificate be intercepted.
+    #[test]
+    fn the_engines_own_plain_http_is_relayed_and_the_rest_refused() {
+        assert_eq!(guard_tcp(true, HTTP_PORT), Guard::RelayOwn);
+        for port in [443, 53, 8080, 0] {
+            assert_eq!(guard_tcp(true, port), Guard::Refuse, "{port}");
+        }
+        for port in [HTTP_PORT, 443] {
+            assert_eq!(guard_tcp(false, port), Guard::Admit, "{port}");
+        }
     }
 
     #[test]

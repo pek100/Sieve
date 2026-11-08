@@ -110,24 +110,58 @@ describe("every live script", () => {
 });
 
 describe("the key checks", () => {
-  const answer = (text: string, exit: number) => powershell(`Get-KeyAnswer '${text}' ${exit}`);
+  const answer = (text: string, seenAsSystem: boolean) => powershell(`Get-KeyAnswer '${text}' $${seenAsSystem}`);
   const passes = (facts: string) => powershell(`Test-KeyFacts ${facts}`) === "True";
 
-  it("tells a missing key from a refused one", () => {
-    expect(answer("CertUtil: -key command FAILED: 0x80090016 (-2146893802 NTE_BAD_KEYSET) Keyset does not exist", 1)).toBe("missing");
-    expect(answer("CertUtil: -key command FAILED: 0x80070005 (WIN32: 5 ERROR_ACCESS_DENIED) Access is denied.", 1)).toBe("refused");
-    expect(answer("CertUtil: -key command FAILED: 0x80090010 (-2146893808 NTE_PERM) Access denied.", 1)).toBe("refused");
-    expect(answer("CertUtil: something else", 1)).toBe("error");
-    expect(answer("Export Policy", 0)).toBe("readable");
+  // certutil's real answers on Windows Server 2025 (live run 2026-11-08): exit 0 every
+  // time, and the same NTE_BAD_KEYSET line for a refused key and a missing one.
+  const LOAD_FAILED = [
+    "Microsoft Software Key Storage Provider:",
+    "  Sieve root ee7388dceee344e1",
+    "cuLoadKey: LoadKeys returned Keyset does not exist 0x80090016 (-2146893802 NTE_BAD_KEYSET) -- Sieve root ee7388dceee344e1",
+    "CertUtil: -key command completed successfully.",
+  ].join("\n");
+  const LOADED = [
+    "Microsoft Software Key Storage Provider:",
+    "  Sieve root ee7388dceee344e1",
+    "  d4aaa9317f3bffa093d0faa5b7470b5c_811ed7af-9c60-4692-ae69-c8e2e88f1d7a",
+    "  ECDSA_P256",
+    "  ECDSA",
+    "CertUtil: -key command completed successfully.",
+  ].join("\n");
+
+  it("tells a missing key from a refused one by what SYSTEM saw, not by certutil's exit", () => {
+    expect(answer(LOAD_FAILED, true), "SYSTEM opened it, the admin could not").toBe("refused");
+    expect(answer(LOAD_FAILED, false), "nobody could open it").toBe("missing");
+    expect(answer(LOADED, true), "certutil printed the key's algorithm").toBe("readable");
+    expect(answer("CertUtil: -key command FAILED: 0x80070005 (WIN32: 5 ERROR_ACCESS_DENIED) Access is denied.", false)).toBe("refused");
+    expect(answer("CertUtil: -key command FAILED: 0x80090010 (-2146893808 NTE_PERM) Access denied.", false)).toBe("refused");
+    expect(answer("CertUtil: -key command FAILED: something else", true)).toBe("error");
+  });
+
+  it("sees an enabled backup privilege, which reads any key file", () => {
+    const priv = (state: string) => powershell(`Test-BackupPrivilegeEnabled 'SeBackupPrivilege                         Back up files and directories                                      ${state}'`);
+    expect(priv("Enabled")).toBe("True");
+    expect(priv("Disabled")).toBe("False");
   });
 
   it("passes only what was seen as SYSTEM", () => {
-    const facts = (policy: string, sids: string) => `([pscustomobject]@{ export_policy = '${policy}'; dacl_sids = @(${sids}) })`;
+    const facts = (policy: string, sids: string) => `([pscustomobject]@{ exists = $true; export_policy = '${policy}'; dacl_sids = @(${sids}) })`;
     expect(passes(facts("None", "'S-1-5-18'"))).toBe(true);
+    expect(passes("([pscustomobject]@{ exists = $false })"), "a key SYSTEM did not find").toBe(false);
     expect(passes("$null"), "no answer is not a pass").toBe(false);
     expect(passes(facts("None", "")), "an empty DACL shows nothing").toBe(false);
     expect(passes(facts("AllowExport", "'S-1-5-18'"))).toBe(false);
     expect(passes(facts("None", "'S-1-5-18','S-1-5-32-544'")), "administrators too").toBe(false);
+  });
+
+  it("finds a key gone only when SYSTEM answered that it is", () => {
+    const gone = (facts: string) => powershell(`Test-KeyGone ${facts}`) === "True";
+    expect(gone("([pscustomobject]@{ exists = $false })")).toBe(true);
+    expect(gone("$null"), "no answer is not gone").toBe(false);
+    expect(gone("([pscustomobject]@{ exists = $true; export_policy = 'None'; dacl_sids = @('S-1-5-18') })")).toBe(false);
+    const script = read("scripts/live/engine-ca.ps1");
+    expect(script, "no leftover is judged from the admin's key listing").not.toMatch(/\$listing -match/);
   });
 
   it("writes a probe that names the key and parses", () => {

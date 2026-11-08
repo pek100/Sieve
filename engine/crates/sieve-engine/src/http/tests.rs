@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 
 use super::facts::{self, RequestFacts};
 use super::hook::{BodyRewrite, HookError, NoRewrite, ResponseHook};
-use super::serve::{CLOSE_GRACE, Proto, Serve, serve};
+use super::serve::{CLOSE_GRACE, H2_MAX_HEADER_LIST, Proto, Serve, serve};
 use super::upgrade::{is_upgrade, strip_hop_by_hop};
 use crate::domain::{DomainFilter, FilterSlot};
 use crate::inject::InjectLimits;
@@ -43,6 +43,13 @@ const NEWS: &str = "news.example";
 const BENCH_BLOCK: usize = 64 * 1024;
 const BENCH_BYTES: usize = 256 * 1024 * 1024;
 const BENCH_HANDSHAKES: usize = 200;
+/// A head over hyper's 16 KiB default, the size of www.youtube.com's (about 20 KiB).
+const LARGE_HEAD_BYTES: usize = 20 * 1024;
+const LARGE_HEADER: &str = "x-large";
+
+fn large_value() -> String {
+    "v".repeat(LARGE_HEAD_BYTES)
+}
 
 fn empty() -> Body {
     UnsyncBoxBody::new(Empty::new())
@@ -104,6 +111,11 @@ async fn origin_answer(origin: Origin, req: Request<Incoming>) -> Result<Respons
             UnsyncBoxBody::new(rx)
         }
         "/echo" => req.into_body().map_err(|e| Box::new(e) as BoxError).boxed_unsync(),
+        "/large-head" => {
+            let mut response = Response::new(Full::new(Bytes::from_static(b"large")).map_err(|e: Infallible| match e {}).boxed_unsync());
+            response.headers_mut().insert(LARGE_HEADER, large_value().parse().unwrap());
+            return Ok(response);
+        }
         _ => Full::new(Bytes::from(format!("origin:{path}"))).map_err(|e: Infallible| match e {}).boxed_unsync(),
     };
     let mut response = Response::new(body);
@@ -238,7 +250,7 @@ fn origin_dial(arm: Arm, pki: &Pki, alpn: &[&str], origin: Origin) -> TestDial {
             let goaway = origin.goaway.clone();
             let service = service_fn(move |req| origin_upgrade(origin.clone(), req));
             if h2 {
-                let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(io, service);
+                let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new()).max_header_list_size(H2_MAX_HEADER_LIST).serve_connection(io, service);
                 tokio::pin!(connection);
                 tokio::select! {
                     _ = &mut connection => {}
@@ -265,7 +277,8 @@ impl Client {
         let h2 = tls.get_ref().1.alpn_protocol() == Some(H2.as_bytes());
         let io = TokioIo::new(tls);
         if h2 {
-            let (sender, connection) = hyper::client::conn::http2::handshake::<_, _, Body>(TokioExecutor::new(), io).await.unwrap();
+            // A browser's limit, not hyper's: the engine's own limit is what is under test.
+            let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new()).max_header_list_size(H2_MAX_HEADER_LIST).handshake::<_, Body>(io).await.unwrap();
             tokio::spawn(connection);
             Self::H2(sender)
         } else {
@@ -372,6 +385,26 @@ arms!(h1_and_h2_end_to_end_with_streaming_body_and_trailers, |arm| async move {
         // A request body streams up the same way.
         let post = s.client.request(Method::POST, HOST, "/echo").body(text("uploaded")).unwrap();
         assert_eq!(body_of(s.client.send(post).await.unwrap()).await, b"uploaded", "{alpn}");
+        drop(s.client);
+        s.task.await.unwrap();
+    }
+});
+
+/// Live run 2026-11-08: www.youtube.com's 20 KiB response head was over hyper's
+/// 16 KiB h2 default, and every load was the engine's 502. A request head that
+/// large (cookies) must pass the client side the same way.
+arms!(a_head_a_browser_takes_passes_both_ways, |arm| async move {
+    for alpn in BOTH {
+        let mut s = setup(arm, alpn, "").await;
+        let response = s.client.get(HOST, "/large-head", &[]).await;
+        assert_eq!(response.status(), StatusCode::OK, "{alpn}: response head");
+        assert_eq!(response.headers().get(LARGE_HEADER).map(|v| v.len()), Some(LARGE_HEAD_BYTES), "{alpn}");
+        assert_eq!(body_of(response).await, b"large", "{alpn}");
+        let response = s.client.get(HOST, "/cookie", &[("cookie", &large_value())]).await;
+        assert_eq!(response.status(), StatusCode::OK, "{alpn}: request head");
+        assert_eq!(body_of(response).await, b"origin:/cookie", "{alpn}");
+        let asked = s.origin.requests.lock().unwrap().last().map(|(_, _, h)| h.get("cookie").map(|v| v.len()));
+        assert_eq!(asked, Some(Some(LARGE_HEAD_BYTES)), "{alpn}");
         drop(s.client);
         s.task.await.unwrap();
     }
