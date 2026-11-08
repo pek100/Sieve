@@ -3,11 +3,13 @@
 //!
 //! ```text
 //! a fatal alert, during or after the handshake: excluded at once
-//! a refused handshake, no other connection of the pair open:
-//!     v = v * 0.5^(dt / HALF_LIFE) + 1; excluded when v >= EXCLUDE_AT
-//! a quiet close (see QUIET_CLOSES): excluded at QUIET_CLOSES within QUIET_WINDOW
-//! a used connection: v = max(min(decayed, 0) - 1, -MAX_CREDIT), and the pair's
-//!     quiet closes are no evidence for the rest of the run
+//! a refusal (a handshake that did not complete, or any other alert after one on a
+//!     connection that carried no request), no other connection of the pair open,
+//!     one per BURST: v = v * 0.5^(dt / HALF_LIFE) + 1; excluded when v >= EXCLUDE_AT
+//! a quiet close (see QUIET_CLOSES), one per BURST: excluded at QUIET_CLOSES within
+//!     QUIET_WINDOW, or for a pair used this run at USED_QUIET_CLOSES within
+//!     USED_QUIET_WINDOW
+//! a used connection: v = max(min(decayed, 0) - 1, -MAX_CREDIT), quiet count reset
 //! try again: one more refusal or quiet close excludes
 //! ```
 //!
@@ -20,7 +22,7 @@ use std::collections::HashMap;
 use rustls::AlertDescription;
 use sieve_filter::exclusions::exe_file_name;
 
-use super::dials::{EXCLUDE_AT, FATAL_ALERTS, HALF_LIFE_MS, MAX_CREDIT, MAX_PAIRS, QUIET_CLOSES, QUIET_WINDOW_MS, SILENT_CLOSE_MS};
+use super::dials::{BURST_MS, EXCLUDE_AT, FATAL_ALERTS, HALF_LIFE_MS, MAX_CREDIT, MAX_PAIRS, QUIET_CLOSES, QUIET_WINDOW_MS, SILENT_CLOSE_MS, USED_QUIET_CLOSES, USED_QUIET_WINDOW_MS};
 use crate::lru::Lru;
 use crate::tls::intercept::Silence;
 
@@ -42,15 +44,32 @@ struct Score {
     /// Refused handshakes, decaying; below 0 is credit.
     value: f64,
     at_ms: u64,
-    /// A connection of the pair carried a request this run.
+    /// A connection of the pair carried a request this run: quiet closes then take
+    /// [`USED_QUIET_CLOSES`] (P1 of the 2026-11-08 review). Not a lapse after a time:
+    /// the unpinned half of an app keeps its pair used, so only a higher bound lets
+    /// the pinned half, or the same app after an update, heal at all.
     used: bool,
     /// Quiet closes since `quiet_from_ms`.
     quiet: u32,
     quiet_from_ms: u64,
+    /// When the burst of the last counted refusal, and of quiet close, began.
+    refused_burst: Option<u64>,
+    quiet_burst: Option<u64>,
+}
+
+/// True when evidence at `now_ms` opens a burst of its own, which `anchor` then
+/// marks; false when it falls within [`BURST_MS`] of the one marked, either way
+/// (a clock that went back a little is the same burst).
+fn new_burst(anchor: &mut Option<u64>, now_ms: u64) -> bool {
+    if anchor.is_some_and(|at| at.abs_diff(now_ms) <= BURST_MS) {
+        return false;
+    }
+    *anchor = Some(now_ms);
+    true
 }
 
 impl Score {
-    const NONE: Self = Self { value: 0.0, at_ms: 0, used: false, quiet: 0, quiet_from_ms: 0 };
+    const NONE: Self = Self { value: 0.0, at_ms: 0, used: false, quiet: 0, quiet_from_ms: 0, refused_burst: None, quiet_burst: None };
 
     /// A clock that went backwards decays nothing.
     fn decayed(self, now_ms: u64) -> f64 {
@@ -63,13 +82,26 @@ impl Score {
         self.at_ms = now_ms.max(self.at_ms);
     }
 
-    /// One more quiet close; true when it makes [`QUIET_CLOSES`] in the window.
+    /// One more refusal; true when it reaches [`EXCLUDE_AT`].
+    fn refusal(&mut self, now_ms: u64) -> bool {
+        if !new_burst(&mut self.refused_burst, now_ms) {
+            return false;
+        }
+        self.set(self.decayed(now_ms) + 1.0, now_ms);
+        self.value >= EXCLUDE_AT
+    }
+
+    /// One more quiet close; true when it makes the pair's bound in its window.
     fn quiet_close(&mut self, now_ms: u64) -> bool {
-        if self.quiet == 0 || now_ms.saturating_sub(self.quiet_from_ms) > QUIET_WINDOW_MS {
+        if !new_burst(&mut self.quiet_burst, now_ms) {
+            return false;
+        }
+        let (closes, window) = if self.used { (USED_QUIET_CLOSES, USED_QUIET_WINDOW_MS) } else { (QUIET_CLOSES, QUIET_WINDOW_MS) };
+        if self.quiet == 0 || now_ms.saturating_sub(self.quiet_from_ms) > window {
             (self.quiet, self.quiet_from_ms) = (0, now_ms);
         }
         self.quiet += 1;
-        self.quiet >= QUIET_CLOSES
+        self.quiet >= closes
     }
 }
 
@@ -124,11 +156,7 @@ impl Ledger {
         let key = Self::key(exe, host);
         let excluded = match evidence {
             Evidence::Refused(alert) if fatal(alert) => true,
-            Evidence::Refused(_) if self.others_open(&key) => false,
-            Evidence::Refused(_) => self.with_score(&key, |s| {
-                s.set(s.decayed(now_ms) + 1.0, now_ms);
-                s.value >= EXCLUDE_AT
-            }),
+            Evidence::Refused(_) => self.refused(&key, now_ms),
             Evidence::Accepted => {
                 *self.open.entry(key.clone()).or_default() += 1;
                 false
@@ -147,7 +175,9 @@ impl Ledger {
                 }
                 match silence {
                     Some(s) if fatal(s.alert) => true,
-                    Some(s) if s.after.as_millis() <= u128::from(SILENT_CLOSE_MS) && !self.others_open(&key) => self.with_score(&key, |score| !score.used && score.quiet_close(now_ms)),
+                    // Any other alert from the client on a connection it never used, however late.
+                    Some(Silence { alert: Some(_), .. }) => self.refused(&key, now_ms),
+                    Some(s) if s.after.as_millis() <= u128::from(SILENT_CLOSE_MS) && !self.others_open(&key) => self.with_score(&key, |score| score.quiet_close(now_ms)),
                     _ => false,
                 }
             }
@@ -158,9 +188,14 @@ impl Ledger {
         excluded
     }
 
+    /// A refusal, which says nothing while another connection of the pair is open.
+    fn refused(&mut self, key: &Key, now_ms: u64) -> bool {
+        !self.others_open(key) && self.with_score(key, |s| s.refusal(now_ms))
+    }
+
     /// "Try decrypting again": one more refusal or quiet close excludes the pair.
     pub fn seed(&mut self, exe: &str, host: &str, now_ms: u64) {
-        let seeded = Score { value: 1.0, at_ms: now_ms, used: false, quiet: QUIET_CLOSES - 1, quiet_from_ms: now_ms };
+        let seeded = Score { value: 1.0, at_ms: now_ms, quiet: QUIET_CLOSES - 1, quiet_from_ms: now_ms, ..Score::NONE };
         self.scores.insert(Self::key(exe, host), seeded);
     }
 
@@ -203,6 +238,11 @@ mod tests {
 
     fn hear(ledger: &mut Ledger, evidence: Evidence, at: u64) -> bool {
         ledger.hear(EXE, HOST, evidence, at)
+    }
+
+    /// The start of the `n`th burst after NOW: each its own piece of evidence.
+    fn burst(n: u64) -> u64 {
+        NOW + n * (BURST_MS + 1)
     }
 
     /// One connection that completes its handshake and is closed by the client
@@ -256,13 +296,51 @@ mod tests {
         for weak in [Some(AlertDescription::HandshakeFailure), Some(AlertDescription::UserCanceled), None] {
             let mut ledger = Ledger::default();
             assert!(!hear(&mut ledger, Evidence::Refused(weak), NOW), "{weak:?}: one is not enough");
-            assert!(hear(&mut ledger, Evidence::Refused(weak), NOW), "{weak:?}: two are");
+            assert!(hear(&mut ledger, Evidence::Refused(weak), burst(1)), "{weak:?}: two are");
         }
     }
 
     #[test]
+    fn any_alert_after_the_handshake_on_an_unused_connection_is_a_refusal() {
+        let alerted = |alert| Evidence::Ended(Some(Silence { after: PRECONNECT_IDLE, alert: Some(alert) }));
+        for weak in [AlertDescription::HandshakeFailure, AlertDescription::InternalError, AlertDescription::UserCanceled] {
+            let mut ledger = Ledger::default();
+            hear(&mut ledger, Evidence::Accepted, NOW);
+            assert!(!hear(&mut ledger, alerted(weak), NOW), "{weak:?}: one is not enough, however late");
+            hear(&mut ledger, Evidence::Accepted, burst(1));
+            assert!(hear(&mut ledger, alerted(weak), burst(1)), "{weak:?}: two are");
+        }
+        // The control: the same late closes with no alert say nothing.
+        let mut ledger = Ledger::default();
+        for n in 0..10 {
+            assert!(!handshake_then_close(&mut ledger, PRECONNECT_IDLE, burst(n)));
+        }
+    }
+
+    #[test]
+    fn an_alert_beside_an_open_connection_of_the_pair_is_no_evidence() {
+        let mut ledger = Ledger::default();
+        hear(&mut ledger, Evidence::Accepted, NOW);
+        for n in 0..10 {
+            hear(&mut ledger, Evidence::Accepted, burst(n));
+            assert!(!hear(&mut ledger, Evidence::Ended(Some(Silence { after: Duration::ZERO, alert: Some(AlertDescription::HandshakeFailure) })), burst(n)), "{n}");
+        }
+    }
+
+    /// A browser exiting, or a tab closing, with several handshakes to one host in
+    /// flight gives them all up at once: one decision, one piece of evidence.
+    #[test]
+    fn parallel_handshakes_given_up_together_count_once() {
+        let mut ledger = Ledger::default();
+        for socket in 0..10 {
+            assert!(!hear(&mut ledger, refused(), NOW + socket * BURST_MS / 10), "socket {socket}");
+        }
+        assert!(hear(&mut ledger, refused(), burst(1)), "the control: a second burst excludes");
+    }
+
+    #[test]
     fn a_client_closing_during_the_handshake_again_and_again_is_excluded() {
-        for gap in [0, 1, HALF_LIFE_MS] {
+        for gap in [BURST_MS + 1, HALF_LIFE_MS] {
             let mut ledger = Ledger::default();
             assert!(!hear(&mut ledger, refused(), NOW), "one never excludes");
             assert!(hear(&mut ledger, refused(), NOW + gap), "gap {gap}");
@@ -286,7 +364,7 @@ mod tests {
         }
         hear(&mut ledger, Evidence::Ended(None), NOW);
         assert!(!hear(&mut ledger, refused(), NOW), "the control: alone, the first counts");
-        assert!(hear(&mut ledger, refused(), NOW), "and the second excludes");
+        assert!(hear(&mut ledger, refused(), burst(1)), "and the second excludes");
     }
 
     #[test]
@@ -294,18 +372,18 @@ mod tests {
         let mut ledger = Ledger::default();
         hear(&mut ledger, refused(), NOW);
         used_connection(&mut ledger, NOW);
-        assert!(!hear(&mut ledger, refused(), NOW));
-        assert!(!hear(&mut ledger, refused(), NOW), "the first refusal is gone, and one credit stands");
-        assert!(hear(&mut ledger, refused(), NOW), "the control: a third");
+        assert!(!hear(&mut ledger, refused(), burst(1)));
+        assert!(!hear(&mut ledger, refused(), burst(2)), "the first refusal is gone, and one credit stands");
+        assert!(hear(&mut ledger, refused(), burst(3)), "the control: a third");
     }
 
     #[test]
-    fn a_handshake_then_a_close_counts_only_when_it_repeats_at_once() {
+    fn a_handshake_then_a_close_counts_only_when_it_repeats_soon() {
         let mut ledger = Ledger::default();
-        for close in 1..QUIET_CLOSES {
-            assert!(!handshake_then_close(&mut ledger, Duration::ZERO, NOW), "close {close}");
+        for close in 1..u64::from(QUIET_CLOSES) {
+            assert!(!handshake_then_close(&mut ledger, Duration::ZERO, burst(close)), "close {close}");
         }
-        assert!(handshake_then_close(&mut ledger, Duration::ZERO, NOW + QUIET_WINDOW_MS), "the last at the window's edge excludes");
+        assert!(handshake_then_close(&mut ledger, Duration::ZERO, burst(1) + QUIET_WINDOW_MS), "the last at the window's edge excludes");
         // Spread past the window, the same closes never add up.
         let mut ledger = Ledger::default();
         let mut at = NOW;
@@ -320,23 +398,64 @@ mod tests {
         let late = Duration::from_millis(SILENT_CLOSE_MS + 1);
         let edge = Duration::from_millis(SILENT_CLOSE_MS);
         let mut ledger = Ledger::default();
-        for _ in 0..10 * QUIET_CLOSES {
-            assert!(!handshake_then_close(&mut ledger, late, NOW), "an idle connection says nothing");
+        for n in 0..u64::from(10 * QUIET_CLOSES) {
+            assert!(!handshake_then_close(&mut ledger, late, burst(n)), "an idle connection says nothing");
         }
-        for _ in 1..QUIET_CLOSES {
-            assert!(!handshake_then_close(&mut ledger, edge, NOW));
+        let from = u64::from(10 * QUIET_CLOSES);
+        for n in 1..u64::from(QUIET_CLOSES) {
+            assert!(!handshake_then_close(&mut ledger, edge, burst(from + n)));
         }
-        assert!(handshake_then_close(&mut ledger, edge, NOW), "the control: at the edge they count");
+        assert!(handshake_then_close(&mut ledger, edge, burst(from + u64::from(QUIET_CLOSES))), "the control: at the edge they count");
     }
 
+    /// A pinning app that tries again on its own schedule, a minute or two apart.
     #[test]
-    fn a_pair_that_carried_a_request_is_never_excluded_by_closes() {
+    fn a_pinning_app_that_retries_slowly_is_excluded() {
+        const RETRY: u64 = 2 * 60_000;
+        let mut ledger = Ledger::default();
+        for close in 1..u64::from(QUIET_CLOSES) {
+            assert!(!handshake_then_close(&mut ledger, Duration::ZERO, NOW + close * RETRY), "close {close}");
+        }
+        assert!(handshake_then_close(&mut ledger, Duration::ZERO, NOW + u64::from(QUIET_CLOSES) * RETRY));
+    }
+
+    /// Parallel sockets of one client closed one after another within a burst, each
+    /// with nothing else open (the next one's handshake not yet done).
+    #[test]
+    fn quiet_closes_in_one_burst_count_once() {
+        let mut ledger = Ledger::default();
+        for socket in 0..10 {
+            assert!(!handshake_then_close(&mut ledger, Duration::ZERO, NOW + socket * BURST_MS / 10), "socket {socket}");
+        }
+        for n in 1..u64::from(QUIET_CLOSES) - 1 {
+            assert!(!handshake_then_close(&mut ledger, Duration::ZERO, burst(n)));
+        }
+        assert!(handshake_then_close(&mut ledger, Duration::ZERO, burst(u64::from(QUIET_CLOSES) - 1)), "the control: separate bursts add up");
+    }
+
+    /// P1 of the 2026-11-08 review: an app that updates mid-run to start pinning, or
+    /// the pinned half of an app whose unpinned half shares its exe.
+    #[test]
+    fn a_used_pair_that_then_drops_connection_after_connection_is_excluded() {
         let mut ledger = Ledger::default();
         used_connection(&mut ledger, NOW);
-        for close in 0..1000 {
-            assert!(!handshake_then_close(&mut ledger, Duration::ZERO, NOW), "close {close}");
+        for n in 1..u64::from(USED_QUIET_CLOSES) {
+            assert!(!handshake_then_close(&mut ledger, Duration::ZERO, burst(n)), "close {n}: a used pair takes more");
         }
-        assert!(!hear(&mut ledger, refused(), NOW), "refusals still count, against the credit");
+        assert!(handshake_then_close(&mut ledger, Duration::ZERO, burst(u64::from(USED_QUIET_CLOSES))));
+        // Spread past the shorter window, or with a request between, they never add up.
+        let mut ledger = Ledger::default();
+        used_connection(&mut ledger, NOW);
+        for n in 1..1000 {
+            assert!(!handshake_then_close(&mut ledger, Duration::ZERO, NOW + n * (USED_QUIET_WINDOW_MS / u64::from(USED_QUIET_CLOSES - 1) + 1)), "close {n}");
+        }
+        let mut ledger = Ledger::default();
+        for n in 0..1000 {
+            if n % u64::from(USED_QUIET_CLOSES - 1) == 0 {
+                used_connection(&mut ledger, burst(n));
+            }
+            assert!(!handshake_then_close(&mut ledger, Duration::ZERO, burst(n)), "close {n}");
+        }
     }
 
     #[test]
@@ -406,9 +525,9 @@ mod tests {
         assert_eq!(ledger.value(EXE, HOST, NOW + HALF_LIFE_MS), -MAX_CREDIT / 2.0);
         // The bound holds: full credit buys two refusals more, no further.
         for refusal in 1..=3 {
-            assert!(!hear(&mut ledger, refused(), NOW), "refusal {refusal}");
+            assert!(!hear(&mut ledger, refused(), NOW + refusal * (BURST_MS + 1)), "refusal {refusal}");
         }
-        assert!(hear(&mut ledger, refused(), NOW), "the fourth");
+        assert!(hear(&mut ledger, refused(), burst(4)), "the fourth");
     }
 
     #[test]
@@ -416,10 +535,11 @@ mod tests {
         let mut ledger = Ledger::default();
         hear(&mut ledger, refused(), NOW);
         assert_eq!(ledger.value(EXE, HOST, NOW - HALF_LIFE_MS), 1.0);
-        assert!(hear(&mut ledger, refused(), NOW - 1), "and the next refusal still adds up");
+        assert!(!hear(&mut ledger, refused(), NOW - 1), "a little back is the same burst");
+        assert!(hear(&mut ledger, refused(), NOW - BURST_MS - 1), "and the next refusal still adds up");
         let mut ledger = Ledger::default();
-        for _ in 1..QUIET_CLOSES {
-            handshake_then_close(&mut ledger, Duration::ZERO, NOW);
+        for n in 1..u64::from(QUIET_CLOSES) {
+            handshake_then_close(&mut ledger, Duration::ZERO, burst(n));
         }
         assert!(handshake_then_close(&mut ledger, Duration::ZERO, NOW - QUIET_WINDOW_MS), "nor does it open a new quiet window");
     }
@@ -442,7 +562,7 @@ mod tests {
         assert!(!ledger.hear(r"C:\a\two.exe", HOST, refused(), NOW), "another exe");
         assert!(!ledger.hear(r"C:\a\one.exe", "other.example", refused(), NOW), "another host");
         ledger.hear(r"C:\a\two.exe", HOST, Evidence::Accepted, NOW);
-        assert!(ledger.hear(r"D:\elsewhere\ONE.EXE", "PIN.example", refused(), NOW), "the same pair, case folded, by file name; another exe's open connection is not its own");
+        assert!(ledger.hear(r"D:\elsewhere\ONE.EXE", "PIN.example", refused(), burst(1)), "the same pair, case folded, by file name; another exe's open connection is not its own");
     }
 
     #[test]
@@ -462,7 +582,7 @@ mod tests {
     fn an_excluded_pair_leaves_the_ledger() {
         let mut ledger = Ledger::default();
         hear(&mut ledger, refused(), NOW);
-        hear(&mut ledger, refused(), NOW);
+        hear(&mut ledger, refused(), burst(1));
         assert!(ledger.is_empty());
     }
 
