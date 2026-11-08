@@ -17,6 +17,8 @@ pub(crate) type SessionCollection = AHashMap<NetworkTuple, PacketSender>;
 mod error;
 mod packet;
 mod stream;
+mod progress;
+pub use progress::{Progress, ProgressSnapshot};
 
 pub use self::error::{IpStackError, Result};
 pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
@@ -222,6 +224,7 @@ impl IpStackConfig {
 pub struct IpStack {
     accept_receiver: UnboundedReceiver<IpStackStream>,
     handle: JoinHandle<Result<()>>,
+    progress: Arc<Progress>,
 }
 
 impl IpStack {
@@ -254,10 +257,17 @@ impl IpStack {
         Device: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
+        let progress = Arc::new(Progress::default());
         IpStack {
             accept_receiver,
-            handle: run(config, device, accept_sender),
+            handle: run(config, device, accept_sender, progress.clone()),
+            progress,
         }
+    }
+
+    /// Counters for an out-of-runtime watchdog. No flow addresses or payloads.
+    pub fn progress(&self) -> Arc<Progress> {
+        self.progress.clone()
     }
 
     /// Accept an incoming network stream.
@@ -308,6 +318,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     config: IpStackConfig,
     mut device: Device,
     accept_sender: UnboundedSender<IpStackStream>,
+    progress: Arc<Progress>,
 ) -> JoinHandle<Result<()>> {
     let mut sessions: SessionCollection = AHashMap::new();
     let (session_remove_tx, mut session_remove_rx) = mpsc::unbounded_channel::<NetworkTuple>();
@@ -316,10 +327,20 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut buffer = vec![0_u8; config.mtu as usize + offset];
     let (up_pkt_sender, mut up_pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
+    let exit = progress::ExitGuard(progress.clone());
     tokio::spawn(async move {
+        let _exit = exit;
         loop {
             select! {
-                Ok(n) = device.read(&mut buffer) => {
+                read = device.read(&mut buffer) => {
+                    // A packet device's EOF/error is terminal, not an empty
+                    // network packet or a reason to disable just this select
+                    // branch. The owner must be able to observe worker exit.
+                    let n = read?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "packet device closed").into());
+                    }
+                    progress.received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Err(e) = process_device_read(&buffer[offset..n], &mut sessions, &session_remove_tx, &up_pkt_sender, &config, &accept_sender).await {
                         let io_err: std::io::Error = e.into();
                         if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
@@ -328,13 +349,16 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             log::warn!("process_device_read error: {io_err}");
                         }
                     }
+                    progress.dispatched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Some(network_tuple) = session_remove_rx.recv() => {
                     sessions.remove(&network_tuple);
                     log::debug!("session destroyed: {network_tuple}");
                 }
                 Some(packet) = up_pkt_receiver.recv() => {
+                    progress.writes_started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     process_upstream_recv(packet, &mut device, #[cfg(unix)]pi).await?;
+                    progress.writes_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }

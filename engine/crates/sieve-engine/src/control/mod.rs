@@ -370,6 +370,7 @@ impl Engine {
         let mut status = serde_json::to_value(self.status_saying(self.updates.status()))?;
         status["https"] = self.meters.https.report();
         status["quic"] = self.meters.quic.report(crate::quic::REFUSAL);
+        status["packet_path"] = lock(&self.beats.path).as_ref().map(|p| p.report()).unwrap_or(serde_json::Value::Null);
         self.validation.report(&mut status["https"]);
         status["content"] = self.meters.content.report();
         status["content"]["list_hits"] = serde_json::to_value(lock(&self.book).list_hits())?;
@@ -910,6 +911,27 @@ mod tests {
         let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(DNS_STATUS_FILE)).unwrap()).unwrap();
         assert_eq!(status["upstreams"], serde_json::json!([]));
         assert_eq!(status["answers"]["ech_stripped"], serde_json::json!(0), "counts sit beside the list, and start at nothing");
+    }
+
+    #[test]
+    fn packet_path_status_names_the_waiting_stage_without_flow_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        assert!(e.status_value().unwrap()["packet_path"].is_null());
+        let progress = Arc::new(ipstack::Progress::default());
+        let mut path = crate::watchdog::PathWatch::new(e.meters.clone(), progress, e.meters.stack_offered());
+        Meters::bump(&e.meters.packets_in);
+        assert!(path.check(0).is_none());
+        assert_eq!(path.check(crate::watchdog::STALL_MS).unwrap().what, "TUN to ipstack queue");
+        *lock(&e.beats.path) = Some(path);
+        e.write_status_file();
+        let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(STATUS_FILE)).unwrap()).unwrap();
+        let path = &status["packet_path"];
+        assert_eq!(path["offered"], 1);
+        assert_eq!(path["received"], 0);
+        assert_eq!(path["waiting_stage"], "TUN to ipstack queue");
+        assert!(path.as_object().unwrap().iter().all(|(key, value)| key == "waiting_stage" || value.is_u64() || value.is_boolean()));
+        assert!(serde_json::to_value(e.status()).unwrap().get("packet_path").is_none(), "IPC unchanged");
     }
 
     #[test]

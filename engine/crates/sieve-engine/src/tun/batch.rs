@@ -47,6 +47,7 @@ impl Batch {
         if bytes.len() > self.mtu {
             // The legacy device also discards packets that cannot fit the
             // stack's MTU-sized ReadBuf. Never truncate a packet into the slab.
+            Meters::bump(&meters.oversized);
             return;
         }
         let offset = self.count * self.mtu;
@@ -250,7 +251,8 @@ mod tests {
         let good = packet(0, usize::from(crate::tun::MTU));
         let mut filtered = good.clone();
         filtered[16..20].copy_from_slice(&[224, 0, 0, 1]);
-        let mut source = Bursty(Fake([good.clone(), filtered, good.clone()].into()));
+        let oversized = packet(0, usize::from(crate::tun::MTU) + 1);
+        let mut source = Bursty(Fake([good.clone(), filtered, oversized, good.clone()].into()));
         let (tx, mut rx) = channel(BATCH_MAX, crate::tun::MTU, BATCH_MAX);
         let meters = Arc::new(Meters::default());
         let m = meters.clone();
@@ -265,6 +267,8 @@ mod tests {
         reader.join().unwrap().unwrap();
         assert_eq!(got, [good.as_slice(), good.as_slice()].concat());
         assert_eq!(meters.not_unicast.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(meters.oversized.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(meters.stack_offered(), 2);
     }
 
     #[test]

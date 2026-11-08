@@ -1,6 +1,6 @@
 //! The watchdog (plan 1.6.2): a plain thread outside the tokio runtime that
 //! guards against a hung engine. Two heartbeats: the TUN reader's (it marks
-//! a packet as pending while it hands it to the stack) and the relay
+//! a packet as pending while it enqueues it) and the relay
 //! scheduler's (the watchdog posts a ping into the runtime, which a task
 //! answers). When either stays pending for [`STALL_MS`], the watchdog
 //! deletes Sieve's routes first, then exits the process; the service
@@ -10,10 +10,19 @@
 //! reader can block on its read event and use no CPU (plan 6: idle CPU 0).
 //! The watchdog runs only while routes are up; otherwise it waits on a
 //! condition variable.
+//!
+//! [`PathWatch`] additionally follows admitted adapter arrivals through the
+//! packet loop and device writes. Runtime pings and successful enqueueing do
+//! not demonstrate packet progress. A worker exit also uses the existing trip.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
+
+mod path;
+#[cfg(test)]
+mod path_tests;
+pub use path::PathWatch;
 
 /// A component stalled when it stayed pending this long (plan
 /// `watchdog.stallMs`, declared 5000 ms: long enough for a busy relay to
@@ -61,11 +70,14 @@ impl Beat {
     }
 }
 
-/// The two heartbeats the plan names.
+/// Scheduler/reader heartbeats and the current routing run's packet path.
 #[derive(Debug, Default)]
 pub struct Beats {
     pub tun: Beat,
     pub relay: Beat,
+    /// Replaced for each routing run. Only the watchdog/status reader lock it,
+    /// never the packet loop, a flow task, or an OS call.
+    pub path: Mutex<Option<PathWatch>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,7 +135,7 @@ impl Arm {
 }
 
 /// One look: when armed, posts a relay ping if none is pending (`ping`
-/// must make the runtime call `beats.relay.end()`), then checks both beats.
+/// must make the runtime call `beats.relay.end()`), then checks the path and beats.
 pub fn check(arm: &Arm, beats: &Beats, now_ms: u64, ping: &dyn Fn()) -> Option<Stall> {
     if !arm.is_armed() {
         return None;
@@ -132,7 +144,9 @@ pub fn check(arm: &Arm, beats: &Beats, now_ms: u64, ping: &dyn Fn()) -> Option<S
         beats.relay.begin(now_ms);
         ping();
     }
-    stalled(beats, now_ms, STALL_MS)
+    // Prefer the specific packet stage over the reader's queue backpressure.
+    let path = beats.path.lock().unwrap_or_else(|p| p.into_inner()).as_mut().and_then(|p| p.check(now_ms));
+    path.or_else(|| stalled(beats, now_ms, STALL_MS))
 }
 
 /// The watchdog thread's loop: wait to be armed, look every
