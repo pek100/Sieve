@@ -16,6 +16,7 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::{Body, Frame, Incoming};
+use sieve_ipc::LogChange;
 
 use super::facts::RequestFacts;
 use super::serve::{BodyError, ResponseBody};
@@ -28,6 +29,11 @@ pub struct HookError(pub String);
 pub trait BodyRewrite: Send {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, HookError>;
     fn finish(self: Box<Self>) -> Result<Vec<u8>, HookError>;
+    /// What tracking protection this rewrite puts in the page, for the request's
+    /// log row. None by default.
+    fn changes(&self) -> Vec<LogChange> {
+        Vec::new()
+    }
 }
 
 /// Asked about every decrypted response.
@@ -133,9 +139,10 @@ impl Body for Hooked {
 /// The response body after the hook: as it comes when the hook does not want
 /// it, otherwise through `begin` with the first data frame held until then.
 /// A rewrite falsifies `Content-Length`: `begin` holds the headers and owns that.
-pub async fn apply(hook: &dyn ResponseHook, req: &RequestFacts<'_>, status: StatusCode, headers: &mut HeaderMap, mut body: Incoming) -> ResponseBody {
+/// Also what the rewrite says it changed, for the log.
+pub async fn apply(hook: &dyn ResponseHook, req: &RequestFacts<'_>, status: StatusCode, headers: &mut HeaderMap, mut body: Incoming) -> (ResponseBody, Vec<LogChange>) {
     if !hook.wants(req, status, headers) {
-        return boxed(body);
+        return (boxed(body), Vec::new());
     }
     let first = body.frame().await;
     let start = match &first {
@@ -143,6 +150,7 @@ pub async fn apply(hook: &dyn ResponseHook, req: &RequestFacts<'_>, status: Stat
         _ => Bytes::new(),
     };
     let rewrite = hook.begin(req, status, headers, &start);
+    let changes = rewrite.as_ref().map(|r| r.changes()).unwrap_or_default();
     let mut hooked = Hooked { inner: body, rewrite, queued: VecDeque::new(), failed: None, ended: false };
     match first {
         Some(Ok(frame)) => hooked.take_frame(frame),
@@ -152,7 +160,7 @@ pub async fn apply(hook: &dyn ResponseHook, req: &RequestFacts<'_>, status: Stat
             hooked.finish();
         }
     }
-    UnsyncBoxBody::new(hooked)
+    (UnsyncBoxBody::new(hooked), changes)
 }
 
 /// A hyper body as the path's one body type.

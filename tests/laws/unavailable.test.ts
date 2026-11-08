@@ -1,8 +1,9 @@
 /**
  * Law 11, unavailable settings. `unavailableUntil` stays as a mechanism (its
  * behaviour is pinned in src/core/settings/unavailable.test.ts, with real keys
- * mocked unavailable), and today the HTTPS and content switches and the tracking
- * protections carry it. The DNS
+ * mocked unavailable), and today the HTTPS and content switches carry it; the
+ * tracking protections, which the engine carries out, wait for the switch each
+ * requires (registry `isAvailable`). The DNS
  * filter's keys waited for engine slice 4, which retired `filtering.dns` and
  * brought `filtering.upstreams` back. Real registry here, never mocked. An
  * unavailable key must name a plan that exists and names it, and no available
@@ -12,7 +13,7 @@ import { describe, expect, it } from "vitest";
 import { CONTENT_SWITCH, HTTPS_SWITCH } from "@/core/engine";
 import { normalizeDoc, readValue } from "@/core/settings/document";
 import { migrate } from "@/core/settings/migrate";
-import { REGISTRY, SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef } from "@/core/settings/registry";
+import { REGISTRY, SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef, unavailableUntil, type SettingKey } from "@/core/settings/registry";
 import { exportText, resetPlan, searchSettings } from "@/core/settings/transfer";
 import { TRACKING_KEYS, trackingInForce } from "@/core/tracking";
 import { existsSync } from "node:fs";
@@ -23,8 +24,10 @@ const RETIRED = ["filtering.dns", "filtering.perApp"];
 const unavailable = SETTING_KEYS.filter((k) => !isAvailable(k));
 
 describe("unavailable settings law", () => {
-  it("the HTTPS and content switches are unavailable, until their live checks have run, and the tracking protections, until the engine carries them out", () => {
+  it("the HTTPS and content switches are unavailable, until their live checks have run, and with them the tracking protections that require them", () => {
     expect(unavailable).toEqual([HTTPS_SWITCH, CONTENT_SWITCH, ...TRACKING_KEYS]);
+    expect(SETTING_KEYS.filter((k) => settingDef(k).unavailableUntil !== undefined), "only the switches wait for a plan step of their own").toEqual([HTTPS_SWITCH, CONTENT_SWITCH]);
+    for (const k of TRACKING_KEYS) expect(unavailableUntil(k), k).toBe(unavailableUntil(settingDef(k).requires as SettingKey));
     expect(trackingInForce(() => true), "none is ever sent, whatever is read").toEqual([]);
   });
 
@@ -37,8 +40,8 @@ describe("unavailable settings law", () => {
     expect(readValue(stored, CONTENT_SWITCH)).toBe(false);
   });
 
-  it("every unavailable key names a plan step whose plan exists and names the key", () => {
-    for (const k of unavailable) {
+  it("every key unavailable of its own names a plan step whose plan exists and names the key", () => {
+    for (const k of unavailable.filter((key) => settingDef(key).unavailableUntil !== undefined)) {
       const until = settingDef(k).unavailableUntil ?? "";
       const path = until.match(/docs\/[\w./-]+\.md/)?.[0];
       expect(path, k).toBeDefined();

@@ -776,6 +776,7 @@ mod tests {
             rule: Some("||example.com^".into()),
             list: Some("adguard-base".into()),
             forwarded: None,
+            changes: Vec::new(),
         }
     }
 

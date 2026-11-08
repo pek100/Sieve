@@ -4,7 +4,7 @@
  * (plan 8.3). The slice has one writer, the log controller
  * (src/data/log-controller.ts).
  */
-import type { LogEntry, LogOutcome, LogRow } from "@/data/protocol";
+import type { LogChange, LogEntry, LogOutcome, LogRow } from "@/data/protocol";
 import { exclusionReasonWords, isExclusionReason } from "./exclusions";
 
 /** How often the engine's log tail is read while the engine routes. */
@@ -47,11 +47,43 @@ export const LOG_FILTER_TEXT: Record<LogFilter, string> = {
 
 const MODIFIED: ReadonlySet<LogOutcome["kind"]> = new Set(["redirected", "params_removed", "hidden", "scriptlets"]);
 
-export function matchesFilter(row: Pick<LogRow, "outcome">, filter: LogFilter): boolean {
+/** A row tracking protection changed reads Modified whatever the rules did. */
+export function matchesFilter(row: Pick<LogRow, "outcome" | "changes">, filter: LogFilter): boolean {
   const kind = row.outcome?.kind;
   if (filter === "all") return true;
-  if (filter === "modified") return MODIFIED.has(kind);
+  if (filter === "modified") return MODIFIED.has(kind) || (row.changes?.length ?? 0) > 0;
   return kind === filter;
+}
+
+const plural = (n: number, one: string, many: string) => (n === 1 ? one : many.replace("#", String(n)));
+
+/** What one tracking change did, in words (plan 2026-11-09). A name this build does not know shows with spaces, as a reason does. */
+export function changeWords(change: LogChange): string {
+  const n = change.count;
+  switch (change.what) {
+    case "queryParams":
+      return plural(n, "Removed 1 tracking parameter", "Removed # tracking parameters");
+    case "gpc":
+      return n >= 2 ? "Sent Global Privacy Control and Do Not Track" : "Sent a do-not-track signal";
+    case "clientData":
+      return "Removed the X-Client-Data header";
+    case "searchQueries":
+      return "Told the site only where you came from, not the page";
+    case "referrer":
+      return "Removed the page you came from";
+    case "thirdPartyCookies":
+      return plural(n, "Limited a cookie from another site to an hour", "Limited # cookies from another site to an hour");
+    case "firstPartyCookies":
+      return plural(n, "Limited a cookie of the site's own to an hour", "Limited # of the site's own cookies to an hour");
+    case "webRtc":
+      return "Blocked WebRTC in the page";
+    case "push":
+      return "Blocked push notifications in the page";
+    case "location":
+      return "Blocked location requests in the page";
+    default:
+      return `${change.what.replace(/([a-z])([A-Z])/g, "$1 $2").replaceAll("_", " ").toLowerCase()} (${n})`;
+  }
 }
 
 const LIST_USER = "user";
@@ -116,6 +148,17 @@ export function outcomeWords(outcome: LogOutcome | null | undefined): string {
     default:
       return "Unknown";
   }
+}
+
+/**
+ * What a row says it did, in its outcome column: the outcome, except a request
+ * the rules passed and tracking protection changed, which says the change (or
+ * how many), since "passed through" alone would hide it.
+ */
+export function rowWords(row: Pick<LogRow, "outcome" | "changes">): string {
+  const changes = row.changes ?? [];
+  if (row.outcome?.kind !== "passed" || changes.length === 0) return outcomeWords(row.outcome);
+  return changes.length === 1 ? changeWords(changes[0]) : `Tracking protection made ${changes.length} changes`;
 }
 
 /** A row's host as a URL or a filter rule writes it: an IPv6 address (`LogRow.host` has it bare) takes brackets. */

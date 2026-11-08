@@ -2,11 +2,16 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-/** The tracking options are unavailable in this build; `offer.tracking` makes them available, as a later build will. */
+/**
+ * The tracking options wait for the HTTPS switch in this build; `offer.tracking`
+ * makes those that need only it available, as the build with that switch will
+ * (page filtering, which the others need, comes later still).
+ */
 const offer = vi.hoisted(() => ({ tracking: false }));
 vi.mock("@/core/settings/registry", async (importOriginal) => {
   const real = await importOriginal<typeof import("@/core/settings/registry")>();
-  return { ...real, isAvailable: (k: string) => (k.startsWith("tracking.") ? offer.tracking : real.isAvailable(k as never)) };
+  const offered = (k: string) => offer.tracking && real.settingDef(k as never).requires === "filtering.https";
+  return { ...real, isAvailable: (k: string) => (k.startsWith("tracking.") ? offered(k) : real.isAvailable(k as never)) };
 });
 import { NoticeToaster } from "@/components/sieve/shell/notice-toaster";
 import { MAX_POLICY_BYTES } from "@/core/settings/registry";
@@ -598,7 +603,7 @@ describe("your own lists", () => {
   });
 });
 
-describe("tracking protection, while the engine does not carry it out", () => {
+describe("tracking protection, while the HTTPS switch waits for its live check", () => {
   it("is not shown, so nothing claims a protection in force, and a stored wish is never sent", async () => {
     const sent: EnginePolicy[] = [];
     const mock = createMockEngine("idle");
@@ -620,30 +625,34 @@ describe("tracking protection, once offered", () => {
     offer.tracking = false;
   });
 
-  it("is at Standard, the recommended level, every option locked with the reason once, and nothing can change it", async () => {
+  it("is at Balanced, the recommended level, every option locked with the reason once, and nothing can change it", async () => {
     await setup();
     const block = document.querySelector<HTMLElement>("[data-tracking]")!;
-    expect(within(block).getByRole("radio", { name: /^Standard/ })).toHaveAttribute("aria-checked", "true");
-    expect(within(block).getByRole("radio", { name: /^Standard/ })).toBeDisabled();
+    for (const level of ["Minimal", "Balanced", "Strict"]) expect(within(block).getByRole("radio", { name: new RegExp(`^${level}`) })).toBeInTheDocument();
+    expect(within(block).getByRole("radio", { name: /^Balanced/ })).toHaveAttribute("aria-checked", "true");
+    expect(within(block).getByRole("radio", { name: /^Balanced/ })).toBeDisabled();
     expect(block.querySelectorAll("[data-lock]")).toHaveLength(1);
     expect(block.querySelector("[data-tracking-locked]")).toHaveTextContent("which this version of Sieve does not offer yet");
     expect(block.querySelector("[data-tracking-locked]")).toHaveTextContent("None of these is in effect yet");
     for (const s of within(block).getAllByRole("switch")) expect(s).toBeDisabled();
   });
 
-  it("says what each option off at Standard can break", async () => {
+  it("says what each option off at Balanced can break, and shows only the options offered, by level", async () => {
     await setup();
-    const webRtc = document.querySelector<HTMLElement>('[data-tracking-option="tracking.webRtc"]')!;
-    expect(webRtc).toHaveTextContent("Can break: Video calls");
-    expect(within(webRtc).getByRole("switch")).not.toBeChecked();
+    const referrer = document.querySelector<HTMLElement>('[data-tracking-option="tracking.referrer"]')!;
+    expect(referrer).toHaveTextContent("Can break: Some downloads");
+    expect(within(referrer).getByRole("switch")).not.toBeChecked();
+    const shown = [...document.querySelectorAll("[data-tracking-option]")].map((e) => e.getAttribute("data-tracking-option"));
+    expect(shown, "the in-page ones wait for page filtering").toEqual(["tracking.gpc", "tracking.clientData", "tracking.searchQueries", "tracking.queryParams", "tracking.referrer", "tracking.thirdPartyCookies", "tracking.firstPartyCookies"]);
   });
 
   it("a stored custom choice reads Custom and stays a wish: never sent while locked", async () => {
     const sent: EnginePolicy[] = [];
     const mock = createMockEngine("idle");
-    await setup("pending", { schema: 5, values: { "filtering.engine": true, "tracking.webRtc": true } }, { ...mock, setPolicy: (p) => (sent.push(p), mock.setPolicy(p)) });
+    await setup("pending", { schema: 5, values: { "filtering.engine": true, "tracking.referrer": true } }, { ...mock, setPolicy: (p) => (sent.push(p), mock.setPolicy(p)) });
     await settled();
     expect(document.querySelector("[data-tracking-custom]")).toHaveTextContent("Your own choice");
+    expect(screen.getByRole("button", { name: "Back to recommended" })).toBeDisabled();
     expect(sent.length).toBeGreaterThan(0);
     for (const p of sent) expect(p.tracking ?? []).toEqual([]);
   });

@@ -8,7 +8,7 @@ import { FloatingTooltip } from "@/components/sieve/primitives/floating-tooltip"
 import { IconButton } from "@/components/sieve/primitives/icon-button";
 import { StateLayer } from "@/components/sieve/primitives/state-layer";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { listName, outcomeWords, rowOwner, rowPath } from "@/core/log";
+import { listName, rowOwner, rowPath, rowWords } from "@/core/log";
 import type { LogAction } from "@/core/log-actions";
 import type { LogRow as Row } from "@/data/protocol";
 import { cn } from "@/lib/utils";
@@ -47,7 +47,7 @@ function PathCell({ path }: { path: string | null }) {
  * the blocked colour only on Blocked.
  */
 export function LogRowItem({ row, titles, onOpen, onAction }: { row: Row; titles: ReadonlyMap<string, string>; onOpen: () => void; onAction: (action: LogAction, row: Row) => void }) {
-  const words = outcomeWords(row.outcome);
+  const words = rowWords(row);
   const name = rowOwner(row);
   const list = listName(row.list ?? null, titles);
   return (

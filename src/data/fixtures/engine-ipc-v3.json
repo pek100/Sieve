@@ -14,7 +14,7 @@
   "customUrlMax": 512,
   "customTitleMax": 64,
   "listRulesShown": 200,
-  "trackingNames": ["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location"],
+  "trackingNames": ["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location", "queryParams", "firstPartyCookies"],
   "policyWithContent": { "type": "set_policy", "revision": 5, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": true, "content": true, "user_rules": [], "exclusions": [] },
   "policyWithPlainDns": { "type": "set_policy", "revision": 6, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false, "plain_dns": true, "user_rules": [], "exclusions": [] },
   "customLists": [
