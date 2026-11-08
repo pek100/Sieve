@@ -14,7 +14,7 @@
   "customUrlMax": 512,
   "customTitleMax": 64,
   "listRulesShown": 200,
-  "trackingNames": ["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location"],
+  "trackingNames": ["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location", "queryParams", "firstPartyCookies"],
   "policyWithContent": { "type": "set_policy", "revision": 5, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": true, "content": true, "user_rules": [], "exclusions": [] },
   "policyWithPlainDns": { "type": "set_policy", "revision": 6, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false, "plain_dns": true, "user_rules": [], "exclusions": [] },
   "customLists": [
@@ -487,7 +487,8 @@
             { "signal": "connect_failed", "cause": "unknown", "host": "192.0.2.40", "count": 1, "first_ms": 1793000040000, "last_ms": 1793000040000 },
             { "signal": "egress_failed", "cause": "sieve", "host": "2001:db8::40", "count": 1, "first_ms": 1793000041000, "last_ms": 1793000041000 },
             { "signal": "connection_lost", "cause": "unknown", "host": "files.example", "count": 2, "first_ms": 1793000042000, "last_ms": 1793000043000 },
-            { "signal": "dns_unanswered", "cause": "unknown", "host": null, "count": 5, "first_ms": 1793000044000, "last_ms": 1793000045000 }
+            { "signal": "dns_unanswered", "cause": "unknown", "host": null, "count": 5, "first_ms": 1793000044000, "last_ms": 1793000045000 },
+            { "signal": "handshake_abandoned", "cause": "unknown", "host": "chat.example", "count": 1, "first_ms": 1793000046000, "last_ms": 1793000046000 }
           ]
         }
       ],

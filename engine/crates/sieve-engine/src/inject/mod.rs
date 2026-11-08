@@ -9,7 +9,8 @@
 //! - [`decode`]: streaming, capped decoding;
 //! - [`html`]: where the payload goes, with lol_html;
 //! - [`csp`]: the nonce rules;
-//! - [`payload`]: the injected elements, safe by construction.
+//! - [`payload`]: the injected elements, safe by construction;
+//! - [`privacy`]: tracking protection's page script.
 //!
 //! On an [`InjectError`] the caller resets the connection: part of a rewritten
 //! body has gone out, so it can neither pass the original nor finish cleanly.
@@ -19,15 +20,18 @@ pub mod csp;
 pub mod decode;
 pub mod html;
 pub mod payload;
+pub mod privacy;
 pub mod response;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use http::{HeaderMap, StatusCode};
 use sieve_filter::rules::RuleSet;
+use sieve_ipc::LogChange;
 
 use self::decode::{BodyDecoder, ContentEncoding};
 use self::html::{HtmlInjector, has_utf16_bom};
+use self::privacy::PageScript;
 pub use self::response::PageRequest;
 
 const MIB: u64 = 1024 * 1024;
@@ -82,9 +86,16 @@ pub struct PageRewriter {
     html: HtmlInjector,
     has_scriptlets: bool,
     has_procedural: bool,
+    /// What Sieve's own script put in this page, for the log.
+    own_changes: Vec<LogChange>,
 }
 
 impl PageRewriter {
+    /// What Sieve's own script changes in this page.
+    pub fn own_changes(&self) -> &[LogChange] {
+        &self.own_changes
+    }
+
     /// This page gets scriptlets.
     pub fn has_scriptlets(&self) -> bool {
         self.has_scriptlets
@@ -132,20 +143,49 @@ pub fn begin(
     body_start: &[u8],
     limits: &InjectLimits,
 ) -> Option<PageRewriter> {
+    begin_with(rules, &PageScript::default(), request, status, headers, body_start, limits)
+}
+
+/// [`begin`] with `own`, Sieve's own code (tracking protection's
+/// [`privacy::script`]), run with the page's scriptlets. A page with only its
+/// `script` to inject is rewritten for it; its `signals` ride along only on a
+/// page rewritten anyway. A page a `$document` exception holds for (the user's
+/// or a list's) gets none of it, as AdGuard's `$document` turns its stealth mode
+/// off; `$elemhide` does not, as it is about hiding elements only.
+pub fn begin_with(
+    rules: &RuleSet,
+    own: &PageScript,
+    request: &PageRequest<'_>,
+    status: StatusCode,
+    headers: &mut HeaderMap,
+    body_start: &[u8],
+    limits: &InjectLimits,
+) -> Option<PageRewriter> {
     let format = response::body_format(request, status, headers)?;
     if format.encoding == ContentEncoding::Identity && has_utf16_bom(body_start) {
         return None;
     }
-    let cosmetics = rules.page_cosmetics(request.url);
+    let mut cosmetics = rules.page_cosmetics(request.url);
+    let has_scriptlets = !cosmetics.scriptlets.is_empty();
+    let has_own = !own.script.is_empty() || !own.signals.is_empty();
+    let own_allowed = has_own && !rules.has_document_exception(request.url);
+    let mut own_changes = Vec::new();
+    if own_allowed && !own.script.is_empty() {
+        cosmetics.scriptlets.push_str(&own.script);
+        own_changes.clone_from(&own.changes);
+    }
     if cosmetics.is_empty() {
         return None;
+    }
+    if own_allowed {
+        cosmetics.scriptlets.push_str(&own.signals);
     }
     let nonce = fresh_nonce()?;
     let decoder = BodyDecoder::new(format.encoding, *limits).ok()?;
     let html = HtmlInjector::new(payload::render(&cosmetics, &nonce), format.charset, limits);
     csp::rewrite_headers(headers, &nonce);
     response::strip_falsified_headers(headers);
-    Some(PageRewriter { decoder, html, has_scriptlets: !cosmetics.scriptlets.is_empty(), has_procedural: !cosmetics.procedural.is_empty() })
+    Some(PageRewriter { decoder, html, has_scriptlets, has_procedural: !cosmetics.procedural.is_empty(), own_changes })
 }
 
 #[cfg(test)]
@@ -186,5 +226,41 @@ mod tests {
         let policy = headers.get(CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap();
         let nonce = policy.split("'nonce-").nth(1).unwrap().trim_end_matches('\'');
         assert_eq!(String::from_utf8(out).unwrap(), format!("<head><style nonce=\"{nonce}\">.x{{display:none!important}}</style><title>t</title>"));
+    }
+
+    fn page_with(lists: &str, own: &PageScript) -> Option<String> {
+        let engine = RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(RuleEngine::compile(&[ListText { id: "l", text: lists, trusted: true }])) };
+        let get = http::Method::GET;
+        let request = PageRequest { url: "https://sieve-test.invalid/", method: &get, is_document: true };
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/html".parse().unwrap());
+        let mut rewriter = begin_with(&engine, own, &request, StatusCode::OK, &mut headers, b"", &InjectLimits::default())?;
+        let mut out = rewriter.push(b"<head></head>").unwrap();
+        out.extend(rewriter.finish().unwrap());
+        Some(String::from_utf8(out).unwrap())
+    }
+
+    fn own() -> PageScript {
+        PageScript { script: "window.own=1;".into(), changes: vec![LogChange { what: "webRtc".into(), count: 1 }], signals: "window.signals=1;".into() }
+    }
+
+    #[test]
+    fn a_document_exception_keeps_sieves_own_script_out_and_elemhide_does_not() {
+        let page = page_with("", &own()).expect("the own script alone rewrites the page");
+        assert!(page.contains("window.own=1;") && page.contains("window.signals=1;"), "{page}");
+        for exception in ["@@||sieve-test.invalid^$document", "@@||sieve-test.invalid^$document\n##.x"] {
+            let text: &'static str = Box::leak(format!("{exception}\n").into_boxed_str());
+            assert!(page_with(text, &own()).is_none_or(|p| !p.contains("window.own") && !p.contains("window.signals")), "{exception}");
+        }
+        let page = page_with("@@||sieve-test.invalid^$elemhide\n", &own()).unwrap();
+        assert!(page.contains("window.own=1;"), "{page}");
+    }
+
+    #[test]
+    fn the_signals_ride_along_only_on_a_page_rewritten_anyway() {
+        let signals_only = PageScript { signals: "window.signals=1;".into(), ..PageScript::default() };
+        assert_eq!(page_with("", &signals_only), None, "nothing else to inject: the page passes");
+        let page = page_with("##.x\n", &signals_only).unwrap();
+        assert!(page.contains("window.signals=1;"), "{page}");
     }
 }

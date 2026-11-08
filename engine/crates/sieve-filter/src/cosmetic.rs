@@ -473,6 +473,13 @@ impl RuleSet {
         };
         self.lists.page_cosmetics_under(url, &gates).merged_with(self.user.page_cosmetics(url))
     }
+
+    /// A `$document` exception, the user's or a list's, holds for the page at
+    /// `url`: Sieve adds nothing of its own to it either (tracking protection's
+    /// page script), as AdGuard's `$document` turns its stealth mode off there.
+    pub fn has_document_exception(&self, url: &str) -> bool {
+        [&self.user, &self.lists].into_iter().any(|e| exception_applies(&e.cosmetic.document, url))
+    }
 }
 
 /// Per-list scriptlet names, kept to recount when a bundle changes.
@@ -824,6 +831,15 @@ sieve-test.invalid##+js(sieve-set-flag, a, b)
         assert_eq!(p.specific_css, ".mine{display:none!important}", "{p:?}");
         assert_eq!(&*p.generic_css, ".anywhere{display:none!important}", "{p:?}");
         assert!(p.scriptlets.is_empty() && p.procedural.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn a_document_exception_of_either_engine_is_seen_and_elemhide_is_not_one() {
+        assert!(set_with(&[&format!("@@||{HOST}^$document")]).has_document_exception(URL), "the user's");
+        let lists = RuleSet { user: Arc::new(RuleEngine::empty()), lists: Arc::new(engine_with(&format!("{RULES}@@||{HOST}^$document\n"), true)) };
+        assert!(lists.has_document_exception(URL), "a list's");
+        assert!(!lists.has_document_exception(OTHER_URL), "another page");
+        assert!(!set_with(&[&format!("@@||{HOST}^$elemhide")]).has_document_exception(URL));
     }
 
     #[test]

@@ -110,8 +110,11 @@ pub const LIST_RULES_SHOWN: usize = 200;
 /// A search of a list's rules is at most this many bytes.
 pub const LIST_QUERY_MAX: usize = 256;
 /// The names of the tracking protections [`Policy::tracking`] may hold, the
-/// app's `tracking.*` settings without their prefix.
-pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location"];
+/// app's `tracking.*` settings without their prefix. Append-only: an engine
+/// refuses a policy naming one it does not know.
+pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location", "queryParams", "firstPartyCookies"];
+/// A log row carries at most this many [`LogChange`]s: one per protection.
+pub const MAX_LOG_CHANGES: usize = TRACKING_NAMES.len();
 /// A flow event's rule text is cut to this many bytes: a list rule can run to
 /// kilobytes, and at this cap a full `flows` frame stays under [`MAX_FRAME`].
 pub const MAX_RULE_BYTES: usize = 256;
@@ -270,6 +273,18 @@ pub enum Signal {
     Blocked,
     /// Sieve refused QUIC so the app falls back to TCP, where it is filtered.
     QuicRefused,
+    /// The app went away in the middle of the handshake with Sieve, or did not
+    /// finish it in time, with no alert: a tab closed, a PC asleep, or an app that
+    /// gave up on Sieve's certificate without saying so. Appended after
+    /// `QuicRefused` (the TENSION at [`LogOutcome`] holds for it too: an older app
+    /// and this engine ship together).
+    HandshakeAbandoned,
+    /// Decode only: a signal a newer engine sent that this build does not know. It
+    /// reads as this, so one new kind never fails a whole `Log` or `Issues` frame
+    /// for an app and engine out of step. The engine never sends it; not in
+    /// [`Signal::ALL`].
+    #[serde(other)]
+    Unknown,
 }
 
 /// Who most likely caused a problem.
@@ -280,12 +295,14 @@ pub enum Cause {
     Sieve,
     /// The same would happen without Sieve: the server or the network refused it.
     Network,
-    /// The signal cannot tell.
+    /// The signal cannot tell. A cause a newer engine sent that this build does not
+    /// know reads as this too, as [`Signal::Unknown`] does.
+    #[serde(other)]
     Unknown,
 }
 
 impl Signal {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::ConnectRefused,
         Self::ConnectTimeout,
         Self::Unreachable,
@@ -297,6 +314,7 @@ impl Signal {
         Self::AppRefusedCertificate,
         Self::Blocked,
         Self::QuicRefused,
+        Self::HandshakeAbandoned,
     ];
 
     /// The classification table, the only one: a signal decides its cause.
@@ -305,12 +323,13 @@ impl Signal {
     ///   the app's own, to the same address, from the interface Windows would use.
     /// - Unknown: a broken or stalled connection reads the same whichever side
     ///   broke it, and a lookup with no answer may be the resolvers Sieve asks or
-    ///   the network that blocks them.
+    ///   the network that blocks them; a handshake the app gave up on says nothing
+    ///   of why.
     pub fn cause(self) -> Cause {
         match self {
             Self::EgressFailed | Self::AppRefusedCertificate | Self::Blocked | Self::QuicRefused => Cause::Sieve,
             Self::ConnectRefused | Self::ConnectTimeout | Self::Unreachable => Cause::Network,
-            Self::ConnectFailed | Self::ConnectionLost | Self::Stall | Self::DnsUnanswered => Cause::Unknown,
+            Self::ConnectFailed | Self::ConnectionLost | Self::Stall | Self::DnsUnanswered | Self::HandshakeAbandoned | Self::Unknown => Cause::Unknown,
         }
     }
 
@@ -386,7 +405,9 @@ pub struct ExclusionRow {
     pub line: String,
     /// Lower-case exe file names; empty means every app.
     pub apps: Vec<String>,
-    /// `list:<id>`, `auto:pinning`, `auto:client-cert` or `auto:ev`.
+    /// `list:<id>`, `auto:pinning`, `auto:client-cert`, `auto:ev`, or `auto:failing`
+    /// (line `*`: one exe, by its full path in one session, though the row names
+    /// only the file).
     pub reason: String,
     /// When the engine first wrote it; None for a list's line.
     pub created_ms: Option<u64>,
@@ -1003,8 +1024,17 @@ pub enum LogOutcome {
 
 /// One row of the filtering log. A host-level row leaves `url` and
 /// `request_type` null.
+///
+/// Unlike the rest of the protocol, a row takes fields it does not know, as
+/// `LogChange` does: the log is evidence the app only shows, no decision reads it,
+/// and its fields are appended (as `forwarded` and `changes` were), so an app
+/// built from now on keeps reading the rows of a newer engine, a field short,
+/// rather than losing the whole `log` message. The app's own reader
+/// (`parseLogTail`) already tolerates them. Every field this crate knows stays
+/// as strict as before: a missing or mistyped one still refuses the row. What
+/// the app sends the engine (`ClientMessage`, `Policy`) still refuses unknown
+/// fields, which is where they could carry a decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LogRow {
     /// Unique for the engine's run.
     pub id: u64,
@@ -1030,6 +1060,21 @@ pub struct LogRow {
     /// Some for a guest's flow, which has no process (see [`FlowEvent::forwarded`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded: Option<Forwarded>,
+    /// What tracking protection changed in this request or its response, at most
+    /// [`MAX_LOG_CHANGES`]. Left out while empty, so an app that never asked for
+    /// a protection never sees the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<LogChange>,
+}
+
+/// One tracking protection's change to a request (plan 2026-11-09). `what` is the
+/// protection's name in [`TRACKING_NAMES`]; `count` how many things it changed
+/// (parameters removed, headers added, cookies capped). A name an app does not
+/// know is shown by its slug, as a reason is. Takes unknown fields, as [`LogRow`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogChange {
+    pub what: String,
+    pub count: u32,
 }
 
 /// A batch of rows as the `log` messages to send.
@@ -1507,7 +1552,42 @@ mod tests {
             rule: Some(rule.to_string().repeat(LOG_RULE_MAX)),
             list: Some("adguard-url-tracking".into()),
             forwarded: None,
+            changes: TRACKING_NAMES.iter().map(|n| LogChange { what: (*n).to_string(), count: u32::MAX }).collect(),
         }
+    }
+
+    /// A row without changes is the wire it always was; one with them round trips.
+    #[test]
+    fn log_changes_are_left_out_while_empty_and_round_trip() {
+        let plain = LogRow { changes: Vec::new(), ..log_row_at_caps('u', 'r') };
+        let wire = serde_json::to_value(&plain).unwrap();
+        assert!(wire.get("changes").is_none());
+        let older: LogRow = serde_json::from_value(wire).unwrap();
+        assert_eq!(older, plain);
+        let changed = LogRow { changes: vec![LogChange { what: "queryParams".into(), count: 3 }], ..plain };
+        let wire = serde_json::to_value(&changed).unwrap();
+        assert_eq!(wire["changes"], serde_json::json!([{ "what": "queryParams", "count": 3 }]));
+        assert_eq!(serde_json::from_value::<LogRow>(wire).unwrap(), changed);
+    }
+
+    /// A newer engine's row, with a field this build does not know, still reads,
+    /// in a `log` message too; a known field missing or mistyped still refuses it,
+    /// and what the app sends stays strict.
+    #[test]
+    fn a_log_row_takes_a_field_it_does_not_know_and_nothing_else_loosens() {
+        let row = LogRow { changes: vec![LogChange { what: "gpc".into(), count: 2 }], ..log_row_at_caps('u', 'r') };
+        let mut wire = serde_json::to_value(&row).unwrap();
+        wire["later"] = serde_json::json!({ "any": 1 });
+        wire["changes"][0]["later"] = serde_json::json!(true);
+        assert_eq!(serde_json::from_value::<LogRow>(wire.clone()).unwrap(), row);
+        let message = serde_json::json!({ "type": "log", "rows": [wire.clone()] });
+        assert_eq!(serde_json::from_value::<EngineMessage>(message).unwrap(), EngineMessage::Log { rows: vec![row] });
+        let mut missing = wire.clone();
+        missing.as_object_mut().unwrap().remove("host");
+        assert!(serde_json::from_value::<LogRow>(missing).is_err(), "a known field is still required");
+        wire["id"] = serde_json::json!("x");
+        assert!(serde_json::from_value::<LogRow>(wire).is_err(), "and still typed");
+        assert!(serde_json::from_str::<Policy>(r#"{"revision":4,"engine":true,"x":1}"#).is_err(), "the app's own messages stay strict");
     }
 
     fn rows_of(frames: &LogFrames) -> Vec<LogRow> {
@@ -1873,12 +1953,29 @@ mod tests {
             (Signal::AppRefusedCertificate, Sieve, false),
             (Signal::Blocked, Sieve, true),
             (Signal::QuicRefused, Sieve, true),
+            (Signal::HandshakeAbandoned, Unknown, false),
         ];
         assert_eq!(table.map(|(s, _, _)| s), Signal::ALL, "every signal, in order");
         for (signal, cause, intended) in table {
             assert_eq!((signal.cause(), signal.intended()), (cause, intended), "{signal:?}");
         }
         assert!(Signal::ALL.iter().filter(|s| s.intended()).all(|s| s.cause() == Sieve), "only Sieve means anything");
+        assert_eq!((Signal::Unknown.cause(), Signal::Unknown.intended()), (Unknown, false), "decode only: says nothing");
+    }
+
+    /// The fixture's `Issues` and a `Log` row, each with a signal and a cause a
+    /// newer engine might send: they read as `Unknown`, and the rest of the frame
+    /// with them (2026-11-09 verifier of bdd761a, P3).
+    #[test]
+    fn a_signal_or_cause_from_a_newer_engine_reads_as_unknown() {
+        let mut issues = fixture()["engine"].as_array().unwrap().iter().find(|m| m["type"] == "issues").cloned().unwrap();
+        let known = issues["apps"][0]["problems"].as_array().unwrap().len();
+        issues["apps"][0]["problems"].as_array_mut().unwrap().push(serde_json::json!({ "signal": "teleported", "cause": "the_moon", "host": "x.example", "count": 1, "first_ms": 1, "last_ms": 2 }));
+        let EngineMessage::Issues { apps, .. } = serde_json::from_value(issues).unwrap() else { unreachable!() };
+        assert_eq!(apps[0].problems.len(), known + 1, "the whole frame is read");
+        assert_eq!((apps[0].problems[known].signal, apps[0].problems[known].cause), (Signal::Unknown, Cause::Unknown));
+        let outcome: LogOutcome = serde_json::from_value(serde_json::json!({ "kind": "problem", "signal": "teleported", "cause": "network" })).unwrap();
+        assert_eq!(outcome, LogOutcome::Problem { signal: Signal::Unknown, cause: Cause::Network });
     }
 
     #[test]

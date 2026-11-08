@@ -522,6 +522,9 @@ pub fn decrypt(facts: &FlowFacts<'_>, store: &ExclusionSet, switches: &Switches)
     if let Some(source) = store.find(facts.host, facts.ip, facts.exe, switches.skip_ev) {
         return Decrypt::PassThrough(PassReason::Stored(source.clone()));
     }
+    if store.passes_app(facts.exe, facts.session) {
+        return Decrypt::PassThrough(PassReason::Stored(Source::Auto(AutoReason::Failing)));
+    }
     if facts.app_off {
         return Decrypt::PassThrough(PassReason::AppOff);
     }
@@ -558,9 +561,28 @@ pub struct ExclusionSet {
     hosts: HashMap<String, Vec<Stored>>,
     scanned: Vec<Stored>,
     len: usize,
+    /// `auto:failing`: whole apps that pass through untouched, each one exe by its
+    /// full path (lower case) in one Windows session. Not a host pattern: an app
+    /// named like another, or the same app of another user, is not this one, and no
+    /// name is held back for every app ([`Self::names_host`] does not read these).
+    whole_apps: Vec<(String, u32)>,
 }
 
 impl ExclusionSet {
+    /// Lets every flow of `exe` (its full path) in `session` through untouched.
+    pub fn add_whole_app(&mut self, exe: &str, session: u32) {
+        self.len += 1;
+        self.whole_apps.push((exe.to_ascii_lowercase(), session));
+    }
+
+    /// True when this flow's exe, by its full path, in its session, passes whole.
+    /// An unknown exe or session matches nothing here: `decrypt`'s floor already
+    /// passes such a flow through.
+    pub fn passes_app(&self, exe: Option<&str>, session: Option<u32>) -> bool {
+        let (Some(exe), Some(session)) = (exe, session) else { return false };
+        !self.whole_apps.is_empty() && self.whole_apps.iter().any(|(path, s)| *s == session && path.eq_ignore_ascii_case(exe))
+    }
+
     /// Adds entries from one source.
     pub fn add(&mut self, entries: impl IntoIterator<Item = Exclusion>, source: &Source) {
         for entry in entries {
@@ -727,8 +749,9 @@ mod decrypt_tests {
         assert_eq!(AutoReason::ALL.len(), 4);
     }
 
-    /// `auto:failing` is the whole app: `*` reads as every named host, and only
-    /// for the app it names.
+    /// The line "Keep it this way" writes for a whole app: `*` reads as every named
+    /// host, and only for the app it names. (`auto:failing` itself is no line: the
+    /// next test.)
     #[test]
     fn a_star_for_one_app_matches_every_named_host_of_that_app_only() {
         let star = parse_line("*$app=launcher.exe").unwrap();
@@ -737,6 +760,27 @@ mod decrypt_tests {
         assert!(star.matches(Some("cdn.game.example"), None, Some(r"C:\Games\launcher.exe")));
         assert!(!star.matches(Some("cdn.game.example"), None, Some(r"C:\Apps\other.exe")));
         assert!(!star.matches(None, Some("192.0.2.1".parse().unwrap()), Some("launcher.exe")), "no name, no match: such a flow is not decrypted anyway");
+    }
+
+    /// P2-5 of the 2026-11-08 second review: `auto:failing` is one exe by its full
+    /// path in one session, so another exe of the same file name, or the same app of
+    /// another user, stays decrypted; it holds no name back and no floor fact.
+    #[test]
+    fn a_whole_app_passes_by_full_path_and_session_only() {
+        let alpn = alpn();
+        let mut set = ExclusionSet::default();
+        set.add_whole_app(r"C:\Games\Launcher.exe", 1);
+        let flow = |exe, session| FlowFacts { exe: Some(exe), session: Some(session), ..base(&alpn) };
+        let all = Switches { scope: Scope::All, ..switches() };
+        assert_eq!(decrypt(&flow(r"c:\games\launcher.EXE", 1), &set, &all), Decrypt::PassThrough(PassReason::Stored(Source::Auto(AutoReason::Failing))));
+        assert_eq!(decrypt(&flow(r"C:\Users\x\Downloads\launcher.exe", 1), &set, &all), Decrypt::Intercept, "named like it, elsewhere");
+        assert_eq!(decrypt(&flow(r"C:\Games\Launcher.exe", 2), &set, &all), Decrypt::Intercept, "another user's");
+        assert_eq!(decrypt(&flow(r"C:\Games\Launcher.exe", 0), &set, &all), Decrypt::PassThrough(PassReason::Floor(Floor::Service)), "the floor first");
+        assert!(!set.passes_app(None, Some(1)) && !set.passes_app(Some(r"C:\Games\Launcher.exe"), None));
+        assert!(name_may_intercept(HOST, &set, &switches()), "no name is held back for every app");
+        let mut user = set.clone();
+        user.add([line(HOST)], &Source::User);
+        assert_eq!(decrypt(&flow(r"C:\Games\Launcher.exe", 1), &user, &all), Decrypt::PassThrough(PassReason::Stored(Source::User)), "a stored line ranks first");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, HeaderValue, LOCATION};
 use ::http::uri::{PathAndQuery, Uri};
@@ -21,13 +21,14 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::AlertDescription;
-use sieve_ipc::LogOutcome;
+use sieve_ipc::{LogChange, LogOutcome};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
 use super::facts;
 use super::hook::{self, ResponseHook};
 use super::rules::{self, Action};
+use super::tracking::{self, Changes, Protection, Protections};
 use super::upgrade::{AbortOnDrop, is_upgrade, splice, strip_hop_by_hop};
 use crate::domain::FilterSlot;
 use crate::stack::book::{FlowBook, RequestRow};
@@ -59,6 +60,22 @@ const ANY: &str = "*";
 const NO_STORE: &str = "no-store";
 const CLOSE: &str = "close";
 const MISDIRECTED: &str = "misdirected";
+/// The reason of a page the site sent back to its parameters, passed as asked.
+const PARAMS_KEPT: &str = "params_kept";
+/// How long a connection remembers a 307 it sent to remove parameters, and how
+/// many: the site's redirect back comes within the same chain, well under a
+/// second; ten seconds is room for a slow origin, sixteen for the pages one
+/// connection opens in that time. Declared dials, not measured.
+const MOVE_MEMORY: Duration = Duration::from_secs(10);
+const MOVES_KEPT: usize = 16;
+
+/// A 307 this connection sent, to `target`; `bounced` once the site answered
+/// that target with a redirect of its own.
+struct Move {
+    target: String,
+    at: Instant,
+    bounced: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proto {
@@ -80,12 +97,43 @@ pub struct Serve {
     seen: AtomicBool,
     splice: Mutex<Option<AbortOnDrop<()>>>,
     in_flight: Arc<watch::Sender<usize>>,
+    /// The 307s sent to remove parameters, newest last, at most [`MOVES_KEPT`].
+    moves: Mutex<Vec<Move>>,
 }
 
 impl Serve {
     #[allow(clippy::too_many_arguments)]
     pub fn new(filter: Arc<FilterSlot>, book: Arc<Mutex<FlowBook>>, hook: Arc<dyn ResponseHook>, watch: Arc<dyn ClientWatch>, flow_id: u64, pair: Pair, sni: String, port: u16, clock: fn() -> u64) -> Self {
-        Self { filter, book, hook, watch, flow_id, pair, sni, port, clock, seen: AtomicBool::new(false), splice: Mutex::new(None), in_flight: Arc::new(watch::Sender::new(0)) }
+        Self { filter, book, hook, watch, flow_id, pair, sni, port, clock, seen: AtomicBool::new(false), splice: Mutex::new(None), in_flight: Arc::new(watch::Sender::new(0)), moves: Mutex::new(Vec::new()) }
+    }
+
+    fn moves(&self) -> std::sync::MutexGuard<'_, Vec<Move>> {
+        let mut moves = self.moves.lock().unwrap_or_else(|p| p.into_inner());
+        moves.retain(|m| m.at.elapsed() < MOVE_MEMORY);
+        moves
+    }
+
+    fn remember_move(&self, target: &str) {
+        let mut moves = self.moves();
+        moves.retain(|m| m.target != target);
+        if moves.len() == MOVES_KEPT {
+            moves.remove(0);
+        }
+        moves.push(Move { target: target.to_string(), at: Instant::now(), bounced: false });
+    }
+
+    /// The site answered `url` with a redirect.
+    fn note_bounce(&self, url: &str) {
+        for m in self.moves().iter_mut().filter(|m| m.target == url) {
+            m.bounced = true;
+        }
+    }
+
+    /// This connection sent a 307 to `target` and the site sent it straight back
+    /// (with the parameters, or the redirect to it would not be asked): another
+    /// 307 would loop.
+    fn bounced_back(&self, target: &str) -> bool {
+        self.moves().iter().any(|m| m.target == target && m.bounced)
     }
 
     pub fn request_was_seen(&self) -> bool {
@@ -103,9 +151,49 @@ impl Serve {
         tokio::time::sleep(CLOSE_GRACE).await;
     }
 
-    fn log(&self, facts: &facts::OwnedFacts, outcome: LogOutcome, rule: Option<&str>, list: Option<&str>) {
-        let row = RequestRow { url: &facts.url, request_type: facts.request_type, outcome, rule, list };
+    fn log(&self, facts: &facts::OwnedFacts, outcome: LogOutcome, rule: Option<&str>, list: Option<&str>, changes: Vec<LogChange>) {
+        let row = RequestRow { url: &facts.url, request_type: facts.request_type, outcome, rule, list, changes };
         self.book.lock().unwrap_or_else(|p| p.into_inner()).log_request(self.flow_id, row, (self.clock)());
+    }
+}
+
+/// A request's log row, with what tracking protection changed on the way. Written
+/// once: by [`Row::write`], or when the request ends without it (the client went,
+/// the upstream failed), so a request is never missing from the log.
+struct Row {
+    ctx: Arc<Serve>,
+    facts: facts::OwnedFacts,
+    outcome: LogOutcome,
+    rule: Option<String>,
+    list: Option<String>,
+    changes: Changes,
+    written: bool,
+}
+
+impl Row {
+    fn new(ctx: Arc<Serve>, facts: facts::OwnedFacts, ruling: &rules::Ruling) -> Self {
+        Self { ctx, facts, outcome: ruling.outcome.clone(), rule: ruling.rule.clone(), list: ruling.list.clone(), changes: ruling.changes.clone(), written: false }
+    }
+
+    /// The request goes as the browser sent it: what removing its parameters
+    /// would have changed is not done, and the row says why.
+    fn keep_params(&mut self) {
+        self.outcome = LogOutcome::Passed { reason: PARAMS_KEPT.to_string() };
+        self.changes = Changes::default();
+    }
+
+    fn write(&mut self) {
+        if std::mem::replace(&mut self.written, true) {
+            return;
+        }
+        let changes = std::mem::take(&mut self.changes).into_vec();
+        self.ctx.log(&self.facts, self.outcome.clone(), self.rule.as_deref(), self.list.as_deref(), changes);
+    }
+}
+
+impl Drop for Row {
+    fn drop(&mut self) {
+        self.write();
     }
 }
 
@@ -290,7 +378,7 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
     let authority = facts::authority_of(&req);
     if misdirected(authority.as_deref(), &ctx.sni, ctx.port) {
         let f = facts::of(&req, authority.as_deref().unwrap_or(&ctx.sni));
-        ctx.log(&f, LogOutcome::Passed { reason: MISDIRECTED.to_string() }, None, None);
+        ctx.log(&f, LogOutcome::Passed { reason: MISDIRECTED.to_string() }, None, None, Vec::new());
         let mut response = answer(StatusCode::MISDIRECTED_REQUEST);
         if req.version() < ::http::Version::HTTP_2 {
             response.headers_mut().insert(CONNECTION, HeaderValue::from_static(CLOSE));
@@ -298,16 +386,36 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
         return Ok(response);
     }
     let f = facts::of(&req, authority.as_deref().unwrap_or(&ctx.sni));
-    let ruling = rules::rule(&ctx.filter.get(), &f.borrowed());
-    ctx.log(&f, ruling.outcome.clone(), ruling.rule.as_deref(), ruling.list.as_deref());
+    // One snapshot for the request: the rules and the protections are read as one.
+    let snapshot = ctx.filter.get();
+    let ruling = rules::rule(&snapshot, &f.borrowed());
+    let mut row = Row::new(ctx.clone(), f.clone(), &ruling);
     let rewritten = match ruling.action {
         Action::Block => return Ok(blocked()),
         Action::Serve { content_type, body } => return Ok(served(&content_type, body)),
-        Action::RedirectTo(clean) => return Ok(moved(&clean)),
+        // The site sent the clean address back to this one: a loop, so this time
+        // the page goes as asked.
+        Action::RedirectTo(clean) if ctx.bounced_back(&clean) => {
+            row.keep_params();
+            None
+        }
+        Action::RedirectTo(clean) => {
+            ctx.remember_move(&clean);
+            return Ok(moved(&clean));
+        }
         Action::Forward { rewritten } => rewritten,
     };
     if let Some(uri) = rewritten.as_deref().and_then(|url| with_path_of(req.uri(), url)) {
         *req.uri_mut() = uri;
+    }
+    let protections = snapshot.tracking_in_force();
+    tracking::prepare_request(protections, tracking::party(req.headers()), req.headers_mut(), &mut row.changes);
+    // A row waits for the response head only when a protection may change it, so
+    // with none on every row is written when the request is ruled, as it always was.
+    let cookies = tracking::cookie_cap(protections, tracking::cookie_party(req.headers()));
+    let page = f.borrowed().is_page();
+    if cookies.is_none() && !(page && (protections.has(Protection::QueryParams) || (snapshot.content && page_script(protections)))) {
+        row.write();
     }
     let upgrading = is_upgrade(req.headers());
     let on_client_upgrade = upgrading.then(|| hyper::upgrade::on(&mut req));
@@ -320,6 +428,22 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
         Err(e) if upstream.refused(&e) => return Err(Box::new(h2::Error::from(h2::Reason::REFUSED_STREAM))),
         Err(_) => return Ok(answer(StatusCode::BAD_GATEWAY)),
     };
+    if let Some(p) = cookies {
+        row.changes.add(p, tracking::cap_set_cookies(response.headers_mut(), tracking::now_s()));
+    }
+    let location = response.headers().get(LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string);
+    if page && response.status().is_redirection() && let Some(location) = location {
+        // Only a redirect that carries a query can bring a parameter back.
+        if location.contains('?') {
+            ctx.note_bounce(&f.url);
+        }
+        if let Some((clean, removed)) = rules::clean_location(&snapshot, &f.borrowed(), &location)
+            && let Ok(value) = HeaderValue::from_str(&clean)
+        {
+            response.headers_mut().insert(LOCATION, value);
+            row.changes.add(Protection::QueryParams, removed);
+        }
+    }
     if let (StatusCode::SWITCHING_PROTOCOLS, Some(client)) = (response.status(), on_client_upgrade) {
         let on_upstream_upgrade = hyper::upgrade::on(&mut response);
         *ctx.splice.lock().unwrap_or_else(|p| p.into_inner()) = Some(splice(client, on_upstream_upgrade));
@@ -327,8 +451,15 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
     }
     strip_hop_by_hop(response.headers_mut(), false);
     let (mut parts, body) = response.into_parts();
-    let body = hook::apply(ctx.hook.as_ref(), &f.borrowed(), parts.status, &mut parts.headers, body).await;
+    let (body, page_changes) = hook::apply(ctx.hook.as_ref(), &f.borrowed(), parts.status, &mut parts.headers, body).await;
+    row.changes.extend(page_changes);
+    row.write();
     Ok(Response::from_parts(parts, UnsyncBoxBody::new(Counted { body, stream: Some(stream) })))
+}
+
+/// A protection that lives in the page's script, which only the content hook writes.
+fn page_script(on: Protections) -> bool {
+    [Protection::WebRtc, Protection::Push, Protection::Location].into_iter().any(|p| on.has(p))
 }
 
 /// Takes the pair to its end, however it ends.

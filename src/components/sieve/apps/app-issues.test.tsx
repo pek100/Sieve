@@ -118,6 +118,57 @@ describe("apps having trouble", () => {
     expect(tried).toHaveBeenCalledWith("*", "launcher.exe", "auto:failing");
   });
 
+  it("keep and try again act on the exe the untouched row names, not the one its problems were last heard from", async () => {
+    const engine = createMockEngine("filtering", { issues: "some", heal: true });
+    const some = engine.issues;
+    // The same app (by key) with problems last heard from its helper exe, while the row
+    // passes its other exe through.
+    engine.issues = async (after) => {
+      const answer = await some(after);
+      return { ...answer, apps: answer.apps.map((a, i) => (i === 0 ? { ...a, key: "google chrome", exe: "chrome_helper.exe" } : a)) };
+    };
+    const page = engine.exclusions;
+    engine.exclusions = async (after) => {
+      const p = await page(after);
+      return { ...p, rows: [...p.rows, { line: "*", apps: ["chrome.exe"], reason: "auto:failing", created_ms: 1_793_000_000_000, retries: 0 }] };
+    };
+    const tried = vi.fn(engine.tryDecryptAgain);
+    engine.tryDecryptAgain = tried;
+    const { runtime, user } = await setup(engine);
+    await waitFor(() => expect(troubleRows()[0]?.dataset.app).toBe("google chrome"));
+    const chrome = document.querySelector<HTMLElement>('[data-testid="app-row"][data-app="google chrome"]')!;
+    await user.click(within(chrome).getAllByRole("button")[0]);
+    const sheet = await screen.findByTestId("app-problems");
+    expect(await within(sheet).findByTestId("app-untouched")).toBeInTheDocument();
+    await user.click(within(sheet).getByRole("button", { name: "Keep it this way" }));
+    const dialog = await screen.findByRole("dialog", { name: /Never decrypt chrome.exe/ });
+    expect(dialog).toHaveTextContent("for everyone who uses this PC");
+    await user.click(within(dialog).getByRole("button", { name: "Add it" }));
+    await waitFor(() => expect(runtime.settings.get("filtering.exclusions")).toEqual(["*$app=chrome.exe"]));
+    await user.click(within(sheet).getByRole("button", { name: "Try decrypting again" }));
+    expect(tried).toHaveBeenCalledWith("*", "chrome.exe", "auto:failing");
+  });
+
+  it("the untouched note and its buttons last the row's whole day, after the problems grew old", async () => {
+    const engine = createMockEngine("filtering", { issues: "none", heal: true });
+    const page = engine.exclusions;
+    engine.exclusions = async (after) => {
+      const p = await page(after);
+      return { ...p, rows: [...p.rows, { line: "*", apps: ["chrome.exe"], reason: "auto:failing", created_ms: 1_793_000_000_000, retries: 0 }] };
+    };
+    const tried = vi.fn(engine.tryDecryptAgain);
+    engine.tryDecryptAgain = tried;
+    const { user } = await setup(engine);
+    const chrome = document.querySelector<HTMLElement>('[data-testid="app-row"][data-app="google chrome"]')!;
+    await user.click(within(chrome).getAllByRole("button")[0]);
+    const sheet = await screen.findByTestId("app-problems");
+    expect(within(sheet).getByText("No problems Sieve saw.")).toBeInTheDocument();
+    expect(await within(sheet).findByTestId("app-untouched")).toHaveTextContent("Sieve passes this app through untouched for a day");
+    expect(within(sheet).queryByRole("button", { name: "Copy a report" }), "no problems, no report").toBeNull();
+    await user.click(within(sheet).getByRole("button", { name: "Try decrypting again" }));
+    expect(tried).toHaveBeenCalledWith("*", "chrome.exe", "auto:failing");
+  });
+
   it("degraded answers render what can be read and never crash", async () => {
     await setup(engineWith("partial"));
     await waitFor(() => expect(troubleRows()).toHaveLength(1));

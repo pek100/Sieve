@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { iconExe } from "@/core/apps";
 import type { AppEntry } from "@/core/apps-actions";
 import { engineRoutes, engineVersion } from "@/core/engine";
+import { exeFileName } from "@/core/exclusions";
 
 import {
   appFixes,
@@ -45,6 +46,7 @@ const FIX_ICON: Record<Fix, LucideIcon> = {
 };
 
 const NO_APPS: AppIssues[] = [];
+const NO_EXES: readonly string[] = [];
 
 /** The engine's apps with problems, or none while it is not routing. */
 function useIssues() {
@@ -131,7 +133,7 @@ function ProblemRow({ problem, exe, onFix }: { problem: Problem; exe: string | n
  * is written is shown before it is written (`RulePreview`); Off is the switch's
  * own write. Nothing leaves the PC: the report goes to the clipboard.
  */
-export function AppProblems({ appKey, name, canTurnOff, turnOff }: { appKey: string; name: string; canTurnOff: boolean; turnOff: () => void }) {
+export function AppProblems({ appKey, name, exes = NO_EXES, canTurnOff, turnOff }: { appKey: string; name: string; exes?: readonly string[]; canTurnOff: boolean; turnOff: () => void }) {
   const { routes, apps, error } = useIssues();
   const e = useEngine();
   const rows = useExclusionRows();
@@ -140,8 +142,14 @@ export function AppProblems({ appKey, name, canTurnOff, turnOff }: { appKey: str
   const preview = useRowActions();
   if (!routes) return null;
   const issues = apps.find((a) => a.key === appKey) ?? null;
-  const exe = issues?.exe ?? null;
-  const untouched = failingOpen(rows, exe);
+  // The pass-through lasts its day whether or not problems are still recent: its
+  // note and buttons read the exclusion rows, by the problems' exe or the app's own.
+  const names = [issues?.exe ?? null, ...(Array.isArray(exes) ? exes : []).filter((p) => typeof p === "string").map(exeFileName)];
+  const untouched = failingOpen(rows, names);
+  // The row's own exe: an app of several exes may pass one through while its
+  // problems were last heard from another. Keep and try again act on the row.
+  const untouchedExe = untouched?.apps.find((a) => names.includes(a)) ?? null;
+  const exe = issues?.exe ?? untouchedExe;
 
   const copyReport = (a: AppIssues) => {
     void (async () => navigator.clipboard.writeText(reportText(a, name, engineVersion(e))))().then(
@@ -152,8 +160,8 @@ export function AppProblems({ appKey, name, canTurnOff, turnOff }: { appKey: str
   const fix = (f: Fix, p: Problem | null) => {
     if (f === "turn_off") return turnOff();
     if (f === "report") return issues && copyReport(issues);
-    if (f === "try_again") return void (exe && tryDecryptAgain("*", exe, "auto:failing"));
-    const line = fixPreview(f, p?.host ?? null, exe);
+    if (f === "try_again") return void (untouchedExe && tryDecryptAgain("*", untouchedExe, "auto:failing"));
+    const line = fixPreview(f, p?.host ?? null, f === "keep_untouched" ? untouchedExe : exe);
     if (line) preview.ask(line);
   };
 
@@ -169,28 +177,33 @@ export function AppProblems({ appKey, name, canTurnOff, turnOff }: { appKey: str
             {VERDICT_TEXT[verdict(issues)]} {summaryText(issues)}.
           </p>
           {retriesText(issues) && <p className="text-label text-on-surface-muted">{retriesText(issues)}</p>}
-          {untouched && (
-            <p className="text-label text-on-surface-muted" data-testid="app-untouched">
-              {factTime(untouched.createdMs) ? `Since ${factTime(untouched.createdMs)}, ` : ""}{UNTOUCHED_TEXT}
-            </p>
-          )}
-          <div className="flex flex-wrap gap-2">
-            {appFixes(issues, untouched, canTurnOff).map((f) => {
-              const Icon = FIX_ICON[f];
-              return (
-                <Button key={f} variant="secondary" onClick={() => fix(f, null)}>
-                  <Icon strokeWidth={1.75} />
-                  {FIX_TEXT[f]}
-                </Button>
-              );
-            })}
-          </div>
-          <ul className="flex flex-col gap-2">
-            {issues.problems.map((p) => (
-              <ProblemRow key={`${p.signal}|${p.host ?? ""}`} problem={p} exe={exe} onFix={fix} />
-            ))}
-          </ul>
         </>
+      )}
+      {untouched && (
+        <p className="text-label text-on-surface-muted" data-testid="app-untouched">
+          {factTime(untouched.createdMs) ? `Since ${factTime(untouched.createdMs)}, ` : ""}
+          {UNTOUCHED_TEXT}
+        </p>
+      )}
+      {appFixes(issues, untouched, canTurnOff).length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {appFixes(issues, untouched, canTurnOff).map((f) => {
+            const Icon = FIX_ICON[f];
+            return (
+              <Button key={f} variant="secondary" onClick={() => fix(f, null)}>
+                <Icon strokeWidth={1.75} />
+                {FIX_TEXT[f]}
+              </Button>
+            );
+          })}
+        </div>
+      )}
+      {issues !== null && (
+        <ul className="flex flex-col gap-2">
+          {(issues.problems ?? []).map((p) => (
+            <ProblemRow key={`${p.signal}|${p.host ?? ""}`} problem={p} exe={exe} onFix={fix} />
+          ))}
+        </ul>
       )}
       <RulePreview preview={preview.preview} onConfirm={() => void preview.confirm()} onCancel={preview.cancelPreview} />
     </section>

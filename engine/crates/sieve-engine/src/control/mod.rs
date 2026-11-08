@@ -612,12 +612,15 @@ impl Backend for Engine {
 
     fn heal_notices(&self, after: u64) -> HealAnswer {
         let (revision, notices) = self.heal.notices(after);
+        // An entry past its end (an app's day untouched) moves the revision the app
+        // compares, with or without a flow to read the store.
+        self.exclusions.get();
         HealAnswer { run: self.heal.run(), revision, exclusions_revision: self.exclusions.revision(), notices }
     }
 
     /// The book's revisions start at this run's start, as heal's do.
     fn issues(&self, session: u32) -> IssuesAnswer {
-        let book = lock(&self.book);
+        let mut book = lock(&self.book);
         IssuesAnswer { run: self.heal.run(), revision: book.issues_revision(), apps: book.issues(session), dropped: book.issues_dropped() }
     }
 }
@@ -1287,7 +1290,7 @@ mod tests {
             };
             let id = book.open(event).unwrap();
             let url = format!("https://{HOST}/a.js");
-            let row = crate::stack::book::RequestRow { url: &url, request_type: "script", outcome: sieve_ipc::LogOutcome::Blocked, rule: Some("||secret-host.example^"), list: Some("adguard-dns") };
+            let row = crate::stack::book::RequestRow { url: &url, request_type: "script", outcome: sieve_ipc::LogOutcome::Blocked, rule: Some("||secret-host.example^"), list: Some("adguard-dns"), changes: Vec::new() };
             book.log_request(id, row, 1);
         }
         e.write_status_file();

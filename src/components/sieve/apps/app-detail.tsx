@@ -163,7 +163,7 @@ function Detail({ app, actions }: { app: AppEntry; actions: RowActions }) {
       </Section>
 
       <CardBoundary title="Problems">
-        <AppProblems appKey={app.key} name={app.name} canTurnOff={canTurnOff(app.key) && on} turnOff={() => actions.setOn(app.key, false)} />
+        <AppProblems appKey={app.key} name={app.name} exes={app.exes} canTurnOff={canTurnOff(app.key) && on} turnOff={() => actions.setOn(app.key, false)} />
       </CardBoundary>
 
       <Section title={app.exes.length === 1 ? "Path" : "Paths"}>

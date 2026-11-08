@@ -697,6 +697,9 @@ export const SIGNALS = [
   "app_refused_certificate",
   "blocked",
   "quic_refused",
+  "handshake_abandoned",
+  // What the Rust reader makes of a signal a newer engine sent that this build does not know.
+  "unknown",
 ] as const;
 export type Signal = (typeof SIGNALS)[number];
 /** sieve-ipc `Cause`: who most likely caused it. The engine decides; the app only says it. */
@@ -739,6 +742,14 @@ export interface LogRow {
   list: string | null;
   /** Present on a guest's flow, which has no process. `vm` null: its VM has no name. */
   forwarded?: { vm: string | null };
+  /** What tracking protection changed in the request or its response; absent while nothing. */
+  changes?: LogChange[];
+}
+
+/** sieve-ipc `LogChange`: `what` is a tracking protection's name (`Policy.tracking`), `count` how many things it changed. */
+export interface LogChange {
+  what: string;
+  count: number;
 }
 
 /** A row and its place in the app's own count, which survives an engine restart. */
@@ -881,8 +892,16 @@ function logEntry(raw: unknown): LogEntry | null {
       rule: optStr(r.rule),
       list: optStr(r.list),
       ...(isRec(r.forwarded) ? { forwarded: { vm: optStr(r.forwarded.vm) } } : {}),
+      ...logChanges(r.changes),
     },
   };
+}
+
+/** A row's tracking changes; a change that does not read is left out, never the row. Absent while none. */
+function logChanges(raw: unknown): { changes?: LogChange[] } {
+  if (!Array.isArray(raw)) return {};
+  const changes = raw.filter((c): c is LogChange => isRec(c) && typeof c.what === "string" && c.what !== "" && isCount(c.count) && c.count > 0).map((c) => ({ what: c.what, count: c.count }));
+  return changes.length > 0 ? { changes } : {};
 }
 
 /**

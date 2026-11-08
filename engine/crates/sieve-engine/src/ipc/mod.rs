@@ -433,7 +433,7 @@ mod tests {
             HealAnswer { run: 7, revision: notices.iter().map(|n| n.rev).max().unwrap_or(0), exclusions_revision: 4, notices: notices.iter().filter(|n| n.rev > after).cloned().collect() }
         }
         fn issues(&self, session: u32) -> IssuesAnswer {
-            let book = self.book.lock().unwrap();
+            let mut book = self.book.lock().unwrap();
             IssuesAnswer { run: 7, revision: book.issues_revision(), apps: book.issues(session), dropped: book.issues_dropped() }
         }
     }
@@ -744,6 +744,7 @@ mod tests {
             rule: None,
             list: None,
             forwarded,
+            changes: Vec::new(),
         }
     }
 

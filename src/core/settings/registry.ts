@@ -35,9 +35,11 @@ export const SECTIONS = [
   { id: "password", label: "Password" },
 ] as const;
 
-/** Tracking protection's levels, mildest first (the scale of core/profiles). */
-export const TRACKING_LEVELS = ["standard", "strict"] as const;
+/** Tracking protection's levels, mildest first (the scale of core/profiles), named as the filter profiles are. */
+export const TRACKING_LEVELS = ["minimal", "balanced", "strict"] as const;
 export type TrackingLevel = (typeof TRACKING_LEVELS)[number];
+/** What a person gets who changes nothing; every option's default derives from it (core/tracking re-exports it). */
+export const RECOMMENDED_TRACKING_LEVEL: TrackingLevel = "balanced";
 
 export type Section = (typeof SECTIONS)[number]["id"];
 
@@ -54,13 +56,13 @@ interface Base<T> {
    * Present: the setting is unavailable until what this names replaces it or
    * brings it back (a plan step, with the plan's path). It then has no row,
    * search, export or import, the UI that edits it is not shown, and it reads
-   * as its default, so an unavailable data switch is never on. Absent:
-   * available. Its code stays (see isAvailable).
+   * as its default, so an unavailable data switch is never on. Absent: available
+   * once the setting it `requires` is (see isAvailable). Its code stays.
    */
   unavailableUntil?: string;
   /** A record of what happened, not a preference: "Reset every setting" leaves it. Its own row can still change it. */
   keptByResetAll?: true;
-  /** A tracking protection: the lowest level that turns it on, null for none (its default is on exactly at Standard). */
+  /** A tracking protection: the lowest level that turns it on, null for none (its default is on exactly at Balanced, the recommended level). */
   preset?: TrackingLevel | null;
   /** What turning it on can break, in plain words, shown beside it. */
   breaks?: string;
@@ -201,33 +203,32 @@ export type SettingDef =
 const ENGINE_SLICE_6 = "engine slice 6 (docs/plans/2026-10-17-https-filtering.md)";
 /** The plan step whose live check opens rewriting pages to the user. */
 const ENGINE_SLICE_9 = "engine slice 9 (docs/plans/2026-10-17-https-filtering.md)";
-/** The engine holds `Policy.tracking` but acts on none of it; implementing the protections is the work that unlocks them. */
-const ENGINE_TRACKING = "the engine carrying out each tracking protection (docs/plans/2026-10-17-parity.md, rows 26 to 28)";
-
 const enumSetting = <const O extends string>(d: Omit<EnumSetting<O>, "kind">): EnumSetting<O> => ({
   kind: "enum",
   ...d,
 });
 
 /**
- * One tracking protection (plan rows 26 to 30). Each acts on decrypted requests
- * and pages, so each requires the HTTPS switch; the engine controller sends only
- * those in force. Its default is derived from its level: on exactly at Standard,
- * the recommended one, so the defaults are Standard (core/tracking).
+ * One tracking protection (plan rows 26 to 30, docs/plans/2026-11-09-tracking-protection.md),
+ * carried out by the engine. Each acts on decrypted requests, so each requires
+ * the HTTPS switch; one that lives in the page's script requires page filtering,
+ * which is what writes it. The engine controller sends only those in force. Its
+ * default is derived from its level: on exactly when Balanced, the recommended
+ * level, turns it on, so the defaults are Balanced (core/tracking).
  *
- * Unavailable until the engine carries them out: a default that is on would
- * otherwise read as a protection in force the moment HTTPS ships, while the
- * engine does nothing with it. Unavailable, none is shown, searched, imported or
- * sent, and a stored wish is kept unread.
+ * Available once the switch it requires is (isAvailable): until then none is
+ * shown, searched, imported or sent, and a stored wish is kept unread.
  */
-const trackingOption = (d: { label: string; help: string; preset: TrackingLevel | null; breaks?: string }): BooleanSetting => ({
-  kind: "boolean",
-  section: "tracking",
-  requires: "filtering.https",
-  default: d.preset === "standard",
-  unavailableUntil: ENGINE_TRACKING,
-  ...d,
-});
+const trackingOption = (d: { label: string; help: string; preset: TrackingLevel | null; breaks?: string; inPage?: true }): BooleanSetting => {
+  const { inPage, ...rest } = d;
+  return {
+    kind: "boolean",
+    section: "tracking",
+    requires: inPage ? "filtering.content" : "filtering.https",
+    default: d.preset !== null && TRACKING_LEVELS.indexOf(d.preset) <= TRACKING_LEVELS.indexOf(RECOMMENDED_TRACKING_LEVEL),
+    ...rest,
+  };
+};
 
 export const REGISTRY = {
   "appearance.theme": enumSetting({
@@ -426,21 +427,22 @@ export const REGISTRY = {
     default: [] as readonly CustomList[],
     of: { type: "customList" },
   } satisfies ListSetting<CustomList>,
-  // Keys are the names in the policy's `tracking` (sieve_ipc::TRACKING_NAMES).
+  // Keys are the names in the policy's `tracking` (sieve_ipc::TRACKING_NAMES), in
+  // its order, which is append-only; the block shows them by level.
   "tracking.gpc": trackingOption({
     label: "Ask sites not to track you",
     help: "Sends the Global Privacy Control and Do Not Track signals with every request, which sites that honour them treat as a no to selling or sharing what you do.",
-    preset: "standard",
+    preset: "minimal",
   }),
   "tracking.searchQueries": trackingOption({
     label: "Hide your searches from the sites you open",
-    help: "When you open a search result, that site is not told what you searched for.",
-    preset: "standard",
+    help: "Other sites are told only which site sent you, never the page, so a site you open from a search is not told what you searched for.",
+    preset: "balanced",
   }),
   "tracking.clientData": trackingOption({
     label: "Remove Chrome's tracking header",
     help: "Takes out the X-Client-Data header Chrome adds to requests to Google's sites, which can tell your browser apart from others.",
-    preset: "standard",
+    preset: "minimal",
   }),
   "tracking.referrer": trackingOption({
     label: "Hide which page you came from",
@@ -450,27 +452,41 @@ export const REGISTRY = {
   }),
   "tracking.thirdPartyCookies": trackingOption({
     label: "Expire other sites' cookies after an hour",
-    help: "Cookies from sites other than the one you are on are deleted after an hour, so they cannot follow you for long.",
+    help: "Cookies that other sites set from inside the page you are on are kept for an hour at most, so they cannot follow you for long. The site you open keeps its own cookies, however you got there.",
     preset: "strict",
-    breaks: "Comments, video players and sign-in buttons from other sites may ask you to sign in again.",
+    breaks: "Comments, video players and sign-in buttons from other sites may ask you to sign in again, and so may a site that signs you in through another of its own domains.",
   }),
   "tracking.webRtc": trackingOption({
     label: "Block WebRTC",
     help: "Stops pages finding your real network address through WebRTC, even behind a VPN.",
     preset: null,
     breaks: "Video calls, voice chat and screen sharing in the browser stop working.",
+    inPage: true,
   }),
   "tracking.push": trackingOption({
     label: "Block push notifications",
     help: "Sites cannot send you notifications through the browser.",
     preset: null,
     breaks: "Notifications from sites you chose to hear from stop too, such as web mail and chat.",
+    inPage: true,
   }),
   "tracking.location": trackingOption({
     label: "Block location requests",
     help: "Sites cannot ask the browser where you are.",
     preset: null,
     breaks: "Maps, delivery and weather sites cannot find where you are.",
+    inPage: true,
+  }),
+  "tracking.queryParams": trackingOption({
+    label: "Remove tracking codes from links",
+    help: "Takes campaign tags and click codes such as utm_source and fbclid out of the address of each page you open, so the site cannot tell which ad, mail or post sent you.",
+    preset: "balanced",
+  }),
+  "tracking.firstPartyCookies": trackingOption({
+    label: "Expire every site's own cookies after an hour",
+    help: "The cookies of the site you are on are deleted after an hour too, so it cannot recognise you on your next visit.",
+    preset: null,
+    breaks: "Every site signs you out after an hour and forgets your settings and your basket.",
   }),
   "password.idleMinutes": {
     kind: "number",
@@ -518,11 +534,21 @@ export function isSettingKey(key: string): key is SettingKey {
 /**
  * Can the user see and change this setting in this build? The one place the
  * answer comes from: the settings document, export, import, search and the
- * Settings view all ask it. `filtering.https`, `filtering.content` and the
- * tracking protections are the unavailable ones today (law 11).
+ * Settings view all ask it. A setting is unavailable by its own
+ * `unavailableUntil`, or because the setting it requires is: what needs a switch
+ * this build does not offer could never act (law 11). `filtering.https` and
+ * `filtering.content` are unavailable today, and with them the tracking
+ * protections that require them.
  */
 export function isAvailable(key: SettingKey): boolean {
-  return settingDef(key).unavailableUntil === undefined;
+  return unavailableUntil(key) === null;
+}
+
+/** What a setting waits for: its own plan step, else the one of the setting it requires; null when available. */
+export function unavailableUntil(key: SettingKey): string | null {
+  const d = settingDef(key);
+  if (d.unavailableUntil !== undefined) return d.unavailableUntil;
+  return d.requires !== undefined && isSettingKey(d.requires) ? unavailableUntil(d.requires) : null;
 }
 
 /** Does the filtering engine carry this setting out (a data switch declared `needsEngine`)? */

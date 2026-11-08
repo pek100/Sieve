@@ -111,6 +111,23 @@ async fn origin_answer(origin: Origin, req: Request<Incoming>) -> Result<Respons
             UnsyncBoxBody::new(rx)
         }
         "/echo" => req.into_body().map_err(|e| Box::new(e) as BoxError).boxed_unsync(),
+        "/set-cookies" => {
+            // A tracker's answer: a year, a minute, and a deletion.
+            let mut response = Response::new(Full::new(Bytes::from_static(b"cookies")).map_err(|e: Infallible| match e {}).boxed_unsync());
+            for cookie in ["uid=1; Max-Age=31536000; Path=/; Secure; SameSite=None", "seen=1; Max-Age=60", "old=; Expires=Thu, 01 Jan 1970 00:00:00 GMT"] {
+                response.headers_mut().append(::http::header::SET_COOKIE, cookie.parse().unwrap());
+            }
+            return Ok(response);
+        }
+        // A site that wants its own campaign tag on this page, and one that sends
+        // the reader on with one.
+        "/insists" | "/elsewhere" => {
+            let to = if path == "/insists" { "/insists?utm_source=site" } else { "/landing?utm_source=x&id=1" };
+            let mut response = Response::new(Full::new(Bytes::new()).map_err(|e: Infallible| match e {}).boxed_unsync());
+            *response.status_mut() = StatusCode::FOUND;
+            response.headers_mut().insert(::http::header::LOCATION, to.parse().unwrap());
+            return Ok(response);
+        }
         "/large-head" => {
             let mut response = Response::new(Full::new(Bytes::from_static(b"large")).map_err(|e: Infallible| match e {}).boxed_unsync());
             response.headers_mut().insert(LARGE_HEADER, large_value().parse().unwrap());
@@ -1359,4 +1376,279 @@ async fn bench_intercepted_h1_h2_in_memory() {
         drop(client);
         let _ = task.await;
     }
+}
+
+// ---- Tracking protection (plan 2026-11-09): what the origin and the client see,
+// and the log row that says so.
+
+fn tracking_policy(names: &[&str], content: bool) -> sieve_ipc::Policy {
+    sieve_ipc::Policy { tracking: names.iter().map(|n| (*n).to_string()).collect(), ..content_policy(content) }
+}
+
+async fn tracking_setup(arm: Arm, alpn: &str, policy: sieve_ipc::Policy) -> ContentSetup {
+    content_setup_with(arm, alpn, list_rules(""), policy, InjectLimits::default()).await
+}
+
+/// A cross-site image request as a browser sends it, from a search result page.
+const CROSS_SITE_IMAGE: [(&str, &str); 4] = [("sec-fetch-dest", "image"), ("sec-fetch-site", "cross-site"), ("referer", "https://search.example/results?q=private"), ("x-client-data", "CJa2yQEIpLbJAQ==")];
+
+fn last_asked(origin: &Origin) -> HeaderMap {
+    origin.requests.lock().unwrap().last().map(|(_, _, h)| h.clone()).expect("the origin was asked")
+}
+
+fn changes(row: &LogRow) -> Vec<(&str, u32)> {
+    row.changes.iter().map(|c| (c.what.as_str(), c.count)).collect()
+}
+
+arms!(tracking_changes_a_requests_head_and_the_log_says_how, |arm| async move {
+    for alpn in BOTH {
+        let mut c = tracking_setup(arm, alpn, tracking_policy(&["gpc", "clientData", "referrer"], false)).await;
+        assert_eq!(c.s.client.get(HOST, "/pixel.gif", &CROSS_SITE_IMAGE).await.status(), StatusCode::OK, "{alpn}");
+        let asked = last_asked(&c.s.origin);
+        assert_eq!((asked.get("sec-gpc").map(|v| v.to_str().unwrap()), asked.get("dnt").map(|v| v.to_str().unwrap())), (Some("1"), Some("1")), "{alpn}");
+        assert!(!asked.contains_key("x-client-data") && !asked.contains_key("referer"), "{alpn}: {asked:?}");
+        assert_eq!(asked.get("sec-fetch-dest").unwrap(), "image", "{alpn}: what no protection names is untouched");
+        let log = rows(&c.s.rig);
+        let row = log.iter().find(|r| r.url.as_deref() == Some("https://site.example/pixel.gif")).expect("a row");
+        assert_eq!(changes(row), [("gpc", 2), ("clientData", 1), ("referrer", 1)], "{alpn}");
+        assert_eq!(row.outcome, LogOutcome::Passed { reason: "no_rule".into() }, "{alpn}: what the rules did stays the outcome");
+        // A same-site request keeps its referrer: only cross-site ones lose it.
+        let same = [("sec-fetch-dest", "image"), ("sec-fetch-site", "same-origin"), ("referer", "https://site.example/a?b=c")];
+        c.s.client.get(HOST, "/own.gif", &same).await;
+        assert_eq!(last_asked(&c.s.origin).get("referer").unwrap(), "https://site.example/a?b=c", "{alpn}");
+        c.end().await;
+    }
+});
+
+arms!(search_queries_leave_a_cross_site_referrer_its_origin, |arm| async move {
+    for alpn in BOTH {
+        let mut c = tracking_setup(arm, alpn, tracking_policy(&["searchQueries"], false)).await;
+        c.s.client.get(HOST, "/pixel.gif", &CROSS_SITE_IMAGE).await;
+        let asked = last_asked(&c.s.origin);
+        assert_eq!(asked.get("referer").unwrap(), "https://search.example/", "{alpn}");
+        assert_eq!(asked.get("x-client-data").unwrap(), "CJa2yQEIpLbJAQ==", "{alpn}: an option that is off changes nothing");
+        assert!(!asked.contains_key("sec-gpc"), "{alpn}");
+        assert_eq!(changes(&rows(&c.s.rig)[0]), [("searchQueries", 1)], "{alpn}");
+        c.end().await;
+    }
+});
+
+arms!(tracking_off_or_the_switch_off_leaves_every_request_as_it_came, |arm| async move {
+    for (policy, what) in [(tracking_policy(&[], false), "no protection"), (sieve_ipc::Policy { sieving: false, ..tracking_policy(&["gpc", "clientData", "referrer", "thirdPartyCookies", "queryParams"], false) }, "the global switch off")] {
+        let mut c = tracking_setup(arm, H2, policy).await;
+        c.s.client.get(HOST, "/pixel.gif?utm_source=a", &CROSS_SITE_IMAGE).await;
+        let asked = last_asked(&c.s.origin);
+        for (name, value) in CROSS_SITE_IMAGE {
+            assert_eq!(asked.get(name).unwrap(), value, "{what}: {name}");
+        }
+        assert!(!asked.contains_key("sec-gpc") && !asked.contains_key("dnt"), "{what}");
+        let cookies = c.s.client.get(HOST, "/set-cookies", &[("sec-fetch-site", "cross-site")]).await;
+        assert_eq!(cookies.headers().get_all("set-cookie").iter().next().unwrap(), "uid=1; Max-Age=31536000; Path=/; Secure; SameSite=None", "{what}");
+        drop(cookies);
+        assert!(rows(&c.s.rig).iter().all(|r| r.changes.is_empty()), "{what}");
+        c.end().await;
+    }
+});
+
+arms!(query_params_send_a_page_to_its_clean_address_once, |arm| async move {
+    for alpn in BOTH {
+        let mut c = tracking_setup(arm, alpn, tracking_policy(&["queryParams"], false)).await;
+        let response = c.s.client.get(HOST, "/page?utm_source=mail&id=1&fbclid=AbC", &NAVIGATION).await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{alpn}");
+        assert_eq!(response.headers().get(::http::header::LOCATION).unwrap(), &format!("https://{HOST}/page?id=1"), "{alpn}");
+        drop(response);
+        assert!(c.s.origin.paths().is_empty(), "{alpn}: nothing went upstream");
+        let log = rows(&c.s.rig);
+        assert_eq!(log[0].outcome, LogOutcome::ParamsRemoved, "{alpn}");
+        assert_eq!(changes(&log[0]), [("queryParams", 2)], "{alpn}");
+        assert_eq!((log[0].rule.as_deref(), log[0].list.as_deref()), (None, None), "{alpn}: no list's rule did it");
+        assert_eq!(c.s.client.get(HOST, "/page?id=1", &NAVIGATION).await.status(), StatusCode::OK, "{alpn}: no loop");
+        // A subresource keeps its address: it may be signed, and no link carried it.
+        c.s.client.get(HOST, "/lib.js?utm_source=x&v=2", &[("sec-fetch-dest", "script")]).await;
+        assert_eq!(c.s.origin.paths(), ["/page?id=1", "/lib.js?utm_source=x&v=2"], "{alpn}");
+        assert!(rows(&c.s.rig).iter().all(|r| r.changes.is_empty()), "{alpn}");
+        c.end().await;
+    }
+});
+
+arms!(a_lists_removeparam_and_the_built_in_list_act_on_one_page_once, |arm| async move {
+    let policy = tracking_policy(&["queryParams"], false);
+    let mut c = content_setup_with(arm, H2, list_rules("||site.example^$removeparam=ref_id\n"), policy, InjectLimits::default()).await;
+    let response = c.s.client.get(HOST, "/page?ref_id=7&utm_campaign=x&id=1", &NAVIGATION).await;
+    assert_eq!(response.headers().get(::http::header::LOCATION).unwrap(), &format!("https://{HOST}/page?id=1"));
+    let row = rows(&c.s.rig).remove(0);
+    assert_eq!(row.list.as_deref(), Some("fixture"), "the list keeps its credit");
+    assert_eq!(changes(&row), [("queryParams", 1)], "and the protection says what it took");
+    drop(response);
+    c.end().await;
+});
+
+arms!(third_party_cookies_reach_the_browser_capped_at_an_hour, |arm| async move {
+    for alpn in BOTH {
+        let mut c = tracking_setup(arm, alpn, tracking_policy(&["thirdPartyCookies"], false)).await;
+        let response = c.s.client.get(HOST, "/set-cookies", &[("sec-fetch-dest", "image"), ("sec-fetch-site", "cross-site")]).await;
+        let got: Vec<String> = response.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap().to_string()).collect();
+        assert_eq!(got, ["uid=1; Path=/; Secure; SameSite=None; Max-Age=3600", "seen=1; Max-Age=60", "old=; Expires=Thu, 01 Jan 1970 00:00:00 GMT"], "{alpn}: a deletion stays one");
+        assert_eq!(body_of(response).await, b"cookies", "{alpn}");
+        assert_eq!(changes(&rows(&c.s.rig)[0]), [("thirdPartyCookies", 1)], "{alpn}: the row waited for the head");
+        // The site's own cookies are its own.
+        let own = c.s.client.get(HOST, "/set-cookies", &[("sec-fetch-dest", "document"), ("sec-fetch-site", "none")]).await;
+        assert_eq!(own.headers().get("set-cookie").unwrap(), "uid=1; Max-Age=31536000; Path=/; Secure; SameSite=None", "{alpn}");
+        drop(own);
+        assert!(rows(&c.s.rig)[0].changes.is_empty(), "{alpn}");
+        c.end().await;
+    }
+});
+
+arms!(first_party_cookies_cap_the_sites_own_and_leave_other_sites, |arm| async move {
+    let mut c = tracking_setup(arm, H1, tracking_policy(&["firstPartyCookies"], false)).await;
+    let own = c.s.client.get(HOST, "/set-cookies", &[("sec-fetch-site", "same-origin")]).await;
+    assert_eq!(own.headers().get("set-cookie").unwrap(), "uid=1; Path=/; Secure; SameSite=None; Max-Age=3600");
+    drop(own);
+    let other = c.s.client.get(HOST, "/set-cookies", &[("sec-fetch-site", "cross-site")]).await;
+    assert_eq!(other.headers().get("set-cookie").unwrap(), "uid=1; Max-Age=31536000; Path=/; Secure; SameSite=None");
+    drop(other);
+    let log = rows(&c.s.rig);
+    assert_eq!(changes(&log[0]), [("firstPartyCookies", 1)]);
+    assert!(log[1].changes.is_empty());
+    c.end().await;
+});
+
+arms!(browser_api_protections_go_into_a_decrypted_page_with_content_on, |arm| async move {
+    for alpn in BOTH {
+        let mut c = tracking_setup(arm, alpn, tracking_policy(&["webRtc", "location"], true)).await;
+        let page = String::from_utf8(body_of(c.s.client.get(HOST, "/page/identity", &NAVIGATION).await).await).unwrap();
+        assert!(page.contains("RTCPeerConnection") && page.contains("navigator.geolocation") && !page.contains("PushManager"), "{alpn}: {page}");
+        let log = rows(&c.s.rig);
+        assert_eq!(changes(&log[0]), [("webRtc", 1), ("location", 1)], "{alpn}");
+        // A script is no page: nothing goes into it.
+        c.s.client.get(HOST, "/lib.js", &[("sec-fetch-dest", "script")]).await;
+        assert!(rows(&c.s.rig)[0].changes.is_empty(), "{alpn}");
+        c.end().await;
+        // Content off: the page arrives as the site sent it, and the row says nothing.
+        let mut off = tracking_setup(arm, alpn, tracking_policy(&["webRtc", "location"], false)).await;
+        let page = body_of(off.s.client.get(HOST, "/page/identity", &NAVIGATION).await).await;
+        assert_eq!(page, PAGE.as_bytes(), "{alpn}");
+        assert!(rows(&off.s.rig)[0].changes.is_empty(), "{alpn}");
+        off.end().await;
+    }
+});
+
+fn location(response: &Response<Incoming>) -> &str {
+    response.headers().get(::http::header::LOCATION).expect("a Location").to_str().unwrap()
+}
+
+// Second review P2-3: a site that redirects back to its parameter met a 307 each
+// time, and the browser looped until it gave up.
+arms!(query_params_never_loop_with_a_site_that_sends_its_parameter_back, |arm| async move {
+    for alpn in BOTH {
+        let mut c = tracking_setup(arm, alpn, tracking_policy(&["queryParams"], false)).await;
+        let first = c.s.client.get(HOST, "/insists?utm_source=mail", &NAVIGATION).await;
+        assert_eq!((first.status(), location(&first)), (StatusCode::TEMPORARY_REDIRECT, format!("https://{HOST}/insists").as_str()), "{alpn}");
+        drop(first);
+        let back = c.s.client.get(HOST, "/insists", &NAVIGATION).await;
+        assert_eq!((back.status(), location(&back)), (StatusCode::FOUND, "/insists?utm_source=site"), "{alpn}: a redirect to this very page is the site's to make");
+        drop(back);
+        let asked = c.s.client.get(HOST, "/insists?utm_source=site", &NAVIGATION).await;
+        assert_eq!(asked.status(), StatusCode::OK, "{alpn}: no second 307");
+        drop(asked);
+        assert_eq!(c.s.origin.paths(), ["/insists", "/insists?utm_source=site"], "{alpn}: the page went as the browser asked");
+        let log = rows(&c.s.rig);
+        let last = log.last().unwrap();
+        assert_eq!((last.outcome.clone(), last.changes.is_empty()), (LogOutcome::Passed { reason: "params_kept".into() }, true), "{alpn}: the row says why");
+        // Another page still loses its parameters.
+        assert_eq!(c.s.client.get(HOST, "/page?utm_source=a", &NAVIGATION).await.status(), StatusCode::TEMPORARY_REDIRECT, "{alpn}");
+        c.end().await;
+    }
+});
+
+arms!(query_params_leave_a_sites_redirect_to_another_page_clean, |arm| async move {
+    for alpn in BOTH {
+        let mut c = tracking_setup(arm, alpn, tracking_policy(&["queryParams"], false)).await;
+        let response = c.s.client.get(HOST, "/elsewhere", &NAVIGATION).await;
+        assert_eq!((response.status(), location(&response)), (StatusCode::FOUND, "/landing?id=1"), "{alpn}");
+        drop(response);
+        assert_eq!(changes(&rows(&c.s.rig)[0]), [("queryParams", 1)], "{alpn}");
+        // A script's redirect is no page's: left as the site sent it.
+        let script = c.s.client.get(HOST, "/elsewhere", &[("sec-fetch-dest", "script")]).await;
+        assert_eq!(location(&script), "/landing?utm_source=x&id=1", "{alpn}");
+        drop(script);
+        c.end().await;
+        // Off: the site's Location stands.
+        let mut off = tracking_setup(arm, alpn, tracking_policy(&[], false)).await;
+        assert_eq!(location(&off.s.client.get(HOST, "/elsewhere", &NAVIGATION).await), "/landing?utm_source=x&id=1", "{alpn}");
+        off.end().await;
+    }
+});
+
+// Second review P2-4: the built-in list ignored the user's and the lists' exceptions.
+arms!(query_params_obey_exceptions, |arm| async move {
+    const LINK: &str = "/page?utm_source=mail&id=1&fbclid=AbC";
+    let policy = || tracking_policy(&["queryParams"], false);
+    let mut allowed = content_setup_with(arm, H2, list_rules("@@||site.example^\n"), policy(), InjectLimits::default()).await;
+    assert_eq!(allowed.s.client.get(HOST, LINK, &NAVIGATION).await.status(), StatusCode::OK, "an @@ rule for the page");
+    assert_eq!(allowed.s.origin.paths(), [LINK]);
+    assert!(rows(&allowed.s.rig)[0].changes.is_empty());
+    allowed.end().await;
+    let mut kept = content_setup_with(arm, H2, list_rules("@@||site.example^$removeparam=fbclid\n"), policy(), InjectLimits::default()).await;
+    let response = kept.s.client.get(HOST, LINK, &NAVIGATION).await;
+    assert_eq!(location(&response), format!("https://{HOST}/page?id=1&fbclid=AbC"), "a list's $removeparam exception keeps its name");
+    drop(response);
+    assert_eq!(changes(&rows(&kept.s.rig)[0]), [("queryParams", 1)]);
+    kept.end().await;
+    let user = RuleSet { user: Arc::new(RuleEngine::compile_user_rules(std::iter::empty(), ["@@||site.example^$removeparam"])), lists: list_rules("").lists };
+    let mut mine = content_setup_with(arm, H2, user, policy(), InjectLimits::default()).await;
+    assert_eq!(mine.s.client.get(HOST, LINK, &NAVIGATION).await.status(), StatusCode::OK, "the user's keeps every parameter");
+    assert_eq!(mine.s.origin.paths(), [LINK]);
+    mine.end().await;
+});
+
+// Second review P1-1: a sign-in callback arrives cross-site as a top-level
+// navigation, and Strict capped its session at an hour.
+arms!(third_party_cookies_leave_a_cross_site_navigation_its_own_cookies, |arm| async move {
+    for alpn in BOTH {
+        let mut c = tracking_setup(arm, alpn, tracking_policy(&["thirdPartyCookies", "referrer"], false)).await;
+        let callback = [("sec-fetch-dest", "document"), ("sec-fetch-site", "cross-site"), ("referer", "https://idp.example/authorize?client=1")];
+        let response = c.s.client.get(HOST, "/set-cookies", &callback).await;
+        assert_eq!(response.headers().get("set-cookie").unwrap(), "uid=1; Max-Age=31536000; Path=/; Secure; SameSite=None", "{alpn}");
+        drop(response);
+        assert!(!last_asked(&c.s.origin).contains_key("referer"), "{alpn}: the referrer options still read it as cross-site");
+        assert_eq!(changes(&rows(&c.s.rig)[0]), [("referrer", 1)], "{alpn}");
+        let frame = c.s.client.get(HOST, "/set-cookies", &[("sec-fetch-dest", "iframe"), ("sec-fetch-site", "cross-site")]).await;
+        assert_eq!(frame.headers().get("set-cookie").unwrap(), "uid=1; Path=/; Secure; SameSite=None; Max-Age=3600", "{alpn}: a frame from another site stays third-party");
+        drop(frame);
+        c.end().await;
+    }
+});
+
+// Second review P2-4: a page the user or a list excepted with $document still got
+// Sieve's own script.
+arms!(a_document_exception_keeps_the_page_script_out, |arm| async move {
+    let mut c = content_setup_with(arm, H2, list_rules("@@||site.example^$document\n"), tracking_policy(&["webRtc", "location"], true), InjectLimits::default()).await;
+    let response = c.s.client.get(HOST, "/page/identity", &NAVIGATION).await;
+    let head = response.headers().clone();
+    assert_untouched(&head, &body_of(response).await, "$document");
+    assert!(rows(&c.s.rig)[0].changes.is_empty());
+    c.end().await;
+});
+
+// Second review P3-9: the headers said GPC and DNT while the page read neither.
+arms!(gpc_tells_the_page_what_the_headers_say_when_the_page_is_rewritten, |arm| async move {
+    let mut c = content_setup_with(arm, H2, list_rules(CONTENT_RULES), tracking_policy(&["gpc"], true), InjectLimits::default()).await;
+    let page = String::from_utf8(body_of(c.s.client.get(HOST, "/page/identity", &NAVIGATION).await).await).unwrap();
+    assert!(page.contains("globalPrivacyControl") && page.contains("doNotTrack"), "{page}");
+    c.end().await;
+    let mut alone = tracking_setup(arm, H2, tracking_policy(&["gpc"], true)).await;
+    let response = alone.s.client.get(HOST, "/page/identity", &NAVIGATION).await;
+    let head = response.headers().clone();
+    assert_untouched(&head, &body_of(response).await, "gpc alone rewrites no page");
+    alone.end().await;
+});
+
+/// Tracking protection acts only where the floor let decryption through, and
+/// today that is browsers only. The day decryption reaches other apps, this
+/// fails, and tracking protection must ask whose flow it is first (plan 2026-11-09).
+#[test]
+fn tracking_protection_relies_on_decryption_being_for_browsers_only() {
+    assert_eq!(crate::exclusions::SCOPE, sieve_filter::exclusions::Scope::Browsers);
 }

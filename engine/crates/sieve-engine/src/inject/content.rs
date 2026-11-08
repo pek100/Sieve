@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 use http::header::ACCEPT_ENCODING;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use sieve_ipc::LogChange;
 
 use super::decode::readable_accept_encoding;
+use super::privacy;
 use super::response::{PageRequest, body_format};
-use super::{InjectError, InjectLimits, PageRewriter, begin};
+use super::{InjectError, InjectLimits, PageRewriter, begin_with};
 use crate::domain::{DomainFilter, FilterSlot};
 use crate::http::facts::RequestFacts;
 use crate::http::hook::{BodyRewrite, HookError, ResponseHook};
@@ -73,7 +75,8 @@ impl ResponseHook for ContentHook {
         let method = page_method(req)?;
         let snapshot = self.page_snapshot(req)?;
         let request = PageRequest { url: req.url, method: &method, is_document: true };
-        let rewriter = begin(&snapshot.rules, &request, status, headers, body_start, &self.limits)?;
+        let rewriter = begin_with(&snapshot.rules, &privacy::script(snapshot.tracking_in_force()), &request, status, headers, body_start, &self.limits)?;
+        let changes = rewriter.own_changes().to_vec();
         let meters = &self.meters.content;
         Meters::bump(&meters.rewritten);
         if rewriter.has_scriptlets() {
@@ -82,7 +85,7 @@ impl ResponseHook for ContentHook {
         if rewriter.has_procedural() {
             Meters::bump(&meters.with_procedural);
         }
-        Some(Box::new(Page { rewriter, meters: self.meters.clone() }))
+        Some(Box::new(Page { rewriter, meters: self.meters.clone(), changes }))
     }
 }
 
@@ -90,6 +93,8 @@ impl ResponseHook for ContentHook {
 struct Page {
     rewriter: PageRewriter,
     meters: Arc<Meters>,
+    /// The tracking protections its script carries.
+    changes: Vec<LogChange>,
 }
 
 impl Page {
@@ -105,8 +110,12 @@ impl BodyRewrite for Page {
     }
 
     fn finish(self: Box<Self>) -> Result<Vec<u8>, HookError> {
-        let Self { rewriter, meters } = *self;
+        let Self { rewriter, meters, .. } = *self;
         rewriter.finish().map_err(|e| Self::reset(&meters, &e))
+    }
+
+    fn changes(&self) -> Vec<LogChange> {
+        self.changes.clone()
     }
 }
 
