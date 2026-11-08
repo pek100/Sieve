@@ -480,6 +480,33 @@ async fn silent_drop_replies_nothing_and_still_swallows() {
     flow.task.abort();
 }
 
+/// The VN arm answers through the app's stream, never the packet sink: each Initial,
+/// held or later, gets its Version Negotiation; any other datagram is swallowed.
+#[tokio::test(start_paused = true)]
+async fn version_negotiation_answers_each_initial_through_the_stream() {
+    const SCID: [u8; 4] = [5; 4];
+    let initial = || {
+        let mut frames = crypto_frame(0, &[1, 0, 0, 0]);
+        frames.resize(MIN_INITIAL_DATAGRAM, 0);
+        seal_client_initial(VERSION_1, &DCID, &SCID, 0, 1, &frames)
+    };
+    let expected = super::negotiate::version_negotiation(&initial()).unwrap();
+    let mut flow = spawn_flow(Refusal::VersionNegotiation, vec![initial(), vec![2; 200]]);
+    let mut got = vec![0u8; expected.len()];
+    flow.app.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, expected, "the held Initial is answered");
+    send_datagram(&mut flow, &[3; 400]).await;
+    let mut none = [0u8; 8];
+    assert!(tokio::time::timeout(Duration::from_millis(1), flow.app.read(&mut none)).await.is_err(), "no answer to what is no Initial");
+    send_datagram(&mut flow, &initial()).await;
+    flow.app.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, expected, "a later Initial is answered");
+    assert_eq!(flow.sink.tried.load(Ordering::Relaxed), 0, "no ICMP");
+    assert_eq!(flow.meters.replies.load(Ordering::Relaxed), 2);
+    assert!(!flow.task.is_finished(), "the flow is remembered until idle");
+    flow.task.abort();
+}
+
 /// Pins today's arm. A build for the live drop arm is expected to fail here, and
 /// the runbook says so: a flip cannot land unnoticed.
 #[test]
