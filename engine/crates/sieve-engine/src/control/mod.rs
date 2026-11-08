@@ -1240,7 +1240,7 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join(STATUS_FILE)).unwrap();
         assert!(!text.contains(HOST), "no host on disk");
         let status: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(status["quic"]["refusal"], "port_unreachable");
+        assert_eq!(status["quic"]["refusal"], "version_negotiation");
         assert_eq!(status["quic"]["refused"], 2);
         assert_eq!(status["quic"]["replies"], 0);
         assert_eq!(status["quic"]["send_failed"], 0);

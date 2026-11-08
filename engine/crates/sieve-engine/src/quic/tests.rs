@@ -510,8 +510,8 @@ async fn version_negotiation_answers_each_initial_through_the_stream() {
 /// Pins today's arm. A build for the live drop arm is expected to fail here, and
 /// the runbook says so: a flip cannot land unnoticed.
 #[test]
-fn the_declared_constant_is_the_port_unreachable_arm() {
-    assert_eq!(REFUSAL, Refusal::PortUnreachable);
+fn the_declared_constant_is_the_version_negotiation_arm() {
+    assert_eq!(REFUSAL, Refusal::VersionNegotiation);
 }
 
 #[tokio::test(start_paused = true)]
@@ -702,8 +702,8 @@ struct StackRun {
 }
 
 /// The app's two Initials into a real `IpStack`, through `UdpClassifier`, `path`
-/// and, when refused, `refuse`.
-async fn through_the_stack(rig: &Rig, local: SocketAddr, remote: SocketAddr) -> StackRun {
+/// and, when refused, `refuse` with `arm`, so every arm meets the real stack.
+async fn through_the_stack(rig: &Rig, local: SocketAddr, remote: SocketAddr, arm: Refusal) -> StackRun {
     let (to_stack, rx) = mpsc::unbounded_channel();
     let (tx, from_stack) = mpsc::unbounded_channel::<Vec<u8>>();
     let mut config = IpStackConfig::default();
@@ -733,9 +733,9 @@ async fn through_the_stack(rig: &Rig, local: SocketAddr, remote: SocketAddr) -> 
     let who = Who { remote, exe: Some(CHROME), session: Some(1), may_decrypt: true, app_off: false, names_now_ms: 0 };
     let answer = path(Action::Pass, &slot, &decoded, &who, id);
     let sink = FakeSink::default();
-    if let UdpPath::Refuse(refusal) = answer {
+    if let UdpPath::Refuse(_) = answer {
         let meters = QuicMeters::default();
-        let reply = Reply { ends: (app.local_addr(), app.peer_addr()), refusal, sink: &sink, meters: &meters };
+        let reply = Reply { ends: (app.local_addr(), app.peer_addr()), refusal: arm, sink: &sink, meters: &meters };
         assert!(refuse(&mut app, &reply, held, &mut buf, Duration::from_millis(50), || slot.refuses(BROWSER)).await.is_empty(), "it idled out");
     }
     StackRun { answer, sink, from_stack }
@@ -746,7 +746,7 @@ async fn a_sealed_initial_through_ipstack_comes_out_as_icmp() {
     for (local, remote) in FLOWS {
         let (local, remote): (SocketAddr, SocketAddr) = (local.parse().unwrap(), remote.parse().unwrap());
         let rig = rig();
-        let mut run = through_the_stack(&rig, local, remote).await;
+        let mut run = through_the_stack(&rig, local, remote, Refusal::PortUnreachable).await;
         assert_eq!(run.answer, UdpPath::Refuse(REFUSAL), "{local}");
         let sent = run.sink.sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 2, "one answer per datagram");
@@ -758,12 +758,39 @@ async fn a_sealed_initial_through_ipstack_comes_out_as_icmp() {
     }
 }
 
+/// The default arm: each Initial comes back out of the stack as a UDP datagram from
+/// the server's address, holding its Version Negotiation packet, and no ICMP is sent.
+#[tokio::test]
+async fn a_sealed_initial_through_ipstack_is_answered_by_version_negotiation() {
+    for (local, remote) in FLOWS {
+        let (local, remote): (SocketAddr, SocketAddr) = (local.parse().unwrap(), remote.parse().unwrap());
+        let rig = rig();
+        let mut run = through_the_stack(&rig, local, remote, Refusal::VersionNegotiation).await;
+        assert_eq!(run.answer, UdpPath::Refuse(REFUSAL), "{local}");
+        assert_eq!(run.sink.tried.load(Ordering::Relaxed), 0, "no ICMP");
+        for initial in sealed_initials(HOST) {
+            let packet = run.from_stack.try_recv().expect("one answer per Initial");
+            let headers = etherparse::SlicedPacket::from_ip(&packet).unwrap();
+            let Some(etherparse::TransportSlice::Udp(udp)) = headers.transport else { panic!("not UDP: {headers:?}") };
+            let from = match headers.net {
+                Some(etherparse::NetSlice::Ipv4(ip)) => std::net::IpAddr::from(ip.header().source_addr()),
+                Some(etherparse::NetSlice::Ipv6(ip)) => std::net::IpAddr::from(ip.header().source_addr()),
+                _ => panic!("no IP header"),
+            };
+            assert_eq!((SocketAddr::new(from, udp.source_port()), udp.destination_port()), (remote, local.port()), "from the server to the app");
+            assert_eq!(udp.payload(), super::negotiate::version_negotiation(&initial).unwrap(), "{local}");
+        }
+        assert!(run.from_stack.try_recv().is_err(), "nothing else");
+        assert_eq!(rig.deps.connector.count(), 0, "nothing went upstream");
+    }
+}
+
 #[tokio::test]
 async fn a_relayed_flow_gets_no_reply() {
     for (local, remote) in FLOWS {
         let rig = rig();
         rig.deps.exclusions.set_user(&[HOST.to_string()], wall_ms());
-        let mut run = through_the_stack(&rig, local.parse().unwrap(), remote.parse().unwrap()).await;
+        let mut run = through_the_stack(&rig, local.parse().unwrap(), remote.parse().unwrap(), REFUSAL).await;
         assert_eq!(run.answer, UdpPath::Relay);
         assert_eq!(run.sink.tried.load(Ordering::Relaxed), 0);
         assert!(run.from_stack.try_recv().is_err());

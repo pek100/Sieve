@@ -35,8 +35,8 @@ use crate::stack::book::FlowBook;
 use crate::tls::intercept::{Dial, HttpsSlot, Who};
 use fallback::QuicMeters;
 
-/// How a refused flow is told. Both arms are built and tested; which one stands
-/// is decided by the live numbers, `docs/live/engine-slice-8.md`.
+/// How a refused flow is told. The three arms are built and tested; which one
+/// stands is decided by the live numbers, `docs/live/engine-slice-8.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     PortUnreachable,
@@ -56,8 +56,10 @@ impl Refusal {
     }
 }
 
-/// Plan section 3: if ICMP proves no faster than a drop, this word changes.
-pub const REFUSAL: Refusal = Refusal::PortUnreachable;
+/// Decided by the live numbers of 2026-11-08 (`docs/live/engine-slice-8.md`): after a Version
+/// Negotiation answer neither Edge nor Chrome waited out its own delay before TCP, where ICMP and
+/// a silent drop both left samples at about 300 ms.
+pub const REFUSAL: Refusal = Refusal::VersionNegotiation;
 
 /// The log's word for a refused flow. The app shows a slug it does not know
 /// with spaces (`reasonWords` in `src/core/log.ts`), so no protocol bump.
