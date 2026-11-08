@@ -5,7 +5,8 @@
 //! exclusion keeps whole.
 //!
 //! Third-party is the browser's own `Sec-Fetch-Site: cross-site`; without that
-//! header a request reads as first-party, so nothing is changed on a guess.
+//! header a request reads as first-party, so nothing is changed on a guess. For
+//! cookies a top-level navigation is always first-party ([`cookie_party`]).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,8 @@ use sieve_ipc::{LogChange, TRACKING_NAMES};
 
 const SEC_FETCH_SITE: &str = "sec-fetch-site";
 const CROSS_SITE: &str = "cross-site";
+const SEC_FETCH_DEST: &str = "sec-fetch-dest";
+const DOCUMENT: &str = "document";
 const SEC_GPC: &str = "sec-gpc";
 const DNT: &str = "dnt";
 const SIGNAL_ON: &str = "1";
@@ -118,9 +121,22 @@ pub enum Party {
     Third,
 }
 
+fn header_is(headers: &HeaderMap, name: &str, value: &str) -> bool {
+    headers.get(name).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim().eq_ignore_ascii_case(value))
+}
+
+/// The party as the referrer options read it: the raw `Sec-Fetch-Site`.
 pub fn party(headers: &HeaderMap) -> Party {
-    let cross = headers.get(SEC_FETCH_SITE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim().eq_ignore_ascii_case(CROSS_SITE));
-    if cross { Party::Third } else { Party::First }
+    if header_is(headers, SEC_FETCH_SITE, CROSS_SITE) { Party::Third } else { Party::First }
+}
+
+/// The party as the cookie options read it. A top-level navigation
+/// (`Sec-Fetch-Dest: document`) is the site the user opened, whoever linked to
+/// it: a sign-in callback, a mail link and a search click arrive cross-site, and
+/// what their responses set is that site's own cookie. A frame (`iframe`) or a
+/// subresource from another site stays third-party.
+pub fn cookie_party(headers: &HeaderMap) -> Party {
+    if header_is(headers, SEC_FETCH_DEST, DOCUMENT) { Party::First } else { party(headers) }
 }
 
 /// A cookie protection that applies to this request's response.
@@ -209,8 +225,10 @@ pub fn cap_set_cookies(headers: &mut HeaderMap, now_s: u64) -> u32 {
 }
 
 /// One `Set-Cookie` with a lifetime of at most `cap_s`, or None when it already
-/// has one (a deletion included) or its lifetime cannot be read. RFC 6265 5.3:
-/// the last valid `Max-Age` wins over `Expires`.
+/// has one (a deletion included) or is a session cookie. RFC 6265 5.2 and 5.3: an
+/// attribute whose value does not read is ignored, the last valid `Max-Age` wins
+/// over `Expires`, and a cookie with neither ends with the browser's session,
+/// which is the browser's to end: it is left alone.
 fn capped_cookie(value: &str, cap_s: u64, now_s: u64) -> Option<String> {
     let mut parts = value.split(';');
     let pair = parts.next()?;
@@ -219,15 +237,10 @@ fn capped_cookie(value: &str, cap_s: u64, now_s: u64) -> Option<String> {
     fn value_of(a: &str) -> &str {
         a.split_once('=').map_or("", |(_, v)| v.trim())
     }
-    let max_age = attributes.iter().rev().find(|a| named(a, MAX_AGE)).map(|a| value_of(a));
-    let lifetime_s: Option<i128> = match max_age {
-        Some(v) => Some(parse_max_age(v)?),
-        None => match attributes.iter().rev().find(|a| named(a, EXPIRES)) {
-            Some(a) => Some(i128::from(cookie_date(value_of(a))?) - i128::from(now_s)),
-            None => None,
-        },
-    };
-    if lifetime_s.is_some_and(|s| s <= i128::from(cap_s)) {
+    let max_age = attributes.iter().rev().filter(|a| named(a, MAX_AGE)).find_map(|a| parse_max_age(value_of(a)));
+    let expires = || attributes.iter().rev().filter(|a| named(a, EXPIRES)).find_map(|a| cookie_date(value_of(a))).map(|t| i128::from(t) - i128::from(now_s));
+    let lifetime_s = max_age.or_else(expires)?;
+    if lifetime_s <= i128::from(cap_s) {
         return None;
     }
     let mut out = pair.to_string();
@@ -239,8 +252,7 @@ fn capped_cookie(value: &str, cap_s: u64, now_s: u64) -> Option<String> {
     Some(out)
 }
 
-/// RFC 6265 5.2.2: an optional `-` and digits; anything else is no Max-Age, and
-/// the cookie is then left as it is.
+/// RFC 6265 5.2.2: an optional `-` and digits; anything else is no Max-Age.
 fn parse_max_age(v: &str) -> Option<i128> {
     let digits = v.strip_prefix('-').unwrap_or(v);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -467,8 +479,49 @@ mod tests {
         assert_eq!(cap("id=1; Max-Age=31536000; Path=/; Secure; SameSite=None").as_deref(), Some("id=1; Path=/; Secure; SameSite=None; Max-Age=3600"));
         assert_eq!(cap("id=1; Expires=Wed, 09 Nov 2027 00:00:00 GMT; Path=/").as_deref(), Some("id=1; Expires=Wed, 09 Nov 2027 00:00:00 GMT; Path=/; Max-Age=3600"));
         assert_eq!(cap("id=1; expires=Tue, 09-Nov-2027 00:00:00 GMT").as_deref(), Some("id=1; expires=Tue, 09-Nov-2027 00:00:00 GMT; Max-Age=3600"), "the Netscape form");
-        assert_eq!(cap("id=1; Path=/").as_deref(), Some("id=1; Path=/; Max-Age=3600"), "a session cookie gets the hour too");
         assert_eq!(cap("id=1; max-age=5; MAX-AGE=99999").as_deref(), Some("id=1; Max-Age=3600"), "the last Max-Age is the one in force");
+    }
+
+    /// RFC 6265 5.2.2: a Max-Age that does not read is ignored, so the cookie lives
+    /// by its Expires, or by the last Max-Age that does read.
+    #[test]
+    fn a_max_age_that_does_not_read_falls_back_to_expires() {
+        assert_eq!(cap("id=1; Max-Age=soon; Expires=Wed, 09 Nov 2050 00:00:00 GMT").as_deref(), Some("id=1; Expires=Wed, 09 Nov 2050 00:00:00 GMT; Max-Age=3600"));
+        assert_eq!(cap("id=1; Max-Age=99999; Max-Age=soon").as_deref(), Some("id=1; Max-Age=3600"), "the last valid one");
+        assert_eq!(cap("id=1; Max-Age=soon; Expires=Mon, 09 Nov 2026 00:30:00 GMT"), None, "an Expires inside the hour stands");
+        assert_eq!(cap("id=1; Max-Age=60; Max-Age=soon"), None);
+    }
+
+    /// A cookie with no lifetime ends with the browser's session: the browser's to
+    /// end, and an hour could cut it short (a sign-in, a basket).
+    #[test]
+    fn a_session_cookie_is_left_alone() {
+        for value in ["id=1", "id=1; Path=/; Secure; HttpOnly", "id=1; Max-Age=soon", "id=1; Expires=someday"] {
+            assert_eq!(cap(value), None, "{value}");
+        }
+        let mut h = HeaderMap::new();
+        h.append("set-cookie", "sid=1; Path=/; Secure".parse().unwrap());
+        assert_eq!(cap_set_cookies(&mut h, NOW), 0);
+        assert_eq!(h.get("set-cookie").unwrap(), "sid=1; Path=/; Secure");
+    }
+
+    /// A sign-in callback, a mail link or a search click is a top-level navigation
+    /// that arrives cross-site; its cookies are the opened site's own. Frames and
+    /// subresources from another site stay third-party, and the referrer options
+    /// keep reading the raw header.
+    #[test]
+    fn a_top_level_navigation_is_first_party_for_cookies_only() {
+        let mut nav = browser_request("cross-site");
+        nav.insert("sec-fetch-dest", "document".parse().unwrap());
+        assert_eq!(cookie_party(&nav), Party::First);
+        assert_eq!(party(&nav), Party::Third, "the referrer options keep the raw header");
+        for dest in ["iframe", "image", "script", "empty"] {
+            let mut h = browser_request("cross-site");
+            h.insert("sec-fetch-dest", dest.parse().unwrap());
+            assert_eq!(cookie_party(&h), Party::Third, "{dest}");
+        }
+        assert_eq!(cookie_party(&browser_request("same-site")), Party::First);
+        assert_eq!(cookie_cap(Protections::of(&[Protection::ThirdPartyCookies]), cookie_party(&nav)), None, "Strict leaves a sign-in's cookies alone");
     }
 
     #[test]

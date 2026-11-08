@@ -1024,8 +1024,17 @@ pub enum LogOutcome {
 
 /// One row of the filtering log. A host-level row leaves `url` and
 /// `request_type` null.
+///
+/// Unlike the rest of the protocol, a row takes fields it does not know, as
+/// `LogChange` does: the log is evidence the app only shows, no decision reads it,
+/// and its fields are appended (as `forwarded` and `changes` were), so an app
+/// built from now on keeps reading the rows of a newer engine, a field short,
+/// rather than losing the whole `log` message. The app's own reader
+/// (`parseLogTail`) already tolerates them. Every field this crate knows stays
+/// as strict as before: a missing or mistyped one still refuses the row. What
+/// the app sends the engine (`ClientMessage`, `Policy`) still refuses unknown
+/// fields, which is where they could carry a decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LogRow {
     /// Unique for the engine's run.
     pub id: u64,
@@ -1061,9 +1070,8 @@ pub struct LogRow {
 /// One tracking protection's change to a request (plan 2026-11-09). `what` is the
 /// protection's name in [`TRACKING_NAMES`]; `count` how many things it changed
 /// (parameters removed, headers added, cookies capped). A name an app does not
-/// know is shown by its slug, as a reason is.
+/// know is shown by its slug, as a reason is. Takes unknown fields, as [`LogRow`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LogChange {
     pub what: String,
     pub count: u32,
@@ -1560,6 +1568,26 @@ mod tests {
         let wire = serde_json::to_value(&changed).unwrap();
         assert_eq!(wire["changes"], serde_json::json!([{ "what": "queryParams", "count": 3 }]));
         assert_eq!(serde_json::from_value::<LogRow>(wire).unwrap(), changed);
+    }
+
+    /// A newer engine's row, with a field this build does not know, still reads,
+    /// in a `log` message too; a known field missing or mistyped still refuses it,
+    /// and what the app sends stays strict.
+    #[test]
+    fn a_log_row_takes_a_field_it_does_not_know_and_nothing_else_loosens() {
+        let row = LogRow { changes: vec![LogChange { what: "gpc".into(), count: 2 }], ..log_row_at_caps('u', 'r') };
+        let mut wire = serde_json::to_value(&row).unwrap();
+        wire["later"] = serde_json::json!({ "any": 1 });
+        wire["changes"][0]["later"] = serde_json::json!(true);
+        assert_eq!(serde_json::from_value::<LogRow>(wire.clone()).unwrap(), row);
+        let message = serde_json::json!({ "type": "log", "rows": [wire.clone()] });
+        assert_eq!(serde_json::from_value::<EngineMessage>(message).unwrap(), EngineMessage::Log { rows: vec![row] });
+        let mut missing = wire.clone();
+        missing.as_object_mut().unwrap().remove("host");
+        assert!(serde_json::from_value::<LogRow>(missing).is_err(), "a known field is still required");
+        wire["id"] = serde_json::json!("x");
+        assert!(serde_json::from_value::<LogRow>(wire).is_err(), "and still typed");
+        assert!(serde_json::from_str::<Policy>(r#"{"revision":4,"engine":true,"x":1}"#).is_err(), "the app's own messages stay strict");
     }
 
     fn rows_of(frames: &LogFrames) -> Vec<LogRow> {

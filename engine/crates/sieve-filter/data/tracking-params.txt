@@ -2,7 +2,9 @@
 # addresses by tracking protection's "queryParams" (plan 2026-11-09). One name a
 # line, compared without case; a trailing * matches every name it starts. A name
 # goes here only when no page needs it to work: the lists' $removeparam rules
-# carry what is specific to a site.
+# carry what is specific to a site. A name that says who a mail went to or carries
+# a token (a mail link that signs the reader in, unsubscribes them or fills a form)
+# is never here, whatever else it does: those are left to the lists.
 
 # Campaign tags (Urchin tracking module): utm_source, utm_medium, utm_campaign...
 utm_*
@@ -25,16 +27,9 @@ irclickid
 rb_clickid
 wickedid
 
-# Mail campaign identifiers.
-mc_eid
+# Mail campaign identifiers: the campaign, never the recipient.
 mc_cid
-_hsenc
-_hsmi
-mkt_tok
-vero_id
 vero_conv
-oly_anon_id
-oly_enc_id
 s_cid
 _openstat
 

@@ -160,6 +160,67 @@ pub struct RuleEngine {
     written: HashMap<(u32, String), String>,
     /// Per list, parallel to `reports`.
     strips: Vec<Strips>,
+    /// The `@@…$removeparam` lines, which adblock-rust's parser refuses (they stay
+    /// counted as skipped: the lists' own `$removeparam` ignores them), by the
+    /// parameter each keeps (lower case; empty for every parameter), as one
+    /// exception engine each. Only tracking protection's built-in list obeys them
+    /// ([`RuleSet::kept_params`]).
+    param_exceptions: HashMap<String, Engine>,
+}
+
+/// The parameters an exception keeps on one request: every one, or these names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeptParams {
+    every: bool,
+    /// Lower case.
+    names: HashSet<String>,
+}
+
+impl KeptParams {
+    pub fn keeps(&self, name: &str) -> bool {
+        self.every || self.names.contains(&name.to_ascii_lowercase())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.every && self.names.is_empty()
+    }
+}
+
+const EXCEPTION_MARK: &str = "@@";
+const REMOVEPARAM_OPTION: &str = "removeparam";
+/// A pattern that matches every URL, for an exception written with none.
+const ANY_URL: &str = "*";
+
+/// `@@pattern$…,removeparam[=name],…` as the parameter it keeps (lower case,
+/// empty for every one) and the exception without that option, whose matcher
+/// says which requests it holds for. A regex or inverted name is not read: None,
+/// and the built-in list removes as before.
+fn param_exception(line: &str) -> Option<(String, String)> {
+    let (pattern, options) = line.strip_prefix(EXCEPTION_MARK)?.rsplit_once(OPTIONS_START)?;
+    let mut key = None;
+    let mut kept = Vec::new();
+    for option in options.split(',') {
+        match option.strip_prefix(REMOVEPARAM_OPTION) {
+            Some("") => key = Some(String::new()),
+            Some(value) if value.starts_with('=') => {
+                let name = &value[1..];
+                if name.is_empty() || name.starts_with(['/', '~']) {
+                    return None;
+                }
+                key = Some(name.to_ascii_lowercase());
+            }
+            _ => kept.push(option),
+        }
+    }
+    let pattern = if pattern.is_empty() { ANY_URL } else { pattern };
+    let mut matcher = format!("{EXCEPTION_MARK}{pattern}");
+    if !kept.is_empty() {
+        matcher.push(OPTIONS_START);
+        matcher.push_str(&kept.join(","));
+    }
+    // An `@@` line that parses as a network rule is an exception.
+    let parses = matches!(parse_filter(&matcher, false, ParseOptions::default()), Ok(ParsedLine::Network(_)));
+    Some((key?, matcher)).filter(|_| parses)
 }
 
 /// One list's `$removeparam` lines, by the parameter each names, without those a
@@ -209,13 +270,27 @@ pub fn rule_lines(text: &str) -> impl Iterator<Item = &str> {
 /// A compiled list's derived network lines: half to the line that says it.
 type NetworkHalves = Vec<(String, String)>;
 
-fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder, cancelled: &mut HashSet<u64>) -> (ListReport, ScriptletUse, NetworkHalves, Vec<StripLine>) {
+/// What one list compiled to besides the engine's own text.
+struct Compiled {
+    report: ListReport,
+    scriptlets: ScriptletUse,
+    halves: NetworkHalves,
+    strips: Vec<StripLine>,
+    /// [`param_exception`]s.
+    kept: Vec<(String, String)>,
+}
+
+fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder, cancelled: &mut HashSet<u64>) -> Compiled {
     let opts = options(list.trusted);
     let mut r = ListReport { id: list.id.to_string(), ..ListReport::default() };
     let mut scriptlets = ScriptletUse::new();
     let mut halves = NetworkHalves::new();
     let mut strips = Vec::new();
+    let mut kept = Vec::new();
     for line in rule_lines(list.text) {
+        if let Some(exception) = param_exception(line) {
+            kept.push(exception);
+        }
         // A skipped exception is a defect (plan 5.2): the parser refuses these
         // options, so a line it can answer through `page_exception` is applied.
         let exception = page_exception(line).filter(|e| parse_filter(e.rule(), false, opts).is_ok());
@@ -256,7 +331,7 @@ fn report(list: &ListText<'_>, cosmetic: &mut CosmeticBuilder, cancelled: &mut H
             }
         }
     }
-    (r, scriptlets, halves, strips)
+    Compiled { report: r, scriptlets, halves, strips, kept }
 }
 
 fn live_strips(lines: Vec<StripLine>, cancelled: &HashSet<u64>) -> Strips {
@@ -310,21 +385,41 @@ impl RuleEngine {
         let mut written = HashMap::new();
         let mut strip_lines = Vec::with_capacity(lists.len());
         let mut cancelled = HashSet::new();
+        let mut kept: HashMap<String, Vec<String>> = HashMap::new();
         for (index, list) in lists.iter().enumerate() {
-            let (report, uses, halves, list_strips) = report(list, &mut cosmetic, &mut cancelled);
-            strip_lines.push(list_strips);
+            let compiled = report(list, &mut cosmetic, &mut cancelled);
+            strip_lines.push(compiled.strips);
+            for (key, matcher) in compiled.kept {
+                kept.entry(key).or_default().push(matcher);
+            }
             let mut text = list.text.to_string();
-            for (half, line) in halves {
+            for (half, line) in compiled.halves {
                 text.push('\n');
                 text.push_str(&half);
                 written.entry((index as u32, half)).or_insert(line);
             }
             set.add_filter_list(text, options(list.trusted));
-            reports.push(report);
-            scriptlets.push(uses);
+            reports.push(compiled.report);
+            scriptlets.push(compiled.scriptlets);
         }
         let strips = strip_lines.into_iter().map(|lines| live_strips(lines, &cancelled)).collect();
-        Self { engine: Engine::new_with_filter_set_no_optimize(set), reports, cosmetic: cosmetic.build(), scriptlets, written, strips }
+        let param_exceptions = kept.into_iter().map(|(key, lines)| (key, private_engine(&lines))).collect();
+        Self { engine: Engine::new_with_filter_set_no_optimize(set), reports, cosmetic: cosmetic.build(), scriptlets, written, strips, param_exceptions }
+    }
+
+    /// Adds what this engine's `$removeparam` exceptions keep on this request.
+    fn add_kept_params(&self, query: &RequestQuery<'_>, kept: &mut KeptParams) {
+        if self.param_exceptions.is_empty() {
+            return;
+        }
+        let Ok(request) = Request::new(query.url, query.initiator, query.request_type, query.method) else { return };
+        let holds = |key: &str| self.param_exceptions.get(key).is_some_and(|e| e.check_network_request_subset(&request, false, true).exception.is_some());
+        kept.every = kept.every || holds("");
+        for key in query_keys(query.url).map(str::to_ascii_lowercase) {
+            if !kept.every && !key.is_empty() && !kept.names.contains(&key) && holds(&key) {
+                kept.names.insert(key);
+            }
+        }
     }
 
     /// Which line removed a parameter from this request, and its list. adblock-rust
@@ -543,6 +638,15 @@ impl RuleSet {
         }
         RequestDecision { rewritten: lists.rewritten.clone().or(user.rewritten), ..lists }
     }
+
+    /// The parameters a `$removeparam` exception of the user's or a list's keeps
+    /// on this request, which the built-in tracking list then leaves too.
+    pub fn kept_params(&self, query: &RequestQuery<'_>) -> KeptParams {
+        let mut kept = KeptParams::default();
+        self.user.add_kept_params(query, &mut kept);
+        self.lists.add_kept_params(query, &mut kept);
+        kept
+    }
 }
 
 #[cfg(test)]
@@ -673,6 +777,25 @@ example.invalid##+js(set-constant, adsAllowed, true)
         assert_eq!(set.check_request(&query("https://ads.example/x", "https://b.example/", "script")).verdict, HostVerdict::Allow, "the user's allow beats a list's block");
         let both = set.check_request(&query("https://news.example/a?one=1&two=2&id=3", "", "document"));
         assert_eq!(both.rewritten.as_deref(), Some("https://news.example/a?id=3"), "the lists are asked on what the user's engine left");
+    }
+
+    #[test]
+    fn a_removeparam_exception_keeps_its_names_for_the_requests_it_matches() {
+        let page = |url| query(url, "", "document");
+        let set = set(RuleEngine::compile_user_rules(std::iter::empty(), ["@@||mine.example^$removeparam"]), "@@||site.example^$removeparam=FBCLID\n@@||site.example/x$removeparam=utm_source,document\n");
+        let kept = set.kept_params(&page("https://site.example/a?fbclid=1&utm_source=2"));
+        assert!(kept.keeps("fbclid") && kept.keeps("FbClid") && !kept.keeps("utm_source"), "{kept:?}");
+        assert!(set.kept_params(&page("https://site.example/x?utm_source=2")).keeps("utm_source"), "its own options hold");
+        assert!(set.kept_params(&page("https://other.example/a?fbclid=1")).is_empty(), "another site");
+        let every = set.kept_params(&page("https://mine.example/?anything=1"));
+        assert!(every.keeps("gclid") && every.keeps("utm_campaign"), "a bare $removeparam keeps every parameter: the user's own");
+        // A regex or inverted name is not read, and nothing is kept for it.
+        for line in ["@@||site.example^$removeparam=/^utm_/", "@@||site.example^$removeparam=~id"] {
+            let text: &'static str = Box::leak(format!("{line}\n").into_boxed_str());
+            assert!(lists(&[("l", text)]).param_exceptions.is_empty(), "{line}");
+        }
+        // The line stays counted as skipped: the lists' own $removeparam ignores it.
+        assert_eq!(engine("@@||site.example^$removeparam=fbclid\n").reports()[0].skipped, 1);
     }
 
     fn lists(texts: &[(&'static str, &'static str)]) -> RuleEngine {

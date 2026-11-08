@@ -54,11 +54,23 @@ export const LOG_FILTER_TEXT: Record<LogFilter, string> = {
 
 const MODIFIED: ReadonlySet<LogOutcome["kind"]> = new Set(["redirected", "params_removed", "hidden", "scriptlets"]);
 
-/** A row tracking protection changed reads Modified whatever the rules did. */
+/**
+ * Signals added to or taken from the request's own headers, on at every level
+ * and so on nearly every decrypted row: a row says them in its details only, or
+ * every decrypted row would read Modified and say them instead of its outcome.
+ */
+const HEADER_SIGNALS: ReadonlySet<string> = new Set(["gpc", "clientData"]);
+
+/** The changes a row shows in its column and the Modified filter counts. */
+export function shownChanges(row: Pick<LogRow, "changes">): LogChange[] {
+  return (row.changes ?? []).filter((c) => !HEADER_SIGNALS.has(c.what));
+}
+
+/** A row tracking protection changed reads Modified whatever the rules did; the header signals alone do not make it so. */
 export function matchesFilter(row: Pick<LogRow, "outcome" | "changes">, filter: LogFilter): boolean {
   const kind = row.outcome?.kind;
   if (filter === "all") return true;
-  if (filter === "modified") return MODIFIED.has(kind) || (row.changes?.length ?? 0) > 0;
+  if (filter === "modified") return MODIFIED.has(kind) || shownChanges(row).length > 0;
   return kind === filter;
 }
 
@@ -127,6 +139,7 @@ export const REASON_TEXT: Readonly<Record<string, string>> = {
   app_off: "app is off",
   mixed_names: "the address also serves names no rule blocks",
   no_name: "no name known for this address",
+  params_kept: "the site sends this page back to its tracking parameters, so they were kept",
 };
 
 /** A reason in words; one this build does not know shows its slug with spaces. */
@@ -166,10 +179,11 @@ export function outcomeWords(outcome: LogOutcome | null | undefined): string {
 /**
  * What a row says it did, in its outcome column: the outcome, except a request
  * the rules passed and tracking protection changed, which says the change (or
- * how many), since "passed through" alone would hide it.
+ * how many), since "passed through" alone would hide it. The header signals are
+ * left to the details.
  */
 export function rowWords(row: Pick<LogRow, "outcome" | "changes">): string {
-  const changes = row.changes ?? [];
+  const changes = shownChanges(row);
   if (row.outcome?.kind !== "passed" || changes.length === 0) return outcomeWords(row.outcome);
   return changes.length === 1 ? changeWords(changes[0]) : `Tracking protection made ${changes.length} changes`;
 }

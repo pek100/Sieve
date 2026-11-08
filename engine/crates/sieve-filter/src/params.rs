@@ -39,12 +39,18 @@ impl ParamList {
 
     pub fn matches(&self, name: &str) -> bool {
         let name = name.to_ascii_lowercase();
-        self.exact.iter().any(|e| *e == name) || self.prefixes.iter().any(|p| name.starts_with(p.as_str()))
+        self.exact.contains(&name) ||self.prefixes.iter().any(|p| name.starts_with(p.as_str()))
     }
 
     /// `url` without the listed parameters, and how many went; None when none did.
     /// A parameter's name is read as written: a percent-encoded name is no match.
     pub fn strip(&self, url: &str) -> Option<(String, u32)> {
+        self.strip_keeping(url, |_| false)
+    }
+
+    /// [`ParamList::strip`], leaving the listed names `keep` says to keep (an
+    /// exception for them, [`crate::rules::KeptParams`]).
+    pub fn strip_keeping(&self, url: &str, keep: impl Fn(&str) -> bool) -> Option<(String, u32)> {
         let (before_fragment, fragment) = match url.split_once('#') {
             Some((b, f)) => (b, Some(f)),
             None => (url, None),
@@ -55,7 +61,7 @@ impl ParamList {
             .split('&')
             .filter(|pair| {
                 let name = pair.split_once('=').map_or(*pair, |(n, _)| n);
-                let drop = !name.is_empty() && self.matches(name);
+                let drop = !name.is_empty() && self.matches(name) && !keep(name);
                 removed += u32::from(drop);
                 !drop
             })
@@ -83,12 +89,30 @@ mod tests {
     #[test]
     fn the_built_in_list_has_the_campaign_tags_and_the_click_ids() {
         let list = ParamList::built_in();
-        for name in ["utm_source", "utm_medium", "utm_campaign", "UTM_Content", "fbclid", "gclid", "msclkid", "yclid", "mc_eid"] {
+        for name in ["utm_source", "utm_medium", "utm_campaign", "UTM_Content", "fbclid", "gclid", "msclkid", "yclid", "mc_cid"] {
             assert!(list.matches(name), "{name}");
         }
         for name in ["q", "id", "page", "utm", "ref", "token", "v", "s", ""] {
             assert!(!list.matches(name), "{name}: a page may need it");
         }
+    }
+
+    /// A mail link's recipient id or token signs the reader in, unsubscribes them or
+    /// fills a form: the page needs it, so only a list's `$removeparam` may take it.
+    #[test]
+    fn names_that_carry_a_recipient_or_a_token_are_not_built_in() {
+        let list = ParamList::built_in();
+        for name in ["mkt_tok", "_hsenc", "_hsmi", "vero_id", "oly_enc_id", "oly_anon_id", "mc_eid"] {
+            assert!(!list.matches(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_kept_name_stays_and_the_rest_go() {
+        let list = ParamList::built_in();
+        let (clean, n) = list.strip_keeping("https://news.example/?utm_source=a&fbclid=b&id=1", |name| name == "fbclid").unwrap();
+        assert_eq!((clean.as_str(), n), ("https://news.example/?fbclid=b&id=1", 1));
+        assert_eq!(list.strip_keeping("https://news.example/?fbclid=b", |_| true), None, "every name kept is no change");
     }
 
     #[test]

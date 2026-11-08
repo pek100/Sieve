@@ -452,9 +452,9 @@ export const REGISTRY = {
   }),
   "tracking.thirdPartyCookies": trackingOption({
     label: "Expire other sites' cookies after an hour",
-    help: "Cookies from sites other than the one you are on are deleted after an hour, so they cannot follow you for long.",
+    help: "Cookies that other sites set from inside the page you are on are kept for an hour at most, so they cannot follow you for long. The site you open keeps its own cookies, however you got there.",
     preset: "strict",
-    breaks: "Comments, video players and sign-in buttons from other sites may ask you to sign in again.",
+    breaks: "Comments, video players and sign-in buttons from other sites may ask you to sign in again, and so may a site that signs you in through another of its own domains.",
   }),
   "tracking.webRtc": trackingOption({
     label: "Block WebRTC",

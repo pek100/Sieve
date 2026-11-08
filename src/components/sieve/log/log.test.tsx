@@ -233,16 +233,16 @@ describe("row details", () => {
   it("say what tracking protection changed, and the row says it in its outcome column", async () => {
     const rt = await setup("missing");
     const base = FIXTURE_ROWS[1].row as LogRow;
-    const row: LogRow = { ...base, url: "https://shop.example.net/a", request_type: "document", changes: [{ what: "queryParams", count: 3 }, { what: "gpc", count: 2 }] };
-    const one: LogRow = { ...base, id: 2, url: "https://shop.example.net/b", request_type: "image", changes: [{ what: "referrer", count: 1 }] };
+    const row: LogRow = { ...base, url: "https://shop.example.net/a", request_type: "document", changes: [{ what: "queryParams", count: 3 }, { what: "searchQueries", count: 1 }, { what: "gpc", count: 2 }] };
+    const one: LogRow = { ...base, id: 2, url: "https://shop.example.net/b", request_type: "image", changes: [{ what: "referrer", count: 1 }, { what: "gpc", count: 2 }] };
     act(() => rt.store.setLog({ ...EMPTY_LOG, rows: [{ seq: 1, row }, { seq: 2, row: one }] }));
     const [newest, older] = rows();
     expect(newest.querySelector("[data-log-outcome]")).toHaveTextContent("Removed the page you came from");
-    expect(older.querySelector("[data-log-outcome]")).toHaveTextContent("Tracking protection made 2 changes");
+    expect(older.querySelector("[data-log-outcome]"), "the header signals are not counted in the column").toHaveTextContent("Tracking protection made 2 changes");
     await userEvent.click(older.querySelector("button")!);
     const sheet = await screen.findByRole("dialog");
     const changes = within(sheet.querySelector<HTMLElement>("[data-log-changes]")!).getAllByRole("listitem").map((li) => li.textContent);
-    expect(changes).toEqual(["Removed 3 tracking parameters", "Sent Global Privacy Control and Do Not Track"]);
+    expect(changes, "the details keep every change, the signals too").toEqual(["Removed 3 tracking parameters", "Told the site only where you came from, not the page", "Sent Global Privacy Control and Do Not Track"]);
   });
 });
 

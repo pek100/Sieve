@@ -221,9 +221,25 @@ describe("tracking protection's changes (plan 2026-11-09)", () => {
     expect(matchesFilter(one, "modified")).toBe(true);
     expect(matchesFilter(changed(undefined), "modified")).toBe(false);
     expect(rowWords(one)).toBe("Removed 3 tracking parameters");
-    expect(rowWords(changed([{ what: "gpc", count: 2 }, { what: "referrer", count: 1 }]))).toBe("Tracking protection made 2 changes");
+    expect(rowWords(changed([{ what: "searchQueries", count: 1 }, { what: "referrer", count: 1 }]))).toBe("Tracking protection made 2 changes");
     expect(rowWords(changed(undefined))).toBe("Passed through (no rule matched)");
     const removed = { ...one, outcome: { kind: "params_removed" } as LogOutcome };
     expect(rowWords(removed), "the rules' own outcome stays first").toBe("Parameters removed");
+  });
+
+  // Second review P2-2: gpc and clientData are on at every level, so every
+  // decrypted row read Modified and said them instead of its outcome.
+  it("the header signals stay in the details: not Modified, not the row's words", () => {
+    const signals = changed([{ what: "gpc", count: 2 }, { what: "clientData", count: 1 }]);
+    expect(signals.changes).toHaveLength(2);
+    expect(matchesFilter(signals, "modified")).toBe(false);
+    expect(rowWords(signals)).toBe("Passed through (no rule matched)");
+    const withReferrer = changed([{ what: "gpc", count: 2 }, { what: "referrer", count: 1 }]);
+    expect(matchesFilter(withReferrer, "modified")).toBe(true);
+    expect(rowWords(withReferrer)).toBe("Removed the page you came from");
+  });
+
+  it("a page the site sent back to its parameters says so", () => {
+    expect(outcomeWords({ kind: "passed", reason: "params_kept" })).toBe("Passed through (the site sends this page back to its tracking parameters, so they were kept)");
   });
 });

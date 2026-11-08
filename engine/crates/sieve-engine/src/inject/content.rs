@@ -75,8 +75,8 @@ impl ResponseHook for ContentHook {
         let method = page_method(req)?;
         let snapshot = self.page_snapshot(req)?;
         let request = PageRequest { url: req.url, method: &method, is_document: true };
-        let (own_script, changes) = privacy::script(snapshot.tracking_in_force());
-        let rewriter = begin_with(&snapshot.rules, &own_script, &request, status, headers, body_start, &self.limits)?;
+        let rewriter = begin_with(&snapshot.rules, &privacy::script(snapshot.tracking_in_force()), &request, status, headers, body_start, &self.limits)?;
+        let changes = rewriter.own_changes().to_vec();
         let meters = &self.meters.content;
         Meters::bump(&meters.rewritten);
         if rewriter.has_scriptlets() {
