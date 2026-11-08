@@ -1,0 +1,42 @@
+# Query parameters that only identify a click or a campaign, removed from page
+# addresses by tracking protection's "queryParams" (plan 2026-11-09). One name a
+# line, compared without case; a trailing * matches every name it starts. A name
+# goes here only when no page needs it to work: the lists' $removeparam rules
+# carry what is specific to a site.
+
+# Campaign tags (Urchin tracking module): utm_source, utm_medium, utm_campaign...
+utm_*
+
+# Ad click identifiers, by ad network.
+gclid
+gclsrc
+dclid
+gbraid
+wbraid
+fbclid
+msclkid
+yclid
+ysclid
+twclid
+ttclid
+li_fat_id
+epik
+irclickid
+rb_clickid
+wickedid
+
+# Mail campaign identifiers.
+mc_eid
+mc_cid
+_hsenc
+_hsmi
+mkt_tok
+vero_id
+vero_conv
+oly_anon_id
+oly_enc_id
+s_cid
+_openstat
+
+# Share identifiers added to copied links.
+igshid

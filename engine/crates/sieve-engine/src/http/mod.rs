@@ -5,7 +5,8 @@
 //! - [`rules`]: what the rules make of a request;
 //! - [`serve`]: the connection pair and the per-request path, 421 included;
 //! - [`upgrade`]: hop-by-hop headers and the WebSocket splice;
-//! - [`hook`]: the response-body hook `inject::content` implements.
+//! - [`hook`]: the response-body hook `inject::content` implements;
+//! - [`tracking`]: what tracking protection does to a request and its response.
 //!
 //! Inside this module the HTTP types crate is written `::http::`.
 
@@ -15,4 +16,5 @@ pub mod rules;
 pub mod serve;
 #[cfg(test)]
 mod tests;
+pub mod tracking;
 pub mod upgrade;

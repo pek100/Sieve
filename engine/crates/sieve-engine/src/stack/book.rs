@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use sieve_ipc::{AppIssues, FlowAction, FlowEvent, Forwarded, Guest, LOG_RULE_MAX, LOG_URL_MAX, LogOutcome, LogRow, MAX_GUESTS, RetryHow, Signal, cap_text, vm_key};
+use sieve_ipc::{AppIssues, FlowAction, FlowEvent, Forwarded, Guest, LOG_RULE_MAX, LOG_URL_MAX, LogChange, LogOutcome, LogRow, MAX_GUESTS, MAX_LOG_CHANGES, RetryHow, Signal, cap_text, vm_key};
 
 use crate::domain::{Decision, Reason};
 use crate::issues::{AppId, Issues};
@@ -72,6 +72,8 @@ pub struct RequestRow<'a> {
     pub outcome: LogOutcome,
     pub rule: Option<&'a str>,
     pub list: Option<&'a str>,
+    /// What tracking protection changed (plan 2026-11-09).
+    pub changes: Vec<LogChange>,
 }
 
 /// Whose an open flow is, for its problems: the app, its exe's file name, and
@@ -158,7 +160,7 @@ impl FlowBook {
             self.issues.problem(&o.app, o.exe.as_deref(), signal, Some(&host), now);
         }
         if !signal.intended() {
-            self.push_row(id, now, None, LogOutcome::Problem { signal, cause: signal.cause() }, None, None);
+            self.push_row(id, now, None, LogOutcome::Problem { signal, cause: signal.cause() }, None, None, Vec::new());
         }
     }
 
@@ -169,7 +171,7 @@ impl FlowBook {
         if let Some(o) = self.owners.get(&id) {
             self.issues.retried(&o.app, o.exe.as_deref(), recovered, now);
         }
-        self.push_row(id, now, None, LogOutcome::Retried { how, recovered }, None, None);
+        self.push_row(id, now, None, LogOutcome::Retried { how, recovered }, None, None, Vec::new());
     }
 
     /// The apps of `session` (and the services' and VMs') with recent problems.
@@ -236,7 +238,8 @@ impl FlowBook {
     }
 
     /// One row about an open flow, with what the flow's event already says.
-    fn push_row(&mut self, id: u64, t: u64, request: Option<(&str, &str)>, outcome: LogOutcome, rule: Option<&str>, list: Option<&str>) {
+    #[allow(clippy::too_many_arguments)]
+    fn push_row(&mut self, id: u64, t: u64, request: Option<(&str, &str)>, outcome: LogOutcome, rule: Option<&str>, list: Option<&str>, mut changes: Vec<LogChange>) {
         let Some(e) = self.open.get(&id) else { return };
         if self.log.len() >= MAX_PENDING_LOG {
             self.next_log_id += 1;
@@ -259,6 +262,10 @@ impl FlowBook {
             rule: rule.map(|r| cap_text(r, LOG_RULE_MAX).to_string()),
             list: list.map(str::to_string),
             forwarded: e.forwarded.clone(),
+            changes: {
+                changes.truncate(MAX_LOG_CHANGES);
+                changes
+            },
         };
         self.next_log_id += 1;
         self.log.push(row);
@@ -270,14 +277,14 @@ impl FlowBook {
     pub fn log_decision(&mut self, id: u64, decision: &Decision, t: u64) {
         let Some(outcome) = log_outcome(decision) else { return };
         self.count_hit(&outcome, decision.list.as_deref());
-        self.push_row(id, t, None, outcome, decision.rule.as_deref(), decision.list.as_deref());
+        self.push_row(id, t, None, outcome, decision.rule.as_deref(), decision.list.as_deref(), Vec::new());
     }
 
     /// One decrypted request (task D13). Only what `RequestRow` holds reaches
     /// the log: bodies, cookies and auth headers never do (plan 7.1).
     pub fn log_request(&mut self, id: u64, request: RequestRow<'_>, t: u64) {
         self.count_hit(&request.outcome, request.list);
-        self.push_row(id, t, Some((request.url, request.request_type)), request.outcome, request.rule, request.list);
+        self.push_row(id, t, Some((request.url, request.request_type)), request.outcome, request.rule, request.list, request.changes);
     }
 
     fn count_hit(&mut self, outcome: &LogOutcome, list: Option<&str>) {
@@ -290,7 +297,7 @@ impl FlowBook {
 
     /// A flow that goes on undecrypted, and why (plan 4.1).
     pub fn log_not_decrypted(&mut self, id: u64, reason: &str, t: u64) {
-        self.push_row(id, t, None, LogOutcome::NotDecrypted { reason: reason.to_string() }, None, None);
+        self.push_row(id, t, None, LogOutcome::NotDecrypted { reason: reason.to_string() }, None, None, Vec::new());
     }
 
     pub fn list_hits(&self) -> &BTreeMap<String, u64> {
@@ -475,7 +482,7 @@ mod tests {
     fn list_hits_count_acted_requests_by_list() {
         let mut b = FlowBook::default();
         let id = b.open(event(Some(1))).unwrap();
-        let row = |outcome, list| RequestRow { url: "https://x.example/a", request_type: "script", outcome, rule: None, list };
+        let row = |outcome, list| RequestRow { url: "https://x.example/a", request_type: "script", outcome, rule: None, list, changes: Vec::new() };
         for outcome in [LogOutcome::Blocked, LogOutcome::Redirected, LogOutcome::ParamsRemoved] {
             b.log_request(id, row(outcome, Some("a")), 1);
         }

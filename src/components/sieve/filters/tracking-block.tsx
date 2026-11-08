@@ -11,7 +11,7 @@ import { useHydrated } from "@/hooks/use-hydrated";
 import { CUSTOM } from "@/core/profiles";
 import { readValue, writeValue } from "@/core/settings/document";
 import { TRACKING_LEVELS, settingDef, type Section, type SettingKey } from "@/core/settings/registry";
-import { RECOMMENDED_TRACKING, TRACKING_KEYS, TRACKING_TEXT, trackingLevel, trackingValues } from "@/core/tracking";
+import { RECOMMENDED_TRACKING, TRACKING_KEYS, TRACKING_TEXT, offeredTrackingKeys, trackingLevel, trackingValues } from "@/core/tracking";
 import { ChoiceList } from "./choice-list";
 
 const NO_BLOCKS: ReadonlySet<Section> = new Set();
@@ -22,14 +22,17 @@ export const TRACKING_WAITS_TEXT = "None of these is in effect yet, so each show
 /**
  * Tracking protection: a level (Standard, Strict, or Custom when the options
  * say neither) over options each stated by its effect, with what it can break.
- * The level is derived from the options; picking one writes them all in one
+ * The level is derived from the options, Minimal, Balanced (recommended) or
+ * Strict as the filter profiles are named; picking one writes them all in one
  * change with an Undo. Every option is locked the way Settings locks a row,
  * and while they all share one reason it is said once, above them.
  */
 export function TrackingBlock() {
   const view = useSettingsView("", NO_BLOCKS);
   const { doc, lockOf } = view;
-  const locks = useMemo(() => new Map(TRACKING_KEYS.map((k) => [k, lockOf(k)] as const)), [lockOf]);
+  // What the build offers cannot change while it runs.
+  const offered = useMemo(() => offeredTrackingKeys(), []);
+  const locks = useMemo(() => new Map(offered.map((k) => [k, lockOf(k)] as const)), [offered, lockOf]);
   // The password is said once, at the top of the screen; here what would still hold each option.
   const reasons = useMemo(() => new Map([...locks].map(([k, l]) => [k, l?.kind === "password" ? l.beneath : l] as const)), [locks]);
   // Stored settings are read in the window only: the first paint matches the prerendered page.
@@ -44,7 +47,7 @@ export function TrackingBlock() {
   const choose = (next: (typeof TRACKING_LEVELS)[number]) => {
     const values = trackingValues(next);
     const target = TRACKING_KEYS.reduce((d, k) => writeValue(d, k, values[k]), doc);
-    view.apply(target, next === RECOMMENDED_TRACKING ? "Tracking protection is back to Standard, the recommended level" : `Tracking protection set to ${TRACKING_TEXT[next].label}`);
+    view.apply(target, next === RECOMMENDED_TRACKING ? `Tracking protection is back to ${TRACKING_TEXT[next].label}, the recommended level` : `Tracking protection set to ${TRACKING_TEXT[next].label}`);
   };
   const choices = TRACKING_LEVELS.map((v) => ({ value: v, label: TRACKING_TEXT[v].label, note: v === RECOMMENDED_TRACKING ? "Recommended" : undefined, text: TRACKING_TEXT[v].text }));
 
@@ -62,12 +65,12 @@ export function TrackingBlock() {
           <div className="flex flex-wrap items-center gap-2" data-tracking-custom="">
             <p className="text-label text-on-surface-muted">{TRACKING_TEXT.custom.text}</p>
             <Button variant="ghost" size="sm" disabled={anyLocked} onClick={() => choose(RECOMMENDED_TRACKING)}>
-              Back to Standard
+              Back to recommended
             </Button>
           </div>
         )}
         <ul aria-label="Tracking protection options" className="flex flex-col gap-4">
-          {TRACKING_KEYS.map((k) => (
+          {offered.map((k) => (
             // A locked option shows what is in effect, off, never the wish it keeps: the level above says the choice.
             <TrackingOption key={k} k={k} lock={locks.get(k) ?? null} reason={reasons.get(k) ?? null} showLock={shared === null} on={hydrated && locks.get(k) === null && valueInForce(k, doc, null) === true} onSet={(v) => view.set(k, v)} />
           ))}

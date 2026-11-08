@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use crate::dns::NameMap;
 use crate::flow::classify::Decoded;
 use crate::flow::flows::Action;
+use crate::http::tracking::Protections;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
@@ -86,6 +87,9 @@ pub struct DomainFilter {
     /// `filtering.content`: decrypted pages get their cosmetics. In this snapshot
     /// so the switch and the rules it applies are read as one.
     pub content: bool,
+    /// The tracking protections the policy holds (plan 2026-11-09), read with the
+    /// switch: see [`DomainFilter::tracking_in_force`].
+    pub tracking: Protections,
     off: HashSet<String>,
     pub rules: RuleSet,
 }
@@ -125,12 +129,18 @@ pub fn user_engine(user: &UserRules, bundle: Option<&ResourceBundle>) -> RuleEng
 
 impl DomainFilter {
     pub fn new(policy: &Policy, rules: RuleSet) -> Self {
-        Self { enabled: policy.sieving, content: policy.content, off: off_keys(policy), rules }
+        Self { enabled: policy.sieving, content: policy.content, tracking: Protections::from_names(&policy.tracking), off: off_keys(policy), rules }
     }
 
     /// A snapshot that blocks nothing (the switch reads off).
     pub fn inert() -> Self {
-        Self { enabled: false, content: false, off: HashSet::new(), rules: RuleSet::empty() }
+        Self { enabled: false, content: false, tracking: Protections::NONE, off: HashSet::new(), rules: RuleSet::empty() }
+    }
+
+    /// What tracking protection does now: nothing with the global switch off,
+    /// which sieves nothing.
+    pub fn tracking_in_force(&self) -> Protections {
+        if self.enabled { self.tracking } else { Protections::NONE }
     }
 
     /// The same snapshot with newly compiled lists.

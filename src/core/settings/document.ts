@@ -14,7 +14,7 @@ import {
   isAvailable,
   isSettingKey,
   isValidValue,
-  settingDef,
+  unavailableUntil,
   type SettingKey,
   type SettingValue,
 } from "./registry";
@@ -58,7 +58,7 @@ export function readValue<K extends SettingKey>(doc: SettingsDoc, key: K): Setti
 export function writeValue<K extends SettingKey>(doc: SettingsDoc, key: K, value: SettingValue<K>): SettingsDoc {
   if (!isValidValue(key, value)) throw new Error(`Setting ${key}: invalid value ${JSON.stringify(value)}`);
   if (!isAvailable(key) && !sameValue(value, defaultValue(key))) {
-    throw new Error(`Setting ${key} is not available in this version of Sieve (until ${settingDef(key).unavailableUntil})`);
+    throw new Error(`Setting ${key} is not available in this version of Sieve (until ${unavailableUntil(key)})`);
   }
   const values: Record<string, unknown> = { ...doc.values };
   if (sameValue(value, defaultValue(key))) delete values[key];

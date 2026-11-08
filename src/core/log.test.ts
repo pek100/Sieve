@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
+import ipc from "@/data/fixtures/engine-ipc-v3.json";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
 import { LOG_OUTCOMES, ProtocolError, parseLogTail, type LogEntry, type LogOutcome } from "@/data/protocol";
-import { LOG_RING, LOG_SHOWN, appendRows, exeName, listName, matchesFilter, matchesSearch, outcomeWords, reasonWords, rowOwner, rowPath, rowUrl, urlFormHost, visibleRows } from "./log";
+import { LOG_RING, LOG_SHOWN, appendRows, changeWords, exeName, listName, matchesFilter, matchesSearch, outcomeWords, reasonWords, rowOwner, rowPath, rowUrl, rowWords, urlFormHost, visibleRows } from "./log";
 
 const rows = parseLogTail(logFixture).rows;
 const NO_TITLES = new Map<string, string>();
@@ -179,5 +180,50 @@ describe("parseLogTail", () => {
     const tail = parseLogTail({ v: 1, rows: [logFixture.rows[3]] });
     expect(tail.next).toBe(4);
     expect(tail.dropped).toBe(0);
+  });
+});
+
+describe("tracking protection's changes (plan 2026-11-09)", () => {
+  const changed = (changes: unknown) => parseLogTail({ ...logFixture, rows: [{ seq: 1, row: { ...logFixture.rows[1].row, url: "https://shop.example.net/a", changes } }] }).rows[0].row;
+
+  it("a row carries its changes; a change that does not read is left out, never the row", () => {
+    expect(changed([{ what: "queryParams", count: 3 }]).changes).toEqual([{ what: "queryParams", count: 3 }]);
+    const odd = parseLogTail({ ...logFixture, rows: [{ seq: 1, row: { ...logFixture.rows[1].row, changes: [{ what: "gpc", count: 2 }, { what: "", count: 1 }, { what: "referrer", count: -1 }, "junk", null] } }] });
+    expect(odd.skipped).toBe(0);
+    expect(odd.rows[0].row.changes).toEqual([{ what: "gpc", count: 2 }]);
+    expect(changed("nope").changes).toBeUndefined();
+    expect(changed([]).changes).toBeUndefined();
+    expect(rows.every((e) => e.row.changes === undefined), "an older engine's rows have none").toBe(true);
+  });
+
+  it.each([
+    [{ what: "queryParams", count: 3 }, "Removed 3 tracking parameters"],
+    [{ what: "queryParams", count: 1 }, "Removed 1 tracking parameter"],
+    [{ what: "gpc", count: 2 }, "Sent Global Privacy Control and Do Not Track"],
+    [{ what: "gpc", count: 1 }, "Sent a do-not-track signal"],
+    [{ what: "clientData", count: 1 }, "Removed the X-Client-Data header"],
+    [{ what: "searchQueries", count: 1 }, "Told the site only where you came from, not the page"],
+    [{ what: "referrer", count: 1 }, "Removed the page you came from"],
+    [{ what: "thirdPartyCookies", count: 2 }, "Limited 2 cookies from another site to an hour"],
+    [{ what: "firstPartyCookies", count: 1 }, "Limited a cookie of the site's own to an hour"],
+    [{ what: "webRtc", count: 1 }, "Blocked WebRTC in the page"],
+    [{ what: "push", count: 1 }, "Blocked push notifications in the page"],
+    [{ what: "location", count: 1 }, "Blocked location requests in the page"],
+    [{ what: "newThing", count: 4 }, "new thing (4)"],
+  ])("%j says %s", (change, words) => expect(changeWords(change)).toBe(words));
+
+  it("every protection the engine names has words of its own", () => {
+    for (const what of ipc.trackingNames) expect(changeWords({ what, count: 1 }), what).not.toMatch(/\(1\)$/);
+  });
+
+  it("a passed row a protection changed reads Modified and says the change in its column", () => {
+    const one = changed([{ what: "queryParams", count: 3 }]);
+    expect(matchesFilter(one, "modified")).toBe(true);
+    expect(matchesFilter(changed(undefined), "modified")).toBe(false);
+    expect(rowWords(one)).toBe("Removed 3 tracking parameters");
+    expect(rowWords(changed([{ what: "gpc", count: 2 }, { what: "referrer", count: 1 }]))).toBe("Tracking protection made 2 changes");
+    expect(rowWords(changed(undefined))).toBe("Passed through (no rule matched)");
+    const removed = { ...one, outcome: { kind: "params_removed" } as LogOutcome };
+    expect(rowWords(removed), "the rules' own outcome stays first").toBe("Parameters removed");
   });
 });

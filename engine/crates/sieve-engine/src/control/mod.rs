@@ -1290,7 +1290,7 @@ mod tests {
             };
             let id = book.open(event).unwrap();
             let url = format!("https://{HOST}/a.js");
-            let row = crate::stack::book::RequestRow { url: &url, request_type: "script", outcome: sieve_ipc::LogOutcome::Blocked, rule: Some("||secret-host.example^"), list: Some("adguard-dns") };
+            let row = crate::stack::book::RequestRow { url: &url, request_type: "script", outcome: sieve_ipc::LogOutcome::Blocked, rule: Some("||secret-host.example^"), list: Some("adguard-dns"), changes: Vec::new() };
             book.log_request(id, row, 1);
         }
         e.write_status_file();

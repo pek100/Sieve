@@ -21,13 +21,14 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::AlertDescription;
-use sieve_ipc::LogOutcome;
+use sieve_ipc::{LogChange, LogOutcome};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
 use super::facts;
 use super::hook::{self, ResponseHook};
 use super::rules::{self, Action};
+use super::tracking::{self, Changes, Protection, Protections};
 use super::upgrade::{AbortOnDrop, is_upgrade, splice, strip_hop_by_hop};
 use crate::domain::FilterSlot;
 use crate::stack::book::{FlowBook, RequestRow};
@@ -103,9 +104,42 @@ impl Serve {
         tokio::time::sleep(CLOSE_GRACE).await;
     }
 
-    fn log(&self, facts: &facts::OwnedFacts, outcome: LogOutcome, rule: Option<&str>, list: Option<&str>) {
-        let row = RequestRow { url: &facts.url, request_type: facts.request_type, outcome, rule, list };
+    fn log(&self, facts: &facts::OwnedFacts, outcome: LogOutcome, rule: Option<&str>, list: Option<&str>, changes: Vec<LogChange>) {
+        let row = RequestRow { url: &facts.url, request_type: facts.request_type, outcome, rule, list, changes };
         self.book.lock().unwrap_or_else(|p| p.into_inner()).log_request(self.flow_id, row, (self.clock)());
+    }
+}
+
+/// A request's log row, with what tracking protection changed on the way. Written
+/// once: by [`Row::write`], or when the request ends without it (the client went,
+/// the upstream failed), so a request is never missing from the log.
+struct Row {
+    ctx: Arc<Serve>,
+    facts: facts::OwnedFacts,
+    outcome: LogOutcome,
+    rule: Option<String>,
+    list: Option<String>,
+    changes: Changes,
+    written: bool,
+}
+
+impl Row {
+    fn new(ctx: Arc<Serve>, facts: facts::OwnedFacts, ruling: &rules::Ruling) -> Self {
+        Self { ctx, facts, outcome: ruling.outcome.clone(), rule: ruling.rule.clone(), list: ruling.list.clone(), changes: ruling.changes.clone(), written: false }
+    }
+
+    fn write(&mut self) {
+        if std::mem::replace(&mut self.written, true) {
+            return;
+        }
+        let changes = std::mem::take(&mut self.changes).into_vec();
+        self.ctx.log(&self.facts, self.outcome.clone(), self.rule.as_deref(), self.list.as_deref(), changes);
+    }
+}
+
+impl Drop for Row {
+    fn drop(&mut self) {
+        self.write();
     }
 }
 
@@ -290,7 +324,7 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
     let authority = facts::authority_of(&req);
     if misdirected(authority.as_deref(), &ctx.sni, ctx.port) {
         let f = facts::of(&req, authority.as_deref().unwrap_or(&ctx.sni));
-        ctx.log(&f, LogOutcome::Passed { reason: MISDIRECTED.to_string() }, None, None);
+        ctx.log(&f, LogOutcome::Passed { reason: MISDIRECTED.to_string() }, None, None, Vec::new());
         let mut response = answer(StatusCode::MISDIRECTED_REQUEST);
         if req.version() < ::http::Version::HTTP_2 {
             response.headers_mut().insert(CONNECTION, HeaderValue::from_static(CLOSE));
@@ -298,8 +332,10 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
         return Ok(response);
     }
     let f = facts::of(&req, authority.as_deref().unwrap_or(&ctx.sni));
-    let ruling = rules::rule(&ctx.filter.get(), &f.borrowed());
-    ctx.log(&f, ruling.outcome.clone(), ruling.rule.as_deref(), ruling.list.as_deref());
+    // One snapshot for the request: the rules and the protections are read as one.
+    let snapshot = ctx.filter.get();
+    let ruling = rules::rule(&snapshot, &f.borrowed());
+    let mut row = Row::new(ctx.clone(), f.clone(), &ruling);
     let rewritten = match ruling.action {
         Action::Block => return Ok(blocked()),
         Action::Serve { content_type, body } => return Ok(served(&content_type, body)),
@@ -308,6 +344,15 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
     };
     if let Some(uri) = rewritten.as_deref().and_then(|url| with_path_of(req.uri(), url)) {
         *req.uri_mut() = uri;
+    }
+    let protections = snapshot.tracking_in_force();
+    let party = tracking::party(req.headers());
+    tracking::prepare_request(protections, party, req.headers_mut(), &mut row.changes);
+    // A row waits for the response head only when a protection may change it, so
+    // with none on every row is written when the request is ruled, as it always was.
+    let cookies = tracking::cookie_cap(protections, party);
+    if cookies.is_none() && !(f.borrowed().is_page() && snapshot.content && page_script(protections)) {
+        row.write();
     }
     let upgrading = is_upgrade(req.headers());
     let on_client_upgrade = upgrading.then(|| hyper::upgrade::on(&mut req));
@@ -320,6 +365,9 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
         Err(e) if upstream.refused(&e) => return Err(Box::new(h2::Error::from(h2::Reason::REFUSED_STREAM))),
         Err(_) => return Ok(answer(StatusCode::BAD_GATEWAY)),
     };
+    if let Some(p) = cookies {
+        row.changes.add(p, tracking::cap_set_cookies(response.headers_mut(), tracking::now_s()));
+    }
     if let (StatusCode::SWITCHING_PROTOCOLS, Some(client)) = (response.status(), on_client_upgrade) {
         let on_upstream_upgrade = hyper::upgrade::on(&mut response);
         *ctx.splice.lock().unwrap_or_else(|p| p.into_inner()) = Some(splice(client, on_upstream_upgrade));
@@ -327,8 +375,15 @@ async fn handle(ctx: Arc<Serve>, upstream: Arc<Upstream>, mut req: Request<Incom
     }
     strip_hop_by_hop(response.headers_mut(), false);
     let (mut parts, body) = response.into_parts();
-    let body = hook::apply(ctx.hook.as_ref(), &f.borrowed(), parts.status, &mut parts.headers, body).await;
+    let (body, page_changes) = hook::apply(ctx.hook.as_ref(), &f.borrowed(), parts.status, &mut parts.headers, body).await;
+    row.changes.extend(page_changes);
+    row.write();
     Ok(Response::from_parts(parts, UnsyncBoxBody::new(Counted { body, stream: Some(stream) })))
+}
+
+/// A protection that lives in the page's script, which only the content hook writes.
+fn page_script(on: Protections) -> bool {
+    [Protection::WebRtc, Protection::Push, Protection::Location].into_iter().any(|p| on.has(p))
 }
 
 /// Takes the pair to its end, however it ends.

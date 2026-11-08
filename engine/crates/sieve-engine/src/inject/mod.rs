@@ -9,7 +9,8 @@
 //! - [`decode`]: streaming, capped decoding;
 //! - [`html`]: where the payload goes, with lol_html;
 //! - [`csp`]: the nonce rules;
-//! - [`payload`]: the injected elements, safe by construction.
+//! - [`payload`]: the injected elements, safe by construction;
+//! - [`privacy`]: tracking protection's page script.
 //!
 //! On an [`InjectError`] the caller resets the connection: part of a rewritten
 //! body has gone out, so it can neither pass the original nor finish cleanly.
@@ -19,6 +20,7 @@ pub mod csp;
 pub mod decode;
 pub mod html;
 pub mod payload;
+pub mod privacy;
 pub mod response;
 
 use base64::Engine as _;
@@ -132,11 +134,28 @@ pub fn begin(
     body_start: &[u8],
     limits: &InjectLimits,
 ) -> Option<PageRewriter> {
+    begin_with(rules, "", request, status, headers, body_start, limits)
+}
+
+/// [`begin`] with `own_script`, Sieve's own code (tracking protection's
+/// [`privacy::script`]), run with the page's scriptlets. A page with only that
+/// to inject is rewritten for it.
+pub fn begin_with(
+    rules: &RuleSet,
+    own_script: &str,
+    request: &PageRequest<'_>,
+    status: StatusCode,
+    headers: &mut HeaderMap,
+    body_start: &[u8],
+    limits: &InjectLimits,
+) -> Option<PageRewriter> {
     let format = response::body_format(request, status, headers)?;
     if format.encoding == ContentEncoding::Identity && has_utf16_bom(body_start) {
         return None;
     }
-    let cosmetics = rules.page_cosmetics(request.url);
+    let mut cosmetics = rules.page_cosmetics(request.url);
+    let has_scriptlets = !cosmetics.scriptlets.is_empty();
+    cosmetics.scriptlets.push_str(own_script);
     if cosmetics.is_empty() {
         return None;
     }
@@ -145,7 +164,7 @@ pub fn begin(
     let html = HtmlInjector::new(payload::render(&cosmetics, &nonce), format.charset, limits);
     csp::rewrite_headers(headers, &nonce);
     response::strip_falsified_headers(headers);
-    Some(PageRewriter { decoder, html, has_scriptlets: !cosmetics.scriptlets.is_empty(), has_procedural: !cosmetics.procedural.is_empty() })
+    Some(PageRewriter { decoder, html, has_scriptlets, has_procedural: !cosmetics.procedural.is_empty() })
 }
 
 #[cfg(test)]

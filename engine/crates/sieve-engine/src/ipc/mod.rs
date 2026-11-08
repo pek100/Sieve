@@ -744,6 +744,7 @@ mod tests {
             rule: None,
             list: None,
             forwarded,
+            changes: Vec::new(),
         }
     }
 

@@ -6,12 +6,14 @@
 //!   with a per-list report, and the host-level check;
 //! - [`exclusions`]: the HTTPS exclusion syntax (E10) and its matcher;
 //! - [`cosmetic`]: what one page gets (CSS, procedural filters, scriptlets);
-//! - [`resources`]: the pinned resource bundle, verified then loaded.
+//! - [`resources`]: the pinned resource bundle, verified then loaded;
+//! - [`params`]: the built-in tracking parameters and their removal.
 //!
 //! No I/O happens here: the engine downloads, this crate decides.
 pub mod catalogue;
 pub mod cosmetic;
 pub mod exclusions;
 pub mod lists;
+pub mod params;
 pub mod resources;
 pub mod rules;

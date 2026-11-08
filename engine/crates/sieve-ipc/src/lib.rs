@@ -110,8 +110,11 @@ pub const LIST_RULES_SHOWN: usize = 200;
 /// A search of a list's rules is at most this many bytes.
 pub const LIST_QUERY_MAX: usize = 256;
 /// The names of the tracking protections [`Policy::tracking`] may hold, the
-/// app's `tracking.*` settings without their prefix.
-pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location"];
+/// app's `tracking.*` settings without their prefix. Append-only: an engine
+/// refuses a policy naming one it does not know.
+pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location", "queryParams", "firstPartyCookies"];
+/// A log row carries at most this many [`LogChange`]s: one per protection.
+pub const MAX_LOG_CHANGES: usize = TRACKING_NAMES.len();
 /// A flow event's rule text is cut to this many bytes: a list rule can run to
 /// kilobytes, and at this cap a full `flows` frame stays under [`MAX_FRAME`].
 pub const MAX_RULE_BYTES: usize = 256;
@@ -1048,6 +1051,22 @@ pub struct LogRow {
     /// Some for a guest's flow, which has no process (see [`FlowEvent::forwarded`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded: Option<Forwarded>,
+    /// What tracking protection changed in this request or its response, at most
+    /// [`MAX_LOG_CHANGES`]. Left out while empty, so an app that never asked for
+    /// a protection never sees the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<LogChange>,
+}
+
+/// One tracking protection's change to a request (plan 2026-11-09). `what` is the
+/// protection's name in [`TRACKING_NAMES`]; `count` how many things it changed
+/// (parameters removed, headers added, cookies capped). A name an app does not
+/// know is shown by its slug, as a reason is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogChange {
+    pub what: String,
+    pub count: u32,
 }
 
 /// A batch of rows as the `log` messages to send.
@@ -1525,7 +1544,22 @@ mod tests {
             rule: Some(rule.to_string().repeat(LOG_RULE_MAX)),
             list: Some("adguard-url-tracking".into()),
             forwarded: None,
+            changes: TRACKING_NAMES.iter().map(|n| LogChange { what: (*n).to_string(), count: u32::MAX }).collect(),
         }
+    }
+
+    /// A row without changes is the wire it always was; one with them round trips.
+    #[test]
+    fn log_changes_are_left_out_while_empty_and_round_trip() {
+        let plain = LogRow { changes: Vec::new(), ..log_row_at_caps('u', 'r') };
+        let wire = serde_json::to_value(&plain).unwrap();
+        assert!(wire.get("changes").is_none());
+        let older: LogRow = serde_json::from_value(wire).unwrap();
+        assert_eq!(older, plain);
+        let changed = LogRow { changes: vec![LogChange { what: "queryParams".into(), count: 3 }], ..plain };
+        let wire = serde_json::to_value(&changed).unwrap();
+        assert_eq!(wire["changes"], serde_json::json!([{ "what": "queryParams", "count": 3 }]));
+        assert_eq!(serde_json::from_value::<LogRow>(wire).unwrap(), changed);
     }
 
     fn rows_of(frames: &LogFrames) -> Vec<LogRow> {
