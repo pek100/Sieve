@@ -2,7 +2,13 @@
 
 ## Run 2 (second session, same day)
 
-Branch `live-vm-2026-11-08` with main 8d1d873 merged. VM started 2026-11-08 20:10 local. Slice 7 skipped (self-healing is being fixed elsewhere). Scripts in the session scratchpad: `d-s8b.ps1`, `d-s9.ps1`, `d-s10.ps1`, `d-s11.ps1`, `d-real2.ps1`, `k-*.ps1`, `content.mjs`, `text.mjs`.
+Branch `live-vm-2026-11-08` with main 8d1d873 merged. VM 20:10 to 23:50 local (3.7 h; 5.1 h today with run 1), stopped at the end.
+
+Fixes on this branch, each with a test that fails without it: 5a6d8af (Version Negotiation is the QUIC refusal), 6dc6a8d (bundle script marks `trusted-*` resources trusted), 3850222 (a user's `+js()` rules get the bundle), 8726598 (`scriptletGlobals` declared for uBO scriptlets).
+
+Still open, in order: the DNS Client leak (run 1; the fec0 capture does not engage on Server 2025, below); lookups with no answer for about 3 s after each engine start; slice 7 U1 (curl with its own CA bundle is never healed); the uBO list arm of slice 10; slice 9 U6 and the meta-CSP row; slice 11 U9 and U12; video playback (needs a residential IP); the runbooks' `example.com##h1` (the page has no h1 now).
+
+VM state at the stop: Sieve installed from `setup-cur.exe`, engine main 0ea3303 release (3940237E), the real app in place, policy `engine` false, no `live-scope.json`, IPv6 enabled again, no test firewall rule or NRPT rule left. Scripts in the session scratchpad: `d-s8b.ps1`, `d-s9.ps1`, `d-s10.ps1`, `d-s11.ps1`, `d-real2.ps1`, `k-*.ps1`, `content.mjs`, `text.mjs`.
 
 Engines: `engine-cur-pin.exe` (C26FD6DE) is this branch with Version Negotiation as `REFUSAL` and a VM-only pin of the TEST scriptlet bundle (uBO 3762a26, sha256 9527a0b5...a385, placed as `lists\resources.json`). The pin is never committed. The slice 8 arms ran on the earlier pin builds (c4f9e87), whose QUIC code is the same.
 
@@ -108,6 +114,22 @@ Engine CDD4A717 built from that worktree, installed in place of this run's engin
 | 16 | PASS | rebooted with Sieve installed and off: 0 capture objects, lookups and HTTPS normal |
 
 So on this Windows Server 2025 VM the design's premise does not hold: the DNS Client does not use the fec0 well-known servers of an adapter with no DNS server, even when its own server fails. The leak found in run 1 stays. The normal engine was put back afterwards (the slice 7 checks below install main's build).
+
+### Slice 7 with main's fixes (0ea3303)
+
+Main built here (release 3940237E; `live-scope` build B0DBE09A), installed over a fresh install, `https` on, `content` off.
+
+| Check | Result | Evidence |
+|---|---|---|
+| U5 ordinary browsing | PASS | 20 sites, 20 minutes, 17 passes alternating Edge and Chrome, fresh profiles and a kept profile per browser (closed after each pass): 340 loads, 4847 intercepted; `https.healed` +0, 0 `auto:pinning` rows. `exclusions.json` before: empty; after: one row, www.apple.com reason `ev` (not heal's). The old build in this run had made 32 browser `auto:pinning` rows in the same kind of browsing |
+| U1 a pinning client | FAIL | live-scope build, `{"scope":"all"}`: curl 8.21.0 (Schannel) with `--cacert` holding the machine's 32 public roots (Sieve's left out), www.wikipedia.org, six attempts 2 s apart: each failed with "untrusted root" (Sieve's certificate, 0.07 to 0.14 s). No exclusion was made, `https.healed` stayed 0, and the log rows for curl read `passed (no_rule)`. A capture shows each connection ended by FIN, no RST. So curl was never excluded and never worked on retry |
+| U2 | SKIP | Discord and Steam are not installed |
+| U3 | SKIP | "Try decrypting again" is an app action; not driven here |
+| U4 | Reported | curl over Schannel closes with FIN after the certificate (no RST); the alert byte was not decoded |
+
+On the first try the three curls ran about 1 s after the restart and all failed with "Could not resolve host": the same DNS gap just after a start as above.
+
+Afterwards: live-scope file removed, main's release engine 3940237E back, the real app back in place of the pipe client, policy `engine` false.
 
 ### Slice 10 without the video site
 
