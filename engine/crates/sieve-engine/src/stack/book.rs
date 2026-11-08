@@ -177,7 +177,9 @@ impl FlowBook {
         self.issues.view(|s| s.is_none_or(|s| s == session || s == 0), (self.clock)())
     }
 
-    pub fn issues_revision(&self) -> u64 {
+    /// Moves when a problem grew old too, so the app hears that it is gone.
+    pub fn issues_revision(&mut self) -> u64 {
+        self.issues.age((self.clock)());
         self.issues.revision()
     }
 

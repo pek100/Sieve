@@ -129,6 +129,13 @@ impl DomainFilter {
         self.enabled && (any(&self.rules.user) || any(&self.rules.lists))
     }
 
+    /// True when a flow named `name` would be blocked, the switch on: what a retry
+    /// asks before reaching for another address (`stack::retry::alternates`). An
+    /// app turned Off is not known there, so this can only skip a retry, never a block.
+    pub fn blocks_name(&self, name: &str) -> bool {
+        self.enabled && self.rules.check_host(name).verdict == HostVerdict::Block
+    }
+
     pub fn is_off(&self, owner: Owner<'_>) -> bool {
         match owner {
             Owner::App { key } => self.off.contains(&key.to_lowercase()),

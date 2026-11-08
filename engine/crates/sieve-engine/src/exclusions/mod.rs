@@ -69,6 +69,8 @@ struct Layers {
     /// By source id, in source order.
     lists: Vec<(&'static str, Option<Vec<Exclusion>>)>,
     auto: Vec<AutoEntry>,
+    /// `auto:failing` (`heal::trouble`), in memory only: see [`WholeApp`].
+    whole_apps: Vec<WholeApp>,
     /// Why `exclusions.json` cannot be believed: the floor holds (S24).
     auto_error: Option<String>,
     browsers: BrowserSet,
@@ -88,12 +90,19 @@ impl Layers {
             set.add(entries.iter().flatten().cloned(), &EntrySource::List((*id).to_string()));
         }
         let mut next = None;
-        for entry in self.auto.iter().filter(|e| e.is_held(now_ms)) {
-            set.add([entry.exclusion()], &EntrySource::Auto(entry.reason));
-            next = match (next, entry.expires_ms) {
+        let mut sooner = |end: Option<u64>| {
+            next = match (next, end) {
                 (Some(a), Some(b)) => Some(u64::min(a, b)),
                 (a, b) => a.or(b),
             };
+        };
+        for entry in self.auto.iter().filter(|e| e.is_held(now_ms)) {
+            set.add([entry.exclusion()], &EntrySource::Auto(entry.reason));
+            sooner(entry.expires_ms);
+        }
+        for app in self.whole_apps.iter().filter(|a| a.is_held(now_ms)) {
+            set.add_whole_app(&app.exe, app.session);
+            sooner(Some(app.expires_ms));
         }
         (set, next)
     }
@@ -108,9 +117,49 @@ impl Layers {
             entries.iter().flatten().map(move |e| ExclusionRow { line: e.pattern.line(), apps: e.apps.clone(), reason: EntrySource::List((*id).to_string()).slug(), created_ms: None, retries: 0 })
         });
         let written = self.auto.iter().filter(|e| e.is_held(now_ms)).map(|e| ExclusionRow { line: e.pattern.line(), apps: e.app.iter().cloned().collect(), reason: e.reason.slug().to_string(), created_ms: Some(e.created_ms), retries: e.retries });
-        listed.chain(written).collect()
+        // The row shape the app already reads: `*` for the exe's file name. Rows are
+        // machine-wide (the TENSION at `ipc::Backend::exclusions`); the entry is not.
+        let whole = self.whole_apps.iter().filter(|a| a.is_held(now_ms)).map(|a| ExclusionRow { line: "*".into(), apps: vec![exe_file_name(&a.exe)], reason: AutoReason::Failing.slug().to_string(), created_ms: Some(a.created_ms), retries: a.retries });
+        listed.chain(written).chain(whole).collect()
     }
 }
+
+/// One `auto:failing` entry: one exe, by its full path, in one Windows session,
+/// passes through untouched until `expires_ms` (`heal::trouble`).
+///
+/// In memory only, never in `exclusions.json`: an older engine reads that file
+/// with the reasons it knows, so a `failing` there fails its whole load, and an
+/// engine rolled back by the update (`update::swap`) would then decrypt nothing
+/// and never rewrite the file (P1-2 of the 2026-11-08 second review). A second
+/// file would survive a restart, but what it names does not: a session id is
+/// reused after a sign-out, and a full day across a restart is no promise this
+/// rule needs. A restart costs the app the three refusals again, and the rule
+/// arms again from the restart (its window starts at the first decrypted flow).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WholeApp {
+    /// Full path, lower case.
+    pub exe: String,
+    pub session: u32,
+    pub created_ms: u64,
+    pub expires_ms: u64,
+    pub retries: u32,
+    /// Taken back by "Try decrypting again".
+    pub retrying: bool,
+}
+
+impl WholeApp {
+    pub fn new(exe: &str, session: u32, created_ms: u64, expires_ms: u64) -> Self {
+        Self { exe: exe.to_ascii_lowercase(), session, created_ms, expires_ms, retries: 0, retrying: false }
+    }
+
+    pub fn is_held(&self, now_ms: u64) -> bool {
+        !self.retrying && now_ms < self.expires_ms
+    }
+}
+
+/// Whole apps held at once, oldest first out. A memory bound: one per app and
+/// session a person runs, with room to spare.
+pub const MAX_WHOLE_APPS: usize = 256;
 
 #[derive(Debug)]
 struct Snapshot {
@@ -166,7 +215,7 @@ impl ExclusionSlot {
             .collect();
         let writer = dir.filter(|_| auto_error.is_none()).map(auto::Writer::for_dir);
         let old_rule_pending = writer.is_some() && dir.is_some_and(|d| auto::rule_applied(d) < auto::PINNING_RULE);
-        let layers = Layers { user: user_entries(policy_exclusions), lists: list_layers, auto, auto_error, browsers: BrowserSet::default(), old_rule_pending, rule_error: None };
+        let layers = Layers { user: user_entries(policy_exclusions), lists: list_layers, auto, whole_apps: Vec::new(), auto_error, browsers: BrowserSet::default(), old_rule_pending, rule_error: None };
         let (set, next_expiry) = layers.build(now_ms);
         Self { dir: dir.map(Path::to_path_buf), writer, sources: enabled, skip_ev: SKIP_EV, scope: start_scope(dir), layers: Mutex::new(layers), snapshot: Mutex::new(Snapshot { set: Arc::new(set), next_expiry }), revision: AtomicU64::new(0) }
     }
@@ -196,6 +245,8 @@ impl ExclusionSlot {
     /// What the app is told of the store and of this engine's reach, the fact
     /// `decrypt` uses (S14).
     pub fn view(&self, now_ms: u64) -> ExclusionsView {
+        // An entry past its end is a change the app must hear of, flows or none.
+        self.get_at(now_ms);
         // Read before the rows: a change in between shows as a newer revision.
         let revision = self.revision();
         let layers = lock(&self.layers);
@@ -298,6 +349,11 @@ impl ExclusionSlot {
     /// pattern, app and reason it keeps the first date and the count: the entry comes
     /// back with its history, and another refusal of it changes neither.
     pub fn add_auto(&self, mut entry: AutoEntry, now_ms: u64) -> bool {
+        // `auto:failing` is [`Self::add_whole_app`]'s, never the file's.
+        if !entry.on_disk() {
+            debug_assert!(false, "an auto:failing entry reached add_auto");
+            return false;
+        }
         let mut layers = lock(&self.layers);
         layers.auto.retain(|e| !e.expired(now_ms));
         let same = |e: &AutoEntry| e.pattern == entry.pattern && e.app == entry.app && e.reason == entry.reason;
@@ -320,11 +376,53 @@ impl ExclusionSlot {
     /// and app stands. It can only touch this layer: not a user line, not a list line,
     /// not a floor fact (S24). False when there is no such entry held.
     pub fn try_again(&self, pattern: &Pattern, app: Option<&str>, reason: AutoReason, now_ms: u64) -> bool {
+        if reason == AutoReason::Failing {
+            return pattern == &Pattern::Wildcard("*".into()) && app.is_some_and(|app| !self.try_again_whole_app(app, now_ms).is_empty());
+        }
         !self.take_back(now_ms, |e| &e.pattern == pattern && e.app.as_deref() == app && e.reason == reason).is_empty()
+    }
+
+    /// An `auto:failing` entry for `exe` (its full path) in `session`, until
+    /// `expires_ms`. Memory only ([`WholeApp`]). True when it newly lets the app
+    /// through; over one held or taken back it keeps the first date and the count.
+    pub fn add_whole_app(&self, exe: &str, session: u32, now_ms: u64, expires_ms: u64) -> bool {
+        let mut layers = lock(&self.layers);
+        let mut entry = WholeApp::new(exe, session, now_ms, expires_ms);
+        layers.whole_apps.retain(|a| now_ms < a.expires_ms);
+        let before = layers.whole_apps.iter().position(|a| a.exe == entry.exe && a.session == session).map(|at| layers.whole_apps.remove(at));
+        if let Some(before) = &before {
+            (entry.created_ms, entry.retries) = (before.created_ms, before.retries);
+        }
+        let newly = before.is_none_or(|b| b.retrying);
+        layers.whole_apps.push(entry);
+        let over = layers.whole_apps.len().saturating_sub(MAX_WHOLE_APPS);
+        layers.whole_apps.drain(..over);
+        self.rebuild(&layers, now_ms);
+        newly
+    }
+
+    /// "Try decrypting again" on the `auto:failing` row of `app` (an exe file name,
+    /// as the row names it): every held entry of that exe. Each (full path,
+    /// session) taken back.
+    pub fn try_again_whole_app(&self, app: &str, now_ms: u64) -> Vec<(String, u32)> {
+        let mut layers = lock(&self.layers);
+        let mut taken = Vec::new();
+        for entry in layers.whole_apps.iter_mut().filter(|a| a.is_held(now_ms) && exe_file_name(&a.exe) == app) {
+            entry.retrying = true;
+            entry.retries = entry.retries.saturating_add(1);
+            taken.push((entry.exe.clone(), entry.session));
+        }
+        if !taken.is_empty() {
+            self.rebuild(&layers, now_ms);
+        }
+        taken
     }
 
     /// The bulk form, for one app's entries of one reason. The patterns taken back.
     pub fn try_again_app(&self, app: &str, reason: AutoReason, now_ms: u64) -> Vec<Pattern> {
+        if reason == AutoReason::Failing {
+            return self.try_again_whole_app(app, now_ms).into_iter().map(|_| Pattern::Wildcard("*".into())).collect();
+        }
         self.take_back(now_ms, |e| e.reason == reason && e.app.as_deref() == Some(app))
     }
 
@@ -607,6 +705,77 @@ mod tests {
         let first = ExclusionSlot::new(Some(fresh.path()), &[], NOW + DAY);
         first.set_browsers(BrowserSet::read(&TheBrowser), NOW + DAY);
         assert_eq!(find(&first, "pin.example", NOW + DAY), None);
+    }
+
+    /// P1-2 of the 2026-11-08 second review: the file this engine writes, with a
+    /// whole app let through, still loads in the engine an update rolls back to,
+    /// whose reasons were these three and whose file refused anything else.
+    #[test]
+    fn a_file_written_now_parses_with_the_previous_reasons() {
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(rename_all = "kebab-case")]
+        #[allow(dead_code)]
+        enum OldReason {
+            Pinning,
+            ClientCert,
+            Ev,
+        }
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OldEntry {
+            pattern: Pattern,
+            app: Option<String>,
+            reason: OldReason,
+            created_ms: u64,
+            expires_ms: Option<u64>,
+            #[serde(default)]
+            retries: u32,
+            #[serde(default)]
+            retrying: bool,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct OldFile {
+            v: u32,
+            entries: Vec<OldEntry>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        slot.add_auto(pinned("pin.example"), NOW);
+        assert!(slot.add_whole_app(r"C:\Games\Launcher.exe", 1, NOW, NOW + DAY));
+        slot.add_auto(AutoEntry::host("cert.example", AutoReason::ClientCert, NOW, None), NOW);
+        slot.flush();
+        let bytes = std::fs::read(auto::path(dir.path())).unwrap();
+        let old: OldFile = serde_json::from_slice(&bytes).expect("the older engine reads it");
+        assert_eq!(old.entries.len(), 2, "the whole app is not in it");
+        assert!(slot.rows(NOW).iter().any(|r| r.reason == "auto:failing" && r.line == "*" && r.apps == ["launcher.exe"]), "and yet it holds, as a row");
+        // The control: the shape this build wrote first is one the older engine refuses.
+        let first = br#"{"v":1,"entries":[{"pattern":{"Wildcard":"*"},"app":"launcher.exe","reason":"failing","created_ms":5,"expires_ms":9}]}"#;
+        assert!(serde_json::from_slice::<OldFile>(first).is_err());
+        std::fs::write(auto::path(dir.path()), first).unwrap();
+        let again = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        assert!(again.switches(true, true).lists_ready, "it loads here, its failing entry dropped");
+        again.add_auto(pinned("pin.example"), NOW);
+        again.flush();
+        assert!(serde_json::from_slice::<OldFile>(&std::fs::read(auto::path(dir.path())).unwrap()).is_ok(), "and the next write cleans it");
+    }
+
+    #[test]
+    fn a_whole_app_is_its_path_and_session_and_its_end_moves_the_revision() {
+        let slot = ExclusionSlot::new(None, &[], NOW);
+        let passes = |exe, session, at| slot.get_at(at).passes_app(Some(exe), Some(session));
+        assert!(slot.add_whole_app(r"C:\Games\Launcher.exe", 1, NOW, NOW + DAY));
+        assert!(!slot.add_whole_app(r"c:\games\launcher.exe", 1, NOW + 1, NOW + 1 + DAY), "held");
+        assert!(passes(r"C:\Games\Launcher.exe", 1, NOW));
+        assert!(!passes(r"C:\Other\launcher.exe", 1, NOW) && !passes(r"C:\Games\Launcher.exe", 2, NOW));
+        let held = slot.view(NOW + DAY).revision;
+        assert!(slot.view(NOW + DAY + 2).rows.iter().all(|r| r.reason != "auto:failing"), "gone at its end");
+        assert!(slot.view(NOW + DAY + 2).revision > held, "with no flow to read the store, the app still hears of it");
+        assert!(!slot.try_again(&Pattern::Wildcard("*".into()), Some("launcher.exe"), AutoReason::Failing, NOW + DAY + 2), "nothing held");
+        assert!(slot.add_whole_app(r"C:\Games\Launcher.exe", 1, NOW + DAY + 3, NOW + 2 * DAY), "and it can come again");
+        assert!(slot.try_again(&Pattern::Wildcard("*".into()), Some("launcher.exe"), AutoReason::Failing, NOW + DAY + 4));
+        assert!(!passes(r"C:\Games\Launcher.exe", 1, NOW + DAY + 4));
     }
 
     #[cfg(feature = "live-scope")]

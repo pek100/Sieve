@@ -90,9 +90,10 @@ impl AutoEntry {
         Self { app: Some(exe_file_name(exe)), ..Self::host(host, reason, created_ms, None) }
     }
 
-    /// An entry for every named host of one app (`*`), until `expires_ms`.
-    pub fn whole_app(exe: &str, reason: AutoReason, created_ms: u64, expires_ms: u64) -> Self {
-        Self { pattern: Pattern::Wildcard("*".into()), app: Some(exe_file_name(exe)), ..Self::host("", reason, created_ms, Some(expires_ms)) }
+    /// What an older engine can read: every reason but `auto:failing`, which lives
+    /// in memory only (`exclusions::WholeApp`).
+    pub fn on_disk(&self) -> bool {
+        self.reason != AutoReason::Failing
     }
 
     /// Excludes right now: not taken back, not past its end.
@@ -153,7 +154,9 @@ pub fn load(engine_dir: &Path) -> Result<Vec<AutoEntry>, String> {
     if file.v != VERSION {
         return Err(format!("{FILE}: version {} is not {VERSION}", file.v));
     }
-    let mut entries = file.entries;
+    // A `failing` entry is a build's of 2026-11-08 that wrote them here; the next
+    // write takes it off the disk, so an older engine can read the file again.
+    let mut entries: Vec<AutoEntry> = file.entries.into_iter().filter(AutoEntry::on_disk).collect();
     cap(&mut entries);
     Ok(entries)
 }
@@ -179,7 +182,7 @@ pub fn record_rule(engine_dir: &Path) -> Result<(), String> {
 }
 
 pub fn save(engine_dir: &Path, entries: &[AutoEntry]) -> Result<(), String> {
-    let file = OnDisk { v: VERSION, entries: entries.to_vec() };
+    let file = OnDisk { v: VERSION, entries: entries.iter().filter(|e| e.on_disk()).cloned().collect() };
     let json = serde_json::to_vec_pretty(&file).map_err(|e| format!("{FILE}: {e}"))?;
     write_atomic(&path(engine_dir), &json).map_err(|e| format!("{FILE}: {e}"))
 }

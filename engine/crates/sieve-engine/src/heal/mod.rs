@@ -75,15 +75,19 @@ impl Heal {
     pub fn hear(&self, pair: &Pair, evidence: Evidence, now_ms: u64) {
         let (Some(exe), Some(session)) = (pair.exe.as_deref(), pair.session) else { return };
         let mut state = self.state();
-        let file = exe_file_name(exe);
-        state.trouble.heard(&file, now_ms);
-        if matches!(evidence, Evidence::Refused(_)) && state.trouble.refused(&file, &pair.host, now_ms) {
-            let whole = AutoEntry::whole_app(exe, AutoReason::Failing, now_ms, now_ms.saturating_add(trouble::FAIL_OPEN_MS));
-            if self.exclusions.add_auto(whole, now_ms) {
+        let app = trouble::key(exe, session);
+        state.trouble.heard(&app, now_ms);
+        let excluded = state.ledger.hear(exe, &pair.host, evidence, now_ms);
+        // The app's case is sites it refused with an alert, each one `score` took for
+        // a refusal: never a client that only went away (P1-1).
+        if excluded && refused_with_an_alert(evidence) && state.trouble.refused(&app, &pair.host, now_ms) {
+            let until = now_ms.saturating_add(trouble::FAIL_OPEN_MS);
+            state.trouble.opened(&app, until, now_ms);
+            if self.exclusions.add_whole_app(exe, session, now_ms, until) {
                 Meters::bump(&self.meters.https.failed_open);
             }
         }
-        if !state.ledger.hear(exe, &pair.host, evidence, now_ms) {
+        if !excluded {
             return;
         }
         // A second refusal of a held entry says nothing new, and raises no notice.
@@ -101,6 +105,13 @@ impl Heal {
     pub fn try_again(&self, retry: &Retry, now_ms: u64) -> usize {
         let mut state = self.state();
         match retry {
+            Retry::One { app: Some(app), reason: AutoReason::Failing, .. } => {
+                let taken = self.exclusions.try_again_whole_app(app, now_ms);
+                for key in &taken {
+                    state.trouble.rearm(key, now_ms);
+                }
+                taken.len()
+            }
             Retry::One { pattern, app, reason } => {
                 if !self.exclusions.try_again(pattern, app.as_deref(), *reason, now_ms) {
                     return 0;
@@ -132,6 +143,12 @@ impl Heal {
         let state = self.state();
         (state.notices.revision(), state.notices.after(after))
     }
+}
+
+/// The client said no to Sieve's certificate: an alert in the handshake, or one on
+/// a connection it never used. A handshake it only gave up on carries none.
+fn refused_with_an_alert(evidence: Evidence) -> bool {
+    matches!(evidence, Evidence::Refused(Some(_)) | Evidence::Ended(Some(Silence { alert: Some(_), .. })))
 }
 
 impl ClientWatch for Heal {
@@ -376,21 +393,63 @@ mod tests {
     fn an_app_refusing_several_sites_goes_through_untouched_for_a_while() {
         use super::trouble::{FAIL_OPEN_MS, TROUBLE_HOSTS};
         let h = heal();
-        let ip = "192.0.2.1".parse().unwrap();
-        let excluded = |at: u64, exe: &str| h.exclusions.get_at(at).find(Some("never.seen.example"), ip, Some(exe), true).cloned();
+        let excluded = |at: u64, exe: &str, session: u32| h.exclusions.get_at(at).passes_app(Some(exe), Some(session));
         for i in 0..TROUBLE_HOSTS - 1 {
-            h.hear(&pair(CLIENT, &format!("s{i}.example")), Evidence::Refused(None), NOW + i as u64 * (BURST_MS + 1));
+            h.hear(&pair(CLIENT, &format!("s{i}.example")), refused(), NOW + i as u64 * (BURST_MS + 1));
         }
-        assert_eq!(excluded(NOW + 5_000, CLIENT), None, "not yet the app's case");
-        h.hear(&pair(CLIENT, "last.example"), Evidence::Refused(None), NOW + 5_000);
-        assert_eq!(excluded(NOW + 5_000, CLIENT), Some(Src::Auto(AutoReason::Failing)), "a site it never asked for passes too");
-        assert_eq!(excluded(NOW + 5_000, OTHER), None);
-        assert_eq!(excluded(NOW + 5_000 + FAIL_OPEN_MS, CLIENT), None, "a day later it is decrypted again");
+        assert!(!excluded(NOW + 5_000, CLIENT, 1), "not yet the app's case");
+        h.hear(&pair(CLIENT, "last.example"), refused(), NOW + 5_000);
+        assert!(excluded(NOW + 5_000, CLIENT, 1), "every site of it passes");
+        assert!(!excluded(NOW + 5_000, OTHER, 1) && !excluded(NOW + 5_000, CLIENT, 2), "another app, the same app of another user");
+        assert!(!excluded(NOW + 5_000, r"C:\Elsewhere\client.exe", 1), "an exe named like it");
+        assert!(!excluded(NOW + 5_000 + FAIL_OPEN_MS, CLIENT, 1), "a day later it is decrypted again");
         assert_eq!(h.meters.https.report()["failed_open"], 1);
         let row = h.exclusions.rows(NOW + 5_000).into_iter().find(|r| r.reason == "auto:failing").unwrap();
         assert_eq!((row.line.as_str(), row.apps.as_slice()), ("*", &["client.exe".to_string()][..]));
         let taken = h.try_again(&Retry::One { pattern: Pattern::Wildcard("*".into()), app: Some("client.exe".into()), reason: AutoReason::Failing }, NOW + 6_000);
-        assert_eq!((taken, excluded(NOW + 6_000, CLIENT)), (1, None));
+        assert_eq!((taken, excluded(NOW + 6_000, CLIENT, 1)), (1, false));
+    }
+
+    /// P1-1 of the 2026-11-08 second review: a client that goes away mid handshake
+    /// (a tab closed, sleep, the 10 s timeout) on many sites, often enough that
+    /// `score` excludes each, never lets the whole app through.
+    #[test]
+    fn handshakes_given_up_on_many_sites_never_let_the_app_through() {
+        let h = heal();
+        let burst = |n: u64| NOW + n * (BURST_MS + 1);
+        for i in 0..10u64 {
+            let host = format!("s{i}.example");
+            h.hear(&pair(CLIENT, &host), Evidence::Refused(None), burst(2 * i));
+            h.hear(&pair(CLIENT, &host), Evidence::Refused(None), burst(2 * i + 1));
+        }
+        assert!(found_any(&h, "s9.example"), "the control: score took each site");
+        assert!(!h.exclusions.get_at(burst(20)).passes_app(Some(CLIENT), Some(1)));
+        assert_eq!(h.meters.https.report()["failed_open"], 0);
+        // A weak alert counts once score takes the site for it.
+        let weak = Evidence::Refused(Some(AlertDescription::HandshakeFailure));
+        for i in 0..3u64 {
+            let host = format!("w{i}.example");
+            h.hear(&pair(OTHER, &host), weak, burst(2 * i));
+            h.hear(&pair(OTHER, &host), weak, burst(2 * i + 1));
+        }
+        assert!(h.exclusions.get_at(burst(6)).passes_app(Some(OTHER), Some(1)));
+    }
+
+    fn found_any(h: &Heal, host: &str) -> bool {
+        h.exclusions.rows(NOW).iter().any(|r| r.line == format!("\"{host}\"") && r.reason == "auto:pinning")
+    }
+
+    #[test]
+    fn after_a_try_again_the_rule_arms_again() {
+        use super::trouble::TROUBLE_HOSTS;
+        let h = heal();
+        let three = |at: u64| (0..TROUBLE_HOSTS).for_each(|i| h.hear(&pair(CLIENT, &format!("t{at}-{i}.example")), refused(), at + i as u64));
+        three(NOW);
+        assert!(h.exclusions.get_at(NOW + 5).passes_app(Some(CLIENT), Some(1)));
+        let later = NOW + 3 * 60 * 60_000;
+        assert_eq!(h.try_again(&Retry::One { pattern: Pattern::Wildcard("*".into()), app: Some("client.exe".into()), reason: AutoReason::Failing }, later), 1);
+        three(later + 1);
+        assert!(h.exclusions.get_at(later + 10).passes_app(Some(CLIENT), Some(1)), "hours after the run's start, armed from the try");
     }
 
     #[test]

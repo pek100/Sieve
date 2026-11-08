@@ -579,6 +579,20 @@ struct Names {
 #[derive(Debug, Default)]
 pub struct NameMap {
     entries: HashMap<IpAddr, Names>,
+    /// Each name's addresses, every name in `entries`' `live` lists and no other:
+    /// [`Self::addresses`] reads it instead of the whole map. Kept in step wherever a
+    /// name enters or leaves a list, so it is bounded as `entries` is.
+    by_name: HashMap<String, HashSet<IpAddr>>,
+}
+
+/// Takes `ip` off `name`'s addresses, and the name with its last one.
+fn unindex(by_name: &mut HashMap<String, HashSet<IpAddr>>, name: &str, ip: IpAddr) {
+    if let Some(ips) = by_name.get_mut(name) {
+        ips.remove(&ip);
+        if ips.is_empty() {
+            by_name.remove(name);
+        }
+    }
 }
 
 impl NameMap {
@@ -591,14 +605,22 @@ impl NameMap {
         if ttl_s == 0 && !self.entries.contains_key(&ip) {
             return;
         }
+        let by_name = &mut self.by_name;
         let entry = self.entries.entry(ip).or_default();
-        entry.live.retain(|(_, exp)| *exp > now_ms);
+        entry.live.retain(|(n, exp)| {
+            let live = *exp > now_ms;
+            if !live {
+                unindex(by_name, n, ip);
+            }
+            live
+        });
         // The map is shared by every app and resolver: a shorter answer seen
         // by one client never cuts short an answer another client still caches.
         if let Some(e) = entry.live.iter_mut().find(|(n, _)| *n == name) {
             e.1 = e.1.max(expires);
         } else if ttl_s != 0 {
             if entry.live.len() < NAMES_PER_IP_CAP {
+                by_name.entry(name.clone()).or_default().insert(ip);
                 entry.live.push((name, expires));
             } else {
                 entry.ambiguous_until = entry.ambiguous_until.max(expires);
@@ -620,10 +642,12 @@ impl NameMap {
                         .max(v.ambiguous_until)
                 })
                 .map(|(ip, _)| *ip);
-            match soonest {
-                Some(ip) => self.entries.remove(&ip),
-                None => break,
-            };
+            let Some(ip) = soonest else { break };
+            if let Some(gone) = self.entries.remove(&ip) {
+                for (n, _) in &gone.live {
+                    unindex(&mut self.by_name, n, ip);
+                }
+            }
         }
     }
 
@@ -654,20 +678,25 @@ impl NameMap {
     }
 
     /// Every address `name` (as recorded) is live for at `now_ms`, an ambiguous
-    /// one included only once its ambiguity ended. A scan of the whole map, so it
-    /// is asked only when a connect is in trouble (`stack::retry`), never per flow.
+    /// one included only once its ambiguity ended. Read from the name's own index,
+    /// so it costs that name's addresses, not the map (asked by `stack::retry`
+    /// under the lock every flow's DNS answer takes).
     pub fn addresses(&self, name: &str, now_ms: u64) -> Vec<IpAddr> {
-        self.entries
-            .iter()
-            .filter(|(_, v)| v.ambiguous_until <= now_ms && v.live.iter().any(|(n, exp)| n == name && *exp > now_ms))
-            .map(|(ip, _)| *ip)
-            .collect()
+        let live = |ip: &IpAddr| self.entries.get(ip).is_some_and(|v| v.ambiguous_until <= now_ms && v.live.iter().any(|(n, exp)| n == name && *exp > now_ms));
+        self.by_name.get(name).into_iter().flatten().filter(|ip| live(ip)).copied().collect()
     }
 
     /// Drops every expired name and every address left with none.
     pub fn prune(&mut self, now_ms: u64) {
-        self.entries.retain(|_, v| {
-            v.live.retain(|(_, exp)| *exp > now_ms);
+        let by_name = &mut self.by_name;
+        self.entries.retain(|ip, v| {
+            v.live.retain(|(n, exp)| {
+                let live = *exp > now_ms;
+                if !live {
+                    unindex(by_name, n, *ip);
+                }
+                live
+            });
             !v.live.is_empty() || v.ambiguous_until > now_ms
         });
     }
@@ -1099,6 +1128,34 @@ mod tests {
         // A TTL 0 answer for an unseen address records nothing.
         map.record("zero.example", ip("192.0.2.2"), 0, 0);
         assert!(map.names(ip("192.0.2.2"), 0).is_empty());
+    }
+
+    /// P3 of the 2026-11-08 second review: `addresses` reads an index, which holds
+    /// exactly the live lists' names, through expiry, pruning and the map's cap.
+    #[test]
+    fn the_name_index_follows_the_map() {
+        let mut map = NameMap::default();
+        let (a, b) = (ip("192.0.2.1"), ip("2001:db8::1"));
+        map.record("cdn.example", a, 60, 0);
+        map.record("cdn.example", b, 300, 0);
+        map.record("other.example", a, 300, 0);
+        let sorted = |mut v: Vec<IpAddr>| {
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(map.addresses("cdn.example", 1_000)), [a, b]);
+        assert_eq!(map.addresses("cdn.example", 61_000), [b], "the expired one is not read");
+        map.record("other.example", a, 300, 61_000);
+        assert!(!map.by_name["cdn.example"].contains(&a), "a list that drops a name drops its index entry");
+        map.prune(400_000);
+        assert!(map.by_name.is_empty() && map.entries.is_empty());
+        for i in 0..(NAME_MAP_CAP + 10) as u32 {
+            map.record("many.example", IpAddr::from(i.to_be_bytes()), 300, 1_000_000);
+        }
+        assert_eq!(map.by_name["many.example"].len(), map.entries.len(), "evicted addresses leave the index too");
+        let indexed: usize = map.by_name.values().map(HashSet::len).sum();
+        let listed: usize = map.entries.values().map(|v| v.live.len()).sum();
+        assert_eq!(indexed, listed);
     }
 
     #[test]

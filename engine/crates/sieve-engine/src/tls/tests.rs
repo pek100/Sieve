@@ -1645,6 +1645,29 @@ arms!(client_watch_hears_a_refusal_and_a_silent_close, |arm| async move {
     assert_eq!((watched.accepted.load(Ordering::Relaxed), watched.ended.load(Ordering::Relaxed)), (1, 1), "the refused one was never open");
 });
 
+// P2-6 of the 2026-11-08 second review: a client that sends its hello, reads
+// Sieve's answer and goes away is no refusal of the certificate: its own signal,
+// cause unknown, and no alert for self-healing.
+arms!(a_client_gone_mid_handshake_is_its_own_signal, |arm| async move {
+    let pki = Pki::new("Test Public Root");
+    let watched = Arc::new(Watched::default());
+    let (dial, _) = echo_dial(arm, vec![server_tls(pki.leaf(HOST, GOOD), &[], None)]);
+    let rig = Rig::new(dial, RigOpts { watch: watched.clone(), ..RigOpts::new(pki.roots()) });
+    let (mut app, task) = rig.flow(flow_opts()).await;
+    let (client, _) = client_tls(&[], None);
+    let mut conn = rustls::ClientConnection::new(client, ServerName::try_from(HOST).unwrap()).unwrap();
+    let mut hello = Vec::new();
+    conn.write_tls(&mut hello).unwrap();
+    app.write_all(&hello).await.unwrap();
+    let mut first = [0u8; 1];
+    app.read_exact(&mut first).await.expect("Sieve's own hello: the local handshake began");
+    drop(app);
+    assert_eq!(task.await.unwrap().action, FlowAction::Failed);
+    assert_eq!(*watched.refused.lock().unwrap(), [(HOST.to_string(), None)]);
+    let problems: Vec<LogOutcome> = rig.deps.book.lock().unwrap().take_log().into_iter().map(|r| r.outcome).filter(|o| matches!(o, LogOutcome::Problem { .. })).collect();
+    assert_eq!(problems, [LogOutcome::Problem { signal: sieve_ipc::Signal::HandshakeAbandoned, cause: sieve_ipc::Cause::Unknown }]);
+});
+
 /// An upstream on a negotiated protocol: holds its session, or ends it at once.
 fn watched_rig(arm: Arm, alpn: &str, holds: bool, watched: Arc<Watched>) -> Rig {
     let pki = Pki::new("Test Public Root");

@@ -60,9 +60,31 @@ pub struct Issues {
     revision: u64,
     /// Problems let go to keep the bounds (not those that only grew old).
     dropped: u64,
+    /// No problem grows old before this; [`Self::age`] looks again then. Early is
+    /// harmless: a look that finds nothing old changes nothing.
+    next_old_ms: Option<u64>,
 }
 
 impl Issues {
+    /// Lets go of the problems that grew old by `now_ms`, and raises the revision
+    /// when any did: the app asks for the apps only when it moved, so a problem an
+    /// hour old would otherwise stay on its screen (P3 of the 2026-11-08 second review).
+    pub fn age(&mut self, now_ms: u64) {
+        if self.next_old_ms.is_none_or(|at| now_ms < at) {
+            return;
+        }
+        let mut aged = false;
+        for record in self.apps.values_mut() {
+            let before = record.problems.len();
+            record.problems.retain(|p| p.last_ms.saturating_add(KEEP_MS) > now_ms);
+            aged |= record.problems.len() != before;
+        }
+        self.next_old_ms = self.apps.values().flat_map(|r| &r.problems).map(|p| p.last_ms.saturating_add(KEEP_MS)).min();
+        if aged {
+            self.revision += 1;
+        }
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -102,7 +124,10 @@ impl Issues {
         record.flows = record.flows.saturating_add(1);
     }
 
-    /// One problem of one flow.
+    /// One problem of one flow. At the app's bound what Sieve meant goes first
+    /// (P2-3 of the 2026-11-08 second review): blocks and QUIC refusals come by the
+    /// dozen and must not push out the one failure the user needs to see. A new
+    /// intended one finding the slots all failures is the one let go.
     pub fn problem(&mut self, app: &AppId, exe: Option<&str>, signal: Signal, host: Option<&str>, now_ms: u64) {
         let host = host.map(|h| cap_text(h, ISSUE_HOST_MAX).to_string());
         let record = self.record(app, exe, now_ms);
@@ -113,14 +138,24 @@ impl Issues {
             p.count = p.count.saturating_add(1);
             p.last_ms = p.last_ms.max(now_ms);
         } else {
-            if record.problems.len() >= MAX_APP_PROBLEMS
-                && let Some(oldest) = record.problems.iter().enumerate().min_by_key(|(_, p)| p.last_ms).map(|(i, _)| i)
-            {
-                record.problems.swap_remove(oldest);
-                lost = 1;
+            let full = record.problems.len() >= MAX_APP_PROBLEMS;
+            // Intended first, then the oldest: (false, ..) sorts before (true, ..).
+            let victim = if full { record.problems.iter().enumerate().min_by_key(|(_, p)| (!p.signal.intended(), p.last_ms)).map(|(i, p)| (i, p.signal.intended())) } else { None };
+            let keep_new = match victim {
+                Some((_, false)) if signal.intended() => false,
+                Some((at, _)) => {
+                    record.problems.swap_remove(at);
+                    true
+                }
+                None => true,
+            };
+            lost = u64::from(victim.is_some());
+            if keep_new {
+                record.problems.push(Problem { signal, cause: signal.cause(), host, count: 1, first_ms: now_ms, last_ms: now_ms });
             }
-            record.problems.push(Problem { signal, cause: signal.cause(), host, count: 1, first_ms: now_ms, last_ms: now_ms });
         }
+        let old_at = now_ms.saturating_add(KEEP_MS);
+        self.next_old_ms = Some(self.next_old_ms.map_or(old_at, |at| at.min(old_at)));
         self.dropped += lost;
         self.revision += 1;
     }
@@ -275,6 +310,47 @@ mod tests {
         assert!(view.windows(2).all(|w| w[0].problems[0].last_ms >= w[1].problems[0].last_ms), "newest first");
         let frame = encode(&EngineMessage::Issues { run: NOW, revision: i.revision(), apps: view, dropped: i.dropped() }).unwrap();
         assert!(frame.len() <= MAX_FRAME);
+    }
+
+    /// P2-3 of the 2026-11-08 second review: a page of blocked hosts never pushes
+    /// out the failure the user came to see.
+    #[test]
+    fn blocks_go_before_failures_at_an_apps_bound() {
+        let mut i = Issues::default();
+        i.problem(&app("game"), None, Signal::ConnectTimeout, Some("cdn.example"), NOW);
+        for b in 0..100u64 {
+            i.problem(&app("game"), None, if b % 2 == 0 { Signal::Blocked } else { Signal::QuicRefused }, Some(&format!("ads{b}.example")), NOW + 1 + b);
+        }
+        let problems = &i.view(everyone, NOW + 200)[0].problems;
+        assert_eq!(problems.len(), MAX_APP_PROBLEMS);
+        assert!(problems.iter().any(|p| p.signal == Signal::ConnectTimeout), "the oldest, and a failure: kept");
+        // Slots all failures: a new block is the one let go.
+        let mut full = Issues::default();
+        for f in 0..MAX_APP_PROBLEMS as u64 {
+            full.problem(&app("game"), None, Signal::Stall, Some(&format!("s{f}.example")), NOW + f);
+        }
+        let dropped = full.dropped();
+        full.problem(&app("game"), None, Signal::Blocked, Some("ads.example"), NOW + 50);
+        let problems = &full.view(everyone, NOW + 60)[0].problems;
+        assert!(problems.iter().all(|p| p.signal == Signal::Stall) && problems.len() == MAX_APP_PROBLEMS);
+        assert_eq!(full.dropped(), dropped + 1, "counted");
+        // The control: a new failure takes the oldest failure's place.
+        full.problem(&app("game"), None, Signal::ConnectRefused, Some("x.example"), NOW + 70);
+        assert!(full.view(everyone, NOW + 80)[0].problems.iter().any(|p| p.signal == Signal::ConnectRefused));
+    }
+
+    #[test]
+    fn a_problem_growing_old_moves_the_revision() {
+        let mut i = Issues::default();
+        i.problem(&app("game"), None, Signal::Stall, None, NOW);
+        let at = i.revision();
+        i.age(NOW + KEEP_MS - 1);
+        assert_eq!(i.revision(), at, "still recent");
+        i.age(NOW + KEEP_MS);
+        assert_eq!(i.revision(), at + 1);
+        assert!(i.view(everyone, NOW + KEEP_MS).is_empty());
+        i.age(NOW + 2 * KEEP_MS);
+        assert_eq!(i.revision(), at + 1, "nothing more grew old");
     }
 
     #[test]

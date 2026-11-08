@@ -697,6 +697,7 @@ export const SIGNALS = [
   "app_refused_certificate",
   "blocked",
   "quic_refused",
+  "handshake_abandoned",
 ] as const;
 export type Signal = (typeof SIGNALS)[number];
 /** sieve-ipc `Cause`: who most likely caused it. The engine decides; the app only says it. */
