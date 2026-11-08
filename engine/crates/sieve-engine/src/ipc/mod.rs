@@ -52,7 +52,8 @@ pub trait Backend: Send + Sync + 'static {
     /// Downloads one list at the next chance; refused for an unknown id or a list from a file.
     fn list_refresh(&self, id: &str) -> Result<(), String>;
     /// Judges and keeps a list from a file: how many rules it holds and skipped.
-    fn list_import(&self, id: &str, text: &str) -> Result<(u64, u64), String>;
+    /// Async: the compile runs off the runtime, so it holds up no other client.
+    fn list_import(&self, id: &str, text: String) -> impl std::future::Future<Output = Result<(u64, u64), String>> + Send;
     /// The rules of a list's copy that hold query: the first ones, matched, total.
     fn list_rules(&self, id: &str, query: &str) -> Result<(Vec<String>, u64, u64), String>;
     /// The root certificate's status.
@@ -184,7 +185,7 @@ where
                 Ok(()) => lists_answer(backend),
                 Err(message) => EngineMessage::Error { message },
             },
-            Ok(ClientMessage::ListImport { id, text }) => match backend.list_import(&id, &text) {
+            Ok(ClientMessage::ListImport { id, text }) => match backend.list_import(&id, text).await {
                 Ok((rules, skipped)) => EngineMessage::ListImported { id, rules, skipped },
                 Err(message) => EngineMessage::Error { message },
             },
@@ -379,7 +380,7 @@ mod tests {
             *self.refreshes.lock().unwrap() += 10;
             Ok(())
         }
-        fn list_import(&self, id: &str, text: &str) -> Result<(u64, u64), String> {
+        async fn list_import(&self, id: &str, text: String) -> Result<(u64, u64), String> {
             if text.is_empty() { Err(format!("{id}: empty")) } else { Ok((2, 1)) }
         }
         fn list_rules(&self, _id: &str, query: &str) -> Result<(Vec<String>, u64, u64), String> {

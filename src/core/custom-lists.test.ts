@@ -17,7 +17,8 @@ import {
   type CustomList,
 } from "./custom-lists";
 import { EMPTY_DOC, writeValue } from "./settings/document";
-import { isValidValue } from "./settings/registry";
+import { SETTINGS_SCHEMA, isValidValue } from "./settings/registry";
+import { EXPORT_KIND, planImport } from "./settings/transfer";
 
 const list = (over: Partial<CustomList> = {}): CustomList => ({ id: "custom-a1", title: "My list", url: "https://lists.example/my.txt", enabled: true, ...over });
 
@@ -41,13 +42,25 @@ describe("a custom list", () => {
   });
 
   it("an import or a stored value over the budget is refused with a sentence", () => {
-    const many = Array.from({ length: 200 }, (_, i) => list({ id: `custom-${i}`, url: `https://lists.example/${"x".repeat(400)}${i}.txt` }));
+    // As many as the engine holds, each at the longest address and name: past the budget.
+    const url = (i: number) => `https://lists.example/${String(i).padStart(2, "0")}${"x".repeat(CUSTOM_URL_MAX - 28)}.txt`;
+    const many = Array.from({ length: MAX_CUSTOM_LISTS }, (_, i) => list({ id: `custom-${i}`, title: "𝒳".repeat(CUSTOM_TITLE_MAX), url: url(i) }));
+    expect(many.every((l) => isCustomList(l) && l.url!.length === CUSTOM_URL_MAX)).toBe(true);
     expect(() => writeValue(EMPTY_DOC, "filters.custom", many)).toThrow(/Your own filter lists.*not saved/);
   });
 
   it("can be at most so many", () => {
     expect(addProblem(Array.from({ length: MAX_CUSTOM_LISTS - 1 }, () => list()))).toBeNull();
     expect(addProblem(Array.from({ length: MAX_CUSTOM_LISTS }, () => list()))).toMatch(/up to 20/);
+  });
+
+  it("an import of more lists than the engine holds, or of an id twice, is refused: the engine would refuse every later policy", () => {
+    const lists = (n: number) => Array.from({ length: n }, (_, i) => list({ id: `custom-${i}`, url: null }));
+    expect(isValidValue("filters.custom", lists(MAX_CUSTOM_LISTS))).toBe(true);
+    expect(isValidValue("filters.custom", lists(MAX_CUSTOM_LISTS + 1))).toBe(false);
+    expect(isValidValue("filters.custom", [list(), list({ url: null })])).toBe(false);
+    const plan = planImport(EMPTY_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filters.custom": lists(MAX_CUSTOM_LISTS + 1) } }));
+    expect(plan.ok && plan.refused.map((r) => r.key)).toEqual(["filters.custom"]);
   });
 });
 
@@ -65,6 +78,8 @@ describe("an address typed or pasted", () => {
     ["http://lists.example/a.txt", /https only/],
     ["ftp://lists.example/a.txt", /https only/],
     ["https://user@lists.example/a.txt", /not a web address/],
+    ["localhost:8080/list.txt", /internet only.*local network/],
+    ["https://192.168.1.10/list.txt", /internet only/],
     [`https://lists.example/${"a".repeat(CUSTOM_URL_MAX)}`, /longer than/],
   ])("%j is refused with a sentence", (typed, why) => {
     const r = parseListUrl(typed);
@@ -76,6 +91,12 @@ describe("an address typed or pasted", () => {
     expect(titleFromUrl("https://lists.example/path/EasyList%20Germany.txt?x=1")).toBe("EasyList Germany");
     expect(titleFromUrl("https://lists.example/")).toBe("lists.example");
     expect([...titleFromUrl(`https://lists.example/${"n".repeat(100)}.txt`)].length).toBe(CUSTOM_TITLE_MAX);
+  });
+
+  it("strips every control character from the name, so the name is one the engine takes", () => {
+    const title = titleFromUrl("https://lists.example/a%0Ab%09c%07.txt");
+    expect(title).toBe("abc");
+    expect(customListProblem(list({ title }))).toBeNull();
   });
 });
 

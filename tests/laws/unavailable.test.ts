@@ -1,7 +1,8 @@
 /**
  * Law 11, unavailable settings. `unavailableUntil` stays as a mechanism (its
  * behaviour is pinned in src/core/settings/unavailable.test.ts, with real keys
- * mocked unavailable), and today the HTTPS and content switches carry it. The DNS
+ * mocked unavailable), and today the HTTPS and content switches and the tracking
+ * protections carry it. The DNS
  * filter's keys waited for engine slice 4, which retired `filtering.dns` and
  * brought `filtering.upstreams` back. Real registry here, never mocked. An
  * unavailable key must name a plan that exists and names it, and no available
@@ -13,6 +14,7 @@ import { normalizeDoc, readValue } from "@/core/settings/document";
 import { migrate } from "@/core/settings/migrate";
 import { REGISTRY, SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef } from "@/core/settings/registry";
 import { exportText, resetPlan, searchSettings } from "@/core/settings/transfer";
+import { TRACKING_KEYS, trackingInForce } from "@/core/tracking";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT, read } from "./files";
@@ -21,8 +23,9 @@ const RETIRED = ["filtering.dns", "filtering.perApp"];
 const unavailable = SETTING_KEYS.filter((k) => !isAvailable(k));
 
 describe("unavailable settings law", () => {
-  it("the HTTPS and content switches are unavailable, until their live checks have run", () => {
-    expect(unavailable).toEqual([HTTPS_SWITCH, CONTENT_SWITCH]);
+  it("the HTTPS and content switches are unavailable, until their live checks have run, and the tracking protections, until the engine carries them out", () => {
+    expect(unavailable).toEqual([HTTPS_SWITCH, CONTENT_SWITCH, ...TRACKING_KEYS]);
+    expect(trackingInForce(() => true), "none is ever sent, whatever is read").toEqual([]);
   });
 
   it("the content switch is not searched, exported or reset, and reads off whatever is stored", () => {
@@ -44,16 +47,10 @@ describe("unavailable settings law", () => {
     }
   });
 
-  // Declared exception: the tracking protections act inside decrypted traffic.
-  // They are shown, locked with the reason, until the HTTPS switch is available
-  // (task: filter profiles), and the policy never carries one before then
-  // (src/core/tracking.test.ts). Every other available key needs an available switch.
-  it("no available setting requires an unavailable one, but the tracking protections, which require the HTTPS switch", () => {
+  it("no available setting requires an unavailable one", () => {
     for (const k of SETTING_KEYS.filter(isAvailable)) {
       const req = settingDef(k).requires;
-      if (!req) continue;
-      if (settingDef(k).section === "tracking") expect(req, k).toBe(HTTPS_SWITCH);
-      else expect(unavailable as string[], k).not.toContain(req);
+      if (req) expect(unavailable as string[], k).not.toContain(req);
     }
   });
 

@@ -144,15 +144,11 @@ test.describe("filters", () => {
     expect(errors).toEqual([]);
   });
 
-  test("tracking protection is shown locked with its reason, and says what each option can break", async ({ page }, info) => {
+  test("tracking protection is not shown while the engine does not carry it out", async ({ page }) => {
     await open(page);
-    const block = page.locator("[data-tracking]");
-    await expect(block.locator("[data-tracking-locked]")).toContainText("does not offer yet");
-    await expect(block.getByRole("radio", { name: /^Standard/ })).toHaveAttribute("aria-checked", "true");
-    await expect(block.getByRole("radio", { name: /^Standard/ })).toBeDisabled();
-    await expect(block.locator('[data-tracking-option="tracking.webRtc"]')).toContainText("Can break: Video calls");
-    await block.scrollIntoViewIfNeeded();
-    await page.screenshot({ path: `test-results/screens/filters-tracking-${info.project.name}.png` });
+    await expect(page.locator("[data-own-lists]")).toBeVisible();
+    await expect(page.locator("[data-tracking]")).toHaveCount(0);
+    await expect(page.getByText("Ask sites not to track you")).toHaveCount(0);
   });
 
   test("an own list by address: added, refused with a sentence when it is not https, its rules viewable with the engine", async ({ page }, info) => {

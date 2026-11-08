@@ -964,7 +964,8 @@ export interface FilterList {
   default: (typeof LIST_DEFAULTS)[number];
   trusted: boolean;
   kind: ListKind;
-  level: ListLevel;
+  /** Null: the row did not say (an older build's), so no profile decides it. */
+  level: ListLevel | null;
   /** What turning it on does, in plain words. */
   description: string;
   /** Primary language subtags of the sites it is for; empty for every site. */
@@ -996,8 +997,8 @@ function filterList(x: unknown): FilterList | null {
   if (typeof id !== "string" || id === "" || typeof title !== "string" || title === "") return null;
   if (!(LIST_DEFAULTS as readonly unknown[]).includes(x.default)) return null;
   // Rows from before kinds and levels (an older build's answer) read as an ad
-  // list in no profile: shown, and never taken for part of a level.
-  const pick = <T extends string>(v: unknown, of: readonly T[], fallback: T): T => ((of as readonly unknown[]).includes(v) ? (v as T) : fallback);
+  // list with no level: shown, outside every profile, never turned on or off by one.
+  const pick = <T extends string, F>(v: unknown, of: readonly T[], fallback: F): T | F => ((of as readonly unknown[]).includes(v) ? (v as T) : fallback);
   return {
     id,
     title,
@@ -1006,7 +1007,7 @@ function filterList(x: unknown): FilterList | null {
     default: x.default as FilterList["default"],
     trusted: trusted === true,
     kind: pick(x.kind, LIST_KINDS, "ads"),
-    level: pick(x.level, LIST_LEVELS, "optional"),
+    level: pick(x.level, LIST_LEVELS, null),
     description: typeof x.description === "string" ? x.description : "",
     languages: Array.isArray(x.languages) ? x.languages.filter((l): l is string => typeof l === "string") : [],
     report: filterReport(x.report),
