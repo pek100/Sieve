@@ -21,7 +21,10 @@ const emptyDefault = (k: SettingKey) => {
   return Array.isArray(d) ? d.length === 0 : typeof d === "object" && d !== null && Object.keys(d).length === 0;
 };
 
-function LockNote({ lock }: { lock: Lock }) {
+/** Why a row waits on a switch this build does not offer yet. */
+export const requiresUnavailableText = (label: string) => `Needs ${label}, which this version of Sieve does not offer yet.`;
+
+export function LockNote({ lock }: { lock: Lock }) {
   if (lock.kind === "password") return <LockedNote phase={lock.phase} />;
   return (
     <p data-lock={lock.kind} className="flex items-start gap-2 pt-1 text-label text-on-surface-muted">
@@ -33,6 +36,8 @@ function LockNote({ lock }: { lock: Lock }) {
           lock.reason
         ) : lock.checking ? (
           `Needs ${lock.label} to pass its self check.`
+        ) : lock.unavailable ? (
+          requiresUnavailableText(lock.label)
         ) : (
           `Needs ${lock.label}, which is off.`
         )}
@@ -92,6 +97,11 @@ export function SettingRow({
       <p id={helpId} className="text-label text-on-surface-muted">
         {d.help}
       </p>
+      {d.breaks && (
+        <p className="text-label text-on-surface-muted" data-breaks="">
+          <span className="text-on-surface">Can break:</span> {d.breaks}
+        </p>
+      )}
       {lock && <LockNote lock={lock} />}
     </>
   );

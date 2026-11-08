@@ -1,30 +1,32 @@
-//! The default lists at run time (plan 5.4, D10 to D13 of
-//! docs/tasks/2026-11-02-domain-policy.md). `sieve-filter` judges; this module
-//! does the I/O: asks a [`Fetcher`], keeps the last good copy on disk, compiles
-//! off the hot path and swaps the snapshot.
+//! The lists at run time (plan 5.4, D10 to D13 of
+//! docs/tasks/2026-11-02-domain-policy.md): the catalogue's selection and the
+//! user's own lists, by address or imported from a file. `sieve-filter` judges;
+//! this module does the I/O: asks a [`Fetcher`], keeps the last good copy on
+//! disk, compiles off the hot path and swaps the snapshot.
 //!
 //! Lists refresh only while routes are up: [`Lists::run`] is started by
 //! `bring_up` and aborted by `take_down`, so the switch off means no timer. A
 //! missing, broken or uncompiled list means fewer blocks, never a failed
 //! connection: flows pass until the first snapshot lands, and a compile that
-//! panics keeps the previous snapshot.
+//! panics keeps the previous snapshot. A user's list is compiled untrusted, so
+//! it can never use a `trusted-*` scriptlet.
 
 pub mod cache;
 #[cfg(windows)]
 pub mod https;
 pub mod resources;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sieve_filter::catalogue::{self, LISTS, List};
-use sieve_filter::lists::{Applied, FetchResponse, FetchState, list_version};
-use sieve_filter::rules::{ListReport, ListText, RuleEngine, USER_LIST};
-use sieve_ipc::{FilterFacts, ListFact, ListStatus, listed_line};
+use sieve_filter::catalogue::{self, LISTS};
+use sieve_filter::lists::{Applied, FetchResponse, FetchState, judge_text, list_version};
+use sieve_filter::rules::{ListReport, ListText, RuleEngine, USER_LIST, rule_lines};
+use sieve_ipc::{CUSTOM_LIST_PREFIX, CustomList, FilterFacts, LIST_QUERY_MAX, LIST_RULES_SHOWN, ListFact, ListStatus, MAX_IMPORT_BYTES, custom_id_problem, listed_line};
 use tokio::sync::Notify;
 
 use crate::domain::{DomainFilter, FilterSlot};
@@ -39,6 +41,12 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// one wake an hour, only while routes are up.
 const MAX_SLEEP: Duration = Duration::from_secs(3_600);
 
+pub const UNKNOWN_LIST: &str = "the engine knows no list by that id";
+pub const NO_COPY: &str = "Sieve has no copy of this list yet: it downloads a list while the list is on and the engine routes traffic";
+pub const FILE_NOT_DOWNLOADED: &str = "a list from a file is not downloaded: import the file again to update it";
+pub const NOTHING_USABLE: &str = "no rule Sieve can use: every line was skipped";
+pub const NO_STATE_FOLDER: &str = "the engine keeps no lists in this run";
+
 /// How a list is downloaded: the real client (`https`), or a fake in tests.
 pub trait Fetcher: Send + Sync {
     fn fetch(&self, url: &str, headers: Vec<(&'static str, String)>) -> impl Future<Output = Result<FetchResponse, String>> + Send;
@@ -46,14 +54,28 @@ pub trait Fetcher: Send + Sync {
 
 type Compile = fn(&[ListText<'_>]) -> RuleEngine;
 
+/// One list the engine fetches and compiles: a catalogue row or one of the
+/// user's own (`url` None: imported from a file, never downloaded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Source {
+    id: String,
+    url: Option<String>,
+    trusted: bool,
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     selection: Option<Vec<String>>,
-    states: HashMap<&'static str, FetchState>,
+    custom: Vec<CustomList>,
+    states: HashMap<String, FetchState>,
+    /// Lists asked to download at the next look, whatever their age.
+    forced: HashSet<String>,
+    /// Imported this run and not yet named by a policy: kept, not swept.
+    imported: HashSet<String>,
     compile_ms: Option<u64>,
     compile_error: Option<String>,
     /// Each compiled list's own `! Version:`.
-    versions: HashMap<&'static str, String>,
+    versions: HashMap<String, String>,
     /// The resource bundle in use, as the report quotes it.
     resource_pin: Option<String>,
     resource_error: Option<String>,
@@ -66,6 +88,8 @@ pub struct Lists {
     compile: Compile,
     inner: Mutex<Inner>,
     force: AtomicBool,
+    /// A copy changed outside a download (an import): compile at the next look.
+    dirty: AtomicBool,
     wake: Notify,
 }
 
@@ -103,16 +127,30 @@ impl Lists {
 
     fn with_compile(engine_dir: Option<&Path>, slot: Arc<FilterSlot>, selection: Option<Vec<String>>, compile: Compile) -> Self {
         let cache = engine_dir.map(Cache::new);
-        let states = cache.as_ref().map(|c| LISTS.iter().map(|l| (l.id, c.read_state(l.id))).collect()).unwrap_or_default();
-        Self { dir: engine_dir.map(Path::to_path_buf), cache, slot, compile, inner: Mutex::new(Inner { selection, states, ..Inner::default() }), force: AtomicBool::new(false), wake: Notify::new() }
+        let states = cache.as_ref().map(|c| LISTS.iter().map(|l| (l.id.to_string(), c.read_state(l.id))).collect()).unwrap_or_default();
+        Self {
+            dir: engine_dir.map(Path::to_path_buf),
+            cache,
+            slot,
+            compile,
+            inner: Mutex::new(Inner { selection, states, ..Inner::default() }),
+            force: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
+            wake: Notify::new(),
+        }
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn selected(&self) -> Vec<&'static List> {
-        catalogue::selected(self.inner().selection.as_deref())
+    /// What is fetched and compiled now: the selected catalogue rows, then the
+    /// user's own lists that are on, in the policy's order.
+    fn sources(&self) -> Vec<Source> {
+        let inner = self.inner();
+        let rows = catalogue::selected(inner.selection.as_deref()).into_iter().map(|l| Source { id: l.id.to_string(), url: Some(l.url.to_string()), trusted: l.trusted });
+        let own = inner.custom.iter().filter(|c| c.enabled).map(|c| Source { id: c.id.clone(), url: c.url.clone(), trusted: false });
+        rows.chain(own).collect()
     }
 
     /// The policy's selection changed: fetch and compile what it names now.
@@ -124,10 +162,118 @@ impl Lists {
         }
     }
 
+    /// The policy's own lists changed. A list that left (or whose address
+    /// changed) is forgotten with its copy, so removing a list removes what the
+    /// engine kept of it; so is a copy on disk no policy names, unless it was
+    /// imported this run and its policy has not arrived yet.
+    pub fn set_custom(&self, custom: Vec<CustomList>) {
+        let mut inner = self.inner();
+        if inner.custom == custom {
+            return;
+        }
+        let kept = |c: &CustomList| inner.custom.iter().any(|old| old.id == c.id && old.url == c.url);
+        let fresh: Vec<String> = custom.iter().filter(|c| !kept(c)).map(|c| c.id.clone()).collect();
+        let forget: Vec<String> = inner.custom.iter().filter(|old| !custom.iter().any(|c| c.id == old.id && c.url == old.url)).map(|c| c.id.clone()).collect();
+        for id in &forget {
+            inner.states.remove(id);
+            inner.versions.remove(id);
+        }
+        for c in &custom {
+            inner.imported.remove(&c.id);
+        }
+        if let Some(cache) = &self.cache {
+            for id in &forget {
+                cache.remove(id);
+            }
+            for id in cache.ids_with_prefix(CUSTOM_LIST_PREFIX) {
+                if !custom.iter().any(|c| c.id == id) && !inner.imported.contains(&id) {
+                    cache.remove(&id);
+                }
+            }
+            for id in fresh {
+                if !inner.states.contains_key(&id) {
+                    inner.states.insert(id.clone(), cache.read_state(&id));
+                }
+            }
+        }
+        inner.custom = custom;
+        self.wake.notify_one();
+    }
+
     /// Every selected list downloads at the next look, whatever its age.
     pub fn refresh_now(&self) {
         self.force.store(true, Ordering::Relaxed);
         self.wake.notify_one();
+    }
+
+    /// List `id` downloads at the next look, whatever its age. Refused for an
+    /// id the engine does not know, and for a list from a file.
+    pub fn refresh_one(&self, id: &str) -> Result<(), String> {
+        let mut inner = self.inner();
+        let url = catalogue::find(id).map(|l| Some(l.url.to_string())).or_else(|| inner.custom.iter().find(|c| c.id == id).map(|c| c.url.clone()));
+        match url {
+            None => Err(UNKNOWN_LIST.to_string()),
+            Some(None) => Err(FILE_NOT_DOWNLOADED.to_string()),
+            Some(Some(_)) => {
+                inner.forced.insert(id.to_string());
+                self.wake.notify_one();
+                Ok(())
+            }
+        }
+    }
+
+    /// Judges and keeps a list the user picked from a file, as a download is
+    /// judged, and compiles it untrusted alone to count what it holds. It takes
+    /// effect once the policy names it. The rules and skipped counts it holds.
+    pub fn import(&self, id: &str, text: &str, now_ms: u64) -> Result<(u64, u64), String> {
+        if let Some(why) = custom_id_problem(id) {
+            return Err(why);
+        }
+        let text = judge_text(text.as_bytes(), MAX_IMPORT_BYTES, false)?;
+        let compiled = RuleEngine::compile(&[ListText { id, text, trusted: false }]);
+        let report = compiled.reports().first().cloned().unwrap_or_default();
+        let rules = counted(report.network + report.cosmetic);
+        if rules == 0 {
+            return Err(NOTHING_USABLE.to_string());
+        }
+        let cache = self.cache.as_ref().ok_or(NO_STATE_FOLDER)?;
+        let state = FetchState::fetched(text, None, None, now_ms);
+        cache.write_text(id, text)?;
+        cache.write_state(id, &state)?;
+        let mut inner = self.inner();
+        inner.states.insert(id.to_string(), state);
+        if !inner.custom.iter().any(|c| c.id == id) {
+            inner.imported.insert(id.to_string());
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
+        Ok((rules, counted(report.skipped)))
+    }
+
+    /// The rules of the engine's copy of list `id` that hold `query` (case
+    /// folded), the first [`LIST_RULES_SHOWN`] of them, how many match and how
+    /// many rules the copy holds.
+    pub fn rules(&self, id: &str, query: &str) -> Result<(Vec<String>, u64, u64), String> {
+        if query.len() > LIST_QUERY_MAX {
+            return Err(format!("a search of {} bytes is over the {LIST_QUERY_MAX} byte limit", query.len()));
+        }
+        let known = catalogue::find(id).is_some() || self.inner().custom.iter().any(|c| c.id == id);
+        if !known {
+            return Err(UNKNOWN_LIST.to_string());
+        }
+        let text = self.cache.as_ref().and_then(|c| c.read_text(id)).ok_or(NO_COPY)?;
+        let needle = query.trim().to_lowercase();
+        let (mut total, mut matched, mut lines) = (0u64, 0u64, Vec::new());
+        for rule in rule_lines(&text) {
+            total += 1;
+            if needle.is_empty() || rule.to_lowercase().contains(&needle) {
+                matched += 1;
+                if lines.len() < LIST_RULES_SHOWN {
+                    lines.push(listed_line(rule));
+                }
+            }
+        }
+        Ok((lines, matched, total))
     }
 
     /// Why the last compile produced nothing, or why it went without a resource
@@ -142,8 +288,8 @@ impl Lists {
 
     /// What the engine filters with, for the Status: the lists the snapshot in
     /// force holds, whatever the selection has since become. None until a
-    /// compile finished. The user's rules are not a list here: they have no
-    /// project page and are never what a report names.
+    /// compile finished. The user's rules and own lists are not here: they have
+    /// no project page and are never what a report names.
     pub fn facts(&self) -> Option<FilterFacts> {
         let filter = self.slot.get();
         let inner = self.inner();
@@ -168,41 +314,43 @@ impl Lists {
         Some(FilterFacts { lists, resource_pin: inner.resource_pin.clone() })
     }
 
-    /// The per-list report: every catalogue row, then the user's rules.
+    /// The per-list report: every catalogue row, the user's own lists, then the
+    /// user's rules.
     pub fn report(&self) -> (Vec<ListStatus>, Option<u64>) {
         let filter = self.slot.get();
-        let selected = self.selected();
+        let sources = self.sources();
         let inner = self.inner();
         let find = |reports: &'_ [ListReport], id: &str| reports.iter().find(|r| r.id == id).cloned();
-        let mut rows: Vec<ListStatus> = LISTS
-            .iter()
-            .map(|l| {
-                let enabled = selected.iter().any(|s| s.id == l.id);
-                status_of(l.id, enabled, inner.states.get(l.id), find(filter.rules.lists.reports(), l.id).as_ref())
-            })
-            .collect();
+        let row = |id: &str| {
+            let enabled = sources.iter().any(|s| s.id == id);
+            status_of(id, enabled, inner.states.get(id), find(filter.rules.lists.reports(), id).as_ref())
+        };
+        let mut rows: Vec<ListStatus> = LISTS.iter().map(|l| row(l.id)).chain(inner.custom.iter().map(|c| row(&c.id))).collect();
         rows.push(status_of(USER_LIST, true, None, find(filter.rules.user.reports(), USER_LIST).as_ref()));
         (rows, inner.compile_ms)
     }
 
-    /// Asks for every list that is due, in catalogue order. True when a copy
-    /// was replaced. A failure keeps the copy and only its time is recorded.
+    /// Asks for every list that is due, in order. True when a copy was
+    /// replaced. A failure keeps the copy and only its time is recorded. A list
+    /// from a file is never asked for.
     pub async fn fetch_due<F: Fetcher>(&self, fetcher: &F, now_ms: u64) -> bool {
         let force = self.force.swap(false, Ordering::Relaxed);
         let mut replaced = false;
-        for list in self.selected() {
-            let mut state = self.inner().states.get(list.id).cloned().unwrap_or_default();
-            if !force && !state.is_due(now_ms) {
+        for source in self.sources() {
+            let Some(url) = source.url.as_deref() else { continue };
+            let forced = self.inner().forced.remove(&source.id);
+            let mut state = self.inner().states.get(&source.id).cloned().unwrap_or_default();
+            if !force && !forced && !state.is_due(now_ms) {
                 continue;
             }
-            let answer = tokio::time::timeout(FETCH_TIMEOUT, fetcher.fetch(list.url, state.conditional_headers())).await;
+            let answer = tokio::time::timeout(FETCH_TIMEOUT, fetcher.fetch(url, state.conditional_headers())).await;
             match answer {
                 Ok(Ok(response)) => {
                     // The state describes the copy on disk, so a new one only
                     // counts once it is written.
                     let mut next = state.clone();
                     let written = match (next.apply(response, now_ms), &self.cache) {
-                        (Applied::Replaced(text), Some(cache)) => cache.write_text(list.id, &text).map(|()| true),
+                        (Applied::Replaced(text), Some(cache)) => cache.write_text(&source.id, &text).map(|()| true),
                         _ => Ok(false),
                     };
                     match written {
@@ -218,9 +366,9 @@ impl Lists {
             }
             if let Some(cache) = &self.cache {
                 // Lost on a full disk: the next start only asks again.
-                let _ = cache.write_state(list.id, &state);
+                let _ = cache.write_state(&source.id, &state);
             }
-            self.inner().states.insert(list.id, state);
+            self.inner().states.insert(source.id, state);
         }
         replaced
     }
@@ -232,19 +380,22 @@ impl Lists {
         let started = Instant::now();
         let cache = self.cache.clone();
         let compile = self.compile;
-        let selected = self.selected();
+        let sources = self.sources();
         let dir = self.dir.clone();
         let job = tokio::task::spawn_blocking(move || {
-            let copies: Vec<(&'static List, Option<String>)> = selected.into_iter().map(|l| (l, cache.as_ref().and_then(|c| c.read_text(l.id)))).collect();
-            let texts: Vec<ListText<'_>> = copies.iter().filter_map(|(l, t)| t.as_deref().map(|text| ListText { id: l.id, text, trusted: l.trusted })).collect();
+            let copies: Vec<(Source, Option<String>)> = sources.into_iter().map(|s| {
+                let text = cache.as_ref().and_then(|c| c.read_text(&s.id));
+                (s, text)
+            }).collect();
+            let texts: Vec<ListText<'_>> = copies.iter().filter_map(|(s, t)| t.as_deref().map(|text| ListText { id: &s.id, text, trusted: s.trusted })).collect();
             let mut engine = compile(&texts);
             let (loaded, resource_error) = dir.as_deref().map_or((None, None), |d| resources::load(d, resources::RESOURCE_PIN));
             let resource_pin = loaded.map(|l| {
                 engine.use_resources(&l.bundle);
                 l.pin
             });
-            let versions: HashMap<&'static str, String> = copies.iter().filter_map(|(l, t)| Some((l.id, list_version(t.as_deref()?)?))).collect();
-            let missing: Vec<&'static str> = copies.iter().filter(|(_, t)| t.is_none()).map(|(l, _)| l.id).collect();
+            let versions: HashMap<String, String> = copies.iter().filter_map(|(s, t)| Some((s.id.clone(), list_version(t.as_deref()?)?))).collect();
+            let missing: Vec<String> = copies.iter().filter(|(_, t)| t.is_none()).map(|(s, _)| s.id.clone()).collect();
             (engine, missing, versions, resource_pin, resource_error)
         });
         match job.await {
@@ -258,7 +409,7 @@ impl Lists {
                 inner.resource_pin = resource_pin;
                 inner.resource_error = resource_error;
                 for id in missing {
-                    if inner.states.get(id).is_some_and(|s| s.fetched_at_ms.is_some()) {
+                    if inner.states.get(&id).is_some_and(|s| s.fetched_at_ms.is_some()) {
                         inner.states.insert(id, FetchState::default());
                     }
                 }
@@ -267,24 +418,27 @@ impl Lists {
         }
     }
 
+    /// Until the next list is due. A list from a file is never due.
     fn next_sleep(&self, now_ms: u64) -> Duration {
-        let selected = self.selected();
+        let sources = self.sources();
         let inner = self.inner();
-        let next = selected.iter().map(|l| inner.states.get(l.id).map_or(0, FetchState::due_at_ms)).min();
+        let next = sources.iter().filter(|s| s.url.is_some()).map(|s| inner.states.get(&s.id).map_or(0, FetchState::due_at_ms)).min();
+        let next = if inner.forced.is_empty() { next } else { Some(0) };
         next.map_or(MAX_SLEEP, |due| Duration::from_millis(due.saturating_sub(now_ms)).min(MAX_SLEEP))
     }
 
     /// The refresh task, for as long as routes are up.
     pub async fn run<F: Fetcher>(self: Arc<Self>, fetcher: F) {
         // Read before compiling: a change during the compile mismatches below.
-        let mut compiled_for = self.selected();
+        let mut compiled_for = self.sources();
+        self.dirty.store(false, Ordering::Relaxed);
         self.compile_and_swap().await;
         loop {
             let replaced = self.fetch_due(&fetcher, wall_ms()).await;
-            let selected = self.selected();
-            if replaced || selected != compiled_for {
+            let sources = self.sources();
+            if replaced || sources != compiled_for || self.dirty.swap(false, Ordering::Relaxed) {
                 self.compile_and_swap().await;
-                compiled_for = selected;
+                compiled_for = sources;
             }
             tokio::select! {
                 () = tokio::time::sleep(self.next_sleep(wall_ms())) => {}
@@ -706,5 +860,129 @@ mod tests {
         l.set_selection(Some(vec![]));
         assert!(wait_for("other.example", false).await, "the new selection compiled");
         task.abort();
+    }
+
+    const OWN_URL: &str = "https://lists.example/own.txt";
+
+    fn own(id: &str, url: Option<&str>) -> CustomList {
+        CustomList { id: id.into(), title: "Mine".into(), url: url.map(str::to_string), enabled: true }
+    }
+
+    impl FakeFetcher {
+        fn answering_url(url: &str, answers: Vec<Answer>) -> Self {
+            let fake = Self::default();
+            fake.answers.lock().unwrap().entry(url.to_string()).or_default().extend(answers);
+            fake
+        }
+    }
+
+    #[tokio::test]
+    async fn an_own_list_by_address_is_downloaded_compiled_untrusted_reported_and_forgotten_when_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = lists_at(dir.path(), &[]);
+        l.set_custom(vec![own("custom-a1", Some(OWN_URL))]);
+        assert!(l.sources().iter().all(|s| !s.trusted), "a user's list never gets trusted scriptlets");
+        let f = FakeFetcher::answering_url(OWN_URL, vec![ok(BODY)]);
+        assert!(l.fetch_due(&f, 1_000).await);
+        assert_eq!(f.asked_urls(), [OWN_URL]);
+        l.compile_and_swap().await;
+        assert!(blocks(&l, "ads.example"));
+        let (rows, _) = l.report();
+        let row = rows.iter().find(|r| r.id == "custom-a1").unwrap();
+        assert_eq!((row.enabled, row.fetched_at_ms, row.network), (true, Some(1_000), 1));
+        assert_eq!(rows.len(), LISTS.len() + 2, "the catalogue, the own list, the user's rules");
+
+        l.set_custom(vec![CustomList { enabled: false, ..own("custom-a1", Some(OWN_URL)) }]);
+        assert!(Cache::new(dir.path()).read_text("custom-a1").is_some(), "off keeps the copy");
+        l.compile_and_swap().await;
+        assert!(!blocks(&l, "ads.example"), "off stops it");
+        l.set_custom(vec![]);
+        assert_eq!(Cache::new(dir.path()).read_text("custom-a1"), None, "removed, and its copy with it");
+        assert!(l.report().0.iter().all(|r| r.id != "custom-a1"));
+    }
+
+    #[tokio::test]
+    async fn an_own_list_that_is_a_web_page_is_refused_with_the_reason_and_keeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = lists_at(dir.path(), &[]);
+        l.set_custom(vec![own("custom-a1", Some(OWN_URL))]);
+        assert!(!l.fetch_due(&FakeFetcher::answering_url(OWN_URL, vec![ok("<!doctype html><p>sign in")]), 0).await);
+        let (rows, _) = l.report();
+        let row = rows.iter().find(|r| r.id == "custom-a1").unwrap();
+        assert_eq!(row.last_error.as_deref(), Some("an HTML page, not a filter list"));
+        assert_eq!(row.fetched_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn an_imported_file_is_judged_kept_compiled_once_named_and_never_downloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = lists_at(dir.path(), &[]);
+        let too_big = "||a.example^\n".repeat(MAX_IMPORT_BYTES / 13 + 1);
+        for (text, why) in [
+            ("<html><body>no</body></html>", "an HTML page"),
+            ("! only a comment\n", "no rule in the response"),
+            (too_big.as_str(), "byte limit"),
+            ("||bad$unknown-option-xyz\n", "no rule in the response"),
+        ] {
+            assert!(l.import("custom-b2", text, 5).unwrap_err().contains(why), "{why}");
+        }
+        assert!(l.import("adguard-base", BODY, 5).unwrap_err().contains("custom list id"), "never over a catalogue row");
+        assert!(l.import("custom-../x", BODY, 5).is_err(), "never a path");
+        assert_eq!(Cache::new(dir.path()).read_text("custom-b2"), None, "nothing kept from a refusal");
+
+        assert_eq!(l.import("custom-b2", "||ads.example^\n||bad$unknown-option-xyz\n", 5).unwrap(), (1, 1));
+        l.set_custom(vec![]);
+        assert!(Cache::new(dir.path()).read_text("custom-b2").is_some(), "imported, its policy not here yet: kept");
+        l.set_custom(vec![own("custom-b2", None)]);
+        let f = FakeFetcher::default();
+        assert!(!l.fetch_due(&f, 10 * HOUR_MS).await);
+        assert!(f.asked_urls().is_empty(), "a file is never downloaded");
+        assert_eq!(l.next_sleep(0), MAX_SLEEP, "nor ever due");
+        l.compile_and_swap().await;
+        assert!(blocks(&l, "ads.example"));
+        assert_eq!(l.refresh_one("custom-b2").unwrap_err(), FILE_NOT_DOWNLOADED);
+    }
+
+    #[test]
+    fn a_copy_no_policy_names_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path());
+        cache.write_text("custom-old", BODY).unwrap();
+        cache.write_text(LIST_A, BODY).unwrap();
+        let l = lists_at(dir.path(), &[]);
+        l.set_custom(vec![own("custom-a1", Some(OWN_URL))]);
+        assert_eq!(cache.read_text("custom-old"), None, "left by an import that was never added");
+        assert!(cache.read_text(LIST_A).is_some(), "a catalogue copy is never swept");
+    }
+
+    #[tokio::test]
+    async fn one_list_can_be_downloaded_now_and_only_that_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = lists_at(dir.path(), &[LIST_A, SECOND_DEFAULT]);
+        let f = FakeFetcher::answering(LIST_A, vec![ok(BODY), ok(BODY_2)]);
+        f.queue(SECOND_DEFAULT, vec![ok(BODY)]);
+        l.fetch_due(&f, 0).await;
+        assert_eq!(f.asked_urls().len(), 2);
+        l.refresh_one(LIST_A).unwrap();
+        assert_eq!(l.next_sleep(1), Duration::ZERO, "the loop looks at once");
+        l.fetch_due(&f, 1).await;
+        assert_eq!(f.asked_urls().len(), 3);
+        assert_eq!(f.asked_urls()[2], catalogue::find(LIST_A).unwrap().url);
+        assert_eq!(l.refresh_one("nope").unwrap_err(), UNKNOWN_LIST);
+    }
+
+    #[tokio::test]
+    async fn a_lists_rules_are_searched_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = std::iter::once("! Title: Big\n[Adblock Plus 2.0]\n".to_string()).chain((0..LIST_RULES_SHOWN + 50).map(|i| format!("||host{i}.ads.example^\n"))).chain(["||Other.example^\n".to_string()]).collect();
+        Cache::new(dir.path()).write_text(LIST_A, &body).unwrap();
+        let l = lists_at(dir.path(), &[LIST_A]);
+        let (lines, matched, total) = l.rules(LIST_A, "").unwrap();
+        assert_eq!((lines.len(), matched, total), (LIST_RULES_SHOWN, LIST_RULES_SHOWN as u64 + 51, LIST_RULES_SHOWN as u64 + 51), "comments and the header are not rules");
+        let (lines, matched, _) = l.rules(LIST_A, "OTHER").unwrap();
+        assert_eq!((lines, matched), (vec!["||Other.example^".to_string()], 1), "case folded");
+        assert_eq!(l.rules(SECOND_DEFAULT, "").unwrap_err(), NO_COPY);
+        assert_eq!(l.rules("custom-zz", "").unwrap_err(), UNKNOWN_LIST);
+        assert!(l.rules(LIST_A, &"x".repeat(LIST_QUERY_MAX + 1)).is_err());
     }
 }

@@ -75,6 +75,9 @@ function fakeEngine(start: EngineScenario) {
     },
     lists: () => mock.lists(),
     listsRefresh: () => mock.listsRefresh(),
+    listRefresh: (id) => mock.listRefresh(id),
+    listRules: (id, query) => mock.listRules(id, query),
+    listImport: (id) => mock.listImport(id),
     dnsUpstreams: () => mock.dnsUpstreams(),
     setDnsUpstreams: (l) => {
       upstreams.push(l);
@@ -570,6 +573,26 @@ describe("engine controller", () => {
     ]);
     await s.fc.advance(ENGINE_POLL_MS * 2);
     expect(s.fake.policies, "the engine holds it now: nothing more to send").toHaveLength(1);
+    s.undo();
+  });
+
+  it("sends the person's own lists, and a tracking option stored on only once HTTPS decryption is in force: never while it is locked", async () => {
+    const own = [
+      { id: "custom-a1", title: "Mine", url: "https://lists.example/a.txt", enabled: true },
+      { id: "custom-b2", title: "From a file", url: null, enabled: false },
+    ];
+    const values = { [ENGINE_SWITCH]: true, "filters.custom": own, "filtering.https": true, "tracking.webRtc": true, "tracking.gpc": true };
+    const s = setup("idle", memoryBackend({ schema: 5, values }));
+    await s.fc.flush();
+    expect(s.fake.policies).toHaveLength(1);
+    expect(s.fake.policies[0].custom_lists).toEqual(own);
+    expect(s.fake.policies[0]).not.toHaveProperty("tracking");
+    expect(s.fake.policies[0].https).toBe(false);
+    await s.fc.advance(ENGINE_POLL_MS * 2);
+    expect(s.fake.policies, "the engine holds them: nothing more to send").toHaveLength(1);
+    await s.settings.set("filters.custom", own.slice(1));
+    await s.fc.flush();
+    expect(s.fake.policies.at(-1)?.custom_lists, "a removed list leaves the policy").toEqual(own.slice(1));
     s.undo();
   });
 

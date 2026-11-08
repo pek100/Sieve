@@ -160,6 +160,7 @@ impl Engine {
         let rules = RuleSet { user: Arc::new(user_engine(&policy)), lists: Arc::new(RuleEngine::empty()) };
         let filter = Arc::new(FilterSlot::new(DomainFilter::new(&policy, rules)));
         let lists = Arc::new(Lists::new(dir.as_deref(), filter.clone(), policy.lists.clone()));
+        lists.set_custom(policy.custom_lists.clone());
         let (dns_upstreams, unused_dns_file) = dir.as_deref().map(config::load).unwrap_or_else(|| (config::defaults(), None));
         let exclusions = Arc::new(ExclusionSlot::new(dir.as_deref(), &policy.exclusions, policy::wall_ms()));
         let meters: Arc<Meters> = Arc::default();
@@ -225,6 +226,7 @@ impl Engine {
             DomainFilter::new(now, rules)
         });
         self.lists.set_selection(now.lists.clone());
+        self.lists.set_custom(now.custom_lists.clone());
         self.exclusions.set_user(&now.exclusions, policy::wall_ms());
         // Off closes every decrypted flow now; on waits for the routing loop,
         // which holds the pinned sockets.
@@ -545,6 +547,18 @@ impl Backend for Engine {
 
     fn lists_refresh(&self) {
         self.lists.refresh_now();
+    }
+
+    fn list_refresh(&self, id: &str) -> Result<(), String> {
+        self.lists.refresh_one(id)
+    }
+
+    fn list_import(&self, id: &str, text: &str) -> Result<(u64, u64), String> {
+        self.lists.import(id, text, policy::wall_ms())
+    }
+
+    fn list_rules(&self, id: &str, query: &str) -> Result<(Vec<String>, u64, u64), String> {
+        self.lists.rules(id, query)
     }
 
     fn cert_status(&self) -> CertStatus {

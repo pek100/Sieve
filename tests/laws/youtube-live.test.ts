@@ -49,7 +49,7 @@ describe("the video site live script", () => {
   });
 
   it("the arms are the fixture's rows: the defaults, or the defaults and every gated row", () => {
-    const on = ["adguard-base", "adguard-tracking", "adguard-url-tracking", "adguard-dns"];
+    const on = ["adguard-base", "adguard-tracking", "adguard-url-tracking", "adguard-dns", "ubo-badware"];
     expect(armLists(fixture, "adguard")).toEqual(on);
     expect(armLists(fixture, "adguard+ubo")).toEqual([...on, "ubo-filters", "ubo-quick-fixes", "ubo-unbreak"]);
     expect(() => armLists(fixture, "ubo")).toThrow();

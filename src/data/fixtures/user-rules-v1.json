@@ -39,5 +39,11 @@
       { "list": "||other.example^", "ask": "other.example", "verdict": "block" },
       { "list": "||ok.example^$important", "ask": "ok.example", "verdict": "block" }
     ]
-  }
+  },
+  "form": [
+    { "form": { "host": "ads.example", "action": "block", "subdomains": true, "comment": "Pop-ups  on\nevery page" }, "rules": ["! Pop-ups on every page", "||ads.example^"], "list": "", "ask": [{ "host": "ads.example", "verdict": "block" }, { "host": "x.ads.example", "verdict": "block" }, { "host": "other.example", "verdict": "none" }] },
+    { "form": { "host": "ads.example", "action": "block", "subdomains": false, "comment": "" }, "rules": ["|https://ads.example^", "|http://ads.example^"], "list": "", "ask": [{ "host": "ads.example", "verdict": "block" }, { "host": "x.ads.example", "verdict": "none" }, { "host": "notads.example", "verdict": "none" }] },
+    { "form": { "host": "shop.example", "action": "allow", "subdomains": true, "comment": "" }, "rules": ["@@||shop.example^"], "list": "||shop.example^", "ask": [{ "host": "shop.example", "verdict": "allow" }, { "host": "cdn.shop.example", "verdict": "allow" }] },
+    { "form": { "host": "shop.example", "action": "allow", "subdomains": false, "comment": " " }, "rules": ["@@|https://shop.example^", "@@|http://shop.example^"], "list": "||shop.example^", "ask": [{ "host": "shop.example", "verdict": "allow" }, { "host": "cdn.shop.example", "verdict": "block" }] }
+  ]
 }

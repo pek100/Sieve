@@ -9,6 +9,7 @@
  * No switch may write persistent system network state (DNS servers, routes,
  * proxy settings, firewall rules): Sieve off means a normal network.
  */
+import { isCustomList, type CustomList } from "../custom-lists";
 import { APP_STATES, type AppState } from "../policy";
 import { ALLOWLIST_TEXT, checkRuleLine, normalizeDomain } from "../rules";
 import { parseUpstream } from "../upstream";
@@ -30,8 +31,13 @@ export const SECTIONS = [
   { id: "filtering", label: "Filtering" },
   { id: "notifications", label: "Notifications" },
   { id: "filters", label: "Filter lists" },
+  { id: "tracking", label: "Tracking protection" },
   { id: "password", label: "Password" },
 ] as const;
+
+/** Tracking protection's levels, mildest first (the scale of core/profiles). */
+export const TRACKING_LEVELS = ["standard", "strict"] as const;
+export type TrackingLevel = (typeof TRACKING_LEVELS)[number];
 
 export type Section = (typeof SECTIONS)[number]["id"];
 
@@ -54,6 +60,10 @@ interface Base<T> {
   unavailableUntil?: string;
   /** A record of what happened, not a preference: "Reset every setting" leaves it. Its own row can still change it. */
   keptByResetAll?: true;
+  /** A tracking protection: the lowest level that turns it on, null for none (its default is on exactly at Standard). */
+  preset?: TrackingLevel | null;
+  /** What turning it on can break, in plain words, shown beside it. */
+  breaks?: string;
 }
 
 /**
@@ -62,9 +72,11 @@ interface Base<T> {
  * normalized host name. So an import cannot smuggle in a trusted scriptlet or a
  * junk host: the registry refuses it.
  */
-export type ElementSpec = { type: "string" } | { type: "upstream" } | { type: "rule" } | { type: "domain" } | { type: "enum"; options: readonly string[] };
+export type ElementSpec = { type: "string" } | { type: "upstream" } | { type: "rule" } | { type: "domain" } | { type: "enum"; options: readonly string[] } | { type: "customList" };
 
 export function isValidElement(spec: ElementSpec, v: unknown): boolean {
+  // `customList`: one of the person's own lists, the engine's own rule (core/custom-lists).
+  if (spec.type === "customList") return isCustomList(v);
   if (typeof v !== "string") return false;
   switch (spec.type) {
     case "string":
@@ -120,6 +132,7 @@ export const POLICY_BUDGETS: readonly { keys: readonly SettingKey[]; bytes: numb
     what: "Your rules, blocklist, allowlist and undecrypted sites",
   },
   { keys: ["apps.levels"], bytes: 32 * KIB, what: "The apps you turned off" },
+  { keys: ["filters.custom"], bytes: 16 * KIB, what: "Your own filter lists" },
 ];
 
 export type PolicyBudget = (typeof POLICY_BUDGETS)[number];
@@ -191,6 +204,21 @@ const ENGINE_SLICE_9 = "engine slice 9 (docs/plans/2026-10-17-https-filtering.md
 
 const enumSetting = <const O extends string>(d: Omit<EnumSetting<O>, "kind">): EnumSetting<O> => ({
   kind: "enum",
+  ...d,
+});
+
+/**
+ * One tracking protection (plan rows 26 to 30). Each acts on decrypted requests
+ * and pages, so each requires the HTTPS switch and is locked, with that reason,
+ * while it is off or unavailable; the engine controller sends only those in
+ * force. Its default is derived from its level: on exactly at Standard, the
+ * recommended one, so the defaults are Standard (core/tracking).
+ */
+const trackingOption = (d: { label: string; help: string; preset: TrackingLevel | null; breaks?: string }): BooleanSetting => ({
+  kind: "boolean",
+  section: "tracking",
+  requires: "filtering.https",
+  default: d.preset === "standard",
   ...d,
 });
 
@@ -370,6 +398,62 @@ export const REGISTRY = {
     of: { type: "enum", options: ["on", "off"] },
     noun: "list",
   } satisfies MapSetting<string>,
+  // The person's own lists, sent whole as the policy's `custom_lists`. A list by
+  // address is downloaded and judged by the engine; one from a file is kept by it.
+  "filters.custom": {
+    kind: "list",
+    section: "filters",
+    label: "Your own lists",
+    help: "Filter lists you added by their address or from a file, under Filters. The engine downloads the ones by address, keeps the ones from files, and applies those that are on, without the trusted scriptlets the built-in lists may use.",
+    default: [] as readonly CustomList[],
+    of: { type: "customList" },
+  } satisfies ListSetting<CustomList>,
+  // Keys are the names in the policy's `tracking` (sieve_ipc::TRACKING_NAMES).
+  "tracking.gpc": trackingOption({
+    label: "Ask sites not to track you",
+    help: "Sends the Global Privacy Control and Do Not Track signals with every request, which sites that honour them treat as a no to selling or sharing what you do.",
+    preset: "standard",
+  }),
+  "tracking.searchQueries": trackingOption({
+    label: "Hide your searches from the sites you open",
+    help: "When you open a search result, that site is not told what you searched for.",
+    preset: "standard",
+  }),
+  "tracking.clientData": trackingOption({
+    label: "Remove Chrome's tracking header",
+    help: "Takes out the X-Client-Data header Chrome adds to requests to Google's sites, which can tell your browser apart from others.",
+    preset: "standard",
+  }),
+  "tracking.referrer": trackingOption({
+    label: "Hide which page you came from",
+    help: "Other sites are not told which page sent you to them.",
+    preset: "strict",
+    breaks: "Some downloads, payment pages and sign-ins check where you came from and may refuse to load.",
+  }),
+  "tracking.thirdPartyCookies": trackingOption({
+    label: "Expire other sites' cookies after an hour",
+    help: "Cookies from sites other than the one you are on are deleted after an hour, so they cannot follow you for long.",
+    preset: "strict",
+    breaks: "Comments, video players and sign-in buttons from other sites may ask you to sign in again.",
+  }),
+  "tracking.webRtc": trackingOption({
+    label: "Block WebRTC",
+    help: "Stops pages finding your real network address through WebRTC, even behind a VPN.",
+    preset: null,
+    breaks: "Video calls, voice chat and screen sharing in the browser stop working.",
+  }),
+  "tracking.push": trackingOption({
+    label: "Block push notifications",
+    help: "Sites cannot send you notifications through the browser.",
+    preset: null,
+    breaks: "Notifications from sites you chose to hear from stop too, such as web mail and chat.",
+  }),
+  "tracking.location": trackingOption({
+    label: "Block location requests",
+    help: "Sites cannot ask the browser where you are.",
+    preset: null,
+    breaks: "Maps, delivery and weather sites cannot find where you are.",
+  }),
   "password.idleMinutes": {
     kind: "number",
     section: "password",

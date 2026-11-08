@@ -16,7 +16,7 @@ All of these must be true, or a run says nothing:
 The script prints the list ids an arm needs. Give them to `engine-content.ps1`, which puts them in `policy.json` with the app closed. Then wait until `status.json` shows those lists under `filter.lists`, since a list with no downloaded copy is not held: the script reads that before the first video and after the last, and if it differs from the arm at either end, or the file cannot be read, the run is inconclusive.
 
 ```
-powershell -ExecutionPolicy Bypass -File scripts\live\engine-content.ps1 -Step on -Lists adguard-base,adguard-tracking,adguard-url-tracking,adguard-dns
+powershell -ExecutionPolicy Bypass -File scripts\live\engine-content.ps1 -Step on -Lists adguard-base,adguard-tracking,adguard-url-tracking,adguard-dns,ubo-badware
 powershell -NoProfile -File <tools>\procs\with-gpu.ps1 -Label sieve-youtube -- node scripts\live\youtube.mjs --browser chrome --arm adguard --out C:\Users\Public\sieve-engine-live\youtube
 ```
 

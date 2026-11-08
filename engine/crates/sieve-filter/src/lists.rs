@@ -79,12 +79,19 @@ pub enum Applied {
 
 /// Why a 200 is not a list, or None when it is one.
 fn refuse_body(response: &FetchResponse) -> Result<&str, String> {
-    if response.body.len() > MAX_LIST_BYTES {
-        return Err(format!("{} bytes is over the {MAX_LIST_BYTES} byte limit", response.body.len()));
-    }
-    let text = std::str::from_utf8(&response.body).map_err(|e| format!("not UTF-8: {e}"))?;
-    let text = text.strip_prefix(BOM).unwrap_or(text);
     let declared_html = response.content_type.as_deref().is_some_and(|t| t.to_ascii_lowercase().starts_with(HTML_TYPE));
+    judge_text(&response.body, MAX_LIST_BYTES, declared_html)
+}
+
+/// The text of `body` when it is a filter list of at most `max` bytes, or why
+/// it is not: the one judge of a download and of a file the user imports. The
+/// words of each refusal are what the app explains (src/core/custom-lists.ts).
+pub fn judge_text(body: &[u8], max: usize, declared_html: bool) -> Result<&str, String> {
+    if body.len() > max {
+        return Err(format!("{} bytes is over the {max} byte limit", body.len()));
+    }
+    let text = std::str::from_utf8(body).map_err(|e| format!("not UTF-8: {e}"))?;
+    let text = text.strip_prefix(BOM).unwrap_or(text);
     let head = text.trim_start().as_bytes();
     if declared_html || HTML_STARTS.iter().any(|start| head.get(..start.len()).is_some_and(|h| h.eq_ignore_ascii_case(start.as_bytes()))) {
         return Err("an HTML page, not a filter list".into());

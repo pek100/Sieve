@@ -13,6 +13,10 @@
 //!   (the engine controller's whole policy) to the engine.
 //! - `engine_lists() -> EngineLists`, `engine_lists_refresh() -> EngineLists`:
 //!   the per-list report; the second also asks for a download of every list.
+//! - `engine_list_refresh(id)`, `engine_list_rules(id, query)`,
+//!   `engine_list_import(id)`: one list downloads now; the rules of one list's
+//!   copy; a list from a file the user picks in a dialog Rust opens (the window
+//!   never names a path), judged and kept by the engine.
 //! - `engine_dns_upstreams() -> DnsUpstreams`, `engine_set_dns_upstreams(list)`:
 //!   the encrypted DNS resolvers the engine holds, read and sent (the engine
 //!   controller keeps them equal to `filtering.upstreams`).
@@ -400,6 +404,14 @@ mod imp {
         }
     }
 
+    /// A list question (`ListRules`, `ListImport`): the engine's answer, or its refusal.
+    pub async fn list_answer(name: &str, msg: ClientMessage) -> Result<EngineMessage, String> {
+        match ask(name, msg).await? {
+            EngineMessage::Error { message } => Err(message),
+            other => Ok(other),
+        }
+    }
+
     /// The notices newer than `after`, of this client's session.
     pub async fn heal_notices(name: &str, after: u64) -> Result<HealNotices, String> {
         match ask(name, ClientMessage::HealNotices { after }).await? {
@@ -444,7 +456,7 @@ mod imp {
             match read_frame::<_, EngineMessage>(&mut pipe).await {
                 Ok(EngineMessage::Flows { flows: batch }) => flows.apply(batch),
                 Ok(EngineMessage::Log { rows }) => log.push(rows),
-                Ok(EngineMessage::Welcome { .. } | EngineMessage::Incompatible { .. } | EngineMessage::Status(_) | EngineMessage::Error { .. } | EngineMessage::Lists { .. } | EngineMessage::DnsUpstreams(_) | EngineMessage::CertStatus(_) | EngineMessage::Exclusions { .. } | EngineMessage::HealNotices { .. }) => {}
+                Ok(EngineMessage::Welcome { .. } | EngineMessage::Incompatible { .. } | EngineMessage::Status(_) | EngineMessage::Error { .. } | EngineMessage::Lists { .. } | EngineMessage::DnsUpstreams(_) | EngineMessage::CertStatus(_) | EngineMessage::Exclusions { .. } | EngineMessage::HealNotices { .. } | EngineMessage::ListImported { .. } | EngineMessage::ListRules { .. }) => {}
                 Err(sieve_ipc::FrameError::Closed) => break Ok(()),
                 Err(e) => break Err(e.to_string()),
             }
@@ -534,6 +546,78 @@ pub async fn engine_lists() -> Result<EngineLists, String> {
 #[cfg(not(windows))]
 #[tauri::command]
 pub async fn engine_lists_refresh() -> Result<EngineLists, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// What `engine_list_rules` answers: the first rules of one list that hold the search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListRules {
+    pub id: String,
+    pub lines: Vec<String>,
+    pub matched: u64,
+    pub total: u64,
+}
+
+/// What `engine_list_import` answers once the engine kept the file's list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListImported {
+    /// The file's name without its extension, the list's name until the user gives another.
+    pub name: String,
+    pub rules: u64,
+    pub skipped: u64,
+}
+
+/// Command: one list downloads now (a catalogue row or one of the user's own by address).
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_list_refresh(id: String) -> Result<EngineLists, String> {
+    imp::lists(PIPE_NAME, sieve_ipc::ClientMessage::ListRefresh { id }).await
+}
+
+/// Command: the rules of one list's copy that hold `query`.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_list_rules(id: String, query: String) -> Result<ListRules, String> {
+    match imp::list_answer(PIPE_NAME, sieve_ipc::ClientMessage::ListRules { id, query }).await? {
+        sieve_ipc::EngineMessage::ListRules { id, lines, matched, total } => Ok(ListRules { id, lines, matched, total }),
+        other => Err(format!("unexpected answer: {other:?}")),
+    }
+}
+
+/// Command: the user picks a filter list file here, in Rust, so the window never
+/// names a path; its text goes to the engine, which judges and keeps it as
+/// `id`. None when the user closed the picker.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_list_import(app: tauri::AppHandle, id: String) -> Result<Option<ListImported>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = tauri::async_runtime::spawn_blocking(move || app.dialog().file().set_title("Import a filter list").add_filter("Filter list", &["txt"]).blocking_pick_file())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(picked) = picked else { return Ok(None) };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let (name, text) = crate::filters::read_import(&path)?;
+    match imp::list_answer(PIPE_NAME, sieve_ipc::ClientMessage::ListImport { id, text }).await? {
+        sieve_ipc::EngineMessage::ListImported { rules, skipped, .. } => Ok(Some(ListImported { name, rules, skipped })),
+        other => Err(format!("unexpected answer: {other:?}")),
+    }
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_list_refresh(_id: String) -> Result<EngineLists, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_list_rules(_id: String, _query: String) -> Result<ListRules, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_list_import(_id: String) -> Result<Option<ListImported>, String> {
     Err("the engine runs on Windows only".into())
 }
 

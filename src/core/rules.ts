@@ -148,3 +148,33 @@ export const ALLOWLIST_TEXT =
   "Connections to these sites go through even when a list or rule would block them, unless that rule is marked $important. What their pages load from other sites is still filtered.";
 /** The rule "Block a site" writes. */
 export const blockRule = (host: string) => `||${host}^`;
+
+/** The one-rule form: a site, block or allow, its subdomains or not, a note. */
+export interface RuleForm {
+  host: string;
+  action: "block" | "allow";
+  subdomains: boolean;
+  comment: string;
+}
+
+/**
+ * The lines the form stands for: an optional `!` note, then the rule. With
+ * subdomains, `||host^` (the host and every name under it); without, one
+ * left-anchored rule per scheme, which a subdomain's address cannot start with.
+ * An allow rule is the same with `@@`. The fixture's `form` table, read by Rust
+ * `filters::tests` with a real RuleEngine, holds what each one decides.
+ */
+export function formRules(form: RuleForm): string[] {
+  const mark = form.action === "allow" ? "@@" : "";
+  const rules = form.subdomains ? [`${mark}||${form.host}^`] : ["https", "http"].map((scheme) => `${mark}|${scheme}://${form.host}^`);
+  const note = form.comment.replace(/\s+/g, " ").trim();
+  return note === "" ? rules : [`! ${note}`, ...rules];
+}
+
+/** The text with the form's lines added at its end, a rule already there not twice. */
+export function withFormRules(text: string, form: RuleForm): string {
+  const have = new Set(text.split(/\r?\n/).map((l) => l.trim()));
+  const added = formRules(form).filter((l) => l.startsWith("!") || !have.has(l));
+  if (added.every((l) => l.startsWith("!"))) return text;
+  return text.trim() === "" ? added.join("\n") : `${text.replace(/\s+$/, "")}\n${added.join("\n")}`;
+}

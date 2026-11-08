@@ -66,6 +66,23 @@ impl Cache {
         std::fs::create_dir_all(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
         write_atomic(&self.state_path(id), &serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?)
     }
+
+    /// Forgets a list: its copy and its state. Absent files are no error.
+    pub fn remove(&self, id: &str) {
+        for path in [self.text_path(id), self.state_path(id)] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// The ids of the copies on disk whose id starts with `prefix`.
+    pub fn ids_with_prefix(&self, prefix: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else { return Vec::new() };
+        entries
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter_map(|name| name.strip_suffix(".txt").map(str::to_string))
+            .filter(|id| id.starts_with(prefix))
+            .collect()
+    }
 }
 
 #[cfg(test)]

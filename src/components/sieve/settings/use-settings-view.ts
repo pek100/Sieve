@@ -5,7 +5,7 @@ import { engineInForce, engineLockReason } from "@/core/engine";
 import { isShut, type LockPhase } from "@/core/lock";
 import { ROUTES, type RouteDef } from "@/core/routes";
 import { readValue, type SettingsDoc } from "@/core/settings/document";
-import { REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, needsEngine, settingDef, type Section, type SettingKey } from "@/core/settings/registry";
+import { REGISTRY, SECTIONS, SETTING_KEYS, isAvailable, isSettingKey, needsEngine, settingDef, type Section, type SettingKey } from "@/core/settings/registry";
 import { planImport, resetPlan, searchSettings, type ImportPlan } from "@/core/settings/transfer";
 import { useRuntime } from "@/hooks/sieve-provider";
 import { useHydrated } from "@/hooks/use-hydrated";
@@ -21,8 +21,11 @@ export type Lock =
    */
   | { kind: "password"; phase: LockPhase; beneath: Lock | null }
   | { kind: "desktop" }
-  /** `checking`: the switch it needs is on but its live check has not passed (yet). */
-  | { kind: "requires"; label: string; checking: boolean }
+  /**
+   * `checking`: the switch it needs is on but its live check has not passed (yet).
+   * `unavailable`: the switch it needs is not offered in this build, so nothing here can turn it on.
+   */
+  | { kind: "requires"; label: string; checking: boolean; unavailable?: boolean }
   /**
    * The engine carries it out (registry `needsEngine`) and cannot take a
    * policy now. `reason` is one line from the engine's phase; `inForce` is
@@ -94,7 +97,7 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
       }
       if (d.requires) {
         const label = isSettingKey(d.requires) ? REGISTRY[d.requires].label : d.requires;
-        if (!switchOn(d.requires)) return { kind: "requires", label, checking: false };
+        if (!switchOn(d.requires)) return { kind: "requires", label, checking: false, unavailable: isSettingKey(d.requires) && !isAvailable(d.requires) };
         // A data switch is proven by its live check; what builds on it waits for that.
         if (isSettingKey(d.requires) && settingDef(d.requires).kind === "dataSwitch" && !passed(d.requires)) {
           return { kind: "requires", label, checking: true };

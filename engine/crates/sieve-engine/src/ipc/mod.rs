@@ -49,6 +49,12 @@ pub trait Backend: Send + Sync + 'static {
     fn lists(&self) -> (Vec<ListStatus>, Option<u64>);
     /// Downloads every selected list at the next chance, whatever its age.
     fn lists_refresh(&self);
+    /// Downloads one list at the next chance; refused for an unknown id or a list from a file.
+    fn list_refresh(&self, id: &str) -> Result<(), String>;
+    /// Judges and keeps a list from a file: how many rules it holds and skipped.
+    fn list_import(&self, id: &str, text: &str) -> Result<(u64, u64), String>;
+    /// The rules of a list's copy that hold query: the first ones, matched, total.
+    fn list_rules(&self, id: &str, query: &str) -> Result<(Vec<String>, u64, u64), String>;
     /// The root certificate's status.
     fn cert_status(&self) -> CertStatus;
     /// Asks for a new root (refused unless `policy.https` is on) and answers
@@ -172,6 +178,18 @@ where
                     backend.try_decrypt_again(retry);
                     exclusions_page(&backend.exclusions(), 0)?
                 }
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::ListRefresh { id }) => match backend.list_refresh(&id) {
+                Ok(()) => lists_answer(backend),
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::ListImport { id, text }) => match backend.list_import(&id, &text) {
+                Ok((rules, skipped)) => EngineMessage::ListImported { id, rules, skipped },
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::ListRules { id, query }) => match backend.list_rules(&id, &query) {
+                Ok((lines, matched, total)) => EngineMessage::ListRules { id, lines, matched, total },
                 Err(message) => EngineMessage::Error { message },
             },
             Ok(ClientMessage::HealNotices { after }) => {
@@ -353,6 +371,19 @@ mod tests {
         }
         fn lists_refresh(&self) {
             *self.refreshes.lock().unwrap() += 1;
+        }
+        fn list_refresh(&self, id: &str) -> Result<(), String> {
+            if id != "adguard-dns" {
+                return Err("unknown".into());
+            }
+            *self.refreshes.lock().unwrap() += 10;
+            Ok(())
+        }
+        fn list_import(&self, id: &str, text: &str) -> Result<(u64, u64), String> {
+            if text.is_empty() { Err(format!("{id}: empty")) } else { Ok((2, 1)) }
+        }
+        fn list_rules(&self, _id: &str, query: &str) -> Result<(Vec<String>, u64, u64), String> {
+            Ok((vec![format!("||{query}^")], 1, 9))
         }
         fn cert_status(&self) -> CertStatus {
             CertStatus { thumbprint: Some("abc".into()), ..CertStatus::default() }
@@ -557,6 +588,24 @@ mod tests {
         assert!(matches!(recv(&mut c).await, EngineMessage::Lists { lists, compile_ms: Some(5) } if lists[0].network == 0));
         send(&mut c, &ClientMessage::ListsRefresh).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Lists { lists, .. } if lists[0].network == 1));
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_list_refresh_an_import_and_a_rules_search_are_answered_and_a_refusal_ends_nothing() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = welcomed(fake.clone(), 1).await;
+        send(&mut c, &ClientMessage::ListRefresh { id: "adguard-dns".into() }).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Lists { lists, .. } if lists[0].network == 10));
+        send(&mut c, &ClientMessage::ListRefresh { id: "nope".into() }).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Error { .. }));
+        send(&mut c, &ClientMessage::ListImport { id: "custom-b2".into(), text: String::new() }).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Error { message } if message.contains("empty")));
+        send(&mut c, &ClientMessage::ListImport { id: "custom-b2".into(), text: "||a^".into() }).await;
+        assert_eq!(recv(&mut c).await, EngineMessage::ListImported { id: "custom-b2".into(), rules: 2, skipped: 1 });
+        send(&mut c, &ClientMessage::ListRules { id: "adguard-dns".into(), query: "ads".into() }).await;
+        assert_eq!(recv(&mut c).await, EngineMessage::ListRules { id: "adguard-dns".into(), lines: vec!["||ads^".into()], matched: 1, total: 9 });
         drop(c);
         task.await.unwrap().unwrap();
     }

@@ -201,7 +201,8 @@ fn options(trusted: bool) -> ParseOptions {
     ParseOptions { permissions, ..ParseOptions::default() }
 }
 
-fn rule_lines(text: &str) -> impl Iterator<Item = &str> {
+/// A list's lines that are rules: not blank, not a comment or the header.
+pub fn rule_lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines().map(str::trim).filter(|l| !l.is_empty() && !is_comment(l))
 }
 
