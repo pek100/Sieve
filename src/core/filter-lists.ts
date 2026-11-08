@@ -85,11 +85,11 @@ export const PROFILE_ORDER: readonly Profile[] = ["balanced", "strict", "minimal
 /**
  * The lists a profile decides: every selectable one but the language lists,
  * which say which sites, not how strict, and so stay as the person set them
- * whatever profile is picked.
+ * whatever profile is picked, and a row from an older build that names no level.
  */
-export const inProfileScope = (list: FilterList) => !isGated(list) && list.kind !== "language";
+export const inProfileScope = (list: FilterList) => !isGated(list) && list.kind !== "language" && list.level !== null;
 
-const profileLevel = (level: ListLevel): Profile | null => ((PROFILES as readonly string[]).includes(level) ? (level as Profile) : null);
+const profileLevel = (level: ListLevel | null): Profile | null => (level !== null && (PROFILES as readonly string[]).includes(level) ? (level as Profile) : null);
 
 /** The profile the selection is at, or Custom. */
 export function listProfile(lists: readonly FilterList[], selection: ListSelection): Profile | typeof CUSTOM {
@@ -122,8 +122,8 @@ export function countText(report: FilterReport | null): string {
   return `${report.applied.toLocaleString("en-US")} applied, ${report.skipped.toLocaleString("en-US")} skipped`;
 }
 
-/** No list has counts yet: nothing here is in force. */
-export const nothingLoaded = (lists: readonly FilterList[]) => lists.every((l) => l.report === null);
+/** No list has counts yet, catalogue or own: nothing here is in force. */
+export const nothingLoaded = (lists: readonly { report: FilterReport | null }[]) => lists.every((l) => l.report === null);
 
 /**
  * The catalogue ids SetPolicy names for a selection the user changed: the one

@@ -6,13 +6,18 @@
  *
  * Every option acts on decrypted traffic and requires the HTTPS switch. The
  * policy carries only those in force (`trackingInForce`): an option stored on
- * while that switch is off or unavailable is a wish, kept, never sent.
+ * while that switch is off or unavailable is a wish, kept, never sent. Until the
+ * engine carries them out the options themselves are unavailable (registry
+ * `trackingOption`): none is in force, whatever its default, and no screen shows them.
  */
 import { CUSTOM, inPreset, presetOf } from "./profiles";
-import { SETTING_KEYS, TRACKING_LEVELS, settingDef, type SettingKey, type TrackingLevel } from "./settings/registry";
+import { SETTING_KEYS, TRACKING_LEVELS, isAvailable, settingDef, type SettingKey, type TrackingLevel } from "./settings/registry";
 
 /** The options, in registry order. */
 export const TRACKING_KEYS: readonly SettingKey[] = SETTING_KEYS.filter((k) => settingDef(k).section === "tracking");
+
+/** Tracking protection is offered at all: its options share one availability (registry `trackingOption`). */
+export const trackingOffered = () => TRACKING_KEYS.every(isAvailable);
 
 /** What a person gets who changes nothing: the options' defaults. */
 export const RECOMMENDED_TRACKING: TrackingLevel = "standard";
@@ -39,10 +44,10 @@ export function trackingValues(level: TrackingLevel): Record<string, boolean> {
   return Object.fromEntries(TRACKING_KEYS.map((k) => [k, inPreset(TRACKING_LEVELS, level, settingDef(k).preset ?? null)]));
 }
 
-/** The options the policy carries: on, and with the switch each requires on. `read` gives the value in force. */
+/** The options the policy carries: available, on, and with the switch each requires on. `read` gives the value in force. */
 export function trackingInForce(read: (key: SettingKey) => unknown): string[] {
   return TRACKING_KEYS.filter((k) => {
     const needs = settingDef(k).requires as SettingKey | undefined;
-    return read(k) === true && (needs === undefined || read(needs) === true);
+    return isAvailable(k) && read(k) === true && (needs === undefined || read(needs) === true);
   }).map(trackingName);
 }

@@ -9,7 +9,7 @@
  * No switch may write persistent system network state (DNS servers, routes,
  * proxy settings, firewall rules): Sieve off means a normal network.
  */
-import { isCustomList, type CustomList } from "../custom-lists";
+import { customListsFit, isCustomList, type CustomList } from "../custom-lists";
 import { APP_STATES, type AppState } from "../policy";
 import { ALLOWLIST_TEXT, checkRuleLine, normalizeDomain } from "../rules";
 import { parseUpstream } from "../upstream";
@@ -201,6 +201,8 @@ export type SettingDef =
 const ENGINE_SLICE_6 = "engine slice 6 (docs/plans/2026-10-17-https-filtering.md)";
 /** The plan step whose live check opens rewriting pages to the user. */
 const ENGINE_SLICE_9 = "engine slice 9 (docs/plans/2026-10-17-https-filtering.md)";
+/** The engine holds `Policy.tracking` but acts on none of it; implementing the protections is the work that unlocks them. */
+const ENGINE_TRACKING = "the engine carrying out each tracking protection (docs/plans/2026-10-17-parity.md, rows 26 to 28)";
 
 const enumSetting = <const O extends string>(d: Omit<EnumSetting<O>, "kind">): EnumSetting<O> => ({
   kind: "enum",
@@ -209,16 +211,21 @@ const enumSetting = <const O extends string>(d: Omit<EnumSetting<O>, "kind">): E
 
 /**
  * One tracking protection (plan rows 26 to 30). Each acts on decrypted requests
- * and pages, so each requires the HTTPS switch and is locked, with that reason,
- * while it is off or unavailable; the engine controller sends only those in
- * force. Its default is derived from its level: on exactly at Standard, the
- * recommended one, so the defaults are Standard (core/tracking).
+ * and pages, so each requires the HTTPS switch; the engine controller sends only
+ * those in force. Its default is derived from its level: on exactly at Standard,
+ * the recommended one, so the defaults are Standard (core/tracking).
+ *
+ * Unavailable until the engine carries them out: a default that is on would
+ * otherwise read as a protection in force the moment HTTPS ships, while the
+ * engine does nothing with it. Unavailable, none is shown, searched, imported or
+ * sent, and a stored wish is kept unread.
  */
 const trackingOption = (d: { label: string; help: string; preset: TrackingLevel | null; breaks?: string }): BooleanSetting => ({
   kind: "boolean",
   section: "tracking",
   requires: "filtering.https",
   default: d.preset === "standard",
+  unavailableUntil: ENGINE_TRACKING,
   ...d,
 });
 
@@ -511,8 +518,8 @@ export function isSettingKey(key: string): key is SettingKey {
 /**
  * Can the user see and change this setting in this build? The one place the
  * answer comes from: the settings document, export, import, search and the
- * Settings view all ask it. `filtering.https` and `filtering.content` are the
- * unavailable ones today (law 11).
+ * Settings view all ask it. `filtering.https`, `filtering.content` and the
+ * tracking protections are the unavailable ones today (law 11).
  */
 export function isAvailable(key: SettingKey): boolean {
   return settingDef(key).unavailableUntil === undefined;
@@ -545,6 +552,8 @@ export function isValidValue(key: SettingKey, value: unknown): boolean {
     case "list":
       // The engine refuses an empty resolver list: an empty list never means plain DNS, so it means nothing.
       if (def.of.type === "upstream" && Array.isArray(value) && value.length === 0) return false;
-      return Array.isArray(value) && value.every((v) => isValidElement(def.of, v));
+      if (!Array.isArray(value) || !value.every((v) => isValidElement(def.of, v))) return false;
+      // The engine refuses a policy with too many own lists or an id twice, and with it every later change.
+      return def.of.type !== "customList" || customListsFit(value as CustomList[]);
   }
 }

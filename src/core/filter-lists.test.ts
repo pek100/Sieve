@@ -94,7 +94,7 @@ describe("profiles", () => {
   it.each(PROFILES)("%s maps to exactly its lists: every list at its level or milder on, the rest of the scope off", (profile) => {
     const selection = withProfile({}, lists, profile);
     expect(listProfile(lists, selection)).toBe(profile);
-    const rank = (l: string) => PROFILES.indexOf(l as (typeof PROFILES)[number]);
+    const rank = (l: string | null) => PROFILES.indexOf(l as (typeof PROFILES)[number]);
     const want = scope.filter((l) => rank(l.level) >= 0 && rank(l.level) <= rank(profile)).map((l) => l.id);
     expect(onIds(selection)).toEqual(want);
   });
@@ -135,11 +135,14 @@ describe("profiles", () => {
     expect(back).toEqual({ [german.id]: "on" });
   });
 
-  it("a catalogue from an older build, with no levels, is all outside every profile but off", () => {
+  it("a row from an older build, with no level, is outside every profile: it never makes one Custom and no profile turns it off", () => {
     const old = parseFilterCatalogue({ v: 1, lists: [{ id: "a", title: "A", url: "", licence: "", default: "on", trusted: true, report: null }] }).lists;
-    expect(old[0]).toMatchObject({ kind: "ads", level: "optional", description: "", languages: [] });
-    expect(listProfile(old, {}), "on, but no level turns it on").toBe(CUSTOM);
-    expect(listProfile(old, { a: "off" })).toBe("minimal");
+    expect(old[0]).toMatchObject({ kind: "ads", level: null, description: "", languages: [] });
+    expect(inProfileScope(old[0])).toBe(false);
+    const mixed = [...lists, ...old];
+    expect(listProfile(mixed, {}), "on by default, and Balanced still").toBe("balanced");
+    expect(listProfile(mixed, { a: "off" })).toBe("balanced");
+    for (const profile of PROFILES) expect(withProfile({}, mixed, profile), profile).not.toHaveProperty("a");
   });
 });
 

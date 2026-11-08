@@ -1,6 +1,13 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+/** The tracking options are unavailable in this build; `offer.tracking` makes them available, as a later build will. */
+const offer = vi.hoisted(() => ({ tracking: false }));
+vi.mock("@/core/settings/registry", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/core/settings/registry")>();
+  return { ...real, isAvailable: (k: string) => (k.startsWith("tracking.") ? offer.tracking : real.isAvailable(k as never)) };
+});
 import { NoticeToaster } from "@/components/sieve/shell/notice-toaster";
 import { MAX_POLICY_BYTES } from "@/core/settings/registry";
 import fixture from "@/data/fixtures/filter-lists-v1.json";
@@ -124,6 +131,16 @@ describe("what the screen says is in force", () => {
     await setup("pending", undefined, createMockEngine("error"));
     await settled();
     expect(pending()).toBeNull();
+  });
+
+  it("an own list the engine applies is a list in force: nothing claims otherwise", async () => {
+    const idle = createMockEngine("idle");
+    const empty = await idle.lists();
+    const mine = { ...empty.lists[0], id: "custom-a1", enabled: true, network: 7, cosmetic: 0, skipped: 0 };
+    const own = [{ id: "custom-a1", title: "Mine", url: "https://lists.example/a.txt", enabled: true }];
+    await setup("pending", { schema: 5, values: { "filters.custom": own } }, { ...idle, lists: async () => ({ ...empty, lists: [mine] }) });
+    await settled();
+    expect(pending(), "only an own list is loaded, and it is in force").toBeNull();
   });
 
   it("an engine that answers with no list applied, and no engine at all, do say it", async () => {
@@ -581,7 +598,28 @@ describe("your own lists", () => {
   });
 });
 
-describe("tracking protection", () => {
+describe("tracking protection, while the engine does not carry it out", () => {
+  it("is not shown, so nothing claims a protection in force, and a stored wish is never sent", async () => {
+    const sent: EnginePolicy[] = [];
+    const mock = createMockEngine("idle");
+    await setup("pending", { schema: 5, values: { "filtering.engine": true, "tracking.webRtc": true } }, { ...mock, setPolicy: (p) => (sent.push(p), mock.setPolicy(p)) });
+    await settled();
+    expect(document.querySelector("[data-tracking]")).toBeNull();
+    expect(screen.queryByText("Ask sites not to track you")).toBeNull();
+    expect(sent.length).toBeGreaterThan(0);
+    for (const p of sent) expect(p.tracking ?? []).toEqual([]);
+  });
+});
+
+/** The block itself, as the build that offers the options will show it. */
+describe("tracking protection, once offered", () => {
+  beforeEach(() => {
+    offer.tracking = true;
+  });
+  afterEach(() => {
+    offer.tracking = false;
+  });
+
   it("is at Standard, the recommended level, every option locked with the reason once, and nothing can change it", async () => {
     await setup();
     const block = document.querySelector<HTMLElement>("[data-tracking]")!;
