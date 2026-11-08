@@ -20,6 +20,12 @@ use crate::policy::write_atomic;
 
 pub const FILE: &str = "exclusions.json";
 const VERSION: u32 = 1;
+/// The evidence rule of `heal::score` that this engine writes `auto:pinning`
+/// entries by. An entry of an older rule is dropped at load: that rule took what
+/// is now no evidence for a rejection, so its entries cannot be believed. Raise it
+/// whenever that rule starts excluding on less. 0 is a file from before rules
+/// were recorded, whose rule excluded browsers' unused preconnects (2026-11-08).
+pub const PINNING_RULE: u32 = 1;
 /// Entries kept per reason. A budget for each, so a flood of one reason cannot
 /// push out the others. An evicted entry costs one more upstream handshake at
 /// that host's next visit, which writes it again, so this is a memory and disk
@@ -49,12 +55,21 @@ pub struct AutoEntry {
     /// [`cap`], so the file stays bounded; an evicted one just loses its history.
     #[serde(default)]
     pub retrying: bool,
+    /// The [`PINNING_RULE`] it was written by; defaulted to 0, so a file without it
+    /// loads, and a rolled-back engine reads it too (S39). Read for `auto:pinning` only.
+    #[serde(default)]
+    pub rule: u32,
 }
 
 impl AutoEntry {
     /// An entry for exactly this host and every app.
     pub fn host(host: &str, reason: AutoReason, created_ms: u64, expires_ms: Option<u64>) -> Self {
-        Self { pattern: Pattern::Exact(host.to_ascii_lowercase()), app: None, reason, created_ms, expires_ms, retries: 0, retrying: false }
+        Self { pattern: Pattern::Exact(host.to_ascii_lowercase()), app: None, reason, created_ms, expires_ms, retries: 0, retrying: false, rule: PINNING_RULE }
+    }
+
+    /// Written by an evidence rule this engine no longer believes.
+    fn outdated(&self) -> bool {
+        self.reason == AutoReason::Pinning && self.rule < PINNING_RULE
     }
 
     /// An entry for exactly this host and one app.
@@ -121,6 +136,8 @@ pub fn load(engine_dir: &Path) -> Result<Vec<AutoEntry>, String> {
         return Err(format!("{FILE}: version {} is not {VERSION}", file.v));
     }
     let mut entries = file.entries;
+    // Gone from the file at the store's next write; until then each load drops them again.
+    entries.retain(|e| !e.outdated());
     cap(&mut entries);
     Ok(entries)
 }
@@ -368,14 +385,31 @@ mod tests {
         assert_eq!(load(dir.path()).unwrap().len(), MAX_PER_REASON);
     }
 
-    /// S39: both ways, so a rollback of the engine reads a new file too.
+    /// S39: both ways, so a rollback of the engine reads a new file too. Changed
+    /// 2026-11-08: this file's entry was `pinning`, which a file with no rule now
+    /// drops (the next test); `client-cert` is kept whatever its rule.
     #[test]
     fn a_file_without_the_new_fields_loads() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(path(dir.path()), r#"{"v":1,"entries":[{"pattern":{"Exact":"a.example"},"app":null,"reason":"pinning","created_ms":5,"expires_ms":null}]}"#).unwrap();
+        std::fs::write(path(dir.path()), r#"{"v":1,"entries":[{"pattern":{"Exact":"a.example"},"app":null,"reason":"client-cert","created_ms":5,"expires_ms":null}]}"#).unwrap();
         let loaded = load(dir.path()).unwrap();
-        assert_eq!(loaded, [AutoEntry::host("a.example", AutoReason::Pinning, 5, None)]);
+        assert_eq!(loaded, [AutoEntry { rule: 0, ..AutoEntry::host("a.example", AutoReason::ClientCert, 5, None) }]);
         assert_eq!((loaded[0].retries, loaded[0].retrying), (0, false));
+    }
+
+    #[test]
+    fn pinning_entries_of_an_older_rule_are_dropped_at_load_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = |host: &str, reason| AutoEntry { rule: PINNING_RULE - 1, ..AutoEntry::for_app(host, "msedge.exe", reason, NOW) };
+        let current = AutoEntry::for_app("pinned.example", "client.exe", AutoReason::Pinning, NOW);
+        let kept = [old("cert.example", AutoReason::ClientCert), old("ev.example", AutoReason::Ev), current.clone()];
+        let mut all = vec![old("search.example", AutoReason::Pinning), AutoEntry { retrying: true, ..old("cdn.example", AutoReason::Pinning) }];
+        all.extend(kept.iter().cloned());
+        save(dir.path(), &all).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), kept, "the old rule's pinning entries, held or retrying, are gone");
+        save(dir.path(), &load(dir.path()).unwrap()).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), kept, "and a file this engine wrote keeps its own");
+        assert_eq!(current.rule, PINNING_RULE, "a new entry records the rule");
     }
 
     #[test]

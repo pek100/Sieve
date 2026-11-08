@@ -390,9 +390,9 @@ arms!(h1_and_h2_end_to_end_with_streaming_body_and_trailers, |arm| async move {
     }
 });
 
-/// Live run 2026-11-08: a large video site's 20 KiB response head was over hyper's
-/// 16 KiB h2 default, and every load was the engine's 502. A request head that
-/// large (cookies) must pass the client side the same way.
+// Live run 2026-11-08: a large video site's 20 KiB response head was over hyper's
+// 16 KiB h2 default, and every load was the engine's 502. A request head that
+// large (cookies) must pass the client side the same way.
 arms!(a_head_a_browser_takes_passes_both_ways, |arm| async move {
     for alpn in BOTH {
         let mut s = setup(arm, alpn, "").await;

@@ -118,7 +118,8 @@ pub struct Ended {
     /// that did not parse, which are not silence. What `ClientWatch` may read as
     /// evidence about the client.
     pub client_ended: bool,
-    /// The fatal alert it ended with, when it sent one (plan 4.3's "right after").
+    /// The alert it ended with, when it sent one (plan 4.3's "right after"); the
+    /// watch judges whether it is fatal.
     pub client_alert: Option<AlertDescription>,
 }
 
