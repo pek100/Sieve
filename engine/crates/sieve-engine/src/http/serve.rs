@@ -42,6 +42,12 @@ pub type ResponseBody = UnsyncBoxBody<Bytes, BodyError>;
 /// (`docs/live/engine-slice-6.md`, U10).
 pub const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 pub const H2_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+/// The largest header list either h2 side takes: what Chromium advertises
+/// (`kSpdyMaxHeaderListSize`), so a head a browser takes without Sieve passes with
+/// it. hyper's default is 16 KiB, and www.youtube.com's response head is about
+/// 20 KiB (live run 2026-11-08: every load a 502 from the engine, so Edge showed
+/// ERR_HTTP_RESPONSE_CODE_FAILURE).
+pub const H2_MAX_HEADER_LIST: u32 = 256 * 1024;
 /// After the upstream's end and its last stream, how long the client gets to
 /// finish the close (an h2 GOAWAY needs its PING answered). Streams in flight do
 /// not count against it: they run until the upstream ends them.
@@ -378,6 +384,7 @@ where
             let Ok((sender, connection)) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
                 .initial_stream_window_size(H2_STREAM_WINDOW)
                 .initial_connection_window_size(H2_CONNECTION_WINDOW)
+                .max_header_list_size(H2_MAX_HEADER_LIST)
                 .handshake(upstream)
                 .await
             else {
@@ -385,7 +392,7 @@ where
             };
             let builder = {
                 let mut b = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
-                b.initial_stream_window_size(H2_STREAM_WINDOW).initial_connection_window_size(H2_CONNECTION_WINDOW);
+                b.initial_stream_window_size(H2_STREAM_WINDOW).initial_connection_window_size(H2_CONNECTION_WINDOW).max_header_list_size(H2_MAX_HEADER_LIST);
                 b
             };
             race!(|service| builder.serve_connection(client, service), connection, Upstream::H2(sender))
