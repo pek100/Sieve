@@ -9,6 +9,9 @@ pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicat
 /// Retransmission timeout
 pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The longest a doubled retransmission timeout grows (RFC 6298 2.5 allows 60 s).
+const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Maximum count of retransmissions before dropping the packet
 pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
 
@@ -288,24 +291,36 @@ impl Tcb {
         self.inflight_packets.get(&seq)
     }
 
-    #[must_use]
-    pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> Vec<InflightPacket> {
-        let mut retransmit_list = Vec::new();
+    /// When the earliest unacknowledged segment's retransmission timer runs out.
+    pub(crate) fn next_retransmission_deadline(&self) -> Option<std::time::Instant> {
+        self.inflight_packets.values().map(InflightPacket::deadline).min()
+    }
 
-        self.inflight_packets.retain(|_, packet| {
+    /// The segments whose timer ran out, each timed again with a doubled timeout.
+    /// `None` when one of them was already resent `max_retransmit_count` times: the
+    /// peer is gone and the connection must be reset.
+    ///
+    /// Sieve (2026-11-08): upstream silently dropped such a segment and kept the
+    /// connection, so the peer could never receive those bytes. While the peer's
+    /// window is zero nothing fits, so nothing is resent or counted, only timed again.
+    #[must_use]
+    pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> Option<Vec<InflightPacket>> {
+        let window_closed = self.get_send_window() == 0;
+        let mut retransmit_list = Vec::new();
+        for packet in self.inflight_packets.values_mut().filter(|p| p.is_timed_out()) {
+            if window_closed {
+                packet.back_off();
+                continue;
+            }
             if packet.retransmit_count >= self.max_retransmit_count {
-                log::warn!("Packet with seq {:?} reached max retransmit count, dropping packet", packet.seq);
-                return false; // remove this packet
+                log::warn!("Packet with seq {:?} reached max retransmit count, the connection is lost", packet.seq);
+                return None;
             }
-            if packet.is_timed_out() {
-                packet.retransmit_count += 1;
-                packet.retransmit_timeout *= 2; // increase timeout exponentially
-                packet.send_time = std::time::Instant::now();
-                retransmit_list.push(packet.clone());
-            }
-            true // keep the packet in the inflight_packets
-        });
-        retransmit_list
+            packet.retransmit_count += 1;
+            packet.back_off();
+            retransmit_list.push(packet.clone());
+        }
+        Some(retransmit_list)
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
@@ -348,6 +363,14 @@ impl InflightPacket {
     }
     pub(crate) fn is_timed_out(&self) -> bool {
         self.send_time.elapsed() >= self.retransmit_timeout
+    }
+    fn deadline(&self) -> std::time::Instant {
+        self.send_time + self.retransmit_timeout
+    }
+    /// Times the segment again from now, with the timeout doubled up to [`MAX_RTO`].
+    fn back_off(&mut self) {
+        self.retransmit_timeout = (self.retransmit_timeout * 2).min(MAX_RTO);
+        self.send_time = std::time::Instant::now();
     }
 }
 
@@ -465,34 +488,50 @@ mod tests {
 
     #[test]
     fn test_retransmit_with_exponential_backoff() {
+        let rto = Duration::from_millis(10);
         let mut tcb = Tcb::new(
             SeqNum(1000),
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            rto,
             MAX_RETRANSMIT_COUNT,
         );
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 
+        let sleep_past_deadline = |tcb: &Tcb| {
+            let deadline = tcb.next_retransmission_deadline().unwrap();
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(5));
+        };
         // Simulate retransmission timeouts
         for i in 0..MAX_RETRANSMIT_COUNT {
-            // Simulate a timeout for the first packet
-            let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + std::time::Duration::from_millis(100);
-            println!("timeout: {timeout:?}");
-            std::thread::sleep(timeout);
-
-            let packets = tcb.collect_timed_out_inflight_packets();
+            sleep_past_deadline(&tcb);
+            let packets = tcb.collect_timed_out_inflight_packets().unwrap();
             assert_eq!(packets.len(), 1);
             let packet = &packets[0];
             assert_eq!(packet.retransmit_count, i + 1);
-            assert!(packet.retransmit_timeout > RTO);
+            assert!(packet.retransmit_timeout > rto);
         }
 
-        let packets = tcb.collect_timed_out_inflight_packets();
-        assert!(packets.is_empty());
-        assert!(tcb.inflight_packets.is_empty());
+        assert!(tcb.collect_timed_out_inflight_packets().unwrap().is_empty(), "not due yet");
+        sleep_past_deadline(&tcb);
+        assert!(tcb.collect_timed_out_inflight_packets().is_none(), "out of retransmissions");
     }
+
+    #[test]
+    fn test_closed_window_times_again_without_counting() {
+        let rto = Duration::from_millis(10);
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, rto, MAX_RETRANSMIT_COUNT);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        tcb.update_send_window(0);
+        for _ in 0..=MAX_RETRANSMIT_COUNT {
+            let deadline = tcb.next_retransmission_deadline().unwrap();
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(5));
+            assert!(tcb.collect_timed_out_inflight_packets().unwrap().is_empty());
+        }
+        assert_eq!(tcb.inflight_packets.values().next().unwrap().retransmit_count, 0);
+    }
+
 }

@@ -242,19 +242,21 @@ const WINDOW: u16 = 64_000;
 const BANNER: &[u8] = b"220 ready\r\n";
 
 #[derive(Clone, Copy, Default)]
-struct Flags {
-    syn: bool,
-    psh: bool,
-    ack: Option<u32>,
+pub(super) struct Flags {
+    pub(super) syn: bool,
+    pub(super) psh: bool,
+    pub(super) ack: Option<u32>,
+    /// The receive window the app's stack advertises; [`WINDOW`] when unset.
+    pub(super) window: Option<u16>,
 }
 
-fn segment(local: SocketAddr, remote: SocketAddr, seq: u32, flags: Flags, payload: &[u8]) -> Vec<u8> {
+pub(super) fn segment(local: SocketAddr, remote: SocketAddr, seq: u32, flags: Flags, payload: &[u8]) -> Vec<u8> {
     let ip = match (local, remote) {
         (SocketAddr::V4(l), SocketAddr::V4(r)) => PacketBuilder::ipv4(l.ip().octets(), r.ip().octets(), 64),
         (SocketAddr::V6(l), SocketAddr::V6(r)) => PacketBuilder::ipv6(l.ip().octets(), r.ip().octets(), 64),
         _ => panic!("one family"),
     };
-    let mut tcp = ip.tcp(local.port(), remote.port(), seq, WINDOW);
+    let mut tcp = ip.tcp(local.port(), remote.port(), seq, flags.window.unwrap_or(WINDOW));
     if flags.syn {
         tcp = tcp.syn();
     }

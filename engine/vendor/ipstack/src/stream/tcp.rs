@@ -163,6 +163,9 @@ pub struct IpStackTcpStream {
     tcb: TcbPtr,
     shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    /// Wakes the TCP task when a segment goes in flight with none before it, so it
+    /// arms the retransmission timer.
+    inflight_notify: Arc<tokio::sync::Notify>,
     destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
     timeout: Pin<Box<tokio::time::Sleep>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
@@ -217,6 +220,7 @@ impl IpStackTcpStream {
             tcb: std::sync::Arc::new(std::sync::Mutex::new(tcb.clone())),
             shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
             write_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            inflight_notify: Arc::default(),
             destroy_messenger,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             data_tx,
@@ -283,24 +287,12 @@ impl IpStackTcpStream {
     /// the session times out. Bytes in flight are given up. Later reads see the end
     /// of the stream, later writes fail, and `shutdown` returns at once, sending no FIN.
     pub fn abort(&self) {
-        let nt = self.network_tuple();
         {
             let mut tcb = self.tcb.lock().unwrap();
             if tcb.get_state() == TcpState::Closed {
                 return;
             }
-            if let Err(err) = write_packet_to_device(&self.up_packet_sender, nt, &tcb, None, ACK | RST, None, None) {
-                log::warn!("{nt} [abort] error sending RST/ACK packet: {err}");
-            }
-            // A client that has not seen our unacknowledged bytes expects this sequence,
-            // not the one above, and under RFC 5961 only challenges any other reset.
-            let acked = tcb.get_last_received_ack();
-            if acked != tcb.get_seq()
-                && let Err(err) = write_packet_to_device(&self.up_packet_sender, nt, &tcb, None, ACK | RST, Some(acked), None)
-            {
-                log::warn!("{nt} [abort] error sending RST/ACK packet: {err}");
-            }
-            tcb.change_state(TcpState::Closed);
+            reset_and_close("[abort]", &self.up_packet_sender, self.network_tuple(), &mut tcb);
         }
         self.shutdown.lock().unwrap().ready();
         self.read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
@@ -391,7 +383,11 @@ impl AsyncWrite for IpStackTcpStream {
 
         let sender = &self.up_packet_sender;
         let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
+        let timer_idle = tcb.get_inflight_packets_total_len() == 0;
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
+        if timer_idle {
+            self.inflight_notify.notify_one();
+        }
 
         let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
         log::trace!("{nt} {state:?}: [poll_write] local {{ seq: {seq}, ack: {ack} }} upstream data written to device, len = {payload_len}");
@@ -432,6 +428,46 @@ impl AsyncWrite for IpStackTcpStream {
             }
             Shutdown::Ready => Poll::Ready(Ok(())),
         }
+    }
+}
+
+/// Ends the connection with an ACK|RST at our next sequence and, when the peer has
+/// not acknowledged everything, another at its last ACK: a client that has not seen
+/// our unacknowledged bytes expects that one, and under RFC 5961 only challenges any
+/// other reset.
+fn reset_and_close(hint: &str, sender: &PacketSender, nt: NetworkTuple, tcb: &mut Tcb) {
+    if let Err(err) = write_packet_to_device(sender, nt, tcb, None, ACK | RST, None, None) {
+        log::warn!("{nt} {hint} error sending RST/ACK packet: {err}");
+    }
+    let acked = tcb.get_last_received_ack();
+    if acked != tcb.get_seq()
+        && let Err(err) = write_packet_to_device(sender, nt, tcb, None, ACK | RST, Some(acked), None)
+    {
+        log::warn!("{nt} {hint} error sending RST/ACK packet: {err}");
+    }
+    tcb.change_state(TcpState::Closed);
+}
+
+/// Resends every segment whose retransmission timer ran out, or resets the
+/// connection when one has no retransmission left. False once it is reset.
+fn retransmit_timed_out(sender: &PacketSender, nt: NetworkTuple, tcb: &mut Tcb) -> std::io::Result<bool> {
+    let Some(packets) = tcb.collect_timed_out_inflight_packets() else {
+        reset_and_close("[retransmit]", sender, nt, tcb);
+        return Ok(false);
+    };
+    for packet in packets {
+        let (seq, count) = (packet.seq, packet.retransmit_count);
+        log::debug!("{nt} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}");
+        write_packet_to_device(sender, nt, tcb, None, ACK | PSH, Some(seq), Some(packet.payload))?;
+    }
+    Ok(true)
+}
+
+/// Completes at `deadline`, never without one.
+async fn retransmission_due(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -483,6 +519,7 @@ impl IpStackTcpStream {
         let shutdown = self.shutdown.clone();
         let write_notify = self.write_notify.clone();
         let read_notify = self.read_notify.clone();
+        let inflight_notify = self.inflight_notify.clone();
         let data_tx = self.data_tx.clone();
         let destroy_messenger = self.destroy_messenger.take();
 
@@ -501,6 +538,7 @@ impl IpStackTcpStream {
                 network_tuple,
                 write_notify,
                 read_notify,
+                inflight_notify,
                 data_tx,
                 exit_monitor,
             )
@@ -529,6 +567,7 @@ async fn tcp_main_logic_loop(
     network_tuple: NetworkTuple,
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    inflight_notify: Arc<tokio::sync::Notify>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
@@ -649,11 +688,26 @@ async fn tcp_main_logic_loop(
     loop {
         let exit_notifier = exit_notifier.clone();
 
+        // Sieve (2026-11-08): upstream checked the retransmission timers only when a
+        // packet arrived, so a lost segment or ACK with fewer than three duplicate ACKs
+        // behind it (two segments fill the window at MTU 9000) waited for the peer's
+        // next packet: a browser's keep-alive, 45 s later.
+        let deadline = tcb.lock().unwrap().next_retransmission_deadline();
         let network_packet = tokio::select! {
             _ = exit_monitor.recv() => {
                 log::debug!("{network_tuple} task exited due to exit signal");
                 break;
             }
+            () = retransmission_due(deadline) => {
+                let mut tcb = tcb.lock().unwrap();
+                if tcb.get_state() == TcpState::Closed || !retransmit_timed_out(&up_packet_sender, network_tuple, &mut tcb)? {
+                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    break;
+                }
+                continue;
+            }
+            () = inflight_notify.notified() => continue,
             network_packet = stream_receiver.recv() => network_packet,
         };
 
@@ -692,20 +746,6 @@ async fn tcp_main_logic_loop(
         tcb.update_duplicate_ack_count(incoming_ack);
 
         tcb.update_inflight_packet_queue(incoming_ack);
-
-        for packet in tcb.collect_timed_out_inflight_packets() {
-            let (seq, count) = (packet.seq, packet.retransmit_count);
-            log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
-            write_packet_to_device(
-                &up_packet_sender,
-                network_tuple,
-                &tcb,
-                None,
-                ACK | PSH,
-                Some(seq),
-                Some(packet.payload),
-            )?;
-        }
 
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
 
