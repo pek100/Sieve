@@ -370,7 +370,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
 /// Interception as this engine run wires it (task D1, D2). Nothing here runs
 /// while the slot is empty, and a failure here means every flow takes the relay.
 fn build_interception(engine: &Engine, egress: &Arc<Egress>) -> Result<Interception<Egress>, String> {
-    engine.exclusions.set_browsers(BrowserSet::read(&WindowsRegistry));
+    engine.exclusions.set_browsers(BrowserSet::read(&WindowsRegistry), wall_ms());
     let trust = Arc::new(PlatformTrust::new()?);
     let verifier = Arc::new(Verifier::new(crate::tls::public_roots(), trust, TRUST_TIMEOUT, engine.validation.clone())?);
     let lookup = super::lock(&engine.dns_service).clone().ok_or("the DNS service is not running")?;
@@ -427,7 +427,7 @@ async fn refresh_exclusions(slot: Arc<ExclusionSlot>, fetcher: HttpsFetcher, val
     let mut every = tokio::time::interval(EXCLUSIONS_EVERY);
     loop {
         every.tick().await;
-        slot.set_browsers(BrowserSet::read(&WindowsRegistry));
+        slot.set_browsers(BrowserSet::read(&WindowsRegistry), wall_ms());
         slot.reload_seeds(wall_ms());
         if slot.fetches() {
             slot.refresh(&fetcher, wall_ms()).await;

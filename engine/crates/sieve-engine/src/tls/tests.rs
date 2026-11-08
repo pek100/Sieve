@@ -465,7 +465,7 @@ impl Rig {
         if !opts.skip_ev {
             slot = slot.without_ev_skip();
         }
-        slot.set_browsers(BrowserSet::read(&FakeBrowsers));
+        slot.set_browsers(BrowserSet::read(&FakeBrowsers), wall_ms());
         let policy = Policy { sieving: true, https: true, ..Policy::default() };
         let minted = (ca.clone(), opts.minter);
         let slot = Arc::new(slot);
