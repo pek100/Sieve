@@ -22,12 +22,13 @@ test.describe("settings", () => {
     const rail = page.getByRole("navigation", { name: "Settings sections" });
     // Filtering stays: it carries the engine.
     await expect(rail.getByRole("link")).toHaveText(["Appearance", "Sampling", "Startup", "Apps", "Filtering", "Notifications", "Filter lists", "Password"]);
-    // Eighteen rows: theme, sieving, interval, launch at startup, welcome guide finished, apps turned
-    // off, my apps, the engine's switch, the blocked and allowed domains, the encrypted upstreams, your
-    // rules and the sites not decrypted, desktop notifications, lists changed, user rules, allowlist,
-    // lock again after. There is no Windows DNS row: Sieve never changes Windows DNS.
-    await expect(page.locator("[data-setting]")).toHaveCount(16);
+    // Seventeen rows: theme, sieving, interval, launch at startup, welcome guide finished, apps turned
+    // off, my apps, the engine's switch, the blocked and allowed domains, the encrypted upstreams, DNS
+    // encryption, your rules and the sites not decrypted, desktop notifications, lists changed, lock
+    // again after. There is no Windows DNS row: Sieve never changes Windows DNS.
+    await expect(page.locator("[data-setting]")).toHaveCount(17);
     await expect(row(page, "filtering.engine").getByRole("switch")).not.toBeChecked();
+    await expect(row(page, "filtering.dnsEncryption").getByRole("switch", { name: "Encrypt DNS lookups" }), "encrypted by default").toBeChecked();
     await expect(page.getByText("Upstream DNS servers", { exact: true })).toHaveCount(1);
     expect(await noHorizontalScroll(page)).toBeLessThanOrEqual(0);
 
