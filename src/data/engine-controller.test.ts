@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { createPassedChecks } from "@/core/checks";
-import { CONTENT_SWITCH, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineUpdate } from "@/core/engine";
+import { CONTENT_SWITCH, DNS_ENCRYPTION, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineStatus, engineUpdate } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
 import { MAX_POLICY_BYTES, settingDef, type SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
-import { CRASH_LOOP_BANNER, createEngineController } from "./engine-controller";
+import { CRASH_LOOP_BANNER, DNS_UNREACHABLE_BANNER, createEngineController } from "./engine-controller";
 import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_CERT_ERROR, MOCK_ENGINE_ERROR, MOCK_HTTPS_OFF, type CertScenario, type EngineScenario } from "./engine-mock";
 import type { EngineSource } from "./engine-source";
 import { createMockFilterLists } from "./filter-lists-mock";
@@ -17,7 +17,7 @@ import { createSettingsStore, memoryBackend, type SettingsBackend } from "./sett
 const SWITCH = ENGINE_SWITCH as SettingKey;
 
 /** What the settings' defaults ask of the engine, at a revision and switch. */
-const policy = (revision: number, engine: boolean): EnginePolicy => ({ revision, engine, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false, content: false, user_rules: [], exclusions: [] });
+const policy = (revision: number, engine: boolean): EnginePolicy => ({ revision, engine, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false, content: false, plain_dns: false, user_rules: [], exclusions: [] });
 
 function fakeClock() {
   let now = 0;
@@ -559,6 +559,7 @@ describe("engine controller", () => {
         off_apps: ["firefox"],
         https: false,
         content: false,
+        plain_dns: false,
         lists: null,
         domain_lists: [
           { kind: "block", entries: ["ads.example"], enabled: true },
@@ -1088,6 +1089,46 @@ describe("engine controller", () => {
       s.fake.policies.length = 0;
       await s.fc.advance(ENGINE_POLL_MS);
       expect(s.fake.policies.at(-1)).toMatchObject({ content: false });
+      s.undo();
+    });
+
+    it("DNS encryption: on sends no plain, off is the user's choice and sent as plain_dns, on again takes it back", async () => {
+      const s = setup("idle", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      await s.fc.flush();
+      expect(s.fake.policies.at(-1)?.plain_dns).toBe(false);
+      await s.settings.set(DNS_ENCRYPTION as SettingKey, false);
+      await s.fc.flush();
+      expect(s.fake.policies.at(-1)).toMatchObject({ plain_dns: true, engine: true });
+      expect(engineStatus(s.store.getState().engine)?.policy.plain_dns, "the engine's answer holds it").toBe(true);
+      await s.settings.set(DNS_ENCRYPTION as SettingKey, true);
+      await s.fc.flush();
+      expect(s.fake.policies.at(-1)?.plain_dns).toBe(false);
+      const sent = s.fake.policies.length;
+      await s.fc.advance(ENGINE_POLL_MS * 2);
+      expect(s.fake.policies, "an engine that leaves false out is not told again").toHaveLength(sent);
+      s.undo();
+    });
+
+    it("no encrypted DNS server answering shows one banner that names the switch, and never turns encryption off", async () => {
+      const s = setup("filtering", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      const banners = () => s.notices.list().filter((n) => n.surface === "banner").map((n) => n.text);
+      await s.fc.flush();
+      expect(banners()).toEqual([]);
+      const real = s.fake.source.probe;
+      let unreachable = true;
+      s.fake.source.probe = async () => {
+        const facts = await real();
+        return facts.pipe?.kind === "welcome" ? { ...facts, pipe: { ...facts.pipe, status: { ...facts.pipe.status, dns_unreachable: unreachable } } } : facts;
+      };
+      await s.fc.advance(ENGINE_POLL_MS);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners()).toEqual([DNS_UNREACHABLE_BANNER]);
+      expect(DNS_UNREACHABLE_BANNER).toContain(settingDef(DNS_ENCRYPTION as SettingKey).label);
+      expect(s.settings.get(DNS_ENCRYPTION as SettingKey), "said, never switched").toBe(true);
+      expect(s.fake.policies.every((p) => p.plain_dns === false)).toBe(true);
+      unreachable = false;
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners()).toEqual([]);
       s.undo();
     });
 

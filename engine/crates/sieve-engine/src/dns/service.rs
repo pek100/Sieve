@@ -7,20 +7,27 @@
 //!   the wire, so a name the evidence parser refuses is still checked. A matched
 //!   name whose server fails, or that has none, gets SERVFAIL: the public
 //!   upstream would publish a corporate name.
+//! - [`Mode`] is the user's choice (`Policy::plain_dns`). In [`Mode::Plain`] a query
+//!   that would go encrypted goes in plain text to the server the client addressed
+//!   instead (the one Windows uses for that adapter without Sieve); every other
+//!   rule here holds as it is. Nothing else picks plain: no list, no failure.
 //! - A reverse lookup for a private range goes to a LAN server, or gets NXDOMAIN
 //!   here when there is none. It never reaches the public upstream
 //!   (`upstream::path_of`).
 //! - Firefox's canary ([`CANARY_DOMAIN`]) gets NXDOMAIN here.
-//! - An `ech` parameter comes out of an encrypted answer for a name that may be
-//!   intercepted ([`Service::without_ech`]). The LAN path is never stripped: its
+//! - An `ech` parameter comes out of a public answer, encrypted or on the user's
+//!   plain path, for a name that may be intercepted ([`Service::without_ech`]). The LAN path is never stripped: its
 //!   answers are for addresses that never enter the stack.
 //! - Other opcodes (Windows' dynamic DNS UPDATE carries the host name) are
 //!   answered NOTIMP here and nothing leaves.
-//! - When nothing answers, the client gets SERVFAIL at the deadline. No path
-//!   reaches a plain socket beyond the LAN exchange.
+//! - When nothing answers, the client gets SERVFAIL at the deadline. In
+//!   [`Mode::Encrypted`] no path reaches a plain socket beyond the LAN exchange,
+//!   whatever failed; lookups that every encrypted resolver failed are counted
+//!   ([`Service::unreachable`]) so the app can say so, and never change the mode.
 //! - No answer cache: the DNS Client service caches.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -32,7 +39,7 @@ use tokio::time::Instant;
 use super::ech::{self, Stripped};
 use super::pool::{Context, Pool, UpstreamReport};
 use super::upstream::{self, Health, Path, REQUEST_BUDGET, Upstream};
-use super::{FLAG_OPCODE, FLAG_QR, HttpsRecord, MAX_MESSAGE, NameMap, TYPE_HTTPS, TYPE_SVCB, edns, flags_of, lan, notimp, nxdomain, parse, query_for, reply_answers, reverse, servfail, truncated, udp_limit, with_id};
+use super::{FLAG_OPCODE, FLAG_QR, HttpsRecord, MAX_MESSAGE, NameMap, TYPE_HTTPS, TYPE_SVCB, edns, flags_of, notimp, nxdomain, parse, plain, query_for, reply_answers, reverse, servfail, truncated, udp_limit, with_id};
 use crate::route::table::NetTables;
 use crate::stack::Meters;
 use crate::watchdog::monotonic_ms;
@@ -50,6 +57,25 @@ pub const CANARY_DOMAIN: &str = "use-application-dns.net";
 pub const DNS_IDLE: Duration = Duration::from_secs(5);
 /// The shortest message: a header.
 const MIN_MESSAGE: usize = 12;
+/// Lookups in a row that every encrypted resolver failed before
+/// [`Service::unreachable`] says so: one is a blip, a captive portal fails them all.
+pub const UNREACHABLE_AFTER: u64 = 3;
+
+/// Where a lookup no LAN rule claims goes: the user's choice, encrypted unless
+/// they turned it off (`Policy::plain_dns`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    Encrypted,
+    /// To the server the client addressed, in plain text.
+    Plain,
+}
+
+impl Mode {
+    pub fn of(policy: &sieve_ipc::Policy) -> Self {
+        if policy.plain_dns { Mode::Plain } else { Mode::Encrypted }
+    }
+}
 
 /// How the reply will travel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,13 +85,16 @@ pub enum Transport {
     Stream,
 }
 
-/// Who asks, as far as an answer depends on it.
+/// Who asks, and whom, as far as an answer depends on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Asker {
     /// `domain::Owner::may_decrypt`. A VM's or WSL's flows are never decrypted, so
     /// stripping would cost their ECH for nothing. The DNS Client service does
     /// count: it is how browsers resolve, so the service floor does not apply here.
     pub may_decrypt: bool,
+    /// The server the query was sent to: the flow's destination, routed into the
+    /// adapter by its host route (`route::plan`). Only [`Mode::Plain`] uses it.
+    pub addressed: IpAddr,
 }
 
 /// True when a flow to this name may be decrypted: `Interception::may_intercept_name`
@@ -147,12 +176,33 @@ pub struct Service {
     in_flight: Arc<Semaphore>,
     may_intercept: NameGate,
     facts: Facts,
+    /// [`Mode::Plain`] when true. Encrypted from the start: the engine sets the
+    /// user's choice before the service answers anything (`Engine::start_dns_service`).
+    plain: AtomicBool,
+    /// Encrypted lookups in a row that every resolver failed; an answer ends the run.
+    failed_in_a_row: AtomicU64,
 }
 
 impl Service {
     pub fn new(endpoints: Vec<Upstream>, context: Context, tables: Arc<RwLock<NetTables>>, names: Arc<Mutex<NameMap>>, meters: Arc<Meters>, mtu: usize, may_intercept: NameGate) -> Self {
         let active = RwLock::new(Arc::new(Active::new(endpoints, &context)));
-        Self { context, active, tables, names, meters, mtu, in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)), may_intercept, facts: Facts::default() }
+        Self { context, active, tables, names, meters, mtu, in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)), may_intercept, facts: Facts::default(), plain: AtomicBool::new(false), failed_in_a_row: AtomicU64::new(0) }
+    }
+
+    /// The next query takes this mode; queries in flight finish as they began.
+    pub fn set_mode(&self, mode: Mode) {
+        self.plain.store(mode == Mode::Plain, Ordering::SeqCst);
+        self.failed_in_a_row.store(0, Ordering::SeqCst);
+    }
+
+    pub fn mode(&self) -> Mode {
+        if self.plain.load(Ordering::SeqCst) { Mode::Plain } else { Mode::Encrypted }
+    }
+
+    /// In [`Mode::Encrypted`], the last [`UNREACHABLE_AFTER`] lookups or more all
+    /// failed on every encrypted resolver, and none has answered since.
+    pub fn unreachable(&self) -> bool {
+        self.mode() == Mode::Encrypted && self.failed_in_a_row.load(Ordering::SeqCst) >= UNREACHABLE_AFTER
     }
 
     fn active(&self) -> Arc<Active> {
@@ -206,7 +256,7 @@ impl Service {
             Meters::bump(&self.facts.canary);
             return nxdomain(query).map(|reply| Answered { reply, resolved: true });
         }
-        let path = self.path(query);
+        let path = self.path(query, Some(asker.addressed));
         if path == Path::NoServer {
             Meters::bump(&self.facts.reverse_local);
             return nxdomain(query).map(|reply| Answered { reply, resolved: true });
@@ -218,8 +268,9 @@ impl Service {
             return servfail(query).map(|reply| Answered { reply, resolved: false });
         };
         // Before the size check: a smaller reply may now fit.
+        // A public answer, whichever way it came: its addresses enter the stack.
         let reply = match (path, &question) {
-            (Path::Encrypted, Some(message)) => self.without_ech(query, message, reply, asker),
+            (Path::Encrypted | Path::Plain(_), Some(message)) => self.without_ech(query, message, reply, asker),
             _ => reply,
         };
         if let Some(message) = reply_answers(query, &reply) {
@@ -231,26 +282,33 @@ impl Service {
     }
 
     /// The engine's own HTTPS lookup, for its upstream hello (task D9). The same
-    /// `resolve`: encrypted, or LAN for a matched suffix, and never plain beyond
-    /// that. It takes no permit a client is waiting for: past the bound it fails,
-    /// and the flow goes on without ECH.
+    /// paths as a client's: encrypted, or LAN for a matched suffix, or with
+    /// encryption off plain to the first server Windows names
+    /// ([`upstream::first_server`]). It takes no permit a client is waiting for:
+    /// past the bound it fails, and the flow goes on without ECH.
     pub async fn https_records(&self, name: &str) -> Result<Vec<HttpsRecord>, String> {
         let _permit = self.try_permit().ok_or("too many queries in flight")?;
         let mut id = [0u8; 2];
         getrandom::fill(&mut id).map_err(|e| e.to_string())?;
         let query = with_id(&query_for(name, TYPE_HTTPS).ok_or("a name that cannot be sent")?, u16::from_be_bytes(id));
-        let reply = self.exchange(self.path(&query), &query).await?;
+        let first = upstream::first_server(&self.tables.read().unwrap_or_else(|p| p.into_inner()));
+        let reply = self.exchange(self.path(&query, first), &query).await?;
         Ok(reply_answers(&query, &reply).ok_or("an answer to another question")?.https)
     }
 
-    fn path(&self, query: &[u8]) -> Path {
-        upstream::path_of(query, &self.tables.read().unwrap_or_else(|p| p.into_inner()))
+    /// `upstream::path_of`, the one routing decision, with the user's mode applied
+    /// to what it sends encrypted. Plain with no server to send to goes nowhere.
+    fn path(&self, query: &[u8], addressed: Option<IpAddr>) -> Path {
+        match upstream::path_of(query, &self.tables.read().unwrap_or_else(|p| p.into_inner())) {
+            Path::Encrypted if self.mode() == Mode::Plain => addressed.map_or(Path::Refused, Path::Plain),
+            path => path,
+        }
     }
 
     /// The one exchange on a path. A path with nowhere to go is an error here.
     async fn exchange(&self, path: Path, query: &[u8]) -> Result<Vec<u8>, String> {
         match path {
-            Path::Lan(server) => match tokio::time::timeout(REQUEST_BUDGET, lan::exchange(self.context.connector.as_ref(), server, query)).await {
+            Path::Lan(server) | Path::Plain(server) => match tokio::time::timeout(REQUEST_BUDGET, plain::exchange(self.context.connector.as_ref(), server, query)).await {
                 Ok(reply) => reply,
                 Err(_) => Err(format!("{server} did not answer in time")),
             },
@@ -258,7 +316,12 @@ impl Service {
             Path::NoServer => Err("a private reverse name, and no LAN server to ask".to_string()),
             Path::Encrypted => {
                 let active = self.active();
-                upstream::resolve(&active.endpoints, query, &active.pool, &active.health).await
+                let resolved = upstream::resolve(&active.endpoints, query, &active.pool, &active.health).await;
+                match &resolved {
+                    Ok(_) => self.failed_in_a_row.store(0, Ordering::SeqCst),
+                    Err(_) => _ = self.failed_in_a_row.fetch_add(1, Ordering::SeqCst),
+                }
+                resolved
             }
         }
     }
@@ -422,9 +485,11 @@ mod tests {
     const MTU: usize = 1500;
     const PATIENT: Duration = Duration::from_secs(20);
 
+    /// The public server Windows uses without Sieve, which the clients address.
+    const ORIGINAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 53));
     /// The host's own lookups, through the DNS Client service.
-    const HOST: Asker = Asker { may_decrypt: true };
-    const GUEST: Asker = Asker { may_decrypt: false };
+    const HOST: Asker = Asker { may_decrypt: true, addressed: ORIGINAL };
+    const GUEST: Asker = Asker { may_decrypt: false, addressed: ORIGINAL };
 
     struct Bed {
         service: Arc<Service>,
@@ -489,11 +554,145 @@ mod tests {
 
     /// A connector with the router's address standing in on this machine.
     fn connector_with(router: &Plain) -> Arc<Loopback> {
+        connector_for(&[(ROUTER.parse().unwrap(), router)])
+    }
+
+    /// A connector with each of these addresses standing in on this machine.
+    fn connector_for(servers: &[(IpAddr, &Plain)]) -> Arc<Loopback> {
         let connector = Loopback::default();
-        let ip: IpAddr = ROUTER.parse().unwrap();
-        *connector.lan_udp.lock().unwrap() = HashMap::from([(ip, router.udp)]);
-        *connector.lan_tcp.lock().unwrap() = HashMap::from([(ip, router.tcp)]);
+        *connector.lan_udp.lock().unwrap() = servers.iter().map(|(ip, s)| (*ip, s.udp)).collect::<HashMap<_, _>>();
+        *connector.lan_tcp.lock().unwrap() = servers.iter().map(|(ip, s)| (*ip, s.tcp)).collect::<HashMap<_, _>>();
         Arc::new(connector)
+    }
+
+    fn queries(server: &Plain) -> usize {
+        server.udp_queries.load(Ordering::SeqCst) + server.tcp_queries.load(Ordering::SeqCst)
+    }
+
+    // ---- The user's choice: plain DNS only when they turned encryption off.
+
+    #[tokio::test]
+    async fn plain_mode_forwards_to_the_server_the_client_addressed_and_never_to_an_encrypted_upstream() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let original = Plain::start(answering(), answering()).await;
+        let other = Plain::start(answering(), answering()).await;
+        let second: IpAddr = "198.51.100.53".parse().unwrap();
+        let b = bed(&ca, &[doh.url()], None, connector_for(&[(ORIGINAL, &original), (second, &other)]));
+        b.service.set_mode(Mode::Plain);
+        let answered = b.ask(&client_query(9, "www.example"), Transport::Datagram).await;
+        assert_eq!((id_of(&answered.reply), rcode(&answered.reply), answered.resolved), (Some(9), 0, true));
+        assert_eq!(b.names_of(ANSWER), ["www.example"], "a plain answer is evidence too");
+        b.ask_as(&client_query(10, "www.example"), Transport::Datagram, Asker { addressed: second, ..HOST }).await;
+        assert_eq!(b.connector.udp_recorded(), [SocketAddr::new(ORIGINAL, 53), SocketAddr::new(second, 53)], "each to the server it addressed");
+        assert_eq!((queries(&original), queries(&other)), (1, 1));
+        assert!(doh.seen().is_empty() && b.connector.tcp_recorded().is_empty(), "no encrypted upstream, not even a connect");
+        assert!(b.service.report().iter().all(|r| !r.connected && r.answers == 0));
+
+        // Back on: the next lookup goes encrypted and nothing plain.
+        b.service.set_mode(Mode::Encrypted);
+        b.ask(&client_query(11, "www.example"), Transport::Datagram).await;
+        assert_eq!(doh.seen().len(), 1);
+        assert_eq!(b.connector.udp_recorded().len(), 2, "no new plain socket");
+    }
+
+    #[tokio::test]
+    async fn plain_mode_retries_a_truncated_answer_over_tcp_to_the_same_server() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let cut: Script = Arc::new(|query| Step::Answer(crate::dns::truncated(&answer_to(query)).unwrap()));
+        let original = Plain::start(cut, answering()).await;
+        let b = bed(&ca, &[doh.url()], None, connector_for(&[(ORIGINAL, &original)]));
+        b.service.set_mode(Mode::Plain);
+        let answered = b.ask(&client_query(9, "big.example"), Transport::Stream).await;
+        assert_eq!(crate::dns::parse(&answered.reply).unwrap().answers.len(), 1);
+        assert_eq!(b.connector.tcp_recorded(), [SocketAddr::new(ORIGINAL, 53)]);
+        assert!(doh.seen().is_empty());
+    }
+
+    /// Plain mode changes where encrypted lookups go and nothing else.
+    #[tokio::test]
+    async fn plain_mode_keeps_the_split_horizon_the_private_reverse_and_the_local_answers() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let router = Plain::start(answering(), answering()).await;
+        let original = Plain::start(answering(), answering()).await;
+        let b = bed(&ca, &[doh.url()], Some("lan"), connector_for(&[(ROUTER.parse().unwrap(), &router), (ORIGINAL, &original)]));
+        b.service.set_mode(Mode::Plain);
+        b.ask(&client_query(1, "nas.lan"), Transport::Datagram).await;
+        b.ask(&ptr_query(2, "7.168.192.in-addr.arpa"), Transport::Datagram).await;
+        assert_eq!(rcode(&b.ask(&client_query(3, CANARY_DOMAIN), Transport::Datagram).await.reply), 3);
+        let mut update = client_query(4, "host.example");
+        update[2] = 0x28;
+        assert_eq!(rcode(&b.ask(&update, Transport::Datagram).await.reply), 4);
+        assert_eq!((queries(&router), queries(&original)), (2, 0), "LAN names to the router, nothing to the original server");
+        b.service.tables.write().unwrap().adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap().dns = vec!["fe80::1".parse().unwrap()];
+        for refused in [client_query(5, "nas.lan"), ptr_query(6, "7.168.192.in-addr.arpa")] {
+            assert_ne!(rcode(&b.ask(&refused, Transport::Datagram).await.reply), 0);
+        }
+        assert_eq!(queries(&original), 0, "a LAN name with no LAN server still goes nowhere");
+        assert!(doh.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_silent_original_server_is_servfail_and_never_the_encrypted_upstream() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let silent: Script = Arc::new(|_| Step::Silent);
+        let original = Plain::start(silent.clone(), silent).await;
+        let b = bed(&ca, &[doh.url()], None, connector_for(&[(ORIGINAL, &original)]));
+        b.service.set_mode(Mode::Plain);
+        let answered = b.ask(&client_query(9, "www.example"), Transport::Datagram).await;
+        assert_eq!((rcode(&answered.reply), answered.resolved), (2, false));
+        assert!(doh.seen().is_empty());
+        assert!(!b.service.unreachable(), "the notice is about encrypted resolvers only");
+    }
+
+    #[tokio::test]
+    async fn the_engines_own_lookup_in_plain_mode_asks_the_first_server_windows_names() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let router = Plain::start(answering(), answering()).await;
+        let b = bed(&ca, &[doh.url()], None, connector_with(&router));
+        b.service.set_mode(Mode::Plain);
+        tokio::time::timeout(PATIENT, b.service.https_records("www.example")).await.unwrap().unwrap();
+        assert_eq!(b.connector.udp_recorded(), [lan_target()], "the Wi-Fi's server, as Windows would ask");
+        b.service.tables.write().unwrap().adapters.iter_mut().for_each(|a| a.dns.clear());
+        assert!(b.service.https_records("www.example").await.is_err(), "no server: no lookup");
+        assert!(doh.seen().is_empty(), "never encrypted instead");
+    }
+
+    /// The other half of the owner's rule: with encryption on, no failure of any
+    /// kind sends a plain query, and the mode never changes by itself.
+    #[tokio::test]
+    async fn encrypted_mode_never_sends_plain_on_any_failure_and_says_when_none_answers() {
+        let ca = Ca::new();
+        let close: Script = Arc::new(|_| Step::Close);
+        let silent: Script = Arc::new(|_| Step::Silent);
+        let refusing = Server::start(Kind::Https, &ca, Options { status: 500, ..Options::default() }).await;
+        let closing = Server::start(Kind::Tls, &ca, Options { script: close, ..Options::default() }).await;
+        let mute = Server::start(Kind::Https, &ca, Options { script: silent, ..Options::default() }).await;
+        let original = Plain::start(answering(), answering()).await;
+        let router = Plain::start(answering(), answering()).await;
+        let urls = [refusing.url(), closing.url(), mute.url(), "tls://127.0.0.1:1".to_string()];
+        let b = bed(&ca, &urls, None, connector_for(&[(ORIGINAL, &original), (ROUTER.parse().unwrap(), &router)]));
+        for id in 0..UNREACHABLE_AFTER as u16 {
+            assert!(!b.service.unreachable(), "not before {UNREACHABLE_AFTER} in a row");
+            let answered = b.ask(&client_query(id, "www.example"), Transport::Datagram).await;
+            assert_eq!((rcode(&answered.reply), answered.resolved), (2, false));
+        }
+        assert!(b.service.unreachable());
+        assert_eq!(b.service.mode(), Mode::Encrypted, "said, never switched");
+        assert!(b.connector.udp_recorded().is_empty(), "no UDP socket at all");
+        assert_eq!((queries(&original), queries(&router)), (0, 0), "nothing plain, to the original server or the router");
+        assert!(b.service.https_records("www.example").await.is_err());
+        assert!(b.connector.udp_recorded().is_empty(), "the engine's own lookup neither");
+
+        // One answer ends it; the user's plain mode is not this notice's business.
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        b.service.set_list(vec![doh.url().parse().unwrap()]);
+        b.ask(&client_query(9, "www.example"), Transport::Datagram).await;
+        assert!(!b.service.unreachable());
     }
 
     #[tokio::test]

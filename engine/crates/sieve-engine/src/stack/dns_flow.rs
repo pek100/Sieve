@@ -1,6 +1,6 @@
 //! Windows: a flow to port 53. It is attributed and booked like any other, and
-//! `dns::service` answers it; nothing is connected to the server the client
-//! addressed, so plain DNS has no path out of the relay.
+//! `dns::service` answers it; the relay connects nothing to the server the client
+//! addressed. Only `dns::service`, in the user's plain mode, sends there.
 
 use std::sync::Arc;
 
@@ -26,7 +26,7 @@ fn first_question(ctx: &Relay, id: u64) -> impl FnMut(&str) + use<'_> {
 fn admit(ctx: &Relay, flow: &FiveTuple, attributed: &Attributed, proto: FlowProto) -> Option<(u64, Asker)> {
     let admitted = ctx.admit(flow, attributed, proto, FlowKind::Dns)?;
     lock(&ctx.book).update(admitted.id, |e| e.reason = Some(FlowReason::Dns));
-    Some((admitted.id, Asker { may_decrypt: admitted.may_decrypt() }))
+    Some((admitted.id, Asker { may_decrypt: admitted.may_decrypt(), addressed: flow.remote.ip() }))
 }
 
 fn finish(ctx: &Relay, id: u64, totals: Totals) {

@@ -21,7 +21,7 @@ use sieve_ipc::{Blocker, CertStatus, DnsUpstreams, EngineStatus, ExclusionsView,
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::ca::Ca;
-use crate::dns::service::Service;
+use crate::dns::service::{Mode, Service};
 use crate::dns::upstream::Upstream;
 use crate::dns::{NameMap, config};
 use crate::domain::{DomainFilter, FilterSlot, user_engine, user_rules_changed};
@@ -314,12 +314,16 @@ impl Engine {
         lock(&self.dns_upstreams).clone()
     }
 
-    /// Builds the DNS service from the held list and installs it, all under the
-    /// list's lock: a list set on the pipe reaches either the build or the
-    /// installed service, so what the pipe answers is what the service uses.
+    /// Builds the DNS service from the held list and the policy's mode and installs
+    /// it, all under both locks: a list or a policy set on the pipe reaches either
+    /// the build or the installed service, so what the pipe answers is what the
+    /// service uses. Lock order: list, policy, service (as `set_policy` and
+    /// `set_dns_upstreams` take theirs).
     pub fn start_dns_service(&self, build: impl FnOnce(Vec<Upstream>) -> Arc<Service>) -> Result<Arc<Service>, String> {
         let held = lock(&self.dns_upstreams);
+        let policy = lock(&self.policy);
         let service = build(config::validate(&held)?);
+        service.set_mode(Mode::of(&policy));
         *lock(&self.dns_service) = Some(service.clone());
         Ok(service)
     }
@@ -368,6 +372,7 @@ impl Engine {
     /// tells a person about a release, so this holds the plain update state.
     fn status_value(&self) -> Result<serde_json::Value, serde_json::Error> {
         let mut status = serde_json::to_value(self.status_saying(self.updates.status()))?;
+        status["dns_mode"] = serde_json::to_value(Mode::of(&self.policy()))?;
         status["https"] = self.meters.https.report();
         status["quic"] = self.meters.quic.report(crate::quic::REFUSAL);
         let local = |c: &std::sync::atomic::AtomicU64| serde_json::Value::from(c.load(std::sync::atomic::Ordering::Relaxed));
@@ -390,10 +395,18 @@ impl Engine {
     /// is never read as a current one. Best effort.
     fn write_dns_status_file(&self) {
         let Some(dir) = &self.dir else { return };
-        let (upstreams, counts) = lock(&self.dns_service).as_ref().map(|s| (s.report(), s.counts())).unwrap_or_default();
-        if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({ "upstreams": upstreams, "answers": counts })) {
+        if let Ok(json) = serde_json::to_vec_pretty(&self.dns_status_value()) {
             let _ = policy::write_report(&dir.join(DNS_STATUS_FILE), &json);
         }
+    }
+
+    /// `dns-status.json`'s content: the mode the user chose, and the sessions and
+    /// counts while the service is up.
+    fn dns_status_value(&self) -> serde_json::Value {
+        // The policy first and on its own: `set_policy` holds it while it takes the service's lock.
+        let mode = Mode::of(&self.policy());
+        let (upstreams, counts) = lock(&self.dns_service).as_ref().map(|s| (s.report(), s.counts())).unwrap_or_default();
+        serde_json::json!({ "mode": mode, "upstreams": upstreams, "answers": counts })
     }
 
     #[cfg(feature = "relay-experiments")]
@@ -458,6 +471,7 @@ impl Engine {
             let book = lock(&self.book);
             (book.live(), book.guests())
         };
+        let dns_unreachable = lock(&self.dns_service).as_ref().is_some_and(|s| s.unreachable());
         EngineStatus {
             filtering: f.routes_up,
             routes_up: f.routes_up,
@@ -471,6 +485,7 @@ impl Engine {
             counters: self.meters.counters(),
             guests,
             filter: self.lists.facts(),
+            dns_unreachable,
             update,
         }
     }
@@ -500,6 +515,9 @@ impl Backend for Engine {
                 }
             }
             self.apply_to_filter(&current, &next);
+            if let Some(service) = lock(&self.dns_service).as_ref() {
+                service.set_mode(Mode::of(&next));
+            }
             let saved = self.dir.as_ref().map_or(Ok(()), |dir| policy::save(dir, &next));
             *current = next;
             self.set_facts(|f| f.policy_save_error = saved.err().map(|why| format!("the policy holds until a restart, which reads the last one saved: {why}")));
@@ -915,6 +933,77 @@ mod tests {
         let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join(DNS_STATUS_FILE)).unwrap()).unwrap();
         assert_eq!(status["upstreams"], serde_json::json!([]));
         assert_eq!(status["answers"]["ech_stripped"], serde_json::json!(0), "counts sit beside the list, and start at nothing");
+        assert_eq!(status["mode"], "encrypted", "the default, said");
+    }
+
+    /// The app's switch over the pipe: SetPolicy reaches a running service at once,
+    /// a service started later starts in it, and both status files say it.
+    #[tokio::test]
+    async fn the_plain_dns_switch_reaches_the_service_over_the_pipe_and_the_status_says_so() {
+        use sieve_ipc::nonblocking::{read_frame, write_frame};
+        use sieve_ipc::{ClientMessage, EngineMessage, PROTOCOL};
+
+        let dir = tempfile::tempdir().unwrap();
+        let e = Arc::new(Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None));
+        let running = e.start_dns_service(service_from).unwrap();
+        assert_eq!(running.mode(), Mode::Encrypted, "the default");
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let backend = e.clone();
+        let task = tokio::spawn(async move { crate::ipc::serve_client(&mut server, 1, backend.as_ref()).await });
+        write_frame(&mut client, &ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.1.0".into() }).await.unwrap();
+        let _: EngineMessage = read_frame(&mut client).await.unwrap();
+
+        write_frame(&mut client, &ClientMessage::SetPolicy(Policy { revision: 1, plain_dns: true, ..Policy::default() })).await.unwrap();
+        let EngineMessage::Status(status) = read_frame(&mut client).await.unwrap() else { panic!("a status answers SetPolicy") };
+        assert!(status.policy.plain_dns, "the pipe's status holds the mode");
+        assert_eq!(running.mode(), Mode::Plain, "the running service took it");
+        e.stop_dns_service();
+        assert_eq!(e.start_dns_service(service_from).unwrap().mode(), Mode::Plain, "a new service starts in it");
+        e.write_status_file();
+        let read = |file: &str| serde_json::from_slice::<serde_json::Value>(&std::fs::read(dir.path().join(file)).unwrap()).unwrap();
+        assert_eq!((read(DNS_STATUS_FILE)["mode"].clone(), read(STATUS_FILE)["dns_mode"].clone()), ("plain".into(), "plain".into()));
+
+        write_frame(&mut client, &ClientMessage::SetPolicy(Policy { revision: 2, ..Policy::default() })).await.unwrap();
+        let _: EngineMessage = read_frame(&mut client).await.unwrap();
+        assert_eq!(lock(&e.dns_service).as_ref().unwrap().mode(), Mode::Encrypted, "and back");
+        drop(client);
+        task.await.unwrap().unwrap();
+        let reloaded = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), policy::load(dir.path()).0, Runs::default(), None);
+        assert!(!reloaded.policy().plain_dns, "the saved policy is the last one");
+    }
+
+    #[tokio::test]
+    async fn the_status_says_when_no_encrypted_resolver_answers_and_the_mode_stays() {
+        use crate::dns::service::{Asker, Transport, UNREACHABLE_AFTER};
+        let e = engine(Policy::default(), None);
+        e.set_dns_upstreams(DnsUpstreams { revision: 1, upstreams: vec!["tls://127.0.0.1:1".into()] }).unwrap();
+        let service = e.start_dns_service(service_from).unwrap();
+        let asker = Asker { may_decrypt: true, addressed: "203.0.113.53".parse().unwrap() };
+        assert!(!e.status().dns_unreachable);
+        for id in 0..UNREACHABLE_AFTER as u16 {
+            service.answer(&crate::dns::testing::client_query(id, "www.example"), Transport::Datagram, asker).await.unwrap();
+        }
+        let status = e.status();
+        assert!(status.dns_unreachable && !status.policy.plain_dns, "said, and still encrypted");
+        assert_eq!(service.mode(), Mode::Encrypted);
+        e.set_policy(Policy { revision: 1, plain_dns: true, ..Policy::default() }).unwrap();
+        assert!(!e.status().dns_unreachable, "the user's plain mode is no encrypted failure");
+    }
+
+    #[test]
+    fn a_policy_set_while_the_dns_service_starts_reaches_its_mode() {
+        let e = Arc::new(engine(Policy::default(), None));
+        let (answered, answer) = std::sync::mpsc::channel();
+        let service = e
+            .start_dns_service(|endpoints| {
+                let pipe = e.clone();
+                std::thread::spawn(move || answered.send(pipe.set_policy(Policy { revision: 1, plain_dns: true, ..Policy::default() })));
+                assert!(answer.recv_timeout(OVERTAKE).is_err(), "the policy waits for the service to be installed");
+                service_from(endpoints)
+            })
+            .unwrap();
+        assert!(answer.recv().unwrap().unwrap().policy.plain_dns);
+        assert_eq!(service.mode(), Mode::Plain);
     }
 
     #[test]

@@ -17,8 +17,9 @@
 //!   commit (v3, the wave after slice 3: blocked flows, the grown policy, the
 //!   list report, forwarded flows and guests, the `log` message, the status's filter
 //!   facts, the certificate's status with its `removal_pending` state,
-//!   `InstallRoot`, `Policy.https`, `Policy.content`, `request_update` and the
-//!   `update` status).
+//!   `InstallRoot`, `Policy.https`, `Policy.content`, `request_update`, the
+//!   `update` status, and `Policy.plain_dns` with the status's `dns_unreachable`,
+//!   both left out while false so a peer from before them reads the same bytes).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -298,6 +299,12 @@ pub struct Policy {
     /// what it always saw.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub content: bool,
+    /// The user turned `filtering.dnsEncryption` off: a lookup no LAN rule claims
+    /// goes in plain text to the server the client addressed. Defaulted, and left
+    /// out while false, so a file or a peer from before it reads as encrypted: plain
+    /// is only ever the user's explicit choice, never an absence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plain_dns: bool,
     /// `filtering.userRules`: rule lines in the lists' language, compiled
     /// untrusted beside `domain_lists`.
     #[serde(default)]
@@ -511,6 +518,12 @@ pub struct EngineStatus {
     /// What it filters with; None until it holds compiled lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<FilterFacts>,
+    /// With DNS encryption on, every encrypted resolver failed the last lookups and
+    /// none has answered since (a captive portal, or a network that blocks them).
+    /// Left out while false. The app may say so and point at the switch; nothing
+    /// ever turns encryption off but the user.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dns_unreachable: bool,
     /// Signed updates (protocol 3).
     pub update: UpdateStatus,
 }
@@ -1283,6 +1296,26 @@ mod tests {
         let wire = serde_json::to_value(&on).unwrap();
         assert_eq!(wire["content"], true);
         assert_eq!(serde_json::from_value::<Policy>(wire).unwrap(), on, "the round trip");
+    }
+
+    /// Absent is encrypted: an old file, an old peer and `Policy::default()` alike.
+    #[test]
+    fn a_policy_without_plain_dns_is_encrypted_and_only_true_is_written() {
+        let old: Policy = serde_json::from_str(r#"{"revision":4,"engine":true}"#).unwrap();
+        assert!(!old.plain_dns && !Policy::default().plain_dns);
+        assert!(serde_json::to_value(&old).unwrap().get("plain_dns").is_none(), "false is left out");
+        let chosen = Policy { plain_dns: true, ..old };
+        let wire = serde_json::to_value(&chosen).unwrap();
+        assert_eq!(wire["plain_dns"], true);
+        assert_eq!(serde_json::from_value::<Policy>(wire).unwrap(), chosen, "the round trip");
+        let shared = fixture()["policyWithPlainDns"].clone();
+        let sent: ClientMessage = serde_json::from_value(shared.clone()).unwrap();
+        assert!(matches!(&sent, ClientMessage::SetPolicy(p) if p.plain_dns), "the app's switch as the pipe carries it");
+        assert_eq!(serde_json::to_value(&sent).unwrap(), shared);
+        let status = EngineStatus::default();
+        assert!(serde_json::to_value(&status).unwrap().get("dns_unreachable").is_none(), "false is left out");
+        let unreachable = serde_json::to_value(EngineStatus { dns_unreachable: true, ..status }).unwrap();
+        assert!(serde_json::from_value::<EngineStatus>(unreachable).unwrap().dns_unreachable);
     }
 
     #[test]

@@ -2,13 +2,15 @@
 //! through an encrypted upstream, or by the adapter's own LAN server for a name
 //! under its own suffixes, and every answer is read for the IP-to-names map
 //! with TTL, which later decides flows that carry no name of their own. The
-//! engine never blocks in DNS, never writes a DNS setting and never sends plain
-//! DNS beyond a private server excluded from routing.
+//! engine never blocks in DNS and never writes a DNS setting. It sends plain DNS
+//! beyond a private server excluded from routing only when the user turned
+//! encryption off (`Policy::plain_dns`), and then only to the server the client
+//! addressed; with encryption on, failed resolvers mean failed lookups.
 //!
 //! - [`service`]: one query to one answer, and the two flow loops;
 //! - [`upstream`]: the resolver list, failover and the split-horizon rules;
 //! - [`pool`]: one kept-open session per upstream, over [`doh`], [`dot`], [`doq`];
-//! - [`lan`]: the one plain exchange, to a LAN server;
+//! - [`plain`]: the one plain exchange, to a LAN server or the user's chosen plain path;
 //! - [`config`]: the list as `dns.json` holds it;
 //! - [`ech`]: `ech` parameters taken out of HTTPS and SVCB answers;
 //! - [`reverse`]: which reverse lookups name a private range.
@@ -36,7 +38,7 @@ pub mod doh;
 pub mod doq;
 pub mod dot;
 pub mod ech;
-pub mod lan;
+pub mod plain;
 pub mod pool;
 pub mod reverse;
 pub mod service;

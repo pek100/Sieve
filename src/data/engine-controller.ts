@@ -9,7 +9,7 @@
  * - the engine's policy follows the user's settings: the switch
  *   `filtering.engine` (ENGINE_SWITCH), the global Sieving switch, the apps
  *   turned off, the filter list selection, the domain lists, the user's rules
- *   and exclusions. Whenever the engine answers with anything different, order
+ *   and exclusions, and DNS encryption (`plain_dns` only when the user turned it off). Whenever the engine answers with anything different, order
  *   aside, the whole policy is sent with the next revision (`setPolicy`): a
  *   part-filled one would clear the rest. The switch defaults off, so the engine
  *   routes nothing until the user turns it on. Nothing is sent while the engine
@@ -31,16 +31,17 @@
  *
  * The passed live check of ENGINE_SWITCH is recorded while the engine
  * reports routing, and forgotten when it stops. A crash loop pushes one Home
- * banner, dismissed when it is over; so does an update on offer or rolled back.
+ * banner, dismissed when it is over; so does an update on offer or rolled back,
+ * and no encrypted DNS server answering (it points at the switch, never flips it).
  * Update state rides the probe: there is no separate poll.
  */
 import type { PassedChecks } from "@/core/checks";
-import { CONTENT_SWITCH, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, httpsInForce, updateBanner, type EngineSlice } from "@/core/engine";
+import { CONTENT_SWITCH, DNS_ENCRYPTION as DNS_ENCRYPTION_KEY, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, httpsInForce, updateBanner, type EngineSlice } from "@/core/engine";
 import type { ExclusionsFacts, HealGroup } from "@/core/exclusions";
 import type { NoticeBus } from "@/core/notices";
 import { selectedListIds } from "@/core/filter-lists";
 import { GLOBAL_SWITCH, offKeys } from "@/core/policy";
-import { MAX_POLICY_BYTES, type SettingKey } from "@/core/settings/registry";
+import { MAX_POLICY_BYTES, REGISTRY, type SettingKey } from "@/core/settings/registry";
 import type { SieveStore } from "@/core/store";
 import type { EngineSource } from "./engine-source";
 import type { FilterListSource } from "./filter-lists-source";
@@ -83,6 +84,14 @@ export const CRASH_LOOP_BANNER =
 const SWITCH = ENGINE_SWITCH as SettingKey;
 const HTTPS = HTTPS_SWITCH as SettingKey;
 const CONTENT = CONTENT_SWITCH as SettingKey;
+const DNS_ENCRYPTION = DNS_ENCRYPTION_KEY as SettingKey;
+
+/**
+ * The Home banner while no encrypted DNS server answers (the status's
+ * `dns_unreachable`). It points at the switch and never flips it: plain DNS is
+ * only ever the user's choice.
+ */
+export const DNS_UNREACHABLE_BANNER = `No encrypted DNS server answers on this network, so sites may not load. Hotel and airport Wi-Fi often needs plain DNS to show its sign-in page: you can turn off ${REGISTRY[DNS_ENCRYPTION].label} in Settings > Filtering.`;
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** Notices the window keeps for the toast hook: far more than one person reads, as the engine's own ring. */
@@ -109,6 +118,8 @@ function wantedPolicy(settings: SettingsStore, catalogue: Pick<FilterCatalogue, 
     off_apps: [...offKeys(settings.get("apps.levels"))],
     https: Boolean(settings.get(HTTPS)),
     content: Boolean(settings.get(CONTENT)),
+    // Plain only when the user turned encryption off: an unread setting reads as its default, on.
+    plain_dns: settings.get(DNS_ENCRYPTION) === false,
     lists: untouched ? null : catalogue ? selectedListIds(selection, catalogue) : heldLists,
     domain_lists: [...domainList("block", settings.get("filtering.blockedDomains")), ...domainList("allow", settings.get("filtering.allowedDomains"))],
     user_rules: [...settings.get("filtering.userRules")],
@@ -123,6 +134,7 @@ function normalised(p: WantedPolicy): string {
     engine: p.engine,
     https: p.https,
     content: p.content ?? false,
+    plain_dns: p.plain_dns ?? false,
     sieving: p.sieving,
     off_apps: sorted(p.off_apps),
     lists: p.lists && sorted(p.lists),
@@ -160,6 +172,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
   // The switch is read only after the settings loaded: before that it reads as its default (off).
   let settingsReady = false;
   let banner: number | null = null;
+  let dnsBanner: number | null = null;
   let update: { id: number; text: string } | null = null;
   let probeNow: () => Promise<void> = async () => {};
   // Null until the first read. The engine is a service that outlives this window,
@@ -181,6 +194,12 @@ export function createEngineController({ engine, store, clock, settings, checks,
     if (phase !== "crash_loop" && banner !== null) {
       notices.dismiss(banner);
       banner = null;
+    }
+    const unreachable = engineStatus(e)?.dns_unreachable === true;
+    if (unreachable && dnsBanner === null) dnsBanner = notices.push({ kind: "error", surface: "banner", text: DNS_UNREACHABLE_BANNER });
+    if (!unreachable && dnsBanner !== null) {
+      notices.dismiss(dnsBanner);
+      dnsBanner = null;
     }
     const text = updateBanner(engineUpdate(e));
     if (text !== (update?.text ?? null)) {
@@ -451,6 +470,8 @@ export function createEngineController({ engine, store, clock, settings, checks,
         probeNow = async () => {};
         if (banner !== null) notices.dismiss(banner);
         banner = null;
+        if (dnsBanner !== null) notices.dismiss(dnsBanner);
+        dnsBanner = null;
         if (update !== null) notices.dismiss(update.id);
         update = null;
       };

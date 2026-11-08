@@ -1,6 +1,8 @@
-//! The one plain exchange in the engine: a query for a name under an adapter's
-//! own suffix, to that adapter's server. `upstream::SplitHorizon` admits only a
-//! private server excluded from routing, so this never leaves the LAN.
+//! The one plain exchange in the engine, on two paths only (`upstream::Path`):
+//! a name under an adapter's own suffix or a private reverse name, to a private
+//! server excluded from routing, so that never leaves the LAN; and, only when the
+//! user turned DNS encryption off, any other name to the server the client
+//! addressed, the one Windows uses without Sieve.
 
 use std::net::{IpAddr, SocketAddr};
 

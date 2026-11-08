@@ -231,6 +231,10 @@ pub enum Path {
     NoServer,
     /// To the encrypted upstreams: nothing in it is a LAN name.
     Encrypted,
+    /// In plain text to this server, the one the client addressed. Only the
+    /// service makes it, from [`Path::Encrypted`], and only while the user has
+    /// encryption off; [`path_of`] never does.
+    Plain(IpAddr),
 }
 
 impl SplitHorizon {
@@ -317,6 +321,13 @@ pub fn split_rules(tables: &NetTables) -> Vec<SplitHorizon> {
         }
     }
     rules
+}
+
+/// Where the engine's own lookup goes in plain mode, having no client whose server
+/// to use: the first DNS server of the other up adapters, in the tables' order.
+/// A link-local IPv6 one is skipped, as [`lan_server`] does.
+pub fn first_server(tables: &NetTables) -> Option<IpAddr> {
+    tables.others().flat_map(|a| a.dns.iter().copied()).find(|ip| !is_v6_link_local(*ip))
 }
 
 fn is_v6_link_local(ip: IpAddr) -> bool {
@@ -620,6 +631,20 @@ mod tests {
         for dns in [vec!["8.8.8.8".parse().unwrap()], vec!["fe80::1".parse().unwrap()], vec![]] {
             assert_eq!(path_for(ROUTER_REVERSE, &others_empty(dns.clone())), Path::NoServer, "{dns:?}");
         }
+    }
+
+    #[test]
+    fn the_first_server_is_another_adapters_first_usable_one_and_never_sieves() {
+        use crate::route::table::fixtures::*;
+        assert_eq!(first_server(&load(HOME)), Some("192.168.7.1".parse().unwrap()));
+        let mut scoped = load(HOME);
+        wifi(&mut scoped).dns = vec!["fe80::1".parse().unwrap(), "8.8.8.8".parse().unwrap()];
+        assert_eq!(first_server(&scoped), Some("8.8.8.8".parse().unwrap()), "link-local skipped");
+        let mut none = load(SIEVE_UP);
+        none.adapters.iter_mut().filter(|a| a.alias != "Sieve").for_each(|a| a.dns.clear());
+        none.adapters.iter_mut().find(|a| a.alias == "Sieve").unwrap().dns = vec!["192.168.7.1".parse().unwrap()];
+        assert_eq!(first_server(&none), None, "Sieve's own adapter names none");
+        assert!(path_for("www.example", &load(HOME)) == Path::Encrypted, "path_of never says plain");
     }
 
     #[test]
