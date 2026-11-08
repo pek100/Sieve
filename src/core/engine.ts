@@ -40,6 +40,8 @@ export const ENGINE_HREF = `/settings/#${ENGINE_ANCHOR}`;
 export const HTTPS_SWITCH = "filtering.https";
 /** The data switch that rewrites decrypted pages (registry key; UI reads it from here). */
 export const CONTENT_SWITCH = "filtering.content";
+/** DNS encryption, on by default (registry key). Off is the user's choice of plain DNS; it travels as `plain_dns`. */
+export const DNS_ENCRYPTION = "filtering.dnsEncryption";
 /** The Certificate group's anchor in Settings. */
 export const CERTIFICATE_ANCHOR = "certificate";
 

@@ -317,10 +317,21 @@ export const REGISTRY = {
     kind: "list",
     section: "filtering",
     label: "Upstream DNS servers",
-    help: "Where the engine sends DNS lookups, encrypted, tried in order: DNS over HTTPS, TLS or QUIC. It never sends plain DNS.",
+    help: "Where the engine sends DNS lookups, encrypted, tried in order: DNS over HTTPS, TLS or QUIC. Only these servers, never a plain one.",
     default: ["https://cloudflare-dns.com/dns-query", "https://dns.quad9.net/dns-query"] as readonly string[],
     of: { type: "upstream" },
   } satisfies ListSetting<string>,
+  // The owner's decision (2026-11-06): encrypted by default, plain DNS only by
+  // this choice, never as a fallback. Sent as the policy's `plain_dns`. TENSION:
+  // it changes traffic yet is no data switch, whose default must be off: here
+  // the default is the engine's safe behaviour and off is the user's to pick.
+  "filtering.dnsEncryption": {
+    kind: "boolean",
+    section: "filtering",
+    label: "Encrypt DNS lookups",
+    help: "On: the engine sends the names of the sites you visit to the servers above, encrypted. Off: it sends them in plain text to your network's own DNS server, as Windows does without Sieve, and anyone on the network can see them. Some hotel and airport Wi-Fi needs it off to show its sign-in page.",
+    default: true,
+  } satisfies BooleanSetting,
   // Written by the Filters page's editor and the log's row actions after a
   // preview (core/log-actions), and sent whole in the engine's policy.
   "filtering.userRules": {
@@ -448,7 +459,7 @@ export function isValidValue(key: SettingKey, value: unknown): boolean {
         Object.values(value).every((v) => isValidElement(def.of, v))
       );
     case "list":
-      // The engine refuses an empty resolver list: it never falls back to plain DNS, so an empty one means nothing.
+      // The engine refuses an empty resolver list: an empty list never means plain DNS, so it means nothing.
       if (def.of.type === "upstream" && Array.isArray(value) && value.length === 0) return false;
       return Array.isArray(value) && value.every((v) => isValidElement(def.of, v));
   }

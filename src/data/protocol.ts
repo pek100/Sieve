@@ -283,6 +283,8 @@ export interface EnginePolicy {
   https: boolean;
   /** `filtering.content`: decrypted pages get cosmetics. The engine leaves it out while false, so absent is off. */
   content?: boolean;
+  /** `filtering.dnsEncryption` off: the user chose plain DNS. The engine leaves it out while false, so absent is encrypted. */
+  plain_dns?: boolean;
   /** `filtering.userRules`: rule lines, compiled untrusted beside `domain_lists`. */
   user_rules: string[];
   /** `filtering.exclusions`: sites never decrypted. Nothing decrypts before slice 6. */
@@ -475,6 +477,8 @@ export interface EngineStatus {
   guests: EngineGuest[];
   /** Absent until the engine holds compiled lists, and from an older engine. */
   filter?: FilterFacts;
+  /** With encryption on, no encrypted DNS server has answered the last lookups. Absent is false. */
+  dns_unreachable?: boolean;
   update: EngineUpdate;
 }
 
@@ -553,6 +557,7 @@ function policy(raw: unknown): EnginePolicy {
     domain_lists: orDefault(p.domain_lists, domainLists, []),
     https: orDefault(p.https, (v) => bool(v, "policy.https"), false),
     ...(p.content === undefined ? {} : { content: bool(p.content, "policy.content") }),
+    ...(p.plain_dns === undefined ? {} : { plain_dns: bool(p.plain_dns, "policy.plain_dns") }),
     user_rules: orDefault(p.user_rules, (v) => strings(v, "policy.user_rules"), []),
     exclusions: orDefault(p.exclusions, (v) => strings(v, "policy.exclusions"), []),
   };
@@ -641,6 +646,8 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
     },
     guests: guests(s.guests),
     ...(s.filter === undefined || s.filter === null ? {} : { filter: filterFacts(s.filter) }),
+    // A notice, like the update state: an odd value reads as nothing to say, never a refused Status.
+    ...(s.dns_unreachable === true ? { dns_unreachable: true } : {}),
     update: engineUpdate(s.update),
   };
 }

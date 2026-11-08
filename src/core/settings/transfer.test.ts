@@ -86,6 +86,26 @@ describe("settings export and import", () => {
     expect(kept.ok && readValue(kept.next, "filtering.engine")).toBe(true);
   });
 
+  it("DNS encryption off round-trips through export and import, and a file without it is encrypted", () => {
+    const off = writeValue(EMPTY_DOC, "filtering.dnsEncryption", false);
+    const text = exportText(off);
+    expect(JSON.parse(text).values).toEqual({ "filtering.dnsEncryption": false });
+    const imported = planImport(EMPTY_DOC, text);
+    if (!imported.ok) throw new Error(imported.error);
+    expect(imported.refused).toEqual([]);
+    expect(imported.changes).toEqual([{ key: "filtering.dnsEncryption", from: true, to: false }]);
+    expect(readValue(imported.next, "filtering.dnsEncryption")).toBe(false);
+    const again = planImport(off, text);
+    expect(again.ok && again.changes, "the round trip changes nothing").toEqual([]);
+    // The default travels as absence: an old file, or one without the key, turns it back on.
+    const old = planImport(off, JSON.stringify({ kind: EXPORT_KIND, schema: 4, values: {} }));
+    expect(old.ok && readValue(old.next, "filtering.dnsEncryption")).toBe(true);
+    expect(exportText(EMPTY_DOC)).not.toContain("dnsEncryption");
+    const bad = planImport(EMPTY_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filtering.dnsEncryption": "off" } }));
+    expect(bad.ok && bad.refused.map((r) => r.key)).toEqual(["filtering.dnsEncryption"]);
+    expect(bad.ok && readValue(bad.next, "filtering.dnsEncryption")).toBe(true);
+  });
+
   it("says plainly when the text is not a settings file", () => {
     expect(planImport(EMPTY_DOC, "{nope")).toEqual({ ok: false, error: expect.stringMatching(/not valid JSON/) });
     expect(planImport(EMPTY_DOC, JSON.stringify({ values: {} }))).toEqual({ ok: false, error: expect.stringMatching(/not a Sieve settings file/) });
@@ -115,7 +135,7 @@ describe("settings search and words", () => {
     expect(searchSettings("")).toEqual(SETTING_KEYS.filter(isAvailable));
     expect(searchSettings("theme")).toEqual(["appearance.theme"]);
     expect(searchSettings("LIGHT")).toEqual(["appearance.theme"]);
-    expect(searchSettings("dns")).toEqual(["filtering.upstreams"]);
+    expect(searchSettings("dns")).toEqual(["filtering.upstreams", "filtering.dnsEncryption"]);
     expect(searchSettings("per-app filtering")).toEqual([]);
     expect(searchSettings("turned off")).toEqual(["apps.levels"]);
     expect(searchSettings("startup")).toEqual(["startup.launchAtLogin", "startup.welcomeDone"]);

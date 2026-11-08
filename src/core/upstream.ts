@@ -1,8 +1,10 @@
 /**
  * An encrypted DNS upstream as `filtering.upstreams` holds it: DNS over HTTPS
  * (`https://host[:port][/path][?query]`), DNS over TLS (`tls://host[:port][/]`)
- * or DNS over QUIC (`quic://host[:port][/]`). Nothing else: the engine sends no
- * plain DNS, so a bare address is not an upstream (plan 1.4).
+ * or DNS over QUIC (`quic://host[:port][/]`). Nothing else: the list is only ever
+ * encrypted, so a bare address is not an upstream (plan 1.4). Plain DNS is never a
+ * list entry; it is the user's own switch, `filtering.dnsEncryption`, and goes to
+ * the network's server, not to one named here.
  *
  * This is the same grammar as the engine's `Upstream` in `dns/upstream.rs`, and
  * built the same way: the checks below, then the WHATWG URL parser the `url`

@@ -2,7 +2,9 @@
 
 Run by the user, on a machine where the engine is installed and `filtering.engine` is on. Nothing here was run by the implementing stream: every automated test binds loopback only. Commands are for an admin PowerShell prompt. The engine folder below is `C:\ProgramData\Sieve\engine`.
 
-`dns-status.json` beside `status.json` holds the facts these checks read, rewritten every 30 s while routes are up: per upstream its `address`, `connected`, `kx_group`, `alpn`, `answers`, `failures`, and never a queried name. `kx_group` is `null` for DoQ because quinn does not expose it. Its `answers` counts belong to `docs/live/dns-extras.md`.
+`dns-status.json` beside `status.json` holds the facts these checks read, rewritten every 30 s while routes are up: `mode` (`encrypted`, or `plain` when the user turned Encrypt DNS lookups off), and per upstream its `address`, `connected`, `kx_group`, `alpn`, `answers`, `failures`, and never a queried name. `status.json` says the same mode as `dns_mode`.
+
+**Encryption is the user's switch.** Settings > Filtering > Encrypt DNS lookups is on by default. Off, a lookup that would go encrypted goes in plain text to the server the client addressed, which is the server Windows uses for that adapter without Sieve; the split-horizon, private reverse, canary and update rules stay as they are. Nothing else turns plain on: not an empty or bad list, not a failure. Checks 1 to 11 assume it is on. `kx_group` is `null` for DoQ because quinn does not expose it. Its `answers` counts belong to `docs/live/dns-extras.md`.
 
 **The setting owns the list.** While the app runs, `filtering.upstreams` wins over `dns.json`: at the first probe, and at every probe after, the app reads the engine's list back and overwrites it, and so `dns.json`, if it differs. The setting is never empty, so an untouched app does this too: the default has servers, an import refuses an empty list, and an empty list stored by hand reads as the default. A list written by hand lasts only while the app is closed.
 
@@ -19,7 +21,9 @@ A bad file reads as the defaults and `last_error` in `status.json` says why. Sav
 
 In the settings file the same list is the value of `filtering.upstreams`, with no `revision`.
 
-## 1. No plain DNS leaves the machine
+## 1. No plain DNS leaves the machine without the user's choice
+
+With Encrypt DNS lookups on (the default, `mode` `encrypted`):
 
 ```powershell
 pktmon filter remove
@@ -73,6 +77,10 @@ Idle CPU stays under its gate with sessions open; the slice 3 relay gate is unaf
 
 `pnpm engine:build` needs a C toolchain and probably CMake for aws-lc-sys. It built here with CMake present and NASM absent; which path aws-lc-sys took was not determined. Record it here; plan 2.7 asks slice 6's build notes to say which.
 
-## Known consequence: no encrypted resolver reachable
+## 12. Plain mode, the user's choice
 
-Hotel, airport and other captive-portal networks usually need plain DNS to reach their sign-in page, and some networks block 443 and 853 to public resolvers. The rule is never plain, so DNS answers SERVFAIL for as long as the engine is on. The way out is turning filtering off, which restores normal DNS at once.
+Turn Encrypt DNS lookups off in Settings. Pass: within a probe `dns-status.json` says `mode` `plain`, and check 1's capture shows port 53 traffic only to the servers `Get-DnsClientServerAddress` lists for the adapter (or to a server an app addressed itself), and none on 443, 853 or UDP 853 to the resolver list. A name under the Wi-Fi's own suffix still goes only to its LAN server (check 6). Turn it on again: `mode` is `encrypted` and check 1 passes again with no restart.
+
+## 13. No encrypted resolver reachable
+
+Hotel, airport and other captive-portal networks usually need plain DNS to reach their sign-in page, and some networks block 443 and 853 to public resolvers. With encryption on, DNS answers SERVFAIL for as long as that lasts: failed resolvers mean failed lookups, never plain. Simulate it with an outbound firewall rule blocking TCP 443 and 853 and UDP 853 to the listed resolvers' addresses (remove it after). Pass: after three failed lookups the Home banner names Encrypt DNS lookups, `dns-status.json` still says `encrypted` and the switch is still on; port 53 shows nothing beyond the LAN; removing the rule ends the banner at the next answer. The ways out are the user's: turning Encrypt DNS lookups off (check 12), or turning filtering off, which restores normal DNS at once.

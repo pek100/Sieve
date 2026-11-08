@@ -4,9 +4,9 @@
  * settings are declared nowhere else.
  */
 import { describe, expect, it } from "vitest";
-import { CONTENT_SWITCH, ENGINE_SWITCH, HTTPS_SWITCH } from "@/core/engine";
+import { CONTENT_SWITCH, DNS_ENCRYPTION, ENGINE_SWITCH, HTTPS_SWITCH } from "@/core/engine";
 import { normalizeDoc, readValue } from "@/core/settings/document";
-import { REGISTRY, SECTIONS, SETTING_KEYS, isValidValue, needsEngine, settingDef, type SettingDef } from "@/core/settings/registry";
+import { REGISTRY, SECTIONS, SETTING_KEYS, isValidValue, needsEngine, settingDef, type SettingDef, type SettingKey } from "@/core/settings/registry";
 import { hits, read, walk } from "./files";
 
 const defs = SETTING_KEYS.map((k) => [k, settingDef(k)] as const);
@@ -44,6 +44,14 @@ describe("registry law", () => {
     expect(def.default).toBe(false);
     expect(def.requires).toBe(HTTPS_SWITCH);
     if (def.kind === "dataSwitch") expect(def.liveCheck).toBe("live_content_injects_into_test_page");
+  });
+
+  it("DNS encryption defaults on and no data switch: plain DNS is only ever the user's choice", () => {
+    const def = settingDef(DNS_ENCRYPTION as SettingKey);
+    expect(def.kind).toBe("boolean");
+    expect(def.default).toBe(true);
+    expect(def.help).toMatch(/plain text/);
+    expect(read("src/data/engine-controller.ts")).toContain("plain_dns: settings.get(DNS_ENCRYPTION) === false");
   });
 
   it("every default is a valid value for its own entry", () => {

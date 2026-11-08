@@ -10,7 +10,7 @@ Each needs an admin terminal and network testing allowed. `docs/live/` holds the
 |---|---|---|
 | 1 | `2026-10-18-cpu-experiments-handoff.md`, `p0-relay-floor.md` | The relay's CPU cost against the 0.15 gate, and which settings to keep |
 | 2 | `engine-slice-3.md`, `attribution.md` | Full routing, the 0.95 attribution gate, kill, watchdog, AdGuard pause, reboot and uninstall |
-| 3 | `encrypted-dns.md`, `dns-extras.md` | No plain DNS leaves the machine, failover, ECH stripping, private reverse lookups |
+| 3 | `encrypted-dns.md`, `dns-extras.md` | No plain DNS leaves the machine without the user's choice, failover, ECH stripping, private reverse lookups |
 | 4 | `engine-slice-5.md` | The root certificate: install, Firefox, removal |
 | 5 | `engine-slice-6.md` | HTTPS interception and the never-decrypt floor. Unlocks `filtering.https` |
 | 6 | `engine-slice-7.md`, `engine-slice-8.md`, `engine-slice-11.md` | Self-healing exclusions, QUIC refusal, CT, CRLite, ECH upstream |
@@ -98,6 +98,7 @@ From `docs/tasks/2026-11-02-encrypted-dns.md`.
 **For the user (each has a default, so nothing blocks; change it before merge if you disagree).**
 
 - **Q1. No encrypted resolver reachable, including hotel, airport and other captive-portal Wi-Fi.** Portals usually need plain DNS to reach their sign-in page, and some networks block 443 and 853 to public resolvers. The spec says never plain, and a plan search for "captive" finds nothing. With the default, DNS answers SERVFAIL for as long as the engine is on, and the way out is turning filtering off (which restores normal DNS at once). The alternative would be a user-visible, time-limited "allow plain DNS to the network's server" exception. **Default: strict, as the spec says, documented in the runbook.** Do you want an exception or a notice instead?
+  - **Settled by the owner, 2026-11-06:** DNS encryption is on by default and the user may turn it off (`filtering.dnsEncryption`, the policy's `plain_dns`); off sends lookups in plain text to the server the client addressed. With it on, failed resolvers mean failed lookups, never an automatic fallback. The app says so with a Home banner (the status's `dns_unreachable`) that points at the switch and never flips it. Runbook: `docs/live/encrypted-dns.md` checks 12 and 13.
 - **Q2. Resolver certificate trust (D4).** `webpki-roots` means a resolver behind a private CA (a home DoH server) or a TLS-inspecting corporate network fails, and resolver certificates get no revocation check. In exchange, verification cannot deadlock on its own DNS. The alternative is the Windows verifier run off the runtime, and resolving the loop some other way, which is more code and a real risk to the watchdog. **Default: `webpki-roots`.** Is a private-CA resolver something you need?
 
 **For the orchestrator (scope, not design).**

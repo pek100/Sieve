@@ -130,6 +130,27 @@ describe("settings view (rendered from the registry)", () => {
     expect(within(row("startup.launchAtLogin")).getByRole("switch")).toBeChecked();
   });
 
+  it("DNS encryption sits under the DNS servers, on by default, and says off is visible on the network", async () => {
+    const rt = await setup();
+    const keys = [...document.querySelectorAll("#section-filtering [data-setting]")].map((el) => el.getAttribute("data-setting"));
+    expect(keys.indexOf("filtering.dnsEncryption")).toBe(keys.indexOf("filtering.upstreams") + 1);
+    const r = row("filtering.dnsEncryption");
+    const sw = within(r).getByRole("switch", { name: "Encrypt DNS lookups" });
+    expect(sw).toBeChecked();
+    expect(sw).toBeEnabled();
+    expect(sw).toHaveAccessibleDescription(/anyone on the network can see them/);
+    await userEvent.click(sw);
+    expect(rt.settings.get("filtering.dnsEncryption")).toBe(false);
+    await userEvent.click(within(r).getByRole("switch"));
+    expect(rt.settings.get("filtering.dnsEncryption")).toBe(true);
+  });
+
+  it("a stored value that is not a boolean reads as encrypted", async () => {
+    const rt = await setup({ schema: 5, values: { "filtering.dnsEncryption": "off" } });
+    expect(rt.settings.get("filtering.dnsEncryption")).toBe(true);
+    expect(within(row("filtering.dnsEncryption")).getByRole("switch")).toBeChecked();
+  });
+
   it("changing a control writes the setting", async () => {
     const rt = await setup();
     await userEvent.click(within(row("appearance.theme")).getByRole("radio", { name: "Light" }));

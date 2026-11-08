@@ -18,7 +18,7 @@ describe("parseUpstream: the three encrypted kinds", () => {
     expect(parseUpstream("quic://[2001:db8::1]:853")).toEqual({ kind: "doq", host: "[2001:db8::1]", port: 853, path: null });
   });
 
-  it("refuses bare addresses: the engine sends no plain DNS", () => {
+  it("refuses bare addresses: the list is only ever encrypted", () => {
     for (const bad of ["1.1.1.1", "9.9.9.9:53", "2620:fe::fe", "[2606:4700::1111]:53", "dns.example"]) expect(parseUpstream(bad), bad).toBeNull();
   });
 

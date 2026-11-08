@@ -64,8 +64,9 @@ const UPSTREAMS = "filtering.upstreams" satisfies SettingKey;
  * now holds encrypted upstreams: of a stored list, the entries that parse as
  * DoH, DoT or DoQ come first, followed by the defaults not already present;
  * none parses (every list an old build could store, bare addresses): the key
- * goes, so the defaults apply. A plain address is never carried forward,
- * because the engine sends no plain DNS.
+ * goes, so the defaults apply. A plain address is never carried forward: the
+ * list is only ever encrypted, and plain DNS is the user's own later choice
+ * (`filtering.dnsEncryption`, a new key with a default, so no step of its own).
  */
 export function retireDnsProxy(values: Values): Values {
   const next: Values = { ...values };
