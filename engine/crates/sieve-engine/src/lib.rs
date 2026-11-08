@@ -14,7 +14,9 @@
 //! - [`quic`]: the per-flow refusal behind the same switch (slice 8);
 //! - [`http`]: decrypted requests through hyper, with full-URL rules (slice 6);
 //! - [`exclusions`]: the store behind `sieve_filter::exclusions::decrypt`;
-//! - [`heal`]: self-healing exclusions and their notices (slice 7);
+//! - [`heal`]: self-healing exclusions and their notices (slice 7), and the
+//!   per-app pass-through when an app keeps refusing Sieve's certificate;
+//! - [`issues`]: each app's recent problems and who most likely caused them;
 //! - [`lru`]: the bounded caches' shape;
 //! - [`coexist`]: AdGuard and VPN detection, read only (slice 3);
 //! - [`update`]: signed updates, the service as the only updater (slice 13);
@@ -42,6 +44,7 @@ pub mod heal;
 pub mod http;
 pub mod inject;
 pub mod ipc;
+pub mod issues;
 pub mod lists;
 pub mod lru;
 pub mod policy;

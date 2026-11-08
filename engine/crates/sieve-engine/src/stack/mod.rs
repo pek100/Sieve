@@ -10,10 +10,14 @@
 //! - [`Meters`]: the engine's own counters (attribution is read from them);
 //! - `relay` (Windows): the per-flow tasks; `dns_flow` (Windows): port 53;
 //! - `egress` (Windows): the pinned sockets both of them leave through;
-//! - `path_mtu` (Windows): a relayed UDP datagram too big for the real path.
+//! - `path_mtu` (Windows): a relayed UDP datagram too big for the real path;
+//! - [`retry`]: the upstream connect, tried again before the app sees anything;
+//! - [`progress`]: a relayed flow's last bytes each way, for a stall.
 
 pub mod attribution;
 pub mod book;
+pub mod progress;
+pub mod retry;
 #[cfg(feature = "attribution-diagnostics")]
 pub mod diagnostics;
 #[cfg(windows)]
@@ -83,6 +87,8 @@ pub struct HttpsMeters {
     pub passed: AtomicU64,
     /// Exclusions self-healing wrote (plan 6's rate), no host.
     pub healed: AtomicU64,
+    /// Apps let through untouched because they kept refusing Sieve (`heal::trouble`).
+    pub failed_open: AtomicU64,
     pub upstream_groups: [AtomicU64; KX_GROUPS],
     pub client_groups: [AtomicU64; KX_GROUPS],
     // Slice 11 (task D11), counts only.
@@ -107,6 +113,7 @@ impl HttpsMeters {
             "intercepted": self.intercepted.load(Ordering::Relaxed),
             "passed": self.passed.load(Ordering::Relaxed),
             "healed": self.healed.load(Ordering::Relaxed),
+            "failed_open": self.failed_open.load(Ordering::Relaxed),
             "upstream_groups": groups(&self.upstream_groups),
             "client_groups": groups(&self.client_groups),
             "ct_compliant": self.ct_compliant.load(Ordering::Relaxed),

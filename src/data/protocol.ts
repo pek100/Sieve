@@ -682,7 +682,29 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
 
 export const LOG_TAIL_VERSION = 1 as const;
 /** sieve-ipc `LogOutcome` kinds, in declaration order. */
-export const LOG_OUTCOMES = ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted"] as const;
+export const LOG_OUTCOMES = ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted", "problem", "retried"] as const;
+
+/** sieve-ipc `Signal`, in declaration order: what went wrong for a flow. */
+export const SIGNALS = [
+  "connect_refused",
+  "connect_timeout",
+  "unreachable",
+  "connect_failed",
+  "egress_failed",
+  "connection_lost",
+  "stall",
+  "dns_unanswered",
+  "app_refused_certificate",
+  "blocked",
+  "quic_refused",
+] as const;
+export type Signal = (typeof SIGNALS)[number];
+/** sieve-ipc `Cause`: who most likely caused it. The engine decides; the app only says it. */
+export const CAUSES = ["sieve", "network", "unknown"] as const;
+export type Cause = (typeof CAUSES)[number];
+/** sieve-ipc `RetryHow`. */
+export const RETRY_HOWS = ["next_address", "reconnect"] as const;
+export type RetryHow = (typeof RETRY_HOWS)[number];
 
 export type LogOutcome =
   | { kind: "blocked" }
@@ -691,7 +713,9 @@ export type LogOutcome =
   | { kind: "hidden"; elements: number }
   | { kind: "scriptlets"; count: number }
   | { kind: "passed"; reason: string }
-  | { kind: "not_decrypted"; reason: string };
+  | { kind: "not_decrypted"; reason: string }
+  | { kind: "problem"; signal: Signal; cause: Cause }
+  | { kind: "retried"; how: RetryHow; recovered: boolean };
 
 export interface LogRow {
   id: number;
@@ -752,9 +776,85 @@ function logOutcome(raw: unknown): LogOutcome | null {
     case "passed":
     case "not_decrypted":
       return typeof raw.reason === "string" ? { kind: raw.kind, reason: raw.reason } : null;
+    case "problem":
+      return isOneOf(raw.signal, SIGNALS) && isOneOf(raw.cause, CAUSES) ? { kind: "problem", signal: raw.signal, cause: raw.cause } : null;
+    case "retried":
+      return isOneOf(raw.how, RETRY_HOWS) && typeof raw.recovered === "boolean" ? { kind: "retried", how: raw.how, recovered: raw.recovered } : null;
     default:
       return null;
   }
+}
+
+const isOneOf = <T extends string>(x: unknown, names: readonly T[]): x is T => typeof x === "string" && (names as readonly string[]).includes(x);
+
+// ---------------------------------------------------------------------------
+// Each app's recent problems (`issues`, sieve-ipc `AppIssues`). Local only.
+
+export interface Problem {
+  signal: Signal;
+  cause: Cause;
+  /** The name, else the remote IP; null for a lookup with no question read. */
+  host: string | null;
+  count: number;
+  first_ms: number;
+  last_ms: number;
+}
+
+export interface AppIssues {
+  /** The app's `apps.levels` key, or a VM row's `vm:` key. */
+  key: string;
+  /** The exe's file name, lower case; null for a VM. */
+  exe: string | null;
+  session: number | null;
+  /** When Sieve first saw the app since it last started routing. */
+  since_ms: number;
+  flows: number;
+  retried: number;
+  recovered: number;
+  /** Newest first. */
+  problems: Problem[];
+}
+
+export interface Issues {
+  run: number;
+  revision: number;
+  /** Empty when nothing changed since the revision asked for. */
+  apps: AppIssues[];
+  dropped: number;
+}
+
+function problem(raw: unknown): Problem | null {
+  if (!isRec(raw) || !isOneOf(raw.signal, SIGNALS) || !isOneOf(raw.cause, CAUSES) || !isCount(raw.count) || !isCount(raw.last_ms)) return null;
+  return { signal: raw.signal, cause: raw.cause, host: optStr(raw.host), count: raw.count, first_ms: optCount(raw.first_ms) ?? raw.last_ms, last_ms: raw.last_ms };
+}
+
+/** One app, or null without a key or any readable problem. Counts default to 0. */
+function appIssues(raw: unknown): AppIssues | null {
+  if (!isRec(raw) || typeof raw.key !== "string" || raw.key === "" || !Array.isArray(raw.problems)) return null;
+  const problems = raw.problems.map(problem).filter((p): p is Problem => p !== null);
+  if (problems.length === 0) return null;
+  return {
+    key: raw.key,
+    exe: optStr(raw.exe),
+    session: optCount(raw.session),
+    since_ms: optCount(raw.since_ms) ?? Math.min(...problems.map((p) => p.first_ms)),
+    flows: optCount(raw.flows) ?? 0,
+    retried: optCount(raw.retried) ?? 0,
+    recovered: optCount(raw.recovered) ?? 0,
+    problems,
+  };
+}
+
+/** Validate an untrusted `issues` answer, the one normalizer of this shape. A bad app or problem is left out; a wrong shape throws. */
+export function parseIssues(raw: unknown): Issues {
+  const x = rec(raw, "issues");
+  if (!Array.isArray(x.apps)) throw new ProtocolError("issues.apps must be an array");
+  return {
+    run: int(x.run, "issues.run"),
+    revision: int(x.revision, "issues.revision"),
+    apps: x.apps.map(appIssues).filter((a): a is AppIssues => a !== null),
+    dropped: optCount(x.dropped) ?? 0,
+  };
 }
 
 /** One row, or null when it has no seq, time, host or readable outcome. Optional fields default to null. */

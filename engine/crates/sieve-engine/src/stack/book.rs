@@ -6,12 +6,17 @@
 //!
 //! Bytes are reported when a flow closes (the relay counts them then); an
 //! open flow's event says 0 until its last event.
+//!
+//! Every flow ends here, so the book also feeds each app's problems
+//! ([`crate::issues`]): a relay task names a flow's problem ([`FlowBook::problem`])
+//! before it closes it, and a close says what no task named (a block, a failure).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use sieve_ipc::{FlowAction, FlowEvent, Forwarded, Guest, LOG_RULE_MAX, LOG_URL_MAX, LogOutcome, LogRow, MAX_GUESTS, cap_text, vm_key};
+use sieve_ipc::{AppIssues, FlowAction, FlowEvent, Forwarded, Guest, LOG_RULE_MAX, LOG_URL_MAX, LogOutcome, LogRow, MAX_GUESTS, RetryHow, Signal, cap_text, vm_key};
 
 use crate::domain::{Decision, Reason};
+use crate::issues::{AppId, Issues};
 
 /// The flows the engine holds at most (plan 6, flow caps): past it a new
 /// flow is closed at once and counted.
@@ -27,6 +32,11 @@ pub const MAX_PENDING_LOG: usize = 4_000;
 /// limits clients to the owner and admins); an unknown flow could be anyone's.
 pub fn visible_to(event: &FlowEvent, session: u32) -> bool {
     event.forwarded.is_some() || matches!(event.session, Some(s) if s == session || s == 0)
+}
+
+/// The address part of a flow's `remote`, what a row with no name shows.
+fn remote_ip(remote: &str) -> String {
+    remote.parse::<std::net::SocketAddr>().map_or_else(|_| remote.to_string(), |a| a.ip().to_string())
 }
 
 /// [`visible_to`] for a log row: a row shows no more than its flow does.
@@ -64,8 +74,22 @@ pub struct RequestRow<'a> {
     pub list: Option<&'a str>,
 }
 
-#[derive(Debug, Default)]
+/// Whose an open flow is, for its problems: the app, its exe's file name, and
+/// whether a task already named the flow's problem.
+#[derive(Debug)]
+struct Owned {
+    app: AppId,
+    exe: Option<String>,
+    named: bool,
+}
+
+#[derive(Debug)]
 pub struct FlowBook {
+    /// The wall clock, in ms (S15): what problems and their rows are dated by.
+    clock: fn() -> u64,
+    /// Open flows that belong to an app or a VM row.
+    owners: HashMap<u64, Owned>,
+    issues: Issues,
     next_id: u64,
     open: HashMap<u64, FlowEvent>,
     /// Flows changed since the last batch, by id (closed ones included).
@@ -83,7 +107,83 @@ pub struct FlowBook {
     list_hits: BTreeMap<String, u64>,
 }
 
+impl Default for FlowBook {
+    fn default() -> Self {
+        Self::with_clock(crate::policy::wall_ms)
+    }
+}
+
 impl FlowBook {
+    pub fn with_clock(clock: fn() -> u64) -> Self {
+        Self {
+            clock,
+            owners: HashMap::new(),
+            issues: Issues::default(),
+            next_id: 0,
+            open: HashMap::new(),
+            changed: BTreeSet::new(),
+            closed: HashMap::new(),
+            guests: BTreeMap::new(),
+            next_log_id: 0,
+            log: Vec::new(),
+            list_hits: BTreeMap::new(),
+        }
+    }
+
+    /// Names the app or VM row an open flow belongs to (its `apps.levels` key);
+    /// None for an unknown flow, which has no app to have problems.
+    pub fn own(&mut self, id: u64, key: Option<String>) {
+        let (Some(key), Some(e)) = (key, self.open.get(&id)) else { return };
+        // A VM's row is the machine's (None); a host flow with no session is no
+        // client's, as in `visible_to`.
+        let session = match (&e.forwarded, e.session) {
+            (Some(_), _) => None,
+            (None, Some(s)) => Some(s),
+            (None, None) => return,
+        };
+        let exe = e.exe.as_deref().map(sieve_filter::exclusions::exe_file_name);
+        let app = AppId { key, session };
+        self.issues.seen(&app, exe.as_deref(), (self.clock)());
+        self.owners.insert(id, Owned { app, exe, named: false });
+    }
+
+    /// The problem of an open flow: counted for its app, and a log row unless
+    /// Sieve meant it (a block has its decision's row already).
+    pub fn problem(&mut self, id: u64, signal: Signal) {
+        let Some(e) = self.open.get(&id) else { return };
+        let now = (self.clock)();
+        if let Some(o) = self.owners.get_mut(&id) {
+            o.named = true;
+            let host = e.host.clone().unwrap_or_else(|| remote_ip(&e.remote));
+            self.issues.problem(&o.app, o.exe.as_deref(), signal, Some(&host), now);
+        }
+        if !signal.intended() {
+            self.push_row(id, now, None, LogOutcome::Problem { signal, cause: signal.cause() }, None, None);
+        }
+    }
+
+    /// Sieve tried an open flow's connect again (`stack::retry`): a row, so a
+    /// retry is never silent, and a count for the app.
+    pub fn retried(&mut self, id: u64, how: RetryHow, recovered: bool) {
+        let now = (self.clock)();
+        if let Some(o) = self.owners.get(&id) {
+            self.issues.retried(&o.app, o.exe.as_deref(), recovered, now);
+        }
+        self.push_row(id, now, None, LogOutcome::Retried { how, recovered }, None, None);
+    }
+
+    /// The apps of `session` (and the services' and VMs') with recent problems.
+    pub fn issues(&self, session: u32) -> Vec<AppIssues> {
+        self.issues.view(|s| s.is_none_or(|s| s == session || s == 0), (self.clock)())
+    }
+
+    pub fn issues_revision(&self) -> u64 {
+        self.issues.revision()
+    }
+
+    pub fn issues_dropped(&self) -> u64 {
+        self.issues.dropped()
+    }
     /// The VM name of the row a guest's flow counts in, which is also the row
     /// whose Off applies to it. Past [`MAX_GUESTS`] a new name folds into the
     /// unidentified row (one slot stays reserved for it), and since rows are never
@@ -140,7 +240,7 @@ impl FlowBook {
             self.next_log_id += 1;
             return;
         }
-        let ip = || e.remote.parse::<std::net::SocketAddr>().map_or_else(|_| e.remote.clone(), |a| a.ip().to_string());
+        let ip = || remote_ip(&e.remote);
         let row = LogRow {
             id: self.next_log_id + 1,
             t,
@@ -200,8 +300,19 @@ impl FlowBook {
         std::mem::take(&mut self.log)
     }
 
-    /// The flow ended with these totals.
+    /// The flow ended with these totals. What no task named is named here: a
+    /// block is the rule's, a failure with no other word is a lost connection.
     pub fn close(&mut self, id: u64, action: FlowAction, bytes_up: u64, bytes_down: u64) {
+        if self.owners.get(&id).is_some_and(|o| !o.named) {
+            match action {
+                FlowAction::Blocked => self.problem(id, Signal::Blocked),
+                FlowAction::Failed => self.problem(id, Signal::ConnectionLost),
+                FlowAction::Relayed => {}
+            }
+        }
+        if let Some(o) = self.owners.remove(&id) {
+            self.issues.ended(&o.app, (self.clock)());
+        }
         if let Some(mut e) = self.open.remove(&id) {
             if let Some(forwarded) = &e.forwarded {
                 let guest = self.guest_mut(forwarded);
@@ -216,12 +327,14 @@ impl FlowBook {
         }
     }
 
-    /// Ends every open flow (the routes went down; their tasks are gone).
+    /// Ends every open flow (the routes went down; their tasks are gone). The
+    /// apps' problems stay; when Sieve began filtering each starts over.
     pub fn close_all(&mut self) {
         let ids: Vec<u64> = self.open.keys().copied().collect();
         for id in ids {
             self.close(id, FlowAction::Relayed, 0, 0);
         }
+        self.issues.restart();
     }
 
     /// An open flow's event.
@@ -384,6 +497,87 @@ mod tests {
         b.log_decision(id, &decided(Reason::NamedNoRule, None, None), 1);
         b.log_decision(id, &decided(Reason::Disabled, None, Some("a")), 1);
         assert_eq!(b.list_hits().iter().map(|(k, v)| (k.as_str(), *v)).collect::<Vec<_>>(), [("a", 2)]);
+    }
+
+    const T: u64 = 1_793_000_000_000;
+
+    fn clocked() -> FlowBook {
+        FlowBook::with_clock(|| T)
+    }
+
+    fn owned(b: &mut FlowBook, key: &str) -> u64 {
+        let id = b.open(event(Some(1))).unwrap();
+        b.own(id, Some(key.into()));
+        id
+    }
+
+    #[test]
+    fn a_close_names_what_no_task_named_and_a_named_problem_counts_once() {
+        let mut b = clocked();
+        let blocked = owned(&mut b, "a");
+        b.update(blocked, |e| e.host = Some("ads.example".into()));
+        b.close(blocked, FlowAction::Blocked, 0, 0);
+        let failed = owned(&mut b, "a");
+        b.close(failed, FlowAction::Failed, 0, 0);
+        let timed_out = owned(&mut b, "a");
+        b.problem(timed_out, Signal::ConnectTimeout);
+        b.close(timed_out, FlowAction::Failed, 0, 0);
+        let fine = owned(&mut b, "a");
+        b.close(fine, FlowAction::Relayed, 1, 1);
+        let rows: Vec<LogOutcome> = b.take_log().into_iter().map(|r| r.outcome).collect();
+        assert_eq!(rows, [LogOutcome::Problem { signal: Signal::ConnectionLost, cause: sieve_ipc::Cause::Unknown }, LogOutcome::Problem { signal: Signal::ConnectTimeout, cause: sieve_ipc::Cause::Network }], "a block's row is its decision's");
+        let a = &b.issues(1)[0];
+        assert_eq!((a.key.as_str(), a.exe.as_deref(), a.flows, a.since_ms), ("a", Some("a.exe"), 4, T));
+        let mut signals: Vec<(Signal, Option<&str>, u32)> = a.problems.iter().map(|p| (p.signal, p.host.as_deref(), p.count)).collect();
+        signals.sort();
+        assert_eq!(signals, [(Signal::ConnectTimeout, Some("93.184.215.14"), 1), (Signal::ConnectionLost, Some("93.184.215.14"), 1), (Signal::Blocked, Some("ads.example"), 1)]);
+    }
+
+    #[test]
+    fn an_unknown_flows_problem_is_logged_but_belongs_to_no_app() {
+        let mut b = clocked();
+        let id = b.open(event(Some(1))).unwrap();
+        b.own(id, None);
+        b.problem(id, Signal::Stall);
+        b.close(id, FlowAction::Relayed, 0, 0);
+        assert_eq!(b.take_log().len(), 1);
+        assert!(b.issues(1).is_empty());
+        let no_session = b.open(event(None)).unwrap();
+        b.own(no_session, Some("a".into()));
+        b.problem(no_session, Signal::Stall);
+        assert!(b.issues(1).is_empty() && b.issues(0).is_empty(), "a flow of no session is no client's");
+    }
+
+    #[test]
+    fn a_retry_is_a_row_and_a_count() {
+        let mut b = clocked();
+        let id = owned(&mut b, "a");
+        b.retried(id, RetryHow::NextAddress, true);
+        b.problem(id, Signal::ConnectRefused);
+        assert_eq!(b.take_log()[0].outcome, LogOutcome::Retried { how: RetryHow::NextAddress, recovered: true });
+        assert_eq!((b.issues(1)[0].retried, b.issues(1)[0].recovered), (1, 1));
+    }
+
+    #[test]
+    fn a_guests_problems_are_the_machines_and_another_sessions_are_not_mine() {
+        let mut b = clocked();
+        let guest = b.open(guest_event(Some("DevBox"))).unwrap();
+        b.own(guest, Some(vm_key(Some("DevBox"))));
+        b.problem(guest, Signal::Stall);
+        let other = b.open(event(Some(2))).unwrap();
+        b.own(other, Some("theirs".into()));
+        b.problem(other, Signal::Stall);
+        assert_eq!(b.issues(1).iter().map(|a| a.key.as_str()).collect::<Vec<_>>(), ["vm:devbox"]);
+        assert_eq!(b.issues(1)[0].session, None);
+    }
+
+    #[test]
+    fn routes_coming_down_start_since_over_and_keep_problems() {
+        let mut b = clocked();
+        let id = owned(&mut b, "a");
+        b.problem(id, Signal::Stall);
+        b.close_all();
+        assert_eq!((b.issues(1)[0].flows, b.issues(1)[0].problems.len()), (0, 1));
     }
 
     #[test]

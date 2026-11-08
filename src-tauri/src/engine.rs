@@ -25,6 +25,8 @@
 //! - `engine_exclusions(after) -> ExclusionsPage`, `engine_try_decrypt_again(line,
 //!   app, reason) -> ExclusionsPage`, `engine_heal_notices(after) -> HealNotices`: what the
 //!   engine keeps from being decrypted, and self-healing's notices (plan 4.3, 8.2).
+//! - `engine_issues(after) -> Issues`: the apps with recent problems and their
+//!   likely cause, when they changed since `after` (local only).
 //! - `engine_request_update() -> EngineStatus`: asks the engine to update; it
 //!   carries nothing, and the engine alone fetches and verifies (plan 7.5).
 //! - [`EngineFlows`]: while the engine routes, a subscription to its `Flows`
@@ -412,6 +414,15 @@ mod imp {
         }
     }
 
+    /// The apps of this client's session with recent problems, when they changed since `after`.
+    pub async fn issues(name: &str, after: u64) -> Result<Issues, String> {
+        match ask(name, ClientMessage::Issues { after }).await? {
+            EngineMessage::Issues { run, revision, apps, dropped } => Ok(Issues { run, revision, apps, dropped }),
+            EngineMessage::Error { message } => Err(message),
+            other => Err(format!("unexpected answer: {other:?}")),
+        }
+    }
+
     /// The notices newer than `after`, of this client's session.
     pub async fn heal_notices(name: &str, after: u64) -> Result<HealNotices, String> {
         match ask(name, ClientMessage::HealNotices { after }).await? {
@@ -456,7 +467,7 @@ mod imp {
             match read_frame::<_, EngineMessage>(&mut pipe).await {
                 Ok(EngineMessage::Flows { flows: batch }) => flows.apply(batch),
                 Ok(EngineMessage::Log { rows }) => log.push(rows),
-                Ok(EngineMessage::Welcome { .. } | EngineMessage::Incompatible { .. } | EngineMessage::Status(_) | EngineMessage::Error { .. } | EngineMessage::Lists { .. } | EngineMessage::DnsUpstreams(_) | EngineMessage::CertStatus(_) | EngineMessage::Exclusions { .. } | EngineMessage::HealNotices { .. } | EngineMessage::ListImported { .. } | EngineMessage::ListRules { .. }) => {}
+                Ok(EngineMessage::Welcome { .. } | EngineMessage::Incompatible { .. } | EngineMessage::Status(_) | EngineMessage::Error { .. } | EngineMessage::Lists { .. } | EngineMessage::DnsUpstreams(_) | EngineMessage::CertStatus(_) | EngineMessage::Exclusions { .. } | EngineMessage::HealNotices { .. } | EngineMessage::ListImported { .. } | EngineMessage::ListRules { .. } | EngineMessage::Issues { .. }) => {}
                 Err(sieve_ipc::FrameError::Closed) => break Ok(()),
                 Err(e) => break Err(e.to_string()),
             }
@@ -692,6 +703,28 @@ pub async fn engine_try_decrypt_again(line: Option<String>, app: Option<String>,
 #[cfg(not(windows))]
 #[tauri::command]
 pub async fn engine_try_decrypt_again(_line: Option<String>, _app: Option<String>, _reason: Option<String>) -> Result<ExclusionsPage, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// `EngineMessage::Issues`, for the window. Local only: it goes no further.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Issues {
+    pub run: u64,
+    pub revision: u64,
+    pub apps: Vec<sieve_ipc::AppIssues>,
+    pub dropped: u64,
+}
+
+/// Command: the apps of this session with recent problems, when they changed since `after`.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_issues(after: u64) -> Result<Issues, String> {
+    imp::issues(PIPE_NAME, after).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_issues(_after: u64) -> Result<Issues, String> {
     Err("the engine runs on Windows only".into())
 }
 
@@ -1154,6 +1187,20 @@ mod tests {
         assert_eq!(got, Ok(HealNotices { run: 9, revision: 1, exclusions_revision: 2, notices: vec![notice] }));
         let old = EngineMessage::Error { message: "unknown variant".into() };
         let got = one_answer("notices-old", ClientMessage::HealNotices { after: 9 }, old, async |n| imp::heal_notices(n, 9).await).await;
+        assert_eq!(got, Err("unknown variant".to_string()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_issues_command_reads_the_apps_or_the_refusal() {
+        use sieve_ipc::{AppIssues, ClientMessage, EngineMessage, Problem, Signal};
+        let problem = Problem { signal: Signal::Blocked, cause: Signal::Blocked.cause(), host: Some("updates.example".into()), count: 2, first_ms: 1, last_ms: 2 };
+        let app = AppIssues { key: "launcher".into(), exe: Some("launcher.exe".into()), session: Some(1), since_ms: 1, flows: 3, retried: 0, recovered: 0, problems: vec![problem] };
+        let answer = EngineMessage::Issues { run: 9, revision: 4, apps: vec![app.clone()], dropped: 0 };
+        let got = one_answer("issues", ClientMessage::Issues { after: 0 }, answer, async |n| imp::issues(n, 0).await).await;
+        assert_eq!(got, Ok(Issues { run: 9, revision: 4, apps: vec![app], dropped: 0 }));
+        let old = EngineMessage::Error { message: "unknown variant".into() };
+        let got = one_answer("issues-old", ClientMessage::Issues { after: 4 }, old, async |n| imp::issues(n, 4).await).await;
         assert_eq!(got, Err("unknown variant".to_string()));
     }
 

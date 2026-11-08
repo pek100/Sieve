@@ -260,16 +260,20 @@ pub enum AutoReason {
     Pinning,
     ClientCert,
     Ev,
+    /// The whole app (pattern `*`), for a while: it refused Sieve's certificate
+    /// for several sites right after Sieve began decrypting it (`heal::trouble`).
+    Failing,
 }
 
 impl AutoReason {
-    pub const ALL: [Self; 3] = [Self::Pinning, Self::ClientCert, Self::Ev];
+    pub const ALL: [Self; 4] = [Self::Pinning, Self::ClientCert, Self::Ev, Self::Failing];
 
     pub fn slug(self) -> &'static str {
         match self {
             Self::Pinning => "auto:pinning",
             Self::ClientCert => "auto:client-cert",
             Self::Ev => "auto:ev",
+            Self::Failing => "auto:failing",
         }
     }
 
@@ -703,7 +707,7 @@ mod decrypt_tests {
             assert_eq!(reason, PassReason::Floor(fact));
             slugs.push(reason.slug().into_owned());
         }
-        let stored = [Source::User, Source::List("banks".into()), Source::Auto(AutoReason::Pinning), Source::Auto(AutoReason::ClientCert), Source::Auto(AutoReason::Ev)];
+        let stored = [Source::User, Source::List("banks".into()), Source::Auto(AutoReason::Pinning), Source::Auto(AutoReason::ClientCert), Source::Auto(AutoReason::Ev), Source::Auto(AutoReason::Failing)];
         for source in &stored {
             let mut set = ExclusionSet::default();
             set.add([line(HOST)], source);
@@ -720,7 +724,19 @@ mod decrypt_tests {
         unique.dedup();
         assert_eq!(unique.len(), slugs.len(), "no two reasons share a slug: {slugs:?}");
         assert!(slugs.contains(&"list:banks".to_string()) && slugs.contains(&"auto:pinning".to_string()) && slugs.contains(&"floor:service".to_string()));
-        assert_eq!(AutoReason::ALL.len(), 3);
+        assert_eq!(AutoReason::ALL.len(), 4);
+    }
+
+    /// `auto:failing` is the whole app: `*` reads as every named host, and only
+    /// for the app it names.
+    #[test]
+    fn a_star_for_one_app_matches_every_named_host_of_that_app_only() {
+        let star = parse_line("*$app=launcher.exe").unwrap();
+        assert_eq!(star.pattern, Pattern::Wildcard("*".into()));
+        assert_eq!(star.pattern.line(), "*");
+        assert!(star.matches(Some("cdn.game.example"), None, Some(r"C:\Games\launcher.exe")));
+        assert!(!star.matches(Some("cdn.game.example"), None, Some(r"C:\Apps\other.exe")));
+        assert!(!star.matches(None, Some("192.0.2.1".parse().unwrap()), Some("launcher.exe")), "no name, no match: such a flow is not decrypted anyway");
     }
 
     #[test]

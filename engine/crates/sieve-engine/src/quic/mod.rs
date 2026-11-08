@@ -101,7 +101,9 @@ pub fn path<C: Dial>(action: Action, slot: &HttpsSlot<C>, decoded: &Decoded, who
 /// app does not read the action, `Blocked` would count against the block figures
 /// when nothing was blocked, and a new variant is a protocol bump.
 pub fn close_refused(book: &Mutex<FlowBook>, id: u64) {
-    book.lock().unwrap_or_else(|p| p.into_inner()).close(id, FlowAction::Relayed, 0, 0);
+    let mut book = book.lock().unwrap_or_else(|p| p.into_inner());
+    book.problem(id, sieve_ipc::Signal::QuicRefused);
+    book.close(id, FlowAction::Relayed, 0, 0);
 }
 
 /// What answers one refused flow.

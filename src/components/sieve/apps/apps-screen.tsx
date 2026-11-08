@@ -9,6 +9,7 @@ import { Page } from "@/components/sieve/shell/page";
 import { matchesQuery, sections } from "@/core/apps-actions";
 import { AddApp } from "./add-app";
 import { AppDetailSheet } from "./app-detail";
+import { TroubleList } from "./app-issues";
 import { AppSectionView, type RowActions } from "./app-list";
 import { AppSearch } from "./app-search";
 import { BulkMenu } from "./bulk-menu";
@@ -20,8 +21,9 @@ import { VmGroup } from "./vm-group";
  * The Apps screen: every app grouped by derived category, on or off per app,
  * the detail sheet deep-linked by ?app=<key>, add and remove, bulk actions.
  * Flat on the page grid (no card): the count beside the title, the search,
- * then the groups, edge to edge of the page container. Virtual machines come
- * first, once the engine has seen their traffic.
+ * then the groups, edge to edge of the page container. Apps having trouble come
+ * first (their problems and fixes are in the sheet), then virtual machines, once
+ * the engine has seen their traffic.
  */
 export function AppsScreen() {
   const model = useApps();
@@ -32,6 +34,8 @@ export function AppsScreen() {
   const grouped = useMemo(() => sections(visible), [visible]);
   const visibleGuests = useMemo(() => model.guests.filter((g) => matchesQuery(g, query)), [model.guests, query]);
   const filtered = query.trim() !== "";
+  // Apps and VM rows by key: what a problem's app is called wherever it shows.
+  const known = useMemo(() => [...model.apps, ...model.guests], [model.apps, model.guests]);
   const waiting = model.phase === "starting" && model.apps.length === 0;
 
   const actions: RowActions = {
@@ -85,6 +89,11 @@ export function AppsScreen() {
                   <EmptyState line="Nothing by that name" body={`No app or path matches "${query.trim()}".`} />
                 ) : (
                   <div className="flex flex-col gap-6">
+                    {!filtered && (
+                      <CardBoundary title="Having trouble">
+                        <TroubleList apps={model.apps} known={known} open={setOpenKey} />
+                      </CardBoundary>
+                    )}
                     <VmGroup rows={visibleGuests} actions={actions} />
                     {grouped.map((s) => (
                       <AppSectionView key={s.category} section={s} actions={actions} filtered={filtered} />
@@ -100,6 +109,7 @@ export function AppsScreen() {
         appKey={openKey}
         app={openKey === null ? undefined : model.apps.find((a) => a.key === openKey)}
         loading={waiting}
+        known={known}
         actions={actions}
         onClose={() => setOpenKey(null)}
       />

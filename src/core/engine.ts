@@ -13,7 +13,7 @@
  *
  * The slice has one writer, the engine controller (src/data/engine-controller.ts).
  */
-import type { CertState, CertStatus, EngineBlocker, EngineProbe, EngineStatus, EngineUpdate, FirefoxTrust, ListFact } from "@/data/protocol";
+import type { CertState, CertStatus, EngineBlocker, EngineProbe, EngineStatus, EngineUpdate, FirefoxTrust, Issues, ListFact } from "@/data/protocol";
 import type { ExclusionsFacts, HealGroup } from "./exclusions";
 
 /** An update state that says nothing: no answer, or a missing or broken one. */
@@ -80,6 +80,10 @@ export interface EngineSlice {
   exclusionsActionError?: string | null;
   /** What self-healing excluded in this window's life, oldest first. */
   healNotices?: readonly HealGroup[];
+  /** The apps with recent problems, as the engine last said; null while the engine is not routing or before the first read. */
+  issues?: Issues | null;
+  /** Why the newest read of those failed; null after a good one. The apps stay. */
+  issuesError?: string | null;
 }
 
 export const EMPTY_ENGINE: EngineSlice = { probe: null, error: null, adguard: null, actionError: null, cert: null, certError: null, certActionError: null };

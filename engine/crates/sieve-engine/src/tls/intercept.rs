@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use rustls::{AlertDescription, NamedGroup};
 use sieve_filter::exclusions::{AutoReason, Decrypt, Floor, FlowFacts, PassReason, Switches, Transport, UpstreamVerdict, decrypt, name_may_intercept};
-use sieve_ipc::FlowAction;
+use sieve_ipc::{FlowAction, Signal};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 
@@ -563,10 +563,12 @@ where
         Ok(Ok(client)) => client,
         Ok(Err(e)) => {
             deps.watch.handshake_failed(&pair, alert_in(&e));
+            lock(&deps.book).problem(flow.id, Signal::AppRefusedCertificate);
             return FlowAction::Failed;
         }
         Err(_) => {
             deps.watch.handshake_failed(&pair, None);
+            lock(&deps.book).problem(flow.id, Signal::AppRefusedCertificate);
             return FlowAction::Failed;
         }
     };

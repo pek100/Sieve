@@ -9,11 +9,14 @@
 //! exists, so nothing here runs on any flow.
 //! - [`dials`]: every number, declared;
 //! - [`score`]: the evidence, one quantity with one threshold;
-//! - [`notices`]: one notice per app.
+//! - [`notices`]: one notice per app;
+//! - [`trouble`]: the whole app through untouched for a while, when it refuses
+//!   Sieve for several sites right after Sieve began decrypting it.
 
 pub mod dials;
 pub mod notices;
 pub mod score;
+pub mod trouble;
 
 use std::sync::{Arc, Mutex};
 
@@ -42,6 +45,7 @@ pub enum Retry {
 struct State {
     ledger: Ledger,
     notices: Notices,
+    trouble: trouble::Trouble,
 }
 
 pub struct Heal {
@@ -71,6 +75,14 @@ impl Heal {
     pub fn hear(&self, pair: &Pair, evidence: Evidence, now_ms: u64) {
         let (Some(exe), Some(session)) = (pair.exe.as_deref(), pair.session) else { return };
         let mut state = self.state();
+        let file = exe_file_name(exe);
+        state.trouble.heard(&file, now_ms);
+        if matches!(evidence, Evidence::Refused(_)) && state.trouble.refused(&file, &pair.host, now_ms) {
+            let whole = AutoEntry::whole_app(exe, AutoReason::Failing, now_ms, now_ms.saturating_add(trouble::FAIL_OPEN_MS));
+            if self.exclusions.add_auto(whole, now_ms) {
+                Meters::bump(&self.meters.https.failed_open);
+            }
+        }
         if !state.ledger.hear(exe, &pair.host, evidence, now_ms) {
             return;
         }
@@ -355,6 +367,30 @@ mod tests {
         let (revision, notices) = h.notices(0);
         assert_eq!((revision, notices[0].total), (1, 1));
         assert_eq!(h.meters.https.healed.load(Ordering::Relaxed), 1);
+    }
+
+    /// The fail-open rule end to end: three sites refused right after the start
+    /// let the whole app through, every site, for a day; another app stays
+    /// decrypted; "Try decrypting again" takes it back like any `auto:*` entry.
+    #[test]
+    fn an_app_refusing_several_sites_goes_through_untouched_for_a_while() {
+        use super::trouble::{FAIL_OPEN_MS, TROUBLE_HOSTS};
+        let h = heal();
+        let ip = "192.0.2.1".parse().unwrap();
+        let excluded = |at: u64, exe: &str| h.exclusions.get_at(at).find(Some("never.seen.example"), ip, Some(exe), true).cloned();
+        for i in 0..TROUBLE_HOSTS - 1 {
+            h.hear(&pair(CLIENT, &format!("s{i}.example")), Evidence::Refused(None), NOW + i as u64 * (BURST_MS + 1));
+        }
+        assert_eq!(excluded(NOW + 5_000, CLIENT), None, "not yet the app's case");
+        h.hear(&pair(CLIENT, "last.example"), Evidence::Refused(None), NOW + 5_000);
+        assert_eq!(excluded(NOW + 5_000, CLIENT), Some(Src::Auto(AutoReason::Failing)), "a site it never asked for passes too");
+        assert_eq!(excluded(NOW + 5_000, OTHER), None);
+        assert_eq!(excluded(NOW + 5_000 + FAIL_OPEN_MS, CLIENT), None, "a day later it is decrypted again");
+        assert_eq!(h.meters.https.report()["failed_open"], 1);
+        let row = h.exclusions.rows(NOW + 5_000).into_iter().find(|r| r.reason == "auto:failing").unwrap();
+        assert_eq!((row.line.as_str(), row.apps.as_slice()), ("*", &["client.exe".to_string()][..]));
+        let taken = h.try_again(&Retry::One { pattern: Pattern::Wildcard("*".into()), app: Some("client.exe".into()), reason: AutoReason::Failing }, NOW + 6_000);
+        assert_eq!((taken, excluded(NOW + 6_000, CLIENT)), (1, None));
     }
 
     #[test]

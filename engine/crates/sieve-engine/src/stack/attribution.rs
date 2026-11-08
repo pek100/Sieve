@@ -119,6 +119,15 @@ impl HeldOwner {
             Self::Unknown => Owner::Unknown,
         }
     }
+
+    /// The `apps.levels` key of the row this flow counts in; None when unknown.
+    pub fn row_key(&self) -> Option<String> {
+        match self {
+            Self::App(key) => Some(key.clone()),
+            Self::Forwarded(vm) => Some(sieve_ipc::vm_key(vm.as_deref())),
+            Self::Unknown => None,
+        }
+    }
 }
 
 impl Attribution {

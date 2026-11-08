@@ -6,7 +6,7 @@ import { MAX_POLICY_BYTES, settingDef, type SettingKey } from "@/core/settings/r
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
 import { CRASH_LOOP_BANNER, DNS_UNREACHABLE_BANNER, createEngineController } from "./engine-controller";
-import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_CERT_ERROR, MOCK_ENGINE_ERROR, MOCK_HTTPS_OFF, type CertScenario, type EngineScenario } from "./engine-mock";
+import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_CERT_ERROR, MOCK_ENGINE_ERROR, MOCK_HTTPS_OFF, MOCK_ISSUES_ERROR, type CertScenario, type EngineScenario, type IssuesScenario } from "./engine-mock";
 import type { EngineSource } from "./engine-source";
 import { createMockFilterLists } from "./filter-lists-mock";
 import type { FilterListSource } from "./filter-lists-source";
@@ -63,6 +63,7 @@ function fakeEngine(start: EngineScenario) {
   let certReads = 0;
   let rowReads = 0;
   let noticeReads = 0;
+  const issueReads: number[] = [];
   const source: EngineSource = {
     kind: "mock",
     probe: () => {
@@ -101,9 +102,15 @@ function fakeEngine(start: EngineScenario) {
       noticeReads++;
       return mock.healNotices(after);
     },
+    issues: (after) => {
+      issueReads.push(after);
+      return mock.issues(after);
+    },
   };
   return {
     source,
+    issueReads,
+    withIssues: (issues: IssuesScenario, run?: number) => void (mock = createMockEngine(start, { issues, run, now: () => ISSUES_NOW })),
     set: (s: EngineScenario) => void (mock = createMockEngine(s)),
     setCert: (c: CertScenario) => void (mock = createMockEngine(start, { cert: c })),
     holdHttps: (run?: number) => void (mock = createMockEngine(start, { heal: true, run })),
@@ -379,6 +386,67 @@ function setup(start: EngineScenario, backend: SettingsBackend = memoryBackend()
   const phase = () => enginePhase(store.getState().engine);
   return { fc, store, fake, settings, checks, notices, controller, undo, phase };
 }
+
+const ISSUES_NOW = 1_793_000_500_000;
+
+describe("engine controller, apps' problems", () => {
+  /** An engine routing because the user's switch says so, its problems as asked. */
+  const routing = () => setup("filtering", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+  const slice = (s: ReturnType<typeof setup>) => s.store.getState().engine;
+
+  it("reads nothing while the engine does not route, and clears what it held", async () => {
+    const s = setup("idle");
+    s.fake.withIssues("some");
+    await s.fc.flush();
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.fake.issueReads).toEqual([]);
+    expect(slice(s).issues ?? null).toBeNull();
+  });
+
+  it("reads while it routes, keeps the answer, and asks from its revision so nothing is read twice", async () => {
+    const s = routing();
+    s.fake.withIssues("some");
+    await s.fc.flush();
+    const first = slice(s).issues;
+    expect(first?.apps.map((a) => a.key)).toEqual(["game launcher", "vm:devbox"]);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.fake.issueReads).toEqual([0, first?.revision]);
+    expect(slice(s).issues, "an unchanged answer keeps the apps it had").toBe(first);
+  });
+
+  it("a failed read keeps the apps and says why; the next good one clears the error", async () => {
+    const s = routing();
+    s.fake.withIssues("some");
+    await s.fc.flush();
+    s.fake.withIssues("error");
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).issues?.apps).toHaveLength(2);
+    expect(slice(s).issuesError).toBe(MOCK_ISSUES_ERROR);
+    s.fake.withIssues("some");
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).issuesError).toBeNull();
+  });
+
+  it("a new engine run is read from the start", async () => {
+    const s = routing();
+    s.fake.withIssues("some", 1);
+    await s.fc.flush();
+    s.fake.withIssues("some", 2);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(s.fake.issueReads.slice(-2)).toEqual([9, 0]);
+    expect(slice(s).issues?.run).toBe(2);
+  });
+
+  it("routing stopping clears the apps: nothing true is left to show", async () => {
+    const s = routing();
+    s.fake.withIssues("some");
+    await s.fc.flush();
+    expect(slice(s).issues).not.toBeNull();
+    s.fake.set("stopped");
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(slice(s).issues ?? null).toBeNull();
+  });
+});
 
 describe("engine controller, updates", () => {
   const banners = (s: ReturnType<typeof setup>) => s.notices.list().filter((n) => n.surface === "banner").map((n) => n.text);

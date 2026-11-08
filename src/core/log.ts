@@ -4,8 +4,15 @@
  * (plan 8.3). The slice has one writer, the log controller
  * (src/data/log-controller.ts).
  */
-import type { LogEntry, LogOutcome, LogRow } from "@/data/protocol";
+import type { LogEntry, LogOutcome, LogRow, RetryHow } from "@/data/protocol";
 import { exclusionReasonWords, isExclusionReason } from "./exclusions";
+import { CAUSE_TEXT, SIGNAL_TEXT } from "./issues";
+
+/** How Sieve tried a connection again, before the app saw anything. */
+export const RETRY_TEXT: Readonly<Record<RetryHow, string>> = {
+  next_address: "Sieve tried the site's other address",
+  reconnect: "Sieve tried the connection once more",
+};
 
 /** How often the engine's log tail is read while the engine routes. */
 export const LOG_POLL_MS = 1000;
@@ -113,6 +120,12 @@ export function outcomeWords(outcome: LogOutcome | null | undefined): string {
       return `Passed through (${reasonWords(outcome.reason)})`;
     case "not_decrypted":
       return `Not decrypted (${reasonWords(outcome.reason)})`;
+    case "problem": {
+      const cause = CAUSE_TEXT[outcome.cause] ?? CAUSE_TEXT.unknown;
+      return `${SIGNAL_TEXT[outcome.signal] ?? "A problem"} (${cause.charAt(0).toLowerCase()}${cause.slice(1)})`;
+    }
+    case "retried":
+      return `${RETRY_TEXT[outcome.how] ?? "Sieve tried again"}: ${outcome.recovered ? "it worked" : "it still failed"}`;
     default:
       return "Unknown";
   }

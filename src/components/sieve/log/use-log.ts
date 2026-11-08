@@ -124,7 +124,8 @@ export function useRowActions() {
     notices.push({ kind: "success", text: added, action: { label: "Undo", run: () => void undo() } });
   }, [preview, settings, notices, write]);
 
-  return { run, preview, confirm, cancelPreview: () => setPreview(null), report, setReport, closeReport: () => setReport(null) };
+  // `ask` shows any line first: the app sheet's one-step fixes write through the same confirm.
+  return { run, ask: setPreview, preview, confirm, cancelPreview: () => setPreview(null), report, setReport, closeReport: () => setReport(null) };
 }
 
 export type RowActionsModel = ReturnType<typeof useRowActions>;

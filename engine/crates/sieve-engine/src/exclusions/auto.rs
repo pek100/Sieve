@@ -90,6 +90,11 @@ impl AutoEntry {
         Self { app: Some(exe_file_name(exe)), ..Self::host(host, reason, created_ms, None) }
     }
 
+    /// An entry for every named host of one app (`*`), until `expires_ms`.
+    pub fn whole_app(exe: &str, reason: AutoReason, created_ms: u64, expires_ms: u64) -> Self {
+        Self { pattern: Pattern::Wildcard("*".into()), app: Some(exe_file_name(exe)), ..Self::host("", reason, created_ms, Some(expires_ms)) }
+    }
+
     /// Excludes right now: not taken back, not past its end.
     pub fn is_held(&self, now_ms: u64) -> bool {
         !self.retrying && !self.expired(now_ms)

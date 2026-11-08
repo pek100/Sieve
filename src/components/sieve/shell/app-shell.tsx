@@ -7,6 +7,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Runtime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { useHealNotices } from "@/hooks/use-heal-notices";
+import { useIssueNotices } from "@/hooks/use-issue-notices";
 import { useThemeSync } from "@/hooks/use-theme";
 import { NoticeToaster } from "./notice-toaster";
 import { TopBar } from "./top-bar";
@@ -18,6 +19,7 @@ function ThemeSync() {
 
 function HealNotices() {
   useHealNotices();
+  useIssueNotices();
   return null;
 }
 

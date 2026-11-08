@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use ipstack::{IpStackTcpStream, IpStackUdpStream};
-use sieve_ipc::{FlowAction, FlowKind, FlowProto, FlowReason};
+use sieve_ipc::{FlowAction, FlowKind, FlowProto, FlowReason, Signal};
 
 use super::relay::{Attributed, Relay, close_app, lock};
 use crate::dns::service::{Asker, Totals, serve_datagrams, serve_tcp};
@@ -29,9 +29,16 @@ fn admit(ctx: &Relay, flow: &FiveTuple, attributed: &Attributed, proto: FlowProt
     Some((admitted.id, Asker { may_decrypt: admitted.may_decrypt(), addressed: flow.remote.ip() }))
 }
 
+/// A lookup Sieve could not get an answer for is the flow's problem: `resolved`
+/// counts every answer a server gave, failures included, so what is left is a
+/// question no resolver answered.
 fn finish(ctx: &Relay, id: u64, totals: Totals) {
     let action = if totals.queries > 0 && totals.resolved == 0 { FlowAction::Failed } else { FlowAction::Relayed };
-    lock(&ctx.book).close(id, action, totals.bytes_up, totals.bytes_down);
+    let mut book = lock(&ctx.book);
+    if totals.queries > totals.resolved {
+        book.problem(id, Signal::DnsUnanswered);
+    }
+    book.close(id, action, totals.bytes_up, totals.bytes_down);
 }
 
 pub async fn udp(ctx: Arc<Relay>, mut app: IpStackUdpStream, flow: FiveTuple) {
