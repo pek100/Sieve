@@ -218,7 +218,11 @@ pub fn tcp_header_flags(inner: &TcpHeader) -> u8 {
 //     }
 // }
 
-#[cfg(test)]
+// Sieve (2026-11-08): upstream compiled this criterion benchmark into every test
+// build, and criterion is not a dependency of the vendored copy, so the crate's own
+// unit tests did not build. It now builds only on request, with criterion added by
+// hand: `RUSTFLAGS="--cfg ipstack_bench"`.
+#[cfg(all(test, ipstack_bench))]
 pub mod tests {
     use super::*;
     use criterion::Criterion;

@@ -15,6 +15,11 @@
 # A segment's payload also stops at the usable window's right edge (upstream sized it
 # from the whole window, so the segment after a full one overran the peer's window).
 #
+# The criterion benchmark in `packet.rs` builds only under `--cfg ipstack_bench`, so
+# `cargo test --manifest-path engine/vendor/ipstack/Cargo.toml --lib` runs the crate's
+# own unit tests offline (upstream compiled it into every test build without the
+# dependency it needs).
+#
 # Changed by Sieve (2026-10-18): manifest and lazy TCP logging. The upstream
 # `build.rs` is not copied and `build` is not set. Upstream, on every Windows
 # build (also as a dependency) it ran `cargo metadata` and copied the
