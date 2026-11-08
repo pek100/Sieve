@@ -16,8 +16,14 @@ function sieveSetList(text = "") {
   });
 }
 
+// Named trusted with no requiresTrust, as uBO 3762a26 registers trusted-prevent-xhr.js.
+function trustedSieveUnflagged() {
+  globalThis.sieveFixtureUnflagged = true;
+}
+
 export const builtinScriptlets = [
   { name: "sieve-list-parser.fn", fn: SieveListParser },
   { name: "sieve-later.fn", fn: sieveLaterFn },
   { name: "sieve-set-list.js", fn: sieveSetList, dependencies: ["sieve-list-parser.fn", "sieve-later.fn"] },
+  { name: "trusted-sieve-unflagged.js", fn: trustedSieveUnflagged },
 ];

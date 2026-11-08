@@ -16,6 +16,10 @@ const REDIRECT_FILES_DIR = "src/web_accessible_resources";
 // adblock-rust's PermissionMask bit for "needs a trusted list". The engine gives
 // trusted lists every bit and untrusted lists none.
 const TRUST_PERMISSION = 1;
+// uBO's naming rule: a scriptlet so named is for trusted lists whatever its entry says
+// (uBO 3762a26 registers trusted-prevent-xhr.js without requiresTrust). The engine
+// refuses a bundle that leaves one open (`TRUSTED_PREFIX`, sieve-filter resources.rs).
+const TRUSTED_PREFIX = "trusted-";
 // What adblock-rust's extract_function_name needs to call a resource with arguments.
 const NAMED_FUNCTION = /^function\s+[^(){}\s]+\s*\(/;
 // A dependency is only prepended, never called, so any named declaration will do:
@@ -53,7 +57,8 @@ function scriptletResource(entry, nameOf) {
   };
   const dependencies = asArray(entry.dependencies).map(nameOf);
   if (dependencies.length > 0) resource.dependencies = dependencies;
-  if (entry.requiresTrust) resource.permission = TRUST_PERMISSION;
+  const namedTrusted = [resource.name, ...resource.aliases].some((id) => id.startsWith(TRUSTED_PREFIX));
+  if (entry.requiresTrust || namedTrusted) resource.permission = TRUST_PERMISSION;
   return resource;
 }
 

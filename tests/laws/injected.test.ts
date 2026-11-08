@@ -113,10 +113,18 @@ describe("the bundle script", () => {
   it("takes dependencies declared as a class or an async function, as current uBO has them", () => {
     const resources = JSON.parse(assembleFixtureTree("tests/fixtures/ubo-tree-declarations")) as { name: string; kind: { mime: string }; content: string }[];
     const source = (name: string) => Buffer.from(resources.find((r) => r.name === name)?.content ?? "", "base64").toString("utf8");
-    expect(resources.map((r) => r.name)).toEqual(["sieve-later.fn", "sieve-list-parser.fn", "sieve-set-list.js"]);
+    expect(resources.map((r) => r.name)).toEqual(["sieve-later.fn", "sieve-list-parser.fn", "sieve-set-list.js", "trusted-sieve-unflagged.js"]);
     expect(resources.filter((r) => r.name.endsWith(".fn")).every((r) => r.kind.mime === "fn/javascript")).toBe(true);
     expect(source("sieve-list-parser.fn")).toMatch(/^class SieveListParser /);
     expect(source("sieve-later.fn")).toMatch(/^async function sieveLaterFn\(/);
+  });
+
+  // Live run 2026-11-08: uBO 3762a26 registers trusted-prevent-xhr.js without requiresTrust,
+  // and the engine refused the whole bundle. uBO's naming rule makes it trusted all the same.
+  it("marks a resource named trusted- as trusted even without requiresTrust", () => {
+    const resources = JSON.parse(assembleFixtureTree("tests/fixtures/ubo-tree-declarations")) as { name: string; permission?: number }[];
+    expect(resources.find((r) => r.name === "trusted-sieve-unflagged.js")?.permission).toBe(1);
+    expect(resources.find((r) => r.name === "sieve-set-list.js")?.permission).toBeUndefined();
   });
 });
 
