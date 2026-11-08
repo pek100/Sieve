@@ -36,32 +36,56 @@ function Test-InterceptionUp($status, [int64]$revision) {
 }
 
 # What certutil's answer about the key says: "refused", "missing", "readable" or "error".
-function Get-KeyAnswer([string]$text, [int]$exitCode) {
-  if ($exitCode -eq 0) { return "readable" }
-  if ($text -match "(?i)NTE_BAD_KEYSET|0x80090016") { return "missing" }
+# Seen on Windows Server 2025 (2026-11-08): certutil exits 0 whether or not it loaded the
+# key, printing a `cuLoadKey` line when it could not, and a key whose DACL refuses the
+# caller answers NTE_BAD_KEYSET exactly like a key that does not exist. So the exit code
+# says nothing, and only SYSTEM having opened the same key ($seenAsSystem) tells refused
+# from missing.
+function Get-KeyAnswer([string]$text, [bool]$seenAsSystem) {
+  if ($text -notmatch "(?i)cuLoadKey|FAILED") { return "readable" }
   if ($text -match "(?i)access (is )?denied|E_ACCESSDENIED|NTE_PERM|0x80070005|0x80090010") { return "refused" }
+  if ($text -match "(?i)NTE_BAD_KEYSET|0x80090016") { return $(if ($seenAsSystem) { "refused" } else { "missing" }) }
   return "error"
 }
 
-# True only when the facts read as SYSTEM positively show no export and a DACL of
-# SYSTEM alone. No facts, or an empty DACL, is not observed, and not a pass.
+# True while this token can read any file whatever its DACL: an admin over OpenSSH holds
+# SeBackupPrivilege enabled, and then reads the key file too. Terminal (Admin) does not.
+function Test-BackupPrivilegeEnabled([string]$privileges) {
+  return [bool]($privileges -match "SeBackupPrivilege\s+.*\s+Enabled")
+}
+
+# True only when the facts read as SYSTEM positively show the key there, no export and a
+# DACL of SYSTEM alone. No facts, or an empty DACL, is not observed, and not a pass.
 function Test-KeyFacts($facts) {
-  if ($null -eq $facts) { return $false }
+  if ($null -eq $facts -or -not $facts.exists) { return $false }
   $sids = @($facts.dacl_sids)
   if ($sids.Count -eq 0) { return $false }
   return $facts.export_policy -eq "None" -and -not ($sids | Where-Object { $_ -ne "S-1-5-18" })
 }
 
-# What the one-shot SYSTEM task runs: the key's export policy and DACL, as JSON.
+# True only when SYSTEM answered and found no such machine key. The key listing an admin
+# reads cannot say this: it leaves out a key whose DACL refuses that admin, so a key still
+# there would read as gone.
+function Test-KeyGone($facts) {
+  return $null -ne $facts -and $facts.exists -eq $false
+}
+
+# What the one-shot SYSTEM task runs: whether the machine key of the software provider
+# exists and, when it does, its export policy and DACL, as JSON.
 function New-KeyProbeScript([string]$keyName, [string]$resultFile) {
   return @"
 Add-Type -AssemblyName System.Core
 `$provider = [Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
-`$key = [Security.Cryptography.CngKey]::Open('$keyName', `$provider, [Security.Cryptography.CngKeyOpenOptions]::MachineKey)
+`$machine = [Security.Cryptography.CngKeyOpenOptions]::MachineKey
+if (-not [Security.Cryptography.CngKey]::Exists('$keyName', `$provider, `$machine)) {
+  [pscustomobject]@{ exists = `$false } | ConvertTo-Json | Out-File -Encoding utf8 '$resultFile'
+  exit
+}
+`$key = [Security.Cryptography.CngKey]::Open('$keyName', `$provider, `$machine)
 `$daclOnly = [Enum]::ToObject([Security.Cryptography.CngPropertyOptions], 4)
 `$bytes = `$key.GetProperty('Security Descr', `$daclOnly).GetValue()
 `$descriptor = New-Object Security.AccessControl.RawSecurityDescriptor(`$bytes, 0)
 `$sids = @(`$descriptor.DiscretionaryAcl | ForEach-Object { `$_.SecurityIdentifier.Value })
-[pscustomobject]@{ export_policy = [string]`$key.ExportPolicy; dacl_sids = `$sids } | ConvertTo-Json | Out-File -Encoding utf8 '$resultFile'
+[pscustomobject]@{ exists = `$true; export_policy = [string]`$key.ExportPolicy; dacl_sids = `$sids } | ConvertTo-Json | Out-File -Encoding utf8 '$resultFile'
 "@
 }
