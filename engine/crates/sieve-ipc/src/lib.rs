@@ -21,7 +21,9 @@
 //!   `update` status, `Policy.plain_dns` with the status's `dns_unreachable`,
 //!   both left out while false so a peer from before them reads the same bytes,
 //!   and `Policy.custom_lists` and `Policy.tracking`, both defaulted and left out
-//!   while empty, so a policy without them reads and writes as before).
+//!   while empty, so a policy without them reads and writes as before;
+//!   `Policy.skip_dns_capture` and the status's `dns_capture`, left out while
+//!   false or unknown, so the default, capture on, reads the same bytes).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -534,6 +536,13 @@ pub struct Policy {
     /// engine drops them then too. Left out while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tracking: Vec<String>,
+    /// The user turned `filtering.dnsClientCapture` ("Also encrypt Windows' own
+    /// lookups") off: the Windows DNS Client's queries are not caught (no filter, no
+    /// server on Sieve's adapter, no metric change, no NXDOMAIN rewrite), and the rest
+    /// of DNS stays as it is. Defaulted, and left out while false, so a file or a peer
+    /// from before it reads as on, and the app sends it only when it is off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_dns_capture: bool,
 }
 
 /// One of the user's own lists. `url` is None for a list imported from a file:
@@ -814,8 +823,47 @@ pub struct EngineStatus {
     /// ever turns encryption off but the user.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dns_unreachable: bool,
+    /// Whether the Windows DNS Client's queries are caught (`Policy::skip_dns_capture`),
+    /// while routes are up; left out otherwise and by an engine from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_capture: Option<DnsCapture>,
     /// Signed updates (protocol 3).
     pub update: UpdateStatus,
+}
+
+/// The Windows DNS Client capture as the app shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DnsCapture {
+    /// Caught and proven by the last probe.
+    Working,
+    /// The user's switch is off.
+    Off,
+    /// Wanted and not caught, with the reason. `adapter` names the adapter it
+    /// concerns, when one does; `detail` is the engine's own words.
+    NotCaught {
+        reason: CaptureReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adapter: Option<String>,
+        detail: String,
+    },
+}
+
+/// Why the Windows DNS Client's queries are not caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureReason {
+    /// Another adapter already has interface priority 1, so Sieve's cannot come first.
+    Tie,
+    /// IPv6 is off on Sieve's adapter, and its DNS server is IPv6.
+    Ipv6Off,
+    /// The check lookup never reached Sieve: a firewall rule or another program
+    /// is in the way.
+    NoAnswer,
+    /// The network has no IPv4 route to the internet (IPv6-only).
+    NoIpv4,
+    /// Anything else; `detail` says what.
+    Failed,
 }
 
 /// What the engine filters with, as the app shows it. The catalogue stays in
@@ -1707,6 +1755,32 @@ mod tests {
         let wire = serde_json::to_value(&on).unwrap();
         assert_eq!(wire["content"], true);
         assert_eq!(serde_json::from_value::<Policy>(wire).unwrap(), on, "the round trip");
+    }
+
+    /// Absent is on: an old file, an old peer and `Policy::default()` alike; only
+    /// the user's off is written, so an engine from before it never sees the field
+    /// while the switch is at its default.
+    #[test]
+    fn a_policy_without_skip_dns_capture_captures_and_only_off_is_written() {
+        let old: Policy = serde_json::from_str(r#"{"revision":4,"engine":true}"#).unwrap();
+        assert!(!old.skip_dns_capture && !Policy::default().skip_dns_capture);
+        assert!(serde_json::to_value(&old).unwrap().get("skip_dns_capture").is_none(), "false is left out");
+        let shared = fixture()["policyWithoutDnsCapture"].clone();
+        let sent: ClientMessage = serde_json::from_value(shared.clone()).unwrap();
+        assert!(matches!(&sent, ClientMessage::SetPolicy(p) if p.skip_dns_capture && !p.plain_dns));
+        assert_eq!(serde_json::to_value(&sent).unwrap(), shared, "the round trip");
+    }
+
+    #[test]
+    fn the_capture_states_round_trip_and_none_is_left_out() {
+        let states: Vec<DnsCapture> = serde_json::from_value(fixture()["dnsCaptureStates"].clone()).unwrap();
+        assert_eq!(states.len(), 7);
+        assert_eq!(states[0], DnsCapture::Working);
+        assert_eq!(states[2], DnsCapture::NotCaught { reason: CaptureReason::Tie, adapter: Some("Ethernet".into()), detail: "\"Ethernet\" has interface metric 1".into() });
+        assert_eq!(serde_json::to_value(&states).unwrap(), fixture()["dnsCaptureStates"], "the app reads the same bytes");
+        assert!(serde_json::to_value(EngineStatus::default()).unwrap().get("dns_capture").is_none());
+        let on = EngineStatus { dns_capture: Some(DnsCapture::Off), ..EngineStatus::default() };
+        assert_eq!(serde_json::from_value::<EngineStatus>(serde_json::to_value(&on).unwrap()).unwrap(), on);
     }
 
     /// Absent is encrypted: an old file, an old peer and `Policy::default()` alike.

@@ -38,7 +38,7 @@
  * Update state rides the probe: there is no separate poll.
  */
 import type { PassedChecks } from "@/core/checks";
-import { CONTENT_SWITCH, DNS_ENCRYPTION as DNS_ENCRYPTION_KEY, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, httpsInForce, updateBanner, type EngineSlice } from "@/core/engine";
+import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE as DNS_CLIENT_CAPTURE_KEY, DNS_ENCRYPTION as DNS_ENCRYPTION_KEY, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, httpsInForce, updateBanner, type EngineSlice } from "@/core/engine";
 import type { ExclusionsFacts, HealGroup } from "@/core/exclusions";
 import type { NoticeBus } from "@/core/notices";
 import { selectedListIds } from "@/core/filter-lists";
@@ -88,6 +88,7 @@ const SWITCH = ENGINE_SWITCH as SettingKey;
 const HTTPS = HTTPS_SWITCH as SettingKey;
 const CONTENT = CONTENT_SWITCH as SettingKey;
 const DNS_ENCRYPTION = DNS_ENCRYPTION_KEY as SettingKey;
+const DNS_CLIENT_CAPTURE = DNS_CLIENT_CAPTURE_KEY as SettingKey;
 
 /**
  * The Home banner while no encrypted DNS server answers (the status's
@@ -123,6 +124,8 @@ function wantedPolicy(settings: SettingsStore, catalogue: Pick<FilterCatalogue, 
     content: Boolean(settings.get(CONTENT)),
     // Plain only when the user turned encryption off: an unread setting reads as its default, on.
     plain_dns: settings.get(DNS_ENCRYPTION) === false,
+    // Only when off, so an engine from before the field never sees it at the default (on).
+    ...(settings.get(DNS_CLIENT_CAPTURE) === false ? { skip_dns_capture: true } : {}),
     lists: untouched ? null : catalogue ? selectedListIds(selection, catalogue) : heldLists,
     domain_lists: [...domainList("block", settings.get("filtering.blockedDomains")), ...domainList("allow", settings.get("filtering.allowedDomains"))],
     user_rules: [...settings.get("filtering.userRules")],
@@ -144,6 +147,7 @@ function normalised(p: WantedPolicy): string {
     https: p.https,
     content: p.content ?? false,
     plain_dns: p.plain_dns ?? false,
+    skip_dns_capture: p.skip_dns_capture ?? false,
     sieving: p.sieving,
     off_apps: sorted(p.off_apps),
     lists: p.lists && sorted(p.lists),
@@ -166,11 +170,21 @@ const rulesAsHeld = (want: WantedPolicy, held: WantedPolicy): WantedPolicy => ({
  * all of it; then the rules left as the engine holds them, which it took once and
  * need no compiling; then the off-apps and the list selection too, for a stored
  * value the settings' budgets never saw. Turning something off never waits on
- * the size of what is switched.
+ * the size of what is switched. Each of those is tried once more with
+ * `skip_dns_capture` as the engine holds it: an engine from before that field
+ * refuses any policy that names it, and the rest must still arrive.
  */
 function policyParts(want: WantedPolicy, held: WantedPolicy): WantedPolicy[] {
   const switches = rulesAsHeld(want, held);
-  return [want, switches, { ...switches, off_apps: held.off_apps, lists: held.lists, custom_lists: held.custom_lists ?? [], tracking: held.tracking ?? [] }];
+  const parts = [want, switches, { ...switches, off_apps: held.off_apps, lists: held.lists, custom_lists: held.custom_lists ?? [], tracking: held.tracking ?? [] }];
+  return [...parts, ...parts.map((p) => captureAsHeld(p, held))];
+}
+
+/** `p` with the capture switch as `held` has it, left out while that is the default (on). */
+function captureAsHeld(p: WantedPolicy, held: WantedPolicy): WantedPolicy {
+  const rest = { ...p };
+  delete rest.skip_dns_capture;
+  return held.skip_dns_capture ? { ...rest, skip_dns_capture: true } : rest;
 }
 
 export function createEngineController({ engine, store, clock, settings, checks, notices, filterLists }: EngineControllerDeps): EngineController {
@@ -268,11 +282,15 @@ export function createEngineController({ engine, store, clock, settings, checks,
       policyInFlight = false;
     }
     policyHeldBack = refusal !== null;
+    // An engine from before the capture switch took everything but it: said once, retried at the next probe.
+    const captureRefused = sent && refusal !== null && (want.skip_dns_capture ?? false) !== (holds.skip_dns_capture ?? false);
     if (refusal === null) set({ actionError: null });
+    else if (captureRefused) set({ actionError: `This version of Sieve's engine does not know "${REGISTRY[DNS_CLIENT_CAPTURE].label}". Your other settings reached it.` });
     else if (normalised(rulesAsHeld(want, holds)) === normalised(holds)) set({ actionError: `Could not tell the engine your rules: ${refusal}. Your switches reached it, and it keeps the rules it had.` });
     else set({ actionError: `Could not tell the engine: ${refusal}` });
     // Only a send that went through follows: after a refusal, following now would send it again at once, forever.
-    if (sent && !disposed) follow();
+    // Nor after the capture switch was left out: the next follow would send it again at once.
+    if (sent && !captureRefused && !disposed) follow();
   };
 
   // Once it is read it stays: the catalogue is compiled into this build. A failed

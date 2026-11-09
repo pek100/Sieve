@@ -42,6 +42,8 @@ export const HTTPS_SWITCH = "filtering.https";
 export const CONTENT_SWITCH = "filtering.content";
 /** DNS encryption, on by default (registry key). Off is the user's choice of plain DNS; it travels as `plain_dns`. */
 export const DNS_ENCRYPTION = "filtering.dnsEncryption";
+/** "Also encrypt Windows' own lookups", on by default (registry key). Off travels as `skip_dns_capture`, sent only then. */
+export const DNS_CLIENT_CAPTURE = "filtering.dnsClientCapture";
 /** The Certificate group's anchor in Settings. */
 export const CERTIFICATE_ANCHOR = "certificate";
 

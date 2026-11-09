@@ -12,7 +12,7 @@ import { REASON_TEXT, RETRY_TEXT } from "@/core/log";
 import { MAX_POLICY_BYTES } from "@/core/settings/registry";
 import fixture from "@/data/fixtures/engine-ipc-v3.json";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
-import { BLOCKER_KINDS, CAUSES, CERT_STATES, EXCLUSION_SCOPES, FIREFOX_TRUST, LOG_OUTCOMES, parseCertStatus, parseEngineLists, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseIssues, parseLogTail, RETRY_HOWS, SIGNALS, UPDATE_KINDS } from "@/data/protocol";
+import { BLOCKER_KINDS, CAPTURE_REASONS, CAUSES, CERT_STATES, EXCLUSION_SCOPES, FIREFOX_TRUST, LOG_OUTCOMES, parseCertStatus, parseEngineLists, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseIssues, parseLogTail, RETRY_HOWS, SIGNALS, UPDATE_KINDS } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -103,6 +103,24 @@ describe("engine IPC law", () => {
     expect(parseEngineStatus({ ...body, dns_unreachable: 1 }), "a notice never refuses the Status").not.toHaveProperty("dns_unreachable");
     expect(RUST).toMatch(/skip_serializing_if = "std::ops::Not::not"\)\]\s*pub plain_dns: bool/);
     expect(RUST).toMatch(/skip_serializing_if = "std::ops::Not::not"\)\]\s*pub dns_unreachable: bool/);
+  });
+
+  it("the app reads the capture switch and every capture state; absent is on and nothing to say", () => {
+    const status = fixture.engine.find((m) => m.type === "status")!;
+    const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
+    const policy = Object.fromEntries(Object.entries(fixture.policyWithoutDnsCapture).filter(([k]) => k !== "type"));
+    expect(parseEngineStatus({ ...body, policy }).policy).toEqual(policy);
+    expect(parseEngineStatus(body).policy, "an older engine: on").not.toHaveProperty("skip_dns_capture");
+    expect(() => parseEngineStatus({ ...body, policy: { ...policy, skip_dns_capture: "no" } })).toThrow(/policy\.skip_dns_capture/);
+    expect(RUST).toMatch(/skip_serializing_if = "std::ops::Not::not"\)\]\s*pub skip_dns_capture: bool/);
+    for (const state of fixture.dnsCaptureStates) expect(parseEngineStatus({ ...body, dns_capture: state }).dns_capture).toEqual(state);
+    expect(parseEngineStatus(body), "an older engine says nothing").not.toHaveProperty("dns_capture");
+    for (const odd of [1, { state: "maybe" }, { state: "not_caught", reason: "new_reason", detail: "x" }, { state: "not_caught", reason: "tie" }]) {
+      expect(parseEngineStatus({ ...body, dns_capture: odd }), `a notice never refuses the Status: ${JSON.stringify(odd)}`).not.toHaveProperty("dns_capture");
+    }
+    const crate = (RUST.match(/pub enum CaptureReason \{([\s\S]*?)\n\}/)?.[1] ?? "").match(/^\s{4}(\w+)\b/gm) ?? [];
+    expect(crate.map((v) => v.trim().replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()))).toEqual([...CAPTURE_REASONS]);
+    expect(fixture.dnsCaptureStates.flatMap((s) => ("reason" in s ? [s.reason] : []))).toEqual([...CAPTURE_REASONS]);
   });
 
   it("the app reads every certificate status, and its enums are the crate's", () => {

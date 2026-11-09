@@ -285,6 +285,8 @@ export interface EnginePolicy {
   content?: boolean;
   /** `filtering.dnsEncryption` off: the user chose plain DNS. The engine leaves it out while false, so absent is encrypted. */
   plain_dns?: boolean;
+  /** `filtering.dnsClientCapture` off: Windows' own lookups are not caught. Sent only when off; the engine leaves it out while false, so absent is on. */
+  skip_dns_capture?: boolean;
   /** `filtering.userRules`: rule lines, compiled untrusted beside `domain_lists`. */
   user_rules: string[];
   /** `filtering.exclusions`: sites never decrypted. Nothing decrypts before slice 6. */
@@ -491,7 +493,27 @@ export interface EngineStatus {
   filter?: FilterFacts;
   /** With encryption on, no encrypted DNS server has answered the last lookups. Absent is false. */
   dns_unreachable?: boolean;
+  /** Whether Windows' own lookups are caught, while routes are up. Absent: routes down, or an older engine. */
+  dns_capture?: DnsCapture;
   update: EngineUpdate;
+}
+
+/** sieve-ipc `CaptureReason`, in declaration order. */
+export const CAPTURE_REASONS = ["tie", "ipv6_off", "no_answer", "no_ipv4", "failed"] as const;
+export type CaptureReason = (typeof CAPTURE_REASONS)[number];
+
+/** sieve-ipc `DnsCapture`: caught and proven, the user's off, or not caught and why. */
+export type DnsCapture = { state: "working" } | { state: "off" } | { state: "not_caught"; reason: CaptureReason; adapter?: string; detail: string };
+
+const withCapture = (c: DnsCapture | null): { dns_capture?: DnsCapture } => (c === null ? {} : { dns_capture: c });
+
+/** A notice, as `dns_unreachable`: anything unexpected reads as nothing to say, never a refused Status. */
+export function parseDnsCapture(raw: unknown): DnsCapture | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const c = raw as Record<string, unknown>;
+  if (c.state === "working" || c.state === "off") return { state: c.state };
+  if (c.state !== "not_caught" || typeof c.detail !== "string" || !(CAPTURE_REASONS as readonly unknown[]).includes(c.reason)) return null;
+  return { state: "not_caught", reason: c.reason as CaptureReason, detail: c.detail, ...(typeof c.adapter === "string" ? { adapter: c.adapter } : {}) };
 }
 
 /** One filter list as the engine compiled it (sieve-ipc `ListFact`; the catalogue stays in Rust). */
@@ -570,6 +592,7 @@ function policy(raw: unknown): EnginePolicy {
     https: orDefault(p.https, (v) => bool(v, "policy.https"), false),
     ...(p.content === undefined ? {} : { content: bool(p.content, "policy.content") }),
     ...(p.plain_dns === undefined ? {} : { plain_dns: bool(p.plain_dns, "policy.plain_dns") }),
+    ...(p.skip_dns_capture === undefined ? {} : { skip_dns_capture: bool(p.skip_dns_capture, "policy.skip_dns_capture") }),
     user_rules: orDefault(p.user_rules, (v) => strings(v, "policy.user_rules"), []),
     exclusions: orDefault(p.exclusions, (v) => strings(v, "policy.exclusions"), []),
     ...(p.custom_lists === undefined ? {} : { custom_lists: customLists(p.custom_lists) }),
@@ -671,6 +694,7 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
     ...(s.filter === undefined || s.filter === null ? {} : { filter: filterFacts(s.filter) }),
     // A notice, like the update state: an odd value reads as nothing to say, never a refused Status.
     ...(s.dns_unreachable === true ? { dns_unreachable: true } : {}),
+    ...withCapture(parseDnsCapture(s.dns_capture)),
     update: engineUpdate(s.update),
   };
 }

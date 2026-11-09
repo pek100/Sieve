@@ -167,6 +167,8 @@ export function createMockEngine(
   const holdsHttps = options.heal === true;
   const echo = (status: EngineStatus): EngineStatus => {
     const policy = held ? { ...status.policy, ...held } : status.policy;
+    // As the engine: the capture's state while routes are up, off by the user's switch or with plain DNS.
+    if (status.routes_up) status = { ...status, dns_capture: policy.skip_dns_capture || policy.plain_dns ? { state: "off" } : { state: "working" } };
     if (!holdsHttps) return { ...status, policy };
     // As the engine: its switch alone decrypts nothing, with routes down or sieving off.
     return { ...status, decrypting: status.routes_up && policy.sieving, policy: { ...policy, https: true } };
@@ -254,7 +256,7 @@ export function createMockEngine(
       if (https && !policy.https) cert = "policy_off";
       if (!https && policy.https && (cert === "policy_off" || cert === "not_installed")) cert = "installed";
       https = policy.https;
-      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists, https: policy.https, content: policy.content, plain_dns: policy.plain_dns, user_rules: policy.user_rules, exclusions: policy.exclusions, custom_lists: policy.custom_lists ?? [], tracking: policy.https ? (policy.tracking ?? []) : [] };
+      held = { sieving: policy.sieving, off_apps: policy.off_apps, lists: policy.lists, domain_lists: policy.domain_lists, https: policy.https, content: policy.content, plain_dns: policy.plain_dns, ...(policy.skip_dns_capture ? { skip_dns_capture: true } : {}), user_rules: policy.user_rules, exclusions: policy.exclusions, custom_lists: policy.custom_lists ?? [], tracking: policy.https ? (policy.tracking ?? []) : [] };
       return echo(statusOf(scenario));
     },
     dnsUpstreams: async () => {

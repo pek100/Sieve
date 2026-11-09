@@ -57,6 +57,7 @@ use std::time::Duration;
 use super::plan::is_tunnel;
 use super::prefix::Prefix;
 use super::table::NetTables;
+use sieve_ipc::{CaptureReason, DnsCapture};
 
 /// The IPv6 interface metric that makes the engine's adapter the DNS Client's first
 /// network (live: with Ethernet at 5 in both families, Sieve at IPv4 50 and IPv6 1
@@ -157,12 +158,82 @@ fn is_never_asked(ip: IpAddr) -> bool {
     matches!(ip, IpAddr::V6(v6) if { let s = v6.segments(); s[..7] == [0xfec0, 0, 0, 0xffff, 0, 0, 0] && (1..=3).contains(&s[7]) })
 }
 
+/// Why the capture is not held, as the status says it (`sieve_ipc::DnsCapture`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotCaught {
+    pub reason: CaptureReason,
+    pub adapter: Option<String>,
+    pub detail: String,
+}
+
+impl NotCaught {
+    pub fn new(reason: CaptureReason, detail: impl Into<String>) -> Self {
+        Self { reason, adapter: None, detail: detail.into() }
+    }
+
+    pub fn state(&self) -> DnsCapture {
+        DnsCapture::NotCaught { reason: self.reason, adapter: self.adapter.clone(), detail: self.detail.clone() }
+    }
+}
+
+impl From<String> for NotCaught {
+    fn from(detail: String) -> Self {
+        Self::new(CaptureReason::Failed, detail)
+    }
+}
+
+/// Whether the user's policy wants the capture: "Also encrypt Windows' own
+/// lookups" on (`skip_dns_capture` false) and DNS encryption on. With encryption
+/// off the capture would send the DNS Client's queries to the same servers in the
+/// same plain text, and only cost: so it is off then too.
+pub fn wanted(policy: &sieve_ipc::Policy) -> bool {
+    !policy.skip_dns_capture && !policy.plain_dns
+}
+
+/// What the routing loop does with the capture on one pass. The user's switch
+/// (`Policy::skip_dns_capture`) comes first: off, nothing is opened, and a held
+/// capture closes. Then nothing to block closes it too. A held one is proven
+/// again when due; an empty one opens when its retry is due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Close,
+    Open,
+    Prove,
+    Keep,
+    Nothing,
+}
+
+pub fn step(wanted: bool, held: bool, has_blocks: bool, retry_due: bool, proof_due: bool) -> Step {
+    match (wanted && has_blocks, held) {
+        (false, true) => Step::Close,
+        (false, false) => Step::Nothing,
+        (true, true) if proof_due => Step::Prove,
+        (true, true) => Step::Keep,
+        (true, false) if retry_due => Step::Open,
+        (true, false) => Step::Nothing,
+    }
+}
+
+/// The state while routes are up and nothing is held: the user's off, or why
+/// there was nothing to catch, or the last failure.
+pub fn idle_state(wanted: bool, tables: &NetTables, has_blocks: bool, last: Option<&NotCaught>) -> DnsCapture {
+    if !wanted {
+        DnsCapture::Off
+    } else if !has_blocks && !tables.has_default(true) {
+        NotCaught::new(CaptureReason::NoIpv4, "this network has no IPv4 route to the internet").state()
+    } else if !has_blocks {
+        NotCaught::new(CaptureReason::Failed, "no network adapter whose DNS queries would leave outside Sieve").state()
+    } else {
+        last.map_or_else(|| NotCaught::new(CaptureReason::Failed, "not opened yet").state(), NotCaught::state)
+    }
+}
+
 /// Why the capture must not open: an adapter it would block already has the
 /// interface metric the engine's adapter takes ([`DNS_FIRST_METRIC`]) or a lower
 /// one, so the DNS Client's first network would be a tie and every lookup could
 /// wait out the block. `metric` reads an adapter's interface metric (LUID, IPv4),
 /// and both families are checked.
-pub fn refusal(tables: &NetTables, blocks: &[Block], metric: impl Fn(u64, bool) -> Option<u32>) -> Option<String> {
+pub fn refusal(tables: &NetTables, blocks: &[Block], metric: impl Fn(u64, bool) -> Option<u32>) -> Option<NotCaught> {
     let mut luids: Vec<u64> = blocks.iter().flat_map(|b| b.on.iter().copied()).collect();
     luids.sort_unstable();
     luids.dedup();
@@ -170,10 +241,11 @@ pub fn refusal(tables: &NetTables, blocks: &[Block], metric: impl Fn(u64, bool) 
         [true, false].into_iter().find_map(|v4| {
             let m = metric(*luid, v4).filter(|m| *m <= DNS_FIRST_METRIC)?;
             let alias = tables.adapters.iter().find(|a| a.luid == *luid).map_or("an adapter", |a| a.alias.as_str());
-            Some(format!(
+            let detail = format!(
                 "\"{alias}\" has interface metric {m} for {}, which ties with Sieve's DNS server, so the DNS Client's queries are not caught (give \"{alias}\" a metric above {DNS_FIRST_METRIC} to have them caught)",
                 if v4 { "IPv4" } else { "IPv6" }
-            ))
+            );
+            Some(NotCaught { reason: CaptureReason::Tie, adapter: Some(alias.to_string()), detail })
         })
     })
 }
@@ -323,8 +395,49 @@ mod tests {
         assert_eq!(refusal(&tables, &blocks, |_, _| Some(25)), None);
         assert_eq!(refusal(&tables, &blocks, |_, _| None), None, "an interface without that family");
         let why = refusal(&tables, &blocks, |l, v4| (l == luid && v4).then_some(DNS_FIRST_METRIC)).expect("a tie");
+        assert_eq!((why.reason, why.adapter.as_deref()), (CaptureReason::Tie, Some("Wi-Fi")));
+        let why = why.detail;
         assert!(why.contains("Wi-Fi") && why.contains("metric 1") && why.contains("IPv4"), "{why}");
-        assert!(refusal(&tables, &blocks, |l, v4| (l == luid && !v4).then_some(0)).unwrap().contains("IPv6"));
+        assert!(refusal(&tables, &blocks, |l, v4| (l == luid && !v4).then_some(0)).unwrap().detail.contains("IPv6"));
+    }
+
+    /// The user's switch: off, nothing is ever opened and a held capture closes,
+    /// whatever else holds; back on, it opens at once on a network with blocks.
+    #[test]
+    fn the_switch_off_opens_nothing_and_closes_a_held_capture() {
+        for has_blocks in [true, false] {
+            for retry_due in [true, false] {
+                for proof_due in [true, false] {
+                    assert_eq!(step(false, false, has_blocks, retry_due, proof_due), Step::Nothing, "off never opens");
+                    assert_eq!(step(false, true, has_blocks, retry_due, proof_due), Step::Close, "off closes");
+                }
+            }
+        }
+        assert_eq!(step(true, false, true, true, false), Step::Open, "back on: opens");
+        assert_eq!(step(true, false, true, false, false), Step::Nothing, "a failed open waits for its retry");
+        assert_eq!(step(true, true, true, false, true), Step::Prove);
+        assert_eq!(step(true, true, true, false, false), Step::Keep);
+        assert_eq!(step(true, true, false, true, true), Step::Close, "nothing left to block");
+    }
+
+    #[test]
+    fn the_capture_is_wanted_only_with_its_switch_and_encryption_on() {
+        use sieve_ipc::Policy;
+        assert!(wanted(&Policy::default()), "on by default");
+        assert!(!wanted(&Policy { skip_dns_capture: true, ..Policy::default() }));
+        assert!(!wanted(&Policy { plain_dns: true, ..Policy::default() }), "plain DNS: nothing to encrypt");
+    }
+
+    #[test]
+    fn the_idle_state_says_off_or_why() {
+        let home = load(HOME);
+        assert_eq!(idle_state(false, &home, true, None), DnsCapture::Off);
+        let mut v6_only = load(HOME);
+        v6_only.routes.retain(|r| r.dest.length() != 0 || !r.dest.is_ipv4());
+        assert!(matches!(idle_state(true, &v6_only, false, None), DnsCapture::NotCaught { reason: CaptureReason::NoIpv4, .. }));
+        let tie = NotCaught { reason: CaptureReason::Tie, adapter: Some("Wi-Fi".into()), detail: "metric 1".into() };
+        assert_eq!(idle_state(true, &home, true, Some(&tie)), tie.state());
+        assert_eq!(NotCaught::from("x".to_string()).reason, CaptureReason::Failed);
     }
 
     /// The server is IPv6 so the adapter is first by its IPv6 metric alone; it sits

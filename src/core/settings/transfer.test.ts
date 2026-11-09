@@ -135,7 +135,7 @@ describe("settings search and words", () => {
     expect(searchSettings("")).toEqual(SETTING_KEYS.filter(isAvailable));
     expect(searchSettings("theme")).toEqual(["appearance.theme"]);
     expect(searchSettings("LIGHT")).toEqual(["appearance.theme"]);
-    expect(searchSettings("dns")).toEqual(["filtering.upstreams", "filtering.dnsEncryption"]);
+    expect(searchSettings("dns")).toEqual(["filtering.upstreams", "filtering.dnsEncryption", "filtering.dnsClientCapture"]);
     expect(searchSettings("per-app filtering")).toEqual([]);
     expect(searchSettings("turned off")).toEqual(["apps.levels"]);
     expect(searchSettings("startup")).toEqual(["startup.launchAtLogin", "startup.welcomeDone"]);
