@@ -1,5 +1,42 @@
 # VM live run 2026-11-08: status at the stop
 
+## Run 4 (2026-11-09): the capture's second review
+
+Branch `worktree-agent-acd57d2c31e644f62`, main merged (a3c5a24), fixes fc6e72f and 27141dd. VM 02:03 to 02:44 local (0.7 h), stopped at the end. Engines: A958B1C9 (rewrite on) and EF74955B (rewrite off, the one switch `dns::service::NXDOMAIN_AS_NODATA` flipped), then 67666092 (27141dd, rewrite on) for the key and probe checks. "Off" is policy `engine` false. Helpers on the VM: a DNS server on 127.0.0.2 (zones `split.test`, `corp.test`) and an LLMNR responder on Ethernet for `sieveonly1` (scratchpad `r-resp.ps1`).
+
+Found on the VM and fixed in 27141dd:
+- The rewrite never acted at first (NXDOMAIN 12 s): the loopback pseudo-interface lists `fec0:0:0:ffff::1-3`, so not every network looked blocked. Those servers and the loopback are no network now; after, NXDOMAIN 25 ms and `dns-status.json` counts each rewrite (`nodata`).
+- With metric 1 Sieve's adapter held `224.0.0.0/4`, `255.255.255.255/32` and `ff00::/8` at 256 + 1 against Ethernet's 256 + 5, so multicast and broadcast sends naming no interface went into the engine. They are deleted from Sieve's adapter; after, only Ethernet and loopback hold them.
+- After a kill Windows still converts Sieve's GUID to a LUID (a non-present interface), so the leftover key was never deleted. Presence is now the adapter list's.
+- A firewall rule against 198.18.0.53 closed the capture 48 s later (60 s probe); every lookup timed out (12 s) meanwhile. Probe every 15 s: closed in 16 s, reopened 13.6 s after the rule went.
+
+| Check | Off | On, rewrite on | On, rewrite off |
+|---|---|---|---|
+| Plain port-53 packets out of the NIC, 30 fresh names | (40 for 20, run 3) | **0** from the DNS Client; 1 SRV and 2 A/AAAA of the internal suffix, the engine's own split-horizon sends to the LAN server | not run |
+| 20 uncached lookups, median / p90 | 18 / 19 ms | 23 / 26 ms | 24 / 32 ms |
+| NXDOMAIN, Resolve-DnsName, median of 6 | 18 ms | 25 ms | **12 018 ms** |
+| NXDOMAIN, .NET getaddrinfo / curl, median of 6 | 26 / 89 ms | 21 / 99 ms | **12 015 / 12 111 ms** |
+| Search list `sieve-nope-4711.com,wikipedia.org` (set and settled 20 s), `www` and `en`, .NET and curl, 6 each | 24/24, 4 to 160 ms | 24/24, 16 to 136 ms (42 rewrites counted) | 24/24, 5 to 151 ms |
+| The same list set 1 s before each trial (.NET `www`) | 1 of 5 resolved (4 failed at 2.8 s) | 3 of 5 (2 failed at 9.7 s) | 5 of 5 |
+| Search list `nope.test,corp.test`, `host1` only under the second (NRPT to 127.0.0.2), .NET | 24 ms | 61 ms | 14 ms |
+| Single label only LLMNR answers (`sieveonly1`), .NET | 2.8 s | **9.7 s** | **9.8 s** |
+| `.local` own name (mDNS) | 15 ms, Ethernet's link-local | 15 ms, Sieve's link-local first | 1 ms, the same |
+| Split DNS `a.split.test`, NRPT to 127.0.0.2 | 17 ms | 16 ms | 2 ms |
+| Own host name, single label | 10.128.0.2 | 198.18.0.1 first | not run |
+
+Does NODATA change the suffix search or LLMNR? Not measurably: with a settled search list the name under the second suffix resolved 24 of 24 times with 42 rewrites behind it, as without the rewrite. The failures in the second-to-last row came with a search list changed a second earlier, and Sieve off failed more of those than the rewrite did. LLMNR fallback works in every arm; Sieve on costs it 7 s whatever the rewrite (NetBIOS off on Sieve's adapter: still 9.8 s; cause not found). Without the rewrite every NXDOMAIN costs 12 s, in every program that resolves through Windows.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Ethernet at metric 1 | PASS | capture refused, `last_error`: "Ethernet" has interface metric 1 for IPv4, which ties with Sieve's DNS server...; 0 filters, no server on Sieve; lookups 10/10 at 25 ms, NXDOMAIN 17 ms; the old leak (44 plain packets), as without the capture |
+| Firewall drops 53 to 198.18.0.53 | PASS after the fix | closed 16 s after the rule; lookups then 55 ms; at a restart with the rule the probe refuses it ("a probe through the DNS Client did not reach Sieve's DNS server within 1000 ms"), lookups 10/10 |
+| Kill, then the next start | PASS after the fix | key with `NameServer=198.18.0.53` after the kill; absent after the recovery start; DNS 0.01 s, https 0.26 s after the kill |
+| Uninstall after a kill | PASS | key present before, absent after; service absent, no adapter; DNS 0.02 s |
+| Dynamic registration (primary suffix `corp.test`, `ipconfig /registerdns`) | INCONCLUSIVE | the VM's server is no authority for `corp.test`, so registration fails off and on alike (event 8016 in both). On: 8 queries reached 198.18.0.53, 2 reached the engine addressed to 10.128.0.1 through the adapter (sent unbound, so the block did not stop them), and 29 port-53 packets left the NIC to 10.128.0.1 (the engine's split-horizon sends for `corp.test`, now a machine suffix, and any forwarded update: pktmon does not tell them apart). No server on the VM accepts an update; forwarding is proven by unit test only |
+| Two-adapter split DNS, a VPN | SKIP | one NIC and no VPN on the VM; NRPT to a loopback server instead (above), the rest by unit tests |
+
+VM state at the stop: `setup-cur.exe` reinstalled (engine 8BFE89A7), policy `engine` false, no NRPT rule, no test firewall rule, search list and primary suffix empty, Ethernet metric automatic, responders stopped, no Sieve key in the registry.
+
 ## Run 3 (2026-11-09): the DNS gap after a start, the DNS Client leak
 
 Branch `worktree-agent-acd57d2c31e644f62` on main 8abf3bf. VM 23:57 to 01:21 local (1.4 h), stopped at the end. Engine under test 1B5C3A1A (release); "before" is main 0ea3303 (3940237E), whose bring-up and DNS code are the same as 8abf3bf's.
