@@ -401,6 +401,7 @@ async fn follow_capture(engine: &Engine, mut up: Up, network_moved: bool) -> Up 
         None => {}
     }
     dns.set_every_network_blocked(up.capture.held.is_some() && capture::every_network_blocked(&tables, &blocks));
+    apply::drop_system_routes(up.luid);
     up
 }
 
@@ -642,6 +643,8 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn()
         }
     }
     relay.dns.set_every_network_blocked(capture.held.is_some() && capture::every_network_blocked(tables, &blocks));
+    // After the metric changed: no multicast or broadcast send goes into the adapter.
+    apply::drop_system_routes(luid);
     let batches = {
         let e = engine.clone();
         tokio::spawn(async move {

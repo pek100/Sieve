@@ -47,6 +47,13 @@ pub const EXCLUDED: &[(&str, &str)] = &[
     ("ff00::/8", "multicast; AdGuard's default"),
 ];
 
+/// Routes Windows puts on every interface that the engine's adapter must not keep:
+/// with the DNS Client's first metric (`route::capture`) they win the tie for any
+/// multicast or broadcast send that names no interface (live, 2026-11-09: 256 + 1
+/// on Sieve against 256 + 5 on Ethernet), and LAN discovery would go into the
+/// engine. Deleted from the engine's adapter only (`apply::drop_system_routes`).
+pub const NOT_ON_SIEVE: &[&str] = &["224.0.0.0/4", "255.255.255.255/32", "ff00::/8"];
+
 /// The IPv4 and IPv6 address space the engine routes before the holes.
 pub const UNIVERSE_V4: &str = "0.0.0.0/0";
 /// Global unicast: every other IPv6 range is local or reserved.
@@ -151,6 +158,17 @@ mod tests {
     fn routed(plan: &RoutePlan, ip: &str) -> bool {
         let ip: IpAddr = ip.parse().unwrap();
         plan.routes.iter().any(|r| r.contains(ip))
+    }
+
+    #[test]
+    fn the_system_routes_dropped_from_sieve_are_multicast_and_broadcast_only() {
+        let dropped: Vec<Prefix> = NOT_ON_SIEVE.iter().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(dropped.len(), NOT_ON_SIEVE.len());
+        for p in &dropped {
+            assert!(declared().iter().any(|h| h.contains(p.addr())), "{p} is a hole the engine never routes");
+        }
+        let plan = plan(&load(HOME));
+        assert!(plan.routes.iter().all(|r| !dropped.contains(r)), "never one of the engine's own routes");
     }
 
     #[test]

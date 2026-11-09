@@ -136,6 +136,7 @@ struct Facts {
     canary: AtomicU64,
     reverse_lan: AtomicU64,
     reverse_local: AtomicU64,
+    nodata: AtomicU64,
 }
 
 /// [`Facts`] as read.
@@ -150,6 +151,8 @@ pub struct Counts {
     pub reverse_lan: u64,
     /// Private reverse lookups answered NXDOMAIN here.
     pub reverse_local: u64,
+    /// NXDOMAINs given to the DNS Client as NODATA (`NXDOMAIN_AS_NODATA`).
+    pub nodata: u64,
 }
 
 /// `name` without the attrleaf labels of an HTTPS or SVCB query:
@@ -316,7 +319,7 @@ impl Service {
     pub fn counts(&self) -> Counts {
         let read = |count: &AtomicU64| count.load(Ordering::Relaxed);
         let f = &self.facts;
-        Counts { ech_stripped: read(&f.ech_stripped), ech_left: read(&f.ech_left), canary: read(&f.canary), reverse_lan: read(&f.reverse_lan), reverse_local: read(&f.reverse_local) }
+        Counts { ech_stripped: read(&f.ech_stripped), ech_left: read(&f.ech_left), canary: read(&f.canary), reverse_lan: read(&f.reverse_lan), reverse_local: read(&f.reverse_local), nodata: read(&f.nodata) }
     }
 
     fn try_permit(&self) -> Option<OwnedSemaphorePermit> {
@@ -344,8 +347,8 @@ impl Service {
     /// and every other asker, gets the reply as it came.
     pub async fn answer(&self, query: &[u8], transport: Transport, asker: Asker) -> Option<Answered> {
         let mut answered = self.answer_as_asked(query, transport, asker).await?;
-        if self.rewrites(query, asker) {
-            as_nodata(&mut answered.reply);
+        if self.rewrites(query, asker) && as_nodata(&mut answered.reply) {
+            Meters::bump(&self.facts.nodata);
         }
         Some(answered)
     }
@@ -543,12 +546,12 @@ fn names_sieves_address(message: &[u8]) -> bool {
 }
 
 /// An NXDOMAIN reply's code made NOERROR and its AD bit cleared (the data is no
-/// longer what was validated), its records left as they are.
-fn as_nodata(reply: &mut [u8]) {
+/// longer what was validated), its records left as they are. True when it was one.
+fn as_nodata(reply: &mut [u8]) -> bool {
     const NXDOMAIN: u8 = 3;
-    if let Some(low) = reply.get_mut(3).filter(|low| **low & 0x0f == NXDOMAIN) {
-        *low &= 0xf0 & !(FLAG_AD as u8);
-    }
+    let Some(low) = reply.get_mut(3).filter(|low| **low & 0x0f == NXDOMAIN) else { return false };
+    *low &= 0xf0 & !(FLAG_AD as u8);
+    true
 }
 
 /// Serves one datagram flow until it has been idle for [`DNS_IDLE`] with nothing
@@ -953,6 +956,7 @@ mod tests {
         assert_eq!(rcode(&b.ask_as(&with_edns(&missing(14), false), Transport::Datagram, CAPTURED).await.reply), 0, "the control: EDNS without DO");
         b.service.set_every_network_blocked(false);
         assert_eq!(rcode(&b.ask_as(&missing(15), Transport::Datagram, CAPTURED).await.reply), 3, "a network came unblocked");
+        assert_eq!(b.service.counts().nodata, 3, "each rewrite counted");
         let servfail: Script = Arc::new(|_| Step::Close);
         let failing = Server::start(Kind::Https, &ca, Options { script: servfail, ..Options::default() }).await;
         let b = bed(&ca, &[failing.url()], None, Arc::new(Loopback::default()));
@@ -1878,9 +1882,9 @@ mod tests {
 
     #[test]
     fn the_report_holds_counts_and_never_a_name() {
-        let json = serde_json::to_value(Counts { ech_stripped: 1, ech_left: 2, canary: 3, reverse_lan: 4, reverse_local: 5 }).unwrap();
+        let json = serde_json::to_value(Counts { ech_stripped: 1, ech_left: 2, canary: 3, reverse_lan: 4, reverse_local: 5, nodata: 6 }).unwrap();
         let object = json.as_object().unwrap();
-        assert_eq!(object.len(), 5, "{object:?}");
+        assert_eq!(object.len(), 6, "{object:?}");
         assert!(object.values().all(serde_json::Value::is_u64), "numbers, never a name");
     }
 

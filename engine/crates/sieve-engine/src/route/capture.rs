@@ -58,8 +58,12 @@ use crate::tun::TUN_DNS;
 pub const DNS_FIRST_METRIC: u32 = 1;
 /// How long a probe's answer may take, from the DNS Client's call to its return.
 pub const PROBE_WITHIN: Duration = Duration::from_secs(1);
-/// How often a held capture is proven again.
-pub const PROBE_EVERY: Duration = Duration::from_secs(60);
+/// How often a held capture is proven again, and an empty one tried again. Until
+/// a capture that stopped working is closed, every lookup through the DNS Client
+/// waits out its 12 s (live, 2026-11-09: a firewall rule against Sieve's server,
+/// closed 48 s later at a 60 s period), so this bounds that; a probe is one local
+/// query the DNS service answers itself.
+pub const PROBE_EVERY: Duration = Duration::from_secs(15);
 /// The probe names' parent: reserved (RFC 6761), answered by the DNS service
 /// itself and never sent on.
 pub const PROBE_PARENT: &str = "probe.sieve.invalid";
@@ -131,7 +135,20 @@ pub fn blocks(tables: &NetTables, routes: &[Prefix]) -> Vec<Block> {
 /// came. False with no block at all.
 pub fn every_network_blocked(tables: &NetTables, blocks: &[Block]) -> bool {
     let blocked = |luid: u64, ip: IpAddr| blocks.iter().any(|b| b.v4 == ip.is_ipv4() && b.on.contains(&luid) && b.to.iter().any(|p| p.contains(ip)));
-    !blocks.is_empty() && tables.others().all(|a| a.dns.iter().all(|ip| blocked(a.luid, *ip)))
+    let asked = |ip: &IpAddr| !is_never_asked(*ip);
+    !blocks.is_empty()
+        && tables
+            .others()
+            .filter(|a| a.if_type != super::table::if_type::SOFTWARE_LOOPBACK)
+            .all(|a| a.dns.iter().filter(|ip| asked(ip)).all(|ip| blocked(a.luid, *ip)))
+}
+
+/// The well-known site-local servers Windows lists for an interface with no IPv6
+/// server of its own (`fec0:0:0:ffff::1` to `::3`, deprecated by RFC 3879). The DNS
+/// Client never asked them on the VM (Server 2025, 2026-11-09), and no network
+/// answers there; the loopback pseudo-interface lists them too and is no network.
+fn is_never_asked(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V6(v6) if { let s = v6.segments(); s[..7] == [0xfec0, 0, 0, 0xffff, 0, 0, 0] && (1..=3).contains(&s[7]) })
 }
 
 /// Why the capture must not open: an adapter it would block already has the
@@ -236,6 +253,33 @@ mod tests {
         assert!(!blocks.is_empty());
         assert!(!every_network_blocked(&tables, &blocks));
         assert!(!every_network_blocked(&load(HOME), &[]), "no block, no rewrite");
+    }
+
+    /// The VM's tables: the loopback pseudo-interface lists the well-known
+    /// site-local servers, which the DNS Client never asks.
+    #[test]
+    fn the_loopback_and_the_well_known_site_local_servers_are_no_network() {
+        use super::super::table::{AddressOnLink, Adapter, if_type};
+        let mut tables = load(HOME);
+        let site_local: Vec<IpAddr> = (1..=3).map(|i| format!("fec0:0:0:ffff::{i}").parse().unwrap()).collect();
+        tables.adapters.push(Adapter {
+            index: 1,
+            luid: 0x0018_0000_0000_0000,
+            alias: "Loopback Pseudo-Interface 1".into(),
+            description: "Software Loopback Interface 1".into(),
+            if_type: if_type::SOFTWARE_LOOPBACK,
+            up: true,
+            addresses: vec![AddressOnLink { ip: "127.0.0.1".parse().unwrap(), len: 8 }],
+            dns: site_local.clone(),
+            dns_suffixes: vec![],
+        });
+        let blocks = blocks(&tables, &plan(&tables).routes);
+        assert!(every_network_blocked(&tables, &blocks));
+        let at = tables.adapters.iter().position(|a| a.luid == wifi(&tables)).unwrap();
+        tables.adapters[at].dns.extend(site_local);
+        assert!(every_network_blocked(&tables, &blocks), "never asked on a real adapter either");
+        tables.adapters[at].dns.push("fec0:0:0:ffff::4".parse().unwrap());
+        assert!(!every_network_blocked(&tables, &blocks), "any other site-local server counts");
     }
 
     #[test]

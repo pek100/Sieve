@@ -100,6 +100,17 @@ pub fn delete_route(luid: u64, prefix: Prefix) -> Deleted {
     super::classify_delete(unsafe { DeleteIpForwardEntry2(&row) }.0)
 }
 
+/// Deletes the multicast and broadcast routes Windows put on the engine's adapter
+/// (`plan::NOT_ON_SIEVE`), and returns how many were there. Windows may put them
+/// back when the interface changes, so the routing loop calls this again.
+pub fn drop_system_routes(luid: SieveLuid) -> usize {
+    super::plan::NOT_ON_SIEVE
+        .iter()
+        .filter_map(|p| p.parse::<Prefix>().ok())
+        .filter(|p| delete_route(luid.0, *p) == Deleted::Yes)
+        .count()
+}
+
 /// The adapter's own host address (a /32 or /128), active store only.
 pub fn add_address(luid: SieveLuid, ip: IpAddr) -> Result<(), String> {
     let mut row = MIB_UNICASTIPADDRESS_ROW::default();
@@ -209,9 +220,12 @@ fn adapter_key(root: &str) -> String {
 }
 
 /// Deletes what [`set_adapter_dns`] left in the registry when no adapter with the
-/// engine's GUID exists (after a kill, Windows never removed it): that GUID's
-/// interface key in both families, and nothing else. With the adapter there, its
-/// key is Windows' own and stays.
+/// engine's GUID is present (after a kill, Windows never removed it): that GUID's
+/// interface key in both families, and nothing else. With the adapter present, its
+/// key is Windows' own and stays. After a kill Windows still knows the interface
+/// (its GUID converts to a LUID, live 2026-11-09) while no adapter lists it, so
+/// presence is the adapter list's (`GetAdaptersAddresses`); a list that cannot be
+/// read deletes nothing.
 pub fn forget_adapter_key() -> Result<String, String> {
     use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     use windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceGuidToLuid;
@@ -219,7 +233,11 @@ pub fn forget_adapter_key() -> Result<String, String> {
     let mut luid = NET_LUID_LH::default();
     // SAFETY: both pointers are this frame's.
     if unsafe { ConvertInterfaceGuidToLuid(&GUID::from_u128(ADAPTER_GUID), &mut luid) } == NO_ERROR {
-        return Ok("the adapter exists, its key is Windows'".into());
+        // SAFETY: reading the union's only field.
+        let luid = unsafe { luid.Value };
+        if super::table::read::adapters()?.iter().any(|a| a.luid == luid) {
+            return Ok("the adapter is present, its key is Windows'".into());
+        }
     }
     let mut deleted = 0;
     for root in ["Tcpip", "Tcpip6"] {
