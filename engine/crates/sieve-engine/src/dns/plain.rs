@@ -42,6 +42,13 @@ pub async fn exchange(connector: &dyn Connector, server: IpAddr, query: &[u8], m
     }
 }
 
+/// Over TCP from the start, for a message the client itself sent over TCP and
+/// that must reach the server as it was (a key negotiation too large for a
+/// datagram, or a signed message).
+pub async fn exchange_over_tcp(connector: &dyn Connector, server: IpAddr, query: &[u8]) -> Result<Vec<u8>, String> {
+    over_tcp(connector, SocketAddr::new(server, DNS_PORT), query).await
+}
+
 async fn over_tcp(connector: &dyn Connector, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String> {
     let len = u16::try_from(query.len()).map_err(|_| "a query over the size limit")?;
     let mut stream = connector.tcp(target).await?;

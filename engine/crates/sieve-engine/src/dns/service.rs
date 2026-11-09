@@ -24,6 +24,10 @@
 //!   in plain text to the server it addressed when that is another adapter's LAN
 //!   DNS server, as a LAN name does; one sent to the engine's own server, or to
 //!   any other, and every other opcode are answered NOTIMP here and nothing leaves.
+//! - A message of a signed exchange (a TKEY query, or one carrying a TSIG record:
+//!   secure dynamic registration on a domain network) goes the same way, only to
+//!   the LAN DNS server it addressed, on the client's transport; otherwise it is
+//!   REFUSED here and nothing leaves.
 //! - A capture probe (`route::capture::is_probe`) is answered NODATA here.
 //! - When nothing answers, the client gets SERVFAIL at the deadline. In
 //!   [`Mode::Encrypted`] no path reaches a plain socket beyond the LAN exchange,
@@ -44,7 +48,7 @@ use tokio::time::Instant;
 use super::ech::{self, Stripped};
 use super::pool::{Context, Pool, UpstreamReport};
 use super::upstream::{self, Health, Path, REQUEST_BUDGET, Upstream};
-use super::{FLAG_AD, FLAG_OPCODE, FLAG_QR, HttpsRecord, MAX_MESSAGE, NameMap, TYPE_HTTPS, TYPE_SVCB, edns, flags_of, nodata, notimp, nxdomain, parse, plain, query_for, reply_answers, reverse, servfail, truncated, udp_limit, with_id};
+use super::{FLAG_AD, FLAG_OPCODE, FLAG_QR, HttpsRecord, MAX_MESSAGE, NameMap, TYPE_HTTPS, TYPE_SVCB, edns, flags_of, nodata, notimp, nxdomain, parse, plain, query_for, refused, reply_answers, reverse, servfail, truncated, udp_limit, with_id};
 use crate::route::capture;
 use crate::route::table::NetTables;
 use crate::stack::Meters;
@@ -366,8 +370,11 @@ impl Service {
         if flags & FLAG_QR != 0 {
             return None;
         }
+        if super::is_signed_exchange(query) {
+            return self.signed(query, flags, transport, asker).await;
+        }
         if flags & FLAG_OPCODE != 0 {
-            return self.other_opcode(query, flags, asker).await;
+            return self.other_opcode(query, flags, transport, asker).await;
         }
         let question = parse(query);
         let name = question.as_ref().and_then(|m| m.question.as_deref());
@@ -443,15 +450,53 @@ impl Service {
     /// own registration, which the capture's block would otherwise stop). One to
     /// the engine's own server never leaves: Sieve's address is no host's to
     /// register. Everything else is NOTIMP.
-    async fn other_opcode(&self, query: &[u8], flags: u16, asker: Asker) -> Option<Answered> {
-        let to_lan = || upstream::is_lan_server(&self.tables.read().unwrap_or_else(|p| p.into_inner()), asker.addressed);
-        if (flags & FLAG_OPCODE) >> 11 == OPCODE_UPDATE && asker.addressed != TUN_DNS && !names_sieves_address(query) && to_lan() {
-            return match self.plain_exchange(asker.addressed, query, || true).await {
-                Ok(reply) => Some(Answered { reply, resolved: true }),
-                Err(_) => servfail(query).map(|reply| Answered { reply, resolved: false }),
-            };
+    async fn other_opcode(&self, query: &[u8], flags: u16, transport: Transport, asker: Asker) -> Option<Answered> {
+        if (flags & FLAG_OPCODE) >> 11 == OPCODE_UPDATE && !names_sieves_address(query) && self.to_lan_server(asker) {
+            return self.to_addressed(query, transport, asker).await;
         }
         notimp(query).map(|reply| Answered { reply, resolved: false })
+    }
+
+    /// A message of a signed exchange (`dns::is_signed_exchange`): Windows'
+    /// secure dynamic registration on a domain network negotiates a key with the
+    /// company's DNS server (a TKEY query) and then signs its UPDATE with it (a
+    /// TSIG record). The key, the name it is for and the signature mean something
+    /// only to the server the client addressed, so the message goes there, in
+    /// plain text as without Sieve, when that is another adapter's LAN DNS server,
+    /// and nowhere else: a public resolver would only learn the company's names.
+    /// One to the engine's own server, or to any other, is REFUSED here and
+    /// nothing leaves. A signed UPDATE that would register Sieve's address stays
+    /// here too, as an unsigned one does. Only QUERY and UPDATE carry these.
+    async fn signed(&self, query: &[u8], flags: u16, transport: Transport, asker: Asker) -> Option<Answered> {
+        let opcode = (flags & FLAG_OPCODE) >> 11;
+        let carried = opcode == 0 || (opcode == OPCODE_UPDATE && !names_sieves_address(query));
+        if carried && self.to_lan_server(asker) {
+            return self.to_addressed(query, transport, asker).await;
+        }
+        refused(query).map(|reply| Answered { reply, resolved: false })
+    }
+
+    /// The query was addressed to another adapter's LAN DNS server, not to the
+    /// engine's own.
+    fn to_lan_server(&self, asker: Asker) -> bool {
+        asker.addressed != TUN_DNS && upstream::is_lan_server(&self.tables.read().unwrap_or_else(|p| p.into_inner()), asker.addressed)
+    }
+
+    /// The message, as it came, to the server it addressed, on the transport the
+    /// client chose: what came over TCP goes over TCP (a key negotiation is often
+    /// too large for a datagram). SERVFAIL when that server does not answer.
+    async fn to_addressed(&self, query: &[u8], transport: Transport, asker: Asker) -> Option<Answered> {
+        let sent = match transport {
+            Transport::Datagram => self.plain_exchange(asker.addressed, query, || true).await,
+            Transport::Stream => match tokio::time::timeout(REQUEST_BUDGET, plain::exchange_over_tcp(self.context.connector.as_ref(), asker.addressed, query)).await {
+                Ok(reply) => reply,
+                Err(_) => Err(format!("{} did not answer in time", asker.addressed)),
+            },
+        };
+        match sent {
+            Ok(reply) => Some(Answered { reply, resolved: true }),
+            Err(_) => servfail(query).map(|reply| Answered { reply, resolved: false }),
+        }
     }
 
     /// The one exchange on a path. A path with nowhere to go is an error here.
@@ -1011,6 +1056,45 @@ mod tests {
         assert_eq!(rcode(&b.ask_as(&notify, Transport::Datagram, Asker { addressed: ROUTER.parse().unwrap(), ..HOST }).await.reply), 4, "NOTIFY: NOTIMP");
         assert_eq!((queries(&router), queries(&original)), (1, 0));
         assert!(doh.seen().is_empty());
+    }
+
+    /// Windows' secure registration on a domain network: the TKEY negotiation over
+    /// TCP, then the signed UPDATE. Both reach the LAN server they addressed, on
+    /// the client's transport, and nothing reaches the encrypted resolver; the
+    /// same messages to any other server are REFUSED and nothing leaves.
+    #[tokio::test]
+    async fn a_key_negotiation_and_a_signed_update_go_only_to_the_lan_server_addressed() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let accepted: Script = Arc::new(|query| Step::Answer(crate::dns::nodata(query).unwrap()));
+        let router = Plain::start(accepted.clone(), accepted).await;
+        let original = Plain::start(answering(), answering()).await;
+        let b = bed(&ca, &[doh.url()], Some("corp.test"), connector_for(&[(ROUTER.parse().unwrap(), &router), (ORIGINAL, &original)]));
+        let to_router = Asker { addressed: ROUTER.parse().unwrap(), ..HOST };
+        let tkey = build::tkey_query(0x51d2, 1_800);
+        let update = build::signed_update(0x51d3, "corp.test", "pc1.corp.test", "192.168.7.20".parse().unwrap());
+
+        let negotiated = b.ask_as(&tkey, Transport::Stream, to_router).await;
+        assert_eq!((id_of(&negotiated.reply), rcode(&negotiated.reply), negotiated.resolved), (Some(0x51d2), 0, true), "the server's answer");
+        assert_eq!((router.tcp_queries.load(Ordering::SeqCst), router.udp_queries.load(Ordering::SeqCst)), (1, 0), "over TCP, as it came");
+        let signed = b.ask_as(&update, Transport::Stream, to_router).await;
+        assert_eq!((id_of(&signed.reply), rcode(&signed.reply)), (Some(0x51d3), 0));
+        b.ask_as(&tkey, Transport::Datagram, to_router).await;
+        assert_eq!((router.tcp_queries.load(Ordering::SeqCst), router.udp_queries.load(Ordering::SeqCst)), (2, 1), "a datagram as a datagram");
+
+        b.service.set_mode(Mode::Plain);
+        for asker in [HOST, CAPTURED, Asker { dns_client: true, ..HOST }] {
+            for (message, transport) in [(&tkey, Transport::Stream), (&update, Transport::Datagram)] {
+                let answered = b.ask_as(message, transport, asker).await;
+                assert_eq!((rcode(&answered.reply), answered.resolved), (5, false), "{asker:?}: REFUSED");
+            }
+        }
+        b.service.set_mode(Mode::Encrypted);
+        // A signed UPDATE that would register Sieve's own address stays here.
+        let sieves = build::signed_update(0x51d4, "corp.test", "pc1.corp.test", crate::tun::TUN_V4);
+        assert_eq!(rcode(&b.ask_as(&sieves, Transport::Stream, to_router).await.reply), 5);
+        assert_eq!((queries(&router), queries(&original)), (3, 0));
+        assert!(doh.seen().is_empty(), "no encrypted resolver heard the company's names");
     }
 
     /// Windows tries a network's servers in order, then the next network's.

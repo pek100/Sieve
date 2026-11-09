@@ -85,6 +85,10 @@ const EDNS_DO: u32 = 0x0000_8000;
 const RCODE_SERVFAIL: u16 = 2;
 const RCODE_NXDOMAIN: u16 = 3;
 const RCODE_NOTIMP: u16 = 4;
+const RCODE_REFUSED: u16 = 5;
+/// The key negotiation record (RFC 2930) and the signature record (RFC 8945).
+const TYPE_TKEY: u16 = 249;
+const TYPE_TSIG: u16 = 250;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -253,6 +257,38 @@ pub fn servfail(query: &[u8]) -> Option<Vec<u8>> {
 /// NOTIMP with the client's ID and question: the engine answers this itself.
 pub fn notimp(query: &[u8]) -> Option<Vec<u8>> {
     error_reply(query, RCODE_NOTIMP)
+}
+
+/// REFUSED with the client's ID and question: the engine will not send this on.
+pub fn refused(query: &[u8]) -> Option<Vec<u8>> {
+    error_reply(query, RCODE_REFUSED)
+}
+
+/// True when the message belongs to a signed exchange: a TKEY question or record
+/// (RFC 2930, the key negotiation Windows' secure dynamic registration starts
+/// with) or a TSIG record (RFC 8945, a message signed with that key), anywhere in
+/// it. A message that cannot be walked to its end is judged by what was read
+/// before the break, so a cut-off TKEY question still counts.
+pub(crate) fn is_signed_exchange(msg: &[u8]) -> bool {
+    let count = |at: usize| msg.get(at..at + 2).map_or(0, |b| usize::from(u16::from_be_bytes([b[0], b[1]])));
+    let mut pos = HEADER;
+    for _ in 0..count(4) {
+        let Some(end) = skip_name(msg, pos) else { return false };
+        match msg.get(end..end + 2) {
+            Some(ty) if u16::from_be_bytes([ty[0], ty[1]]) == TYPE_TKEY => return true,
+            Some(_) => pos = end + 4,
+            None => return false,
+        }
+    }
+    for _ in 0..count(6) + count(8) + count(10) {
+        let Some(end) = skip_name(msg, pos) else { return false };
+        let Some(head) = msg.get(end..end + 10) else { return false };
+        if matches!(u16::from_be_bytes([head[0], head[1]]), TYPE_TKEY | TYPE_TSIG) {
+            return true;
+        }
+        pos = end + 10 + usize::from(u16::from_be_bytes([head[8], head[9]]));
+    }
+    false
 }
 
 /// NXDOMAIN with the client's ID and question: no such name, said here. It has
@@ -746,6 +782,77 @@ pub(crate) mod build {
         }
         m
     }
+
+    #[cfg(test)]
+    fn name(m: &mut Vec<u8>, name: &str) {
+        for label in name.split('.') {
+            m.push(label.len() as u8);
+            m.extend_from_slice(label.as_bytes());
+        }
+        m.push(0);
+    }
+
+    /// GSS-TSIG's key name for a context, as Windows makes it: a counter, a
+    /// version and a GUID, under no zone.
+    #[cfg(test)]
+    pub const KEY_NAME: &str = "2741-ms-7.1-c0f3.8c3f1a26-7b1e-11ef-9a41-005056a1b2c3";
+
+    /// The first message of Windows' secure registration (RFC 3645): a query of
+    /// type TKEY, class ANY, for the key name, with RD clear, carrying in its
+    /// additional section a TKEY record (algorithm gss-tsig, mode 3 GSS-API) whose
+    /// key is the client's GSS token, `token` octets of it (a Kerberos AP-REQ is
+    /// 1.5 to 3 KB, so it travels over TCP).
+    #[cfg(test)]
+    pub fn tkey_query(id: u16, token: usize) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&id.to_be_bytes());
+        m.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1]);
+        name(&mut m, KEY_NAME);
+        m.extend_from_slice(&[0, 249, 0, 255]);
+        m.extend_from_slice(&[0xc0, 0x0c, 0, 249, 0, 255, 0, 0, 0, 0]);
+        let mut rdata = Vec::new();
+        name(&mut rdata, "gss-tsig");
+        rdata.extend_from_slice(&1_731_100_000u32.to_be_bytes());
+        rdata.extend_from_slice(&1_731_186_400u32.to_be_bytes());
+        rdata.extend_from_slice(&[0, 3, 0, 0]);
+        rdata.extend_from_slice(&(token as u16).to_be_bytes());
+        rdata.extend((0..token).map(|i| (i * 7 + 0x60) as u8));
+        rdata.extend_from_slice(&[0, 0]);
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rdata);
+        m
+    }
+
+    /// The UPDATE that follows (RFC 2136 with RFC 8945): zone `zone` SOA, a
+    /// prerequisite that `host` has no CNAME, `host`'s A record replaced by
+    /// `address`, then the TSIG record signed with the negotiated key, last in the
+    /// additional section.
+    #[cfg(test)]
+    pub fn signed_update(id: u16, zone: &str, host: &str, address: std::net::Ipv4Addr) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&id.to_be_bytes());
+        m.extend_from_slice(&[0x28, 0x00, 0, 1, 0, 1, 0, 2, 0, 1]);
+        name(&mut m, zone);
+        m.extend_from_slice(&[0, 6, 0, 1]);
+        name(&mut m, host);
+        m.extend_from_slice(&[0, 5, 0, 254, 0, 0, 0, 0, 0, 0]);
+        name(&mut m, host);
+        m.extend_from_slice(&[0, 1, 0, 255, 0, 0, 0, 0, 0, 0]);
+        name(&mut m, host);
+        m.extend_from_slice(&[0, 1, 0, 1, 0, 0, 4, 0xb0, 0, 4]);
+        m.extend_from_slice(&address.octets());
+        name(&mut m, KEY_NAME);
+        m.extend_from_slice(&[0, 250, 0, 255, 0, 0, 0, 0]);
+        let mut rdata = Vec::new();
+        name(&mut rdata, "gss-tsig");
+        rdata.extend_from_slice(&[0, 0, 0x67, 0x2f, 0x5a, 0x10, 0x01, 0x2c, 0, 28]);
+        rdata.extend((0..28u8).map(|i| i.wrapping_mul(37) ^ 0x5a));
+        rdata.extend_from_slice(&id.to_be_bytes());
+        rdata.extend_from_slice(&[0, 0, 0, 0]);
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rdata);
+        m
+    }
 }
 
 #[cfg(test)]
@@ -756,6 +863,27 @@ mod tests {
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
+
+    #[test]
+    fn a_key_negotiation_and_a_signed_update_are_told_from_ordinary_messages() {
+        let tkey = build::tkey_query(0x51d2, 1_800);
+        let update = build::signed_update(0x51d3, "corp.test", "pc1.corp.test", "10.20.0.15".parse().unwrap());
+        assert!(is_signed_exchange(&tkey) && is_signed_exchange(&update));
+        // The TKEY question alone, its record cut off: still the negotiation.
+        assert!(is_signed_exchange(&tkey[..HEADER + KEY_NAME_WIRE + 4]));
+        let mut unsigned = update.clone();
+        unsigned[11] = 0;
+        assert!(!is_signed_exchange(&unsigned), "the same UPDATE without its TSIG");
+        let mut with_edns = query_for("pc1.corp.test", TYPE_A).unwrap();
+        with_edns[11] = 1;
+        with_edns.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0x80, 0, 0, 0]);
+        assert!(!is_signed_exchange(&with_edns) && !is_signed_exchange(&query_for("example.net", TYPE_HTTPS).unwrap()));
+        assert!(!is_signed_exchange(&[0u8; 5]) && !is_signed_exchange(&tkey[..HEADER + 3]));
+        assert_eq!(flags_of(&refused(&tkey).unwrap()).unwrap() & 0x800f, 0x8005, "a response, REFUSED");
+    }
+
+    /// The key name's length on the wire: its labels and the root.
+    const KEY_NAME_WIRE: usize = build::KEY_NAME.len() + 2;
 
     #[test]
     fn reads_the_question_and_compressed_address_answers() {
