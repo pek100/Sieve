@@ -20,6 +20,16 @@
 # a fast retransmit restarts the segment's timer; the handshake starts the window
 # after the SYN with the SYN's own window, and data waits for ESTABLISHED.
 #
+# The app's end (2026-11-09, VM run 7): upstream never woke the reader on the app's
+# FIN or RST (it slept until its 60 s timeout, or a server's own: an intercepted client
+# that left right after the handshake looked to self-healing like one idle 30 s), read
+# a closed stream as ended before its queued bytes, dropped a FIN that carried data,
+# and sent its own FIN with the ACK of the app's, so a client that half-closed after
+# its request never got the answer. Now the end is read after the bytes, at once; a
+# FIN with data or ahead of a gap is handled in order; and after the app's FIN ours
+# waits for the engine's shutdown (or the stream's drop). Law: sieve-engine
+# `stack::tcp_send_tests`, the app's end.
+#
 # The criterion benchmark in `packet.rs` builds only under `--cfg ipstack_bench`, so
 # `cargo test --manifest-path engine/vendor/ipstack/Cargo.toml --lib` runs the crate's
 # own unit tests offline (upstream compiled it into every test build without the
