@@ -437,8 +437,11 @@ async fn a_fin_ahead_of_a_gap_is_not_the_end() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_apps_reset_ends_the_read_at_once() {
     for flow in FLOWS {
-        let (to_stack, _from_stack, _stack, app, local, remote, server_next) = reading_bed(flow).await;
-        let reader = read_to_end(app);
+        let (to_stack, _from_stack, _stack, mut app, local, remote, server_next) = reading_bed(flow).await;
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            app.read_to_end(&mut Vec::new()).await
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
         to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { rst: true, ack: Some(server_next), ..Flags::default() }, &[])).unwrap();
         assert!(tokio::time::timeout(END_HEARD, reader).await.is_ok(), "{flow:?}: the reset was not heard");
@@ -533,5 +536,338 @@ async fn an_idle_connection_lives_until_the_limit_then_is_reset() {
             }
         }
         assert!(rst, "{flow:?}: and the app's side reset");
+    }
+}
+
+// ---- Closing (2026-11-09, second review of run 7): every FIN goes, once, and is resent.
+
+/// The app's end of one accepted flow: it sends what a test tells it and keeps what
+/// the stack sent, with the sequence numbers both sides are at.
+struct Peer {
+    to_stack: mpsc::UnboundedSender<Vec<u8>>,
+    from_stack: mpsc::UnboundedReceiver<Vec<u8>>,
+    _stack: IpStack,
+    local: SocketAddr,
+    remote: SocketAddr,
+    /// The app's next sequence number, and the stack's next one the app expects.
+    client_next: u32,
+    server_next: u32,
+}
+
+/// What the stack sent, as the test reads it.
+#[derive(Debug, Clone)]
+struct Sent {
+    seq: u32,
+    ack: u32,
+    len: usize,
+    fin: bool,
+    rst: bool,
+}
+
+async fn peer(flow: (&str, &str), tcp_config: TcpConfig) -> (Peer, IpStackTcpStream) {
+    let (to_stack, from_stack, stack, app, local, remote, server_next) = reading_bed_with(flow, tcp_config).await;
+    (Peer { to_stack, from_stack, _stack: stack, local, remote, client_next: CLIENT_ISN + 1, server_next }, app)
+}
+
+impl Peer {
+    /// A segment from the app at its next sequence number, acknowledging `ack`.
+    fn send_at(&mut self, seq: u32, ack: u32, fin: bool, payload: &[u8]) {
+        let flags = Flags { psh: !payload.is_empty(), fin, ack: Some(ack), ..Flags::default() };
+        self.to_stack.send(segment(self.local, self.remote, seq, flags, payload)).unwrap();
+    }
+
+    fn send(&mut self, fin: bool, payload: &[u8]) {
+        let (seq, ack) = (self.client_next, self.server_next);
+        self.send_at(seq, ack, fin, payload);
+        self.client_next = seq.wrapping_add(u32::try_from(payload.len()).unwrap()).wrapping_add(u32::from(fin));
+    }
+
+    /// A keep-alive probe: one sequence number back, no data (RFC 9293 3.8.4).
+    fn keep_alive(&mut self) {
+        let (seq, ack) = (self.client_next.wrapping_sub(1), self.server_next);
+        self.send_at(seq, ack, false, &[]);
+    }
+
+    /// Every segment within `wait`, acknowledging none of them.
+    async fn listen(&mut self, wait: Duration) -> Vec<Sent> {
+        let deadline = Instant::now() + wait;
+        let mut got = Vec::new();
+        while let Ok(Some(packet)) = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), self.from_stack.recv()).await {
+            let (h, payload) = tcp(&packet);
+            got.push(Sent { seq: h.sequence_number, ack: h.acknowledgment_number, len: payload.len(), fin: h.fin, rst: h.rst });
+        }
+        got
+    }
+
+    /// Segments until one with a FIN or a RST, or `wait`; data is acknowledged as it
+    /// comes, the FIN is not.
+    async fn until_end(&mut self, wait: Duration) -> Option<Sent> {
+        let deadline = Instant::now() + wait;
+        while let Ok(Some(packet)) = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), self.from_stack.recv()).await {
+            let (h, payload) = tcp(&packet);
+            let sent = Sent { seq: h.sequence_number, ack: h.acknowledgment_number, len: payload.len(), fin: h.fin, rst: h.rst };
+            if sent.len > 0 {
+                self.server_next = sent.seq.wrapping_add(u32::try_from(sent.len).unwrap());
+                self.send(false, &[]);
+            }
+            if sent.fin || sent.rst {
+                return Some(sent);
+            }
+        }
+        None
+    }
+}
+
+/// P1-1: the server closes right after its last bytes, so the relay shuts down while
+/// they are unacknowledged. The FIN must follow their ACK; it waited for a second
+/// shutdown poll that nothing made, and the app hung until the idle limit (2 h).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fin_follows_the_last_bytes_once_they_are_acknowledged() {
+    const BODY: &[u8] = b"HTTP/1.0 200 OK\r\n\r\nclose-delimited body";
+    for flow in FLOWS {
+        let (mut peer, mut app) = peer(flow, super::relay::tcp_config()).await;
+        let engine = tokio::spawn(async move {
+            app.write_all(BODY).await.unwrap();
+            let shut = tokio::time::timeout(RECOVERY, app.shutdown()).await;
+            (shut.is_ok(), app)
+        });
+        // The ACK comes after the shutdown was asked, as an app's does.
+        let data = loop {
+            let packet = tokio::time::timeout(RECOVERY, peer.from_stack.recv()).await.expect("the body").unwrap();
+            let (h, payload) = tcp(&packet);
+            if !payload.is_empty() {
+                break Sent { seq: h.sequence_number, ack: h.acknowledgment_number, len: payload.len(), fin: h.fin, rst: h.rst };
+            }
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        peer.server_next = data.seq.wrapping_add(u32::try_from(data.len).unwrap());
+        peer.send(false, &[]);
+        let end = peer.until_end(RECOVERY).await;
+        assert!(end.as_ref().is_some_and(|e| e.fin && !e.rst && e.seq == peer.server_next), "{flow:?}: no FIN after the ACK of the last bytes: {end:?}");
+        let (shut, _app) = engine.await.unwrap();
+        assert!(shut, "{flow:?}: and the engine's shutdown returned");
+    }
+}
+
+/// P1-2: a shutdown asked as the app's FIN arrives. Upstream woke the TCP task before
+/// it recorded the ask, so a task that looked in between slept on with no FIN sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shutdown_racing_the_apps_fin_still_sends_ours() {
+    const ROUNDS: usize = 150;
+    let mut missing = 0;
+    for round in 0..ROUNDS {
+        let flow = FLOWS[round % FLOWS.len()];
+        let (mut peer, mut app) = peer(flow, super::relay::tcp_config()).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        peer.send(true, &[]);
+        let engine = tokio::spawn(async move {
+            let _ = tokio::time::timeout(RECOVERY, app.shutdown()).await;
+            app
+        });
+        if !peer.until_end(Duration::from_secs(1)).await.is_some_and(|e| e.fin) {
+            missing += 1;
+        }
+        engine.abort();
+    }
+    assert_eq!(missing, 0, "rounds of {ROUNDS} with no FIN from the stack");
+}
+
+/// P1-2: a server that never answers a half-closed app cannot hold the flow for
+/// ever: past the idle limit with nothing from the app, the stack resets it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_closed_flow_no_one_ends_is_reset_at_the_idle_limit() {
+    const SHORT_IDLE: Duration = Duration::from_millis(400);
+    for flow in FLOWS {
+        let mut short = super::relay::tcp_config();
+        short.timeout = SHORT_IDLE;
+        let (mut peer, app) = peer(flow, short).await;
+        peer.send(true, &[]);
+        let early = peer.listen(SHORT_IDLE / 2).await;
+        assert!(early.iter().all(|s| !s.rst && !s.fin), "{flow:?}: inside the limit only the ACK: {early:?}");
+        let end = peer.until_end(RECOVERY).await;
+        assert!(end.as_ref().is_some_and(|e| e.rst), "{flow:?}: the half-closed flow was never ended: {end:?}");
+        drop(app);
+    }
+}
+
+/// P2-3: the app's keep-alives are the connection in use. Windows sends its first
+/// after 2 h, the same as the idle limit, so an app that relies on them was reset at
+/// exactly the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn keep_alives_keep_an_idle_connection_alive() {
+    const SHORT_IDLE: Duration = Duration::from_millis(600);
+    for flow in FLOWS {
+        let mut short = super::relay::tcp_config();
+        short.timeout = SHORT_IDLE;
+        let (mut peer, mut app) = peer(flow, short).await;
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut byte = [0u8; 1];
+            app.read(&mut byte).await.map_err(|e| e.kind())
+        });
+        let mut sent = Vec::new();
+        for _ in 0..8 {
+            sent.extend(peer.listen(SHORT_IDLE / 3).await);
+            peer.keep_alive();
+        }
+        assert!(!reader.is_finished(), "{flow:?}: reset with the app's keep-alives coming");
+        assert!(sent.iter().all(|s| !s.rst), "{flow:?}: {sent:?}");
+        assert!(sent.iter().any(|s| s.ack == peer.client_next), "{flow:?}: the probes were answered");
+        // The control: once they stop, the limit holds.
+        let end = peer.until_end(RECOVERY).await;
+        assert!(end.as_ref().is_some_and(|e| e.rst), "{flow:?}: {end:?}");
+        assert_eq!(tokio::time::timeout(RECOVERY, reader).await.unwrap().unwrap(), Err(std::io::ErrorKind::TimedOut));
+    }
+}
+
+/// P2-4: the app's FIN again in CLOSE-WAIT, because our ACK of it was lost: it is
+/// acknowledged again, or the app's stack resends it until it gives up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_fin_in_close_wait_is_acknowledged() {
+    for flow in FLOWS {
+        let (mut peer, app) = peer(flow, super::relay::tcp_config()).await;
+        let fin_at = peer.client_next;
+        peer.send(true, &[]);
+        let first = peer.listen(Duration::from_millis(200)).await;
+        assert!(first.iter().any(|s| s.ack == fin_at.wrapping_add(1)), "{flow:?}: the control, the FIN acknowledged: {first:?}");
+        let server_next = peer.server_next;
+        peer.send_at(fin_at, server_next, true, &[]);
+        let again = peer.listen(Duration::from_millis(300)).await;
+        assert!(again.iter().any(|s| s.ack == fin_at.wrapping_add(1) && !s.fin && !s.rst), "{flow:?}: the resent FIN went unanswered: {again:?}");
+        drop(app);
+    }
+}
+
+/// P2-5: our FIN, unacknowledged in LAST-ACK, is resent at its own sequence number,
+/// not one past it; an ACK that does not cover it closes nothing; its own ACK does.
+#[tokio::test(flavor = "multi_thread")]
+async fn our_fin_is_resent_at_its_sequence_and_only_its_ack_closes() {
+    for flow in FLOWS {
+        let (mut peer, mut app) = peer(flow, super::relay::tcp_config()).await;
+        peer.send(true, &[]);
+        let _ = peer.listen(Duration::from_millis(100)).await;
+        let fin_seq = peer.server_next;
+        let engine = tokio::spawn(async move {
+            let _ = tokio::time::timeout(RECOVERY, app.shutdown()).await;
+            app
+        });
+        // An ACK of nothing new, after the first FIN: not the end.
+        let first = peer.until_end(RECOVERY).await.expect("a FIN");
+        assert!(first.fin && first.seq == fin_seq, "{flow:?}: {first:?}");
+        peer.send(false, &[]);
+        let resent = peer.listen(Duration::from_millis(1_200)).await;
+        let fins: Vec<u32> = resent.iter().filter(|s| s.fin).map(|s| s.seq).collect();
+        assert!(!fins.is_empty(), "{flow:?}: an ACK below the FIN closed the flow: {resent:?}");
+        assert!(fins.iter().all(|&s| s == fin_seq), "{flow:?}: resent FINs at {fins:?}, ours is at {fin_seq}");
+        // Its own ACK ends it: nothing more is sent.
+        peer.server_next = fin_seq.wrapping_add(1);
+        peer.send(false, &[]);
+        let after = peer.listen(Duration::from_millis(1_200)).await;
+        assert!(after.iter().all(|s| !s.fin && !s.rst), "{flow:?}: still closing after its ACK: {after:?}");
+        let _ = engine.await;
+    }
+}
+
+/// P3: a half-closed stream the engine lets go of without a shutdown still closes
+/// the app's side: one FIN, resent while unacknowledged, then a reset once its
+/// retransmissions run out, where it was sent once and the task torn down with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_half_closed_stream_resends_its_one_fin_then_resets() {
+    for flow in FLOWS {
+        let (mut peer, app) = peer(flow, super::relay::tcp_config()).await;
+        peer.send(true, &[]);
+        let _ = peer.listen(Duration::from_millis(100)).await;
+        let fin_seq = peer.server_next;
+        drop(app);
+        let sent = peer.listen(Duration::from_secs(3)).await;
+        let fins: Vec<u32> = sent.iter().filter(|s| s.fin).map(|s| s.seq).collect();
+        assert!(fins.len() >= 2, "{flow:?}: the dropped stream's FIN was never resent: {sent:?}");
+        assert!(fins.iter().all(|&s| s == fin_seq), "{flow:?}: two FINs, at {fins:?}");
+        assert!(sent.last().is_some_and(|s| s.rst), "{flow:?}: no reset once the FIN went unanswered: {sent:?}");
+    }
+}
+
+/// P3: the control of the rule above: a dropped stream whose FIN is acknowledged ends
+/// there, with no reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_half_closed_stream_whose_fin_is_acknowledged_just_ends() {
+    for flow in FLOWS {
+        let (mut peer, app) = peer(flow, super::relay::tcp_config()).await;
+        peer.send(true, &[]);
+        let _ = peer.listen(Duration::from_millis(100)).await;
+        drop(app);
+        let fin = peer.until_end(RECOVERY).await.expect("a FIN");
+        assert!(fin.fin, "{flow:?}: {fin:?}");
+        peer.server_next = fin.seq.wrapping_add(1);
+        peer.send(false, &[]);
+        let after = peer.listen(Duration::from_secs(2)).await;
+        assert!(after.iter().all(|s| !s.fin && !s.rst), "{flow:?}: {after:?}");
+    }
+}
+
+/// P3: in FIN-WAIT-2 a FIN that carries bytes ahead of a gap is not the end yet, as in
+/// ESTABLISHED: the read waits for the missing bytes and the FIN is taken after them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fin_ahead_of_a_gap_in_fin_wait_2_is_not_the_end() {
+    for flow in FLOWS {
+        let (mut peer, mut app) = peer(flow, super::relay::tcp_config()).await;
+        // Bounded: before the fix a shutdown returned only once the connection closed.
+        let _ = tokio::time::timeout(Duration::from_millis(300), app.shutdown()).await;
+        let fin = peer.until_end(RECOVERY).await.expect("our FIN");
+        assert!(fin.fin, "{flow:?}: {fin:?}");
+        peer.server_next = fin.seq.wrapping_add(1);
+        peer.send(false, &[]);
+        let reader = read_to_end(app);
+        let start = peer.client_next;
+        let server_next = peer.server_next;
+        peer.send_at(start.wrapping_add(5), server_next, true, b"world");
+        let early = peer.listen(Duration::from_millis(300)).await;
+        assert!(early.iter().all(|s| s.ack == start), "{flow:?}: a FIN past a gap was acknowledged: {early:?}");
+        assert!(!reader.is_finished(), "{flow:?}: the first five bytes never came");
+        peer.send_at(start, server_next, false, b"hello");
+        peer.send_at(start.wrapping_add(5), server_next, true, b"world");
+        let got = tokio::time::timeout(END_HEARD, reader).await.unwrap_or_else(|_| panic!("{flow:?}: the end was not read")).unwrap();
+        assert_eq!(got, b"helloworld", "{flow:?}");
+    }
+}
+
+/// P3: the app's reset reads as a reset, not as the end of what it sent: a relay that
+/// took it for the end would close the upload upstream as if it were complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_apps_reset_reads_as_a_reset_not_an_end() {
+    for flow in FLOWS {
+        let (mut peer, mut app) = peer(flow, super::relay::tcp_config()).await;
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut got = Vec::new();
+            app.read_to_end(&mut got).await.map(|_| got).map_err(|e| e.kind())
+        });
+        peer.send(false, b"half an upload");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (seq, ack) = (peer.client_next, peer.server_next);
+        peer.to_stack.send(segment(peer.local, peer.remote, seq, Flags { rst: true, ack: Some(ack), ..Flags::default() }, &[])).unwrap();
+        let read = tokio::time::timeout(END_HEARD, reader).await.expect("the reset was heard").unwrap();
+        assert_eq!(read, Err(std::io::ErrorKind::ConnectionReset), "{flow:?}");
+    }
+}
+
+/// The book's eviction (P3): a stream's handle tells how long the app has been
+/// silent, keep-alives counting, and ends the flow with a reset when told to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streams_handle_tells_its_idle_time_and_resets_it() {
+    for flow in FLOWS {
+        let (mut peer, mut app) = peer(flow, super::relay::tcp_config()).await;
+        let handle = app.handle();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(handle.idle() >= Duration::from_millis(250), "{flow:?}: {:?}", handle.idle());
+        peer.keep_alive();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(handle.idle() < Duration::from_millis(250), "{flow:?}: a keep-alive is use: {:?}", handle.idle());
+        handle.abort();
+        let end = peer.until_end(RECOVERY).await;
+        assert!(end.as_ref().is_some_and(|e| e.rst), "{flow:?}: {end:?}");
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0u8; 1];
+        assert!(tokio::time::timeout(END_HEARD, app.read(&mut byte)).await.is_ok(), "{flow:?}: the reader heard of it");
     }
 }

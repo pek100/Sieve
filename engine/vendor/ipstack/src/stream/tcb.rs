@@ -66,6 +66,13 @@ pub(crate) struct Tcb {
     max_count_for_dup_ack: usize,
     rto: std::time::Duration,
     max_retransmit_count: usize,
+    /// When the other side last sent a valid segment, keep-alive probes included: the
+    /// idle limit runs from here. Sieve (2026-11-09): upstream ran it from the engine's
+    /// last read or write, so keep-alives never counted.
+    last_activity: std::time::Instant,
+    /// How the connection ended when it did not end with both FINs: what its reader
+    /// is told once every byte that came before is read.
+    closed_by: Option<std::io::ErrorKind>,
 }
 
 impl Tcb {
@@ -98,7 +105,28 @@ impl Tcb {
             max_count_for_dup_ack,
             rto,
             max_retransmit_count,
+            last_activity: std::time::Instant::now(),
+            closed_by: None,
         }
+    }
+
+    /// A valid segment came from the other side.
+    pub(super) fn touch(&mut self) {
+        self.last_activity = std::time::Instant::now();
+    }
+
+    pub(super) fn last_activity(&self) -> std::time::Instant {
+        self.last_activity
+    }
+
+    /// Closes the connection as `kind` says it ended (a reset, a timeout).
+    pub(super) fn close_with(&mut self, kind: std::io::ErrorKind) {
+        self.closed_by = Some(kind);
+        self.state = TcpState::Closed;
+    }
+
+    pub(super) fn closed_by(&self) -> Option<std::io::ErrorKind> {
+        self.closed_by
     }
 
     /// The right edge of the usable window: the last ACK plus the smaller of the peer's

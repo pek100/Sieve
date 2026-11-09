@@ -21,7 +21,7 @@ mod progress;
 pub use progress::{Progress, ProgressSnapshot};
 
 pub use self::error::{IpStackError, Result};
-pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
+pub use self::stream::{IpStackStream, IpStackTcpHandle, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 pub use self::stream::{TcpConfig, TcpOptions};
 pub use etherparse::IpNumber;
 
