@@ -48,7 +48,7 @@ interface Base<T> {
   label: string;
   help: string;
   default: T;
-  /** Settings key of a data switch that must be on for this one to apply. */
+  /** Settings key of a switch (a data switch, or a boolean) that must be on for this one to apply. */
   requires?: string;
   /** Only the desktop app can apply it (it talks to Windows through a Tauri plugin). */
   desktopOnly?: boolean;
@@ -367,6 +367,21 @@ export const REGISTRY = {
     label: "Encrypt DNS lookups",
     help: "On: the engine sends the names of the sites you visit to the servers above, encrypted. Off: it sends them in plain text to your network's own DNS server, as Windows does without Sieve, and anyone on the network can see them. Some hotel and airport Wi-Fi needs it off to show its sign-in page.",
     default: true,
+  } satisfies BooleanSetting,
+  // The owner's decision (2026-11-09): "Setting, on by default". Sent as the
+  // policy's `skip_dns_capture` only when off, so an engine from before it never
+  // sees the field at the default. It needs encryption: with plain DNS there is
+  // nothing to encrypt, the engine does not catch Windows' lookups, and the row
+  // is locked with the reason (`requires`) rather than hidden.
+  "filtering.dnsClientCapture": {
+    kind: "boolean",
+    section: "filtering",
+    label: "Also encrypt Windows' own lookups",
+    help: "Windows' built-in lookups also go through Sieve's encrypted DNS, so the network can't read them. Off: Windows sends them to your network's DNS server in plain text, as it does without Sieve.",
+    breaks:
+      "Names of nearby PCs found without DNS, and short names that don't exist, answer about 7 s slower. Hotel and café Wi-Fi sign-in pages may not open until you turn this off or sign in.",
+    default: true,
+    requires: "filtering.dnsEncryption",
   } satisfies BooleanSetting,
   // Written by the Filters page's editor and the log's row actions after a
   // preview (core/log-actions), and sent whole in the engine's policy.

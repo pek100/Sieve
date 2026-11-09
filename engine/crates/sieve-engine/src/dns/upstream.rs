@@ -235,6 +235,10 @@ pub enum Path {
     /// service makes it, from [`Path::Encrypted`], and only while the user has
     /// encryption off; [`path_of`] never does.
     Plain(IpAddr),
+    /// In plain text to the servers Windows would ask without Sieve, in its order
+    /// ([`plain_servers`]), for a query that addressed no server outside Sieve.
+    /// Made like [`Path::Plain`].
+    PlainAsWindows,
 }
 
 impl SplitHorizon {
@@ -304,36 +308,73 @@ pub fn split_route(query: &[u8], rules: &[SplitHorizon]) -> Path {
     }
 }
 
+/// Suffixes as the registry and the adapters spell them (comma or space
+/// separated, a dot at either end), lower case, each once, in order.
+pub fn suffix_list(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
+        for suffix in value.split([',', ' ', '\t']).map(|s| s.trim_matches('.').to_ascii_lowercase()).filter(|s| !s.is_empty()) {
+            if !out.contains(&suffix) {
+                out.push(suffix);
+            }
+        }
+    }
+    out
+}
+
 /// The rules these tables imply, computed per query (few adapters, no cache):
-/// each suffix of each other up adapter, with [`lan_server`].
+/// each suffix of each other up adapter, with [`lan_server`]. The machine's own
+/// suffixes (`NetTables::global_suffixes`: a domain's primary suffix and search
+/// list) count as suffixes of the adapter Windows sends through, whose servers
+/// are the domain's ([`NetTables::default_adapter`]).
 /// When such servers are all the adapter has, its suffix still holds, with no
 /// server. A public server is another matter: an ISP's or a router's suffix under
 /// a public domain resolves publicly, so that suffix makes no rule.
 pub fn split_rules(tables: &NetTables) -> Vec<SplitHorizon> {
     let holes = plan::holes(tables);
+    let default = tables.default_adapter().map(|a| a.index);
     let mut rules = Vec::new();
     for adapter in tables.others() {
         let only_link_local = !adapter.dns.is_empty() && adapter.dns.iter().all(|ip| is_v6_link_local(*ip));
         let server = lan_server(adapter, &holes);
-        for suffix in &adapter.dns_suffixes {
-            let qualifying = server.and_then(|server| SplitHorizon::new(suffix, server, &holes));
-            rules.extend(qualifying.or_else(|| only_link_local.then(|| SplitHorizon::unreachable(suffix)).flatten()));
+        let global = if default == Some(adapter.index) { tables.global_suffixes.as_slice() } else { &[] };
+        for suffix in suffix_list(adapter.dns_suffixes.iter().chain(global).cloned()) {
+            let qualifying = server.and_then(|server| SplitHorizon::new(&suffix, server, &holes));
+            rules.extend(qualifying.or_else(|| only_link_local.then(|| SplitHorizon::unreachable(&suffix)).flatten()));
         }
     }
     rules
 }
 
-/// Where the engine's own lookup goes in plain mode, having no client whose server
-/// to use: the first DNS server of the other up adapters, the one that holds the
-/// lowest-metric default route first (the adapter Windows sends through), then
+/// The servers Windows would ask without Sieve, in its order: the other up
+/// adapters' DNS servers, the adapter that holds the lowest-metric default route
+/// first (the one Windows sends through), each adapter's in its own order, then
 /// the rest in the tables' order. A link-local IPv6 one is skipped, as
 /// [`lan_server`] does.
-pub fn first_server(tables: &NetTables) -> Option<IpAddr> {
+pub fn plain_servers(tables: &NetTables) -> Vec<IpAddr> {
     let default_metric = |a: &Adapter| tables.routes_on(a).filter(|r| r.dest.length() == 0).map(|r| r.metric).min();
     let mut adapters: Vec<&Adapter> = tables.others().collect();
     // Stable: equal keys keep the tables' order.
     adapters.sort_by_key(|a| default_metric(a).map_or((1, 0), |metric| (0, metric)));
-    adapters.into_iter().flat_map(|a| a.dns.iter().copied()).find(|ip| !is_v6_link_local(*ip))
+    let mut out: Vec<IpAddr> = Vec::new();
+    for ip in adapters.into_iter().flat_map(|a| a.dns.iter().copied()).filter(|ip| !is_v6_link_local(*ip)) {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+/// The first of [`plain_servers`].
+pub fn first_server(tables: &NetTables) -> Option<IpAddr> {
+    plain_servers(tables).first().copied()
+}
+
+/// True when `server` is the LAN DNS server of another up adapter: one of its
+/// servers, private, in a hole (what [`lan_server`] accepts).
+pub fn is_lan_server(tables: &NetTables, server: IpAddr) -> bool {
+    let holes = plan::holes(tables);
+    tables.others().any(|a| a.dns.contains(&server)) && !is_v6_link_local(server) && private_inside(server, &holes)
 }
 
 fn is_v6_link_local(ip: IpAddr) -> bool {
@@ -752,5 +793,45 @@ mod tests {
         sieve.dns = vec![lan];
         sieve.dns_suffixes = vec!["sieve.example".into()];
         assert!(split_rules(&own).is_empty());
+    }
+
+    /// A domain's names are asked under the primary suffix and the global search
+    /// list, which no adapter names: they go to the LAN server of the adapter
+    /// Windows sends through, never public.
+    #[test]
+    fn the_machines_own_suffixes_go_to_the_default_adapters_lan_server() {
+        use crate::route::table::fixtures::*;
+        let lan: IpAddr = "192.168.7.1".parse().unwrap();
+        let mut domain = load(HOME);
+        domain.global_suffixes = suffix_list(["corp.example".to_string(), "Branch.Corp.Example., eu.example".to_string()]);
+        assert_eq!(domain.global_suffixes, ["corp.example", "branch.corp.example", "eu.example"]);
+        let rules = split_rules(&domain);
+        for name in ["dc1.corp.example", "host.branch.corp.example", "x.eu.example", "corp.example"] {
+            assert_eq!(route_of(name, &rules), Path::Lan(lan), "{name}");
+        }
+        assert_eq!(route_of("www.example", &rules), Path::Encrypted);
+        assert_eq!(route_of("dc1.corp.example", &split_rules(&load(HOME))), Path::Encrypted, "the control: no machine suffix");
+
+        // Only the default adapter's servers take them: another adapter's private
+        // server never does.
+        let mut other = domain.clone();
+        wifi(&mut other).dns = vec!["8.8.8.8".parse().unwrap()];
+        other.adapters.iter_mut().find(|a| a.alias.starts_with("vEthernet")).unwrap().dns = vec!["172.27.16.1".parse().unwrap()];
+        assert_eq!(route_of("dc1.corp.example", &split_rules(&other)), Path::Encrypted, "a public default server: the domain resolves publicly");
+        // A default adapter with only a link-local server: refused, never public.
+        let mut scoped = domain.clone();
+        wifi(&mut scoped).dns = vec!["fe80::1".parse().unwrap()];
+        assert_eq!(route_of("dc1.corp.example", &split_rules(&scoped)), Path::Refused);
+    }
+
+    #[test]
+    fn plain_servers_are_each_adapters_in_order_the_default_adapters_first() {
+        use crate::route::table::fixtures::*;
+        let mut tables = load(HOME);
+        let (a, b, c): (IpAddr, IpAddr, IpAddr) = ("192.168.7.1".parse().unwrap(), "192.168.7.2".parse().unwrap(), "172.27.16.1".parse().unwrap());
+        wifi(&mut tables).dns = vec![a, "fe80::1".parse().unwrap(), b];
+        tables.adapters.iter_mut().find(|x| x.alias.starts_with("vEthernet")).unwrap().dns = vec![c, a];
+        assert_eq!(plain_servers(&tables), [a, b, c]);
+        assert!(is_lan_server(&tables, b) && !is_lan_server(&tables, "8.8.8.8".parse().unwrap()) && !is_lan_server(&tables, "192.168.7.9".parse().unwrap()));
     }
 }

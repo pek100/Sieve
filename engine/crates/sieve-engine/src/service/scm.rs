@@ -254,6 +254,12 @@ fn routes() -> Result<String, String> {
     if done.contains("FAILED") { Err(done) } else { Ok(done) }
 }
 
+/// What a kill left of the adapter's DNS setting, once the stop removed the
+/// adapter (`route::apply::forget_adapter_key`).
+fn dns_key() -> Result<String, String> {
+    crate::route::apply::forget_adapter_key()
+}
+
 /// The folder check first; when it refuses, nothing else runs: no service is
 /// registered for an exe that users can replace.
 pub fn install() -> Vec<Step> {
@@ -281,9 +287,10 @@ fn install_steps(folder: impl FnOnce() -> Result<String, String>, rest: impl FnO
 /// service, so it comes before the deletion, which waits until nothing recorded
 /// remains (a rerun needs it too), and `program data` last.
 type StepFn = fn() -> Result<String, String>;
-const UNINSTALL: [(&str, StepFn); 7] = [
+const UNINSTALL: [(&str, StepFn); 8] = [
     ("routes", routes),
     ("stop", stop),
+    ("dns key", dns_key),
     ("attribution session", stop_stale),
     ("trust", trust),
     ("ca keys", ca_keys),
@@ -296,7 +303,7 @@ pub fn uninstall() -> Vec<Step> {
 }
 
 pub fn restore() -> Vec<Step> {
-    vec![Step::run("routes", routes), Step::run("stop", stop), Step::run("attribution session", stop_stale)]
+    vec![Step::run("routes", routes), Step::run("stop", stop), Step::run("dns key", dns_key), Step::run("attribution session", stop_stale)]
 }
 
 #[cfg(test)]
@@ -328,7 +335,7 @@ mod tests {
     #[test]
     fn trust_steps_come_before_service_deletion() {
         let names: Vec<&str> = UNINSTALL.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["routes", "stop", "attribution session", "trust", "ca keys", "delete service", "program data"]);
+        assert_eq!(names, ["routes", "stop", "dns key", "attribution session", "trust", "ca keys", "delete service", "program data"]);
     }
 
     #[test]

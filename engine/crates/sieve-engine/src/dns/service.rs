@@ -20,8 +20,11 @@
 //! - An `ech` parameter comes out of a public answer, encrypted or on the user's
 //!   plain path, for a name that may be intercepted ([`Service::without_ech`]). The LAN path is never stripped: its
 //!   answers are for addresses that never enter the stack.
-//! - Other opcodes (Windows' dynamic DNS UPDATE carries the host name) are
-//!   answered NOTIMP here and nothing leaves.
+//! - A dynamic DNS UPDATE (Windows registers the host's name and address) goes
+//!   in plain text to the server it addressed when that is another adapter's LAN
+//!   DNS server, as a LAN name does; one sent to the engine's own server, or to
+//!   any other, and every other opcode are answered NOTIMP here and nothing leaves.
+//! - A capture probe (`route::capture::is_probe`) is answered NODATA here.
 //! - When nothing answers, the client gets SERVFAIL at the deadline. In
 //!   [`Mode::Encrypted`] no path reaches a plain socket beyond the LAN exchange,
 //!   whatever failed; lookups that every encrypted resolver failed are counted
@@ -41,9 +44,11 @@ use tokio::time::Instant;
 use super::ech::{self, Stripped};
 use super::pool::{Context, Pool, UpstreamReport};
 use super::upstream::{self, Health, Path, REQUEST_BUDGET, Upstream};
-use super::{FLAG_OPCODE, FLAG_QR, HttpsRecord, MAX_MESSAGE, NameMap, TYPE_HTTPS, TYPE_SVCB, edns, flags_of, notimp, nxdomain, parse, plain, query_for, reply_answers, reverse, servfail, truncated, udp_limit, with_id};
+use super::{FLAG_AD, FLAG_OPCODE, FLAG_QR, HttpsRecord, MAX_MESSAGE, NameMap, TYPE_HTTPS, TYPE_SVCB, edns, flags_of, nodata, notimp, nxdomain, parse, plain, query_for, reply_answers, reverse, servfail, truncated, udp_limit, with_id};
+use crate::route::capture;
 use crate::route::table::NetTables;
 use crate::stack::Meters;
+use crate::tun::TUN_DNS;
 use crate::watchdog::monotonic_ms;
 
 /// Queries one service works on at once. Past it a datagram is dropped (the
@@ -62,6 +67,14 @@ const MIN_MESSAGE: usize = 12;
 /// Lookups in a row that every encrypted resolver failed before
 /// [`Service::unreachable`] says so: one is a blip, a captive portal fails them all.
 pub const UNREACHABLE_AFTER: u64 = 3;
+/// The one switch for the NXDOMAIN-as-NODATA rewrite ([`Service::answer`]), which
+/// waits on the owner's decision: false gives the DNS Client every NXDOMAIN as it
+/// came, and it then waits out the blocked networks after one (12 s, measured).
+pub const NXDOMAIN_AS_NODATA: bool = true;
+/// The UPDATE opcode (RFC 2136).
+const OPCODE_UPDATE: u16 = 5;
+/// Probe names the service remembers having seen at [`TUN_DNS`].
+const PROBES_KEPT: usize = 8;
 
 /// Where a lookup no LAN rule claims goes: the user's choice, encrypted unless
 /// they turned it off (`Policy::plain_dns`).
@@ -95,8 +108,12 @@ pub struct Asker {
     /// count: it is how browsers resolve, so the service floor does not apply here.
     pub may_decrypt: bool,
     /// The server the query was sent to: the flow's destination, routed into the
-    /// adapter by its host route (`route::plan`). Only [`Mode::Plain`] uses it.
+    /// adapter by its host route (`route::plan`). [`Mode::Plain`] sends there, an
+    /// UPDATE goes there when it is a LAN server.
     pub addressed: IpAddr,
+    /// The flow is the Windows DNS Client service's, by attribution (`stack::dns_flow`).
+    /// False when it could not be told.
+    pub dns_client: bool,
 }
 
 /// True when a flow to this name may be decrypted: `Interception::may_intercept_name`
@@ -119,6 +136,7 @@ struct Facts {
     canary: AtomicU64,
     reverse_lan: AtomicU64,
     reverse_local: AtomicU64,
+    nodata: AtomicU64,
 }
 
 /// [`Facts`] as read.
@@ -133,6 +151,8 @@ pub struct Counts {
     pub reverse_lan: u64,
     /// Private reverse lookups answered NXDOMAIN here.
     pub reverse_local: u64,
+    /// NXDOMAINs given to the DNS Client as NODATA (`NXDOMAIN_AS_NODATA`).
+    pub nodata: u64,
 }
 
 /// `name` without the attrleaf labels of an HTTPS or SVCB query:
@@ -183,12 +203,73 @@ pub struct Service {
     plain: AtomicBool,
     /// Encrypted lookups in a row that every resolver failed; an answer ends the run.
     failed_in_a_row: AtomicU64,
+    /// The capture is proven and blocks every network the DNS Client could ask
+    /// (`route::capture::every_network_blocked`): the routing loop sets it.
+    every_network_blocked: AtomicBool,
+    probes: Probes,
+}
+
+/// The capture probes seen at [`TUN_DNS`], newest last.
+#[derive(Default)]
+struct Probes {
+    seen: Mutex<std::collections::VecDeque<String>>,
+    arrived: tokio::sync::Notify,
+}
+
+fn probe_key(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 impl Service {
     pub fn new(endpoints: Vec<Upstream>, context: Context, tables: Arc<RwLock<NetTables>>, names: Arc<Mutex<NameMap>>, meters: Arc<Meters>, mtu: usize, may_intercept: NameGate) -> Self {
         let active = RwLock::new(Arc::new(Active::new(endpoints, &context)));
-        Self { context, active, tables, names, meters, mtu, in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)), may_intercept, facts: Facts::default(), plain: AtomicBool::new(false), failed_in_a_row: AtomicU64::new(0) }
+        Self {
+            context,
+            active,
+            tables,
+            names,
+            meters,
+            mtu,
+            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            may_intercept,
+            facts: Facts::default(),
+            plain: AtomicBool::new(false),
+            failed_in_a_row: AtomicU64::new(0),
+            every_network_blocked: AtomicBool::new(false),
+            probes: Probes::default(),
+        }
+    }
+
+    /// What the capture holds now; only true lets [`NXDOMAIN_AS_NODATA`] act.
+    pub fn set_every_network_blocked(&self, blocked: bool) {
+        self.every_network_blocked.store(blocked, Ordering::SeqCst);
+    }
+
+    /// True once the probe `name` has reached [`TUN_DNS`], waiting at most `within`.
+    pub async fn probe_arrived(&self, name: &str, within: Duration) -> bool {
+        let key = probe_key(name);
+        let seen = || self.probes.seen.lock().unwrap_or_else(|p| p.into_inner()).contains(&key);
+        tokio::time::timeout(within, async {
+            loop {
+                let arrived = self.probes.arrived.notified();
+                if seen() {
+                    return;
+                }
+                arrived.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    fn probe_seen(&self, name: &str) {
+        let mut seen = self.probes.seen.lock().unwrap_or_else(|p| p.into_inner());
+        seen.push_back(probe_key(name));
+        while seen.len() > PROBES_KEPT {
+            seen.pop_front();
+        }
+        drop(seen);
+        self.probes.arrived.notify_waiters();
     }
 
     /// The next query takes this mode. A plain query in flight sends nothing more
@@ -238,7 +319,7 @@ impl Service {
     pub fn counts(&self) -> Counts {
         let read = |count: &AtomicU64| count.load(Ordering::Relaxed);
         let f = &self.facts;
-        Counts { ech_stripped: read(&f.ech_stripped), ech_left: read(&f.ech_left), canary: read(&f.canary), reverse_lan: read(&f.reverse_lan), reverse_local: read(&f.reverse_local) }
+        Counts { ech_stripped: read(&f.ech_stripped), ech_left: read(&f.ech_left), canary: read(&f.canary), reverse_lan: read(&f.reverse_lan), reverse_local: read(&f.reverse_local), nodata: read(&f.nodata) }
     }
 
     fn try_permit(&self) -> Option<OwnedSemaphorePermit> {
@@ -251,16 +332,51 @@ impl Service {
 
     /// The reply to one message, or None when it is not worth one: shorter than
     /// a header, or itself a response.
+    ///
+    /// The Windows DNS Client asks every network at once while its queries are
+    /// caught (`route::capture`), and after an NXDOMAIN from one it waits out the
+    /// others' retries, 12 s, for a network whose queries the capture blocks (live,
+    /// 2026-11-09). So, with [`NXDOMAIN_AS_NODATA`] on, an NXDOMAIN goes back as an
+    /// empty NOERROR with the same records (NODATA, AD cleared), which it takes as
+    /// final: the name still resolves to nothing, at once. Only when all of these
+    /// hold: the query came from the DNS Client service (by attribution) to the
+    /// adapter's own server ([`TUN_DNS`]), the capture is proven and blocks every
+    /// network it could ask ([`Service::set_every_network_blocked`]; an unblocked
+    /// one's answer must win), and the query does not ask for DNSSEC (a validator
+    /// would want the denial's proof). Any other program sending to that address,
+    /// and every other asker, gets the reply as it came.
     pub async fn answer(&self, query: &[u8], transport: Transport, asker: Asker) -> Option<Answered> {
+        let mut answered = self.answer_as_asked(query, transport, asker).await?;
+        if self.rewrites(query, asker) && as_nodata(&mut answered.reply) {
+            Meters::bump(&self.facts.nodata);
+        }
+        Some(answered)
+    }
+
+    fn rewrites(&self, query: &[u8], asker: Asker) -> bool {
+        NXDOMAIN_AS_NODATA
+            && asker.dns_client
+            && asker.addressed == TUN_DNS
+            && self.every_network_blocked.load(Ordering::SeqCst)
+            && !edns(query).is_some_and(|e| e.dnssec_ok)
+    }
+
+    async fn answer_as_asked(&self, query: &[u8], transport: Transport, asker: Asker) -> Option<Answered> {
         let flags = flags_of(query).filter(|_| query.len() >= MIN_MESSAGE)?;
         if flags & FLAG_QR != 0 {
             return None;
         }
         if flags & FLAG_OPCODE != 0 {
-            return notimp(query).map(|reply| Answered { reply, resolved: false });
+            return self.other_opcode(query, flags, asker).await;
         }
         let question = parse(query);
         let name = question.as_ref().and_then(|m| m.question.as_deref());
+        if let Some(probe) = name.filter(|n| capture::is_probe(n)) {
+            if asker.addressed == TUN_DNS {
+                self.probe_seen(probe);
+            }
+            return nodata(query).map(|reply| Answered { reply, resolved: true });
+        }
         if name == Some(CANARY_DOMAIN) {
             Meters::bump(&self.facts.canary);
             return nxdomain(query).map(|reply| Answered { reply, resolved: true });
@@ -279,7 +395,7 @@ impl Service {
         // Before the size check: a smaller reply may now fit.
         // A public answer, whichever way it came: its addresses enter the stack.
         let reply = match (path, &question) {
-            (Path::Encrypted | Path::Plain(_), Some(message)) => self.without_ech(query, message, reply, asker),
+            (Path::Encrypted | Path::Plain(_) | Path::PlainAsWindows, Some(message)) => self.without_ech(query, message, reply, asker),
             _ => reply,
         };
         if let Some(message) = reply_answers(query, &reply) {
@@ -292,26 +408,50 @@ impl Service {
 
     /// The engine's own HTTPS lookup, for its upstream hello (task D9). The same
     /// paths as a client's: encrypted, or LAN for a matched suffix, or with
-    /// encryption off plain to the server of the adapter Windows sends through
-    /// ([`upstream::first_server`]). It takes no permit a client is waiting for:
+    /// encryption off plain to the servers Windows would ask ([`upstream::plain_servers`]).
+    /// It takes no permit a client is waiting for:
     /// past the bound it fails, and the flow goes on without ECH.
     pub async fn https_records(&self, name: &str) -> Result<Vec<HttpsRecord>, String> {
         let _permit = self.try_permit().ok_or("too many queries in flight")?;
         let mut id = [0u8; 2];
         getrandom::fill(&mut id).map_err(|e| e.to_string())?;
         let query = with_id(&query_for(name, TYPE_HTTPS).ok_or("a name that cannot be sent")?, u16::from_be_bytes(id));
-        let first = upstream::first_server(&self.tables.read().unwrap_or_else(|p| p.into_inner()));
-        let reply = self.exchange(self.path(&query, first), &query).await?;
+        let reply = self.exchange(self.path(&query, None), &query).await?;
         Ok(reply_answers(&query, &reply).ok_or("an answer to another question")?.https)
     }
 
     /// `upstream::path_of`, the one routing decision, with the user's mode applied
     /// to what it sends encrypted. Plain with no server to send to goes nowhere.
+    /// A query to the adapter's own server ([`TUN_DNS`], the DNS Client's while
+    /// routes are up), and the engine's own, have no server outside Sieve: they
+    /// take the ones Windows would ask without Sieve ([`Path::PlainAsWindows`]),
+    /// never that address itself.
     fn path(&self, query: &[u8], addressed: Option<IpAddr>) -> Path {
-        match upstream::path_of(query, &self.tables.read().unwrap_or_else(|p| p.into_inner())) {
-            Path::Encrypted if self.mode() == Mode::Plain => addressed.map_or(Path::Refused, Path::Plain),
+        let tables = self.tables.read().unwrap_or_else(|p| p.into_inner());
+        match upstream::path_of(query, &tables) {
+            Path::Encrypted if self.mode() == Mode::Plain => match addressed.filter(|ip| *ip != TUN_DNS) {
+                Some(server) => Path::Plain(server),
+                None if upstream::plain_servers(&tables).is_empty() => Path::Refused,
+                None => Path::PlainAsWindows,
+            },
             path => path,
         }
+    }
+
+    /// A message with an opcode other than QUERY. An UPDATE to another adapter's
+    /// LAN DNS server goes there in plain text, as a LAN name would (the host's
+    /// own registration, which the capture's block would otherwise stop). One to
+    /// the engine's own server never leaves: Sieve's address is no host's to
+    /// register. Everything else is NOTIMP.
+    async fn other_opcode(&self, query: &[u8], flags: u16, asker: Asker) -> Option<Answered> {
+        let to_lan = || upstream::is_lan_server(&self.tables.read().unwrap_or_else(|p| p.into_inner()), asker.addressed);
+        if (flags & FLAG_OPCODE) >> 11 == OPCODE_UPDATE && asker.addressed != TUN_DNS && !names_sieves_address(query) && to_lan() {
+            return match self.plain_exchange(asker.addressed, query, || true).await {
+                Ok(reply) => Some(Answered { reply, resolved: true }),
+                Err(_) => servfail(query).map(|reply| Answered { reply, resolved: false }),
+            };
+        }
+        notimp(query).map(|reply| Answered { reply, resolved: false })
     }
 
     /// The one exchange on a path. A path with nowhere to go is an error here.
@@ -321,6 +461,7 @@ impl Service {
         match path {
             Path::Lan(server) => self.plain_exchange(server, query, || true).await,
             Path::Plain(server) => self.plain_exchange(server, query, || self.mode() == Mode::Plain).await,
+            Path::PlainAsWindows => self.plain_as_windows(query).await,
             Path::Refused => Err("it may be a LAN name, and no LAN server can take it".to_string()),
             Path::NoServer => Err("a private reverse name, and no LAN server to ask".to_string()),
             Path::Encrypted => {
@@ -333,6 +474,28 @@ impl Service {
                 resolved
             }
         }
+    }
+
+    /// [`Path::PlainAsWindows`]: each server in Windows' order until one answers,
+    /// within one [`REQUEST_BUDGET`], each remaining server getting an equal share
+    /// of what is left (as `upstream::resolve` shares it), while the mode is plain.
+    async fn plain_as_windows(&self, query: &[u8]) -> Result<Vec<u8>, String> {
+        let servers = upstream::plain_servers(&self.tables.read().unwrap_or_else(|p| p.into_inner()));
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        let mut failures = Vec::new();
+        for (tried, server) in servers.iter().enumerate() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || self.mode() != Mode::Plain {
+                break;
+            }
+            let share = remaining / u32::try_from(servers.len() - tried).unwrap_or(u32::MAX);
+            match tokio::time::timeout(share, plain::exchange(self.context.connector.as_ref(), *server, query, || self.mode() == Mode::Plain)).await {
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(e)) => failures.push(format!("{server}: {e}")),
+                Err(_) => failures.push(format!("{server} did not answer in time")),
+            }
+        }
+        Err(if failures.is_empty() { "no server to ask".into() } else { failures.join("; ") })
     }
 
     async fn plain_exchange(&self, server: IpAddr, query: &[u8], may_send: impl Fn() -> bool) -> Result<Vec<u8>, String> {
@@ -370,6 +533,25 @@ impl Service {
         Meters::bump(&self.facts.ech_left);
         reply
     }
+}
+
+/// True when the message holds one of Sieve's own adapter addresses anywhere past
+/// its header: an UPDATE that would register it is never sent. A false match only
+/// keeps an UPDATE here.
+fn names_sieves_address(message: &[u8]) -> bool {
+    let body = message.get(MIN_MESSAGE..).unwrap_or_default();
+    let v4 = crate::tun::TUN_V4.octets();
+    let v6 = crate::tun::TUN_V6.octets();
+    body.windows(v4.len()).any(|w| w == v4) || body.windows(v6.len()).any(|w| w == v6)
+}
+
+/// An NXDOMAIN reply's code made NOERROR and its AD bit cleared (the data is no
+/// longer what was validated), its records left as they are. True when it was one.
+fn as_nodata(reply: &mut [u8]) -> bool {
+    const NXDOMAIN: u8 = 3;
+    let Some(low) = reply.get_mut(3).filter(|low| **low & 0x0f == NXDOMAIN) else { return false };
+    *low &= 0xf0 & !(FLAG_AD as u8);
+    true
 }
 
 /// Serves one datagram flow until it has been idle for [`DNS_IDLE`] with nothing
@@ -504,8 +686,10 @@ mod tests {
     /// The public server Windows uses without Sieve, which the clients address.
     const ORIGINAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 53));
     /// The host's own lookups, through the DNS Client service.
-    const HOST: Asker = Asker { may_decrypt: true, addressed: ORIGINAL };
-    const GUEST: Asker = Asker { may_decrypt: false, addressed: ORIGINAL };
+    const HOST: Asker = Asker { may_decrypt: true, addressed: ORIGINAL, dns_client: false };
+    const GUEST: Asker = Asker { may_decrypt: false, addressed: ORIGINAL, dns_client: false };
+    /// The DNS Client service, captured: it asks the adapter's own server.
+    const CAPTURED: Asker = Asker { may_decrypt: true, addressed: TUN_DNS, dns_client: true };
 
     struct Bed {
         service: Arc<Service>,
@@ -717,6 +901,137 @@ mod tests {
         b.service.tables.write().unwrap().adapters.iter_mut().for_each(|a| a.dns.clear());
         assert!(b.service.https_records("www.example").await.is_err(), "no server: no lookup");
         assert!(doh.seen().is_empty(), "never encrypted instead");
+    }
+
+    /// The DNS Client asks the adapter's own server while it is captured. In plain
+    /// mode that query goes where Windows would send it without Sieve, never back
+    /// into the adapter; encrypted, it goes encrypted like any other.
+    #[tokio::test]
+    async fn a_query_to_the_adapters_own_server_in_plain_mode_asks_the_first_server_windows_names() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let router = Plain::start(answering(), answering()).await;
+        let b = bed(&ca, &[doh.url()], None, connector_with(&router));
+        let captured = Asker { addressed: TUN_DNS, ..HOST };
+        b.service.set_mode(Mode::Plain);
+        let answered = b.ask_as(&client_query(9, "www.example"), Transport::Datagram, captured).await;
+        assert_eq!((rcode(&answered.reply), answered.resolved), (0, true));
+        assert_eq!(b.connector.udp_recorded(), [lan_target()], "the Wi-Fi's server, as Windows would ask");
+        assert!(doh.seen().is_empty(), "plain, as the user chose");
+        b.service.set_mode(Mode::Encrypted);
+        b.ask_as(&client_query(10, "www.example"), Transport::Datagram, captured).await;
+        assert_eq!(doh.seen().len(), 1);
+        assert_eq!(b.connector.udp_recorded().len(), 1, "no plain query once encryption is on");
+    }
+
+    /// The DNS Client waits 12 s after an NXDOMAIN from Sieve's network for the
+    /// network the capture blocks; it takes NODATA as final. Only the DNS Client
+    /// gets it, only at the adapter's own server, only while every network is
+    /// blocked, never for DNSSEC.
+    #[tokio::test]
+    async fn an_nxdomain_for_the_dns_client_goes_back_as_nodata_only_while_every_network_is_blocked() {
+        let ca = Ca::new();
+        let script: Script = Arc::new(|query| {
+            let mut reply = crate::dns::nxdomain(query).unwrap();
+            reply[3] |= FLAG_AD as u8;
+            Step::Answer(reply)
+        });
+        let doh = Server::start(Kind::Https, &ca, Options { script, ..Options::default() }).await;
+        let b = bed(&ca, &[doh.url()], None, Arc::new(Loopback::default()));
+        let missing = |id| client_query(id, "missing.example");
+        assert_eq!(rcode(&b.ask_as(&missing(8), Transport::Datagram, CAPTURED).await.reply), 3, "an unproven capture, or an unblocked network: as it came");
+        b.service.set_every_network_blocked(true);
+        let answered = b.ask_as(&missing(9), Transport::Datagram, CAPTURED).await;
+        assert_eq!((id_of(&answered.reply), rcode(&answered.reply), answered.resolved), (Some(9), 0, true));
+        assert_eq!(flags_of(&answered.reply).unwrap() & FLAG_AD, 0, "AD cleared");
+        let message = crate::dns::parse(&answered.reply).unwrap();
+        assert!(message.answers.is_empty(), "still no address");
+        assert_eq!(message.question.as_deref(), Some("missing.example"));
+        let canary = b.ask_as(&client_query(10, CANARY_DOMAIN), Transport::Datagram, CAPTURED).await;
+        assert_eq!(rcode(&canary.reply), 0, "the engine's own NXDOMAIN too");
+        assert_eq!(rcode(&b.ask(&missing(11), Transport::Datagram).await.reply), 3, "another asker gets NXDOMAIN");
+        let other_program = Asker { dns_client: false, ..CAPTURED };
+        assert_eq!(rcode(&b.ask_as(&missing(12), Transport::Datagram, other_program).await.reply), 3, "a program with its own resolver, at the same address");
+        assert_eq!(rcode(&b.ask_as(&with_edns(&missing(13), true), Transport::Datagram, CAPTURED).await.reply), 3, "DNSSEC asked: as it came");
+        assert_eq!(rcode(&b.ask_as(&with_edns(&missing(14), false), Transport::Datagram, CAPTURED).await.reply), 0, "the control: EDNS without DO");
+        b.service.set_every_network_blocked(false);
+        assert_eq!(rcode(&b.ask_as(&missing(15), Transport::Datagram, CAPTURED).await.reply), 3, "a network came unblocked");
+        assert_eq!(b.service.counts().nodata, 3, "each rewrite counted");
+        let servfail: Script = Arc::new(|_| Step::Close);
+        let failing = Server::start(Kind::Https, &ca, Options { script: servfail, ..Options::default() }).await;
+        let b = bed(&ca, &[failing.url()], None, Arc::new(Loopback::default()));
+        b.service.set_every_network_blocked(true);
+        assert_eq!(rcode(&b.ask_as(&client_query(16, "www.example"), Transport::Datagram, CAPTURED).await.reply), 2, "SERVFAIL stays a failure");
+    }
+
+    #[tokio::test]
+    async fn a_probe_is_answered_here_and_seen_only_at_the_adapters_own_server() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let b = bed(&ca, &[doh.url()], None, Arc::new(Loopback::default()));
+        let name = capture::probe_name(7);
+        let query = client_query(1, name.trim_end_matches('.'));
+        let elsewhere = b.ask(&query, Transport::Datagram).await;
+        assert_eq!((rcode(&elsewhere.reply), crate::dns::parse(&elsewhere.reply).unwrap().answers.len()), (0, 0), "NODATA");
+        assert!(!b.service.probe_arrived(&name, Duration::from_millis(50)).await, "not at the adapter's server");
+        let waiting = { let s = b.service.clone(); let n = name.clone(); tokio::spawn(async move { s.probe_arrived(&n, PATIENT).await }) };
+        tokio::task::yield_now().await;
+        b.ask_as(&query, Transport::Datagram, Asker { dns_client: false, ..CAPTURED }).await;
+        assert!(tokio::time::timeout(PATIENT, waiting).await.unwrap().unwrap());
+        assert!(b.service.probe_arrived(&name.to_uppercase(), Duration::ZERO).await, "seen before the wait counts too");
+        assert!(doh.seen().is_empty() && b.connector.udp_recorded().is_empty(), "never sent on");
+    }
+
+    /// Windows registers the host's name with an UPDATE to its adapter's server;
+    /// the capture's block stops the one it sends bound to that adapter, so the one
+    /// that reaches the engine goes on, LAN only.
+    #[tokio::test]
+    async fn an_update_goes_to_the_lan_server_it_addressed_and_nowhere_else() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let accepted: Script = Arc::new(|query| Step::Answer(crate::dns::nodata(query).unwrap()));
+        let router = Plain::start(accepted.clone(), accepted).await;
+        let original = Plain::start(answering(), answering()).await;
+        let b = bed(&ca, &[doh.url()], None, connector_for(&[(ROUTER.parse().unwrap(), &router), (ORIGINAL, &original)]));
+        let mut update = client_query(4, "host.lan");
+        update[2] = 0x28;
+        let to_router = b.ask_as(&update, Transport::Datagram, Asker { addressed: ROUTER.parse().unwrap(), ..HOST }).await;
+        assert_eq!((rcode(&to_router.reply), queries(&router)), (0, 1), "the router's answer");
+        for asker in [HOST, CAPTURED] {
+            assert_eq!(rcode(&b.ask_as(&update, Transport::Datagram, asker).await.reply), 4, "{asker:?}");
+        }
+        // An A record of Sieve's own address in the update section: never registered.
+        let mut sieves = update.clone();
+        sieves[11] = 1;
+        sieves.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        sieves.extend_from_slice(&crate::tun::TUN_V4.octets());
+        assert_eq!(rcode(&b.ask_as(&sieves, Transport::Datagram, Asker { addressed: ROUTER.parse().unwrap(), ..HOST }).await.reply), 4);
+        let mut notify = client_query(5, "host.lan");
+        notify[2] = 0x20;
+        assert_eq!(rcode(&b.ask_as(&notify, Transport::Datagram, Asker { addressed: ROUTER.parse().unwrap(), ..HOST }).await.reply), 4, "NOTIFY: NOTIMP");
+        assert_eq!((queries(&router), queries(&original)), (1, 0));
+        assert!(doh.seen().is_empty());
+    }
+
+    /// Windows tries a network's servers in order, then the next network's.
+    #[tokio::test]
+    async fn plain_mode_tries_each_server_windows_would_in_order_within_the_budget() {
+        let ca = Ca::new();
+        let doh = Server::start(Kind::Https, &ca, Options::default()).await;
+        let silent: Script = Arc::new(|_| Step::Silent);
+        let first = Plain::start(silent.clone(), silent).await;
+        let second = Plain::start(answering(), answering()).await;
+        let other: IpAddr = "192.168.7.2".parse().unwrap();
+        let mut tables = load(HOME);
+        tables.adapters.iter_mut().find(|a| a.alias == "Wi-Fi").unwrap().dns = vec![ROUTER.parse().unwrap(), other];
+        let b = bed_on(&ca, &[doh.url()], tables, connector_for(&[(ROUTER.parse().unwrap(), &first), (other, &second)]));
+        b.service.set_mode(Mode::Plain);
+        let started = Instant::now();
+        let answered = b.ask_as(&client_query(9, "www.example"), Transport::Datagram, CAPTURED).await;
+        assert_eq!((rcode(&answered.reply), answered.resolved), (0, true));
+        assert!(started.elapsed() < REQUEST_BUDGET + Duration::from_millis(500), "{:?}", started.elapsed());
+        assert_eq!((queries(&first), queries(&second)), (1, 1));
+        assert!(doh.seen().is_empty());
     }
 
     /// The other half of the owner's rule: with encryption on, no failure of any
@@ -1567,9 +1882,9 @@ mod tests {
 
     #[test]
     fn the_report_holds_counts_and_never_a_name() {
-        let json = serde_json::to_value(Counts { ech_stripped: 1, ech_left: 2, canary: 3, reverse_lan: 4, reverse_local: 5 }).unwrap();
+        let json = serde_json::to_value(Counts { ech_stripped: 1, ech_left: 2, canary: 3, reverse_lan: 4, reverse_local: 5, nodata: 6 }).unwrap();
         let object = json.as_object().unwrap();
-        assert_eq!(object.len(), 5, "{object:?}");
+        assert_eq!(object.len(), 6, "{object:?}");
         assert!(object.values().all(serde_json::Value::is_u64), "numbers, never a name");
     }
 

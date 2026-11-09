@@ -73,6 +73,8 @@ pub struct Facts {
     pub policy_save_error: Option<String>,
     /// When the routes came up (monotonic ms), for the Stall test build.
     pub up_since: Option<u64>,
+    /// The DNS Client capture's state while routes are up (`routing`); None otherwise.
+    pub dns_capture: Option<sieve_ipc::DnsCapture>,
 }
 
 pub struct Engine {
@@ -490,6 +492,7 @@ impl Engine {
             guests,
             filter: self.lists.facts(),
             dns_unreachable,
+            dns_capture: if f.routes_up { f.dns_capture } else { None },
             update,
         }
     }
@@ -961,6 +964,26 @@ mod tests {
         assert_eq!(status["mode"], "encrypted", "the default, said");
     }
 
+    /// "Also encrypt Windows' own lookups" off: the policy holds it and is saved, the
+    /// routing loop is woken to close the capture (`routing::follow_capture`), and the
+    /// status says the capture's state only while routes are up.
+    #[tokio::test]
+    async fn the_capture_switch_is_held_saved_wakes_routing_and_the_status_says_its_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), Policy::default(), Runs::default(), None);
+        assert!(!e.policy().skip_dns_capture, "on by default");
+        e.set_policy(Policy { revision: 1, skip_dns_capture: true, ..Policy::default() }).unwrap();
+        assert!(e.status().policy.skip_dns_capture);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), e.wake.notified()).await.is_ok(), "routing is woken to follow it");
+        let reloaded = Engine::new(Some(dir.path().to_path_buf()), PathBuf::new(), policy::load(dir.path()).0, Runs::default(), None);
+        assert!(reloaded.policy().skip_dns_capture, "saved");
+
+        e.set_facts(|f| f.dns_capture = Some(sieve_ipc::DnsCapture::Off));
+        assert_eq!(e.status().dns_capture, None, "nothing to say while routes are down");
+        e.set_facts(|f| f.routes_up = true);
+        assert_eq!(e.status().dns_capture, Some(sieve_ipc::DnsCapture::Off));
+    }
+
     /// The app's switch over the pipe: SetPolicy reaches a running service at once,
     /// a service started later starts in it, and both status files say it.
     #[tokio::test]
@@ -1003,7 +1026,7 @@ mod tests {
         let e = engine(Policy::default(), None);
         e.set_dns_upstreams(DnsUpstreams { revision: 1, upstreams: vec!["tls://127.0.0.1:1".into()] }).unwrap();
         let service = e.start_dns_service(service_from).unwrap();
-        let asker = Asker { may_decrypt: true, addressed: "203.0.113.53".parse().unwrap() };
+        let asker = Asker { may_decrypt: true, addressed: "203.0.113.53".parse().unwrap(), dns_client: false };
         assert!(!e.status().dns_unreachable);
         for id in 0..UNREACHABLE_AFTER as u16 {
             service.answer(&crate::dns::testing::client_query(id, "www.example"), Transport::Datagram, asker).await.unwrap();

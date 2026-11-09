@@ -62,6 +62,7 @@ export function SettingRow({
   route,
   onSet,
   onReset,
+  note,
 }: {
   k: SettingKey;
   doc: SettingsDoc;
@@ -69,6 +70,8 @@ export function SettingRow({
   route: RouteDef | undefined;
   onSet: (key: SettingKey, value: unknown) => void;
   onReset: (key: SettingKey) => void;
+  /** A live line under the help, shown while the row is not locked. */
+  note?: React.ReactNode;
 }) {
   const d = settingDef(k);
   const value = valueInForce(k, doc, lock);
@@ -102,7 +105,7 @@ export function SettingRow({
           <span className="text-on-surface">Can break:</span> {d.breaks}
         </p>
       )}
-      {lock && <LockNote lock={lock} />}
+      {lock ? <LockNote lock={lock} /> : note}
     </>
   );
 

@@ -1,0 +1,107 @@
+import { act, render, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+import { DNS_CLIENT_CAPTURE, DNS_ENCRYPTION } from "@/core/engine";
+import fixture from "@/data/fixtures/engine-probe-v3.json";
+import ipc from "@/data/fixtures/engine-ipc-v3.json";
+import { createMockSource } from "@/data/mock-source";
+import { parseEngineProbe, type DnsCapture } from "@/data/protocol";
+import { memoryBackend } from "@/data/settings-store";
+import { createRuntime, type Runtime } from "@/hooks/runtime";
+import { SieveProvider } from "@/hooks/sieve-provider";
+import { captureStateLine } from "./dns-capture-state";
+import { SettingsScreen } from "./settings-screen";
+
+vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
+vi.setConfig({ testTimeout: 20_000 });
+
+async function setup(values: Record<string, unknown> = {}) {
+  const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend({ schema: 5, values }) });
+  render(
+    <SieveProvider runtime={runtime}>
+      <SettingsScreen />
+    </SieveProvider>,
+  );
+  await act(async () => {
+    await runtime.settings.ready;
+  });
+  return runtime;
+}
+
+/** The engine's status as the probe fixture's idle example, with routes up and this capture state (none: an older engine). */
+function report(runtime: Runtime, capture: DnsCapture | undefined) {
+  const welcome = parseEngineProbe(fixture.examples.idle);
+  const pipe = welcome.pipe;
+  if (pipe?.kind !== "welcome") throw new Error("the example answers");
+  const status = { ...pipe.status, routes_up: true, ...(capture ? { dns_capture: capture } : {}) };
+  act(() => runtime.store.setEngine({ ...runtime.store.getState().engine, probe: { ...welcome, pipe: { ...pipe, status } } }));
+}
+
+const row = () => document.querySelector<HTMLElement>(`[data-setting="${DNS_CLIENT_CAPTURE}"]`)!;
+const stateLine = () => row().querySelector("[data-capture-state]");
+
+describe("Also encrypt Windows' own lookups", () => {
+  it("sits right under DNS encryption, on by default, and says what it does and what it costs", async () => {
+    await setup();
+    const keys = [...document.querySelectorAll("#section-filtering [data-setting]")].map((el) => el.getAttribute("data-setting"));
+    expect(keys.indexOf(DNS_CLIENT_CAPTURE)).toBe(keys.indexOf(DNS_ENCRYPTION) + 1);
+    const sw = within(row()).getByRole("switch", { name: "Also encrypt Windows' own lookups" });
+    expect(sw).toBeChecked();
+    expect(sw).toBeEnabled();
+    expect(sw).toHaveAccessibleDescription(/Windows' built-in lookups also go through Sieve's encrypted DNS, so the network can't read them/);
+    expect(row()).toHaveTextContent(/Can break: Names of nearby PCs found without DNS, and short names that don't exist, answer about 7 s slower/);
+    expect(row()).toHaveTextContent(/sign-in pages may not open until you turn this off or sign in/);
+    expect(row().querySelectorAll("[data-slot=card], [data-slot=badge]"), "flat: no card or chip of its own").toHaveLength(0);
+  });
+
+  it("the switch writes the setting, and back", async () => {
+    const rt = await setup();
+    await userEvent.click(within(row()).getByRole("switch"));
+    expect(rt.settings.get(DNS_CLIENT_CAPTURE as never)).toBe(false);
+    await userEvent.click(within(row()).getByRole("switch"));
+    expect(rt.settings.get(DNS_CLIENT_CAPTURE as never)).toBe(true);
+  });
+
+  it("is locked with the reason while DNS encryption is off: with plain DNS there is nothing to encrypt", async () => {
+    await setup({ [DNS_ENCRYPTION]: false });
+    const sw = within(row()).getByRole("switch");
+    expect(sw).toBeDisabled();
+    expect(row().querySelector("[data-lock=requires]")).toHaveTextContent("Needs Encrypt DNS lookups, which is off.");
+  });
+
+  it("shows the engine's live state: working, or not and why", async () => {
+    const rt = await setup();
+    expect(stateLine(), "nothing before the engine says").toBeNull();
+    report(rt, { state: "working" });
+    expect(stateLine()).toHaveAttribute("data-capture-state", "working");
+    expect(stateLine()).toHaveTextContent("Working: Windows' own lookups go through Sieve now.");
+    report(rt, { state: "not_caught", reason: "tie", adapter: "Ethernet", detail: '"Ethernet" has interface metric 1' });
+    expect(stateLine()).toHaveAttribute("data-capture-state", "not_caught");
+    expect(stateLine()).toHaveTextContent('the network adapter "Ethernet" has priority 1');
+    report(rt, { state: "not_caught", reason: "no_answer", detail: "a probe did not arrive" });
+    expect(stateLine()).toHaveTextContent("A firewall rule or another program is in the way.");
+  });
+
+  it("says nothing for an older engine, or while the switch is off", async () => {
+    const rt = await setup();
+    report(rt, undefined);
+    expect(stateLine()).toBeNull();
+    report(rt, { state: "working" });
+    await userEvent.click(within(row()).getByRole("switch"));
+    expect(stateLine(), "the switch says it").toBeNull();
+    report(rt, { state: "off" });
+    expect(stateLine()).toBeNull();
+  });
+
+  it("has words for every state the engine can report", () => {
+    for (const state of ipc.dnsCaptureStates as DnsCapture[]) {
+      const line = captureStateLine(state);
+      if (state.state === "off") expect(line).toBeNull();
+      else expect(line?.text.length, JSON.stringify(state)).toBeGreaterThan(20);
+    }
+    expect(captureStateLine({ state: "not_caught", reason: "ipv6_off", detail: "x" })?.text).toMatch(/IPv6 is off on Sieve's network adapter/);
+    expect(captureStateLine({ state: "not_caught", reason: "no_ipv4", detail: "x" })?.text).toMatch(/no IPv4 route/);
+    expect(captureStateLine({ state: "not_caught", reason: "failed", detail: "FwpmEngineOpen0: error 0x5" })?.text).toContain("FwpmEngineOpen0: error 0x5");
+    expect(captureStateLine(undefined)).toBeNull();
+  });
+});

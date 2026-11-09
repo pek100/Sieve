@@ -17,6 +17,8 @@
   "trackingNames": ["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location", "queryParams", "firstPartyCookies"],
   "policyWithContent": { "type": "set_policy", "revision": 5, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": true, "content": true, "user_rules": [], "exclusions": [] },
   "policyWithPlainDns": { "type": "set_policy", "revision": 6, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false, "plain_dns": true, "user_rules": [], "exclusions": [] },
+  "policyWithoutDnsCapture": { "type": "set_policy", "revision": 7, "engine": true, "sieving": true, "off_apps": [], "lists": null, "domain_lists": [], "https": false, "user_rules": [], "exclusions": [], "skip_dns_capture": true },
+  "dnsCaptureStates": [{ "state": "working" }, { "state": "off" }, { "state": "not_caught", "reason": "tie", "adapter": "Ethernet", "detail": "\"Ethernet\" has interface metric 1" }, { "state": "not_caught", "reason": "ipv6_off", "detail": "no IPv6" }, { "state": "not_caught", "reason": "no_answer", "detail": "a probe did not arrive" }, { "state": "not_caught", "reason": "no_ipv4", "detail": "no IPv4 default route" }, { "state": "not_caught", "reason": "failed", "detail": "FwpmEngineOpen0: error 0x5" }],
   "customLists": [
     { "list": {"id": "custom-a1", "title": "My list", "url": "https://lists.example/my.txt", "enabled": true}, "ok": true },
     { "list": {"id": "custom-a1", "title": "My list", "url": null, "enabled": true}, "ok": true },

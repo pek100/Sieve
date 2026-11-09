@@ -9,11 +9,13 @@ import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { GridRegion, LayoutGrid } from "@/components/sieve/shell/layout-grid";
 import { Page } from "@/components/sieve/shell/page";
 import { Button } from "@/components/ui/button";
-import { CERTIFICATE_ANCHOR, ENGINE_ANCHOR, ENGINE_SWITCH } from "@/core/engine";
+import { CERTIFICATE_ANCHOR, DNS_CLIENT_CAPTURE, ENGINE_ANCHOR, ENGINE_SWITCH } from "@/core/engine";
 import { EXCLUSIONS_ANCHOR } from "@/core/exclusions";
+import { readValue } from "@/core/settings/document";
 import { settingDef, type Section, type SettingKey } from "@/core/settings/registry";
 import { cn } from "@/lib/utils";
 import { CertificateGroup } from "./certificate-group";
+import { DnsCaptureState } from "./dns-capture-state";
 import { EngineCard } from "./engine-card";
 import { ExclusionsGroup } from "./exclusions-group";
 import { SettingRow } from "./setting-row";
@@ -93,6 +95,7 @@ export function SettingsScreen() {
                             route={s.route}
                             onSet={view.set}
                             onReset={view.reset}
+                            note={k === DNS_CLIENT_CAPTURE && readValue(view.doc, k) === true ? <DnsCaptureState /> : undefined}
                           />
                         ))}
                         {s.id === PASSWORD_SECTION && <PasswordBlock />}

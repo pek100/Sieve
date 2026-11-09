@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createPassedChecks } from "@/core/checks";
-import { CONTENT_SWITCH, DNS_ENCRYPTION, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineStatus, engineUpdate } from "@/core/engine";
+import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE, DNS_ENCRYPTION, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineStatus, engineUpdate } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
 import { MAX_POLICY_BYTES, settingDef, type SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
@@ -1197,6 +1197,52 @@ describe("engine controller", () => {
       const sent = s.fake.policies.length;
       await s.fc.advance(ENGINE_POLL_MS * 2);
       expect(s.fake.policies, "an engine that leaves false out is not told again").toHaveLength(sent);
+      s.undo();
+    });
+
+    it("Windows' own lookups: on sends no field, off sends skip_dns_capture, on again takes it back", async () => {
+      const s = setup("idle", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      await s.fc.flush();
+      expect(s.fake.policies.at(-1), "the default reaches an engine from before the field unchanged").not.toHaveProperty("skip_dns_capture");
+      await s.settings.set(DNS_CLIENT_CAPTURE as SettingKey, false);
+      await s.fc.flush();
+      expect(s.fake.policies.at(-1)).toMatchObject({ skip_dns_capture: true, engine: true, plain_dns: false });
+      expect(engineStatus(s.store.getState().engine)?.policy.skip_dns_capture, "the engine's answer holds it").toBe(true);
+      await s.settings.set(DNS_CLIENT_CAPTURE as SettingKey, true);
+      await s.fc.flush();
+      expect(s.fake.policies.at(-1)).not.toHaveProperty("skip_dns_capture");
+      const sent = s.fake.policies.length;
+      await s.fc.advance(ENGINE_POLL_MS * 2);
+      expect(s.fake.policies, "settled").toHaveLength(sent);
+      s.undo();
+    });
+
+    it("an engine from before the capture switch refuses it: the rest arrives, it is said, retried at the next probe, never in a loop", async () => {
+      const s = setup("idle", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      await s.fc.flush();
+      const accepting = s.fake.source.setPolicy;
+      let refused = 0;
+      s.fake.source.setPolicy = async (p) => {
+        if ("skip_dns_capture" in p) {
+          refused++;
+          throw new Error("unknown field `skip_dns_capture`");
+        }
+        return accepting(p);
+      };
+      await s.settings.set(DNS_CLIENT_CAPTURE as SettingKey, false);
+      await s.settings.set("sampling.enabled" as SettingKey, false);
+      await s.fc.flush();
+      const last = s.fake.policies.at(-1)!;
+      expect(last.sieving, "the other switch reached it").toBe(false);
+      expect(last).not.toHaveProperty("skip_dns_capture");
+      expect(s.store.getState().engine.actionError).toMatch(/does not know "Also encrypt Windows' own lookups"/);
+      const once = refused;
+      expect(once).toBeGreaterThan(0);
+      await s.fc.flush();
+      expect(refused, "never in a loop").toBe(once);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(refused, "retried at the next probe").toBeGreaterThan(once);
+      s.fake.source.setPolicy = accepting;
       s.undo();
     });
 

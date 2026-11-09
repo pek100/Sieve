@@ -1,12 +1,121 @@
 # VM live run 2026-11-08: status at the stop
 
+## Run 5 (2026-11-09): own-name answers and the LLMNR delay
+
+VM 02:46 to 03:47 local (1.0 h), stopped at the end. "Before" is 27141dd (67666092), "after" is the IPv6-server build (24DF3567). Run 4's metric-1 check had left Ethernet's persistent IPv4 metric at 1 with the automatic metric off, so after the VM restarted the capture refused itself until that was reverted (`Set-NetIPInterface -AutomaticMetric Enabled -PolicyStore PersistentStore`).
+
+**Own name.** With Sieve on, Windows answers the machine's own name with every source-capable address, ordered by interface metric. At metric 1 that put Sieve's addresses first. Fix: the adapter's DNS server is now IPv6, `TUN_DNS` = `fd53:6965:7665:1::53`, beside its ULA `TUN_V6`. Sieve is the DNS Client's first network by its IPv6 metric alone, and IPv4 keeps its automatic metric. Sieve's link-local addresses are skipped as a source. The capture adds and removes the server's host route itself. Measured on the way, not shippable:
+- `SkipAsSource` on 198.18.0.1 removes it from the answer, but then no source exists for anything routed into Sieve (`Find-NetRoute` empty, curl 000).
+- A link-local IPv4 source beside it shows up in the answer instead.
+- Weak-host send and receive on Sieve's adapter: curl 000, lookups 0/5.
+- `SkipAsSource` on `TUN_V6`: the DNS Client has no source for the server, and the probe never arrives.
+
+| Name (.NET) | Off | Before | After |
+|---|---|---|---|
+| `sieve-test-vm` | fe80 (Ethernet), 10.128.0.2 | Sieve's fe80, Ethernet's fe80, **198.18.0.1**, 10.128.0.2 | fe80 (Ethernet), 10.128.0.2, then 198.18.0.1, fd53:6965:7665:1::1 |
+| `sieve-test-vm.<suffix>` | 10.128.0.2 | 10.128.0.2 | 10.128.0.2 |
+| `sieve-test-vm.local` | as the short name | as the short name | as the short name |
+
+So the FQDN is identical. The short and `.local` names keep Ethernet's addresses first and in the same order as off, with Sieve's two after them; no adapter-only setting removes them, for the reasons above.
+
+| Row | Off | Before | After |
+|---|---|---|---|
+| Plain port-53 packets, 10 lookups | 20 | 0 | 0 |
+| 10 lookups, median | 19 ms | 30 ms | 39 ms |
+| NXDOMAIN, .NET, `nx-*.com` | 2 to 27 ms | 19 to 25 ms | 20 to 25 ms (12 rewrites) |
+| `metadata` (only under Ethernet's suffix) | 2 ms | 2 ms | 1 to 2 ms |
+| LLMNR-only `sieveonly1` | 2.8 s | 9.8 s | 9.8 s |
+| Nonexistent single label | 2.8 s | 9.8 s | 9.8 s |
+| curl https | 200 | 200 | 200 |
+| Kill, then the next start | | | Tcpip6 key with `NameServer=fd53:...::53` after the kill, absent after the recovery start; DNS 0.01 s after the kill |
+
+**The LLMNR delay: cause found, not fixed.** DNS Client ETW (3009, 3010) shows what happens to a single-label name. The DNS Client sends it with each adapter's own connection-specific suffixes, and only to that adapter's servers. On Ethernet that means `sieveonly1.us-central1-a.c.sieve-live-test.internal` and the other two suffixes, all to 10.128.0.1. Off, they get an NXDOMAIN in 6 to 8 ms. With the capture, the block drops them, and the DNS Client resends after 1 s and more. It sends LLMNR at 0.4 s in both cases, but returns its answer only when the blocked network's queries time out: 9.8 s against 2.8 s. Sieve's network is never asked those names. Tried:
+- Sieve's adapter given Ethernet's suffix, rewrite off: Sieve answers NXDOMAIN, and the DNS Client still waits for Ethernet (9.8 s; the FQDN under the suffix takes 12 s).
+- The same with the rewrite on: 2.35 s, but the LLMNR-only name **fails**, because NODATA is final.
+- NetBIOS off on Sieve's adapter: 9.8 s.
+
+The rewrite plays no part (9.8 s with it on and off). What stalls is the DNS Client waiting on the queries the block drops. Any user-mode fix means letting the DNS Client's queries to the adapter's own servers through, and with them the parallel public-name leak, or answering them in place, which needs a WFP connect-redirect callout (a kernel driver).
+
+## Run 4 (2026-11-09): the capture's second review
+
+Branch `worktree-agent-acd57d2c31e644f62`, main merged (a3c5a24), fixes fc6e72f and 27141dd. VM 02:03 to 02:44 local (0.7 h), stopped at the end. Engines: A958B1C9 (rewrite on) and EF74955B (rewrite off, the one switch `dns::service::NXDOMAIN_AS_NODATA` flipped), then 67666092 (27141dd, rewrite on) for the key and probe checks. "Off" is policy `engine` false. Helpers on the VM: a DNS server on 127.0.0.2 (zones `split.test`, `corp.test`) and an LLMNR responder on Ethernet for `sieveonly1` (scratchpad `r-resp.ps1`).
+
+Found on the VM and fixed in 27141dd:
+- The rewrite never acted at first (NXDOMAIN 12 s): the loopback pseudo-interface lists `fec0:0:0:ffff::1-3`, so not every network looked blocked. Those servers and the loopback are no network now; after, NXDOMAIN 25 ms and `dns-status.json` counts each rewrite (`nodata`).
+- With metric 1 Sieve's adapter held `224.0.0.0/4`, `255.255.255.255/32` and `ff00::/8` at 256 + 1 against Ethernet's 256 + 5, so multicast and broadcast sends naming no interface went into the engine. They are deleted from Sieve's adapter; after, only Ethernet and loopback hold them.
+- After a kill Windows still converts Sieve's GUID to a LUID (a non-present interface), so the leftover key was never deleted. Presence is now the adapter list's.
+- A firewall rule against 198.18.0.53 closed the capture 48 s later (60 s probe); every lookup timed out (12 s) meanwhile. Probe every 15 s: closed in 16 s, reopened 13.6 s after the rule went.
+
+| Check | Off | On, rewrite on | On, rewrite off |
+|---|---|---|---|
+| Plain port-53 packets out of the NIC, 30 fresh names | (40 for 20, run 3) | **0** from the DNS Client; 1 SRV and 2 A/AAAA of the internal suffix, the engine's own split-horizon sends to the LAN server | not run |
+| 20 uncached lookups, median / p90 | 18 / 19 ms | 23 / 26 ms | 24 / 32 ms |
+| NXDOMAIN, Resolve-DnsName, median of 6 | 18 ms | 25 ms | **12 018 ms** |
+| NXDOMAIN, .NET getaddrinfo / curl, median of 6 | 26 / 89 ms | 21 / 99 ms | **12 015 / 12 111 ms** |
+| Search list `sieve-nope-4711.com,wikipedia.org` (set and settled 20 s), `www` and `en`, .NET and curl, 6 each | 24/24, 4 to 160 ms | 24/24, 16 to 136 ms (42 rewrites counted) | 24/24, 5 to 151 ms |
+| The same list set 1 s before each trial (.NET `www`) | 1 of 5 resolved (4 failed at 2.8 s) | 3 of 5 (2 failed at 9.7 s) | 5 of 5 |
+| Search list `nope.test,corp.test`, `host1` only under the second (NRPT to 127.0.0.2), .NET | 24 ms | 61 ms | 14 ms |
+| Single label only LLMNR answers (`sieveonly1`), .NET | 2.8 s | **9.7 s** | **9.8 s** |
+| `.local` own name (mDNS) | 15 ms, Ethernet's link-local | 15 ms, Sieve's link-local first | 1 ms, the same |
+| Split DNS `a.split.test`, NRPT to 127.0.0.2 | 17 ms | 16 ms | 2 ms |
+| Own host name, single label | 10.128.0.2 | 198.18.0.1 first | not run |
+
+Does NODATA change the suffix search or LLMNR? Not measurably: with a settled search list the name under the second suffix resolved 24 of 24 times with 42 rewrites behind it, as without the rewrite. The failures in the second-to-last row came with a search list changed a second earlier, and Sieve off failed more of those than the rewrite did. LLMNR fallback works in every arm; Sieve on costs it 7 s whatever the rewrite (NetBIOS off on Sieve's adapter: still 9.8 s; cause not found). Without the rewrite every NXDOMAIN costs 12 s, in every program that resolves through Windows.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Ethernet at metric 1 | PASS | capture refused, `last_error`: "Ethernet" has interface metric 1 for IPv4, which ties with Sieve's DNS server...; 0 filters, no server on Sieve; lookups 10/10 at 25 ms, NXDOMAIN 17 ms; the old leak (44 plain packets), as without the capture |
+| Firewall drops 53 to 198.18.0.53 | PASS after the fix | closed 16 s after the rule; lookups then 55 ms; at a restart with the rule the probe refuses it ("a probe through the DNS Client did not reach Sieve's DNS server within 1000 ms"), lookups 10/10 |
+| Kill, then the next start | PASS after the fix | key with `NameServer=198.18.0.53` after the kill; absent after the recovery start; DNS 0.01 s, https 0.26 s after the kill |
+| Uninstall after a kill | PASS | key present before, absent after; service absent, no adapter; DNS 0.02 s |
+| Dynamic registration (primary suffix `corp.test`, `ipconfig /registerdns`) | INCONCLUSIVE | the VM's server is no authority for `corp.test`, so registration fails off and on alike (event 8016 in both). On: 8 queries reached 198.18.0.53, 2 reached the engine addressed to 10.128.0.1 through the adapter (sent unbound, so the block did not stop them), and 29 port-53 packets left the NIC to 10.128.0.1 (the engine's split-horizon sends for `corp.test`, now a machine suffix, and any forwarded update: pktmon does not tell them apart). No server on the VM accepts an update; forwarding is proven by unit test only |
+| Two-adapter split DNS, a VPN | SKIP | one NIC and no VPN on the VM; NRPT to a loopback server instead (above), the rest by unit tests |
+
+VM state at the stop: `setup-cur.exe` reinstalled (engine 8BFE89A7), policy `engine` false, no NRPT rule, no test firewall rule, search list and primary suffix empty, Ethernet metric automatic, responders stopped, no Sieve key in the registry.
+
+## Run 3 (2026-11-09): the DNS gap after a start, the DNS Client leak
+
+Branch `worktree-agent-acd57d2c31e644f62` on main 8abf3bf. VM 23:57 to 01:21 local (1.4 h), stopped at the end. Engine under test 1B5C3A1A (release); "before" is main 0ea3303 (3940237E), whose bring-up and DNS code are the same as 8abf3bf's.
+
+**The gap after a start: Sieve's address was still tentative.** Sampled every 100 to 300 ms after `Start-Service`: the engine added its routes at 0.27 to 0.39 s while 198.18.0.1 was `Tentative` (duplicate address detection, `DAD Transmits: 3` on the adapter). Until it turned `Preferred` at 3.3 to 3.4 s, every send through those routes failed at once with `HostUnreachable` (own socket to 10.128.0.1 and to 1.1.1.1), so lookups got no answer for 3.0 s each round. Fix: the addresses go on right after the adapter is created, and no route is added before every address is `Preferred` (bounded at 10 s, then a Setup blocker; `routing::route_adapter`, tests in `routing_tests.rs` that fail without the wait). After: 3 rounds, 0 failed probes of 75 to 120 per round through the own socket and the DNS Client; the routes go in at 3.4 to 4.8 s, and until then traffic takes the normal path. One 300 ms probe to 1.1.1.1 timed out in two of six rounds while only Windows' own routes were on the adapter (the probe went out of the NIC), not explained.
+
+**The DNS Client leak.** DNS Client ETW (events 3009, 3010, 3020): it asks every network's servers at once, binding each query to that adapter's address, and Sieve's adapter had no server (its query returned 1460 at once). Server 2025 never asks `fec0:0:0:ffff::1-3`. Measured on the VM with temporary settings, then built:
+
+| Setup | Plain queries out of the NIC | Lookup |
+|---|---|---|
+| main, no server on Sieve | 40 for 20 lookups (all) | 17 to 36 ms |
+| a server on Sieve (198.18.0.53), metric 5 or 1, no block | 40 for 20 lookups | 38 ms |
+| server, metric 5, Dnscache's port 53 on Ethernet blocked | 2 | 12 s (it waits out the blocked first network) |
+| server, metric 1, blocked | 0 | 44 to 143 ms; an NXDOMAIN 12 s (it waits for the blocked network after a negative) |
+| blocking Dnscache's binds to 10.128.0.2 instead | 0 | every lookup fails at once (WSAEACCES) |
+| **built: server, metric 1, block, NXDOMAIN to the DNS Client as NODATA** | **0 for 30 fresh names** | 38 ms median; NXDOMAIN 39 ms, NODATA 46, real 31 (off: 16, 18, 2) |
+
+Built (`route::capture`, `route::wfp`, `apply::set_adapter_dns`, `apply::put_first_for_dns`): the adapter names `TUN_DNS` 198.18.0.53 (host route in the plan), interface metric 1, and a dynamic WFP session blocks port 53 from the DNS Client's service SID only, leaving the default-route adapters, to what the engine routes. The DNS service answers the DNS Client's NXDOMAIN as NODATA (same records, rcode 0) so it does not wait 12 s; that is a change of what the DNS Client sees, and needs the owner's yes.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Leak, 30 fresh names (Resolve-DnsName, .NET, curl) | PASS | pktmon on the NIC: 0 plain port-53 packets; 51 queries to 198.18.0.53. In other runs the only ones were the internal suffix's names (`_ldap._tcp.dc._msdcs.<suffix>` SRV, `<host>.<suffix>`), which the engine itself sends to the LAN server by its split-horizon rule |
+| Lookups | PASS | 10 real names over three resolvers 10/10; the internal suffix name resolved to 10.128.0.2; 20 uncached lookups median 38 ms, p90 53 (Sieve off 18 / 20) |
+| NRPT `.example.org` to 8.8.8.8 | PASS | www.example.org resolved; rule removed |
+| `plain_dns` | PASS | lookups 10/10, NXDOMAIN 22 ms; encrypted upstream answers 311 -> 0 during plain mode; queries left to 10.128.0.1 in plain text, as the user chose |
+| Kill (`taskkill /F`) | PASS | capture filters 0 right after; Resolve-DnsName 0.02 s, curl https 0.24 s; route, DNS, proxy, firewall, adapter listings 0 lines different; metrics as before |
+| `sc stop` | PASS | filters 0; listings 0 lines different; Sieve's Tcpip interface key gone |
+| Reboot after a kill | PASS, one residue | DNS 0.82 s after boot, listings 0 lines different. The kill leaves `Tcpip\Parameters\Interfaces\{5e7e5e7e-...0003}` with `NameServer=198.18.0.53`; it survives the reboot, no adapter reads it, and the next clean stop deletes it (seen) |
+| IPv6 disabled (`DisabledComponents` 0xFF, reboot) | PASS | routes up, 198.18.0.1 Preferred, capture on, lookups 10/10, real names 10/10, curl 200, 0 public names leaked; reverted and rebooted |
+| Uninstall (`uninstall.exe /S`, exit 0 in 3.4 s, capture on) | PASS | filters 0, service absent, no adapter, no Sieve key in the registry, listings 0 lines different; lookups 0.02 s |
+| Dnscache restart | SKIP | Windows refuses to stop it |
+| IPv6 block | SKIP | the VM has no IPv6 default route, so only the IPv4 filter was made |
+| VPN, Wi-Fi to Ethernet switch | SKIP | none on the VM |
+
+VM state at the stop: `setup-cur.exe` reinstalled, engine main 0ea3303 (3940237E) put back, policy `engine` false, `DisabledComponents` absent, no NRPT rule, no test firewall rule.
+
 ## Run 2 (second session, same day)
 
 Branch `live-vm-2026-11-08` with main 8d1d873 merged. VM 20:10 to 23:50 local (3.7 h; 5.1 h today with run 1), stopped at the end.
 
 Fixes on this branch, each with a test that fails without it: 5a6d8af (Version Negotiation is the QUIC refusal), 6dc6a8d (bundle script marks `trusted-*` resources trusted), 3850222 (a user's `+js()` rules get the bundle), 8726598 (`scriptletGlobals` declared for uBO scriptlets).
 
-Still open, in order: the DNS Client leak (run 1; the fec0 capture does not engage on Server 2025, below); lookups with no answer for about 3 s after each engine start; slice 7 U1 (curl with its own CA bundle is never healed); the uBO list arm of slice 10; slice 9 U6 and the meta-CSP row; slice 11 U9 and U12; video playback (needs a residential IP); the runbooks' `example.com##h1` (the page has no h1 now).
+Still open, in order: the DNS Client leak and the 3 s gap after a start (both fixed in run 3 above, not merged); slice 7 U1 (curl with its own CA bundle is never healed); the uBO list arm of slice 10; slice 9 U6 and the meta-CSP row; slice 11 U9 and U12; video playback (needs a residential IP); the runbooks' `example.com##h1` (the page has no h1 now).
 
 VM state at the stop: Sieve installed from `setup-cur.exe`, engine main 0ea3303 release (3940237E), the real app in place, policy `engine` false, no `live-scope.json`, IPv6 enabled again, no test firewall rule or NRPT rule left. Scripts in the session scratchpad: `d-s8b.ps1`, `d-s9.ps1`, `d-s10.ps1`, `d-s11.ps1`, `d-real2.ps1`, `k-*.ps1`, `content.mjs`, `text.mjs`.
 

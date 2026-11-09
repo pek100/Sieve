@@ -19,7 +19,8 @@
 //!   Sieve, plan 1.7, even where a cut-out piece would be more specific).
 //!
 //! Additions: each DNS server that sits in a hole gets a host route into the
-//! adapter, so DNS is caught on the TUN without touching any DNS setting.
+//! adapter, so DNS is caught on the TUN. The adapter's own DNS server's host route
+//! is the capture's (`route::capture`), added and removed with it.
 //! IPv6 is routed only when another adapter holds an IPv6 default route, and
 //! only global unicast (2000::/3) is ever in its universe.
 
@@ -44,6 +45,13 @@ pub const EXCLUDED: &[(&str, &str)] = &[
     ("fe80::/10", "link-local"),
     ("ff00::/8", "multicast; AdGuard's default"),
 ];
+
+/// Routes Windows puts on every interface that the engine's adapter must not keep:
+/// with the DNS Client's first metric (`route::capture`) they win the tie for any
+/// multicast or broadcast send that names no interface (live, 2026-11-09: 256 + 1
+/// on Sieve against 256 + 5 on Ethernet), and LAN discovery would go into the
+/// engine. Deleted from the engine's adapter only (`apply::drop_system_routes`).
+pub const NOT_ON_SIEVE: &[&str] = &["224.0.0.0/4", "255.255.255.255/32", "ff00::/8"];
 
 /// The IPv4 and IPv6 address space the engine routes before the holes.
 pub const UNIVERSE_V4: &str = "0.0.0.0/0";
@@ -148,6 +156,17 @@ mod tests {
     }
 
     #[test]
+    fn the_system_routes_dropped_from_sieve_are_multicast_and_broadcast_only() {
+        let dropped: Vec<Prefix> = NOT_ON_SIEVE.iter().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(dropped.len(), NOT_ON_SIEVE.len());
+        for p in &dropped {
+            assert!(declared().iter().any(|h| h.contains(p.addr())), "{p} is a hole the engine never routes");
+        }
+        let plan = plan(&load(HOME));
+        assert!(plan.routes.iter().all(|r| !dropped.contains(r)), "never one of the engine's own routes");
+    }
+
+    #[test]
     fn the_declared_exclusions_parse_and_say_why() {
         assert_eq!(declared().len(), EXCLUDED.len());
         assert!(EXCLUDED.iter().all(|(_, why)| !why.is_empty()));
@@ -185,6 +204,15 @@ mod tests {
         t.adapters[0].dns = vec!["1.1.1.1".parse().unwrap(), "127.0.0.1".parse().unwrap(), "fe80::1".parse().unwrap()];
         let plan = plan(&t);
         assert!(plan.routes.iter().all(|r| !r.is_host()), "{:?}", plan.routes);
+    }
+
+    #[test]
+    fn the_adapters_own_dns_server_is_the_captures_route_not_the_plans() {
+        let sieves = Prefix::host(crate::tun::TUN_DNS);
+        assert!(!plan(&load(HOME)).routes.contains(&sieves));
+        let mut none = load(HOME);
+        none.routes.retain(|r| r.dest.length() != 0);
+        assert!(plan(&none).routes.is_empty());
     }
 
     #[test]

@@ -4,9 +4,9 @@
  * settings are declared nowhere else.
  */
 import { describe, expect, it } from "vitest";
-import { CONTENT_SWITCH, DNS_ENCRYPTION, ENGINE_SWITCH, HTTPS_SWITCH } from "@/core/engine";
+import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE, DNS_ENCRYPTION, ENGINE_SWITCH, HTTPS_SWITCH } from "@/core/engine";
 import { normalizeDoc, readValue } from "@/core/settings/document";
-import { REGISTRY, SECTIONS, SETTING_KEYS, isValidValue, needsEngine, settingDef, type SettingDef, type SettingKey } from "@/core/settings/registry";
+import { REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, isValidValue, needsEngine, settingDef, type SettingDef, type SettingKey } from "@/core/settings/registry";
 import { hits, read, walk } from "./files";
 
 const defs = SETTING_KEYS.map((k) => [k, settingDef(k)] as const);
@@ -30,8 +30,9 @@ describe("registry law", () => {
     }
   });
 
-  it("every requires points at an existing data switch", () => {
-    for (const [key, def] of defs) if (def.requires) expect(isDataSwitch(def.requires), key).toBe(true);
+  // A data switch, whose live check gates what builds on it, or a plain on/off setting (DNS encryption for the capture switch).
+  it("every requires points at an existing switch: a data switch or a boolean", () => {
+    for (const [key, def] of defs) if (def.requires) expect(isDataSwitch(def.requires) || (isSettingKey(def.requires) && settingDef(def.requires).kind === "boolean"), key).toBe(true);
   });
 
   it("the needsEngine settings are the three switches SetPolicy carries: the controller sends exactly them", () => {
@@ -52,6 +53,17 @@ describe("registry law", () => {
     expect(def.default).toBe(true);
     expect(def.help).toMatch(/plain text/);
     expect(read("src/data/engine-controller.ts")).toContain("plain_dns: settings.get(DNS_ENCRYPTION) === false");
+  });
+
+  it("Windows' own lookups are encrypted by default, need DNS encryption, and only off is sent", () => {
+    const def = settingDef(DNS_CLIENT_CAPTURE as SettingKey);
+    expect(def.kind).toBe("boolean");
+    expect(def.default).toBe(true);
+    expect(def.requires).toBe(DNS_ENCRYPTION);
+    expect(def.help).toMatch(/can't read them/);
+    expect(def.breaks).toMatch(/7 s slower/);
+    expect(def.breaks).toMatch(/sign-in pages/);
+    expect(read("src/data/engine-controller.ts")).toContain("...(settings.get(DNS_CLIENT_CAPTURE) === false ? { skip_dns_capture: true } : {})");
   });
 
   it("every default is a valid value for its own entry", () => {

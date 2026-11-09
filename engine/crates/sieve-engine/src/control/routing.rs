@@ -7,8 +7,9 @@
 //! at all (plan 6: idle CPU 0).
 //!
 //! Bringing up: build the DNS service's TLS, load the pinned wintun.dll, create
-//! the adapter, start the DNS service, give the adapter its addresses, journal
-//! and add each planned route, start the stack, arm the watchdog. Any failure
+//! the adapter and give it its addresses, start the DNS service, wait until
+//! the addresses may be a source ([`ADDRESSES_READY_WITHIN`]), journal and add
+//! each planned route, start the stack, arm the watchdog. Any failure
 //! takes down what was added and
 //! reports a Setup blocker: the network stays as it was. While up, a route
 //! change re-reads the tables (pinning follows them), drops DNS's sessions when
@@ -17,6 +18,7 @@
 //! service, so its connections end with the routes.
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -41,7 +43,10 @@ use crate::inject::InjectLimits;
 use crate::inject::content::ContentHook;
 use crate::lists::https::HttpsFetcher;
 use crate::policy::wall_ms;
-use crate::route::apply::{self, SieveLuid};
+use crate::route::apply::{self, AddressState, SieveLuid};
+use crate::route::capture;
+use sieve_ipc::{CaptureReason, DnsCapture};
+use crate::route::wfp;
 use crate::route::journal::Journal;
 use crate::route::plan::{self, RoutePlan};
 use crate::route::prefix::Prefix;
@@ -58,7 +63,7 @@ use crate::tls::verdict::VerdictCache;
 use crate::tun::device::{Tun, TunDevice, TunSink};
 #[cfg(not(feature = "relay-experiments"))]
 use crate::tun::MTU;
-use crate::tun::{TUN_V4, TUN_V6};
+use crate::tun::{TUN_DNS, TUN_V4, TUN_V6};
 use crate::watchdog::monotonic_ms;
 
 /// While the switch is on, AdGuard is checked this often (it has no route
@@ -81,6 +86,9 @@ struct Up {
     exclusions: JoinHandle<()>,
     /// Lives exactly as long as the routes; None when it could not start.
     etw: Option<EtwSession>,
+    /// Empty when it is refused or could not open or be proven; routing goes on
+    /// without it.
+    capture: CaptureSlot,
 }
 
 fn journal(engine: &Engine) -> Option<Journal> {
@@ -170,8 +178,10 @@ pub async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
                 take_down(&engine, u).await;
                 None
             }
-            (None, Some(tables)) => match bring_up(&engine, &tables).await {
+            (None, Some(tables)) => match bring_up(&engine, &tables, &|| engine.policy().engine && !*stop.borrow()).await {
                 Ok(u) => Some(u),
+                // Stopped or switched off while it waited: the loop decides again.
+                Err(message) if message == NO_LONGER_WANTED => None,
                 Err(message) => {
                     engine.set_facts(|f| f.blocker = Some(Blocker::Setup { message }));
                     None
@@ -209,24 +219,254 @@ async fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
     if network_moved {
         up.relay.dns.reset();
     }
-    if routes == up.routes {
+    let up = if routes == up.routes {
         engine.routes_settled();
-        return up;
+        up
+    } else {
+        let mut kept: Vec<Prefix> = Vec::new();
+        for p in &up.routes {
+            if routes.contains(p) {
+                kept.push(*p);
+            } else {
+                let _ = apply::delete_route(up.luid.value(), *p);
+            }
+        }
+        if let Some(j) = journal(engine) {
+            let missing = routes.iter().copied().filter(|p| !up.routes.contains(p));
+            kept.extend(add_missing(engine, missing, |p| apply::add_route(&j, up.luid, p)));
+        }
+        kept.sort();
+        Up { routes: kept, ..up }
+    };
+    follow_capture(engine, up, network_moved).await
+}
+
+/// The DNS Client capture of one routing run (`route::capture`): its filter
+/// session, the blocks it holds and when it was last proven.
+struct Capture {
+    session: wfp::Session,
+    blocks: Vec<capture::Block>,
+    proven_at: tokio::time::Instant,
+    luid: SieveLuid,
+}
+
+/// The capture's place in a routing run: held, or empty and when to try again.
+#[derive(Default)]
+struct CaptureSlot {
+    held: Option<Capture>,
+    /// An empty slot tries again from then (None: at once).
+    retry_at: Option<tokio::time::Instant>,
+    /// The last failure, reported once and shown in the status until the capture holds.
+    last: Option<capture::NotCaught>,
+}
+
+impl CaptureSlot {
+    /// Reports a failure the first time it is seen, and waits before the next try.
+    fn failed(&mut self, engine: &Engine, why: capture::NotCaught) {
+        if self.last.as_ref().map(|l| &l.detail) != Some(&why.detail) {
+            engine.add_error(format!("the DNS Client's queries are not caught: {}", why.detail));
+        }
+        self.last = Some(why);
+        self.retry_at = Some(tokio::time::Instant::now() + capture::PROBE_EVERY);
     }
-    let mut kept: Vec<Prefix> = Vec::new();
-    for p in &up.routes {
-        if routes.contains(p) {
-            kept.push(*p);
-        } else {
-            let _ = apply::delete_route(up.luid.value(), *p);
+
+    /// What the status says, given the user's switch and the blocks of this pass.
+    fn publish(&self, engine: &Engine, wanted: bool, tables: &NetTables, has_blocks: bool) {
+        let state = if self.held.is_some() { DnsCapture::Working } else { capture::idle_state(wanted, tables, has_blocks, self.last.as_ref()) };
+        engine.set_facts(|f| f.dns_capture = Some(state));
+    }
+}
+
+/// The DNS Client returned this for the probe's NODATA (`DNS_INFO_NO_RECORDS`).
+const DNS_INFO_NO_RECORDS: i32 = 9501;
+
+/// Proves the capture: a fresh name asked through the DNS Client must reach the
+/// DNS service at [`TUN_DNS`] and its answer come back within [`capture::PROBE_WITHIN`].
+async fn prove(dns: &Arc<Service>) -> Result<(), capture::NotCaught> {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
+    let name = capture::probe_name(u64::from_le_bytes(nonce));
+    let deadline = tokio::time::Instant::now() + capture::PROBE_WITHIN;
+    let asked = {
+        let name = name.clone();
+        tokio::task::spawn_blocking(move || apply::ask_dns_client(&name))
+    };
+    let arrived = dns.probe_arrived(&name, capture::PROBE_WITHIN).await;
+    let status = tokio::time::timeout_at(deadline, asked).await;
+    let ms = capture::PROBE_WITHIN.as_millis();
+    match (arrived, status) {
+        (true, Ok(Ok(0 | DNS_INFO_NO_RECORDS))) => Ok(()),
+        (false, _) => Err(capture::NotCaught::new(CaptureReason::NoAnswer, format!("a probe through the DNS Client did not reach Sieve's DNS server within {ms} ms"))),
+        (true, Ok(Ok(status))) => Err(format!("the DNS Client answered a probe with error {status}").into()),
+        (true, _) => Err(format!("the DNS Client did not return a probe's answer within {ms} ms").into()),
+    }
+}
+
+/// How long the adapter's IPv6 source may stay tentative before the capture gives up
+/// (duplicate address detection; the probe would fail meanwhile).
+const SOURCE_READY_WITHIN: Duration = Duration::from_secs(3);
+
+/// Opens the capture: refused when an adapter it would block ties for the DNS
+/// Client's first network or the adapter has no IPv6 interface, else the adapter is
+/// put first (IPv6 metric), gets its IPv6 source and the server's host route, names its server,
+/// then the block goes on, then the probe proves it. A failure undoes all of it and
+/// is the caller's to report; routing goes on.
+async fn open_capture(engine: &Engine, luid: SieveLuid, tables: &NetTables, blocks: Vec<capture::Block>, dns: &Arc<Service>) -> Result<Capture, capture::NotCaught> {
+    if let Some(why) = capture::refusal(tables, &blocks, read::interface_metric_of) {
+        return Err(why);
+    }
+    if !apply::put_first_for_dns(luid)? {
+        return Err(capture::NotCaught::new(CaptureReason::Ipv6Off, "IPv6 is off on Sieve's adapter, and its DNS server is IPv6"));
+    }
+    apply::hide_from_own_name(luid)?;
+    let deadline = tokio::time::Instant::now() + SOURCE_READY_WITHIN;
+    while apply::address_state(luid, IpAddr::V6(TUN_V6))? != AddressState::Preferred {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("Sieve's adapter address {TUN_V6} did not settle within {} s", SOURCE_READY_WITHIN.as_secs()).into());
+        }
+        tokio::time::sleep(ADDRESS_POLL).await;
+    }
+    let journal = journal(engine).ok_or_else(|| "the engine has no state folder for its route journal".to_string())?;
+    apply::add_route(&journal, luid, Prefix::host(TUN_DNS))?;
+    let undo = || {
+        let _ = apply::set_adapter_dns(None);
+        let _ = apply::delete_route(luid.value(), Prefix::host(TUN_DNS));
+    };
+    if let Err(why) = apply::set_adapter_dns(Some(TUN_DNS)) {
+        undo();
+        return Err(why.into());
+    }
+    let opened = tokio::task::spawn_blocking(move || {
+        let mut session = wfp::open()?;
+        session.set(&blocks)?;
+        Ok::<_, String>(Capture { session, blocks, proven_at: tokio::time::Instant::now(), luid })
+    })
+    .await
+    .map_err(|e| format!("the DNS capture's filter task: {e}"))
+    .and_then(|r| r);
+    let held = match opened {
+        Ok(held) => held,
+        Err(why) => {
+            undo();
+            return Err(why.into());
+        }
+    };
+    match prove(dns).await {
+        Ok(()) => Ok(held),
+        Err(why) => {
+            close_capture(dns, held).await;
+            Err(why)
         }
     }
-    if let Some(j) = journal(engine) {
-        let missing = routes.iter().copied().filter(|p| !up.routes.contains(p));
-        kept.extend(add_missing(engine, missing, |p| apply::add_route(&j, up.luid, p)));
+}
+
+/// Ends the rewrite, closes the session (its block goes with it) off the runtime,
+/// then the adapter's server and its host route. Bounded by [`TASKS_BOUND`]: a
+/// filtering engine that does not return holds up no take-down.
+async fn close_capture(dns: &Service, capture: Capture) {
+    dns.set_every_network_blocked(false);
+    let luid = capture.luid;
+    let _ = tokio::time::timeout(TASKS_BOUND, tokio::task::spawn_blocking(move || drop(capture))).await;
+    let _ = apply::set_adapter_dns(None);
+    let _ = apply::delete_route(luid.value(), Prefix::host(TUN_DNS));
+}
+
+/// Keeps the capture on what the user's switch, the fresh tables and the routes
+/// say (`capture::step`): off, or nothing to block, closes it (the adapter's server
+/// goes too) and opens nothing; an adapter that now ties for the first network
+/// closes it; a changed block is set and proven, and a held one is proven again
+/// every [`capture::PROBE_EVERY`] and after the network moved; an empty one opens
+/// when its retry is due, at once after the switch came back on. A failure closes
+/// it and says why: the DNS Client then goes as it would without it. Last, the DNS
+/// service hears whether every network is blocked, and the status what holds.
+async fn follow_capture(engine: &Engine, mut up: Up, network_moved: bool) -> Up {
+    let tables = up.relay.tables.read().unwrap_or_else(|p| p.into_inner()).clone();
+    let wanted = capture::wanted(&engine.policy());
+    let blocks = capture::blocks(&tables, &up.routes);
+    let dns = up.relay.dns.clone();
+    if network_moved || !wanted {
+        up.capture.retry_at = None;
     }
-    kept.sort();
-    Up { routes: kept, ..up }
+    if !wanted {
+        up.capture.last = None;
+    }
+    let now = tokio::time::Instant::now();
+    let changed = up.capture.held.as_ref().is_some_and(|h| h.blocks != blocks);
+    let proof_due = up.capture.held.as_ref().is_some_and(|h| network_moved || changed || now.saturating_duration_since(h.proven_at) >= capture::PROBE_EVERY);
+    let retry_due = up.capture.retry_at.is_none_or(|at| now >= at);
+    match capture::step(wanted, up.capture.held.is_some(), !blocks.is_empty(), retry_due, proof_due) {
+        capture::Step::Close => {
+            if let Some(held) = up.capture.held.take() {
+                close_capture(&dns, held).await;
+            }
+        }
+        capture::Step::Open => match open_capture(engine, up.luid, &tables, blocks.clone(), &dns).await {
+            Ok(held) => {
+                up.capture.held = Some(held);
+                up.capture.last = None;
+            }
+            Err(why) => up.capture.failed(engine, why),
+        },
+        step @ (capture::Step::Prove | capture::Step::Keep) => {
+            let held = up.capture.held.take().expect("held");
+            let kept = match capture::refusal(&tables, &blocks, read::interface_metric_of) {
+                Some(why) => Err((Some(held), why)),
+                None if step == capture::Step::Keep => Ok(held),
+                None => match refilter(held, blocks.clone(), changed).await {
+                    Ok(mut held) => match prove(&dns).await {
+                        Ok(()) => {
+                            held.proven_at = tokio::time::Instant::now();
+                            Ok(held)
+                        }
+                        Err(why) => Err((Some(held), why)),
+                    },
+                    Err((held, why)) => Err((held, why.into())),
+                },
+            };
+            match kept {
+                Ok(held) => up.capture.held = Some(held),
+                Err((held, why)) => {
+                    match held {
+                        Some(held) => close_capture(&dns, held).await,
+                        None => {
+                            dns.set_every_network_blocked(false);
+                            let _ = apply::set_adapter_dns(None);
+                            let _ = apply::delete_route(up.luid.value(), Prefix::host(TUN_DNS));
+                        }
+                    }
+                    up.capture.failed(engine, why);
+                }
+            }
+        }
+        capture::Step::Nothing => {}
+    }
+    dns.set_every_network_blocked(up.capture.held.is_some() && capture::every_network_blocked(&tables, &blocks));
+    if up.capture.held.is_some() {
+        // Windows may give the adapter a new link-local address.
+        let _ = apply::hide_from_own_name(up.luid);
+    }
+    up.capture.publish(engine, wanted, &tables, !blocks.is_empty());
+    apply::drop_system_routes(up.luid);
+    up
+}
+/// The held capture with `blocks` in its session (off the runtime) when they
+/// changed; the session is given back with the error, for closing (none when the
+/// task panicked with it: its drop closed it).
+async fn refilter(mut held: Capture, blocks: Vec<capture::Block>, changed: bool) -> Result<Capture, (Option<Capture>, String)> {
+    if !changed {
+        return Ok(held);
+    }
+    let swapped = tokio::task::spawn_blocking(move || {
+        let done = held.session.set(&blocks);
+        held.blocks = blocks;
+        (held, done)
+    })
+    .await;
+    match swapped {
+        Ok((held, Ok(()))) => Ok(held),
+        Ok((held, Err(why))) => Err((Some(held), why)),
+        Err(e) => Err((None, format!("the DNS capture's filter task: {e}"))),
+    }
 }
 
 /// Adds the routes the plan lacks and returns those that went in. A pass with no
@@ -249,20 +489,113 @@ pub(super) fn add_missing(engine: &Engine, missing: impl Iterator<Item = Prefix>
     added
 }
 
-/// Gives the adapter its addresses and journals and adds each route. A failed
-/// route removes the ones added before it.
-fn route_adapter(journal: &Journal, luid: SieveLuid, routes: &[Prefix]) -> Result<Vec<Prefix>, String> {
-    apply::add_address(luid, TUN_V4.into())?;
-    if routes.iter().any(|p| !p.is_ipv4()) {
-        apply::add_address(luid, TUN_V6.into())?;
+/// A new address is tentative while Windows runs duplicate address detection on
+/// it (3 probes, about 3 s, for IPv4 on this adapter). Until then a send through
+/// the adapter's routes fails with "host unreachable", so a route added earlier
+/// takes every lookup and connection into a hole. Bounded: an adapter whose
+/// address never settles is a Setup blocker, and the network stays as it was.
+pub(super) const ADDRESSES_READY_WITHIN: Duration = Duration::from_secs(10);
+const ADDRESS_POLL: Duration = Duration::from_millis(50);
+
+/// What bringing the adapter up does to the system, apart from the order it is
+/// done in, which the tests check (`routing_tests`).
+pub(super) trait AdapterOps {
+    fn add_address(&mut self, ip: IpAddr) -> Result<(), String>;
+    fn address_state(&mut self, ip: IpAddr) -> Result<AddressState, String>;
+    fn add_route(&mut self, prefix: Prefix) -> Result<(), String>;
+    fn delete_route(&mut self, prefix: Prefix);
+    fn forget_routes(&mut self);
+}
+
+/// The adapter, its journal: the system's side of [`AdapterOps`].
+struct Os<'a> {
+    journal: &'a Journal,
+    luid: SieveLuid,
+}
+
+impl AdapterOps for Os<'_> {
+    fn add_address(&mut self, ip: IpAddr) -> Result<(), String> {
+        apply::add_address(self.luid, ip)
     }
+
+    fn address_state(&mut self, ip: IpAddr) -> Result<AddressState, String> {
+        apply::address_state(self.luid, ip)
+    }
+
+    fn add_route(&mut self, prefix: Prefix) -> Result<(), String> {
+        apply::add_route(self.journal, self.luid, prefix)
+    }
+
+    fn delete_route(&mut self, prefix: Prefix) {
+        let _ = apply::delete_route(self.luid.value(), prefix);
+    }
+
+    fn forget_routes(&mut self) {
+        let _ = self.journal.truncate();
+    }
+}
+
+/// The adapter's own addresses for these routes: IPv6 only when IPv6 is routed.
+pub(super) fn adapter_addresses(routes: &[Prefix]) -> Vec<IpAddr> {
+    let mut addresses = vec![IpAddr::V4(TUN_V4)];
+    if routes.iter().any(|p| !p.is_ipv4()) {
+        addresses.push(IpAddr::V6(TUN_V6));
+    }
+    addresses
+}
+
+/// Gives the adapter its addresses. Done first, so their detection runs while
+/// the rest of the bring-up does.
+pub(super) fn add_addresses(ops: &mut impl AdapterOps, addresses: &[IpAddr]) -> Result<(), String> {
+    addresses.iter().try_for_each(|ip| ops.add_address(*ip))
+}
+
+/// What a bring-up returns when the stop or the switch going off came while it
+/// waited: no blocker, the loop decides again.
+pub(super) const NO_LONGER_WANTED: &str = "routing was stopped or switched off while the adapter's address settled";
+
+/// Returns once every address may be a source, or says why it never will. While
+/// it waits, `wanted` is asked at every poll: a stop or the switch going off ends
+/// the wait at once with [`NO_LONGER_WANTED`].
+pub(super) async fn addresses_ready(ops: &mut impl AdapterOps, addresses: &[IpAddr], wanted: &(dyn Fn() -> bool + Sync)) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + ADDRESSES_READY_WITHIN;
+    loop {
+        let mut tentative = None;
+        for ip in addresses {
+            match ops.address_state(*ip)? {
+                AddressState::Preferred => {}
+                AddressState::Tentative | AddressState::NotYet => tentative = Some(*ip),
+                AddressState::Duplicate => {
+                    return Err(format!(
+                        "Sieve's address {ip} is already in use: another VPN or virtual adapter on this computer, or a device on this network, uses Sieve's range 198.18.0.0/15. Turn it off or move it to another range, then turn Sieve on again"
+                    ));
+                }
+                AddressState::Unusable(state) => return Err(format!("Sieve's adapter cannot use its address {ip} (state {state})")),
+            }
+        }
+        let Some(ip) = tentative else { return Ok(()) };
+        if !wanted() {
+            return Err(NO_LONGER_WANTED.into());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("Sieve's adapter address {ip} was still tentative after {} s", ADDRESSES_READY_WITHIN.as_secs()));
+        }
+        tokio::time::sleep(ADDRESS_POLL).await;
+    }
+}
+
+/// Journals and adds each route once the adapter's addresses are usable, so no
+/// route points at an adapter that cannot send yet. A failed route removes the
+/// ones added before it.
+pub(super) async fn route_adapter(ops: &mut impl AdapterOps, addresses: &[IpAddr], routes: &[Prefix], wanted: &(dyn Fn() -> bool + Sync)) -> Result<Vec<Prefix>, String> {
+    addresses_ready(ops, addresses, wanted).await?;
     let mut added = Vec::new();
     for p in routes {
-        if let Err(e) = apply::add_route(journal, luid, *p) {
+        if let Err(e) = ops.add_route(*p) {
             for a in &added {
-                let _ = apply::delete_route(luid.value(), *a);
+                ops.delete_route(*a);
             }
-            let _ = journal.truncate();
+            ops.forget_routes();
             return Err(e);
         }
         added.push(*p);
@@ -270,7 +603,7 @@ fn route_adapter(journal: &Journal, luid: SieveLuid, routes: &[Prefix]) -> Resul
     Ok(added)
 }
 
-async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String> {
+async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn() -> bool + Sync)) -> Result<Up, String> {
     let plan = plan::plan(tables);
     if plan.routes.is_empty() {
         return Err("this computer has no default route, so there is nothing to route".into());
@@ -291,6 +624,9 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     #[cfg(feature = "relay-experiments")]
     let tun = crate::tun::device::open(&engine.exe, engine.experiments.settings.tun_mtu)?;
     let luid = tun.luid;
+    let mut os = Os { journal: &journal, luid };
+    let addresses = adapter_addresses(&plan.routes);
+    add_addresses(&mut os, &addresses)?;
     let shared_tables = Arc::new(RwLock::new(tables.clone()));
     let egress = Arc::new(Egress::new(tun.index, shared_tables.clone()));
     let context = Context { connector: egress.clone(), tls: resolver_tls, resolvers };
@@ -309,7 +645,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     }
     // Before the routes, so a hang starting it cannot hold a route.
     let (etw, witness, nat) = start_attribution(engine);
-    let added = match route_adapter(&journal, luid, &plan.routes) {
+    let added = match route_adapter(&mut os, &addresses, &plan.routes, still_on).await {
         Ok(added) => added,
         Err(e) => {
             engine.stop_dns_service();
@@ -341,6 +677,21 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     let exclusions = tokio::spawn(refresh_exclusions(engine.exclusions.clone(), HttpsFetcher::new(relay.clone()), engine.validation.clone(), engine.dir.clone()));
     let (stop_accept, stopped) = oneshot::channel();
     let accept = tokio::spawn(accept(stack, relay.clone(), stopped));
+    // Last: the DNS Client is sent here only once the stack answers.
+    let mut capture = CaptureSlot::default();
+    let blocks = capture::blocks(tables, &added);
+    // The user's switch (`Policy::skip_dns_capture`): off, nothing of the capture is made.
+    let wanted = capture::wanted(&engine.policy());
+    if wanted && !blocks.is_empty() {
+        match open_capture(engine, luid, tables, blocks.clone(), &relay.dns).await {
+            Ok(held) => capture.held = Some(held),
+            Err(why) => capture.failed(engine, why),
+        }
+    }
+    relay.dns.set_every_network_blocked(capture.held.is_some() && capture::every_network_blocked(tables, &blocks));
+    capture.publish(engine, wanted, tables, !blocks.is_empty());
+    // After the metric changed: no multicast or broadcast send goes into the adapter.
+    apply::drop_system_routes(luid);
     let batches = {
         let e = engine.clone();
         tokio::spawn(async move {
@@ -364,7 +715,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     engine.beats.relay.end();
     engine.beats.tun.end();
     engine.arm.set(true);
-    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, exclusions, etw })
+    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, exclusions, etw, capture })
 }
 
 /// Interception as this engine run wires it (task D1, D2). Nothing here runs
@@ -461,12 +812,16 @@ async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiv
     drop(stack);
 }
 
-/// The order that keeps the network: disarm, close the session (the reader
+/// The order that keeps the network: close the DNS capture, disarm, close the session (the reader
 /// returns), cancel the flows while the runtime runs, delete the routes,
 /// empty the journal, close the adapter (Wintun removes it). The ETW session
 /// stops only after that, so a hang there cannot hold a route. The DNS service
 /// goes with the last reference to it, the relay's, when this returns.
-async fn take_down(engine: &Engine, up: Up) {
+async fn take_down(engine: &Engine, mut up: Up) {
+    // First, so the DNS Client is never sent to a server that is going away.
+    if let Some(c) = up.capture.held.take() {
+        close_capture(&up.relay.dns, c).await;
+    }
     engine.arm.set(false);
     *super::lock(&engine.beats.path) = None;
     let _ = up.tun.session.shutdown();
@@ -490,6 +845,7 @@ async fn take_down(engine: &Engine, up: Up) {
     engine.set_facts(|f| {
         f.routes_up = false;
         f.up_since = None;
+        f.dns_capture = None;
     });
     engine.routes_settled();
     stop_attribution(engine, up.etw).await;

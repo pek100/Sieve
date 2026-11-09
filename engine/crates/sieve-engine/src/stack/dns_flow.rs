@@ -22,11 +22,38 @@ fn first_question(ctx: &Relay, id: u64) -> impl FnMut(&str) + use<'_> {
 }
 
 /// Books the flow as DNS: a lookup is never blocked (`domain`), whoever asks. The
-/// answer does depend on who asks: a guest's flows are never decrypted.
+/// answer does depend on who asks: a guest's flows are never decrypted, and only
+/// the DNS Client service's may have an NXDOMAIN rewritten (`dns::service`).
 fn admit(ctx: &Relay, flow: &FiveTuple, attributed: &Attributed, proto: FlowProto) -> Option<(u64, Asker)> {
     let admitted = ctx.admit(flow, attributed, proto, FlowKind::Dns)?;
     lock(&ctx.book).update(admitted.id, |e| e.reason = Some(FlowReason::Dns));
-    Some((admitted.id, Asker { may_decrypt: admitted.may_decrypt(), addressed: flow.remote.ip() }))
+    let dns_client = attributed.pid().is_some_and(|pid| dns_client_pid() == Some(pid));
+    Some((admitted.id, Asker { may_decrypt: admitted.may_decrypt(), addressed: flow.remote.ip(), dns_client }))
+}
+
+/// How long the DNS Client service's process id is trusted before it is read again.
+const DNS_CLIENT_PID_FOR_MS: u64 = 60_000;
+
+/// The DNS Client service's process id, read from the service manager at most
+/// once a [`DNS_CLIENT_PID_FOR_MS`]. None when it cannot be read.
+fn dns_client_pid() -> Option<u32> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    static CACHED: std::sync::Mutex<Option<(Option<u32>, u64)>> = std::sync::Mutex::new(None);
+    let now = crate::watchdog::monotonic_ms();
+    let mut cached = CACHED.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((pid, at)) = *cached
+        && now.saturating_sub(at) < DNS_CLIENT_PID_FOR_MS
+    {
+        return pid;
+    }
+    let pid = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .and_then(|m| m.open_service("Dnscache", ServiceAccess::QUERY_STATUS))
+        .and_then(|s| s.query_status())
+        .ok()
+        .and_then(|status| status.process_id);
+    *cached = Some((pid, now));
+    pid
 }
 
 /// A lookup Sieve could not get an answer for is the flow's problem: `resolved`

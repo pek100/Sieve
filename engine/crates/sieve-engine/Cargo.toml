@@ -127,6 +127,11 @@ clubcard-crlite = "0.6"
 # (Services, through windows-service for the rest), the ProgramData ACL, and
 # the deletion of routes on the "Sieve" interface and in the journal. The
 # probe binary alone creates the spike's test adapter (run by the user).
+# The DNS Client capture (route::capture): its adapter's one DNS server and
+# interface metric (route::apply), the DNS Client probe that proves it (Dns),
+# and a block in a dynamic WFP session that
+# the base filtering engine deletes with the engine's handle
+# (WindowsFilteringPlatform, route::wfp only).
 # Attribution reads: a real-time ETW session (Diagnostics_Etw, Time) and WMI
 # queries of NAT state on its own COM thread (Com, Ole for VARIANT, Rpc,
 # Variant, Wmi).
@@ -138,8 +143,10 @@ clubcard-crlite = "0.6"
 wintun-bindings = { version = "0.7.40", features = ["verify_binary_signature"] }
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_Dns",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",

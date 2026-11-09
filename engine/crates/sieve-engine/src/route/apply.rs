@@ -13,9 +13,16 @@ use std::net::IpAddr;
 
 use windows::Win32::Foundation::{ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR, WIN32_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DeleteIpForwardEntry2, InitializeIpForwardEntry,
-    InitializeUnicastIpAddressEntry, MIB_IPFORWARD_ROW2, MIB_UNICASTIPADDRESS_ROW,
+    CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER,
+    DNS_SETTING_IPV6, DNS_SETTING_REGISTRATION_ENABLED, DeleteIpForwardEntry2, GetIpInterfaceEntry, GetUnicastIpAddressEntry, InitializeIpForwardEntry,
+    InitializeIpInterfaceEntry, InitializeUnicastIpAddressEntry, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
+    SetInterfaceDnsSettings, SetIpInterfaceEntry,
 };
+use windows::Win32::Networking::WinSock::{IpDadStateDuplicate, IpDadStateInvalid, IpDadStatePreferred, IpDadStateTentative};
+use windows::core::{GUID, HSTRING, PWSTR};
+
+pub use super::capture::DNS_FIRST_METRIC;
+use crate::tun::ADAPTER_GUID;
 use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
@@ -93,6 +100,17 @@ pub fn delete_route(luid: u64, prefix: Prefix) -> Deleted {
     super::classify_delete(unsafe { DeleteIpForwardEntry2(&row) }.0)
 }
 
+/// Deletes the multicast and broadcast routes Windows put on the engine's adapter
+/// (`plan::NOT_ON_SIEVE`), and returns how many were there. Windows may put them
+/// back when the interface changes, so the routing loop calls this again.
+pub fn drop_system_routes(luid: SieveLuid) -> usize {
+    super::plan::NOT_ON_SIEVE
+        .iter()
+        .filter_map(|p| p.parse::<Prefix>().ok())
+        .filter(|p| delete_route(luid.0, *p) == Deleted::Yes)
+        .count()
+}
+
 /// The adapter's own host address (a /32 or /128), active store only.
 pub fn add_address(luid: SieveLuid, ip: IpAddr) -> Result<(), String> {
     let mut row = MIB_UNICASTIPADDRESS_ROW::default();
@@ -105,13 +123,183 @@ pub fn add_address(luid: SieveLuid, ip: IpAddr) -> Result<(), String> {
     check(unsafe { CreateUnicastIpAddressEntry(&row) }, &format!("CreateUnicastIpAddressEntry {ip}"))
 }
 
+/// Where duplicate address detection stands for one of the adapter's addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressState {
+    /// A packet may leave with it as its source.
+    Preferred,
+    /// Still being checked: Windows refuses it as a source (a send through the
+    /// adapter's routes fails with "host unreachable").
+    Tentative,
+    /// Not yet set (`IpDadStateInvalid`), as right after the address was added:
+    /// waited on like [`AddressState::Tentative`].
+    NotYet,
+    /// Another machine or adapter answers for it.
+    Duplicate,
+    /// It can never be used.
+    Unusable(i32),
+}
+
+/// Reads the state of one of the adapter's addresses.
+pub fn address_state(luid: SieveLuid, ip: IpAddr) -> Result<AddressState, String> {
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    // SAFETY: initialises a row this function owns.
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceLuid = NET_LUID_LH { Value: luid.0 };
+    row.Address = sockaddr_inet(ip);
+    // SAFETY: `row` names the address and the interface, as the call requires.
+    let code = unsafe { GetUnicastIpAddressEntry(&mut row) };
+    if code != NO_ERROR {
+        return Err(format!("GetUnicastIpAddressEntry {ip} failed: Win32 error {}", code.0));
+    }
+    Ok(match row.DadState {
+        state if state == IpDadStatePreferred => AddressState::Preferred,
+        state if state == IpDadStateTentative => AddressState::Tentative,
+        state if state == IpDadStateInvalid => AddressState::NotYet,
+        state if state == IpDadStateDuplicate => AddressState::Duplicate,
+        other => AddressState::Unusable(other.0),
+    })
+}
+
+/// Gives the adapter [`DNS_FIRST_METRIC`] for IPv6 only (IPv4 keeps its automatic
+/// metric, `route::capture`), and says whether it has an IPv6 interface that took
+/// it. With IPv6 off the adapter has none; a failure to set one that exists is an
+/// error.
+pub fn put_first_for_dns(luid: SieveLuid) -> Result<bool, String> {
+    let mut row = MIB_IPINTERFACE_ROW::default();
+    // SAFETY: initialises a row this function owns.
+    unsafe { InitializeIpInterfaceEntry(&mut row) };
+    row.Family = AF_INET6;
+    row.InterfaceLuid = NET_LUID_LH { Value: luid.0 };
+    // SAFETY: the row names the interface and its family, as the call requires.
+    if unsafe { GetIpInterfaceEntry(&mut row) } != NO_ERROR {
+        return Ok(false);
+    }
+    row.UseAutomaticMetric = false;
+    row.Metric = DNS_FIRST_METRIC;
+    row.SitePrefixLength = 0;
+    // SAFETY: a row read back above, changed in three fields.
+    check(unsafe { SetIpInterfaceEntry(&mut row) }, "SetIpInterfaceEntry")?;
+    Ok(true)
+}
+
+/// Gives the adapter [`crate::tun::TUN_V6`] for the DNS Client to reach its server
+/// from, if the routes did not, and skips every link-local address of the adapter
+/// as a source: a skipped address is in no answer for the machine's own name (live,
+/// 2026-11-09). [`crate::tun::TUN_V6`] itself cannot be skipped: the DNS Client
+/// then had no source for the adapter's server and the probe never arrived (live).
+pub fn hide_from_own_name(luid: SieveLuid) -> Result<(), String> {
+    let skip = false;
+    use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_TABLE, SetUnicastIpAddressEntry};
+    let v6 = IpAddr::V6(crate::tun::TUN_V6);
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    // SAFETY: initialises a row this function owns.
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceLuid = NET_LUID_LH { Value: luid.0 };
+    row.Address = sockaddr_inet(v6);
+    row.OnLinkPrefixLength = 128;
+    row.SkipAsSource = skip;
+    // SAFETY: `row` is a valid, initialised row.
+    check(unsafe { CreateUnicastIpAddressEntry(&row) }, &format!("CreateUnicastIpAddressEntry {v6}"))?;
+    let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+    // SAFETY: Windows allocates the table; it is freed below.
+    let code = unsafe { GetUnicastIpAddressTable(AF_INET6, &mut table) };
+    if code != NO_ERROR || table.is_null() {
+        return Err(format!("GetUnicastIpAddressTable: Win32 error {}", code.0));
+    }
+    let mut failed = None;
+    // SAFETY: `table` is valid until FreeMibTable; NumEntries rows follow.
+    unsafe {
+        let rows = std::slice::from_raw_parts_mut((*table).Table.as_mut_ptr(), (*table).NumEntries as usize);
+        for r in rows.iter_mut().filter(|r| r.InterfaceLuid.Value == luid.0) {
+            let ip = super::table::read::inet_ip(&r.Address);
+            let link_local = ip.is_some_and(|ip| matches!(ip, IpAddr::V6(a) if a.segments()[0] & 0xffc0 == 0xfe80));
+            let want = if link_local { true } else if ip == Some(v6) { skip } else { continue };
+            if r.SkipAsSource != want {
+                r.SkipAsSource = want;
+                if let Err(e) = check(SetUnicastIpAddressEntry(r), "SetUnicastIpAddressEntry") {
+                    failed = Some(e);
+                }
+            }
+        }
+        FreeMibTable(table.cast());
+    }
+    failed.map_or(Ok(()), Err)
+}
+
+/// Names `server` as the DNS server of the engine's own adapter, or none, and
+/// keeps Windows from registering the adapter's address in DNS. The only DNS
+/// setting the engine writes, and only on its adapter's GUID ([`ADAPTER_GUID`]).
+/// Each family is set: `server`'s, and the other emptied. Windows keeps it in that
+/// interface's registry key, which it deletes when the adapter is removed; after a
+/// kill the key stays, naming a server only an adapter that no longer exists would
+/// use (live check of 2026-11-09), until the next start or `uninstall`
+/// ([`forget_adapter_key`]). Called only while the adapter exists, so it creates
+/// no key.
+pub fn set_adapter_dns(server: Option<IpAddr>) -> Result<(), String> {
+    for v6 in [false, true] {
+        let text = HSTRING::from(server.filter(|s| s.is_ipv6() == v6).map(|s| s.to_string()).unwrap_or_default());
+        let family = if v6 { DNS_SETTING_IPV6 } else { 0 };
+        let settings = DNS_INTERFACE_SETTINGS {
+            Version: DNS_INTERFACE_SETTINGS_VERSION1,
+            Flags: u64::from(DNS_SETTING_NAMESERVER | DNS_SETTING_REGISTRATION_ENABLED | family),
+            NameServer: PWSTR(text.as_ptr().cast_mut()),
+            RegistrationEnabled: 0,
+            ..Default::default()
+        };
+        // SAFETY: `settings` and the string it points at outlive the call, which only reads them.
+        check(unsafe { SetInterfaceDnsSettings(GUID::from_u128(ADAPTER_GUID), &settings) }, "SetInterfaceDnsSettings")?;
+    }
+    Ok(())
+}
+
+/// The interface registry key of the adapter's own GUID, under `root` (Tcpip or Tcpip6).
+fn adapter_key(root: &str) -> String {
+    let g = ADAPTER_GUID;
+    let guid = format!("{{{:08x}-{:04x}-{:04x}-{:04x}-{:012x}}}", g >> 96, (g >> 80) & 0xffff, (g >> 64) & 0xffff, (g >> 48) & 0xffff, g & 0xffff_ffff_ffff);
+    format!(r"SYSTEM\CurrentControlSet\Services\{root}\Parameters\Interfaces\{guid}")
+}
+
+/// Deletes what [`set_adapter_dns`] left in the registry when no adapter with the
+/// engine's GUID is present (after a kill, Windows never removed it): that GUID's
+/// interface key in both families, and nothing else. With the adapter present, its
+/// key is Windows' own and stays. After a kill Windows still knows the interface
+/// (its GUID converts to a LUID, live 2026-11-09) while no adapter lists it, so
+/// presence is the adapter list's (`GetAdaptersAddresses`); a list that cannot be
+/// read deletes nothing.
+pub fn forget_adapter_key() -> Result<String, String> {
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceGuidToLuid;
+    use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RegDeleteTreeW};
+    let mut luid = NET_LUID_LH::default();
+    // SAFETY: both pointers are this frame's.
+    if unsafe { ConvertInterfaceGuidToLuid(&GUID::from_u128(ADAPTER_GUID), &mut luid) } == NO_ERROR {
+        // SAFETY: reading the union's only field.
+        let luid = unsafe { luid.Value };
+        if super::table::read::adapters()?.iter().any(|a| a.luid == luid) {
+            return Ok("the adapter is present, its key is Windows'".into());
+        }
+    }
+    let mut deleted = 0;
+    for root in ["Tcpip", "Tcpip6"] {
+        // SAFETY: a NUL-terminated path; HKLM is predefined.
+        match unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, &HSTRING::from(adapter_key(root))) } {
+            NO_ERROR => deleted += 1,
+            ERROR_FILE_NOT_FOUND => {}
+            other => return Err(format!("{root} key: Win32 error {}", other.0)),
+        }
+    }
+    Ok(format!("{deleted} key{} deleted", if deleted == 1 { "" } else { "s" }))
+}
+
 /// The start-up and off-path cleanup: every route on an adapter named
-/// "Sieve" and every journalled route, then the journal emptied (plan 1.6.3).
+/// "Sieve" and every journalled route, then the journal emptied (plan 1.6.3),
+/// and the adapter's leftover DNS key ([`forget_adapter_key`]).
 pub fn clear_stale(journal: &Journal) -> String {
     let named = super::delete_sieve_routes();
     let replay = journal.replay(|e| delete_route(e.luid, e.prefix));
     format!(
-        "routes on \"Sieve\": {}; journal: {}",
+        "routes on \"Sieve\": {}; journal: {}; DNS key: {}",
         match named {
             Ok(r) => r.summary(),
             Err(e) => format!("FAILED, {e}"),
@@ -119,13 +307,39 @@ pub fn clear_stale(journal: &Journal) -> String {
         match replay {
             Ok(r) => format!("{}{}, {} unreadable lines", if r.failed > 0 { "FAILED, " } else { "" }, r.summary(), r.skipped),
             Err(e) => format!("FAILED, {e}"),
-        }
+        },
+        forget_adapter_key().unwrap_or_else(|e| format!("FAILED, {e}"))
     )
+}
+
+/// Asks the DNS Client for `name` (fully qualified) bypassing its cache, hosts
+/// file, LLMNR and NetBIOS, and returns its status (0, or `DNS_INFO_NO_RECORDS`
+/// 9501 for NODATA). Blocks until the DNS Client returns: call it off the runtime.
+pub fn ask_dns_client(name: &str) -> i32 {
+    use windows::Win32::NetworkManagement::Dns::{
+        DNS_QUERY_BYPASS_CACHE, DNS_QUERY_NO_HOSTS_FILE, DNS_QUERY_NO_MULTICAST, DNS_QUERY_NO_NETBT, DNS_RECORDA, DNS_TYPE_A, DnsFree, DnsFreeRecordList, DnsQuery_W,
+    };
+    let mut records: *mut DNS_RECORDA = std::ptr::null_mut();
+    let options = DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_HOSTS_FILE | DNS_QUERY_NO_MULTICAST | DNS_QUERY_NO_NETBT;
+    // SAFETY: a NUL-terminated name; the result list is freed below.
+    let status = unsafe { DnsQuery_W(&HSTRING::from(name), DNS_TYPE_A, options, None, &mut records, None) };
+    if !records.is_null() {
+        // SAFETY: a list DnsQuery_W allocated, freed once.
+        unsafe { DnsFree(Some(records.cast()), DnsFreeRecordList) };
+    }
+    i32::try_from(status.0).unwrap_or(i32::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one key the cleanup may delete: the adapter's own GUID, either family.
+    #[test]
+    fn the_leftover_key_is_the_adapters_own_guid_only() {
+        assert_eq!(adapter_key("Tcpip"), r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{5e7e5e7e-51e7-4e00-8a11-5e7e00000003}");
+        assert!(adapter_key("Tcpip6").starts_with(r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\{5e7e5e7e-"));
+    }
 
     /// Every route the engine writes names the Sieve adapter's LUID, is
     /// on-link, and is a plain static route (no persistent store exists in

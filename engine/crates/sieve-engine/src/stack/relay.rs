@@ -87,6 +87,13 @@ pub struct Attributed {
     elapsed_ms: u64,
 }
 
+impl Attributed {
+    /// The host process the flow is attributed to, if any.
+    pub(super) fn pid(&self) -> Option<u32> {
+        self.attribution.event_fields().0
+    }
+}
+
 /// What every flow task shares.
 pub struct Relay {
     #[cfg(feature = "relay-experiments")]
