@@ -427,6 +427,43 @@ async fn an_apps_reset_reaches_the_server_as_a_reset() {
     }
 }
 
+/// Run 8: a client that half-closes after its request (HTTP/1.0 style) gets the
+/// answer through the relay, whose server answers once it saw the end of the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_closed_app_gets_the_servers_answer_through_the_relay() {
+    const ANSWER: &[u8] = b"HTTP/1.0 200 OK\r\n\r\nthe answer, close-delimited";
+    for flow in FLOWS {
+        let mut bed = TcpBed::new(flow).await;
+        let request = format!("GET / HTTP/1.0\r\nHost: {ALLOWED}\r\n\r\n").into_bytes();
+        bed.send(&request);
+        let (seq, ack) = (bed.client_next, bed.server_next);
+        bed.wire.to_stack.send(segment(bed.local, bed.remote, seq, Flags { fin: true, ack: Some(ack), ..Flags::default() }, &[])).unwrap();
+        bed.client_next += 1;
+        let mut got = Vec::new();
+        ended(bed.server.read_to_end(&mut got)).await.unwrap();
+        assert_eq!(got, request, "{flow:?}: the request, then the end");
+        bed.server.write_all(ANSWER).await.unwrap();
+        bed.server.shutdown().await.unwrap();
+        let mut answer = Vec::new();
+        let mut fin = false;
+        while !fin {
+            let packet = tokio::time::timeout(WAIT, bed.wire.from_stack.recv()).await.expect("a segment").unwrap();
+            let headers = PacketHeaders::from_ip_slice(&packet).unwrap();
+            let Some(TransportHeader::Tcp(header)) = headers.transport else { panic!("not TCP") };
+            let payload = headers.payload.slice();
+            assert!(!header.rst, "{flow:?}: reset after {} bytes", answer.len());
+            if !payload.is_empty() {
+                answer.extend_from_slice(payload);
+                bed.server_next = header.sequence_number.wrapping_add(u32::try_from(payload.len()).unwrap());
+                bed.send(&[]);
+            }
+            fin = header.fin;
+        }
+        assert_eq!(answer, ANSWER, "{flow:?}: the answer reached the half-closed app before the FIN");
+        bed.task.abort();
+    }
+}
+
 /// The control: a flow no rule blocks still ends with a FIN when its server does.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_passed_flow_still_closes_with_a_fin() {

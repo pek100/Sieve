@@ -184,8 +184,12 @@ where
             out.stop = true;
             return out;
         }
+        let replayed = (held.len() + tail.len()) as u64;
+        // The classifier's buffers go before the copy phase, which can last the stack's
+        // two-hour idle limit: 16 KiB of an idle plain flow's 68 KiB (VM run 8).
+        drop((held, buf, classifier));
         let (copied, broke) = app_to_server(&mut app_read, up_write).await;
-        out.bytes_up = (held.len() + tail.len()) as u64 + copied;
+        out.bytes_up = replayed + copied;
         out.reset_upstream = broke;
         out
     };
