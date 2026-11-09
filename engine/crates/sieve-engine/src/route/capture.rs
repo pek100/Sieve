@@ -8,12 +8,19 @@
 //! on a Windows Server 2025 VM, 2026-11-09). With routes up, three things together
 //! make its queries reach the engine and nothing else:
 //!
-//! 1. the engine's adapter names one DNS server, [`TUN_DNS`], whose host route
-//!    goes into the adapter and which the DNS service answers;
-//! 2. that adapter is the DNS Client's first network ([`DNS_FIRST_METRIC`]): with
-//!    the first network blocked, the DNS Client waits out its retries (12 s a
-//!    lookup, measured) before it takes another network's answer. An adapter that
-//!    already has that metric would tie, so the capture is refused ([`refusal`]);
+//! 1. the engine's adapter names one DNS server, [`TUN_DNS`](crate::tun::TUN_DNS) (IPv6, in the
+//!    adapter's own ULA prefix), whose host route goes into the adapter and which
+//!    the DNS service answers. The adapter's IPv6 address [`crate::tun::TUN_V6`] is
+//!    its source; while IPv6 is not routed it is skipped as a source for anything
+//!    else, and the adapter's link-local addresses always are, so the machine's own
+//!    name answers as without Sieve (live, 2026-11-09);
+//! 2. that adapter is the DNS Client's first network by its IPv6 metric alone
+//!    ([`DNS_FIRST_METRIC`]; IPv4 keeps its automatic metric, or the machine's own
+//!    name answered 198.18.0.1 first): with the first network blocked, the DNS
+//!    Client waits out its retries (12 s a lookup, measured) before it takes another
+//!    network's answer. An adapter that already has that metric in either family
+//!    would tie, so the capture is refused ([`refusal`]), and so is a machine with
+//!    IPv6 off on the adapter;
 //! 3. a filter in a dynamic WFP session (`route::wfp`) blocks the DNS Client's
 //!    own port-53 connections leaving the adapters that hold a default route
 //!    outside Sieve, to the prefixes the engine routes and to those adapters' own
@@ -29,7 +36,7 @@
 //!
 //! The capture is proven, not assumed: after it opens, after each change and
 //! every [`PROBE_EVERY`], the engine asks the DNS Client a fresh name and the DNS
-//! service must see it at [`TUN_DNS`] and the answer must come back within
+//! service must see it at [`TUN_DNS`](crate::tun::TUN_DNS) and the answer must come back within
 //! [`PROBE_WITHIN`], or the capture closes (`control::routing`).
 //!
 //! Rejected on the same VM: blocking the DNS Client's binds to the physical
@@ -50,11 +57,11 @@ use std::time::Duration;
 use super::plan::is_tunnel;
 use super::prefix::Prefix;
 use super::table::NetTables;
-use crate::tun::TUN_DNS;
 
-/// The interface metric that makes the engine's adapter the DNS Client's first
-/// network. Routes are unaffected: none of the engine's has the same prefix as a
-/// route of another adapter.
+/// The IPv6 interface metric that makes the engine's adapter the DNS Client's first
+/// network (live: with Ethernet at 5 in both families, Sieve at IPv4 50 and IPv6 1
+/// was asked first). Routes are unaffected: none of the engine's has the same
+/// prefix as a route of another adapter.
 pub const DNS_FIRST_METRIC: u32 = 1;
 /// How long a probe's answer may take, from the DNS Client's call to its return.
 pub const PROBE_WITHIN: Duration = Duration::from_secs(1);
@@ -77,13 +84,12 @@ pub struct Block {
     pub to: Vec<Prefix>,
 }
 
-/// True when the plan routes [`TUN_DNS`] into the adapter (`plan::plan` adds its
-/// host route whenever it routes anything) and an IPv4 default route exists.
-/// Without the route the adapter's server would answer nothing. Without IPv4 the
-/// network may be IPv6-only with DNS64, whose synthesized answers only its own
-/// server gives: the DNS Client keeps asking it.
+/// True when anything is routed and an IPv4 default route exists. Without IPv4
+/// the network may be IPv6-only with DNS64, whose synthesized answers only its own
+/// server gives: the DNS Client keeps asking it. [`TUN_DNS`](crate::tun::TUN_DNS)'s host route is the
+/// capture's own (`control::routing`).
 pub fn possible(tables: &NetTables, routes: &[Prefix]) -> bool {
-    routes.contains(&Prefix::host(IpAddr::V4(TUN_DNS))) && tables.has_default(true)
+    !routes.is_empty() && tables.has_default(true)
 }
 
 /// A server the DNS Client may be stopped from asking: not on this machine.
@@ -154,15 +160,19 @@ fn is_never_asked(ip: IpAddr) -> bool {
 /// Why the capture must not open: an adapter it would block already has the
 /// interface metric the engine's adapter takes ([`DNS_FIRST_METRIC`]) or a lower
 /// one, so the DNS Client's first network would be a tie and every lookup could
-/// wait out the block. `metric` reads an adapter's interface metric (LUID, IPv4).
+/// wait out the block. `metric` reads an adapter's interface metric (LUID, IPv4),
+/// and both families are checked.
 pub fn refusal(tables: &NetTables, blocks: &[Block], metric: impl Fn(u64, bool) -> Option<u32>) -> Option<String> {
-    blocks.iter().find_map(|b| {
-        b.on.iter().find_map(|luid| {
-            let m = metric(*luid, b.v4).filter(|m| *m <= DNS_FIRST_METRIC)?;
+    let mut luids: Vec<u64> = blocks.iter().flat_map(|b| b.on.iter().copied()).collect();
+    luids.sort_unstable();
+    luids.dedup();
+    luids.iter().find_map(|luid| {
+        [true, false].into_iter().find_map(|v4| {
+            let m = metric(*luid, v4).filter(|m| *m <= DNS_FIRST_METRIC)?;
             let alias = tables.adapters.iter().find(|a| a.luid == *luid).map_or("an adapter", |a| a.alias.as_str());
             Some(format!(
                 "\"{alias}\" has interface metric {m} for {}, which ties with Sieve's DNS server, so the DNS Client's queries are not caught (give \"{alias}\" a metric above {DNS_FIRST_METRIC} to have them caught)",
-                if b.v4 { "IPv4" } else { "IPv6" }
+                if v4 { "IPv4" } else { "IPv6" }
             ))
         })
     })
@@ -283,9 +293,9 @@ mod tests {
     }
 
     #[test]
-    fn no_route_to_sieves_server_or_no_ipv4_default_means_no_block() {
+    fn nothing_routed_or_no_ipv4_default_means_no_block() {
         let tables = load(HOME);
-        assert!(blocks(&tables, &plan(&tables).routes.into_iter().filter(|p| *p != Prefix::host(IpAddr::V4(TUN_DNS))).collect::<Vec<_>>()).is_empty());
+        assert!(blocks(&tables, &[]).is_empty(), "nothing routed");
         let mut v6_only = load(HOME);
         v6_only.routes.retain(|r| r.dest.length() != 0 || !r.dest.is_ipv4());
         let routes = plan(&v6_only).routes;
@@ -315,6 +325,17 @@ mod tests {
         let why = refusal(&tables, &blocks, |l, v4| (l == luid && v4).then_some(DNS_FIRST_METRIC)).expect("a tie");
         assert!(why.contains("Wi-Fi") && why.contains("metric 1") && why.contains("IPv4"), "{why}");
         assert!(refusal(&tables, &blocks, |l, v4| (l == luid && !v4).then_some(0)).unwrap().contains("IPv6"));
+    }
+
+    /// The server is IPv6 so the adapter is first by its IPv6 metric alone; it sits
+    /// beside the adapter's own ULA and is never one of the plan's routes.
+    #[test]
+    fn the_adapters_server_is_ipv6_in_its_own_prefix_and_never_planned() {
+        use crate::tun::{TUN_DNS, TUN_V6};
+        let IpAddr::V6(server) = TUN_DNS else { panic!("IPv6") };
+        assert_eq!(server.segments()[..4], TUN_V6.segments()[..4]);
+        assert!(super::super::plan::declared().iter().any(|h| h.contains(TUN_DNS)), "a hole: only the capture routes it");
+        assert!(!plan(&load(HOME)).routes.iter().any(|p| p.contains(TUN_DNS)));
     }
 
     #[test]

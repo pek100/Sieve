@@ -43,9 +43,12 @@ pub const ADAPTER_GUID: u128 = 0x5e7e_5e7e_51e7_4e00_8a11_5e7e_0000_0003;
 /// The adapter's own addresses: the benchmark range (RFC 2544) and a ULA.
 pub const TUN_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 pub const TUN_V6: Ipv6Addr = Ipv6Addr::new(0xfd53, 0x6965, 0x7665, 1, 0, 0, 0, 1);
-/// The DNS server the adapter names while routes are up (`route::capture`): no host
-/// has it, its host route goes into the adapter, and the DNS service answers it.
-pub const TUN_DNS: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 53);
+/// The DNS server the adapter names while the DNS Client's queries are caught
+/// (`route::capture`): no host has it, its host route goes into the adapter, and the
+/// DNS service answers it. IPv6, in [`TUN_V6`]'s prefix, so the adapter can be the
+/// DNS Client's first network by its IPv6 metric alone: with IPv4 at metric 1 the
+/// machine's own name answered 198.18.0.1 first (live, 2026-11-09).
+pub const TUN_DNS: IpAddr = IpAddr::V6(Ipv6Addr::new(0xfd53, 0x6965, 0x7665, 1, 0, 0, 0, 0x53));
 /// The adapter's and the stack's MTU, larger than any real path on purpose (E2 of
 /// `docs/plans/2026-10-18-slice-3-attribution-and-cpu.md`): apps send six times
 /// fewer packets per byte, which took relay CPU from 0.156 to 0.048-0.083 cores per

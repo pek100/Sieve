@@ -356,7 +356,7 @@ impl Service {
     fn rewrites(&self, query: &[u8], asker: Asker) -> bool {
         NXDOMAIN_AS_NODATA
             && asker.dns_client
-            && asker.addressed == IpAddr::V4(TUN_DNS)
+            && asker.addressed == TUN_DNS
             && self.every_network_blocked.load(Ordering::SeqCst)
             && !edns(query).is_some_and(|e| e.dnssec_ok)
     }
@@ -372,7 +372,7 @@ impl Service {
         let question = parse(query);
         let name = question.as_ref().and_then(|m| m.question.as_deref());
         if let Some(probe) = name.filter(|n| capture::is_probe(n)) {
-            if asker.addressed == IpAddr::V4(TUN_DNS) {
+            if asker.addressed == TUN_DNS {
                 self.probe_seen(probe);
             }
             return nodata(query).map(|reply| Answered { reply, resolved: true });
@@ -429,7 +429,7 @@ impl Service {
     fn path(&self, query: &[u8], addressed: Option<IpAddr>) -> Path {
         let tables = self.tables.read().unwrap_or_else(|p| p.into_inner());
         match upstream::path_of(query, &tables) {
-            Path::Encrypted if self.mode() == Mode::Plain => match addressed.filter(|ip| *ip != IpAddr::V4(TUN_DNS)) {
+            Path::Encrypted if self.mode() == Mode::Plain => match addressed.filter(|ip| *ip != TUN_DNS) {
                 Some(server) => Path::Plain(server),
                 None if upstream::plain_servers(&tables).is_empty() => Path::Refused,
                 None => Path::PlainAsWindows,
@@ -445,7 +445,7 @@ impl Service {
     /// register. Everything else is NOTIMP.
     async fn other_opcode(&self, query: &[u8], flags: u16, asker: Asker) -> Option<Answered> {
         let to_lan = || upstream::is_lan_server(&self.tables.read().unwrap_or_else(|p| p.into_inner()), asker.addressed);
-        if (flags & FLAG_OPCODE) >> 11 == OPCODE_UPDATE && asker.addressed != IpAddr::V4(TUN_DNS) && !names_sieves_address(query) && to_lan() {
+        if (flags & FLAG_OPCODE) >> 11 == OPCODE_UPDATE && asker.addressed != TUN_DNS && !names_sieves_address(query) && to_lan() {
             return match self.plain_exchange(asker.addressed, query, || true).await {
                 Ok(reply) => Some(Answered { reply, resolved: true }),
                 Err(_) => servfail(query).map(|reply| Answered { reply, resolved: false }),
@@ -689,7 +689,7 @@ mod tests {
     const HOST: Asker = Asker { may_decrypt: true, addressed: ORIGINAL, dns_client: false };
     const GUEST: Asker = Asker { may_decrypt: false, addressed: ORIGINAL, dns_client: false };
     /// The DNS Client service, captured: it asks the adapter's own server.
-    const CAPTURED: Asker = Asker { may_decrypt: true, addressed: IpAddr::V4(TUN_DNS), dns_client: true };
+    const CAPTURED: Asker = Asker { may_decrypt: true, addressed: TUN_DNS, dns_client: true };
 
     struct Bed {
         service: Arc<Service>,
@@ -912,7 +912,7 @@ mod tests {
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let router = Plain::start(answering(), answering()).await;
         let b = bed(&ca, &[doh.url()], None, connector_with(&router));
-        let captured = Asker { addressed: IpAddr::V4(TUN_DNS), ..HOST };
+        let captured = Asker { addressed: TUN_DNS, ..HOST };
         b.service.set_mode(Mode::Plain);
         let answered = b.ask_as(&client_query(9, "www.example"), Transport::Datagram, captured).await;
         assert_eq!((rcode(&answered.reply), answered.resolved), (0, true));

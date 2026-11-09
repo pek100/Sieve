@@ -107,9 +107,9 @@ describe("engine network law", () => {
     const writes = code(files.flatMap((f) => hits(f, DNS_WRITES)));
     expect(writes.map((h) => h.split(":")[0])).toEqual(writes.map(() => APPLY));
     expect(code(hits(APPLY, /SetInterfaceDnsSettings\(/))).toHaveLength(1);
-    const body = read(APPLY).match(/pub fn set_adapter_dns\(server: Option<std::net::Ipv4Addr>\)[^{]*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+    const body = read(APPLY).match(/pub fn set_adapter_dns\(server: Option<IpAddr>\)[^{]*\{([\s\S]*?)\n\}/)?.[1] ?? "";
     expect(body).toContain("SetInterfaceDnsSettings(GUID::from_u128(ADAPTER_GUID), &settings)");
-    expect(body).toContain("Flags: u64::from(DNS_SETTING_NAMESERVER | DNS_SETTING_REGISTRATION_ENABLED)");
+    expect(body).toContain("Flags: u64::from(DNS_SETTING_NAMESERVER | DNS_SETTING_REGISTRATION_ENABLED | family)");
     expect(body).toContain("RegistrationEnabled: 0");
   });
 
