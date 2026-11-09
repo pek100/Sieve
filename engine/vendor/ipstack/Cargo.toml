@@ -28,7 +28,9 @@
 # its request never got the answer. Now the end is read after the bytes, at once; a
 # FIN with data or ahead of a gap is handled in order; and after the app's FIN ours
 # waits for the engine's shutdown (or the stream's drop). Law: sieve-engine
-# `stack::tcp_send_tests`, the app's end.
+# `stack::tcp_send_tests`, the app's end. The reader looks at the queue again once it
+# sees the end, for bytes that came with the FIN while it looked. The idle limit
+# (`TcpConfig::timeout`, 60 s here) is the engine's to set: `stack::relay::TCP_IDLE`.
 #
 # The criterion benchmark in `packet.rs` builds only under `--cfg ipstack_bench`, so
 # `cargo test --manifest-path engine/vendor/ipstack/Cargo.toml --lib` runs the crate's

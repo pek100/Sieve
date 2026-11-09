@@ -305,8 +305,30 @@ impl IpStackTcpStream {
     }
 }
 
-impl AsyncRead for IpStackTcpStream {
-    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+impl IpStackTcpStream {
+    /// The app's next queued bytes, or its end once nothing more can come; None while
+    /// nothing is queued.
+    fn take_queued(&mut self, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Option<Poll<std::io::Result<()>>> {
+        match self.data_rx.poll_recv(cx) {
+            Poll::Ready(Some(data)) => {
+                self.reset_timeout();
+                let capacity = buf.remaining();
+                if capacity >= data.len() {
+                    buf.put_slice(&data);
+                } else {
+                    // if `buf` is not enough, put the remaining data into the temp buffer
+                    buf.put_slice(&data[..capacity]);
+                    self.temp_read_buffer.extend_from_slice(&data[capacity..]);
+                }
+                Some(Poll::Ready(Ok(())))
+            }
+            Poll::Ready(None) => Some(Poll::Ready(Ok(()))),
+            Poll::Pending => None,
+        }
+    }
+}
+
+impl AsyncRead for IpStackTcpStream {    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         // if there is data in the temp buffer, read it first
         if !self.temp_read_buffer.is_empty() {
             let len = std::cmp::min(buf.remaining(), self.temp_read_buffer.len());
@@ -323,37 +345,28 @@ impl AsyncRead for IpStackTcpStream {
         // until its own timeout (60 s, or hyper's 30 s for a request head), so a client
         // that left right after the handshake looked to self-healing like one that idled
         // half a minute (slice 7 U1, run 7), and its server kept the connection as long.
-        match self.data_rx.poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                self.reset_timeout();
-                let capacity = buf.remaining();
-                if capacity >= data.len() {
-                    buf.put_slice(&data);
-                } else {
-                    // if `buf` is not enough, put the remaining data into the temp buffer
-                    buf.put_slice(&data[..capacity]);
-                    self.temp_read_buffer.extend_from_slice(&data[capacity..]);
-                }
-                return Poll::Ready(Ok(()));
-            }
-            Poll::Ready(None) => return Poll::Ready(Ok(())),
-            Poll::Pending => {}
+        if let Some(read) = self.take_queued(cx, buf) {
+            return read;
         }
         // Asked for before the state is read, so an end the TCP task records after the
         // read still wakes this reader.
         self.read_notify.lock().unwrap().replace(cx.waker().clone());
 
         let state = self.tcb.lock().unwrap().get_state();
+        // The app's FIN came in order, after every byte it sent; the TCP task queues those
+        // bytes before it records the end, under the lock the state was read with, so a
+        // second look finds any that came with the FIN.
+        let ended = matches!(state, TcpState::Closed | TcpState::CloseWait | TcpState::LastAck | TcpState::TimeWait);
+        if ended && let Some(read) = self.take_queued(cx, buf) {
+            return read;
+        }
         if state == TcpState::Closed {
             self.shutdown.lock().unwrap().ready();
             self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+        }
+        if ended {
             return Poll::Ready(Ok(()));
         }
-        // The app's FIN came in order, after every byte above: nothing more will.
-        if matches!(state, TcpState::CloseWait | TcpState::LastAck | TcpState::TimeWait) {
-            return Poll::Ready(Ok(()));
-        }
-
         // handle timeout
         if matches!(Pin::new(&mut self.timeout).poll(cx), Poll::Ready(_)) {
             {

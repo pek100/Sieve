@@ -346,11 +346,16 @@ const END_HEARD: Duration = Duration::from_secs(5);
 /// One accepted flow whose app-side stream the test reads: the handshake done, and
 /// the stack's next sequence number.
 async fn reading_bed(flow: (&str, &str)) -> (mpsc::UnboundedSender<Vec<u8>>, mpsc::UnboundedReceiver<Vec<u8>>, IpStack, IpStackTcpStream, SocketAddr, SocketAddr, u32) {
+    reading_bed_with(flow, super::relay::tcp_config()).await
+}
+
+#[allow(clippy::type_complexity)]
+async fn reading_bed_with(flow: (&str, &str), tcp_config: TcpConfig) -> (mpsc::UnboundedSender<Vec<u8>>, mpsc::UnboundedReceiver<Vec<u8>>, IpStack, IpStackTcpStream, SocketAddr, SocketAddr, u32) {
     let (local, remote): (SocketAddr, SocketAddr) = (flow.0.parse().unwrap(), flow.1.parse().unwrap());
     let (to_stack, rx) = mpsc::unbounded_channel();
     let (tx, mut from_stack) = mpsc::unbounded_channel();
     let mut config = IpStackConfig::default();
-    config.mtu(ENGINE_MTU).unwrap();
+    config.mtu(ENGINE_MTU).unwrap().with_tcp_config(tcp_config);
     let mut stack = IpStack::new(config, MemDevice { rx, tx });
     to_stack.send(segment(local, remote, CLIENT_ISN, Flags { syn: true, ..Flags::default() }, &[])).unwrap();
     let Ok(IpStackStream::Tcp(app)) = stack.accept().await else { panic!("no TCP stream") };
@@ -485,5 +490,48 @@ async fn a_half_closed_app_still_gets_the_answer_then_the_fin() {
         assert_eq!(answer, ANSWER, "{flow:?}: the answer reached the half-closed app");
         assert!(fin, "{flow:?}: and the FIN followed the engine's shutdown");
         assert_eq!(tokio::time::timeout(RECOVERY, engine).await.expect("the engine side ended").unwrap(), REQUEST, "{flow:?}");
+    }
+}
+// ---- An idle connection (2026-11-09, run 7): TCP has no idle limit, the stack's is hours.
+
+/// The engine's stack keeps an idle connection for Windows' keep-alive time, not
+/// ipstack's minute, and the stack it builds is given that setting.
+#[test]
+fn the_engines_idle_limit_is_hours_not_a_minute() {
+    assert_eq!(super::relay::tcp_config().timeout, super::relay::TCP_IDLE);
+    assert!(super::relay::TCP_IDLE >= Duration::from_secs(2 * 60 * 60));
+    assert!(TcpConfig::default().timeout <= Duration::from_secs(60), "the control: ipstack's own is a minute");
+    let routing = include_str!("../control/routing.rs");
+    assert!(routing.contains("config.with_tcp_config(crate::stack::relay::tcp_config());"), "the routed stack is built with it");
+}
+
+/// What the limit does: a connection neither side used for that long is reset, the
+/// reader told so. With ipstack's minute an idle WebSocket died 60 s in (run 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_connection_lives_until_the_limit_then_is_reset() {
+    const SHORT_IDLE: Duration = Duration::from_millis(400);
+    for flow in FLOWS {
+        let mut short = super::relay::tcp_config();
+        short.timeout = SHORT_IDLE;
+        let (_to_stack, mut from_stack, _stack, app, _local, _remote, _) = reading_bed_with(flow, short).await;
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut app = app;
+            let mut byte = [0u8; 1];
+            app.read(&mut byte).await
+        });
+        tokio::time::sleep(SHORT_IDLE / 2).await;
+        assert!(!reader.is_finished(), "{flow:?}: alive inside the limit");
+        let got = tokio::time::timeout(RECOVERY, reader).await.expect("reset at the limit").unwrap();
+        assert_eq!(got.unwrap_err().kind(), std::io::ErrorKind::TimedOut, "{flow:?}");
+        let deadline = Instant::now() + RECOVERY;
+        let mut rst = false;
+        while let Ok(Some(packet)) = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), from_stack.recv()).await {
+            if tcp(&packet).0.rst {
+                rst = true;
+                break;
+            }
+        }
+        assert!(rst, "{flow:?}: and the app's side reset");
     }
 }

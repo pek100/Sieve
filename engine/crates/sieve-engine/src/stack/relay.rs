@@ -57,6 +57,20 @@ use crate::watchdog::monotonic_ms;
 pub const FIRST_BYTES_WAIT: Duration = Duration::from_secs(5);
 /// A UDP flow idle this long ends (ipstack's own UDP timeout is the same).
 pub const UDP_IDLE: Duration = Duration::from_secs(30);
+/// A TCP flow neither side used for this long is reset by the stack: Windows' own
+/// keep-alive time, the longest an idle connection goes unprobed. TCP itself has no
+/// idle limit; the stack's is only for a connection whose app vanished without a FIN
+/// or a RST. ipstack's default of 60 s reset every idle connection a minute in (VM
+/// run 7: a WebSocket silent for 2 minutes died at 1.00 with Sieve on, lived with it
+/// off), which an idle SSH session, a database pool or a long poll does not survive.
+pub const TCP_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// The stack's TCP settings: ipstack's, with [`TCP_IDLE`].
+pub fn tcp_config() -> ipstack::TcpConfig {
+    let mut config = ipstack::TcpConfig::default();
+    config.timeout = TCP_IDLE;
+    config
+}
 const DATAGRAM: usize = 65_535;
 
 type ExeLookup = fn(u32) -> Option<String>;
