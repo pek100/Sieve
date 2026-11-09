@@ -93,6 +93,11 @@ mod proxy {
             self.total.fetch_add(self.written, Ordering::Relaxed);
         }
     }
+    impl sieve_engine::flow::relay::Reset for Counted<'_> {
+        fn reset(&self) {
+            self.stream.reset();
+        }
+    }
     impl AsyncRead for Counted<'_> {
         fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
             Pin::new(&mut self.stream).poll_read(cx, buf)

@@ -2,6 +2,7 @@
 //! can close it after any path gave it away, and counted in one place;
 //! [`Prefixed`] replays what the classifier held; [`splice`] is the pass-through.
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +11,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use crate::flow::relay::{APP_SHUTDOWN_BOUND, Reset};
 
 /// How long a FIN to the app may take (`stack::relay::close_app`'s bound).
 const CLOSE_BOUND: Duration = Duration::from_secs(1);
@@ -32,17 +35,21 @@ pub trait Abort {
 pub struct AppSide<A> {
     inner: Arc<Mutex<A>>,
     meter: Arc<Meter>,
+    /// When this clone's shutdown stops being waited for ([`APP_SHUTDOWN_BOUND`]): a
+    /// copy or a TLS session shuts the app side when the server's ended, and the flow
+    /// must not wait on it for ever (P1-2 of the second review of run 7).
+    shutdown_by: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<A> Clone for AppSide<A> {
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone(), meter: self.meter.clone() }
+        Self { inner: self.inner.clone(), meter: self.meter.clone(), shutdown_by: None }
     }
 }
 
 impl<A: AsyncRead + AsyncWrite + Unpin> AppSide<A> {
     pub fn new(app: A) -> Self {
-        Self { inner: Arc::new(Mutex::new(app)), meter: Arc::default() }
+        Self { inner: Arc::new(Mutex::new(app)), meter: Arc::default(), shutdown_by: None }
     }
 
     fn app(&self) -> std::sync::MutexGuard<'_, A> {
@@ -90,8 +97,24 @@ impl<A: AsyncRead + AsyncWrite + Unpin> AsyncWrite for AppSide<A> {
         Pin::new(&mut *self.app()).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.app()).poll_shutdown(cx)
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if Pin::new(&mut *self.app()).poll_shutdown(cx).is_ready() {
+            self.shutdown_by = None;
+            return Poll::Ready(Ok(()));
+        }
+        // Past the bound the stack still sends the FIN, or resets, by itself.
+        let by = self.shutdown_by.get_or_insert_with(|| Box::pin(tokio::time::sleep(APP_SHUTDOWN_BOUND)));
+        if by.as_mut().poll(cx).is_ready() {
+            self.shutdown_by = None;
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    }
+}
+
+impl<A: Abort> Abort for AppSide<A> {
+    fn abort(&self) {
+        AppSide::abort(self);
     }
 }
 
@@ -136,16 +159,20 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 }
 
 /// The pass-through: the held bytes, in order and once, then both directions
-/// to the end, half-closes passed on. True when the held bytes reached it.
+/// to the end, half-closes passed on. True when the held bytes reached it. A copy
+/// that ends with an error (the app's reset among them) resets upstream rather than
+/// closing it, so a cut-short upload does not look complete (`flow::relay`).
 pub async fn splice<A, U>(app: &mut A, mut upstream: U, held: &[u8]) -> bool
 where
     A: AsyncRead + AsyncWrite + Unpin,
-    U: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Reset + Unpin,
 {
     if upstream.write_all(held).await.is_err() {
         return false;
     }
-    let _ = tokio::io::copy_bidirectional(app, &mut upstream).await;
+    if tokio::io::copy_bidirectional(app, &mut upstream).await.is_err() {
+        upstream.reset();
+    }
     true
 }
 

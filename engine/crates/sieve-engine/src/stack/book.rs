@@ -18,9 +18,31 @@ use sieve_ipc::{AppIssues, FlowAction, FlowEvent, Forwarded, Guest, LOG_RULE_MAX
 use crate::domain::{Decision, Reason};
 use crate::issues::{AppId, Issues};
 
-/// The flows the engine holds at most (plan 6, flow caps): past it a new
-/// flow is closed at once and counted.
+/// The flows the engine holds at most (plan 6, flow caps): past it the flow idle
+/// longest is ended to make room ([`Idle`]), and a new flow is closed at once only
+/// when none is idle.
 pub const MAX_FLOWS: usize = 10_000;
+/// A flow whose app sent nothing this long is idle: the time the engine ends a
+/// silent UDP flow at (`stack::relay::UDP_IDLE`). An idle TCP connection otherwise
+/// lives two hours (`stack::relay::TCP_IDLE`).
+pub const IDLE_FOR_EVICTION: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the book can ask of an open flow's connection at the cap: how long its app
+/// has been silent, and to end it (its relay then closes it here as usual).
+pub trait Idle: Send {
+    fn idle(&self) -> std::time::Duration;
+    fn evict(&self);
+}
+
+impl Idle for ipstack::IpStackTcpHandle {
+    fn idle(&self) -> std::time::Duration {
+        ipstack::IpStackTcpHandle::idle(self)
+    }
+    /// A reset: the app reconnects if it still wants the connection.
+    fn evict(&self) {
+        self.abort();
+    }
+}
 /// Log rows held between two batches at most; a burst past it loses the excess,
 /// never a flow, and the row ids count through the loss, so it shows as a gap.
 /// Rows are per flow, so this takes about 16,000 new flows a second; the number
@@ -85,7 +107,6 @@ struct Owned {
     named: bool,
 }
 
-#[derive(Debug)]
 pub struct FlowBook {
     /// The wall clock, in ms (S15): what problems and their rows are dated by.
     clock: fn() -> u64,
@@ -107,6 +128,19 @@ pub struct FlowBook {
     /// started, by list id: what a live check can read of the rules without a log on
     /// disk (plan 7.1).
     list_hits: BTreeMap<String, u64>,
+    /// The connections of open flows that can be ended to make room, by id.
+    idle: HashMap<u64, Box<dyn Idle>>,
+    /// Flows ended to make room whose relay has not closed them yet: they hold no
+    /// place under the cap.
+    evicting: BTreeSet<u64>,
+    /// Flows ended to make room since the engine started.
+    evicted: u64,
+}
+
+impl std::fmt::Debug for FlowBook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlowBook").field("open", &self.open.len()).field("evicting", &self.evicting.len()).field("evicted", &self.evicted).finish_non_exhaustive()
+    }
 }
 
 impl Default for FlowBook {
@@ -129,6 +163,9 @@ impl FlowBook {
             next_log_id: 0,
             log: Vec::new(),
             list_hits: BTreeMap::new(),
+            idle: HashMap::new(),
+            evicting: BTreeSet::new(),
+            evicted: 0,
         }
     }
 
@@ -211,9 +248,14 @@ impl FlowBook {
         rows
     }
 
-    /// Registers a new flow (its `id` is set here); None at the cap.
-    pub fn open(&mut self, mut event: FlowEvent) -> Option<u64> {
-        if self.open.len() >= MAX_FLOWS {
+    /// Registers a new flow (its `id` is set here); None at the cap with no flow idle.
+    pub fn open(&mut self, event: FlowEvent) -> Option<u64> {
+        self.open_with(event, None)
+    }
+
+    /// [`Self::open`] for a flow whose connection can be ended to make room later.
+    pub fn open_with(&mut self, mut event: FlowEvent, idle: Option<Box<dyn Idle>>) -> Option<u64> {
+        if self.open.len() - self.evicting.len() >= MAX_FLOWS && !self.evict_one() {
             return None;
         }
         if let Some(forwarded) = &event.forwarded {
@@ -226,7 +268,29 @@ impl FlowBook {
         event.open = true;
         self.changed.insert(event.id);
         self.open.insert(event.id, event);
+        if let Some(idle) = idle {
+            self.idle.insert(self.next_id, idle);
+        }
         Some(self.next_id)
+    }
+
+    /// Ends the flow idle longest, if one is idle at all ([`IDLE_FOR_EVICTION`]).
+    /// Its place is free at once; its relay closes it as usual.
+    fn evict_one(&mut self) -> bool {
+        let Some((id, _)) = self.idle.iter().map(|(&id, c)| (id, c.idle())).filter(|(_, idle)| *idle >= IDLE_FOR_EVICTION).max_by_key(|&(_, idle)| idle) else {
+            return false;
+        };
+        if let Some(connection) = self.idle.remove(&id) {
+            connection.evict();
+        }
+        self.evicting.insert(id);
+        self.evicted += 1;
+        true
+    }
+
+    /// Flows ended to make room since the engine started.
+    pub fn evicted(&self) -> u64 {
+        self.evicted
     }
 
     /// Fills in what the first bytes said (kind, host) once decided.
@@ -312,6 +376,8 @@ impl FlowBook {
     /// The flow ended with these totals. What no task named is named here: a
     /// block is the rule's, a failure with no other word is a lost connection.
     pub fn close(&mut self, id: u64, action: FlowAction, bytes_up: u64, bytes_down: u64) {
+        self.idle.remove(&id);
+        self.evicting.remove(&id);
         if self.owners.get(&id).is_some_and(|o| !o.named) {
             match action {
                 FlowAction::Blocked => self.problem(id, Signal::Blocked),
@@ -699,6 +765,56 @@ mod tests {
             assert!(b.open(event(Some(1))).is_some());
         }
         assert!(b.open(event(Some(1))).is_none());
+    }
+
+    /// A connection the test sets the idle time of, and that records its eviction.
+    struct Conn {
+        idle: std::time::Duration,
+        evicted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Idle for Conn {
+        fn idle(&self) -> std::time::Duration {
+            self.idle
+        }
+        fn evict(&self) {
+            self.evicted.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn conn(idle_s: u64) -> (Box<dyn Idle>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let evicted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (Box::new(Conn { idle: std::time::Duration::from_secs(idle_s), evicted: evicted.clone() }), evicted)
+    }
+
+    /// P3 (second review of run 7): at the cap a new flow is not refused while an idle
+    /// one is open: the one idle longest is ended to make room, once.
+    #[test]
+    fn at_the_cap_the_longest_idle_flow_makes_room() {
+        let mut b = FlowBook::default();
+        let mut flags = Vec::new();
+        for i in 0..MAX_FLOWS {
+            // Idle 0 s to 9 s, and three flows past the eviction idle.
+            let idle_s = match i { 10 => 40, 20 => 300, 30 => 35, _ => u64::try_from(i % 10).unwrap() };
+            let (c, evicted) = conn(idle_s);
+            flags.push(evicted);
+            b.open_with(event(Some(1)), Some(c)).unwrap();
+        }
+        let ids: Vec<u64> = (1..=u64::try_from(MAX_FLOWS).unwrap()).collect();
+        assert!(b.open(event(Some(1))).is_some(), "refused with idle flows open");
+        let evicted: Vec<usize> = flags.iter().enumerate().filter(|(_, f)| f.load(std::sync::atomic::Ordering::SeqCst)).map(|(i, _)| i).collect();
+        assert_eq!(evicted, [20], "the one idle longest");
+        assert!(b.open(event(Some(1))).is_some());
+        assert!(b.open(event(Some(1))).is_some());
+        let evicted = flags.iter().filter(|f| f.load(std::sync::atomic::Ordering::SeqCst)).count();
+        assert_eq!((evicted, b.evicted()), (3, 3));
+        // No flow idle any more: a new one is refused, as before.
+        assert!(b.open(event(Some(1))).is_none(), "the control: busy flows are not ended");
+        // An evicted flow's relay closes it; that frees no second place.
+        b.close(ids[20], FlowAction::Relayed, 0, 0);
+        assert!(b.open(event(Some(1))).is_none());
+        b.close(ids[0], FlowAction::Relayed, 0, 0);
+        assert!(b.open(event(Some(1))).is_some(), "a closed flow frees its place");
     }
 
     #[test]

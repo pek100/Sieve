@@ -55,6 +55,12 @@ impl<S> Watched<S> {
     }
 }
 
+impl<S: crate::flow::relay::Reset> crate::flow::relay::Reset for Watched<S> {
+    fn reset(&self) {
+        self.inner.reset();
+    }
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let before = buf.filled().len();

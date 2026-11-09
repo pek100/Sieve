@@ -44,7 +44,7 @@ use crate::domain::{FilterSlot, Owner};
 use crate::exclusions::{AutoEntry, ExclusionSlot};
 use crate::flow::classify::{Decoded, Kind};
 use crate::flow::flows::Action;
-use crate::flow::relay::relay_tcp;
+use crate::flow::relay::{Reset, relay_tcp};
 use crate::http::hook::ResponseHook;
 use crate::http::serve::{Ended, Proto, Serve, serve};
 use crate::stack::Meters;
@@ -69,7 +69,7 @@ pub type DialFuture<'a, S> = Pin<Box<dyn Future<Output = Result<S, String>> + Se
 /// production (pinned outside Sieve's routes), an in-memory or loopback one in
 /// tests. The only way this path opens a socket.
 pub trait Dial: Send + Sync + 'static {
-    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+    type Stream: AsyncRead + AsyncWrite + Reset + Unpin + Send + 'static;
     fn dial(&self, target: SocketAddr) -> DialFuture<'_, Self::Stream>;
 }
 
@@ -409,7 +409,7 @@ where
 
 async fn drive<A, C>(deps: &Interception<C>, mut app: AppSide<A>, mut upstream: C::Stream, flow: &FlowMeta<'_>) -> FlowAction
 where
-    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A: AsyncRead + AsyncWrite + Abort + Unpin + Send + 'static,
     C: Dial,
 {
     let (decoded, held) = match read_first(&mut app, &mut upstream, Waits::both(FIRST_BYTES_WAIT)).await {
@@ -510,14 +510,19 @@ where
 /// only splice, on the offline-tested relay, which still asks the decision.
 async fn server_first<A, U>(mut app: AppSide<A>, upstream: U, server: Vec<u8>, held: Vec<u8>, flow: &FlowMeta<'_>) -> FlowAction
 where
-    A: AsyncRead + AsyncWrite + Unpin,
-    U: AsyncRead + AsyncWrite + Unpin,
+    A: AsyncRead + AsyncWrite + Abort + Unpin,
+    U: AsyncRead + AsyncWrite + Reset + Unpin,
 {
     if app.write_all(&server).await.is_err() {
         return FlowAction::Failed;
     }
+    let side = app.clone();
     let mut replayed = Prefixed::new(held, app);
     let out = relay_tcp(&mut replayed, upstream, FIRST_BYTES_WAIT, |d| (flow.decide)(d)).await;
+    // The server's side broke: the app hears a reset, not the FIN of a complete answer.
+    if out.reset_app {
+        side.abort();
+    }
     match (out.dropped, out.upstream_write_failed) {
         (true, _) => FlowAction::Blocked,
         (_, true) => FlowAction::Failed,
@@ -605,7 +610,7 @@ where
 async fn run_protocol<C, U>(ctx: Arc<Serve>, mut client: C, mut upstream: U, alpn: Option<&[u8]>) -> Ended
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    U: AsyncRead + AsyncWrite + Reset + Unpin + Send + 'static,
 {
     match alpn {
         Some(H2) => serve(ctx, client, upstream, Proto::H2).await,

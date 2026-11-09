@@ -400,6 +400,33 @@ async fn a_client_that_missed_server_bytes_still_gets_a_reset_it_accepts() {
     }
 }
 
+/// P3 (second review of run 7): the app resets its connection halfway through an
+/// upload. The server must see a reset, not the end of the stream: a FIN there ends
+/// the upload as if it were complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_apps_reset_reaches_the_server_as_a_reset() {
+    for flow in FLOWS {
+        for reset in [true, false] {
+            let mut bed = TcpBed::new(flow).await;
+            let head = format!("POST /upload HTTP/1.1\r\nHost: {ALLOWED}\r\nContent-Length: 100000\r\n\r\n").into_bytes();
+            bed.send(&head);
+            let mut got = vec![0u8; head.len()];
+            ended(bed.server.read_exact(&mut got)).await.unwrap();
+            let (seq, ack) = (bed.client_next, bed.server_next);
+            let flags = if reset { Flags { rst: true, ack: Some(ack), ..Flags::default() } } else { Flags { fin: true, ack: Some(ack), ..Flags::default() } };
+            bed.wire.to_stack.send(segment(bed.local, bed.remote, seq, flags, &[])).unwrap();
+            let mut rest = Vec::new();
+            let read = ended(bed.server.read_to_end(&mut rest)).await;
+            if reset {
+                assert_eq!(read.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset), "{flow:?}: the server took the cut-short upload as complete");
+            } else {
+                assert_eq!(read.map_err(|e| e.kind()), Ok(0), "{flow:?}: the control, the app's FIN is the server's end");
+            }
+            bed.task.abort();
+        }
+    }
+}
+
 /// The control: a flow no rule blocks still ends with a FIN when its server does.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_passed_flow_still_closes_with_a_fin() {

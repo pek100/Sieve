@@ -57,12 +57,14 @@ use crate::watchdog::monotonic_ms;
 pub const FIRST_BYTES_WAIT: Duration = Duration::from_secs(5);
 /// A UDP flow idle this long ends (ipstack's own UDP timeout is the same).
 pub const UDP_IDLE: Duration = Duration::from_secs(30);
-/// A TCP flow neither side used for this long is reset by the stack: Windows' own
-/// keep-alive time, the longest an idle connection goes unprobed. TCP itself has no
-/// idle limit; the stack's is only for a connection whose app vanished without a FIN
-/// or a RST. ipstack's default of 60 s reset every idle connection a minute in (VM
-/// run 7: a WebSocket silent for 2 minutes died at 1.00 with Sieve on, lived with it
-/// off), which an idle SSH session, a database pool or a long poll does not survive.
+/// A TCP flow whose app sent no valid segment for this long is reset by the stack:
+/// Windows' own keep-alive time, the longest an idle connection goes unprobed, and a
+/// keep-alive probe counts as use, so an app that relies on them is never reset. TCP
+/// itself has no idle limit; the stack's is only for a connection whose app vanished
+/// without a FIN or a RST. ipstack's default of 60 s reset every idle connection a
+/// minute in (VM run 7: a WebSocket silent for 2 minutes died at 1.00 with Sieve on,
+/// lived with it off), which an idle SSH session, a database pool or a long poll does
+/// not survive.
 pub const TCP_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// The stack's TCP settings: ipstack's, with [`TCP_IDLE`].
@@ -244,6 +246,11 @@ impl Relay {
     /// Counts the flow and registers it in the book; None when it is the
     /// engine's own (refused) or the book is full.
     pub(super) fn admit(&self, flow: &FiveTuple, attributed: &Attributed, proto: FlowProto, kind: FlowKind) -> Option<Admitted> {
+        self.admit_with(flow, attributed, proto, kind, None)
+    }
+
+    /// [Self::admit] for a flow the book may end to make room at its cap.
+    pub(super) fn admit_with(&self, flow: &FiveTuple, attributed: &Attributed, proto: FlowProto, kind: FlowKind, idle: Option<Box<dyn super::book::Idle>>) -> Option<Admitted> {
         if attributed.own {
             Meters::bump(&self.meters.own_refused);
             return None;
@@ -275,7 +282,7 @@ impl Relay {
             forwarded,
         };
         let mut book = lock(&self.book);
-        let id = book.open(event)?;
+        let id = book.open_with(event, idle)?;
         let owner = attribution.row_owner(app, &book);
         book.own(id, owner.row_key());
         Some(Admitted { id, owner })
@@ -319,7 +326,7 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
     if guard_tcp(attributed.own, flow.remote.port()) == Guard::RelayOwn {
         return relay_own(app, connected.result).await;
     }
-    let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Tcp, FlowKind::Other) else { return close_app(&mut app).await };
+    let Some(admitted) = ctx.admit_with(&flow, &attributed, FlowProto::Tcp, FlowKind::Other, Some(Box::new(app.handle()))) else { return close_app(&mut app).await };
     if let Some(how) = connected.retry() {
         lock(&ctx.book).retried(admitted.id, how, connected.result.is_ok());
     }
@@ -386,6 +393,10 @@ pub(super) async fn serve_admitted(ctx: Arc<Relay>, mut app: IpStackTcpStream, f
     };
     #[cfg(not(feature = "relay-experiments"))]
     let out = relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, decide).await;
+    // The server's side broke: the app hears a reset, not the FIN of a complete answer.
+    if out.reset_app {
+        app.abort();
+    }
     if out.dropped {
         close_blocked(&ctx.book, &ctx.meters, admitted.id);
         app.abort();

@@ -254,6 +254,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Recording<S> {
 // ---- The upstream: scripted, on either transport.
 
 pub(crate) type BoxStream = Box<dyn IoStream>;
+
+/// The test pipes have no reset: their far end sees the end of the stream.
+impl crate::flow::relay::Reset for BoxStream {
+    fn reset(&self) {}
+}
 pub(crate) type Handler = Arc<dyn Fn(usize, BoxStream) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// The recording connector: every socket a path opens comes from here.

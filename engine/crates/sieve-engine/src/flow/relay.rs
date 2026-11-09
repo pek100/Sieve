@@ -14,7 +14,11 @@
 //!    nothing is sent upstream.
 //!
 //! The caller closes the app side when [`Outcome::stop`] is true, and resets it
-//! first when [`Outcome::dropped`] is.
+//! first when [`Outcome::dropped`] or [`Outcome::reset_app`] is.
+//!
+//! A side that ends with an error (a reset, the stack's idle limit) is passed on as
+//! a reset, never as a FIN: an upload or a close-delimited download cut short must
+//! not look complete to the other end.
 
 use std::time::Duration;
 
@@ -22,6 +26,39 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::flow::classify::{Decoded, TcpClassifier};
 use crate::flow::flows::Action;
+
+/// The longest the app side's shutdown is waited for once the server's side ended.
+/// The stack sends the FIN once every byte before it is acknowledged, which takes at
+/// most until its retransmissions give up (1 + 2 + 4 + 8 s at ipstack's 1 s RTO), or
+/// for ever into a window the app keeps closed; past this the flow ends without
+/// waiting, and the stack still sends the FIN or resets the connection by itself.
+pub const APP_SHUTDOWN_BOUND: Duration = Duration::from_secs(30);
+
+/// An upstream connection that can be ended with a reset rather than a FIN.
+pub trait Reset {
+    /// Makes the connection's close a reset: dropping it then sends a RST.
+    fn reset(&self);
+}
+
+impl Reset for tokio::net::TcpStream {
+    fn reset(&self) {
+        // A zero linger makes the close abortive (a RST), on Windows as elsewhere. If
+        // the socket refuses it, the close is the FIN it was before.
+        let _ = socket2::SockRef::from(self).set_linger(Some(Duration::ZERO));
+    }
+}
+
+impl<S: Reset> Reset for tokio_rustls::client::TlsStream<S> {
+    fn reset(&self) {
+        self.get_ref().0.reset();
+    }
+}
+
+/// An in-memory pipe has no reset: its far end sees the end of the stream.
+#[cfg(test)]
+impl Reset for tokio::io::DuplexStream {
+    fn reset(&self) {}
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outcome {
@@ -38,6 +75,44 @@ pub struct Outcome {
     pub bytes_down: u64,
     /// The upstream write of the held bytes failed.
     pub upstream_write_failed: bool,
+    /// The app's side ended with an error, or the upload into upstream failed: the
+    /// upstream connection was reset, not closed.
+    pub reset_upstream: bool,
+    /// The server's side ended with an error: the app gets no FIN, and the caller
+    /// resets its side.
+    pub reset_app: bool,
+}
+
+/// The server's bytes to the app; an upstream that ended with an error is not passed
+/// on as the end. Bytes written, and whether it ended so.
+async fn server_to_app<R, W>(up_read: &mut R, app_write: &mut W) -> (u64, bool)
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    match tokio::io::copy(up_read, app_write).await {
+        Ok(n) => {
+            let _ = tokio::time::timeout(APP_SHUTDOWN_BOUND, app_write.shutdown()).await;
+            (n, false)
+        }
+        Err(_) => (0, true),
+    }
+}
+
+/// The app's bytes into upstream after the held ones; an app side that ended with an
+/// error is not passed on as the end. Bytes written, and whether it ended so.
+async fn app_to_server<R, W>(app_read: &mut R, up_write: &mut W) -> (u64, bool)
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    match tokio::io::copy(app_read, up_write).await {
+        Ok(n) => {
+            let _ = up_write.shutdown().await;
+            (n, false)
+        }
+        Err(_) => (0, true),
+    }
 }
 
 /// The read buffer the classifier phase uses. It only has to cover the
@@ -53,16 +128,26 @@ pub async fn relay_tcp<A, U>(
 ) -> Outcome
 where
     A: AsyncRead + AsyncWrite + Unpin,
-    U: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Reset + Unpin,
 {
     let (mut up_read, mut up_write) = tokio::io::split(upstream);
+    let out = relay_halves(app, &mut up_read, &mut up_write, first_bytes_wait, decide).await;
+    if out.reset_upstream {
+        up_read.unsplit(up_write).reset();
+    }
+    out
+}
+
+/// [`relay_tcp`] with the upstream split, so it can be reset once both directions end.
+async fn relay_halves<A, R, W>(app: &mut A, up_read: &mut R, up_write: &mut W, first_bytes_wait: Duration, decide: impl FnOnce(&Decoded) -> Action) -> Outcome
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let (mut app_read, mut app_write) = tokio::io::split(app);
 
-    let server_to_app = async {
-        let n = tokio::io::copy(&mut up_read, &mut app_write).await.unwrap_or(0);
-        let _ = app_write.shutdown().await;
-        n
-    };
+    let server_to_app = server_to_app(up_read, &mut app_write);
     let client_to_server = async {
         let mut out = Outcome::default();
         let mut classifier = TcpClassifier::new();
@@ -99,19 +184,25 @@ where
             out.stop = true;
             return out;
         }
-        out.bytes_up = (held.len() + tail.len()) as u64 + tokio::io::copy(&mut app_read, &mut up_write).await.unwrap_or(0);
-        let _ = up_write.shutdown().await;
+        let (copied, broke) = app_to_server(&mut app_read, up_write).await;
+        out.bytes_up = (held.len() + tail.len()) as u64 + copied;
+        out.reset_upstream = broke;
         out
     };
     tokio::pin!(server_to_app, client_to_server);
+    // A side that broke ends the flow at once: the other direction is not waited
+    // for, as nothing it carries can reach a connection that is gone.
     tokio::select! {
         mut out = &mut client_to_server => {
-            if !out.stop {
-                out.bytes_down = server_to_app.await;
+            if !out.stop && !out.reset_upstream {
+                (out.bytes_down, out.reset_app) = server_to_app.await;
             }
             out
         }
-        down = &mut server_to_app => {
+        (down, broke) = &mut server_to_app => {
+            if broke {
+                return Outcome { reset_app: true, reset_upstream: true, stop: true, ..Outcome::default() };
+            }
             let mut out = client_to_server.await;
             out.bytes_down = down;
             out
@@ -131,16 +222,33 @@ pub async fn relay_tcp_buffered<A, U>(
 ) -> Outcome
 where
     A: AsyncRead + AsyncWrite + Unpin,
-    U: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Reset + Unpin,
 {
     let (up_read, mut up_write) = tokio::io::split(upstream);
-    let (mut app_read, mut app_write) = tokio::io::split(app);
-
     let mut up_read = tokio::io::BufReader::with_capacity(capacity, up_read);
+    let out = buffered_halves(app, &mut up_read, &mut up_write, first_bytes_wait, decide, capacity).await;
+    if out.reset_upstream {
+        up_read.into_inner().unsplit(up_write).reset();
+    }
+    out
+}
+
+#[cfg(feature = "relay-experiments")]
+async fn buffered_halves<A, R, W>(app: &mut A, up_read: &mut R, up_write: &mut W, first_bytes_wait: Duration, decide: impl FnOnce(&Decoded) -> Action, capacity: usize) -> Outcome
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (mut app_read, mut app_write) = tokio::io::split(app);
     let server_to_app = async {
-        let n = tokio::io::copy_buf(&mut up_read, &mut app_write).await.unwrap_or(0);
-        let _ = app_write.shutdown().await;
-        n
+        match tokio::io::copy_buf(up_read, &mut app_write).await {
+            Ok(n) => {
+                let _ = tokio::time::timeout(APP_SHUTDOWN_BOUND, app_write.shutdown()).await;
+                (n, false)
+            }
+            Err(_) => (0, true),
+        }
     };
     let client_to_server = async {
         let mut out = Outcome::default();
@@ -181,19 +289,29 @@ where
         }
         drop(buf);
         let mut app_read = tokio::io::BufReader::with_capacity(capacity, &mut app_read);
-        out.bytes_up = (held.len() + spill.len()) as u64 + tokio::io::copy_buf(&mut app_read, &mut up_write).await.unwrap_or(0);
-        let _ = up_write.shutdown().await;
+        match tokio::io::copy_buf(&mut app_read, up_write).await {
+            Ok(n) => {
+                out.bytes_up = (held.len() + spill.len()) as u64 + n;
+                let _ = up_write.shutdown().await;
+            }
+            Err(_) => out.reset_upstream = true,
+        }
         out
     };
     tokio::pin!(server_to_app, client_to_server);
+    // A side that broke ends the flow at once: the other direction is not waited
+    // for, as nothing it carries can reach a connection that is gone.
     tokio::select! {
         mut out = &mut client_to_server => {
-            if !out.stop {
-                out.bytes_down = server_to_app.await;
+            if !out.stop && !out.reset_upstream {
+                (out.bytes_down, out.reset_app) = server_to_app.await;
             }
             out
         }
-        down = &mut server_to_app => {
+        (down, broke) = &mut server_to_app => {
+            if broke {
+                return Outcome { reset_app: true, reset_upstream: true, stop: true, ..Outcome::default() };
+            }
             let mut out = client_to_server.await;
             out.bytes_down = down;
             out
@@ -206,6 +324,8 @@ mod tests {
     use super::*;
     use crate::flow::classify::Kind;
     use crate::flow::sni::build;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream};
 
     const WAIT: Duration = Duration::from_secs(2);
@@ -555,6 +675,117 @@ mod tests {
         let out = relay.await.unwrap();
         assert_eq!(out.decided.and_then(|d| d.failure), Some("not tls/quic/http"));
         assert_eq!(server.await.unwrap(), b"EHLO me\r\n");
+    }
+
+    /// An app end whose reads fail with a reset once its bytes are read, and whose
+    /// shutdown never completes when `stuck`.
+    struct App {
+        inner: DuplexStream,
+        reset_after: bool,
+        stuck: bool,
+    }
+
+    impl AsyncRead for App {
+        fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            if self.reset_after && matches!(polled, std::task::Poll::Ready(Ok(()))) && buf.filled().len() == before {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            polled
+        }
+    }
+
+    impl AsyncWrite for App {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, data: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
+        }
+        fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            if self.stuck {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// An upstream that records whether it was reset or shut down.
+    struct Upstream {
+        inner: DuplexStream,
+        reset: Arc<AtomicBool>,
+        shut: Arc<AtomicBool>,
+    }
+
+    impl Reset for Upstream {
+        fn reset(&self) {
+            self.reset.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AsyncRead for Upstream {
+        fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Upstream {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, data: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
+        }
+        fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            self.shut.store(true, Ordering::SeqCst);
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// P3 (second review of run 7): the app resets the connection halfway through an
+    /// upload. Upstream must be reset, never sent a FIN: a FIN would end the upload
+    /// there as if it were complete.
+    #[tokio::test]
+    async fn an_app_reset_resets_upstream_and_sends_no_fin() {
+        for reset_after in [true, false] {
+            let (app_far, app_near) = tokio::io::duplex(PIPE_BYTES);
+            let (up_near, mut server) = tokio::io::duplex(PIPE_BYTES);
+            let (reset, shut) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let up = Upstream { inner: up_near, reset: reset.clone(), shut: shut.clone() };
+            let mut app = App { inner: app_near, reset_after, stuck: false };
+            let relay = tokio::spawn(async move { relay_tcp(&mut app, up, WAIT, |_| Action::Pass).await });
+            let mut app_far = app_far;
+            app_far.write_all(b"POST /upload HTTP/1.1\r\nHost: up.example\r\nContent-Length: 100000\r\n\r\nhalf").await.unwrap();
+            app_far.shutdown().await.unwrap();
+            let mut byte = [0u8; 1];
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                server.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            drop(server);
+            let out = tokio::time::timeout(WAIT, relay).await.expect("the relay ended").unwrap();
+            assert_eq!((out.reset_upstream, reset.load(Ordering::SeqCst)), (reset_after, reset_after), "reset after {reset_after}: {out:?}");
+            assert_eq!(shut.load(Ordering::SeqCst), !reset_after, "a FIN upstream only for a clean end");
+        }
+    }
+
+    /// P1-2 (second review of run 7): the app side's shutdown is bounded; a stack that
+    /// never completes it cannot hold the flow once both directions ended.
+    #[tokio::test(start_paused = true)]
+    async fn an_app_shutdown_that_never_completes_is_waited_for_a_bound() {
+        let (up, server) = upstream(|s| http_server(s, true)).await;
+        let (mut app_far, app_near) = tokio::io::duplex(PIPE_BYTES);
+        let mut app = App { inner: app_near, reset_after: false, stuck: true };
+        let relay = tokio::spawn(async move { relay_tcp(&mut app, up, WAIT, |_| Action::Pass).await });
+        app_far.write_all(REQUEST).await.unwrap();
+        app_far.shutdown().await.unwrap();
+        let _ = server.await.unwrap();
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(APP_SHUTDOWN_BOUND * 2, relay).await.expect("bounded").unwrap();
+        assert!(started.elapsed() >= APP_SHUTDOWN_BOUND - Duration::from_secs(1), "the control: it did wait for the shutdown");
+        assert!(!out.stop && !out.reset_upstream && !out.reset_app, "{out:?}");
     }
 
     #[tokio::test]
