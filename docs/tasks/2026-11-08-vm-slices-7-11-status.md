@@ -1,5 +1,32 @@
 # VM live run 2026-11-08: status at the stop
 
+## Run 6 (2026-11-09): the capture's compatibility fixes
+
+Branch `worktree-agent-a380fcbceca411e90` on main 3502855, fixes 9f07f15 (signed exchanges) and e2f5c53 (capability gate, backoff, neutral probe, full undo). Engine under test CB1D5B77 (release of e2f5c53); "before" is main 3502855 (4DC7B275). sieve-test-vm ran at n2-standard-2 beside a throwaway domain controller `sieve-test-dc` (e2-standard-2, Windows Server 2025, forest `sievead.test`, zone AD-integrated with secure-only updates, 10.128.0.3), with a temporary VPC rule letting 10.128.0.0/20 in. Runtime switches went through a VM-only pipe client in place of `sieve.exe` (Hello with or without capabilities, `set <field> <bool>`).
+
+Found first: Ethernet's IPv4 metric was 1 with the automatic metric off again, so the capture refused itself (tie). Set back to automatic, it was 1 again after each restart of the VM, the persistent store set to automatic too, so something on this VM image (not Sieve, which writes no other adapter) puts it back at boot; it was set to automatic after each restart before the checks.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Old app, new engine (item 2) | PASS | Status to a bare Hello: `dns_capture` absent; to a Hello naming `dns_capture`: `{"state":"working"}` |
+| Switch on, off, on at runtime (item 7) | PASS | on: 1 filter, server fd53::53, 10/10 lookups median 35 ms, **0** plain port-53 packets; off (status answered in 132 ms): 0 filters, server gone, IPv6 metric back to automatic (5), fd53:6965:7665:1::1 removed, link-local `SkipAsSource` false, 10/10 at 17 ms, 20 plain packets (as without the capture); on again: filter back in 1.6 s, working, 10/10 median 35 ms p90 253 ms, **0** plain packets |
+| Close undoes the adapter (item 5) | PASS | the off row above |
+| Does `SetIpInterfaceEntry` persist the metric? (item 5) | No | the NSI persistent store holds an IPv6 interface entry for Sieve's LUID from the moment the adapter comes up with routes, capture off (Windows' defaults: only zero bytes, no metric); opening the capture (metric 1 live) and closing it leave it byte for byte the same; a clean stop removes it. Tcpip6 key under Sieve's GUID: `NameServer` only, no metric. Nothing added to the cleanup |
+| Kill with the capture on | PASS, one leftover noted | 0 filters after the kill; Tcpip6 key with `NameServer=fd53:...::53` until the next start (as run 5); DNS 0.02 s, https 0.28 s. After kill, restart and clean stop, the NSI interface entries of Sieve's LUID (IPv4 and IPv6, Windows' defaults) stayed, where a clean stop alone removes them |
+| Three kills in an hour | as designed | the crash-loop blocker held routes down until the switch went off and on through the pipe |
+| Secure registration, Sieve off | registered | NIC: unsigned UPDATE Refused, TKEY over TCP answered (473 bytes), signed UPDATE (`[1au]`) NOERROR; no DNS Client error event |
+| Secure registration, main 3502855 | **FAILS** | the DNS Client sends its registration unbound, so it enters Sieve's adapter (the DC has a host route there): the unsigned UPDATE reached the DC through the engine and came back Refused, but the TKEY never reached the DC; the DNS Client got FormErr and ServFail back over TCP (the public resolver's answers); event 8016 "failed to register host (A or AAAA) records" |
+| Secure registration, the fix | registered | the same exchange as off, each message relayed by the engine from 10.128.0.2 to the DC: UPDATE Refused, TKEY over TCP answered (473 bytes) and relayed, signed UPDATE NOERROR and relayed; no DNS Client error event |
+| `DisabledComponents` 0xFF (reboot, report only) | not caught, network as without it | status `not_caught`, `ipv6_off` ("IPv6 is off on Sieve's adapter, and its DNS server is IPv6"), 0 filters; Sieve has IPv4 only; 10/10 fresh names (median 18 ms), 10/10 real names, curl https 0.53 s; 20 plain port-53 packets, as without the capture |
+| `DisabledComponents` 0x10 (reboot, report only) | the same | `ipv6_off`, 0 filters, 10/10 (median 18 ms), 10/10 real names, curl 0.38 s, 20 plain packets |
+| Capture on a domain-joined PC | not caught (fail-open) | with the DC as Ethernet's server the probe arrives but `DnsQuery_W` does not return within 1000 ms, every try; status `not_caught`, `failed`, lookups 5/5 at 24 ms as without the capture. Cause not looked into; the retries now back off from 15 s |
+
+The record-polling half of the registration script (deleting the A record on the DC and polling `Get-DnsServerResourceRecord` every 2 s for 7 minutes) saw no record in any arm, Sieve off included, while the wire showed the signed UPDATE answered NOERROR and the record was there when read later: that measurement is not used.
+
+VM time: sieve-test-vm 10:52 to 12:09 local (1.3 h), the DC 10:51 to 12:00 (1.2 h). State at the stop: the DC VM and its disk deleted, the temporary VPC rule deleted; sieve-test-vm left the domain (WORKGROUP), Ethernet's DNS reset to DHCP (10.128.0.1), TrustedHosts empty, the password file deleted, `DisabledComponents` removed, Ethernet's metric automatic (until the image puts it back at boot), the engine it had before (8BFE89A7) and the real `sieve.exe` (2D5046ED) back, policy `engine` false, no Sieve key in the registry, the run's scheduled tasks removed, machine type back to n2-standard-4, stopped. RSAT-DNS-Server stays installed.
+
+Open from this run: a corporate DNS server that is not on an adapter's on-link prefix is no LAN server by `upstream::is_lan_server` (private and inside a hole), so a TKEY or signed UPDATE to one is REFUSED, and its names get no split-horizon either; the probe failing on a domain-joined PC.
+
 ## Run 5 (2026-11-09): own-name answers and the LLMNR delay
 
 VM 02:46 to 03:47 local (1.0 h), stopped at the end. "Before" is 27141dd (67666092), "after" is the IPv6-server build (24DF3567). Run 4's metric-1 check had left Ethernet's persistent IPv4 metric at 1 with the automatic metric off, so after the VM restarted the capture refused itself until that was reverted (`Set-NetIPInterface -AutomaticMetric Enabled -PolicyStore PersistentStore`).
