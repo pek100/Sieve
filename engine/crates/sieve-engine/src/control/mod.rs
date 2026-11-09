@@ -1003,7 +1003,7 @@ mod tests {
         let e = engine(Policy::default(), None);
         e.set_dns_upstreams(DnsUpstreams { revision: 1, upstreams: vec!["tls://127.0.0.1:1".into()] }).unwrap();
         let service = e.start_dns_service(service_from).unwrap();
-        let asker = Asker { may_decrypt: true, addressed: "203.0.113.53".parse().unwrap() };
+        let asker = Asker { may_decrypt: true, addressed: "203.0.113.53".parse().unwrap(), dns_client: false };
         assert!(!e.status().dns_unreachable);
         for id in 0..UNREACHABLE_AFTER as u16 {
             service.answer(&crate::dns::testing::client_query(id, "www.example"), Transport::Datagram, asker).await.unwrap();

@@ -69,6 +69,12 @@ pub struct RouteRow {
 pub struct NetTables {
     pub adapters: Vec<Adapter>,
     pub routes: Vec<RouteRow>,
+    /// The machine's own suffixes, read only: the primary DNS suffix (the one in
+    /// force and the one set for the next start) and the global search list, the
+    /// policy's first. The DNS Client appends them to a short name on every
+    /// network, so a domain's names are asked under them (`dns::upstream::split_rules`).
+    #[serde(default)]
+    pub global_suffixes: Vec<String>,
 }
 
 impl NetTables {
@@ -92,7 +98,19 @@ impl NetTables {
     pub fn outside_sieve(&self) -> NetTables {
         let adapters: Vec<Adapter> = self.adapters.iter().filter(|a| !is_sieve_interface(&a.alias)).cloned().collect();
         let routes = self.routes.iter().filter(|r| adapters.iter().any(|a| a.index == r.if_index)).cloned().collect();
-        NetTables { adapters, routes }
+        NetTables { adapters, routes, global_suffixes: self.global_suffixes.clone() }
+    }
+
+    /// The adapter Windows sends through: the other up adapter with the
+    /// lowest-metric IPv4 default route, else IPv6. The tables' order breaks a tie.
+    pub fn default_adapter(&self) -> Option<&Adapter> {
+        let best = |v4: bool| {
+            self.others()
+                .filter_map(|a| self.routes_on(a).filter(|r| r.dest.length() == 0 && r.dest.is_ipv4() == v4).map(|r| r.metric).min().map(|m| (m, a)))
+                .min_by_key(|(m, _)| *m)
+                .map(|(_, a)| a)
+        };
+        best(true).or_else(|| best(false))
     }
 
     /// True when some up adapter other than Sieve holds a default route of this family.
@@ -211,6 +229,18 @@ pub mod read {
         Err("GetAdaptersAddresses: the table kept growing".into())
     }
 
+    /// An adapter's interface metric in one family, or None when it has no
+    /// interface of that family.
+    pub fn interface_metric_of(luid: u64, v4: bool) -> Option<u32> {
+        let mut row = MIB_IPINTERFACE_ROW {
+            Family: if v4 { AF_INET } else { AF_INET6 },
+            InterfaceLuid: windows::Win32::NetworkManagement::Ndis::NET_LUID_LH { Value: luid },
+            ..Default::default()
+        };
+        // SAFETY: `row` is initialised with the family and LUID the call needs.
+        (unsafe { GetIpInterfaceEntry(&mut row) } == NO_ERROR).then_some(row.Metric)
+    }
+
     fn interface_metric(luid: windows::Win32::NetworkManagement::Ndis::NET_LUID_LH, family: u16) -> u32 {
         let mut row = MIB_IPINTERFACE_ROW { Family: windows::Win32::Networking::WinSock::ADDRESS_FAMILY(family), InterfaceLuid: luid, ..Default::default() };
         // SAFETY: `row` is initialised with the family and LUID the call needs.
@@ -244,8 +274,34 @@ pub mod read {
         Ok(out)
     }
 
+    /// One REG_SZ value under HKLM, or None when it is absent or empty.
+    fn hklm_text(path: &str, name: &str) -> Option<String> {
+        use windows::Win32::Foundation::ERROR_SUCCESS;
+        use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+        use windows::core::HSTRING;
+        const CHARS: usize = 2_048;
+        let mut value = vec![0u16; CHARS];
+        let mut bytes = (CHARS * 2) as u32;
+        // SAFETY: the buffer and its byte length are this frame's.
+        let status = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, &HSTRING::from(path), &HSTRING::from(name), RRF_RT_REG_SZ, None, Some(value.as_mut_ptr().cast()), Some(&mut bytes)) };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        let text = String::from_utf16_lossy(&value[..(bytes as usize / 2).saturating_sub(1)]);
+        Some(text).filter(|t| !t.trim().is_empty())
+    }
+
+    /// The machine's suffixes (`NetTables::global_suffixes`), read only: the
+    /// policy's search list and primary suffix, then the local ones.
+    pub fn global_suffixes() -> Vec<String> {
+        const POLICY: &str = r"SOFTWARE\Policies\Microsoft\Windows NT\DNSClient";
+        const TCPIP: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters";
+        let values = [(POLICY, "SearchList"), (POLICY, "PrimaryDnsSuffix"), (TCPIP, "SearchList"), (TCPIP, "Domain"), (TCPIP, "NV Domain")];
+        crate::dns::upstream::suffix_list(values.iter().filter_map(|(path, name)| hklm_text(path, name)))
+    }
+
     pub fn tables() -> Result<NetTables, String> {
-        Ok(NetTables { adapters: adapters()?, routes: routes()? })
+        Ok(NetTables { adapters: adapters()?, routes: routes()?, global_suffixes: global_suffixes() })
     }
 }
 

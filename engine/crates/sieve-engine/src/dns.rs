@@ -261,6 +261,12 @@ pub fn nxdomain(query: &[u8]) -> Option<Vec<u8>> {
     error_reply(query, RCODE_NXDOMAIN)
 }
 
+/// NOERROR with the client's ID and question and no records (NODATA): the name
+/// has nothing of this type, said here.
+pub fn nodata(query: &[u8]) -> Option<Vec<u8>> {
+    error_reply(query, 0)
+}
+
 /// `reply` as header and question with TC set: the client retries over TCP.
 pub fn truncated(reply: &[u8]) -> Option<Vec<u8>> {
     answer_without_records(reply, flags_of(reply)? | FLAG_TC)

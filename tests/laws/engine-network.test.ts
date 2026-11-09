@@ -19,7 +19,9 @@
  *   the adapter's fixed GUID only), so the Windows DNS Client's queries reach
  *   the engine (`route/capture.rs`). Windows deletes that setting with the
  *   adapter; the live check of 2026-11-09 found it inert after a kill (no
- *   adapter reads it) and gone at the next clean removal.
+ *   adapter reads it). One scoped exception deletes it: `forget_adapter_key`
+ *   in `route/apply.rs` (start-up cleanup and `uninstall`) deletes that GUID's
+ *   interface key, and only when no adapter with that GUID exists.
  * - WFP: only `route/wfp.rs` calls it, in a dynamic session the base filtering
  *   engine deletes with the engine's handle; no persistent or boot-time
  *   object, no provider, no callout.
@@ -107,7 +109,22 @@ describe("engine network law", () => {
     expect(code(hits(APPLY, /SetInterfaceDnsSettings\(/))).toHaveLength(1);
     const body = read(APPLY).match(/pub fn set_adapter_dns\(server: Option<std::net::Ipv4Addr>\)[^{]*\{([\s\S]*?)\n\}/)?.[1] ?? "";
     expect(body).toContain("SetInterfaceDnsSettings(GUID::from_u128(ADAPTER_GUID), &settings)");
-    expect(body).toContain("Flags: u64::from(DNS_SETTING_NAMESERVER)");
+    expect(body).toContain("Flags: u64::from(DNS_SETTING_NAMESERVER | DNS_SETTING_REGISTRATION_ENABLED)");
+    expect(body).toContain("RegistrationEnabled: 0");
+  });
+
+  it("the one registry deletion is the adapter's own leftover key, and only with no such adapter", () => {
+    const deletions = code(product().flatMap((f) => hits(f, /RegDeleteTreeW\(|RegDeleteKey(?:Ex)?W\(/)));
+    const outside = deletions.map((h) => h.split(":")[0]).filter((f) => f !== APPLY && f !== "engine/crates/sieve-engine/src/ca/win/firefox.rs");
+    expect(outside).toEqual([]);
+    expect(code(hits(APPLY, /RegDeleteTreeW\(/))).toHaveLength(1);
+    const src = read(APPLY);
+    const body = src.match(/pub fn forget_adapter_key\(\)[^{]*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+    expect(body.indexOf("ConvertInterfaceGuidToLuid(&GUID::from_u128(ADAPTER_GUID)")).toBeGreaterThan(-1);
+    expect(body.indexOf("ConvertInterfaceGuidToLuid")).toBeLessThan(body.indexOf("RegDeleteTreeW("));
+    expect(body).toContain("adapter_key(root)");
+    const key = src.match(/fn adapter_key\(root: &str\)[^{]*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+    expect(key).toContain("let g = ADAPTER_GUID;");
   });
 
   it("WFP is called from route/wfp.rs only, in a dynamic session, and nothing it adds persists", () => {

@@ -85,8 +85,9 @@ struct Up {
     exclusions: JoinHandle<()>,
     /// Lives exactly as long as the routes; None when it could not start.
     etw: Option<EtwSession>,
-    /// None when it could not open; routing goes on without it.
-    capture: Option<Capture>,
+    /// Empty when it is refused or could not open or be proven; routing goes on
+    /// without it.
+    capture: CaptureSlot,
 }
 
 fn journal(engine: &Engine) -> Option<Journal> {
@@ -176,8 +177,10 @@ pub async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
                 take_down(&engine, u).await;
                 None
             }
-            (None, Some(tables)) => match bring_up(&engine, &tables).await {
+            (None, Some(tables)) => match bring_up(&engine, &tables, &|| engine.policy().engine && !*stop.borrow()).await {
                 Ok(u) => Some(u),
+                // Stopped or switched off while it waited: the loop decides again.
+                Err(message) if message == NO_LONGER_WANTED => None,
                 Err(message) => {
                     engine.set_facts(|f| f.blocker = Some(Blocker::Setup { message }));
                     None
@@ -234,70 +237,191 @@ async fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
         kept.sort();
         Up { routes: kept, ..up }
     };
-    follow_capture(engine, up).await
+    follow_capture(engine, up, network_moved).await
 }
 
 /// The DNS Client capture of one routing run (`route::capture`): its filter
-/// session and the blocks it holds.
+/// session, the blocks it holds and when it was last proven.
 struct Capture {
     session: wfp::Session,
     blocks: Vec<capture::Block>,
+    proven_at: tokio::time::Instant,
 }
 
-/// Names the adapter's server and puts it first for the DNS Client, then blocks
-/// the leak, in that order: the block never holds without a server to answer.
-/// A failure undoes the server and is the caller's to report; routing goes on.
-async fn open_capture(luid: SieveLuid, blocks: Vec<capture::Block>) -> Result<Capture, String> {
-    apply::put_first_for_dns(luid)?;
+/// The capture's place in a routing run: held, or empty and when to try again.
+#[derive(Default)]
+struct CaptureSlot {
+    held: Option<Capture>,
+    /// An empty slot tries again from then (None: at once).
+    retry_at: Option<tokio::time::Instant>,
+    /// The last failure reported, so a repeat is not reported again.
+    said: Option<String>,
+}
+
+impl CaptureSlot {
+    /// Reports a failure the first time it is seen, and waits before the next try.
+    fn failed(&mut self, engine: &Engine, why: String) {
+        if self.said.as_ref() != Some(&why) {
+            engine.add_error(format!("the DNS Client's queries are not caught: {why}"));
+            self.said = Some(why);
+        }
+        self.retry_at = Some(tokio::time::Instant::now() + capture::PROBE_EVERY);
+    }
+}
+
+/// The DNS Client returned this for the probe's NODATA (`DNS_INFO_NO_RECORDS`).
+const DNS_INFO_NO_RECORDS: i32 = 9501;
+
+/// Proves the capture: a fresh name asked through the DNS Client must reach the
+/// DNS service at [`TUN_DNS`] and its answer come back within [`capture::PROBE_WITHIN`].
+async fn prove(dns: &Arc<Service>) -> Result<(), String> {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
+    let name = capture::probe_name(u64::from_le_bytes(nonce));
+    let deadline = tokio::time::Instant::now() + capture::PROBE_WITHIN;
+    let asked = {
+        let name = name.clone();
+        tokio::task::spawn_blocking(move || apply::ask_dns_client(&name))
+    };
+    let arrived = dns.probe_arrived(&name, capture::PROBE_WITHIN).await;
+    let status = tokio::time::timeout_at(deadline, asked).await;
+    match (arrived, status) {
+        (true, Ok(Ok(0 | DNS_INFO_NO_RECORDS))) => Ok(()),
+        (false, _) => Err(format!("a probe through the DNS Client did not reach Sieve's DNS server within {} ms", capture::PROBE_WITHIN.as_millis())),
+        (true, Ok(Ok(status))) => Err(format!("the DNS Client answered a probe with error {status}")),
+        (true, _) => Err(format!("the DNS Client did not return a probe's answer within {} ms", capture::PROBE_WITHIN.as_millis())),
+    }
+}
+
+/// Opens the capture: refused when an adapter it would block ties for the DNS
+/// Client's first network, else the adapter is put first and names its server,
+/// then the block goes on, then the probe proves it. A failure undoes all of it
+/// and is the caller's to report; routing goes on.
+async fn open_capture(luid: SieveLuid, tables: &NetTables, blocks: Vec<capture::Block>, dns: &Arc<Service>) -> Result<Capture, String> {
+    if let Some(why) = capture::refusal(tables, &blocks, read::interface_metric_of) {
+        return Err(why);
+    }
+    let v6 = apply::put_first_for_dns(luid)?;
+    if !v6 && blocks.iter().any(|b| !b.v4) {
+        return Err("Sieve's adapter has no IPv6 interface to put first for the DNS Client's IPv6 servers".into());
+    }
     apply::set_adapter_dns(Some(TUN_DNS))?;
     let opened = tokio::task::spawn_blocking(move || {
         let mut session = wfp::open()?;
         session.set(&blocks)?;
-        Ok::<_, String>(Capture { session, blocks })
+        Ok::<_, String>(Capture { session, blocks, proven_at: tokio::time::Instant::now() })
     })
     .await
     .map_err(|e| format!("the DNS capture's filter task: {e}"))
     .and_then(|r| r);
-    if opened.is_err() {
-        let _ = apply::set_adapter_dns(None);
+    let held = match opened {
+        Ok(held) => held,
+        Err(why) => {
+            let _ = apply::set_adapter_dns(None);
+            return Err(why);
+        }
+    };
+    match prove(dns).await {
+        Ok(()) => Ok(held),
+        Err(why) => {
+            close_capture(dns, held).await;
+            Err(why)
+        }
     }
-    opened
 }
 
-/// Closes the session (its block goes with it) off the runtime, then the adapter's server.
-async fn close_capture(capture: Capture) {
-    let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
+/// Ends the rewrite, closes the session (its block goes with it) off the runtime,
+/// then the adapter's server. Bounded by [`TASKS_BOUND`]: a filtering engine that
+/// does not return holds up no take-down.
+async fn close_capture(dns: &Service, capture: Capture) {
+    dns.set_every_network_blocked(false);
+    let _ = tokio::time::timeout(TASKS_BOUND, tokio::task::spawn_blocking(move || drop(capture))).await;
     let _ = apply::set_adapter_dns(None);
 }
 
-/// Keeps the block on what the fresh tables and routes say. A failed change
-/// closes the capture (the DNS Client then goes as it would without it) and says why.
-async fn follow_capture(engine: &Engine, mut up: Up) -> Up {
-    let Some(mut held) = up.capture.take() else { return up };
+/// Keeps the capture on what the fresh tables and routes say: closed when there
+/// is nothing to block (the adapter's server goes too) or an adapter now ties for
+/// the first network, its block changed and proven again when that changed, proven
+/// again every [`capture::PROBE_EVERY`] and after the network moved, opened again
+/// when it is empty and its retry is due. A failure closes it and says why: the
+/// DNS Client then goes as it would without it. Last, the DNS service hears
+/// whether every network is blocked.
+async fn follow_capture(engine: &Engine, mut up: Up, network_moved: bool) -> Up {
     let tables = up.relay.tables.read().unwrap_or_else(|p| p.into_inner()).clone();
     let blocks = capture::blocks(&tables, &up.routes);
-    if blocks == held.blocks {
-        up.capture = Some(held);
-        return up;
+    let dns = up.relay.dns.clone();
+    if network_moved {
+        up.capture.retry_at = None;
     }
-    let changed = tokio::task::spawn_blocking(move || {
+    let now = tokio::time::Instant::now();
+    match up.capture.held.take() {
+        Some(held) if blocks.is_empty() => {
+            close_capture(&dns, held).await;
+            up.capture.said = None;
+        }
+        Some(held) => {
+            let refused = capture::refusal(&tables, &blocks, read::interface_metric_of);
+            let changed = blocks != held.blocks;
+            let due = network_moved || changed || now.saturating_duration_since(held.proven_at) >= capture::PROBE_EVERY;
+            let kept = match refused {
+                Some(why) => Err((Some(held), why)),
+                None if !due => Ok(held),
+                None => match refilter(held, blocks.clone(), changed).await {
+                    Ok(mut held) => match prove(&dns).await {
+                        Ok(()) => {
+                            held.proven_at = tokio::time::Instant::now();
+                            Ok(held)
+                        }
+                        Err(why) => Err((Some(held), why)),
+                    },
+                    Err(failed) => Err(failed),
+                },
+            };
+            match kept {
+                Ok(held) => up.capture.held = Some(held),
+                Err((held, why)) => {
+                    match held {
+                        Some(held) => close_capture(&dns, held).await,
+                        None => {
+                            dns.set_every_network_blocked(false);
+                            let _ = apply::set_adapter_dns(None);
+                        }
+                    }
+                    up.capture.failed(engine, why);
+                }
+            }
+        }
+        None if !blocks.is_empty() && up.capture.retry_at.is_none_or(|at| now >= at) => match open_capture(up.luid, &tables, blocks.clone(), &dns).await {
+            Ok(held) => {
+                up.capture.held = Some(held);
+                up.capture.said = None;
+            }
+            Err(why) => up.capture.failed(engine, why),
+        },
+        None => {}
+    }
+    dns.set_every_network_blocked(up.capture.held.is_some() && capture::every_network_blocked(&tables, &blocks));
+    up
+}
+
+/// The held capture with `blocks` in its session (off the runtime) when they
+/// changed; the session is given back with the error, for closing (none when the
+/// task panicked with it: its drop closed it).
+async fn refilter(mut held: Capture, blocks: Vec<capture::Block>, changed: bool) -> Result<Capture, (Option<Capture>, String)> {
+    if !changed {
+        return Ok(held);
+    }
+    let swapped = tokio::task::spawn_blocking(move || {
         let done = held.session.set(&blocks);
         held.blocks = blocks;
         (held, done)
     })
     .await;
-    match changed {
-        Ok((held, Ok(()))) => up.capture = Some(held),
-        Ok((held, Err(why))) => {
-            engine.add_error(format!("the DNS Client's queries are no longer caught: {why}"));
-            close_capture(held).await;
-        }
-        Err(e) => {
-            engine.add_error(format!("the DNS Client's queries are no longer caught: {e}"));
-            let _ = apply::set_adapter_dns(None);
-        }
+    match swapped {
+        Ok((held, Ok(()))) => Ok(held),
+        Ok((held, Err(why))) => Err((Some(held), why)),
+        Err(e) => Err((None, format!("the DNS capture's filter task: {e}"))),
     }
-    up
 }
 
 /// Adds the routes the plan lacks and returns those that went in. A pass with no
@@ -381,19 +505,33 @@ pub(super) fn add_addresses(ops: &mut impl AdapterOps, addresses: &[IpAddr]) -> 
     addresses.iter().try_for_each(|ip| ops.add_address(*ip))
 }
 
-/// Returns once every address may be a source, or says why it never will.
-pub(super) async fn addresses_ready(ops: &mut impl AdapterOps, addresses: &[IpAddr]) -> Result<(), String> {
+/// What a bring-up returns when the stop or the switch going off came while it
+/// waited: no blocker, the loop decides again.
+pub(super) const NO_LONGER_WANTED: &str = "routing was stopped or switched off while the adapter's address settled";
+
+/// Returns once every address may be a source, or says why it never will. While
+/// it waits, `wanted` is asked at every poll: a stop or the switch going off ends
+/// the wait at once with [`NO_LONGER_WANTED`].
+pub(super) async fn addresses_ready(ops: &mut impl AdapterOps, addresses: &[IpAddr], wanted: &(dyn Fn() -> bool + Sync)) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + ADDRESSES_READY_WITHIN;
     loop {
         let mut tentative = None;
         for ip in addresses {
             match ops.address_state(*ip)? {
                 AddressState::Preferred => {}
-                AddressState::Tentative => tentative = Some(*ip),
+                AddressState::Tentative | AddressState::NotYet => tentative = Some(*ip),
+                AddressState::Duplicate => {
+                    return Err(format!(
+                        "Sieve's address {ip} is already in use: another VPN or virtual adapter on this computer, or a device on this network, uses Sieve's range 198.18.0.0/15. Turn it off or move it to another range, then turn Sieve on again"
+                    ));
+                }
                 AddressState::Unusable(state) => return Err(format!("Sieve's adapter cannot use its address {ip} (state {state})")),
             }
         }
         let Some(ip) = tentative else { return Ok(()) };
+        if !wanted() {
+            return Err(NO_LONGER_WANTED.into());
+        }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("Sieve's adapter address {ip} was still tentative after {} s", ADDRESSES_READY_WITHIN.as_secs()));
         }
@@ -404,8 +542,8 @@ pub(super) async fn addresses_ready(ops: &mut impl AdapterOps, addresses: &[IpAd
 /// Journals and adds each route once the adapter's addresses are usable, so no
 /// route points at an adapter that cannot send yet. A failed route removes the
 /// ones added before it.
-pub(super) async fn route_adapter(ops: &mut impl AdapterOps, addresses: &[IpAddr], routes: &[Prefix]) -> Result<Vec<Prefix>, String> {
-    addresses_ready(ops, addresses).await?;
+pub(super) async fn route_adapter(ops: &mut impl AdapterOps, addresses: &[IpAddr], routes: &[Prefix], wanted: &(dyn Fn() -> bool + Sync)) -> Result<Vec<Prefix>, String> {
+    addresses_ready(ops, addresses, wanted).await?;
     let mut added = Vec::new();
     for p in routes {
         if let Err(e) = ops.add_route(*p) {
@@ -420,7 +558,7 @@ pub(super) async fn route_adapter(ops: &mut impl AdapterOps, addresses: &[IpAddr
     Ok(added)
 }
 
-async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String> {
+async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn() -> bool + Sync)) -> Result<Up, String> {
     let plan = plan::plan(tables);
     if plan.routes.is_empty() {
         return Err("this computer has no default route, so there is nothing to route".into());
@@ -462,7 +600,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     }
     // Before the routes, so a hang starting it cannot hold a route.
     let (etw, witness, nat) = start_attribution(engine);
-    let added = match route_adapter(&mut os, &addresses, &plan.routes).await {
+    let added = match route_adapter(&mut os, &addresses, &plan.routes, still_on).await {
         Ok(added) => added,
         Err(e) => {
             engine.stop_dns_service();
@@ -495,13 +633,15 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables) -> Result<Up, String
     let (stop_accept, stopped) = oneshot::channel();
     let accept = tokio::spawn(accept(stack, relay.clone(), stopped));
     // Last: the DNS Client is sent here only once the stack answers.
-    let capture = match open_capture(luid, capture::blocks(tables, &added)).await {
-        Ok(c) => Some(c),
-        Err(why) => {
-            engine.add_error(format!("the DNS Client's queries are not caught: {why}"));
-            None
+    let mut capture = CaptureSlot::default();
+    let blocks = capture::blocks(tables, &added);
+    if !blocks.is_empty() {
+        match open_capture(luid, tables, blocks.clone(), &relay.dns).await {
+            Ok(held) => capture.held = Some(held),
+            Err(why) => capture.failed(engine, why),
         }
-    };
+    }
+    relay.dns.set_every_network_blocked(capture.held.is_some() && capture::every_network_blocked(tables, &blocks));
     let batches = {
         let e = engine.clone();
         tokio::spawn(async move {
@@ -629,8 +769,8 @@ async fn accept(mut stack: IpStack, relay: Arc<Relay>, mut stop: oneshot::Receiv
 /// goes with the last reference to it, the relay's, when this returns.
 async fn take_down(engine: &Engine, mut up: Up) {
     // First, so the DNS Client is never sent to a server that is going away.
-    if let Some(c) = up.capture.take() {
-        close_capture(c).await;
+    if let Some(c) = up.capture.held.take() {
+        close_capture(&up.relay.dns, c).await;
     }
     engine.arm.set(false);
     *super::lock(&engine.beats.path) = None;
