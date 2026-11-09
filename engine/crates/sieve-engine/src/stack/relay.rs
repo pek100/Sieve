@@ -45,12 +45,12 @@ use crate::flow::flows::os::IpHelper;
 use crate::flow::flows::{Action, AppKeys, Attributor, ExeCache, FiveTuple, Owner, REFRESH_MIN_MS};
 use crate::flow::nat::NatTable;
 use crate::flow::packet::Proto;
-use crate::flow::relay::relay_tcp;
+use crate::flow::relay::relay_tcp_until;
 use crate::policy::wall_ms;
 use crate::quic::{self, PacketSink, Reply, UdpPath};
 use crate::route::table::NetTables;
 use crate::tls::intercept::{FlowMeta, HttpsSlot, Who, run as run_intercepted};
-use crate::tls::splice::{Abort, splice};
+use crate::tls::splice::{Abort, Ended, drain_then_abort, splice};
 use crate::watchdog::monotonic_ms;
 
 /// A TCP flow that sends nothing this long is decided without a name.
@@ -309,6 +309,12 @@ impl Abort for IpStackTcpStream {
     fn abort(&self) {
         IpStackTcpStream::abort(self);
     }
+    fn closed(&self) -> Ended {
+        Box::pin(IpStackTcpStream::closed(self))
+    }
+    fn drained(&self) -> Ended {
+        Box::pin(IpStackTcpStream::drained(self))
+    }
 }
 
 pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
@@ -348,7 +354,8 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
 /// entry and no decision, only the copy.
 async fn relay_own(mut app: IpStackTcpStream, upstream: Result<TcpStream, retry::Failure>) {
     if let Ok(upstream) = upstream {
-        splice(&mut app, upstream, &[]).await;
+        let closed = app.closed();
+        splice(&mut app, upstream, &[], closed).await;
     }
     close_app(&mut app).await;
 }
@@ -385,17 +392,20 @@ pub(super) async fn serve_admitted(ctx: Arc<Relay>, mut app: IpStackTcpStream, f
     }
     let progress = Progress::new(monotonic_ms);
     let upstream = Watched::new(upstream, progress.clone());
+    // The app's connection's end ends the relay even while only the server is read.
+    let closed = app.closed();
     #[cfg(feature = "relay-experiments")]
     let out = if let Some(capacity) = ctx.experiments.copy_buffer_bytes {
-        crate::flow::relay::relay_tcp_buffered(&mut app, upstream, FIRST_BYTES_WAIT, decide, capacity).await
+        crate::flow::relay::relay_tcp_buffered(&mut app, upstream, FIRST_BYTES_WAIT, decide, capacity, closed).await
     } else {
-        relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, decide).await
+        relay_tcp_until(&mut app, upstream, FIRST_BYTES_WAIT, decide, closed).await
     };
     #[cfg(not(feature = "relay-experiments"))]
-    let out = relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, decide).await;
-    // The server's side broke: the app hears a reset, not the FIN of a complete answer.
+    let out = relay_tcp_until(&mut app, upstream, FIRST_BYTES_WAIT, decide, closed).await;
+    // The server's side broke: the app hears a reset, not the FIN of a complete
+    // answer, once what reached it is acknowledged.
     if out.reset_app {
-        app.abort();
+        drain_then_abort(&app).await;
     }
     if out.dropped {
         close_blocked(&ctx.book, &ctx.meters, admitted.id);

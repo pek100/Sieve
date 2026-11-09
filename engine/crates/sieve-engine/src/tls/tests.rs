@@ -1892,7 +1892,7 @@ async fn switch_off_uses_relay_tcp_and_never_touches_tls() {
     assert!(slot.get().is_none(), "no slot: `handle_tcp` takes `relay_tcp`");
     let source = include_str!("../stack/relay.rs");
     let branch = source.find("if let Some(https) = ctx.https.get()").expect("the one branch");
-    let relay = source.find("relay_tcp(&mut app, upstream, FIRST_BYTES_WAIT, decide).await").expect("the old path");
+    let relay = source.find("relay_tcp_until(&mut app, upstream, FIRST_BYTES_WAIT, decide, closed).await").expect("the old path");
     assert!(branch < relay, "the branch comes before the plain relay and returns");
     assert!(source[branch..relay].contains("return;"), "and an intercepted flow never falls through");
     assert!(!source.contains("tokio_rustls"), "the relay itself touches no TLS");

@@ -27,6 +27,10 @@ pub(crate) enum TcpState {
     Established,
     FinWait1, // act as a client, actively send a farewell packet to the other side, followed with FinWait2, TimeWait, Closed
     FinWait2,
+    /// Sieve (2026-11-09, P3-1): both FINs sent, ours not yet acknowledged (a
+    /// simultaneous close, RFC 9293 3.6). Upstream went to TIME-WAIT and stopped
+    /// resending our FIN.
+    Closing,
     TimeWait,
     CloseWait, // act as a server, followed with LastAck, Closed
     LastAck,
@@ -70,6 +74,9 @@ pub(crate) struct Tcb {
     /// idle limit runs from here. Sieve (2026-11-09): upstream ran it from the engine's
     /// last read or write, so keep-alives never counted.
     last_activity: std::time::Instant,
+    /// When the engine last wrote to the stream: the other end's bytes on their way
+    /// to the app, which make the flow in use too (P3-3).
+    last_write: std::time::Instant,
     /// How the connection ended when it did not end with both FINs: what its reader
     /// is told once every byte that came before is read.
     closed_by: Option<std::io::ErrorKind>,
@@ -106,6 +113,7 @@ impl Tcb {
             rto,
             max_retransmit_count,
             last_activity: std::time::Instant::now(),
+            last_write: std::time::Instant::now(),
             closed_by: None,
         }
     }
@@ -117,6 +125,17 @@ impl Tcb {
 
     pub(super) fn last_activity(&self) -> std::time::Instant {
         self.last_activity
+    }
+
+    /// The engine wrote to the stream.
+    pub(super) fn wrote(&mut self) {
+        self.last_write = std::time::Instant::now();
+    }
+
+    /// When the connection was last used either way: a segment from the other side,
+    /// or bytes the engine wrote toward it.
+    pub(super) fn last_use(&self) -> std::time::Instant {
+        self.last_activity.max(self.last_write)
     }
 
     /// Closes the connection as `kind` says it ended (a reset, a timeout).

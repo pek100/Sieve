@@ -20,6 +20,10 @@
 //! a reset, never as a FIN: an upload or a close-delimited download cut short must
 //! not look complete to the other end.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -83,35 +87,66 @@ pub struct Outcome {
     pub reset_app: bool,
 }
 
+/// A writer that counts the bytes it took, so an outcome keeps them however the flow
+/// ended (P3-5: a flow cut short reported none).
+struct Counting<'a, W: ?Sized> {
+    inner: &'a mut W,
+    n: &'a AtomicU64,
+}
+
+impl<W: AsyncWrite + Unpin + ?Sized> AsyncWrite for Counting<'_, W> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut *this.inner).poll_write(cx, data);
+        if let Poll::Ready(Ok(n)) = polled {
+            this.n.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        polled
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// The server's bytes to the app; an upstream that ended with an error is not passed
-/// on as the end. Bytes written, and whether it ended so.
-async fn server_to_app<R, W>(up_read: &mut R, app_write: &mut W) -> (u64, bool)
+/// on as the end. True when it ended so, or when the app's connection ended under
+/// the copy (`app_closed`).
+///
+/// Sieve (2026-11-09, P2-b): once the app half-closed, only the server is read here,
+/// so an app connection the stack reset (its idle limit, an eviction) went unseen:
+/// the task, the upstream socket and the book entry lived until the server acted.
+async fn server_to_app<R, W>(up_read: &mut R, app_write: &mut W, app_closed: impl Future<Output = ()>) -> bool
 where
     R: AsyncRead + Unpin + ?Sized,
     W: AsyncWrite + Unpin + ?Sized,
 {
-    match tokio::io::copy(up_read, app_write).await {
-        Ok(n) => {
-            let _ = tokio::time::timeout(APP_SHUTDOWN_BOUND, app_write.shutdown()).await;
-            (n, false)
-        }
-        Err(_) => (0, true),
+    let copied = tokio::select! {
+        biased;
+        copied = tokio::io::copy(up_read, app_write) => copied.is_ok(),
+        () = app_closed => false,
+    };
+    if copied {
+        let _ = tokio::time::timeout(APP_SHUTDOWN_BOUND, app_write.shutdown()).await;
     }
+    !copied
 }
 
 /// The app's bytes into upstream after the held ones; an app side that ended with an
-/// error is not passed on as the end. Bytes written, and whether it ended so.
-async fn app_to_server<R, W>(app_read: &mut R, up_write: &mut W) -> (u64, bool)
+/// error is not passed on as the end. True when it ended so.
+async fn app_to_server<R, W>(app_read: &mut R, up_write: &mut W) -> bool
 where
     R: AsyncRead + Unpin + ?Sized,
     W: AsyncWrite + Unpin + ?Sized,
 {
     match tokio::io::copy(app_read, up_write).await {
-        Ok(n) => {
+        Ok(_) => {
             let _ = up_write.shutdown().await;
-            (n, false)
+            false
         }
-        Err(_) => (0, true),
+        Err(_) => true,
     }
 }
 
@@ -120,6 +155,7 @@ where
 /// so the diagnostic one differs from production only in its copy phase.
 pub const CLASSIFIER_READ: usize = 16 * 1024;
 
+/// [`relay_tcp_until`] for an app end that cannot tell when its connection is gone.
 pub async fn relay_tcp<A, U>(
     app: &mut A,
     upstream: U,
@@ -130,8 +166,24 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Reset + Unpin,
 {
+    relay_tcp_until(app, upstream, first_bytes_wait, decide, std::future::pending()).await
+}
+
+/// The relay; `app_closed` completes once the app's connection is gone, which ends
+/// the flow, upstream reset, even while only the server is read.
+pub async fn relay_tcp_until<A, U>(
+    app: &mut A,
+    upstream: U,
+    first_bytes_wait: Duration,
+    decide: impl FnOnce(&Decoded) -> Action,
+    app_closed: impl Future<Output = ()>,
+) -> Outcome
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Reset + Unpin,
+{
     let (mut up_read, mut up_write) = tokio::io::split(upstream);
-    let out = relay_halves(app, &mut up_read, &mut up_write, first_bytes_wait, decide).await;
+    let out = relay_halves(app, &mut up_read, &mut up_write, first_bytes_wait, decide, app_closed).await;
     if out.reset_upstream {
         up_read.unsplit(up_write).reset();
     }
@@ -139,15 +191,18 @@ where
 }
 
 /// [`relay_tcp`] with the upstream split, so it can be reset once both directions end.
-async fn relay_halves<A, R, W>(app: &mut A, up_read: &mut R, up_write: &mut W, first_bytes_wait: Duration, decide: impl FnOnce(&Decoded) -> Action) -> Outcome
+async fn relay_halves<A, R, W>(app: &mut A, up_read: &mut R, up_write: &mut W, first_bytes_wait: Duration, decide: impl FnOnce(&Decoded) -> Action, app_closed: impl Future<Output = ()>) -> Outcome
 where
     A: AsyncRead + AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let (mut app_read, mut app_write) = tokio::io::split(app);
+    let (up_bytes, down_bytes) = (AtomicU64::new(0), AtomicU64::new(0));
+    let mut up_write = Counting { inner: up_write, n: &up_bytes };
+    let mut app_write = Counting { inner: &mut app_write, n: &down_bytes };
 
-    let server_to_app = server_to_app(up_read, &mut app_write);
+    let server_to_app = server_to_app(up_read, &mut app_write, app_closed);
     let client_to_server = async {
         let mut out = Outcome::default();
         let mut classifier = TcpClassifier::new();
@@ -184,34 +239,33 @@ where
             out.stop = true;
             return out;
         }
-        let replayed = (held.len() + tail.len()) as u64;
         // The classifier's buffers go before the copy phase, which can last the stack's
         // two-hour idle limit: 16 KiB of an idle plain flow's 68 KiB (VM run 8).
         drop((held, buf, classifier));
-        let (copied, broke) = app_to_server(&mut app_read, up_write).await;
-        out.bytes_up = replayed + copied;
-        out.reset_upstream = broke;
+        out.reset_upstream = app_to_server(&mut app_read, &mut up_write).await;
         out
     };
     tokio::pin!(server_to_app, client_to_server);
     // A side that broke ends the flow at once: the other direction is not waited
     // for, as nothing it carries can reach a connection that is gone.
-    tokio::select! {
+    let mut out = tokio::select! {
         mut out = &mut client_to_server => {
             if !out.stop && !out.reset_upstream {
-                (out.bytes_down, out.reset_app) = server_to_app.await;
+                out.reset_app = server_to_app.await;
+                out.reset_upstream = out.reset_app;
             }
             out
         }
-        (down, broke) = &mut server_to_app => {
+        broke = &mut server_to_app => {
             if broke {
-                return Outcome { reset_app: true, reset_upstream: true, stop: true, ..Outcome::default() };
+                Outcome { reset_app: true, reset_upstream: true, stop: true, ..Outcome::default() }
+            } else {
+                client_to_server.await
             }
-            let mut out = client_to_server.await;
-            out.bytes_down = down;
-            out
         }
-    }
+    };
+    (out.bytes_up, out.bytes_down) = (up_bytes.load(Ordering::Relaxed), down_bytes.load(Ordering::Relaxed));
+    out
 }
 
 /// Diagnostic counterpart of relay_tcp. Keep classification, half-close and
@@ -223,6 +277,7 @@ pub async fn relay_tcp_buffered<A, U>(
     first_bytes_wait: Duration,
     decide: impl FnOnce(&Decoded) -> Action,
     capacity: usize,
+    app_closed: impl Future<Output = ()>,
 ) -> Outcome
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -230,7 +285,7 @@ where
 {
     let (up_read, mut up_write) = tokio::io::split(upstream);
     let mut up_read = tokio::io::BufReader::with_capacity(capacity, up_read);
-    let out = buffered_halves(app, &mut up_read, &mut up_write, first_bytes_wait, decide, capacity).await;
+    let out = buffered_halves(app, &mut up_read, &mut up_write, first_bytes_wait, decide, capacity, app_closed).await;
     if out.reset_upstream {
         up_read.into_inner().unsplit(up_write).reset();
     }
@@ -238,21 +293,26 @@ where
 }
 
 #[cfg(feature = "relay-experiments")]
-async fn buffered_halves<A, R, W>(app: &mut A, up_read: &mut R, up_write: &mut W, first_bytes_wait: Duration, decide: impl FnOnce(&Decoded) -> Action, capacity: usize) -> Outcome
+async fn buffered_halves<A, R, W>(app: &mut A, up_read: &mut R, up_write: &mut W, first_bytes_wait: Duration, decide: impl FnOnce(&Decoded) -> Action, capacity: usize, app_closed: impl Future<Output = ()>) -> Outcome
 where
     A: AsyncRead + AsyncWrite + Unpin,
     R: tokio::io::AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let (mut app_read, mut app_write) = tokio::io::split(app);
+    let (up_bytes, down_bytes) = (AtomicU64::new(0), AtomicU64::new(0));
+    let mut up_write = Counting { inner: up_write, n: &up_bytes };
+    let mut app_write = Counting { inner: &mut app_write, n: &down_bytes };
     let server_to_app = async {
-        match tokio::io::copy_buf(up_read, &mut app_write).await {
-            Ok(n) => {
-                let _ = tokio::time::timeout(APP_SHUTDOWN_BOUND, app_write.shutdown()).await;
-                (n, false)
-            }
-            Err(_) => (0, true),
+        let copied = tokio::select! {
+            biased;
+            copied = tokio::io::copy_buf(up_read, &mut app_write) => copied.is_ok(),
+            () = app_closed => false,
+        };
+        if copied {
+            let _ = tokio::time::timeout(APP_SHUTDOWN_BOUND, app_write.shutdown()).await;
         }
+        !copied
     };
     let client_to_server = async {
         let mut out = Outcome::default();
@@ -293,9 +353,8 @@ where
         }
         drop(buf);
         let mut app_read = tokio::io::BufReader::with_capacity(capacity, &mut app_read);
-        match tokio::io::copy_buf(&mut app_read, up_write).await {
-            Ok(n) => {
-                out.bytes_up = (held.len() + spill.len()) as u64 + n;
+        match tokio::io::copy_buf(&mut app_read, &mut up_write).await {
+            Ok(_) => {
                 let _ = up_write.shutdown().await;
             }
             Err(_) => out.reset_upstream = true,
@@ -305,22 +364,24 @@ where
     tokio::pin!(server_to_app, client_to_server);
     // A side that broke ends the flow at once: the other direction is not waited
     // for, as nothing it carries can reach a connection that is gone.
-    tokio::select! {
+    let mut out = tokio::select! {
         mut out = &mut client_to_server => {
             if !out.stop && !out.reset_upstream {
-                (out.bytes_down, out.reset_app) = server_to_app.await;
+                out.reset_app = server_to_app.await;
+                out.reset_upstream = out.reset_app;
             }
             out
         }
-        (down, broke) = &mut server_to_app => {
+        broke = &mut server_to_app => {
             if broke {
-                return Outcome { reset_app: true, reset_upstream: true, stop: true, ..Outcome::default() };
+                Outcome { reset_app: true, reset_upstream: true, stop: true, ..Outcome::default() }
+            } else {
+                client_to_server.await
             }
-            let mut out = client_to_server.await;
-            out.bytes_down = down;
-            out
         }
-    }
+    };
+    (out.bytes_up, out.bytes_down) = (up_bytes.load(Ordering::Relaxed), down_bytes.load(Ordering::Relaxed));
+    out
 }
 
 #[cfg(test)]
@@ -347,7 +408,7 @@ mod tests {
             let (mut app, mut relay_side) = tokio::io::duplex(capacity);
             let (up, mut server) = tokio::io::duplex(PIPE_BYTES);
             let relay = tokio::spawn(async move {
-                relay_tcp_buffered(&mut relay_side, up, WAIT, |_| Action::Pass, capacity).await
+                relay_tcp_buffered(&mut relay_side, up, WAIT, |_| Action::Pass, capacity, std::future::pending()).await
             });
             let echo = tokio::spawn(async move {
                 let mut got = Vec::new();
@@ -715,11 +776,13 @@ mod tests {
         }
     }
 
-    /// An upstream that records whether it was reset or shut down.
+    /// An upstream that records whether it was reset or shut down, and whose reads
+    /// fail with a reset once its bytes are read when `reset_at_end`.
     struct Upstream {
         inner: DuplexStream,
         reset: Arc<AtomicBool>,
         shut: Arc<AtomicBool>,
+        reset_at_end: bool,
     }
 
     impl Reset for Upstream {
@@ -730,7 +793,12 @@ mod tests {
 
     impl AsyncRead for Upstream {
         fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+            let before = buf.filled().len();
+            let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            if self.reset_at_end && matches!(polled, std::task::Poll::Ready(Ok(()))) && buf.filled().len() == before {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            polled
         }
     }
 
@@ -756,7 +824,7 @@ mod tests {
             let (app_far, app_near) = tokio::io::duplex(PIPE_BYTES);
             let (up_near, mut server) = tokio::io::duplex(PIPE_BYTES);
             let (reset, shut) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-            let up = Upstream { inner: up_near, reset: reset.clone(), shut: shut.clone() };
+            let up = Upstream { inner: up_near, reset: reset.clone(), shut: shut.clone(), reset_at_end: false };
             let mut app = App { inner: app_near, reset_after, stuck: false };
             let relay = tokio::spawn(async move { relay_tcp(&mut app, up, WAIT, |_| Action::Pass).await });
             let mut app_far = app_far;
@@ -773,6 +841,30 @@ mod tests {
             assert_eq!((out.reset_upstream, reset.load(Ordering::SeqCst)), (reset_after, reset_after), "reset after {reset_after}: {out:?}");
             assert_eq!(shut.load(Ordering::SeqCst), !reset_after, "a FIN upstream only for a clean end");
         }
+    }
+
+    /// P3-5: a flow cut short by the server still reports the bytes it carried both
+    /// ways; it reported none.
+    #[tokio::test]
+    async fn a_server_reset_keeps_the_byte_counts() {
+        const PARTIAL: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial";
+        let (mut app_far, app_near) = tokio::io::duplex(PIPE_BYTES);
+        let (up_near, mut server) = tokio::io::duplex(PIPE_BYTES);
+        let (reset, shut) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let up = Upstream { inner: up_near, reset: reset.clone(), shut, reset_at_end: true };
+        let mut app = App { inner: app_near, reset_after: false, stuck: false };
+        let relay = tokio::spawn(async move { relay_tcp(&mut app, up, WAIT, |_| Action::Pass).await });
+        app_far.write_all(REQUEST).await.unwrap();
+        let mut request = vec![0u8; REQUEST.len()];
+        server.read_exact(&mut request).await.unwrap();
+        server.write_all(PARTIAL).await.unwrap();
+        drop(server);
+        let out = tokio::time::timeout(WAIT, relay).await.expect("the relay ended").unwrap();
+        assert!(out.reset_app && out.reset_upstream, "the control: the server's side broke: {out:?}");
+        assert_eq!((out.bytes_up, out.bytes_down), (REQUEST.len() as u64, PARTIAL.len() as u64), "{out:?}");
+        let mut got = vec![0u8; PARTIAL.len()];
+        app_far.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, PARTIAL);
     }
 
     /// P1-2 (second review of run 7): the app side's shutdown is bounded; a stack that

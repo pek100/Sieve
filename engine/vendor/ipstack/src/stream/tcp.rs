@@ -166,6 +166,9 @@ pub struct IpStackTcpStream {
     /// Wakes the TCP task when a segment goes in flight with none before it, so it
     /// arms the retransmission timer.
     inflight_notify: Arc<tokio::sync::Notify>,
+    /// Fired when the peer acknowledges more of our bytes and when the connection
+    /// ends: what [`IpStackTcpHandle::closed`] and [`IpStackTcpHandle::drained`] wait on.
+    state_notify: Arc<tokio::sync::Notify>,
     destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     data_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
@@ -222,6 +225,7 @@ impl IpStackTcpStream {
             shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
             write_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             inflight_notify: Arc::default(),
+            state_notify: Arc::default(),
             destroy_messenger,
             data_tx,
             data_rx,
@@ -279,10 +283,21 @@ impl IpStackTcpStream {
     }
 
     /// Ends the connection now with an ACK|RST, the packet the stack sends when the
-    /// session times out. Bytes in flight are given up. Later reads see the end of
-    /// the stream, later writes fail, and `shutdown` returns at once, sending no FIN.
+    /// session times out. Bytes in flight are given up. Later reads fail with
+    /// `ConnectionAborted` once what the app sent before is read, later writes fail,
+    /// and `shutdown` returns at once, sending no FIN.
     pub fn abort(&self) {
         self.handle().abort();
+    }
+
+    /// [`IpStackTcpHandle::closed`].
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + use<> {
+        self.handle().closed()
+    }
+
+    /// [`IpStackTcpHandle::drained`].
+    pub fn drained(&self) -> impl Future<Output = ()> + Send + use<> {
+        self.handle().drained()
     }
 
     /// A handle on this connection for whoever does not own the stream: how long it
@@ -296,6 +311,7 @@ impl IpStackTcpStream {
             read_notify: self.read_notify.clone(),
             write_notify: self.write_notify.clone(),
             inflight_notify: self.inflight_notify.clone(),
+            state_notify: self.state_notify.clone(),
         }
     }
 }
@@ -310,15 +326,23 @@ pub struct IpStackTcpHandle {
     read_notify: Arc<std::sync::Mutex<Option<Waker>>>,
     write_notify: Arc<std::sync::Mutex<Option<Waker>>>,
     inflight_notify: Arc<tokio::sync::Notify>,
+    state_notify: Arc<tokio::sync::Notify>,
 }
 
 impl IpStackTcpHandle {
-    /// How long since the other side last sent a valid segment, keep-alives included.
+    /// How long the connection has gone unused: since the other side last sent a
+    /// valid segment, keep-alives included, or the engine last wrote to it, whichever
+    /// is later. Sieve (2026-11-09, P3-3): the engine's writes count, so a flow whose
+    /// server is still sending is not idle.
     pub fn idle(&self) -> Duration {
-        self.tcb.lock().unwrap().last_activity().elapsed()
+        self.tcb.lock().unwrap().last_use().elapsed()
     }
 
     /// [`IpStackTcpStream::abort`].
+    ///
+    /// Sieve (2026-11-09, P2-a): the end is recorded as `ConnectionAborted`, so the
+    /// reader is told the flow was cut short; it read the end of the stream, and a
+    /// relay passed that upstream as a FIN and waited on.
     pub fn abort(&self) {
         {
             let mut tcb = self.tcb.lock().unwrap();
@@ -326,12 +350,44 @@ impl IpStackTcpHandle {
                 return;
             }
             reset_and_close("[abort]", &self.up_packet_sender, self.tuple, &mut tcb);
+            tcb.close_with(std::io::ErrorKind::ConnectionAborted);
         }
         self.shutdown.lock().unwrap().ready();
         self.read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
         self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+        self.state_notify.notify_waiters();
         // The TCP task ends now too, not at the next packet.
         self.inflight_notify.notify_one();
+    }
+
+    /// Completes once the connection is closed, however it ended (both FINs, a reset,
+    /// the idle limit, an abort): for whoever waits on something else, such as a
+    /// relay whose app half-closed and that reads only the server any more (P2-b).
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + use<> {
+        wait_until(self.tcb.clone(), self.state_notify.clone(), |tcb| tcb.get_state() == TcpState::Closed)
+    }
+
+    /// Completes once every byte written is acknowledged, or the connection closed.
+    pub fn drained(&self) -> impl Future<Output = ()> + Send + use<> {
+        wait_until(self.tcb.clone(), self.state_notify.clone(), |tcb| {
+            tcb.get_state() == TcpState::Closed || tcb.get_inflight_packets_total_len() == 0
+        })
+    }
+}
+
+/// Completes once `done` holds of the connection; `notify` fires on every change it
+/// can see.
+async fn wait_until(tcb: TcbPtr, notify: Arc<tokio::sync::Notify>, done: fn(&Tcb) -> bool) {
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        // Asked for before the look, so a change made in between still wakes it.
+        notified.as_mut().enable();
+        let now = done(&tcb.lock().unwrap());
+        if now {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -388,7 +444,7 @@ impl AsyncRead for IpStackTcpStream {    fn poll_read(mut self: std::pin::Pin<&m
         // The app's FIN came in order, after every byte it sent; the TCP task queues those
         // bytes before it records the end, under the lock the state was read with, so a
         // second look finds any that came with the FIN.
-        let ended = matches!(state, TcpState::Closed | TcpState::CloseWait | TcpState::LastAck | TcpState::TimeWait);
+        let ended = matches!(state, TcpState::Closed | TcpState::CloseWait | TcpState::LastAck | TcpState::Closing | TcpState::TimeWait);
         if ended && let Some(read) = self.take_queued(cx, buf) {
             return read;
         }
@@ -425,6 +481,11 @@ impl AsyncWrite for IpStackTcpStream {
             self.read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
+        // Sieve (2026-11-09, P3-6): nothing goes after our FIN, queued (shutdown asked)
+        // or sent; upstream took bytes after it and sent them past the end.
+        if !fin_unsent(state) || !matches!(*self.shutdown.lock().unwrap(), Shutdown::None) {
+            return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP stream shut down")));
+        }
 
         // Sieve (2026-11-08): data waits for the handshake's last ACK (RFC 9293 3.10.2:
         // queued until ESTABLISHED); upstream sent it in SYN-RECEIVED.
@@ -446,6 +507,7 @@ impl AsyncWrite for IpStackTcpStream {
             write_packet_to_device(&self.up_packet_sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?
         };
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
+        tcb.wrote();
         if timer_idle {
             self.inflight_notify.notify_one();
         }
@@ -583,8 +645,10 @@ impl IpStackTcpStream {
         let write_notify = self.write_notify.clone();
         let read_notify = self.read_notify.clone();
         let inflight_notify = self.inflight_notify.clone();
+        let state_notify = self.state_notify.clone();
         let data_tx = self.data_tx.clone();
         let destroy_messenger = self.destroy_messenger.take();
+        let (ended_tcb, ended_reader, ended_writer) = (self.tcb.clone(), self.read_notify.clone(), self.write_notify.clone());
 
         let (exit_task_notifier, exit_monitor) = tokio::sync::mpsc::channel::<()>(10);
         let exit_notifier = exit_task_notifier.clone();
@@ -602,6 +666,7 @@ impl IpStackTcpStream {
                 write_notify,
                 read_notify,
                 inflight_notify,
+                state_notify.clone(),
                 data_tx,
                 exit_monitor,
                 asked,
@@ -610,6 +675,18 @@ impl IpStackTcpStream {
             if let Err(e) = &v {
                 log::warn!("{network_tuple} task error: {e}");
             }
+            // Sieve (2026-11-09, P2-b): with the task gone nothing is left to carry the
+            // connection, so it is closed whatever stopped the task, and whoever waits
+            // on its end hears of it now.
+            {
+                let mut tcb = ended_tcb.lock().unwrap();
+                if tcb.get_state() != TcpState::Closed {
+                    tcb.close_with(std::io::ErrorKind::ConnectionAborted);
+                }
+            }
+            ended_reader.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            ended_writer.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            state_notify.notify_waiters();
             _ = destroy_messenger.map(|m| m.send(())).unwrap_or(Ok(()));
             log::trace!("{network_tuple} task completed, destroy messenger sent successfully");
             shutdown.lock().unwrap().ready();
@@ -632,6 +709,7 @@ async fn tcp_main_logic_loop(
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     inflight_notify: Arc<tokio::sync::Notify>,
+    state_notify: Arc<tokio::sync::Notify>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
     shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
@@ -680,27 +758,29 @@ async fn tcp_main_logic_loop(
         exit_notifier.send(()).await.unwrap_or(());
     }
 
-    /// Resends our FIN while the connection stays in `waiting` (LAST-ACK or FIN-WAIT-1,
-    /// where its ACK is due), at the FIN's own sequence number, and resets the
-    /// connection once the resends run out.
+    /// Resends our FIN while it is unacknowledged (LAST-ACK, FIN-WAIT-1, CLOSING), at
+    /// the FIN's own sequence number, and resets the connection once the resends run
+    /// out.
     ///
     /// Sieve (2026-11-09, P2-5): upstream resent it at the next sequence number, one
     /// past the FIN, closed without a reset, and had no resend at all in FIN-WAIT-1.
+    /// P3-1: a simultaneous close goes on from FIN-WAIT-1 to CLOSING with our FIN still
+    /// unacknowledged, and the resends go on there.
     async fn task_fin_unacked(
         tcb: TcbPtr,
         exit_notifier: tokio::sync::mpsc::Sender<()>,
         nt: NetworkTuple,
         pkt_sdr: PacketSender,
-        waiting: TcpState,
         last_ack_timeout: Duration,
         last_ack_max_retries: usize,
     ) {
         let hint = "[task_fin_unacked]";
+        let unacked = |state| matches!(state, TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck);
         for idx in 1..=last_ack_max_retries {
             tokio::time::sleep(last_ack_timeout).await;
             let tcb = tcb.lock().unwrap();
             let state = tcb.get_state();
-            if state != waiting {
+            if !unacked(state) {
                 log::debug!("{nt} {state:?}: {hint} our FIN was acknowledged or the session ended");
                 return;
             }
@@ -710,12 +790,13 @@ async fn tcp_main_logic_loop(
         tokio::time::sleep(last_ack_timeout).await;
         {
             let mut tcb = tcb.lock().unwrap();
-            if tcb.get_state() != waiting {
+            let state = tcb.get_state();
+            if !unacked(state) {
                 return;
             }
             reset_and_close(hint, &pkt_sdr, nt, &mut tcb);
             tcb.close_with(std::io::ErrorKind::TimedOut);
-            log::warn!("{nt} {waiting:?}: {hint} our FIN was never acknowledged, the session is reset");
+            log::warn!("{nt} {state:?}: {hint} our FIN was never acknowledged, the session is reset");
         }
         exit_notifier.send(()).await.unwrap_or(());
     }
@@ -748,7 +829,7 @@ async fn tcp_main_logic_loop(
                 tcb.change_state(waiting);
                 log::debug!("{network_tuple} {state:?}: our FIN sent, now {waiting:?}");
                 let (tcb, up) = (tcb_clone.clone(), up_packet_sender.clone());
-                tokio::spawn(task_fin_unacked(tcb, exit_notifier.clone(), network_tuple, up, waiting, config.last_ack_timeout, config.last_ack_max_retries));
+                tokio::spawn(task_fin_unacked(tcb, exit_notifier.clone(), network_tuple, up, config.last_ack_timeout, config.last_ack_max_retries));
                 shutdown.lock().unwrap().ready();
             }
         }
@@ -838,7 +919,11 @@ async fn tcp_main_logic_loop(
 
         tcb.update_duplicate_ack_count(incoming_ack);
 
+        let unacked = tcb.get_inflight_packets_total_len();
         tcb.update_inflight_packet_queue(incoming_ack);
+        if tcb.get_inflight_packets_total_len() < unacked {
+            state_notify.notify_waiters();
+        }
 
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
 
@@ -997,14 +1082,31 @@ async fn tcp_main_logic_loop(
                 if flags & FIN == FIN && pkt_type != PacketType::KeepAlive && tcb.get_ack() == end {
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                    // Both FINs sent; ours unacknowledged is a simultaneous close, which
-                    // waits in TIME-WAIT as well.
-                    tcb.change_state(TcpState::TimeWait);
                     read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
-                    log::trace!("{network_tuple} {state:?}: the app's FIN taken, now TimeWait");
+                    if tcb.get_state() == TcpState::FinWait2 {
+                        tcb.change_state(TcpState::TimeWait);
+                        tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
+                        log::trace!("{network_tuple} {state:?}: the app's FIN taken, now TimeWait");
+                    } else {
+                        // Sieve (2026-11-09, P3-1): a simultaneous close. Ours is still
+                        // unacknowledged, so it waits in CLOSING, resent (`task_fin_unacked`);
+                        // upstream went to TIME-WAIT and stopped resending it.
+                        tcb.change_state(TcpState::Closing);
+                        log::trace!("{network_tuple} {state:?}: the app's FIN crossed ours, now Closing");
+                    }
                 } else if flags & FIN == FIN && pkt_type != PacketType::KeepAlive && len == 0 {
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                }
+            }
+            TcpState::Closing => {
+                if flags & ACK == ACK && incoming_ack == tcb.get_seq() {
+                    tcb.change_state(TcpState::TimeWait);
+                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
+                    log::trace!("{network_tuple} {state:?}: our FIN acknowledged, now TimeWait");
+                } else if flags & FIN == FIN {
+                    // The app's FIN again, our ACK of it lost: our FIN, at its own
+                    // sequence, acknowledges it too.
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, Some(tcb.get_seq() - 1), None)?;
                 }
             }
             TcpState::TimeWait if flags & (ACK | FIN) == (ACK | FIN) => {

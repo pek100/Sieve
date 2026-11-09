@@ -23,10 +23,37 @@ struct Meter {
     down: AtomicU64,
 }
 
+/// What an app end's [`Abort::closed`] and [`Abort::drained`] return.
+pub type Ended = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// The longest a reset of the app's side waits for the bytes already written to it
+/// to be acknowledged ([`drain_then_abort`]): a few of ipstack's retransmissions.
+pub const RESET_DRAIN_BOUND: Duration = Duration::from_secs(5);
+
 /// An app end that can be torn down at once. A reset does not stop a page's own
 /// retries (live, 2026-11-06: about 730 in 15 s with a FIN or an RST alike).
 pub trait Abort {
     fn abort(&self);
+    /// Completes once the app's connection is gone, however it ended; never for an
+    /// end that cannot tell.
+    fn closed(&self) -> Ended {
+        Box::pin(std::future::pending())
+    }
+    /// Completes once every byte written to the app is acknowledged, or its
+    /// connection is gone; at once for an end that cannot tell.
+    fn drained(&self) -> Ended {
+        Box::pin(std::future::ready(()))
+    }
+}
+
+/// The reset of an app side whose server reset after its answer: what was written
+/// to the app goes first, for [`RESET_DRAIN_BOUND`] at most.
+///
+/// Sieve (2026-11-09, P3-2): the reset went at once, so bytes still in flight to the
+/// app, a lost segment's resend among them, never reached it.
+pub async fn drain_then_abort<A: Abort + ?Sized>(app: &A) {
+    let _ = tokio::time::timeout(RESET_DRAIN_BOUND, app.drained()).await;
+    app.abort();
 }
 
 /// The app's end. Clones share one stream: a dropped ipstack stream leaves the
@@ -116,6 +143,12 @@ impl<A: Abort> Abort for AppSide<A> {
     fn abort(&self) {
         AppSide::abort(self);
     }
+    fn closed(&self) -> Ended {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).closed()
+    }
+    fn drained(&self) -> Ended {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).drained()
+    }
 }
 
 /// A stream whose first reads come from `prefix`.
@@ -161,8 +194,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 /// The pass-through: the held bytes, in order and once, then both directions
 /// to the end, half-closes passed on. True when the held bytes reached it. A copy
 /// that ends with an error (the app's reset among them) resets upstream rather than
-/// closing it, so a cut-short upload does not look complete (`flow::relay`).
-pub async fn splice<A, U>(app: &mut A, mut upstream: U, held: &[u8]) -> bool
+/// closing it, so a cut-short upload does not look complete (`flow::relay`). An app
+/// connection gone under the copy (`app_closed`) ends it so too: once the app
+/// half-closed only the server is read, and a reset of the app's side went unseen
+/// until the server acted (P2-b).
+pub async fn splice<A, U>(app: &mut A, mut upstream: U, held: &[u8], app_closed: impl Future<Output = ()>) -> bool
 where
     A: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Reset + Unpin,
@@ -170,7 +206,12 @@ where
     if upstream.write_all(held).await.is_err() {
         return false;
     }
-    if tokio::io::copy_bidirectional(app, &mut upstream).await.is_err() {
+    let copied = tokio::select! {
+        biased;
+        copied = tokio::io::copy_bidirectional(app, &mut upstream) => copied.is_ok(),
+        () = app_closed => false,
+    };
+    if !copied {
         upstream.reset();
     }
     true
@@ -217,7 +258,7 @@ mod tests {
     async fn splice_replays_and_passes_half_closes() {
         let (mut client, mut app) = tokio::io::duplex(1024);
         let (up, mut server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(async move { splice(&mut app, up, b"HELD").await });
+        let task = tokio::spawn(async move { splice(&mut app, up, b"HELD", std::future::pending()).await });
         client.write_all(b"more").await.unwrap();
         client.shutdown().await.unwrap();
         let mut got = Vec::new();

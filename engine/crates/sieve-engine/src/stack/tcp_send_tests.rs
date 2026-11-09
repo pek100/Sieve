@@ -868,6 +868,182 @@ async fn a_streams_handle_tells_its_idle_time_and_resets_it() {
         assert!(end.as_ref().is_some_and(|e| e.rst), "{flow:?}: {end:?}");
         use tokio::io::AsyncReadExt;
         let mut byte = [0u8; 1];
-        assert!(tokio::time::timeout(END_HEARD, app.read(&mut byte)).await.is_ok(), "{flow:?}: the reader heard of it");
+        let read = tokio::time::timeout(END_HEARD, app.read(&mut byte)).await.unwrap_or_else(|_| panic!("{flow:?}: the reader never heard of it"));
+        // P2-a: an aborted flow reads as cut short, not as the app's end: the relay
+        // passes it upstream as a reset and stops, where it sent a FIN and waited on.
+        assert_eq!(read.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionAborted), "{flow:?}");
+    }
+}
+
+/// An upstream in memory that records whether the relay reset it.
+struct Recorded {
+    inner: tokio::io::DuplexStream,
+    reset: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::flow::relay::Reset for Recorded {
+    fn reset(&self) {
+        self.reset.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl tokio::io::AsyncRead for Recorded {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Recorded {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, data: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// P2-b: the app sends its request and half-closes; the server never answers; the
+/// stack resets the app's side at its idle limit. The relay, reading only the server
+/// by then, ends at once and resets upstream, where its task, socket and book entry
+/// lived until the server acted. Through the relay and the stream the engine runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_closed_flow_the_stack_resets_ends_its_relay_and_resets_upstream() {
+    const SHORT_IDLE: Duration = Duration::from_millis(400);
+    const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: slow.example\r\n\r\n";
+    for flow in FLOWS {
+        let mut short = super::relay::tcp_config();
+        short.timeout = SHORT_IDLE;
+        let (mut peer, mut app) = peer(flow, short).await;
+        let (near, mut server) = tokio::io::duplex(64 * 1024);
+        let reset = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let up = Recorded { inner: near, reset: reset.clone() };
+        let relay = tokio::spawn(async move {
+            let closed = app.closed();
+            crate::flow::relay::relay_tcp_until(&mut app, up, super::relay::FIRST_BYTES_WAIT, |_| crate::flow::flows::Action::Pass, closed).await
+        });
+        peer.send(true, REQUEST);
+        use tokio::io::AsyncReadExt;
+        let mut got = Vec::new();
+        tokio::time::timeout(RECOVERY, server.read_to_end(&mut got)).await.expect("the request and the half-close upstream").unwrap();
+        assert_eq!(got, REQUEST, "{flow:?}");
+        let end = peer.until_end(RECOVERY).await;
+        assert!(end.as_ref().is_some_and(|e| e.rst), "{flow:?}: the control, the stack reset the app's side: {end:?}");
+        let out = tokio::time::timeout(END_HEARD, relay).await.unwrap_or_else(|_| panic!("{flow:?}: the relay waited on the server")).unwrap();
+        assert!(out.reset_upstream && reset.load(std::sync::atomic::Ordering::SeqCst), "{flow:?}: upstream was not reset: {out:?}");
+        assert_eq!(out.bytes_up, REQUEST.len() as u64, "{flow:?}");
+        drop(server);
+    }
+}
+
+/// P3-2: a server that resets right after its answer: the app gets every byte of it
+/// before the reset, here a lost segment's resend, where the reset went at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_after_the_answer_lets_its_bytes_reach_the_app_first() {
+    const ANSWER: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    for flow in FLOWS {
+        let mut fast = super::relay::tcp_config();
+        fast.rto = Duration::from_millis(100);
+        let (mut peer, mut app) = peer(flow, fast).await;
+        app.write_all(ANSWER).await.unwrap();
+        let ender = tokio::spawn(async move {
+            crate::tls::splice::drain_then_abort(&app).await;
+            app
+        });
+        let (mut sends, mut lost, mut delivered, mut rst_after) = (0, false, false, None);
+        let deadline = Instant::now() + RECOVERY;
+        while let Ok(Some(packet)) = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), peer.from_stack.recv()).await {
+            let (h, payload) = tcp(&packet);
+            if h.rst {
+                rst_after = Some(delivered);
+                break;
+            }
+            if !payload.is_empty() {
+                sends += 1;
+                // The first send is lost; the resend is taken and acknowledged.
+                if !lost {
+                    lost = true;
+                    continue;
+                }
+                assert_eq!(payload, ANSWER, "{flow:?}");
+                delivered = true;
+                peer.server_next = h.sequence_number.wrapping_add(u32::try_from(payload.len()).unwrap());
+                peer.send(false, &[]);
+            }
+        }
+        assert_eq!(rst_after, Some(true), "{flow:?}: the reset came before the answer reached the app ({sends} sends)");
+        let _ = tokio::time::timeout(RECOVERY, ender).await.expect("bounded");
+    }
+}
+
+/// P3-3: the server's bytes on their way to the app are use too, so a paused download
+/// or a long poll whose server just answered is not the idlest flow at the cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streams_handle_counts_the_engines_writes_as_use() {
+    for flow in FLOWS {
+        let (_peer, mut app) = peer(flow, super::relay::tcp_config()).await;
+        let handle = app.handle();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(handle.idle() >= Duration::from_millis(250), "{flow:?}: the control: {:?}", handle.idle());
+        app.write_all(b"the server's next bytes").await.unwrap();
+        assert!(handle.idle() < Duration::from_millis(250), "{flow:?}: a write is use: {:?}", handle.idle());
+    }
+}
+
+/// P3-6: nothing is written after our FIN, queued or sent: bytes past it would reach
+/// the app after its end, or never.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_is_written_after_our_fin() {
+    for flow in FLOWS {
+        let (mut peer, mut app) = peer(flow, super::relay::tcp_config()).await;
+        app.write_all(b"the last bytes").await.unwrap();
+        // Bytes in flight: the FIN is queued behind them.
+        assert!(tokio::time::timeout(Duration::from_millis(100), app.shutdown()).await.is_err(), "{flow:?}: the control, the FIN waits");
+        let queued = app.write(b"more").await.map_err(|e| e.kind());
+        assert_eq!(queued, Err(std::io::ErrorKind::BrokenPipe), "{flow:?}: a write after the FIN was queued");
+        let fin = peer.until_end(RECOVERY).await.expect("our FIN");
+        assert!(fin.fin, "{flow:?}: {fin:?}");
+        let sent = app.write(b"more").await.map_err(|e| e.kind());
+        assert_eq!(sent, Err(std::io::ErrorKind::BrokenPipe), "{flow:?}: a write after the FIN was sent");
+    }
+}
+
+/// P3-1: the app's FIN crosses ours (a simultaneous close): ours is still unacknowledged,
+/// so it is resent until the app acknowledges it, and only its ACK ends the close.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_simultaneous_close_resends_our_fin_until_it_is_acknowledged() {
+    // Resends at 1 s, 2 s and 3 s after our FIN: each look below ends well clear of one.
+    let mut config = super::relay::tcp_config();
+    config.last_ack_timeout = Duration::from_secs(1);
+    for flow in FLOWS {
+        let (mut peer, mut app) = peer(flow, config.clone()).await;
+        let engine = tokio::spawn(async move {
+            let _ = tokio::time::timeout(RECOVERY, app.shutdown()).await;
+            app
+        });
+        let fin = peer.until_end(RECOVERY).await.expect("our FIN");
+        assert!(fin.fin, "{flow:?}: {fin:?}");
+        let fin_seq = fin.seq;
+        // The app's FIN, sent before ours arrived: it acknowledges nothing of ours.
+        let their_fin = peer.client_next;
+        peer.send(true, &[]);
+        let sent = peer.listen(Duration::from_millis(1_300)).await;
+        assert!(sent.iter().any(|s| s.ack == their_fin.wrapping_add(1)), "{flow:?}: the app's FIN was not acknowledged: {sent:?}");
+        let fins: Vec<u32> = sent.iter().filter(|s| s.fin).map(|s| s.seq).collect();
+        assert!(!fins.is_empty(), "{flow:?}: our unacknowledged FIN was never resent: {sent:?}");
+        assert!(fins.iter().all(|&s| s == fin_seq), "{flow:?}: resent FINs at {fins:?}, ours is at {fin_seq}");
+        assert!(sent.iter().all(|s| !s.rst), "{flow:?}: {sent:?}");
+        // The app's FIN again (our ACK of it lost): our FIN answers it, at its sequence.
+        peer.send_at(their_fin, fin_seq, true, &[]);
+        let again = peer.listen(Duration::from_millis(200)).await;
+        assert!(again.iter().any(|s| s.fin && s.seq == fin_seq && s.ack == their_fin.wrapping_add(1)), "{flow:?}: {again:?}");
+        // Its ACK ends the close: nothing more is sent.
+        peer.server_next = fin_seq.wrapping_add(1);
+        peer.send(false, &[]);
+        let after = peer.listen(Duration::from_millis(1_200)).await;
+        assert!(after.iter().all(|s| !s.fin && !s.rst), "{flow:?}: still closing after its ACK: {after:?}");
+        let _ = engine.await;
     }
 }

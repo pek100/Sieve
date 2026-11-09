@@ -35,7 +35,7 @@ use super::active::{Active, Registered};
 use super::ech::{EchCache, usable_config};
 use super::first_bytes::{First, Waits, read_first};
 use super::server::{server_config, speaks_to};
-use super::splice::{Abort, AppSide, Prefixed, splice};
+use super::splice::{Abort, AppSide, Ended as AppEnded, Prefixed, drain_then_abort, splice};
 use super::upstream::{HandshakeEnd, Handshaken, LeafFacts, Verifier, alert_in, filter_alpn, handshake, is_post_handshake_auth, leaf_facts, rustls_error};
 use super::verdict::{Cached, VerdictCache};
 use crate::ca::{CaError, LeafRequest, Minter};
@@ -44,7 +44,7 @@ use crate::domain::{FilterSlot, Owner};
 use crate::exclusions::{AutoEntry, ExclusionSlot};
 use crate::flow::classify::{Decoded, Kind};
 use crate::flow::flows::Action;
-use crate::flow::relay::{Reset, relay_tcp};
+use crate::flow::relay::{Reset, relay_tcp_until};
 use crate::http::hook::ResponseHook;
 use crate::http::serve::{Ended, Proto, Serve, serve};
 use crate::stack::Meters;
@@ -338,10 +338,11 @@ impl<C: Dial> Interception<C> {
     /// the client's bytes go on a fresh one. A failed connect closes the app.
     async fn fresh_splice<A>(&self, app: &mut AppSide<A>, remote: SocketAddr, held: &[u8]) -> FlowAction
     where
-        A: AsyncRead + AsyncWrite + Unpin,
+        A: AsyncRead + AsyncWrite + Abort + Unpin,
     {
         let Ok(fresh) = self.connector.dial(remote).await else { return FlowAction::Failed };
-        if splice(app, fresh, held).await { FlowAction::Relayed } else { FlowAction::Failed }
+        let closed = app.closed();
+        if splice(app, fresh, held, closed).await { FlowAction::Relayed } else { FlowAction::Failed }
     }
 
     /// Step 4's handshake. A config rustls cannot use is no config. Any failure of
@@ -421,7 +422,8 @@ where
         return FlowAction::Blocked;
     }
     if decoded.kind != Some(Kind::Tls) {
-        return if splice(&mut app, upstream, &held).await { FlowAction::Relayed } else { FlowAction::Failed };
+        let closed = app.closed();
+        return if splice(&mut app, upstream, &held, closed).await { FlowAction::Relayed } else { FlowAction::Failed };
     }
     let host = decoded.domain.as_deref();
     let facts = deps.facts_for(Transport::Tcp, &decoded, &flow.who(&deps.filter));
@@ -431,7 +433,8 @@ where
     if let Decrypt::PassThrough(reason) = deps.first_look(facts, cached) {
         drop(registered);
         deps.not_decrypted(flow.id, &reason);
-        return if splice(&mut app, upstream, &held).await { FlowAction::Relayed } else { FlowAction::Failed };
+        let closed = app.closed();
+        return if splice(&mut app, upstream, &held, closed).await { FlowAction::Relayed } else { FlowAction::Failed };
     }
     // `decrypt` said a name is there, or it would have been `floor:no-sni`.
     let (Some(host), Some(registered)) = (host, registered) else { return FlowAction::Relayed };
@@ -517,11 +520,13 @@ where
         return FlowAction::Failed;
     }
     let side = app.clone();
+    let closed = app.closed();
     let mut replayed = Prefixed::new(held, app);
-    let out = relay_tcp(&mut replayed, upstream, FIRST_BYTES_WAIT, |d| (flow.decide)(d)).await;
-    // The server's side broke: the app hears a reset, not the FIN of a complete answer.
+    let out = relay_tcp_until(&mut replayed, upstream, FIRST_BYTES_WAIT, |d| (flow.decide)(d), closed).await;
+    // The server's side broke: the app hears a reset, not the FIN of a complete
+    // answer, once what reached it is acknowledged.
     if out.reset_app {
-        side.abort();
+        drain_then_abort(&side).await;
     }
     match (out.dropped, out.upstream_write_failed) {
         (true, _) => FlowAction::Blocked,
@@ -533,9 +538,10 @@ where
 /// Step 6.
 async fn intercept<A, C>(deps: &Interception<C>, mut app: AppSide<A>, shaken: Handshaken<C::Stream>, leaf: LeafFacts, registered: Registered, held: Vec<u8>, flow: &FlowMeta<'_>) -> FlowAction
 where
-    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A: AsyncRead + AsyncWrite + Abort + Unpin + Send + 'static,
     C: Dial,
 {
+    let app_closed = app.closed();
     let host = registered.host();
     let now = (deps.clock)();
     let minted = (deps.minter)().ok_or(PassReason::Floor(Floor::NoRoot)).and_then(|minter| match minter.leaf(LeafRequest { host, upstream_not_after_ms: leaf.not_after_ms }, now) {
@@ -591,7 +597,7 @@ where
     let ended = tokio::select! {
         biased;
         () = deps.must_end(&registered, flow.owner) => Ended::without_error(false),
-        ended = run_protocol(ctx.clone(), client, shaken.tls, shaken.alpn.as_deref()) => ended,
+        ended = run_protocol(ctx.clone(), client, shaken.tls, shaken.alpn.as_deref(), app_closed) => ended,
     };
     deps.after_serve(host, ended.upstream_error.as_ref());
     // Evidence about the client only if the client did it (task D17, plan 4.3).
@@ -606,8 +612,8 @@ where
 /// ALPN at all, HTTP/1.1 only if the first decrypted bytes parse as HTTP; else,
 /// and only once there are bytes, the two sessions are copied as plain bytes (plan
 /// 2.8), and a copy cannot say which side ended it, so it is no evidence about the
-/// client.
-async fn run_protocol<C, U>(ctx: Arc<Serve>, mut client: C, mut upstream: U, alpn: Option<&[u8]>) -> Ended
+/// client. `app_closed` is the app connection's end, which ends a copy too.
+async fn run_protocol<C, U>(ctx: Arc<Serve>, mut client: C, mut upstream: U, alpn: Option<&[u8]>, app_closed: AppEnded) -> Ended
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: AsyncRead + AsyncWrite + Reset + Unpin + Send + 'static,
@@ -620,12 +626,12 @@ where
             First::ClientGone { alert } => Ended { client_alert: alert, ..Ended::without_error(true) },
             First::Decoded { decoded, held } if decoded.kind == Some(Kind::Http) && decoded.domain.is_some() => serve(ctx, Prefixed::new(held, client), upstream, Proto::H1).await,
             First::Decoded { held, .. } => {
-                let _ = splice(&mut client, upstream, &held).await;
+                let _ = splice(&mut client, upstream, &held, app_closed).await;
                 Ended::without_error(false)
             }
             First::ServerSpoke { server, held } => {
                 if client.write_all(&server).await.is_ok() {
-                    let _ = splice(&mut client, upstream, &held).await;
+                    let _ = splice(&mut client, upstream, &held, app_closed).await;
                 }
                 Ended::without_error(false)
             }
