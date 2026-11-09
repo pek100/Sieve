@@ -438,6 +438,10 @@ pub(crate) struct RigOpts {
     pub(crate) watch: Arc<dyn ClientWatch>,
     /// The real `heal::Heal` as the watch, in place of `watch`.
     pub(crate) heals: bool,
+    /// The flows are an app's that is not a browser, decrypted as a `live-scope`
+    /// build decrypts it (every app in scope, no browser registered): the case of
+    /// self-healing's quiet-close rule, which a browser's closes never feed.
+    pub(crate) app: bool,
     pub(crate) clock: fn() -> u64,
     /// The exclusion lists the store loads.
     pub(crate) sources: Vec<crate::exclusions::lists::Source>,
@@ -448,7 +452,7 @@ pub(crate) struct RigOpts {
 
 impl RigOpts {
     pub(crate) fn new(roots: Arc<RootCertStore>) -> Self {
-        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, clock: wall_ms, sources: Vec::new(), ech: FakeLookup::none(), filter: None }
+        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, app: false, clock: wall_ms, sources: Vec::new(), ech: FakeLookup::none(), filter: None }
     }
 }
 
@@ -465,7 +469,11 @@ impl Rig {
         if !opts.skip_ev {
             slot = slot.without_ev_skip();
         }
-        slot.set_browsers(BrowserSet::read(&FakeBrowsers), wall_ms());
+        if opts.app {
+            slot = slot.with_scope(sieve_filter::exclusions::Scope::All);
+        } else {
+            slot.set_browsers(BrowserSet::read(&FakeBrowsers), wall_ms());
+        }
         let policy = Policy { sieving: true, https: true, ..Policy::default() };
         let minted = (ca.clone(), opts.minter);
         let slot = Arc::new(slot);
@@ -1942,6 +1950,11 @@ fn an_auto_entry_is_taken_back_by_its_pattern() {
 
 /// A rig whose watch is the real `Heal` on the rig's own store and meters.
 fn healing_rig(arm: Arm, alpn: &[&str]) -> (Rig, Arc<Heal>, Vec<u8>) {
+    healing_rig_of(arm, alpn, true)
+}
+
+/// [`healing_rig`], for an app that is not a browser (`app`) or for a registered browser.
+fn healing_rig_of(arm: Arm, alpn: &[&str], app: bool) -> (Rig, Arc<Heal>, Vec<u8>) {
     let pki = Pki::new("Test Public Root");
     let chain = pki.leaf(HOST, GOOD);
     let upstream_leaf = chain.0[0].to_vec();
@@ -1957,7 +1970,7 @@ fn healing_rig(arm: Arm, alpn: &[&str]) -> (Rig, Arc<Heal>, Vec<u8>) {
             echo(tls).await;
         }
     });
-    let rig = Rig::new(TestDial::new(arm, handler), RigOpts { heals: true, ..RigOpts::new(pki.roots()) });
+    let rig = Rig::new(TestDial::new(arm, handler), RigOpts { heals: true, app, ..RigOpts::new(pki.roots()) });
     let heal = rig.heal.clone().expect("heals");
     (rig, heal, upstream_leaf)
 }
@@ -2016,6 +2029,23 @@ arms!(repeated_silent_clients_exclude_and_the_next_passes_through, |arm| async m
     }
     assert!(heal.notices(0).1.is_empty(), "one fewer is not enough");
     silent_client(&rig, &[]).await;
+    passes_untouched(&rig, &upstream_leaf).await;
+});
+
+// Run 7: a registered browser's handshakes closed at once or given up, again and again
+// (tabs, preconnects), never exclude; its refusal with an alert still does, after one.
+arms!(a_browsers_quiet_closes_never_exclude_but_its_alert_does, |arm| async move {
+    let (rig, heal, upstream_leaf) = healing_rig_of(arm, &[], false);
+    for _ in 0..2 * QUIET_CLOSES {
+        silent_client(&rig, &[]).await;
+        next_burst().await;
+    }
+    for _ in 0..2 * QUIET_CLOSES {
+        closes_during_the_handshake(&rig, &[]).await;
+        next_burst().await;
+    }
+    assert!(heal.notices(0).1.is_empty(), "a browser's quiet closes and handshakes given up");
+    pinned_client_fails(&rig).await;
     passes_untouched(&rig, &upstream_leaf).await;
 });
 
@@ -2103,7 +2133,7 @@ fn answering_rig(arm: Arm, alpn: &str) -> (Rig, Arc<Heal>) {
             let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
         }
     });
-    let rig = Rig::new(TestDial::new(arm, handler), RigOpts { heals: true, ..RigOpts::new(pki.roots()) });
+    let rig = Rig::new(TestDial::new(arm, handler), RigOpts { heals: true, app: true, ..RigOpts::new(pki.roots()) });
     let heal = rig.heal.clone().expect("heals");
     (rig, heal)
 }

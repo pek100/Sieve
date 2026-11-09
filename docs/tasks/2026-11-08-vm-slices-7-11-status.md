@@ -1,5 +1,141 @@
 # VM live run 2026-11-08: status at the stop
 
+## Run 7 (2026-11-09): compatibility, tracking protection, slice 7 U1, the capture again
+
+Branch `worktree-agent-a1b155524f016d23b` on main 6e5f7f2. Main was built with `pnpm tauri build` and its installer installed silently over the old one (exit 0): engine 9F47E8B3, app BACF06A1. Fixes on this branch, each with tests that fail without it: c518da7 (the TCP stack reads the app's FIN and RST at once, and a half-closed app still gets its answer), 8481d53 (self-healing: a registered browser's silence is no evidence, only its alerts) and 71599fc (an idle connection lives two hours, not a minute). Engines on the VM: **main** 9F47E8B3; **fix1** C91A76E4 (c518da7); **fix2** CBB585ED (c518da7 plus the quiet-close half of 8481d53); **fix3** 52DFF988 (8481d53); **fix4** 052BC67C (71599fc, the branch head); live-scope builds of main, fix1, fix2 (1C570BE1) and, for evidence only, of main and fix1 with every piece of heal evidence printed to a file (VM only, never committed). Runtime switches and reads went through a VM-only pipe client in the app's place (status, policy merge, log subscription, issues, exclusions, notices); the real app went back before the uninstall.
+
+Arms: **off** = policy `engine` false; **on** = routing and filtering; **icpt** = on plus `https`. The CLI checks ran as SYSTEM in session 0, which Sieve never decrypts (`floor:service`), and only registered browsers are decrypted at all (`exclusions::SCOPE`), so for every app below that is not a browser, icpt is on plus the floor's pass-through: the icpt battery counted `passed` +113 and `intercepted` 0. The VM quirk held: Ethernet's IPv4 metric was 1 after the boot and was set back to automatic before the checks.
+
+### Section 1: compatibility (docs/live/compatibility.md)
+
+Times in seconds, off / on / icpt, main unless named. Every check worked in every arm unless the row says otherwise.
+
+| Check | Off | On | Icpt | Notes |
+|---|---|---|---|---|
+| Windows Update scan | 14 | 4.4 | 3.5 | 1 update (KB5007651, Defender platform), result 2 every time |
+| Windows Update download, cache emptied first, 21.7 MB | 5.3; 29.4, 3.0, 4.6 | 34.7; 4.0, 12.8, 10.3 | 4.7 | Delivery Optimization `CdnOnly`, 0 bytes from peers; the spread is as wide off as on |
+| Defender signatures (Microsoft Update, MMPC) | 162, 0.8 | 54, 0.6 | 206, 1.3 | exit 0, "no updates needed" each time (`-RemoveDefinitions -All` did not force a download); the MU time varies by minutes in every arm |
+| Store, Edge/Chrome/Firefox through the Store | SKIP | | | no Store on Windows Server |
+| winget install jq 1.6 then upgrade | SKIP | | | winget exits 0xC0000135 (a DLL missing) as SYSTEM in every arm; App Installer 1.29 is present |
+| Chocolatey: jq 1.6 then upgrade to 1.8.2 | 21.4 | 21.9 | 22.5 | |
+| npm install (10 packages, 99 in node_modules, empty cache) | 43.8 | 43.7 | 44.3 | |
+| pip install requests numpy flask, no cache | 20.1 | 20.4 | 20.1 | |
+| git clone --depth 200 + fetch --deepen 300 over HTTPS | 5.1 | 5.3 | 5.4 | 3163 commits each |
+| git over SSH (github.com) | 0.3 | 0.3 | 0.3 | key exchange and host key fine up to "Permission denied (publickey)"; a clone needs a key: SKIP |
+| steamcmd anonymous, app 1007 (65 MB) from scratch | 24.9 | 22.7 | 22.3 | "Success! App '1007' fully installed" |
+| Steam client: package folder emptied, bootstrapper downloads it again | 15.5 | 24.8 | 29.8 | 236 MB each, "Download complete" (fix3 engine; single samples, from the launch). The first try stopped watching too early in the on arms and is not used |
+| Edge updater, last check cleared, `/ua` | 31.4 | 50.9 | 25.8 | `LastChecked` set each time (on a first try without clearing it, the updater skipped its check in every arm) |
+| Chrome updater `--wake --system` | 3.7 | 3.3 | 4.3 | "Run result 0" |
+| Firefox background update task | SKIP | | | exits 11 in every arm, off too (the task does not run headless as SYSTEM) |
+| VS Code: ms-python.python from the marketplace (CLI) | 74, 67.7 | 68.6, 75 | 72.2 | |
+| VS Code's own update check (its window, session 1) | ok | ok | ok | `checking for updates` then `idle` within 30 s |
+| Discord: fresh install, its updater fetches the host and modules | 25.6 | 20.2 | 20.7 | `discord_desktop_core` installed each time |
+| BITS, 370 MB, suspended and resumed | 13.8 | 13.2, 15.5 | 11.3 | same sha256 every time. The first source (a speed-test host) failed off too (BITS: "invalid or unrecognized response"), so a CDN file replaced it |
+| curl: 20 MB range, then `-C -` to the end of 100 MB | 2.1 | 1.7, 2.1 | 1.8 | 206, same sha256 every time |
+| 127.0.0.1 and [::1] HTTP | ok | ok | ok | 15 ms / 3 ms (first request of a new server) |
+| Local "DB" port: 1000 round trips on 127.0.0.1, [::1], the LAN address | 0.020 ms | 0.021 | 0.022 | medians; p99 0.13 to 0.21 ms |
+| WebSocket on loopback, 1000 messages | 0.032 ms | 0.032 | 0.032 | |
+| Vite dev server, hot reload over its WebSocket | 32 ms | 35 | 32 | from a change of main.js to the `update` message |
+| SMB to `\\localhost\C$` and to the LAN address | ok | ok | ok | |
+| GCP metadata server 169.254.169.254 | 40 ms | 30 | 40 | |
+| LAN DNS server queried directly (`-Server 10.128.0.1`) | ok | ok | ok | on: the query goes into Sieve's adapter, by design (the capture routes the adapter's DNS server to the engine), and is answered |
+| mDNS own `.local` name | ok | ok | ok | on: Sieve's two addresses listed after Ethernet's (known, run 5) |
+| SSDP M-SEARCH and metadata traffic on Sieve's adapter | 0 | 0 | 0 | pktmon per component: only the port-53 queries of the row above reach it |
+| HTTP proxy (CONNECT), local | 0.17 s | 0.22 | 0.22 | through a local Node proxy |
+| HTTP proxy, plain GET | 200 | 200 | 200 | to a reliable plain host. The first target, neverssl.com, gave 502 after 10 s on and took 3.7 to 15 s off (a slow host), so it was replaced |
+| SOCKS5 proxy | 0.16 | 0.18 | 0.19 | |
+| Updater through the WinHTTP system proxy (WU scan + Defender MMPC) | ok | ok | ok | the proxy saw the Windows Update and delivery hosts each time; proxy reset after |
+| Edge through the user's system proxy, then a PAC file | 200, 200 | 200, 200 | 200, 200 | 3 CONNECTs and the PAC served each time; settings reverted |
+| STUN to stun.l.google.com, 500 requests 20 ms apart | 500/500, 1.7 ms | 500/500, 2.2 | 500/500, 1.9 | mapped address the VM's own each time |
+| 2,000 TCP connections at once to public :443 | 2000, 225 ms | 2000, 705 | 2000, 743 | median time to connect; a TLS handshake meanwhile 62 / 98 / 92 ms. Sieve's own stack answers each SYN after its upstream connect, so a burst costs about +0.5 s per connection; none failed |
+| **A client that half-closes after its request** (HTTP/1.0, `shutdown(SEND)`) | 404 page, 142 bytes | **0 bytes** | **0 bytes** | **Bug, fixed in c518da7**: fix1 gives the same 142 bytes in both arms (78 and 49 ms). www.example.com answers 0 bytes to this even with Sieve off |
+| Torrent: Debian 13.7 netinst (763 MB), 240 s, qBittorrent 5.3 | done at 25 s | 32 s | 31 s | fix1 engine. Peers up to 100 each; DHT 123 / 241 / 256 nodes; uTP peers 413 / 484 / 481; PEX flags 522 / 754 / 421; incoming peers 8 / 14 / 8 (all uTP); upload 0 MB (no leecher asked in 4 minutes). GCP rule for 51413 tcp/udp opened only for these runs, then deleted |
+| Torrent replies | | | | libtorrent listens on every address (10.128.0.2, Sieve's 198.18.0.1 and fd53::1, loopback), so a reply to a peer that came in on Ethernet leaves from the 10.128.0.2 socket; pktmon saw 136,440 (on) and 199,670 (icpt) packets from port 51413 on Sieve's adapter, which are libtorrent's own sockets on Sieve's addresses talking to peers it dialled. Incoming peers connected in every arm |
+| Idle SSH into the VM (from outside, silent 30 min) | | | ok | fix3, after the reboot: the session sent nothing for 30.05 min and then printed its line. 2 h not run for time |
+| **An idle outbound connection** (WebSocket to a public echo, silent, then one message) | 2 min: echoed | **reset at 1.00 min** | **reset at 1.00 min** | **Bug, fixed in 71599fc**: ipstack's 60 s session timeout reset every connection idle for a minute (main 9F47E8B3 and the fixed engines alike; a plain TCP connection to a public :443 left silent for 90 s was reset at 65 s). With 71599fc (052BC67C): 3 min silent, echoed; 90 s silent then a TLS handshake, fine. So an outbound idle SSH session through Sieve could not have lived 2 h, and was not run |
+| RDP into the VM from outside (X.224 negotiation to its public address) | 399 ms | 484 ms | 640 ms | Connection Confirm, CredSSP selected; the reply went back out the NIC. No RDP client session (nothing to log on to from the VM) |
+| Video call | SKIP | | | none installable and nothing to call on the VM |
+| IPv6-only host | SKIP | | | the VM has no IPv6 route |
+| System log (Wintun, Tcpip, NDIS, BFE, WFP, bugcheck) | 0 | 0 | 0 | no error or warning from those providers in any arm |
+
+"Having trouble" (the Issues view) listed **0 apps** after every on and icpt battery: nothing failed in a way the engine records. It also missed both real Sieve-caused breaks of this run: the half-close (the app got a FIN and nothing else) and the idle reset (the stack's own RST), for neither of which a signal fires. The invisible connect retry did not fire (no app showed `retried`), and per-app fail-open did not fire (`failed_open` 0 throughout). Log rows: the CLI apps' rows are `passed (no_rule)` and, with interception on, `not_decrypted (floor:service)`.
+
+### Section 3: slice 7 U1 (curl with its own CA bundle is never healed)
+
+**Cause.** curl 8.21 (Schannel), live-scope build of main, curl run in session 1 (from session 0 curl is never decrypted, `floor:service`, so this run's first try passed through untouched), `--cacert` holding the 33 public roots without Sieve's, www.wikipedia.org, six tries 2 s apart. Each failed with "untrusted root" in 0.15 s; `intercepted` +6, `healed` 0, no exclusion; the log rows `passed (no_rule)`. The evidence print showed six `Accepted` and no `Ended` until **exactly 30.00 s after each handshake** (`Ended(Some(Silence { after: 30.0022644s, alert: None }))`). pktmon: curl completed the handshake (its 80-byte Finished), then sent a bare FIN 16 ms later, which the engine's stack acknowledged and answered with its own FIN within 0.2 ms. The vendored ipstack never woke the reader for a FIN (nor for a RST, nor on reaching CLOSED), so the intercepted connection sat in hyper until its 30 s request-head timeout. A close 30 s after the handshake is no quiet close (`SILENT_CLOSE_MS` is 2 s), and the connection still counted as open blocked the evidence of the next five.
+
+**Fix (c518da7, vendored ipstack).** The reader reads the end right after the app's queued bytes on FIN, RST or a closed session; a FIN that carries data (FIN|PSH|ACK, which matched no branch and was dropped) is taken in order; a FIN ahead of a gap waits for the missing bytes; and after the app's FIN the stack's own FIN waits for the engine's shutdown or the stream's drop (it went out with the ACK of the app's: the half-close bug of section 1). The heal rules are unchanged by it. Unit tests in `stack::tcp_send_tests` through a real `IpStack` in memory, each failing on the old stack; `stack::`, `quic::`, `watchdog::`, `control::`, `heal::`, `tls::tests`, `exclusions::` and ipstack's own tests pass; clippy clean. Seen live with the fix: a client socket that has already closed now receives the engine's late bytes (TLS close_notify) and its Windows stack answers with a RST, as it does against a direct server.
+
+**Live, fix1 live-scope.** The same six tries: tries 1 to 3 failed, tries 4 to 6 got 200 with the real chain (`not_decrypted (auto:pinning)`); `healed` +1; exclusions.json one `pinning` row for curl.exe on www.wikipedia.org; each `Ended` heard 14 to 16 ms after the handshake. fix2's live-scope build: the same (1C570BE1).
+
+**The protections, rechecked.** The fix made silent ends visible in time, so browsing had to be checked again. 12 minutes of browsing (20 sites, Edge and Chrome alternating, fresh and kept profiles, a 1.5 s watch per page):
+
+| Engine | Passes, loads | `intercepted` | `auto:pinning` rows | `healed` | `failed_open` |
+|---|---|---|---|---|---|
+| fix1 | 10, 200/200 | 2742 | **1: usher.ttvnw.net for msedge** | 1 | 0 |
+| fix2 (browsers' quiet closes no evidence) | 10, 199/200 | 2470 | 0 | 0 | 0 |
+| fix3 (browsers' silence no evidence) | 10, 200/200 | 2481 | 0 | 0 | 0 |
+
+So run 2's clean U5 (340 loads, 0 rows) partly rested on the stack's bug: browsers' silent ends were heard 10 to 60 s late, mostly beside another open connection of the pair. With the evidence print (fix1), four Twitch loads in Edge showed the video host's connections each carrying a request (`Used`, then `Ended(None)`), so which silent end excluded usher in the browsing run was not caught; 8481d53 therefore takes both silent kinds from browsers. Firefox without Sieve's root (enterprise roots off) shows how a browser refuses: `Refused(Some(UnknownCA))` in the handshake and `Ended(... alert: Some(UnknownCA), after 1.1 ms)` right after one, each excluding its site at once (three Mozilla hosts). Per-app fail-open counts alerts only, as before.
+
+Not done: U2 (Discord and Steam are installed now, but they are not browsers and are never decrypted outside live-scope; not run under live-scope), U3 (app action), U8 (toast).
+
+### Section 2: tracking protection (plan 2026-11-09, live checks)
+
+The origin: a small Node server on the VM behind two Cloudflare quick tunnels (no account; `trycloudflare.com` is a public suffix, so the two tunnel names are two sites, A and B), logging every request as it arrived. The page on A loads from B a cross-site fetch, an image, a `Set-Cookie` response (a cookie with `Max-Age=86400`, one with `Expires` a day out, a session cookie) and a deletion (`Max-Age=0`), and from A a same-site fetch carrying `X-Client-Data` (Chrome sends that header only to Google, so the page sends it); the page asks for `unsafe-url` referrers so that only Sieve can cut them. Then a link to A with `utm_source` and `fbclid`, a page that sends its clean address back to itself with `utm_source` (302), and an OAuth-like hop from B to A's callback that sets a first-party cookie. Edge 157 and Chrome 157 through playwright-core (fresh context each), Firefox 159 headless with a fresh profile (its cookies read from `cookies.sqlite`, its redirect count from the page). Interception and content filtering on, fix3 engine, the options set in `policy.json` (the options are hidden in the UI). Every number below is the same in all three browsers unless named.
+
+| Arm (`tracking`) | At the origin, cross-site | Same-site `X-Client-Data` | Link with utm_source + fbclid | Insisting site | Cross-site cookies as the browser got them | Log rows' changes |
+|---|---|---|---|---|---|---|
+| Sieve off | no Sec-GPC/DNT; full referrer (Firefox: origin only, its own default) | present | 200, both kept | 200 | unchanged | (no rows) |
+| none (every option off) | as off | present | **307**, fbclid removed, utm_source kept: the default lists' `$removeparam`, which act whatever the options say (plan); row `params_removed`, no change named | 200, untouched | unchanged | none |
+| minimal (gpc, clientData) | `Sec-GPC: 1`, `DNT: 1`; referrer full | **removed** | as none | 200 | unchanged | `gpc:2` on every row (details only), `clientData:1` on the same-site fetch; outcomes stay Passed |
+| balanced (+ searchQueries, queryParams) | GPC, DNT; referrer **cut to the origin** (Edge, Chrome; Firefox had sent only the origin already) | removed | **one 307**, both removed, `keep=1` kept; the origin never saw the tagged address; Firefox `redirectCount` 1 | **307 > 302 > 200**: the origin got the clean address, then the one with `utm_source=insist` it asked for; row `passed (params_kept)` | unchanged | `searchQueries:1` on B's rows, `queryParams:1` on the link's row (`params_removed`) |
+| strict (+ referrer, thirdPartyCookies) | GPC, DNT; **no referrer** | removed | one 307 | as balanced | `Max-Age=86400` became `Max-Age=3600`; the `Expires` cookie got `Max-Age=3600` (Firefox stored it with 3600 s); the session cookie and the deletion (`Max-Age=0`) unchanged | `referrer:1`, `thirdPartyCookies:2` on the cookie response |
+| sign-in hop B to A's callback (every arm) | | | | | A's `sess` cookie `Max-Age=86400` unchanged in strict (Firefox: 86400 s): a top-level navigation is first-party | |
+
+Profiles: the app's levels (`src/core/tracking.ts`, registry presets) are minimal = gpc, clientData; balanced = + searchQueries, queryParams; strict = + referrer, thirdPartyCookies; webRtc, push, location and firstPartyCookies in none. Those are the sets the arms above sent, and each produced exactly its documented changes and no other.
+
+| Arm | Result |
+|---|---|
+| all ten options | page script (content on): `RTCPeerConnection` undefined, geolocation permission reads `denied` (`PushManager` stays an object; its `subscribe` refusing was not exercised); `webRtc:1, push:1, location:1` on the page's row. With `firstPartyCookies` A's callback cookie was capped too (Firefox: 3600 s), as documented |
+| exception `@@||A^$removeparam=utm_source` (balanced) | one 307 that removes fbclid and keeps utm_source; the insisting page keeps its utm_source with no 307 |
+| exception `@@||A/land` (balanced) | no 307, both parameters arrive (the lists' `$removeparam` honours it too); rows `passed (exception)` |
+| options off vs Sieve off | with every option off the requests arrived as with Sieve off (no GPC/DNT, `X-Client-Data` and the full referrer kept, cookies unchanged), except fbclid, which the default lists' `$removeparam` remove whatever the options say |
+
+Not checked: a page that is not decrypted (a floor site) keeping its own `navigator` values (no floor host could carry the probe page), `PushManager.subscribe`, and geolocation's own call (headless Chromium denies it with Sieve off too). `navigator.globalPrivacyControl` read true and `doNotTrack` "1" in every arm with gpc on, as the page was rewritten anyway (content on).
+
+### Section 4: the capture on this build
+
+fix3 engine, Resolve-DnsName of 30 fresh names, pktmon on the NIC:
+
+| | Off | On |
+|---|---|---|
+| Plain port-53 packets out of the NIC | 61 (all 30 names, A and AAAA, and the internal suffix's SRV) | **0** |
+| Answered | 30/30 | 30/30 |
+| Median / p90 / max | 18 / 21 / 55 ms | 21 / 38 / 58 ms |
+
+Capture `working`; 10/10 real names through three resolvers; the internal suffix name resolved to 10.128.0.2; the DoH upstream (Cloudflare, X25519MLKEM768, h2) answered 60.
+
+### Kill, reboot, uninstall
+
+fix3 engine, interception on. Listings (IPv4 routes outside Sieve's, DNS servers, WinHTTP proxy, every adapter, firewall rule count, Ethernet's metric) compared with copies.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Kill (`Stop-Process -Force` on the engine) | PASS | right after: 0 routes on Sieve, no adapter; DNS 76 ms, curl https 200 in 0.14 s, git clone 2.6 s, WU scan 10 s, pip 4.4 s; the service's recovery brought the routes back 19 s later, then the same four again (DNS 30 ms, clone 1.0 s, WU 2.8 s, pip 3.0 s); no System log error from the network stack. The listing taken after the recovery differs from the one before only by Sieve's adapter, up again |
+| Reboot with Sieve on | PASS | after the boot: routes up, capture `not_caught` (the image put Ethernet's metric back at 1, which the capture refuses: by design); DNS 1.03 s (the first, cold), curl 200 in 0.18 s, clone 2.3 s, WU scan 5.1 s, pip 5.5 s. The listing differs from the one before the reboot only in Ethernet's route metrics (its interface metric 1 against 5), none of Sieve's. No bugcheck recorded; no System error from Wintun, Tcpip, NDIS, BFE or WFP |
+| Uninstall (`uninstall.exe /S`, interception on, the real app back first) | PASS | exit 0 in 12.4 s; no service, no adapter, Sieve's root removed (1 before, 0 after), `Program Files\Sieve` empty, `ProgramData\Sieve` gone, no Tcpip/Tcpip6 key of Sieve's, 0 WFP filters of Sieve's; DNS 0.66 s, curl 200 in 0.18 s, clone 0.9 s, WU scan 4.8 s, pip 3.2 s; the listing is the same as before the kill, 0 lines different. Then main's installer again (exit 0, engine 9F47E8B3) |
+
+### Other findings
+
+- The VM's firewall has `default-allow-ssh` and `default-allow-rdp` open to 0.0.0.0/0 (not this run's; left as found).
+- A `policy.json` the engine cannot read (this run's own script once wrote `"tracking": null`) is read as off, with the parse error in `last_error`: fail-open, as designed. That arm was rerun.
+- Kernel-Power 41 is logged at every restart of this VM, Sieve off too (run 6's reboots, the GCP start at 13:49 UTC, this run's `Restart-Computer` at 17:24 UTC): the image's, not a crash; no bugcheck was ever recorded.
+- "Having trouble" has no signal for a break inside Sieve's own TCP stack (the half-close FIN, the idle RST); with the fixes there is nothing to signal, but a stack-level cause stays invisible to that view.
+- winget does not run as SYSTEM here (0xC0000135), the Firefox background update task exits 11 headless as SYSTEM, and the Store is absent: these updaters are SKIP, not Sieve's.
+
+VM time: sieve-test-vm 15:49 to 20:30 local (4.7 h), stopped at the end; no other resource made. The GCP rule `sieve-r7-bt-temp` (tcp/udp 51413 from anywhere) existed only for the torrent runs (17:41 to 18:28 local) and is deleted; the rules are as before. State at the stop: Sieve uninstalled and main's installer installed again (engine 9F47E8B3, app BACF06A1, the real app), policy `engine` false, no exclusions or live-scope file, no Sieve key in the registry, WinHTTP proxy direct, the user's proxy settings reverted, Ethernet's metric automatic (until the image puts it back at boot), the run's scheduled tasks and Windows firewall rule removed, cloudflared, the echo servers and qBittorrent stopped. Installed for this run and left: Python 3.13, VS Code, Steam, steamcmd, Discord (sievedesk), Chocolatey with jq and qBittorrent, cloudflared, the Microsoft.WinGet.Client module.
+
 ## Run 6 (2026-11-09): the capture's compatibility fixes
 
 Branch `worktree-agent-a380fcbceca411e90` on main 3502855, fixes 9f07f15 (signed exchanges) and e2f5c53 (capability gate, backoff, neutral probe, full undo). Engine under test CB1D5B77 (release of e2f5c53); "before" is main 3502855 (4DC7B275). sieve-test-vm ran at n2-standard-2 beside a throwaway domain controller `sieve-test-dc` (e2-standard-2, Windows Server 2025, forest `sievead.test`, zone AD-integrated with secure-only updates, 10.128.0.3), with a temporary VPC rule letting 10.128.0.0/20 in. Runtime switches went through a VM-only pipe client in place of `sieve.exe` (Hello with or without capabilities, `set <field> <bool>`).

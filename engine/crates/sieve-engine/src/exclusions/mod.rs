@@ -281,6 +281,13 @@ impl ExclusionSlot {
         Self { skip_ev: false, ..self }
     }
 
+    /// Every app in scope, as a `live-scope` build's file makes it: the tests of an
+    /// app that is not a browser.
+    #[cfg(test)]
+    pub fn with_scope(self, scope: Scope) -> Self {
+        Self { scope, ..self }
+    }
+
     /// Sessions' sign-ins from the test, not from Windows.
     #[cfg(test)]
     pub fn with_logons(self, logon_of: impl Fn(u32) -> Option<i64> + Send + Sync + 'static) -> Self {

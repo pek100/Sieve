@@ -671,6 +671,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn()
     #[cfg(not(feature = "relay-experiments"))]
     config.mtu(MTU).map_err(|e| format!("stack MTU: {e}"))?;
     config.udp_timeout(UDP_IDLE);
+    config.with_tcp_config(crate::stack::relay::tcp_config());
     #[cfg(not(feature = "relay-experiments"))]
     let tun = crate::tun::device::open(&engine.exe)?;
     #[cfg(feature = "relay-experiments")]

@@ -245,6 +245,8 @@ const BANNER: &[u8] = b"220 ready\r\n";
 pub(super) struct Flags {
     pub(super) syn: bool,
     pub(super) psh: bool,
+    pub(super) fin: bool,
+    pub(super) rst: bool,
     pub(super) ack: Option<u32>,
     /// The receive window the app's stack advertises; [`WINDOW`] when unset.
     pub(super) window: Option<u16>,
@@ -262,6 +264,12 @@ pub(super) fn segment(local: SocketAddr, remote: SocketAddr, seq: u32, flags: Fl
     }
     if flags.psh {
         tcp = tcp.psh();
+    }
+    if flags.fin {
+        tcp = tcp.fin();
+    }
+    if flags.rst {
+        tcp = tcp.rst();
     }
     if let Some(ack) = flags.ack {
         tcp = tcp.ack(ack);

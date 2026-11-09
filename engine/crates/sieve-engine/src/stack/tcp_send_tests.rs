@@ -335,3 +335,203 @@ async fn the_first_flight_fills_the_apps_window_and_no_more() {
         }
     }
 }
+
+// ---- The app's end (2026-11-09, run 7): the FIN reaches the reader as the end, at once.
+
+/// How soon the reader must hear of the app's end: at once, by the packet that ends it,
+/// not by a timer. Far under the 30 s and 60 s timeouts it waited for before, with room
+/// for a loaded test machine; the live check holds it to self-healing's 2 s.
+const END_HEARD: Duration = Duration::from_secs(5);
+
+/// One accepted flow whose app-side stream the test reads: the handshake done, and
+/// the stack's next sequence number.
+async fn reading_bed(flow: (&str, &str)) -> (mpsc::UnboundedSender<Vec<u8>>, mpsc::UnboundedReceiver<Vec<u8>>, IpStack, IpStackTcpStream, SocketAddr, SocketAddr, u32) {
+    reading_bed_with(flow, super::relay::tcp_config()).await
+}
+
+#[allow(clippy::type_complexity)]
+async fn reading_bed_with(flow: (&str, &str), tcp_config: TcpConfig) -> (mpsc::UnboundedSender<Vec<u8>>, mpsc::UnboundedReceiver<Vec<u8>>, IpStack, IpStackTcpStream, SocketAddr, SocketAddr, u32) {
+    let (local, remote): (SocketAddr, SocketAddr) = (flow.0.parse().unwrap(), flow.1.parse().unwrap());
+    let (to_stack, rx) = mpsc::unbounded_channel();
+    let (tx, mut from_stack) = mpsc::unbounded_channel();
+    let mut config = IpStackConfig::default();
+    config.mtu(ENGINE_MTU).unwrap().with_tcp_config(tcp_config);
+    let mut stack = IpStack::new(config, MemDevice { rx, tx });
+    to_stack.send(segment(local, remote, CLIENT_ISN, Flags { syn: true, ..Flags::default() }, &[])).unwrap();
+    let Ok(IpStackStream::Tcp(app)) = stack.accept().await else { panic!("no TCP stream") };
+    let syn_ack = tokio::time::timeout(RECOVERY, from_stack.recv()).await.expect("a SYN-ACK").unwrap();
+    let server_next = tcp(&syn_ack).0.sequence_number.wrapping_add(1);
+    to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { ack: Some(server_next), ..Flags::default() }, &[])).unwrap();
+    (to_stack, from_stack, stack, app, local, remote, server_next)
+}
+
+/// The reader, already waiting when the app's bytes and FIN arrive, as the TLS side of
+/// an intercepted flow waits for a request: it ends with what the app sent.
+fn read_to_end(mut app: IpStackTcpStream) -> JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut got = Vec::new();
+        app.read_to_end(&mut got).await.unwrap();
+        got
+    })
+}
+
+/// Run 7, slice 7 U1: curl over Schannel completed the handshake and closed with a
+/// bare FIN; the reader slept until hyper's 30 s timeout, so self-healing never heard
+/// a quiet close. The same holds for a FIN that carries the app's last bytes, which
+/// upstream dropped (FIN|PSH|ACK matched no branch).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_apps_fin_ends_the_read_at_once_after_its_bytes() {
+    const LAST: &[u8] = b"the app's last bytes";
+    for flow in FLOWS {
+        for carried in [false, true] {
+            let (to_stack, mut from_stack, _stack, app, local, remote, server_next) = reading_bed(flow).await;
+            let reader = read_to_end(app);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!reader.is_finished(), "{flow:?}: the control, nothing said yet");
+            let ack = Some(server_next);
+            let len = u32::try_from(LAST.len()).unwrap();
+            if carried {
+                to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { psh: true, fin: true, ack, ..Flags::default() }, LAST)).unwrap();
+            } else {
+                to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { psh: true, ack, ..Flags::default() }, LAST)).unwrap();
+                to_stack.send(segment(local, remote, CLIENT_ISN + 1 + len, Flags { fin: true, ack, ..Flags::default() }, &[])).unwrap();
+            }
+            let got = tokio::time::timeout(END_HEARD, reader).await.unwrap_or_else(|_| panic!("{flow:?} carried {carried}: the end was not read")).unwrap();
+            assert_eq!(got, LAST, "{flow:?} carried {carried}");
+            // The stack acknowledged the bytes and the FIN.
+            let deadline = Instant::now() + RECOVERY;
+            let mut acked = 0;
+            while let Ok(Some(packet)) = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), from_stack.recv()).await {
+                let (header, _) = tcp(&packet);
+                acked = acked.max(header.acknowledgment_number.wrapping_sub(CLIENT_ISN + 1));
+                if header.fin {
+                    break;
+                }
+            }
+            assert_eq!(acked, len + 1, "{flow:?} carried {carried}: every byte and the FIN acknowledged");
+        }
+    }
+}
+
+/// The control of the rule: a FIN ahead of a lost segment is not yet the end; the
+/// read waits for the missing bytes, then ends with all of them in order.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fin_ahead_of_a_gap_is_not_the_end() {
+    for flow in FLOWS {
+        let (to_stack, _from_stack, _stack, app, local, remote, server_next) = reading_bed(flow).await;
+        let reader = read_to_end(app);
+        let ack = Some(server_next);
+        to_stack.send(segment(local, remote, CLIENT_ISN + 1 + 5, Flags { psh: true, fin: true, ack, ..Flags::default() }, b"world")).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!reader.is_finished(), "{flow:?}: the first five bytes never came");
+        to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { psh: true, ack, ..Flags::default() }, b"hello")).unwrap();
+        // What the app's stack does when the FIN goes unacknowledged: it sends it again.
+        to_stack.send(segment(local, remote, CLIENT_ISN + 1 + 5, Flags { psh: true, fin: true, ack, ..Flags::default() }, b"world")).unwrap();
+        let got = tokio::time::timeout(END_HEARD, reader).await.unwrap_or_else(|_| panic!("{flow:?}: the end was not read")).unwrap();
+        assert_eq!(got, b"helloworld", "{flow:?}");
+    }
+}
+
+/// A reset ends the read at once too, where the reader slept until its timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_apps_reset_ends_the_read_at_once() {
+    for flow in FLOWS {
+        let (to_stack, _from_stack, _stack, app, local, remote, server_next) = reading_bed(flow).await;
+        let reader = read_to_end(app);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { rst: true, ack: Some(server_next), ..Flags::default() }, &[])).unwrap();
+        assert!(tokio::time::timeout(END_HEARD, reader).await.is_ok(), "{flow:?}: the reset was not heard");
+    }
+}
+
+
+/// Run 7: a client that half-closes after its request (HTTP/1.0 style, `nc -N`) got
+/// the stack's FIN with the ACK of its own, and its answer never arrived. Now the
+/// stream is half-closed: the app's end is read, the engine's answer still goes, and
+/// the stack's FIN follows only once the engine shuts its side.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_closed_app_still_gets_the_answer_then_the_fin() {
+    const REQUEST: &[u8] = b"GET / HTTP/1.0\r\n\r\n";
+    const ANSWER: &[u8] = b"HTTP/1.0 200 OK\r\n\r\nhello";
+    for flow in FLOWS {
+        let (to_stack, mut from_stack, _stack, mut app, local, remote, server_next) = reading_bed(flow).await;
+        let len = u32::try_from(REQUEST.len()).unwrap();
+        let ack = Some(server_next);
+        to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { psh: true, fin: true, ack, ..Flags::default() }, REQUEST)).unwrap();
+        let engine = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut got = Vec::new();
+            app.read_to_end(&mut got).await.unwrap();
+            // The engine's answer comes later than the app's FIN, as a server's does.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            app.write_all(ANSWER).await.unwrap();
+            let _ = tokio::time::timeout(RECOVERY, app.shutdown()).await;
+            got
+        });
+        let deadline = Instant::now() + RECOVERY;
+        let (mut answer, mut fin_before_answer, mut fin) = (Vec::new(), false, false);
+        while let Ok(Some(packet)) = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), from_stack.recv()).await {
+            let (header, payload) = tcp(&packet);
+            if !payload.is_empty() {
+                answer.extend_from_slice(&payload);
+                let next = header.sequence_number.wrapping_add(u32::try_from(payload.len()).unwrap());
+                to_stack.send(segment(local, remote, CLIENT_ISN + 2 + len, Flags { ack: Some(next), ..Flags::default() }, &[])).unwrap();
+            }
+            if header.fin {
+                fin_before_answer |= answer.is_empty();
+                fin = true;
+                let next = header.sequence_number.wrapping_add(u32::try_from(payload.len()).unwrap()).wrapping_add(1);
+                to_stack.send(segment(local, remote, CLIENT_ISN + 2 + len, Flags { ack: Some(next), ..Flags::default() }, &[])).unwrap();
+                break;
+            }
+        }
+        assert!(!fin_before_answer, "{flow:?}: the stack closed before the answer");
+        assert_eq!(answer, ANSWER, "{flow:?}: the answer reached the half-closed app");
+        assert!(fin, "{flow:?}: and the FIN followed the engine's shutdown");
+        assert_eq!(tokio::time::timeout(RECOVERY, engine).await.expect("the engine side ended").unwrap(), REQUEST, "{flow:?}");
+    }
+}
+// ---- An idle connection (2026-11-09, run 7): TCP has no idle limit, the stack's is hours.
+
+/// The engine's stack keeps an idle connection for Windows' keep-alive time, not
+/// ipstack's minute, and the stack it builds is given that setting.
+#[test]
+fn the_engines_idle_limit_is_hours_not_a_minute() {
+    assert_eq!(super::relay::tcp_config().timeout, super::relay::TCP_IDLE);
+    assert!(super::relay::TCP_IDLE >= Duration::from_secs(2 * 60 * 60));
+    assert!(TcpConfig::default().timeout <= Duration::from_secs(60), "the control: ipstack's own is a minute");
+    let routing = include_str!("../control/routing.rs");
+    assert!(routing.contains("config.with_tcp_config(crate::stack::relay::tcp_config());"), "the routed stack is built with it");
+}
+
+/// What the limit does: a connection neither side used for that long is reset, the
+/// reader told so. With ipstack's minute an idle WebSocket died 60 s in (run 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_connection_lives_until_the_limit_then_is_reset() {
+    const SHORT_IDLE: Duration = Duration::from_millis(400);
+    for flow in FLOWS {
+        let mut short = super::relay::tcp_config();
+        short.timeout = SHORT_IDLE;
+        let (_to_stack, mut from_stack, _stack, app, _local, _remote, _) = reading_bed_with(flow, short).await;
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut app = app;
+            let mut byte = [0u8; 1];
+            app.read(&mut byte).await
+        });
+        tokio::time::sleep(SHORT_IDLE / 2).await;
+        assert!(!reader.is_finished(), "{flow:?}: alive inside the limit");
+        let got = tokio::time::timeout(RECOVERY, reader).await.expect("reset at the limit").unwrap();
+        assert_eq!(got.unwrap_err().kind(), std::io::ErrorKind::TimedOut, "{flow:?}");
+        let deadline = Instant::now() + RECOVERY;
+        let mut rst = false;
+        while let Ok(Some(packet)) = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), from_stack.recv()).await {
+            if tcp(&packet).0.rst {
+                rst = true;
+                break;
+            }
+        }
+        assert!(rst, "{flow:?}: and the app's side reset");
+    }
+}

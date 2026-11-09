@@ -74,6 +74,7 @@ impl Heal {
     /// only with an exe and a session: `decrypt` passes everything else through.
     pub fn hear(&self, pair: &Pair, evidence: Evidence, now_ms: u64) {
         let (Some(exe), Some(session)) = (pair.exe.as_deref(), pair.session) else { return };
+        let Some(evidence) = silence_only_for_apps(evidence, self.exclusions.in_scope(Some(exe))) else { return };
         let mut state = self.state();
         let app = trouble::key(exe, session);
         state.trouble.heard(&app, now_ms);
@@ -145,6 +146,24 @@ impl Heal {
     }
 }
 
+/// A browser's silence is no evidence, only its alerts (run 7, 2026-11-09). A browser
+/// that refuses Sieve's certificate says so with an alert (measured: Firefox without
+/// Sieve's root sent unknown_ca, in the handshake and right after it), which counts as
+/// before; a handshake it gives up on, or closes at once, with no alert, is a tab or a
+/// preconnect let go. The silent rules are for apps that check a pin after TLS and
+/// drop the socket (`dials::QUIET_CLOSES`). Once the TCP stack read a client's FIN at
+/// once, twelve minutes of Edge and Chrome excluded a video host for Edge; before, those
+/// ends were heard 10 to 60 s late, mostly beside another open connection, and never
+/// counted. A browser's silent end still closes its connection in the count (None for
+/// a handshake, which opened none). `browser` is the registered-browser set's word,
+/// the one decryption's scope reads.
+fn silence_only_for_apps(evidence: Evidence, browser: bool) -> Option<Evidence> {
+    match evidence {
+        Evidence::Ended(Some(Silence { alert: None, .. })) if browser => Some(Evidence::Ended(None)),
+        Evidence::Refused(None) if browser => None,
+        other => Some(other),
+    }
+}
 /// The client said no to Sieve's certificate: an alert in the handshake, or one on
 /// a connection it never used. A handshake it only gave up on carries none.
 fn refused_with_an_alert(evidence: Evidence) -> bool {
@@ -175,7 +194,7 @@ mod tests {
 
     use sieve_filter::exclusions::Source as Src;
 
-    use super::dials::{BURST_MS, FATAL_ALERTS, NOTICE_WINDOW_MS, USED_QUIET_CLOSES};
+    use super::dials::{BURST_MS, FATAL_ALERTS, NOTICE_WINDOW_MS, QUIET_CLOSES, USED_QUIET_CLOSES};
     use super::*;
 
     const NOW: u64 = 1_793_000_000_000;
@@ -450,6 +469,38 @@ mod tests {
         assert_eq!(h.try_again(&Retry::One { pattern: Pattern::Wildcard("*".into()), app: Some("client.exe".into()), reason: AutoReason::Failing }, later), 1);
         three(later + 1);
         assert!(h.exclusions.get_at(later + 10).passes_app(Some(CLIENT), Some(1)), "hours after the run's start, armed from the try");
+    }
+
+    /// Run 7: with the client's FIN read at once, a browser's tab closes are quiet
+    /// closes in time. For a registered browser they are no evidence; its alert is,
+    /// and an app that is not a browser still heals by them.
+    #[test]
+    fn a_browsers_quiet_closes_never_exclude_and_its_alert_still_does() {
+        use crate::exclusions::browsers::{BrowserRegistry, BrowserSet};
+        struct One;
+        impl BrowserRegistry for One {
+            fn commands(&self) -> Vec<String> {
+                vec![format!("\"{OTHER}\" -- \"%1\"")]
+            }
+        }
+        let h = heal();
+        h.exclusions.set_browsers(BrowserSet::read(&One), NOW);
+        let burst = |n: u64| NOW + n * (BURST_MS + 1);
+        for n in 0..u64::from(10 * USED_QUIET_CLOSES) {
+            handshake_then_close(&h, OTHER, HOST, burst(n));
+        }
+        for n in 0..10u64 {
+            h.hear(&pair(OTHER, HOST), Evidence::Refused(None), burst(30 + n));
+        }
+        assert_eq!(found(&h, OTHER, burst(100)), None, "a browser's tab closes, preconnects and handshakes given up");
+        assert_eq!(h.meters.https.healed.load(Ordering::Relaxed), 0);
+        h.hear(&pair(OTHER, HOST), refused(), burst(101));
+        assert_eq!(found(&h, OTHER, burst(101)), Some(Src::Auto(AutoReason::Pinning)), "its refusal with an alert");
+        // The control: an app that is not a browser heals by the same closes.
+        for n in 0..u64::from(QUIET_CLOSES) {
+            handshake_then_close(&h, CLIENT, HOST, burst(n));
+        }
+        assert_eq!(found(&h, CLIENT, burst(QUIET_CLOSES.into())), Some(Src::Auto(AutoReason::Pinning)));
     }
 
     #[test]
