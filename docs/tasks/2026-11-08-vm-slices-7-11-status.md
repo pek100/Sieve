@@ -1,5 +1,41 @@
 # VM live run 2026-11-08: status at the stop
 
+## Run 5 (2026-11-09): own-name answers and the LLMNR delay
+
+VM 02:46 to 03:47 local (1.0 h), stopped at the end. "Before" is 27141dd (67666092), "after" is the IPv6-server build (24DF3567). Run 4's metric-1 check had left Ethernet's persistent IPv4 metric at 1 with the automatic metric off, so after the VM restarted the capture refused itself until that was reverted (`Set-NetIPInterface -AutomaticMetric Enabled -PolicyStore PersistentStore`).
+
+**Own name.** With Sieve on, Windows answers the machine's own name with every source-capable address, ordered by interface metric. At metric 1 that put Sieve's addresses first. Fix: the adapter's DNS server is now IPv6, `TUN_DNS` = `fd53:6965:7665:1::53`, beside its ULA `TUN_V6`. Sieve is the DNS Client's first network by its IPv6 metric alone, and IPv4 keeps its automatic metric. Sieve's link-local addresses are skipped as a source. The capture adds and removes the server's host route itself. Measured on the way, not shippable:
+- `SkipAsSource` on 198.18.0.1 removes it from the answer, but then no source exists for anything routed into Sieve (`Find-NetRoute` empty, curl 000).
+- A link-local IPv4 source beside it shows up in the answer instead.
+- Weak-host send and receive on Sieve's adapter: curl 000, lookups 0/5.
+- `SkipAsSource` on `TUN_V6`: the DNS Client has no source for the server, and the probe never arrives.
+
+| Name (.NET) | Off | Before | After |
+|---|---|---|---|
+| `sieve-test-vm` | fe80 (Ethernet), 10.128.0.2 | Sieve's fe80, Ethernet's fe80, **198.18.0.1**, 10.128.0.2 | fe80 (Ethernet), 10.128.0.2, then 198.18.0.1, fd53:6965:7665:1::1 |
+| `sieve-test-vm.<suffix>` | 10.128.0.2 | 10.128.0.2 | 10.128.0.2 |
+| `sieve-test-vm.local` | as the short name | as the short name | as the short name |
+
+So the FQDN is identical. The short and `.local` names keep Ethernet's addresses first and in the same order as off, with Sieve's two after them; no adapter-only setting removes them, for the reasons above.
+
+| Row | Off | Before | After |
+|---|---|---|---|
+| Plain port-53 packets, 10 lookups | 20 | 0 | 0 |
+| 10 lookups, median | 19 ms | 30 ms | 39 ms |
+| NXDOMAIN, .NET, `nx-*.com` | 2 to 27 ms | 19 to 25 ms | 20 to 25 ms (12 rewrites) |
+| `metadata` (only under Ethernet's suffix) | 2 ms | 2 ms | 1 to 2 ms |
+| LLMNR-only `sieveonly1` | 2.8 s | 9.8 s | 9.8 s |
+| Nonexistent single label | 2.8 s | 9.8 s | 9.8 s |
+| curl https | 200 | 200 | 200 |
+| Kill, then the next start | | | Tcpip6 key with `NameServer=fd53:...::53` after the kill, absent after the recovery start; DNS 0.01 s after the kill |
+
+**The LLMNR delay: cause found, not fixed.** DNS Client ETW (3009, 3010) shows what happens to a single-label name. The DNS Client sends it with each adapter's own connection-specific suffixes, and only to that adapter's servers. On Ethernet that means `sieveonly1.us-central1-a.c.sieve-live-test.internal` and the other two suffixes, all to 10.128.0.1. Off, they get an NXDOMAIN in 6 to 8 ms. With the capture, the block drops them, and the DNS Client resends after 1 s and more. It sends LLMNR at 0.4 s in both cases, but returns its answer only when the blocked network's queries time out: 9.8 s against 2.8 s. Sieve's network is never asked those names. Tried:
+- Sieve's adapter given Ethernet's suffix, rewrite off: Sieve answers NXDOMAIN, and the DNS Client still waits for Ethernet (9.8 s; the FQDN under the suffix takes 12 s).
+- The same with the rewrite on: 2.35 s, but the LLMNR-only name **fails**, because NODATA is final.
+- NetBIOS off on Sieve's adapter: 9.8 s.
+
+The rewrite plays no part (9.8 s with it on and off). What stalls is the DNS Client waiting on the queries the block drops. Any user-mode fix means letting the DNS Client's queries to the adapter's own servers through, and with them the parallel public-name leak, or answering them in place, which needs a WFP connect-redirect callout (a kernel driver).
+
 ## Run 4 (2026-11-09): the capture's second review
 
 Branch `worktree-agent-acd57d2c31e644f62`, main merged (a3c5a24), fixes fc6e72f and 27141dd. VM 02:03 to 02:44 local (0.7 h), stopped at the end. Engines: A958B1C9 (rewrite on) and EF74955B (rewrite off, the one switch `dns::service::NXDOMAIN_AS_NODATA` flipped), then 67666092 (27141dd, rewrite on) for the key and probe checks. "Off" is policy `engine` false. Helpers on the VM: a DNS server on 127.0.0.2 (zones `split.test`, `corp.test`) and an LLMNR responder on Ethernet for `sieveonly1` (scratchpad `r-resp.ps1`).
