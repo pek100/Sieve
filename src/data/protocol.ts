@@ -499,11 +499,11 @@ export interface EngineStatus {
 }
 
 /** sieve-ipc `CaptureReason`, in declaration order. */
-export const CAPTURE_REASONS = ["tie", "ipv6_off", "no_answer", "no_ipv4", "failed"] as const;
+export const CAPTURE_REASONS = ["tie", "ipv6_off", "no_answer", "no_ipv4", "failed", "nothing_to_catch"] as const;
 export type CaptureReason = (typeof CAPTURE_REASONS)[number];
 
 /** sieve-ipc `DnsCapture`: caught and proven, the user's off, or not caught and why. */
-export type DnsCapture = { state: "working" } | { state: "off" } | { state: "not_caught"; reason: CaptureReason; adapter?: string; detail: string };
+export type DnsCapture = { state: "working" } | { state: "off" } | { state: "not_caught"; reason: CaptureReason; adapter?: string; detail: string; code?: number };
 
 const withCapture = (c: DnsCapture | null): { dns_capture?: DnsCapture } => (c === null ? {} : { dns_capture: c });
 
@@ -513,7 +513,7 @@ export function parseDnsCapture(raw: unknown): DnsCapture | null {
   const c = raw as Record<string, unknown>;
   if (c.state === "working" || c.state === "off") return { state: c.state };
   if (c.state !== "not_caught" || typeof c.detail !== "string" || !(CAPTURE_REASONS as readonly unknown[]).includes(c.reason)) return null;
-  return { state: "not_caught", reason: c.reason as CaptureReason, detail: c.detail, ...(typeof c.adapter === "string" ? { adapter: c.adapter } : {}) };
+  return { state: "not_caught", reason: c.reason as CaptureReason, detail: c.detail, ...(typeof c.adapter === "string" ? { adapter: c.adapter } : {}), ...(Number.isInteger(c.code) && (c.code as number) >= 0 ? { code: c.code as number } : {}) };
 }
 
 /** One filter list as the engine compiled it (sieve-ipc `ListFact`; the catalogue stays in Rust). */

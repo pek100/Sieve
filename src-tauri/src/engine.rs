@@ -241,6 +241,43 @@ pub fn snapshot_flow(e: &FlowEvent) -> Option<Flow> {
     Some(Flow { pid, proto, family, local, remote, state })
 }
 
+/// Whether a Hello names the app's capabilities (`sieve_ipc::APP_CAPABILITIES`).
+/// It does, unless the engine refused them for being unknown: that engine
+/// predates them, and until a Hello without them is welcomed by another engine
+/// version (an update), each Hello leaves them out, so a refusal costs one
+/// connection once, not one per request.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HelloMemory {
+    refused_by: Option<String>,
+}
+
+impl HelloMemory {
+    pub const fn new() -> Self {
+        Self { refused_by: None }
+    }
+
+    pub fn names_capabilities(&self) -> bool {
+        self.refused_by.is_none()
+    }
+
+    /// A Hello without them was welcomed by `version`: just after the refusal
+    /// (`after_refusal`) that engine is remembered; later, another version means
+    /// the engine changed, and the next Hello names them again.
+    pub fn welcomed_bare(&mut self, version: &str, after_refusal: bool) {
+        if after_refusal {
+            self.refused_by = Some(version.to_string());
+        } else if self.refused_by.as_deref() != Some(version) {
+            self.refused_by = None;
+        }
+    }
+}
+
+/// An engine's refusal of a Hello for naming `capabilities`, a field it does
+/// not know (its words are serde's: "unknown field `capabilities`").
+pub fn refuses_capabilities(message: &str) -> bool {
+    message.contains("unknown field") && message.contains("capabilities")
+}
+
 #[cfg(windows)]
 mod imp {
     use sieve_ipc::nonblocking::{read_frame, write_frame};
@@ -283,11 +320,41 @@ mod imp {
         }
     }
 
-    /// Opens the pipe and says Hello; the Welcome's session, or the fact
-    /// that ends the conversation.
+    static HELLO_MEMORY: std::sync::Mutex<HelloMemory> = std::sync::Mutex::new(HelloMemory::new());
+
+    fn memory() -> std::sync::MutexGuard<'static, HelloMemory> {
+        HELLO_MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Opens the pipe and says Hello, naming the app's capabilities unless this
+    /// engine refused them ([`HelloMemory`]); the Welcome's session, or the fact
+    /// that ends the conversation. An engine from before the capabilities refuses
+    /// a Hello that names them and closes: the Hello is said again without them.
     async fn hello(name: &str) -> Result<Result<(NamedPipeClient, String, u32), PipeFact>, String> {
+        let named = memory().names_capabilities();
+        let answer = say_hello(name, named).await?;
+        match answer {
+            Err(PipeFact::Refused { message }) if named && refuses_capabilities(&message) => {
+                let bare = say_hello(name, false).await?;
+                if let Ok((_, version, _)) = &bare {
+                    memory().welcomed_bare(version, true);
+                }
+                Ok(bare)
+            }
+            Ok(welcome) => {
+                if !named {
+                    memory().welcomed_bare(&welcome.1, false);
+                }
+                Ok(Ok(welcome))
+            }
+            other => Ok(other),
+        }
+    }
+
+    async fn say_hello(name: &str, named: bool) -> Result<Result<(NamedPipeClient, String, u32), PipeFact>, String> {
         let mut pipe = ClientOptions::new().open(name).map_err(|e| e.to_string())?;
-        let hello = ClientMessage::Hello { protocol: PROTOCOL, app_version: env!("CARGO_PKG_VERSION").to_string() };
+        let capabilities = if named { sieve_ipc::APP_CAPABILITIES.iter().map(ToString::to_string).collect() } else { Vec::new() };
+        let hello = ClientMessage::Hello { protocol: PROTOCOL, app_version: env!("CARGO_PKG_VERSION").to_string(), capabilities };
         write_frame(&mut pipe, &hello).await.map_err(|e| e.to_string())?;
         Ok(match read_frame(&mut pipe).await.map_err(|e| e.to_string())? {
             EngineMessage::Welcome { engine_version, session_id, .. } => Ok((pipe, engine_version, session_id)),
@@ -916,6 +983,25 @@ mod tests {
         assert_eq!(flows.flows(), Some(vec![]), "a new subscription starts from the engine's open flows");
     }
 
+    /// An engine from before the capabilities refuses a Hello naming them with
+    /// serde's words; after one refusal the Hellos leave them out until another
+    /// engine version welcomes one.
+    #[test]
+    fn capabilities_are_left_out_for_the_engine_that_refused_them_until_it_changes() {
+        let old_engine: Result<sieve_ipc::ClientMessage, _> = serde_json::from_str(r#"{"type":"hello","protocol":3,"app_version":"0.2.0","capabilities":["dns_capture"]}"#);
+        assert!(old_engine.is_ok(), "this build takes them");
+        assert!(refuses_capabilities("malformed frame: unknown field `capabilities`, expected `protocol` or `app_version`"));
+        assert!(!refuses_capabilities("send hello first") && !refuses_capabilities("unknown field `x`"));
+        let mut memory = HelloMemory::new();
+        assert!(memory.names_capabilities());
+        memory.welcomed_bare("0.1.0", true);
+        assert!(!memory.names_capabilities(), "refused once: the same engine is not asked again");
+        memory.welcomed_bare("0.1.0", false);
+        assert!(!memory.names_capabilities());
+        memory.welcomed_bare("0.2.0", false);
+        assert!(memory.names_capabilities(), "another engine version: named again");
+    }
+
     /// Read only, no admin: the service manager answers this test's account
     /// with one of the known facts (missing on a machine without Sieve).
     #[cfg(windows)]
@@ -937,7 +1023,7 @@ mod tests {
         let engine = tokio::spawn(async move {
             server.connect().await.unwrap();
             let first: ClientMessage = read_frame(&mut server).await.unwrap();
-            assert!(matches!(first, ClientMessage::Hello { protocol: PROTOCOL, .. }));
+            assert!(matches!(&first, ClientMessage::Hello { protocol: PROTOCOL, capabilities, .. } if capabilities.iter().any(|c| c == "dns_capture")));
             let welcomed = matches!(hello, EngineMessage::Welcome { .. });
             write_frame(&mut server, &hello).await.unwrap();
             if welcomed {

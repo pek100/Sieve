@@ -125,7 +125,7 @@ mod tests {
         let name = unique("owner");
         let (stop, task) = running(&name, pipe_sddl(Some(&token_user_sid().unwrap())).unwrap());
         let mut client = open(&name).await.expect("the recorded owner may open the pipe");
-        write_frame(&mut client, &ClientMessage::Hello { protocol: PROTOCOL, app_version: "test".into() }).await.unwrap();
+        write_frame(&mut client, &ClientMessage::Hello { protocol: PROTOCOL, app_version: "test".into(), capabilities: Vec::new() }).await.unwrap();
         let reply: EngineMessage = read_frame(&mut client).await.unwrap();
         assert_eq!(reply, EngineMessage::Error { message: NOT_ALLOWED.into() });
         stop.send(true).unwrap();

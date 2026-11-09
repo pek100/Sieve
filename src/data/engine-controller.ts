@@ -38,7 +38,7 @@
  * Update state rides the probe: there is no separate poll.
  */
 import type { PassedChecks } from "@/core/checks";
-import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE as DNS_CLIENT_CAPTURE_KEY, DNS_ENCRYPTION as DNS_ENCRYPTION_KEY, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineTakesPolicy, engineUpdate, httpsInForce, updateBanner, type EngineSlice } from "@/core/engine";
+import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE as DNS_CLIENT_CAPTURE_KEY, DNS_ENCRYPTION as DNS_ENCRYPTION_KEY, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineVersion, engineTakesPolicy, engineUpdate, httpsInForce, updateBanner, type EngineSlice } from "@/core/engine";
 import type { ExclusionsFacts, HealGroup } from "@/core/exclusions";
 import type { NoticeBus } from "@/core/notices";
 import { selectedListIds } from "@/core/filter-lists";
@@ -97,6 +97,7 @@ const DNS_CLIENT_CAPTURE = DNS_CLIENT_CAPTURE_KEY as SettingKey;
  */
 export const DNS_UNREACHABLE_BANNER = `No encrypted DNS server answers on this network, so sites may not load. Hotel and airport Wi-Fi often needs plain DNS to show its sign-in page: you can turn off ${REGISTRY[DNS_ENCRYPTION].label} in Settings > Filtering.`;
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const captureUnknownError = `This version of Sieve's engine does not know "${REGISTRY[DNS_CLIENT_CAPTURE].label}". Your other settings reached it.`;
 
 /** Notices the window keeps for the toast hook: far more than one person reads, as the engine's own ring. */
 const HEAL_KEPT = 64;
@@ -192,6 +193,8 @@ export function createEngineController({ engine, store, clock, settings, checks,
   let policyInFlight = false;
   // The error on show is about the policy, so it ends when the engine holds what is wanted.
   let policyHeldBack = false;
+  // The engine version that refused the capture switch (an engine from before it), so it is not sent again to it.
+  let captureRefusedBy: string | null = null;
   let upstreamsInFlight = false;
   let catalogue: Pick<FilterCatalogue, "lists"> | null = null;
   let catalogueInFlight = false;
@@ -244,10 +247,15 @@ export function createEngineController({ engine, store, clock, settings, checks,
     const status = engineStatus(e);
     if (disposed || !settingsReady || policyInFlight || !engineTakesPolicy(e) || status === null) return;
     if (catalogue === null && Object.keys(settings.get("filters.lists")).length > 0) void readCatalogue();
-    const want = wantedPolicy(settings, catalogue, status.policy.lists);
+    const version = engineVersion(e);
+    const wanted = wantedPolicy(settings, catalogue, status.policy.lists);
+    // This engine refused the capture switch once: it is not sent again until the engine's version changes.
+    const captureUnknown = captureRefusedBy !== null && captureRefusedBy === version && (wanted.skip_dns_capture ?? false) !== (status.policy.skip_dns_capture ?? false);
+    const want = captureUnknown ? captureAsHeld(wanted, status.policy) : wanted;
     if (normalised(status.policy) === normalised(want)) {
-      if (policyHeldBack) set({ actionError: null });
-      policyHeldBack = false;
+      if (captureUnknown) set({ actionError: captureUnknownError });
+      else if (policyHeldBack) set({ actionError: null });
+      policyHeldBack = captureUnknown;
       return;
     }
     policyInFlight = true;
@@ -281,11 +289,13 @@ export function createEngineController({ engine, store, clock, settings, checks,
     } finally {
       policyInFlight = false;
     }
-    policyHeldBack = refusal !== null;
-    // An engine from before the capture switch took everything but it: said once, retried at the next probe.
+    policyHeldBack = refusal !== null || captureUnknown;
+    // An engine from before the capture switch took everything but it: said, and not sent again to that engine version.
     const captureRefused = sent && refusal !== null && (want.skip_dns_capture ?? false) !== (holds.skip_dns_capture ?? false);
-    if (refusal === null) set({ actionError: null });
-    else if (captureRefused) set({ actionError: `This version of Sieve's engine does not know "${REGISTRY[DNS_CLIENT_CAPTURE].label}". Your other settings reached it.` });
+    if (captureRefused) captureRefusedBy = version;
+    else if (sent && (holds.skip_dns_capture ?? false) === (wanted.skip_dns_capture ?? false)) captureRefusedBy = null;
+    if (captureRefused || (captureUnknown && refusal === null)) set({ actionError: captureUnknownError });
+    else if (refusal === null) set({ actionError: null });
     else if (normalised(rulesAsHeld(want, holds)) === normalised(holds)) set({ actionError: `Could not tell the engine your rules: ${refusal}. Your switches reached it, and it keeps the rules it had.` });
     else set({ actionError: `Could not tell the engine: ${refusal}` });
     // Only a send that went through follows: after a refusal, following now would send it again at once, forever.

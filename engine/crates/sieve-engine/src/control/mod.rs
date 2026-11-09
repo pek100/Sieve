@@ -754,7 +754,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(1 << 16);
         let backend = engine.clone();
         let task = tokio::spawn(async move { crate::ipc::serve_client(&mut server, 1, backend.as_ref()).await });
-        write_frame(&mut client, &ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.1.0".into() }).await.unwrap();
+        write_frame(&mut client, &ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.1.0".into(), capabilities: Vec::new() }).await.unwrap();
         let _: EngineMessage = read_frame(&mut client).await.unwrap();
 
         let good = DnsUpstreams { revision: 3, upstreams: vec!["tls://dns.example".into(), "quic://192.0.2.9".into()] };
@@ -998,7 +998,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(1 << 16);
         let backend = e.clone();
         let task = tokio::spawn(async move { crate::ipc::serve_client(&mut server, 1, backend.as_ref()).await });
-        write_frame(&mut client, &ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.1.0".into() }).await.unwrap();
+        write_frame(&mut client, &ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.1.0".into(), capabilities: Vec::new() }).await.unwrap();
         let _: EngineMessage = read_frame(&mut client).await.unwrap();
 
         write_frame(&mut client, &ClientMessage::SetPolicy(Policy { revision: 1, plain_dns: true, ..Policy::default() })).await.unwrap();

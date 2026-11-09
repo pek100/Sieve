@@ -11,9 +11,11 @@
 //! 1. the engine's adapter names one DNS server, [`TUN_DNS`](crate::tun::TUN_DNS) (IPv6, in the
 //!    adapter's own ULA prefix), whose host route goes into the adapter and which
 //!    the DNS service answers. The adapter's IPv6 address [`crate::tun::TUN_V6`] is
-//!    its source; while IPv6 is not routed it is skipped as a source for anything
-//!    else, and the adapter's link-local addresses always are, so the machine's own
-//!    name answers as without Sieve (live, 2026-11-09);
+//!    the DNS Client's source for it, added by the capture while IPv6 is not routed,
+//!    and never skipped as a source (skipped, the DNS Client had no source for the
+//!    server and the probe never arrived, live). The adapter's link-local addresses
+//!    are skipped as sources while the capture holds, so the machine's own name
+//!    answers as without Sieve (live, 2026-11-09);
 //! 2. that adapter is the DNS Client's first network by its IPv6 metric alone
 //!    ([`DNS_FIRST_METRIC`]; IPv4 keeps its automatic metric, or the machine's own
 //!    name answered 198.18.0.1 first): with the first network blocked, the DNS
@@ -34,10 +36,14 @@
 //! an unblocked one (a VPN's, a second adapter's, a loopback resolver) answers for
 //! itself, and its answer must win.
 //!
-//! The capture is proven, not assumed: after it opens, after each change and
-//! every [`PROBE_EVERY`], the engine asks the DNS Client a fresh name and the DNS
-//! service must see it at [`TUN_DNS`](crate::tun::TUN_DNS) and the answer must come back within
-//! [`PROBE_WITHIN`], or the capture closes (`control::routing`).
+//! The capture is proven, not assumed: after it opens, after each change of block
+//! or network, and then on the [`probe_after`] schedule (often at first, minutes
+//! apart once it has held), the engine asks the DNS Client a fresh name
+//! ([`probe_name`]) and the DNS service must see it at [`TUN_DNS`](crate::tun::TUN_DNS)
+//! and the answer must come back within [`PROBE_WITHIN`], or the capture closes
+//! (`control::routing`). A capture that keeps failing to open is tried again on the
+//! same schedule, counted over the failures in a row with the same reason: each
+//! failed try stalls lookups for a moment.
 //!
 //! Rejected on the same VM: blocking the DNS Client's binds to the physical
 //! adapter's address fails every one of its lookups (WSAEACCES, in 1 ms); a server
@@ -66,15 +72,29 @@ use sieve_ipc::{CaptureReason, DnsCapture};
 pub const DNS_FIRST_METRIC: u32 = 1;
 /// How long a probe's answer may take, from the DNS Client's call to its return.
 pub const PROBE_WITHIN: Duration = Duration::from_secs(1);
-/// How often a held capture is proven again, and an empty one tried again. Until
-/// a capture that stopped working is closed, every lookup through the DNS Client
-/// waits out its 12 s (live, 2026-11-09: a firewall rule against Sieve's server,
-/// closed 48 s later at a 60 s period), so this bounds that; a probe is one local
-/// query the DNS service answers itself.
-pub const PROBE_EVERY: Duration = Duration::from_secs(15);
-/// The probe names' parent: reserved (RFC 6761), answered by the DNS service
-/// itself and never sent on.
-pub const PROBE_PARENT: &str = "probe.sieve.invalid";
+/// The first wait of [`probe_after`]: how soon a capture just opened or changed
+/// is proven again, and a failed open tried again. Until a capture that stopped
+/// working is closed, every lookup through the DNS Client waits out its 12 s
+/// (live, 2026-11-09: a firewall rule against Sieve's server, closed 48 s later at
+/// a 60 s period), so a fresh capture is checked often.
+pub const PROBE_FIRST: Duration = Duration::from_secs(15);
+/// The longest wait of [`probe_after`]. A probe is one lookup the DNS service
+/// answers itself, but the DNS Client also sends it to any network it is not
+/// blocked from, so a stable capture asks rarely; and each failed open stalls
+/// lookups for up to [`PROBE_WITHIN`], so a failure that repeats is tried rarely.
+pub const PROBE_LAST: Duration = Duration::from_secs(300);
+/// The probe names' parent: reserved (RFC 6761), so no server anywhere holds a
+/// name under it, and with nothing in the name that says who asked.
+pub const PROBE_PARENT: &str = "invalid";
+/// A probe name's one label: this many lower-case hex digits.
+const PROBE_LABEL: usize = 16;
+
+/// How long after the `n`-th proof in a row (0 for the one right after an open or
+/// a change) the next is due, or after the `n`-th failed open in a row with the
+/// same reason the next try: [`PROBE_FIRST`], doubling, at most [`PROBE_LAST`].
+pub fn probe_after(n: u32) -> Duration {
+    PROBE_FIRST.saturating_mul(1u32.checked_shl(n).unwrap_or(u32::MAX)).min(PROBE_LAST)
+}
 
 /// One family's block: the DNS Client's port-53 connections leaving one of these
 /// adapters (LUIDs) to one of these prefixes.
@@ -164,15 +184,17 @@ pub struct NotCaught {
     pub reason: CaptureReason,
     pub adapter: Option<String>,
     pub detail: String,
+    /// The DNS Client's status for the check lookup, when that is what failed.
+    pub code: Option<u32>,
 }
 
 impl NotCaught {
     pub fn new(reason: CaptureReason, detail: impl Into<String>) -> Self {
-        Self { reason, adapter: None, detail: detail.into() }
+        Self { reason, adapter: None, detail: detail.into(), code: None }
     }
 
     pub fn state(&self) -> DnsCapture {
-        DnsCapture::NotCaught { reason: self.reason, adapter: self.adapter.clone(), detail: self.detail.clone() }
+        DnsCapture::NotCaught { reason: self.reason, adapter: self.adapter.clone(), detail: self.detail.clone(), code: self.code }
     }
 }
 
@@ -222,7 +244,7 @@ pub fn idle_state(wanted: bool, tables: &NetTables, has_blocks: bool, last: Opti
     } else if !has_blocks && !tables.has_default(true) {
         NotCaught::new(CaptureReason::NoIpv4, "this network has no IPv4 route to the internet").state()
     } else if !has_blocks {
-        NotCaught::new(CaptureReason::Failed, "no network adapter whose DNS queries would leave outside Sieve").state()
+        NotCaught::new(CaptureReason::NothingToCatch, "no network adapter whose DNS queries would leave outside Sieve").state()
     } else {
         last.map_or_else(|| NotCaught::new(CaptureReason::Failed, "not opened yet").state(), NotCaught::state)
     }
@@ -245,21 +267,22 @@ pub fn refusal(tables: &NetTables, blocks: &[Block], metric: impl Fn(u64, bool) 
                 "\"{alias}\" has interface metric {m} for {}, which ties with Sieve's DNS server, so the DNS Client's queries are not caught (give \"{alias}\" a metric above {DNS_FIRST_METRIC} to have them caught)",
                 if v4 { "IPv4" } else { "IPv6" }
             );
-            Some(NotCaught { reason: CaptureReason::Tie, adapter: Some(alias.to_string()), detail })
+            Some(NotCaught { reason: CaptureReason::Tie, adapter: Some(alias.to_string()), detail, code: None })
         })
     })
 }
 
-/// A fresh probe name under [`PROBE_PARENT`], fully qualified so no suffix is
-/// appended.
+/// A fresh probe name: one label of random hex digits under [`PROBE_PARENT`], fully
+/// qualified so no suffix is appended.
 pub fn probe_name(nonce: u64) -> String {
-    format!("p{nonce:016x}.{PROBE_PARENT}.")
+    format!("{nonce:016x}.{PROBE_PARENT}.")
 }
 
-/// True for a name the DNS service answers itself as a probe.
+/// True for a name the DNS service answers itself as a probe: exactly the shape
+/// of [`probe_name`], so any other name under `.invalid` gets its NXDOMAIN.
 pub fn is_probe(name: &str) -> bool {
     let name = name.trim_end_matches('.').to_ascii_lowercase();
-    name.len() > PROBE_PARENT.len() && name.ends_with(PROBE_PARENT) && name.as_bytes()[name.len() - PROBE_PARENT.len() - 1] == b'.'
+    name.split_once('.').is_some_and(|(label, parent)| parent == PROBE_PARENT && label.len() == PROBE_LABEL && label.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 #[cfg(test)]
@@ -435,7 +458,8 @@ mod tests {
         let mut v6_only = load(HOME);
         v6_only.routes.retain(|r| r.dest.length() != 0 || !r.dest.is_ipv4());
         assert!(matches!(idle_state(true, &v6_only, false, None), DnsCapture::NotCaught { reason: CaptureReason::NoIpv4, .. }));
-        let tie = NotCaught { reason: CaptureReason::Tie, adapter: Some("Wi-Fi".into()), detail: "metric 1".into() };
+        assert!(matches!(idle_state(true, &home, false, None), DnsCapture::NotCaught { reason: CaptureReason::NothingToCatch, .. }), "nothing would leave: a fact, not a failure");
+        let tie = NotCaught { reason: CaptureReason::Tie, adapter: Some("Wi-Fi".into()), detail: "metric 1".into(), code: None };
         assert_eq!(idle_state(true, &home, true, Some(&tie)), tie.state());
         assert_eq!(NotCaught::from("x".to_string()).reason, CaptureReason::Failed);
     }
@@ -451,13 +475,23 @@ mod tests {
         assert!(!plan(&load(HOME)).routes.iter().any(|p| p.contains(TUN_DNS)));
     }
 
+    /// A probe reaches any network the DNS Client is not blocked from, so its
+    /// name says nothing of who asked: random hex under `.invalid`.
     #[test]
-    fn probe_names_are_fully_qualified_and_told_apart() {
+    fn probe_names_are_fully_qualified_neutral_and_told_apart() {
         let name = probe_name(0xabc);
-        assert_eq!(name, "p0000000000000abc.probe.sieve.invalid.");
-        assert!(is_probe(&name) && is_probe(name.trim_end_matches('.')));
-        for other in ["probe.sieve.invalid", "xprobe.sieve.invalid", "a.probe.sieve.invalid.example", "www.example"] {
+        assert_eq!(name, "0000000000000abc.invalid.");
+        assert!(!name.contains("sieve"));
+        assert!(is_probe(&name) && is_probe(name.trim_end_matches('.')) && is_probe(&probe_name(u64::MAX).to_uppercase()));
+        for other in ["invalid", "abc.invalid", "0000000000000abg.invalid", "a.0000000000000abc.invalid", "0000000000000abc.invalid.example", "00000000000000abc.invalid", "www.example"] {
             assert!(!is_probe(other), "{other}");
         }
+    }
+
+    #[test]
+    fn probes_and_retries_back_off_from_15_s_to_5_minutes() {
+        let waits: Vec<u64> = (0..7).map(|n| probe_after(n).as_secs()).collect();
+        assert_eq!(waits, [15, 30, 60, 120, 240, 300, 300]);
+        assert_eq!(probe_after(u32::MAX), PROBE_LAST, "no overflow");
     }
 }

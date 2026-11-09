@@ -1,4 +1,4 @@
-import { act, render, within } from "@testing-library/react";
+import { act, fireEvent, render, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { DNS_CLIENT_CAPTURE, DNS_ENCRYPTION } from "@/core/engine";
@@ -103,5 +103,31 @@ describe("Also encrypt Windows' own lookups", () => {
     expect(captureStateLine({ state: "not_caught", reason: "no_ipv4", detail: "x" })?.text).toMatch(/no IPv4 route/);
     expect(captureStateLine({ state: "not_caught", reason: "failed", detail: "FwpmEngineOpen0: error 0x5" })?.text).toContain("FwpmEngineOpen0: error 0x5");
     expect(captureStateLine(undefined)).toBeNull();
+  });
+
+  it("a network with nothing to catch, or no IPv4, is a fact, not a warning", async () => {
+    const rt = await setup();
+    report(rt, { state: "not_caught", reason: "nothing_to_catch", detail: "no network adapter whose DNS queries would leave outside Sieve" });
+    expect(stateLine()).toHaveAttribute("data-capture-tone", "neutral");
+    expect(stateLine()).toHaveTextContent("Nothing to do on this network");
+    expect(stateLine()?.querySelector(".text-warning"), "no warning colour").toBeNull();
+    report(rt, { state: "not_caught", reason: "no_ipv4", detail: "x" });
+    expect(stateLine()).toHaveAttribute("data-capture-tone", "neutral");
+    report(rt, { state: "not_caught", reason: "no_answer", detail: "x" });
+    expect(stateLine()).toHaveAttribute("data-capture-tone", "warning");
+  });
+
+  it("a Windows error code is said in words, the number in the tooltip", async () => {
+    const line = captureStateLine({ state: "not_caught", reason: "failed", detail: "the DNS Client answered a probe with error 9003", code: 9003 });
+    expect(line?.text).toMatch(/another DNS server answered Sieve's test lookup before Sieve did/);
+    expect(line?.text).not.toMatch(/9003/);
+    expect(captureStateLine({ state: "not_caught", reason: "failed", detail: "the DNS Client answered a probe with error 4242", code: 4242 })?.text, "a code with no words keeps the engine's").toContain("error 4242");
+    const rt = await setup();
+    report(rt, { state: "not_caught", reason: "failed", detail: "the DNS Client answered a probe with error 9003", code: 9003 });
+    expect(stateLine()).not.toHaveTextContent("9003");
+    fireEvent.pointerMove(stateLine()!, { clientX: 10, clientY: 10 });
+    expect(document.querySelector("[role=tooltip][data-capture-code]")).toHaveTextContent("Windows DNS error 9003");
+    fireEvent.pointerLeave(stateLine()!);
+    expect(document.querySelector("[role=tooltip][data-capture-code]")).toBeNull();
   });
 });

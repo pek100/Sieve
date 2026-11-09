@@ -152,24 +152,27 @@ where
         Err(_) => return Ok(()),
         Ok(first) => first,
     };
-    match first {
-        Ok(ClientMessage::Hello { protocol, .. }) => {
+    // What the app can read beyond its protocol: each Status goes out as it reads it.
+    let capabilities = match first {
+        Ok(ClientMessage::Hello { protocol, capabilities, .. }) => {
             let answer = answer_hello(protocol, ENGINE_VERSION, session_id);
             let welcomed = matches!(answer, EngineMessage::Welcome { .. });
             write_frame(stream, &answer).await?;
             if !welcomed {
                 return Ok(());
             }
+            capabilities
         }
         Ok(_) => return refuse(stream, HELLO_FIRST).await,
         Err(FrameError::Closed) => return Ok(()),
         Err(e) => return refuse(stream, &e.to_string()).await,
-    }
+    };
+    let status = |s: EngineStatus| EngineMessage::Status(s.for_app(&capabilities));
     loop {
         let reply = match read_frame::<_, ClientMessage>(stream).await {
-            Ok(ClientMessage::Status) => EngineMessage::Status(backend.status()),
+            Ok(ClientMessage::Status) => status(backend.status()),
             Ok(ClientMessage::SetPolicy(p)) => match backend.set_policy(p) {
-                Ok(status) => EngineMessage::Status(status),
+                Ok(s) => status(s),
                 Err(message) => EngineMessage::Error { message },
             },
             Ok(ClientMessage::SetDnsUpstreams(list)) => match backend.set_dns_upstreams(list) {
@@ -178,7 +181,7 @@ where
             },
             Ok(ClientMessage::DnsUpstreams) => EngineMessage::DnsUpstreams(backend.dns_upstreams()),
             Ok(ClientMessage::RequestUpdate {}) => match backend.request_update() {
-                Ok(status) => EngineMessage::Status(status),
+                Ok(s) => status(s),
                 Err(message) => EngineMessage::Error { message },
             },
             Ok(ClientMessage::Subscribe) => return stream_flows(stream, session_id, backend).await,
@@ -371,7 +374,7 @@ mod tests {
 
     impl Backend for Fake {
         fn status(&self) -> EngineStatus {
-            EngineStatus { policy: self.policy.lock().unwrap().clone(), ..EngineStatus::default() }
+            EngineStatus { policy: self.policy.lock().unwrap().clone(), dns_capture: Some(sieve_ipc::DnsCapture::Working), ..EngineStatus::default() }
         }
         fn set_policy(&self, p: Policy) -> Result<EngineStatus, String> {
             let next = crate::policy::accept(&self.policy.lock().unwrap(), p)?;
@@ -597,7 +600,7 @@ mod tests {
     }
 
     fn hello(protocol: u32) -> ClientMessage {
-        ClientMessage::Hello { protocol, app_version: "0.1.0".into() }
+        ClientMessage::Hello { protocol, app_version: "0.1.0".into(), capabilities: Vec::new() }
     }
 
     #[tokio::test]
@@ -612,6 +615,30 @@ mod tests {
             send(&mut c, &ClientMessage::Status).await;
             assert_eq!(recv(&mut c).await, EngineMessage::Status(EngineStatus::default()));
         }
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    /// The fake holds a capture state: an app that named nothing reads the status
+    /// of an engine from before it (above), one that names it reads the state, on
+    /// every answer that carries a status.
+    #[tokio::test]
+    async fn only_an_app_that_names_dns_capture_gets_it() {
+        let (mut c, task) = start(1);
+        let named = ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.2.0".into(), capabilities: vec!["dns_capture".into(), "later".into()] };
+        send(&mut c, &named).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Welcome { .. }), "an unknown name is no refusal");
+        send(&mut c, &ClientMessage::Status).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.dns_capture == Some(sieve_ipc::DnsCapture::Working)));
+        send(&mut c, &ClientMessage::SetPolicy(Policy { revision: 1, engine: true, ..Policy::default() })).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.dns_capture.is_some()));
+        drop(c);
+        task.await.unwrap().unwrap();
+        let (mut c, task) = start(1);
+        send(&mut c, &hello(PROTOCOL)).await;
+        recv(&mut c).await;
+        send(&mut c, &ClientMessage::SetPolicy(Policy { revision: 1, engine: true, ..Policy::default() })).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Status(s) if s.dns_capture.is_none()));
         drop(c);
         task.await.unwrap().unwrap();
     }

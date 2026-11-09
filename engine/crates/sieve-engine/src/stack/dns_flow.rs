@@ -34,12 +34,20 @@ fn admit(ctx: &Relay, flow: &FiveTuple, attributed: &Attributed, proto: FlowProt
 /// How long the DNS Client service's process id is trusted before it is read again.
 const DNS_CLIENT_PID_FOR_MS: u64 = 60_000;
 
+/// The DNS Client's process id as last read, and when.
+static CACHED: std::sync::Mutex<Option<(Option<u32>, u64)>> = std::sync::Mutex::new(None);
+
+/// The next flow reads the DNS Client's process id afresh: a failed capture probe
+/// may mean the service restarted under another one.
+pub fn forget_dns_client_pid() {
+    *CACHED.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
 /// The DNS Client service's process id, read from the service manager at most
 /// once a [`DNS_CLIENT_PID_FOR_MS`]. None when it cannot be read.
 fn dns_client_pid() -> Option<u32> {
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-    static CACHED: std::sync::Mutex<Option<(Option<u32>, u64)>> = std::sync::Mutex::new(None);
     let now = crate::watchdog::monotonic_ms();
     let mut cached = CACHED.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((pid, at)) = *cached

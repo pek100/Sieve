@@ -1217,7 +1217,7 @@ describe("engine controller", () => {
       s.undo();
     });
 
-    it("an engine from before the capture switch refuses it: the rest arrives, it is said, retried at the next probe, never in a loop", async () => {
+    it("an engine from before the capture switch refuses it: the rest arrives, it is said, and it is not sent again until the engine's version changes", async () => {
       const s = setup("idle", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
       await s.fc.flush();
       const accepting = s.fake.source.setPolicy;
@@ -1240,9 +1240,25 @@ describe("engine controller", () => {
       expect(once).toBeGreaterThan(0);
       await s.fc.flush();
       expect(refused, "never in a loop").toBe(once);
-      await s.fc.advance(ENGINE_POLL_MS);
-      expect(refused, "retried at the next probe").toBeGreaterThan(once);
+      await s.fc.advance(ENGINE_POLL_MS * 3);
+      expect(refused, "not at the next probes: the same engine").toBe(once);
+      expect(s.store.getState().engine.actionError, "still said").toMatch(/does not know/);
+      const sent = s.fake.policies.length;
+      await s.settings.set("sampling.enabled" as SettingKey, true);
+      await s.fc.flush();
+      expect(s.fake.policies.length, "another change still arrives").toBeGreaterThan(sent);
+      expect(s.fake.policies.at(-1)).not.toHaveProperty("skip_dns_capture");
+      expect(refused, "without the refused field").toBe(once);
+      // An update: another engine version is asked again, and this one knows it.
+      const real = s.fake.source.probe;
+      s.fake.source.probe = async () => {
+        const facts = await real();
+        return facts.pipe?.kind === "welcome" ? { ...facts, pipe: { ...facts.pipe, engine_version: `${facts.pipe.engine_version}-next` } } : facts;
+      };
       s.fake.source.setPolicy = accepting;
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(s.fake.policies.at(-1)).toMatchObject({ skip_dns_capture: true });
+      expect(s.store.getState().engine.actionError).toBeNull();
       s.undo();
     });
 

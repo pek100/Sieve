@@ -23,7 +23,9 @@
 //!   and `Policy.custom_lists` and `Policy.tracking`, both defaulted and left out
 //!   while empty, so a policy without them reads and writes as before;
 //!   `Policy.skip_dns_capture` and the status's `dns_capture`, left out while
-//!   false or unknown, so the default, capture on, reads the same bytes).
+//!   false or unknown, so the default, capture on, reads the same bytes; the
+//!   Hello's `capabilities`, left out while empty, and the status's
+//!   `dns_capture` sent only to an app that names it there).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -115,6 +117,13 @@ pub const LIST_QUERY_MAX: usize = 256;
 /// app's `tracking.*` settings without their prefix. Append-only: an engine
 /// refuses a policy naming one it does not know.
 pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "referrer", "thirdPartyCookies", "webRtc", "push", "location", "queryParams", "firstPartyCookies"];
+/// What an app can read beyond its protocol, named in its Hello. Append-only: a
+/// field added to a message the app reads strictly goes only to an app that names
+/// it, so an app from before the field keeps reading the message. An engine
+/// ignores a name it does not know.
+pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE];
+/// [`EngineStatus::dns_capture`].
+pub const CAPABILITY_DNS_CAPTURE: &str = "dns_capture";
 /// A log row carries at most this many [`LogChange`]s: one per protection.
 pub const MAX_LOG_CHANGES: usize = TRACKING_NAMES.len();
 /// A flow event's rule text is cut to this many bytes: a list rule can run to
@@ -129,8 +138,17 @@ pub const MAX_LISTED_LINE_BYTES: usize = 180;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMessage {
-    /// Always the first frame.
-    Hello { protocol: u32, app_version: String },
+    /// Always the first frame. `capabilities` names what this app can read beyond
+    /// its protocol ([`APP_CAPABILITIES`]); left out while empty, so an app from
+    /// before it sends the bytes it always did. An engine from before it refuses
+    /// a Hello that names any (it denies unknown fields): the app then says Hello
+    /// again without them (`src-tauri/src/engine.rs`).
+    Hello {
+        protocol: u32,
+        app_version: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+    },
     /// Asks for [`EngineMessage::Status`].
     Status,
     /// The user's switches. Applied only when `revision` is above the
@@ -741,9 +759,9 @@ pub enum UpdateStatus {
 
 /// The engine's own counters since it started. Attribution of all flows, the
 /// gate, is `attributed / flows` (plan 6); host only is
-/// `(attributed - forwarded_named) / (flows - forwarded)`.
+/// `(attributed - forwarded_named) / (flows - forwarded)`. Takes unknown fields,
+/// as [`EngineStatus`] does.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Counters {
     /// Flows the stack accepted (the engine's own refused ones excluded).
     pub flows: u64,
@@ -774,9 +792,8 @@ pub struct Counters {
 }
 
 /// One row of "Virtual machines and WSL": what the engine has seen of one VM
-/// since it started.
+/// since it started. Takes unknown fields, as [`EngineStatus`] does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Guest {
     /// [`vm_key`], its key in `apps.levels`.
     pub key: String,
@@ -789,8 +806,18 @@ pub struct Guest {
 }
 
 /// What the engine is doing, from facts it holds (the `status` message).
+///
+/// Takes fields it does not know, as [`LogRow`] does, and so do the facts it is
+/// built of that the app only shows ([`Counters`], [`Guest`], [`FilterFacts`],
+/// [`ListFact`], [`DnsCapture`]): a fact appended to the status reaches an app
+/// built from now on as a fact it does not show, never as a Status it cannot
+/// read, which would cost it every other fact and the policy compare. An app
+/// built before this still reads strictly; for it the engine sends a new fact
+/// only when its Hello names the capability ([`EngineStatus::for_app`]). The
+/// status's `policy` stays strict: the app compares it with its settings and
+/// sends a policy on the difference, so it is where an unknown field could carry
+/// a decision. A known field missing or mistyped still refuses the Status.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EngineStatus {
     /// Filtering is on and every one of its parts is up.
     pub filtering: bool,
@@ -831,9 +858,23 @@ pub struct EngineStatus {
     pub update: UpdateStatus,
 }
 
-/// The Windows DNS Client capture as the app shows it.
+impl EngineStatus {
+    /// The status as the app that said Hello with `capabilities` can read it:
+    /// each fact whose capability it did not name is left out, as an engine from
+    /// before the fact would send it.
+    #[must_use]
+    pub fn for_app(mut self, capabilities: &[String]) -> Self {
+        if !capabilities.iter().any(|c| c == CAPABILITY_DNS_CAPTURE) {
+            self.dns_capture = None;
+        }
+        self
+    }
+}
+
+/// The Windows DNS Client capture as the app shows it. Takes unknown fields, as
+/// [`EngineStatus`] does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum DnsCapture {
     /// Caught and proven by the last probe.
     Working,
@@ -846,6 +887,10 @@ pub enum DnsCapture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         adapter: Option<String>,
         detail: String,
+        /// The status the DNS Client returned for the check lookup (a Win32 DNS
+        /// error such as 9003), when that is what failed; the app puts it in words.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<u32>,
     },
 }
 
@@ -864,21 +909,25 @@ pub enum CaptureReason {
     NoIpv4,
     /// Anything else; `detail` says what.
     Failed,
+    /// No adapter outside Sieve would send the DNS Client's queries (behind a
+    /// full-tunnel VPN, say): nothing is wrong, and nothing is caught because
+    /// nothing would leave. The app shows it as a fact, not a warning.
+    NothingToCatch,
 }
 
 /// What the engine filters with, as the app shows it. The catalogue stays in
 /// `sieve-filter`, which the app does not link; only its facts cross the pipe.
+/// Takes unknown fields, as [`EngineStatus`] does.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FilterFacts {
     pub lists: Vec<ListFact>,
     /// The resource library's pin (plan 8.4).
     pub resource_pin: Option<String>,
 }
 
-/// One filter list as the engine compiled it.
+/// One filter list as the engine compiled it. Takes unknown fields, as
+/// [`EngineStatus`] does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ListFact {
     /// The catalogue's id.
     pub id: String,
@@ -1452,12 +1501,12 @@ mod tests {
     }
 
     #[test]
-    fn status_rejects_unknown_fields() {
+    fn status_takes_unknown_facts_and_refuses_a_missing_one() {
         let f = fixture();
         let mut status = f["engine"].as_array().unwrap().iter().find(|m| m["type"] == "status").unwrap().clone();
         assert!(serde_json::from_value::<EngineMessage>(status.clone()).is_ok());
         status["x"] = 1.into();
-        assert!(serde_json::from_value::<EngineMessage>(status).is_err());
+        assert!(serde_json::from_value::<EngineMessage>(status).is_ok(), "a fact from a newer engine (see EngineStatus)");
         let v1 = r#"{"type":"status","filtering":false,"routes_up":false,"flows":0,"decrypting":false,"last_error":null}"#;
         assert!(serde_json::from_str::<EngineMessage>(v1).is_err(), "a v1 status lacks the v2 fields");
     }
@@ -1774,13 +1823,55 @@ mod tests {
     #[test]
     fn the_capture_states_round_trip_and_none_is_left_out() {
         let states: Vec<DnsCapture> = serde_json::from_value(fixture()["dnsCaptureStates"].clone()).unwrap();
-        assert_eq!(states.len(), 7);
+        assert_eq!(states.len(), 8);
         assert_eq!(states[0], DnsCapture::Working);
-        assert_eq!(states[2], DnsCapture::NotCaught { reason: CaptureReason::Tie, adapter: Some("Ethernet".into()), detail: "\"Ethernet\" has interface metric 1".into() });
+        assert_eq!(states[2], DnsCapture::NotCaught { reason: CaptureReason::Tie, adapter: Some("Ethernet".into()), detail: "\"Ethernet\" has interface metric 1".into(), code: None });
+        assert!(matches!(&states[6], DnsCapture::NotCaught { reason: CaptureReason::Failed, code: Some(9003), .. }), "the DNS Client's status, for the app to put in words");
         assert_eq!(serde_json::to_value(&states).unwrap(), fixture()["dnsCaptureStates"], "the app reads the same bytes");
         assert!(serde_json::to_value(EngineStatus::default()).unwrap().get("dns_capture").is_none());
         let on = EngineStatus { dns_capture: Some(DnsCapture::Off), ..EngineStatus::default() };
         assert_eq!(serde_json::from_value::<EngineStatus>(serde_json::to_value(&on).unwrap()).unwrap(), on);
+    }
+
+    /// An app from before `dns_capture` reads the Status strictly: the fact goes
+    /// only to an app whose Hello names it, and a bare Hello is the bytes it was.
+    #[test]
+    fn dns_capture_goes_only_to_an_app_that_names_it_and_a_bare_hello_is_unchanged() {
+        let bare = serde_json::json!({ "type": "hello", "protocol": 3, "app_version": "0.1.0" });
+        let parsed: ClientMessage = serde_json::from_value(bare.clone()).unwrap();
+        assert!(matches!(&parsed, ClientMessage::Hello { capabilities, .. } if capabilities.is_empty()));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), bare, "empty is left out");
+        let named = ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.2.0".into(), capabilities: APP_CAPABILITIES.iter().map(ToString::to_string).collect() };
+        let wire = serde_json::to_value(&named).unwrap();
+        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture"]));
+        assert_eq!(serde_json::from_value::<ClientMessage>(wire).unwrap(), named);
+
+        let status = EngineStatus { routes_up: true, dns_capture: Some(DnsCapture::Working), ..EngineStatus::default() };
+        let old_app = serde_json::to_value(status.clone().for_app(&[])).unwrap();
+        assert!(old_app.get("dns_capture").is_none(), "an app that named nothing gets the status of an engine from before it");
+        assert_eq!(status.clone().for_app(&["later".into(), CAPABILITY_DNS_CAPTURE.into()]), status, "an unknown name is ignored");
+    }
+
+    /// The status and its display facts take fields they do not know, so an app
+    /// built from now on reads a newer engine's status; the policy in it, and
+    /// every known field, stay strict.
+    #[test]
+    fn a_status_with_an_unknown_fact_reads_and_its_policy_stays_strict() {
+        let f = fixture();
+        let status = f["engine"].as_array().unwrap().iter().find(|m| m["type"] == "status").unwrap().clone();
+        let mut newer = status.clone();
+        newer["later_fact"] = serde_json::json!({ "x": 1 });
+        newer["counters"]["later_counter"] = serde_json::json!(4);
+        newer["dns_capture"] = serde_json::json!({ "state": "not_caught", "reason": "no_answer", "detail": "d", "later": true });
+        let read: EngineMessage = serde_json::from_value(newer).unwrap();
+        let EngineMessage::Status(read) = read else { panic!("a status") };
+        assert_eq!(read.dns_capture, Some(DnsCapture::NotCaught { reason: CaptureReason::NoAnswer, adapter: None, detail: "d".into(), code: None }));
+        let mut strict = status.clone();
+        strict["policy"]["later_switch"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<EngineMessage>(strict).is_err(), "the policy still refuses an unknown field");
+        let mut mistyped = status;
+        mistyped["routes_up"] = serde_json::json!("yes");
+        assert!(serde_json::from_value::<EngineMessage>(mistyped).is_err());
     }
 
     /// Absent is encrypted: an old file, an old peer and `Policy::default()` alike.

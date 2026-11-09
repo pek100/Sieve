@@ -183,6 +183,73 @@ pub fn put_first_for_dns(luid: SieveLuid) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Undoes what the capture changed on the adapter, each part on its own so one
+/// failure leaves none of the rest in place: its IPv6 metric back to automatic
+/// (as [`put_first_for_dns`] found it on an adapter of its own), its link-local
+/// addresses usable as sources again, and [`crate::tun::TUN_V6`] removed unless
+/// the routes need it (`keep_v6`, IPv6 routed). The errors, joined, for the log.
+pub fn restore_after_capture(luid: SieveLuid, keep_v6: bool) -> Result<(), String> {
+    use windows::Win32::NetworkManagement::IpHelper::DeleteUnicastIpAddressEntry;
+    let mut failed = Vec::new();
+    let mut row = MIB_IPINTERFACE_ROW::default();
+    // SAFETY: initialises a row this function owns.
+    unsafe { InitializeIpInterfaceEntry(&mut row) };
+    row.Family = AF_INET6;
+    row.InterfaceLuid = NET_LUID_LH { Value: luid.0 };
+    // SAFETY: the row names the interface and its family, as the call requires.
+    if unsafe { GetIpInterfaceEntry(&mut row) } == NO_ERROR && !row.UseAutomaticMetric {
+        row.UseAutomaticMetric = true;
+        row.SitePrefixLength = 0;
+        // SAFETY: a row read back above, changed in two fields.
+        if let Err(e) = check(unsafe { SetIpInterfaceEntry(&mut row) }, "SetIpInterfaceEntry") {
+            failed.push(e);
+        }
+    }
+    if let Err(e) = set_link_local_skip(luid, false) {
+        failed.push(e);
+    }
+    if !keep_v6 {
+        let mut address = MIB_UNICASTIPADDRESS_ROW::default();
+        // SAFETY: initialises a row this function owns.
+        unsafe { InitializeUnicastIpAddressEntry(&mut address) };
+        address.InterfaceLuid = NET_LUID_LH { Value: luid.0 };
+        address.Address = sockaddr_inet(IpAddr::V6(crate::tun::TUN_V6));
+        // SAFETY: `address` names the interface and the address, as the call requires.
+        let code = unsafe { DeleteUnicastIpAddressEntry(&address) };
+        if code != NO_ERROR && code != windows::Win32::Foundation::ERROR_NOT_FOUND {
+            failed.push(format!("DeleteUnicastIpAddressEntry {}: Win32 error {}", crate::tun::TUN_V6, code.0));
+        }
+    }
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
+}
+
+/// Sets `SkipAsSource` on every IPv6 link-local address of the adapter.
+fn set_link_local_skip(luid: SieveLuid, skip: bool) -> Result<(), String> {
+    use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_TABLE, SetUnicastIpAddressEntry};
+    let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+    // SAFETY: Windows allocates the table; it is freed below.
+    let code = unsafe { GetUnicastIpAddressTable(AF_INET6, &mut table) };
+    if code != NO_ERROR || table.is_null() {
+        return Err(format!("GetUnicastIpAddressTable: Win32 error {}", code.0));
+    }
+    let mut failed = None;
+    // SAFETY: `table` is valid until FreeMibTable; NumEntries rows follow.
+    unsafe {
+        let rows = std::slice::from_raw_parts_mut((*table).Table.as_mut_ptr(), (*table).NumEntries as usize);
+        for r in rows.iter_mut().filter(|r| r.InterfaceLuid.Value == luid.0) {
+            let link_local = super::table::read::inet_ip(&r.Address).is_some_and(|ip| matches!(ip, IpAddr::V6(a) if a.segments()[0] & 0xffc0 == 0xfe80));
+            if link_local && r.SkipAsSource != skip {
+                r.SkipAsSource = skip;
+                if let Err(e) = check(SetUnicastIpAddressEntry(r), "SetUnicastIpAddressEntry") {
+                    failed = Some(e);
+                }
+            }
+        }
+        FreeMibTable(table.cast());
+    }
+    failed.map_or(Ok(()), Err)
+}
+
 /// Gives the adapter [`crate::tun::TUN_V6`] for the DNS Client to reach its server
 /// from, if the routes did not, and skips every link-local address of the adapter
 /// as a source: a skipped address is in no answer for the machine's own name (live,
