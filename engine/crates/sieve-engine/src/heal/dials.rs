@@ -26,7 +26,8 @@ pub const BURST_MS: u64 = 500;
 /// count began. A browser's unused preconnects and the sockets it drops at a tab's or
 /// its own close were taken for rejections by the rule before (2026-11-08: Edge and
 /// Chrome 157 excluded a search engine; plan 4.3); what is left is an app that checks
-/// its pin after TLS and drops the socket, then tries again.
+/// its pin after TLS and drops the socket, then tries again. Never a registered
+/// browser's closes (`heal::silence_only_for_apps`, run 7): a browser refuses with an alert.
 ///
 /// Another connection of the pair open blocks the evidence even when it is from
 /// the same burst: a browser's preconnect round holds one of its sockets idle and
