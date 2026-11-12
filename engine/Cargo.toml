@@ -4,9 +4,11 @@
 #   sieve-ipc     the pipe protocol (no Windows calls), shared with src-tauri
 #   sieve-filter  lists, rule engine, exclusions, resource pin (pure)
 #   sieve-engine  the Windows service: flow decoding today, the TUN later
+#   sieve-link    trusted links (device -> hub), portable; its own licence,
+#                 no dependency on the three crates above
 [workspace]
 resolver = "3"
-members = ["crates/sieve-ipc", "crates/sieve-filter", "crates/sieve-engine"]
+members = ["crates/sieve-ipc", "crates/sieve-filter", "crates/sieve-engine", "crates/sieve-link"]
 exclude = ["vendor/ipstack"]
 
 [workspace.package]
