@@ -76,6 +76,10 @@ pub const WORD_MISSES: u8 = 2;
 /// The refusals of [`SignIn::pause`], as the pipe sends them.
 pub const NOT_WANTED: &str = "Windows' own lookups are not being encrypted, so there is nothing to pause";
 pub const NOT_HELD: &str = "Windows' own lookups are not being caught right now, so there is nothing to pause";
+/// The notice stands for the network, but the capture does not hold at this
+/// moment: it reopens after a pause ended (about a pass), or it failed since the
+/// notice showed. Either way the notice is on screen, so the words say what to do.
+pub const NOT_HELD_YET: &str = "Windows' own lookups are not being caught at this moment, so there is nothing to pause; if the notice is still there in a few seconds, try again";
 pub const NO_SIGN_IN: &str = "this network does not look like one that wants a sign-in, so the capture stays";
 pub const OTHER_NETWORK: &str = "that is not the network Sieve sees now, so the capture stays";
 pub const NOT_AGAIN: &str = "the last pause on this network ran its full time and Sieve does not see a sign-in page there now, so the capture stays";
@@ -304,7 +308,8 @@ impl SignIn {
             None => {}
         }
         if !held {
-            return Err(NOT_HELD);
+            let on_screen = self.shown.as_ref().is_some_and(|s| s.network == network);
+            return Err(if on_screen { NOT_HELD_YET } else { NOT_HELD });
         }
         let Some(shown) = &self.shown else { return Err(NO_SIGN_IN) };
         if network.len() > NETWORK_ID_MAX || shown.network != network {
@@ -472,7 +477,8 @@ mod tests {
         assert_eq!(s.report(t0), None, "the setting off");
         let mut s = detected(t0);
         s.observe(at(t0, 1), Seen { held: false, ..seen(&hotel, true, true) });
-        assert_eq!(s.pause(at(t0, 1), HOTEL, true, false), Err(NOT_HELD), "the capture failed after the notice showed");
+        assert_eq!(s.pause(at(t0, 1), HOTEL, true, false), Err(NOT_HELD_YET), "the capture stopped holding (or reopens after a pause) while the notice stands: the words say to try again");
+        assert_eq!(s.pause(at(t0, 1), CAFE, true, false), Err(NOT_HELD), "a network with no notice gets the plain words");
         s.observe(at(t0, 1 + CLEAR_AFTER.as_secs()), Seen { held: false, ..seen(&hotel, true, true) });
         assert_eq!(s.report(at(t0, 16)), None, "and the notice goes");
     }
