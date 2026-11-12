@@ -1,5 +1,85 @@
 # VM live run 2026-11-08: status at the stop
 
+## Run 8 (2026-11-12): sign-in network pause
+
+Engine built from main 90f2e7a (`cargo build --release -p sieve-engine`, SHA-256 6A4BD8A8…E122DE) and installed over the 11/09 engine; policy `engine` and `sieving` true, `skip_dns_capture` absent (the capture on). All pipe traffic went through a VM-only client built against main's `sieve-ipc` (`sieve-pipe8`: Hello with `APP_CAPABILITIES` or with none, Status, SetPolicy merge, `PauseDnsCapture`, `ResumeDnsCapture`, a 1 s status watch), standing in for `sieve.exe`, since the pipe accepts only the installed app path. The real `sieve.exe` went back at the end. Ethernet's IPv4 metric was 1 after each boot (the known quirk) and was set back to automatic. No engine bug found; no code changed.
+
+**Baseline:** `routes_up` true, `dns_capture` working, no `dns_unreachable`, no `wifi_sign_in`. Cloudflare DoH answering (73 answers, h2, X25519MLKEM768). `Resolve-DnsName example.com` answered.
+
+### The simulation: no driver, and how it differs from a portal
+
+A first try with WinDivert was dropped: Defender flagged the release zip as `Misleading:Win32/Malgent!AMTB`. Nothing of it was installed, and the antivirus settings were left as found. The simulation used instead runs on the VM only and needs no driver:
+
+- **Resolvers blocked:** Windows Firewall outbound block rules (`r8-*`) for 1.1.1.1, 1.0.0.1, 9.9.9.9 and 149.112.112.112, all ports.
+- **Outage:** blocks all outbound IPv4 TCP, UDP (DHCP excepted) and ICMP. This PC's IP and the metadata server are excepted.
+- **Portal:**
+  - The resolver block, plus blocks on all TCP except port 53 and all UDP except 53 and DHCP.
+  - `192.0.2.1/32` and `198.51.100.1/32` added to the Ethernet adapter (ActiveStore, SkipAsSource, with DHCP/static coexistence on).
+  - A small local server on port 80 at those addresses answers 302 to `http://portal.test/login`. It can also answer 503, used to make the check stop seeing a portal. The 200-page variant was not exercised.
+  - "Signed in" removes the rules, the addresses and the server mode together.
+- **Dead-man:** a SYSTEM task, every minute, cleared everything when not renewed for 20 minutes. It never fired.
+
+The first placement (extra addresses on Ethernet) was reached by the engine's pinned probe sockets: the server logged both IPv4 requests every round. So the KM-TEST loopback placement was not needed.
+
+How this differs from a real portal:
+
+- The probe's connections to the documentation addresses are local (loopback), so they never reach the wire or a gateway. This run does not prove that the probe leaves by the physical adapter to a gateway on a portal. On the resolvers-blocked network (B) the SYNs were seen leaving Ethernet.
+- Nothing intercepts port 80 for any other address. A browser's traffic is not redirected, so "Edge lands on the portal page" was not run.
+- A firewall block makes connects fail at once (WFP), where a hotel drops or resets them. In the outage nothing reaches the wire, so the probe's pacing could not be seen there.
+- The VM has no IPv6 address. The two IPv6 probes fail to dial (inferred: no route of that family; only the two IPv4 requests reached the server each round). Two of two IPv4 answers were enough for "portal".
+- Adding the addresses changes the route table. The engine sees that as "network moved" and starts the sign-in facts over, which a real portal does not cause.
+
+### Checks
+
+| Check | Result | Evidence |
+|---|---|---|
+| A normal network | PASS | 125 s pktmon on the NICs with filters 192.0.2.1 and 198.51.100.1: 0 packets (only the two filter-definition lines). Status had no `wifi_sign_in` throughout. |
+| B resolvers blocked | PASS | `dns_unreachable` true 27 s after the block. No `wifi_sign_in` for 4 min. 13 probe rounds of 2 SYNs (`10.128.0.2.50553 > 192.0.2.1.80 [SEW]`, …), every 18.0 s (15 s plus the 3 s give-up). All 66 packets on component 2 (VirtIO Ethernet), 0 on component 1 (Sieve Tunnel), 0 answered. `Resolve-DnsName example.com`: "DNS server failure". |
+| C outage | PASS (pacing not observable) | `dns_unreachable` true after 20 s; no `wifi_sign_in` for 3 min. 0 packets to the documentation addresses on the wire: the firewall refuses the connects before the wire. |
+| D portal | PASS | `wifi_sign_in` `{"network":"{988176B8-2F12-4B49-9D91-2FFEE9F2E97A}"}` 21 s after the portal started (31 s in a second run). `wifi` is false on Ethernet, so the field is left out. Server: `GET /connecttest.txt`, `Host: www.msftconnecttest.com` from both addresses, answered `302 Found`, every 15.0 s. Before the pause, `Resolve-DnsName example.com` failed with "DNS server failure". The status watch showed no change from 10:58:50 to the pause at 11:04:50: no pause by itself, no flapping. |
+| E pause | PASS (Edge part SKIP) | `PauseDnsCapture` gave `paused_left_s` 899, then `dns_capture` off. `Resolve-DnsName www.wikipedia.org` resolved to 208.80.153.224 and example.com to 172.66.147.243. pktmon: 56 port-53 packets between 10.128.0.2 and 10.128.0.1 on Ethernet (for example `A? time.windows.com`, answered). `nslookup example.com 8.8.8.8` returned "Server failed": its 10 packets were on the Sieve Tunnel only, 0 to 8.8.8.8 on Ethernet. Edge on the portal page: SKIP (nothing intercepts a browser here). |
+| F sign in | PASS | The pause ended by itself 13 s after the switch (encrypted probe every 10 s). `wifi_sign_in` was gone at the same moment and `dns_capture` was working at +14.5 s. In the 60 s after, 12 public lookups through the DNS Client resolved and none left in plain. The only plain port-53 packets were `_ldap._tcp.dc._msdcs….c.sieve-live-test.internal` SRV queries, the adapter's own suffix, which goes to the LAN server by design (split horizon). |
+| G refusals and bounds | PASS | The six refusals and limits are listed under "G, in detail" below. |
+| H capture not held | PASS | With `skip_dns_capture` true on the portal, `wifi_sign_in` was gone in 1.5 s and stayed absent for 60 s while `dns_unreachable` stayed true. IPv6 disabled on Sieve's adapter was not run. |
+| I old client | PASS | A Hello with no capabilities got a full Status with neither `wifi_sign_in` nor `dns_capture` and no error. A new client at the same moment saw the notice. |
+| J fail-open | PASS | Killed mid-pause, then rebooted with a pause standing, then stopped cleanly; the readings are under "J, in detail" below. |
+| K health | PASS | System log 10:39–11:34: 23 warnings and errors, none from Wintun, Tcpip, NDIS, WFP or BFE; the only Sieve event is 7031 for the deliberate kill. No Application errors for Sieve, 0 panics in the pipe log, `last_error` empty at the end. WinDivert was never installed. |
+
+**G, in detail:**
+- A wrong network id was refused with "that is not the network Sieve sees now".
+- With no notice standing: "this network does not look like one that wants a sign-in".
+- With the setting off: "Windows' own lookups are not being encrypted".
+- A second click did not extend the pause: 867 s left before and after.
+- `ResumeDnsCapture` ended the pause at once, with the capture working 1.5 s later.
+- Time-up ran once: the pause ended 903.5 s after the click. The notice was back within 1.5 s, because the check kept running during the pause and its portal answer was still fresh. Then the server switched to 503 for two check requests, and a click while the notice only faded was refused with "the last pause on this network ran its full time…". The third pause was taken once the portal was seen again.
+- A fourth pause in the run, with the capture held, was refused with "this network had its three pauses since Sieve started…".
+- An engine restart mid-pause came back with `routes_up` in 5.5 s, unpaused and captured, and the notice reappeared 7.7 s later.
+
+**J, in detail:**
+- **Killed mid-pause**, 1.5 s later: no engine process, no Sieve adapter, no routes, Ethernet DNS still 10.128.0.1 only, 0 NRPT rules, 0 WFP lines naming Sieve. `Resolve-DnsName example.com` resolved in plain through the network. The service restarted itself (recovery: restart after 5 s) unpaused, with the capture working; `policy.json` carried nothing of the pause.
+- **Rebooted with a pause standing:** it came back unpaused, `wifi_sign_in` absent, and nothing in `status.json`. The documentation addresses were gone (ActiveStore). The capture came up `not_caught` until the metric quirk was fixed, then `working`.
+- **Clean stop:** no Sieve adapter, no routes, 0 WFP lines naming Sieve, DNS 10.128.0.1, resolution normal.
+
+### Findings (no bugs)
+
+- **Design/UX:** for about 1.5 s after "Resume now", and after a time-up, the notice stands while the capture is reopening. A click then is refused with `NOT_HELD` ("Windows' own lookups are not being caught right now"), which reads wrong to someone looking at the notice. Seen live at 11:25:30 and 11:26:03.
+- **Expected:** after signing in without a pause, the notice stays for `CLEAR_AFTER` (16 s measured) after encrypted DNS works again.
+
+### UNVERIFIED
+
+- The probe leaving by the physical wire to a gateway on a portal network (the portal addresses were local here).
+- A browser landing on the portal page during a pause.
+- A real hotel's DNS interception, RST-style blocking, or a portal that answers only on IPv6.
+- Windows' own WEBHIJACK flag as the trigger: never set on this VM.
+- The IPv6 probes' dial failures (inferred, not captured).
+- The 200-page portal variant.
+- H with IPv6 disabled on Sieve's adapter.
+- The probe's pacing during an outage.
+
+### VM state left behind
+
+Engine from main 90f2e7a installed with policy `engine` true. Real `sieve.exe` restored (hash equals `C:\sieve\bin\sieve-real.exe`), `C:\sieve\bin\sieve-pipe8.exe` and `C:\sieve\r8\` (logs, captures) kept. Cleared: every `r8-*` firewall rule, task and the dead-man, the portal server, the documentation addresses, DHCP/static coexistence (back to disabled). No Defender exclusions. VM stopped (TERMINATED).
+
 ## Run 7 (2026-11-09): compatibility, tracking protection, slice 7 U1, the capture again
 
 Branch `worktree-agent-a1b155524f016d23b` on main 6e5f7f2. Main was built with `pnpm tauri build` and its installer installed silently over the old one (exit 0): engine 9F47E8B3, app BACF06A1. Fixes on this branch, each with tests that fail without it: c518da7 (the TCP stack reads the app's FIN and RST at once, and a half-closed app still gets its answer), 8481d53 (self-healing: a registered browser's silence is no evidence, only its alerts) and 71599fc (an idle connection lives two hours, not a minute). Engines on the VM: **main** 9F47E8B3; **fix1** C91A76E4 (c518da7); **fix2** CBB585ED (c518da7 plus the quiet-close half of 8481d53); **fix3** 52DFF988 (8481d53); **fix4** 052BC67C (71599fc, the branch head); live-scope builds of main, fix1, fix2 (1C570BE1) and, for evidence only, of main and fix1 with every piece of heal evidence printed to a file (VM only, never committed). Runtime switches and reads went through a VM-only pipe client in the app's place (status, policy merge, log subscription, issues, exclusions, notices); the real app went back before the uninstall.
