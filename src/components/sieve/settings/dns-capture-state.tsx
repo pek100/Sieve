@@ -61,10 +61,15 @@ function timeLeft(s: number): string {
   return s >= 60 ? `about ${Math.ceil(s / 60)} min` : `${s} s`;
 }
 
-/** What the row says while the capture is paused for a Wi-Fi sign-in, or null when it is not. */
+/**
+ * What the row says while the capture is paused for a sign-in, or null when it is
+ * not. Windows resolves names for nearly every app and browser, so nearly all
+ * lookups go plain meanwhile; "Wi-Fi" only when the engine says it is one.
+ */
 export function signInPauseLine(w: WifiSignIn | undefined): string | null {
   if (w?.paused_left_s === undefined) return null;
-  return `Paused for Wi-Fi sign-in, resumes by itself in ${timeLeft(w.paused_left_s)} at the latest, or sooner once encrypted DNS answers or the network changes. Until then only Windows' own lookups go to this Wi-Fi's DNS server in plain text; lookups that apps send through Sieve stay encrypted.`;
+  const place = w.wifi === true ? "Wi-Fi" : "network";
+  return `Paused for sign-in. Nearly every app's lookups go to this ${place}'s DNS server in plain text; only apps with their own encrypted DNS are not affected. Resumes by itself in ${timeLeft(w.paused_left_s)} at the latest, or sooner once encrypted DNS answers or the network changes.`;
 }
 
 const ICONS = { working: CircleCheck, neutral: Info, warning: TriangleAlert } as const;
@@ -72,7 +77,7 @@ const ICON_COLOR = { working: "text-primary", neutral: "text-on-surface-muted", 
 
 /**
  * The capture's live state under "Also encrypt Windows' own lookups", from the
- * engine's status (`dns_capture`), or the Wi-Fi sign-in pause with its time left
+ * engine's status (`dns_capture`), or the sign-in pause with its time left
  * and "Resume now" (`wifi_sign_in`). Nothing while the switch is off, while routes
  * are down, or from an engine that does not report it. A Windows error code is
  * in words; the number itself is in the tooltip, for a support question.

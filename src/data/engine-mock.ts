@@ -180,7 +180,7 @@ export function createMockEngine(
     const paused = signIn === "paused";
     // As the engine: the capture's state while routes are up, off by the user's switch, with plain DNS or while paused.
     if (status.routes_up) status = { ...status, dns_capture: !captureWanted || paused ? { state: "off" } : { state: "working" } };
-    if (status.routes_up && captureWanted && signIn !== "none") status = { ...status, wifi_sign_in: { network: MOCK_SIGN_IN_NETWORK, ...(paused ? { paused_left_s: MOCK_PAUSED_LEFT_S } : {}) } };
+    if (status.routes_up && captureWanted && signIn !== "none") status = { ...status, wifi_sign_in: { network: MOCK_SIGN_IN_NETWORK, wifi: true, ...(paused ? { paused_left_s: MOCK_PAUSED_LEFT_S } : {}) } };
     if (!holdsHttps) return { ...status, policy };
     // As the engine: its switch alone decrypts nothing, with routes down or sieving off.
     return { ...status, decrypting: status.routes_up && policy.sieving, policy: { ...policy, https: true } };

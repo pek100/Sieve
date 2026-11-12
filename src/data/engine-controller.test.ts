@@ -5,7 +5,10 @@ import { createNoticeBus } from "@/core/notices";
 import { MAX_POLICY_BYTES, settingDef, type SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
-import { CRASH_LOOP_BANNER, DNS_UNREACHABLE_BANNER, WIFI_SIGN_IN_NOTICE, WIFI_SIGN_IN_PAUSED_BANNER, createEngineController } from "./engine-controller";
+import { CRASH_LOOP_BANNER, DNS_UNREACHABLE_BANNER, createEngineController, signInNoticeText, signInPausedText } from "./engine-controller";
+
+const WIFI_SIGN_IN_NOTICE = signInNoticeText(true);
+const WIFI_SIGN_IN_PAUSED_BANNER = signInPausedText(true);
 import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_CERT_ERROR, MOCK_ENGINE_ERROR, MOCK_HTTPS_OFF, MOCK_ISSUES_ERROR, MOCK_NO_SIGN_IN, MOCK_SIGN_IN_NETWORK, type CertScenario, type EngineScenario, type IssuesScenario } from "./engine-mock";
 import type { EngineSource } from "./engine-source";
 import { createMockFilterLists } from "./filter-lists-mock";
@@ -1309,8 +1312,12 @@ describe("engine controller", () => {
       for (let i = 0; i < 4; i++) await s.fc.advance(ENGINE_POLL_MS);
       expect(banners().map((n) => n.text), "one notice, not the unreachable one beside it").toEqual([WIFI_SIGN_IN_NOTICE]);
       expect(WIFI_SIGN_IN_NOTICE).toMatch(/^This Wi-Fi wants you to sign in\./);
-      expect(WIFI_SIGN_IN_NOTICE).toContain("sends only Windows' own lookups to this Wi-Fi's DNS server, in plain text");
-      expect(WIFI_SIGN_IN_NOTICE).toContain("Lookups that apps send through Sieve stay encrypted");
+      expect(WIFI_SIGN_IN_NOTICE).toContain("sends them to this Wi-Fi's DNS server in plain text, and nearly every app and browser looks names up through Windows");
+      expect(WIFI_SIGN_IN_NOTICE).toContain("It lasts up to 15 minutes, and ends sooner once encrypted DNS answers or the network changes.");
+      expect(WIFI_SIGN_IN_NOTICE, "never that only Windows' own lookups go plain").not.toMatch(/sends only|stay encrypted/);
+      expect(WIFI_SIGN_IN_PAUSED_BANNER).toMatch(/^Paused for sign-in: nearly every app's lookups go to this Wi-Fi's DNS server in plain text/);
+      expect(signInNoticeText(undefined), "Ethernet, or an engine that does not say").toMatch(/^This network wants you to sign in\..*this network's DNS server/);
+      expect(signInPausedText(undefined)).toContain("this network's DNS server");
       expect(banners()[0].action?.label).toBe("Sign in to this Wi-Fi");
       expect(s.fake.signInCalls, "Sieve never pauses by itself").toEqual([]);
       banners()[0].action!.run();
@@ -1324,6 +1331,25 @@ describe("engine controller", () => {
       expect(s.fake.signInCalls.at(-1)).toBe("resume");
       expect(banners().map((n) => n.text), "resumed on a network that still wants a sign-in: offered again").toEqual([WIFI_SIGN_IN_NOTICE]);
       expect(s.settings.get(DNS_CLIENT_CAPTURE as SettingKey), "the setting is never touched").toBe(true);
+      s.undo();
+    });
+
+    it("on Ethernet, or from an engine that does not say, the notice and its button say network, not Wi-Fi", async () => {
+      const s = setup("filtering", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      const banners = () => s.notices.list().filter((n) => n.surface === "banner");
+      await s.fc.flush();
+      s.fake.withSignIn("filtering");
+      const real = s.fake.source.probe;
+      s.fake.source.probe = async () => {
+        const facts = await real();
+        if (facts.pipe?.kind !== "welcome" || facts.pipe.status.wifi_sign_in === undefined) return facts;
+        const wired = { ...facts.pipe.status.wifi_sign_in };
+        delete wired.wifi;
+        return { ...facts, pipe: { ...facts.pipe, status: { ...facts.pipe.status, wifi_sign_in: wired } } };
+      };
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners().map((n) => n.text)).toEqual([signInNoticeText(false)]);
+      expect(banners()[0].action?.label).toBe("Sign in to this network");
       s.undo();
     });
 
@@ -1362,7 +1388,7 @@ describe("engine controller", () => {
         throw new Error(MOCK_NO_SIGN_IN);
       };
       await s.controller.pauseDnsCapture(MOCK_SIGN_IN_NETWORK);
-      expect(s.store.getState().engine.actionError).toBe(`The Wi-Fi sign-in did not pause: ${MOCK_NO_SIGN_IN}`);
+      expect(s.store.getState().engine.actionError).toBe(`The sign-in pause did not start: ${MOCK_NO_SIGN_IN}`);
       s.undo();
     });
 

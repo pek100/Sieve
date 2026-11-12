@@ -495,7 +495,7 @@ export interface EngineStatus {
   dns_unreachable?: boolean;
   /** Whether Windows' own lookups are caught, while routes are up. Absent: routes down, or an older engine. */
   dns_capture?: DnsCapture;
-  /** A Wi-Fi that wants a sign-in, or the capture paused for one. Absent: nothing to say, or an engine or app from before it. */
+  /** A network that wants a sign-in, or the capture paused for one. Absent: nothing to say, or an engine or app from before it. */
   wifi_sign_in?: WifiSignIn;
   update: EngineUpdate;
 }
@@ -505,6 +505,8 @@ export interface WifiSignIn {
   /** The engine's id for the network; handed back in `pause_dns_capture`. */
   network: string;
   paused_left_s?: number;
+  /** On a Wi-Fi adapter: the app says "Wi-Fi". Absent: another kind, or an engine from before it ("network"). */
+  wifi?: true;
 }
 
 /** sieve-ipc `SIGN_IN_PAUSE_MAX_S` and `NETWORK_ID_MAX`. */
@@ -516,10 +518,12 @@ export function parseWifiSignIn(raw: unknown): WifiSignIn | null {
   if (typeof raw !== "object" || raw === null) return null;
   const w = raw as Record<string, unknown>;
   if (typeof w.network !== "string" || w.network.length === 0 || w.network.length > NETWORK_ID_MAX) return null;
+  // Only a true is Wi-Fi; anything else reads as the neutral "network", never a refusal.
+  const wifi = w.wifi === true ? { wifi: true as const } : {};
   const left = w.paused_left_s;
-  if (left === undefined) return { network: w.network };
+  if (left === undefined) return { network: w.network, ...wifi };
   if (!Number.isInteger(left) || (left as number) < 0) return null;
-  return { network: w.network, paused_left_s: Math.min(left as number, SIGN_IN_PAUSE_MAX_S) };
+  return { network: w.network, paused_left_s: Math.min(left as number, SIGN_IN_PAUSE_MAX_S), ...wifi };
 }
 
 const withSignIn = (w: WifiSignIn | null): { wifi_sign_in?: WifiSignIn } => (w === null ? {} : { wifi_sign_in: w });

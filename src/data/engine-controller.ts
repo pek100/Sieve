@@ -49,7 +49,7 @@ import type { SieveStore } from "@/core/store";
 import type { EngineSource } from "./engine-source";
 import type { FilterListSource } from "./filter-lists-source";
 import type { Clock } from "./poller";
-import { ProtocolError, type EngineDomainList, type EnginePolicy, type EngineStatus, type ExclusionsPage, type FilterCatalogue } from "./protocol";
+import { ProtocolError, type EngineDomainList, type EnginePolicy, type EngineStatus, type ExclusionsPage, type FilterCatalogue, type WifiSignIn } from "./protocol";
 import type { SettingsStore } from "./settings-store";
 
 export interface EngineController {
@@ -102,18 +102,24 @@ const DNS_CLIENT_CAPTURE = DNS_CLIENT_CAPTURE_KEY as SettingKey;
  * only ever the user's choice.
  */
 export const DNS_UNREACHABLE_BANNER = `No encrypted DNS server answers on this network, so sites may not load. Hotel and airport Wi-Fi often needs plain DNS to show its sign-in page: you can turn off ${REGISTRY[DNS_ENCRYPTION].label} in Settings > Filtering.`;
+/** "Wi-Fi" when the engine says the network is on a Wi-Fi adapter (`wifi_sign_in.wifi`), else "network". */
+export const signInPlace = (wifi: boolean | undefined) => (wifi === true ? "Wi-Fi" : "network");
 /**
- * The Home notice while the engine sees a Wi-Fi that wants a sign-in (the
- * status's `wifi_sign_in`, not paused), and its one button. It says exactly what
- * the click changes: only Windows' own lookups go plain, and only for a while.
+ * The Home notice while the engine sees a network that wants a sign-in (the
+ * status's `wifi_sign_in`, not paused), and its one button. It says what the
+ * click changes: Windows resolves names for nearly every app and browser, so
+ * nearly all lookups go plain; only for a while.
  */
-export const WIFI_SIGN_IN_NOTICE =
-  "This Wi-Fi wants you to sign in. Its sign-in page can't open while Sieve encrypts Windows' own lookups. The button sends only Windows' own lookups to this Wi-Fi's DNS server, in plain text, until encrypted DNS answers again, the network changes or 15 minutes pass. Lookups that apps send through Sieve stay encrypted.";
-export const WIFI_SIGN_IN_ACTION = "Sign in to this Wi-Fi";
+export function signInNoticeText(wifi: boolean | undefined): string {
+  const place = signInPlace(wifi);
+  return `This ${place} wants you to sign in. Its sign-in page can't open while Sieve encrypts Windows' own lookups. The button sends them to this ${place}'s DNS server in plain text, and nearly every app and browser looks names up through Windows: only apps with their own encrypted DNS are not affected. It lasts up to 15 minutes, and ends sooner once encrypted DNS answers or the network changes.`;
+}
+export const signInActionLabel = (wifi: boolean | undefined) => `Sign in to this ${signInPlace(wifi)}`;
 /** The Home line while that pause holds. */
-export const WIFI_SIGN_IN_PAUSED_BANNER =
-  "Paused for Wi-Fi sign-in: Windows' own lookups go to this Wi-Fi's DNS server in plain text so its sign-in page can open. Sieve resumes by itself.";
-const SIGN_IN_ERROR_PREFIX = "The Wi-Fi";
+export function signInPausedText(wifi: boolean | undefined): string {
+  return `Paused for sign-in: nearly every app's lookups go to this ${signInPlace(wifi)}'s DNS server in plain text, so its sign-in page can open. Sieve resumes by itself within 15 minutes, sooner once encrypted DNS answers.`;
+}
+const SIGN_IN_ERROR_PREFIX = "The sign-in pause";
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const captureUnknownError = `This version of Sieve's engine does not know "${REGISTRY[DNS_CLIENT_CAPTURE].label}". Your other settings reached it.`;
 
@@ -239,7 +245,10 @@ export function createEngineController({ engine, store, clock, settings, checks,
   // The sign-in notice follows the engine's fact: offered for the network it
   // names (unless the user dismissed it for that network), gone when the engine
   // stops naming one; the paused line while the pause holds. Never a pause by itself.
-  const followSignIn = (offered: string | null, paused: boolean) => {
+  const followSignIn = (signIn: WifiSignIn | undefined) => {
+    const paused = signIn?.paused_left_s !== undefined;
+    const offered = paused ? null : (signIn?.network ?? null);
+    const wifi = signIn?.wifi;
     if (signInNotice !== null && !notices.list().some((n) => n.id === signInNotice?.id)) {
       signInDismissed = signInNotice.network;
       signInNotice = null;
@@ -251,9 +260,9 @@ export function createEngineController({ engine, store, clock, settings, checks,
     if (offered === null && !paused) signInDismissed = null;
     if (offered !== null && signInNotice === null && signInDismissed !== offered) {
       const network = offered;
-      signInNotice = { network, id: notices.push({ kind: "info", surface: "banner", desktop: true, text: WIFI_SIGN_IN_NOTICE, action: { label: WIFI_SIGN_IN_ACTION, run: () => void guard(() => pauseDnsCapture(network)) } }) };
+      signInNotice = { network, id: notices.push({ kind: "info", surface: "banner", desktop: true, text: signInNoticeText(wifi), action: { label: signInActionLabel(wifi), run: () => void guard(() => pauseDnsCapture(network)) } }) };
     }
-    if (paused && pausedBanner === null) pausedBanner = notices.push({ kind: "info", surface: "banner", text: WIFI_SIGN_IN_PAUSED_BANNER });
+    if (paused && pausedBanner === null) pausedBanner = notices.push({ kind: "info", surface: "banner", text: signInPausedText(wifi) });
     if (!paused && pausedBanner !== null) {
       notices.dismiss(pausedBanner);
       pausedBanner = null;
@@ -279,11 +288,11 @@ export function createEngineController({ engine, store, clock, settings, checks,
   const pauseDnsCapture = (network: string) => {
     // An engine from before the fact never named a network, so it is never sent the message.
     if (engineStatus(get())?.wifi_sign_in?.network !== network) return Promise.resolve();
-    return signInRequest(() => engine.pauseDnsCapture(network), `${SIGN_IN_ERROR_PREFIX} sign-in did not pause`);
+    return signInRequest(() => engine.pauseDnsCapture(network), `${SIGN_IN_ERROR_PREFIX} did not start`);
   };
   const resumeDnsCapture = () => {
     if (engineStatus(get())?.wifi_sign_in === undefined) return Promise.resolve();
-    return signInRequest(() => engine.resumeDnsCapture(), `${SIGN_IN_ERROR_PREFIX} sign-in pause did not end`);
+    return signInRequest(() => engine.resumeDnsCapture(), `${SIGN_IN_ERROR_PREFIX} did not end`);
   };
 
   // Facts in, consequences out: passed check, banner, policy.
@@ -298,7 +307,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
       banner = null;
     }
     const signIn = engineStatus(e)?.wifi_sign_in;
-    followSignIn(signIn?.paused_left_s === undefined ? (signIn?.network ?? null) : null, signIn?.paused_left_s !== undefined);
+    followSignIn(signIn);
     // The sign-in notice says what the unreachable one would, with the step that helps here instead.
     const unreachable = engineStatus(e)?.dns_unreachable === true && signIn === undefined;
     if (unreachable && dnsBanner === null) dnsBanner = notices.push({ kind: "error", surface: "banner", text: DNS_UNREACHABLE_BANNER });

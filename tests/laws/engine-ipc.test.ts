@@ -133,6 +133,8 @@ describe("engine IPC law", () => {
       expect(parseEngineStatus({ ...body, wifi_sign_in: odd }), `a notice never refuses the Status: ${JSON.stringify(odd)}`).not.toHaveProperty("wifi_sign_in");
     }
     expect(parseEngineStatus({ ...body, wifi_sign_in: { network: "n", paused_left_s: 10_000 } }).wifi_sign_in?.paused_left_s, "never past the cap").toBe(SIGN_IN_PAUSE_MAX_S);
+    expect(parseEngineStatus({ ...body, wifi_sign_in: { network: "n", wifi: "yes" } }).wifi_sign_in, "only a true says Wi-Fi; anything else is the neutral word").toEqual({ network: "n" });
+    expect(RUST).toMatch(/skip_serializing_if = "std::ops::Not::not"\)\]\s*pub wifi: bool/);
     expect(rustConst("SIGN_IN_PAUSE_MAX_S")).toBe("15 * 60");
     expect(Number(rustConst("NETWORK_ID_MAX"))).toBe(NETWORK_ID_MAX);
     expect(RUST).toMatch(/skip_serializing_if = "Option::is_none"\)\]\s*pub wifi_sign_in: Option<WifiSignIn>/);

@@ -51,7 +51,7 @@ describe("Also encrypt Windows' own lookups", () => {
     expect(sw).toBeEnabled();
     expect(sw).toHaveAccessibleDescription(/Windows' built-in lookups also go through Sieve's encrypted DNS, so the network can't read them/);
     expect(row()).toHaveTextContent(/Can break: Names of nearby PCs found without DNS, and short names that don't exist, answer about 7 s slower/);
-    expect(row()).toHaveTextContent(/Sieve offers Sign in to this Wi-Fi, which pauses this for that network until you are signed in/);
+    expect(row()).toHaveTextContent(/Sieve offers a one-click pause so its page can open: for up to 15 minutes, or until encrypted DNS answers or the network changes, nearly every app's lookups then go in plain text/);
     expect(row().querySelectorAll("[data-slot=card], [data-slot=badge]"), "flat: no card or chip of its own").toHaveLength(0);
   });
 
@@ -118,13 +118,14 @@ describe("Also encrypt Windows' own lookups", () => {
     expect(stateLine()).toHaveAttribute("data-capture-tone", "warning");
   });
 
-  it("the Wi-Fi sign-in pause says what it changes, and its time left", () => {
+  it("the sign-in pause says what it changes, for the kind of network, and its time left", () => {
     expect(signInPauseLine(undefined)).toBeNull();
-    expect(signInPauseLine({ network: MOCK_SIGN_IN_NETWORK }), "shown, not paused: the notice on Home offers it").toBeNull();
-    const line = signInPauseLine({ network: MOCK_SIGN_IN_NETWORK, paused_left_s: 860 })!;
-    expect(line).toMatch(/^Paused for Wi-Fi sign-in, resumes by itself in about 15 min at the latest/);
-    expect(line).toContain("only Windows' own lookups go to this Wi-Fi's DNS server in plain text");
-    expect(line).toContain("lookups that apps send through Sieve stay encrypted");
+    expect(signInPauseLine({ network: MOCK_SIGN_IN_NETWORK, wifi: true }), "shown, not paused: the notice on Home offers it").toBeNull();
+    const line = signInPauseLine({ network: MOCK_SIGN_IN_NETWORK, paused_left_s: 860, wifi: true })!;
+    expect(line).toMatch(/^Paused for sign-in\. Nearly every app's lookups go to this Wi-Fi's DNS server in plain text; only apps with their own encrypted DNS are not affected\./);
+    expect(line).toContain("Resumes by itself in about 15 min at the latest, or sooner once encrypted DNS answers or the network changes.");
+    expect(line, "never that only Windows' own lookups go plain").not.toMatch(/only Windows' own|stay encrypted/);
+    expect(signInPauseLine({ network: MOCK_SIGN_IN_NETWORK, paused_left_s: 42 }), "Ethernet, or an engine that does not say: the neutral word").toContain("go to this network's DNS server");
     expect(signInPauseLine({ network: MOCK_SIGN_IN_NETWORK, paused_left_s: 42 })).toContain("in 42 s at the latest");
   });
 
@@ -142,7 +143,8 @@ describe("Also encrypt Windows' own lookups", () => {
       await runtime.settings.ready;
     });
     await waitFor(() => expect(stateLine()).toHaveAttribute("data-capture-state", "paused"));
-    expect(stateLine()).toHaveTextContent(/Paused for Wi-Fi sign-in, resumes by itself in about 15 min/);
+    expect(stateLine()).toHaveTextContent(/Paused for sign-in\. Nearly every app's lookups go to this Wi-Fi's DNS server in plain text/);
+    expect(stateLine()).toHaveTextContent(/Resumes by itself in about 15 min/);
     expect(row().querySelectorAll("[data-slot=card], [data-slot=badge]"), "flat").toHaveLength(0);
     await userEvent.click(within(row()).getByRole("button", { name: "Resume now" }));
     expect(resume).toHaveBeenCalledTimes(1);
