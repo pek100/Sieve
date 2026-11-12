@@ -366,6 +366,14 @@ pub async fn pair(identity: &Identity, code: &PairingCode, name: &str, via: Pair
         .await;
         cancel.cancel();
         let _ = task.await;
+        // TLS 1.3: a hub that refuses our key does so after our side of the
+        // handshake has finished, so the refusal shows up here as a closed link.
+        let r = r.map_err(|e| match e {
+            LinkError::Io(_) | LinkError::Protocol(_) => {
+                LinkError::Pairing("the hub closed the connection: the code is used, expired, or from another hub".into())
+            }
+            other => other,
+        });
         match r? {
             Message::Response { status: Status::Ok, message } => Ok(message),
             Message::Response { message, .. } => Err(LinkError::Pairing(format!("the hub refused: {message}"))),
