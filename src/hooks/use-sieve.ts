@@ -80,8 +80,8 @@ export function useEngine(): EngineSlice {
   return useSieve(selectEngine);
 }
 
-/** The engine's user actions: the AdGuard pause offer and its undo, the certificate's Reinstall, the update button, "Try decrypting again" (through the engine controller). */
-export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdguard: () => Promise<void>; installRoot: () => Promise<void>; requestUpdate: () => Promise<void>; tryDecryptAgain: (line: string | null, app: string | null, reason: string | null) => Promise<void>; tryDecryptAllAgain: (apps: readonly string[]) => Promise<void> } {
+/** The engine's user actions: the AdGuard pause offer and its undo, the certificate's Reinstall, the update button, "Try decrypting again", "Resume now" of the Wi-Fi sign-in pause (through the engine controller). */
+export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdguard: () => Promise<void>; installRoot: () => Promise<void>; requestUpdate: () => Promise<void>; tryDecryptAgain: (line: string | null, app: string | null, reason: string | null) => Promise<void>; tryDecryptAllAgain: (apps: readonly string[]) => Promise<void>; resumeDnsCapture: () => Promise<void> } {
   const { engineController, lockController } = useRuntime();
   return useMemo(
     () => ({
@@ -91,6 +91,8 @@ export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdg
       requestUpdate: () => lockController.guard(() => engineController.requestUpdate()),
       tryDecryptAgain: (line, app, reason) => lockController.guard(() => engineController.tryDecryptAgain(line, app, reason)),
       tryDecryptAllAgain: (apps) => lockController.guard(() => engineController.tryDecryptAllAgain(apps)),
+      // Not behind the lock: it only gives back the protection the setting asks for.
+      resumeDnsCapture: () => engineController.resumeDnsCapture(),
     }),
     [engineController, lockController],
   );

@@ -74,6 +74,8 @@ pub fn run() {
             engine::engine_heal_notices,
             engine::engine_issues,
             engine::engine_request_update,
+            engine::engine_pause_dns_capture,
+            engine::engine_resume_dns_capture,
             windns::windows_dns,
             filters::filter_catalogue,
             filters::rule_check,

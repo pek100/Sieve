@@ -96,6 +96,7 @@ export function createRuntime(o: RuntimeOptions): Runtime {
   const engine = o.engine ?? createMockEngine();
   const lock = o.lock ?? createMockLock();
   const filterLists = o.filterLists ?? createMockFilterLists();
+  const lockController = createLockController({ source: lock, clock, settings, notices });
   return {
     isTauri: o.isTauri ?? false,
     source: o.source,
@@ -109,11 +110,12 @@ export function createRuntime(o: RuntimeOptions): Runtime {
     pages: o.pages ?? browserPages(),
     safetyNet: createSafetyNet({ source: o.windowsDns ?? createMockWindowsDns(), notices, clock }),
     engine,
-    engineController: createEngineController({ engine, store, clock, settings, checks: passedChecks, notices, filterLists }),
+    // The sign-in notice's button changes what Windows' lookups do, so it passes the settings lock as every write does.
+    engineController: createEngineController({ engine, store, clock, settings, checks: passedChecks, notices, filterLists, guard: (fn) => lockController.guard(fn) }),
     logController: createLogController({ engine, store, clock }),
     filterLists,
     lock,
-    lockController: createLockController({ source: lock, clock, settings, notices }),
+    lockController,
     welcomeOnFirstRun: o.welcomeOnFirstRun ?? o.isTauri ?? false,
   };
 }

@@ -397,6 +397,17 @@ mod imp {
         status_of(name, ClientMessage::RequestUpdate {}).await
     }
 
+    /// `PauseDnsCapture` for the network the status named; the engine's Status,
+    /// or why it refused (it sees no such network now).
+    pub async fn pause_dns_capture(name: &str, network: String) -> Result<EngineStatus, String> {
+        status_of(name, ClientMessage::PauseDnsCapture { network }).await
+    }
+
+    /// `ResumeDnsCapture`; the engine's Status.
+    pub async fn resume_dns_capture(name: &str) -> Result<EngineStatus, String> {
+        status_of(name, ClientMessage::ResumeDnsCapture {}).await
+    }
+
     /// One request answered with a Status, or the reason it was not.
     async fn status_of(name: &str, msg: ClientMessage) -> Result<EngineStatus, String> {
         match tokio::time::timeout(PROBE_TIMEOUT, request(name, msg)).await {
@@ -850,6 +861,37 @@ pub async fn engine_request_update() -> Result<EngineStatus, String> {
     Err("the engine runs on Windows only".into())
 }
 
+/// Command: "Sign in to this Wi-Fi". Only the network id the engine's own status
+/// named; the engine refuses any other, and the window sends it only to an engine
+/// whose status carried `wifi_sign_in`.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_pause_dns_capture(network: String) -> Result<EngineStatus, String> {
+    if network.is_empty() || network.len() > sieve_ipc::NETWORK_ID_MAX {
+        return Err("not a network id the engine gives".into());
+    }
+    imp::pause_dns_capture(PIPE_NAME, network).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_pause_dns_capture(_network: String) -> Result<EngineStatus, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// Command: "Resume now" of the Wi-Fi sign-in pause. No argument.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_resume_dns_capture() -> Result<EngineStatus, String> {
+    imp::resume_dns_capture(PIPE_NAME).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_resume_dns_capture() -> Result<EngineStatus, String> {
+    Err("the engine runs on Windows only".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,11 +1081,15 @@ mod tests {
             ClientAsk::Status => Ok(imp::pipe_fact(name).await),
             ClientAsk::Policy(p) => imp::set_policy(name, p).await.map(welcome),
             ClientAsk::Update => imp::request_update(name).await.map(welcome),
+            ClientAsk::Pause(network) => imp::pause_dns_capture(name, network).await.map(welcome),
+            ClientAsk::Resume => imp::resume_dns_capture(name).await.map(welcome),
         };
         let asked = engine.await.unwrap();
         match (asked, ask) {
             (Some(asked), ClientAsk::Policy(p)) => assert_eq!(asked, ClientMessage::SetPolicy(p)),
             (Some(asked), ClientAsk::Update) => assert_eq!(asked, ClientMessage::RequestUpdate {}),
+            (Some(asked), ClientAsk::Pause(network)) => assert_eq!(asked, ClientMessage::PauseDnsCapture { network }),
+            (Some(asked), ClientAsk::Resume) => assert_eq!(asked, ClientMessage::ResumeDnsCapture {}),
             _ => {}
         }
         fact
@@ -1055,6 +1101,8 @@ mod tests {
         Status,
         Policy(Policy),
         Update,
+        Pause(String),
+        Resume,
     }
 
     #[cfg(windows)]
@@ -1316,6 +1364,26 @@ mod tests {
         let soon = EngineMessage::Error { message: "try again in a few minutes".into() };
         let got = fake_engine(&test_pipe("update-soon"), welcome(), soon, ClientAsk::Update).await;
         assert_eq!(got, Err("try again in a few minutes".into()));
+    }
+
+    /// The Hello names `wifi_sign_in` (the fake engine checks `dns_capture` too),
+    /// the pause carries the network alone, the resume nothing, and a refusal is
+    /// the engine's own words.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_sign_in_pause_and_resume_send_the_one_message_each() {
+        use sieve_ipc::{EngineMessage, WifiSignIn};
+        assert!(sieve_ipc::APP_CAPABILITIES.contains(&sieve_ipc::CAPABILITY_WIFI_SIGN_IN), "an app that can show the notice says so");
+        let welcome = || EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 };
+        let network = "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}".to_string();
+        let paused = EngineStatus { wifi_sign_in: Some(WifiSignIn { network: network.clone(), paused_left_s: Some(900) }), ..EngineStatus::default() };
+        let got = fake_engine(&test_pipe("pause"), welcome(), EngineMessage::Status(paused.clone()), ClientAsk::Pause(network.clone())).await;
+        assert!(matches!(got, Ok(PipeFact::Welcome { status, .. }) if *status == paused));
+        let refused = EngineMessage::Error { message: "that is not the network Sieve sees now, so the capture stays".into() };
+        let got = fake_engine(&test_pipe("pause-other"), welcome(), refused, ClientAsk::Pause(network)).await;
+        assert_eq!(got, Err("that is not the network Sieve sees now, so the capture stays".into()));
+        let got = fake_engine(&test_pipe("resume"), welcome(), EngineMessage::Status(EngineStatus::default()), ClientAsk::Resume).await;
+        assert!(matches!(got, Ok(PipeFact::Welcome { .. })));
     }
 
     #[cfg(windows)]

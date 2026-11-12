@@ -90,6 +90,14 @@ export interface EngineSource {
   healNotices(after: number): Promise<HealNotices>;
   /** The apps with recent problems, when they changed since revision `after` (0: whatever they are). Local only. */
   issues(after: number): Promise<Issues>;
+  /**
+   * "Sign in to this Wi-Fi": pauses the capture of Windows' own lookups for
+   * `network`, the id the status's `wifi_sign_in` named. Sent only to an engine
+   * whose status carried that fact. Rejects when the engine sees no such network now.
+   */
+  pauseDnsCapture(network: string): Promise<EngineStatus>;
+  /** "Resume now": ends the sign-in pause. Sent only to an engine whose status carried `wifi_sign_in`. */
+  resumeDnsCapture(): Promise<EngineStatus>;
 }
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -116,5 +124,7 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     tryDecryptAgain: async (line, app, reason) => parseExclusionsPage(await invoke<unknown>("engine_try_decrypt_again", { line, app, reason })),
     healNotices: async (after) => parseHealNotices(await invoke<unknown>("engine_heal_notices", { after })),
     issues: async (after) => parseIssues(await invoke<unknown>("engine_issues", { after })),
+    pauseDnsCapture: async (network) => parseEngineStatus(await invoke<unknown>("engine_pause_dns_capture", { network })),
+    resumeDnsCapture: async () => parseEngineStatus(await invoke<unknown>("engine_resume_dns_capture")),
   };
 }

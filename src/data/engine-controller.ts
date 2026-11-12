@@ -49,7 +49,7 @@ import type { SieveStore } from "@/core/store";
 import type { EngineSource } from "./engine-source";
 import type { FilterListSource } from "./filter-lists-source";
 import type { Clock } from "./poller";
-import { ProtocolError, type EngineDomainList, type EnginePolicy, type ExclusionsPage, type FilterCatalogue } from "./protocol";
+import { ProtocolError, type EngineDomainList, type EnginePolicy, type EngineStatus, type ExclusionsPage, type FilterCatalogue } from "./protocol";
 import type { SettingsStore } from "./settings-store";
 
 export interface EngineController {
@@ -67,6 +67,10 @@ export interface EngineController {
   tryDecryptAgain(line: string | null, app: string | null, reason: string | null): Promise<void>;
   /** "Try decrypting all again" for an app: every one of its files named. */
   tryDecryptAllAgain(apps: readonly string[]): Promise<void>;
+  /** "Sign in to this Wi-Fi": the one click that pauses the capture for the network the notice named. */
+  pauseDnsCapture(network: string): Promise<void>;
+  /** "Resume now": ends the sign-in pause. */
+  resumeDnsCapture(): Promise<void>;
 }
 
 export interface EngineControllerDeps {
@@ -78,6 +82,8 @@ export interface EngineControllerDeps {
   notices: NoticeBus;
   /** The catalogue, which turns the stored differences into the lists selected. */
   filterLists: Pick<FilterListSource, "catalogue">;
+  /** The settings lock's write gate, for the one action a notice runs by itself (the sign-in button). None: run at once. */
+  guard?: (fn: () => Promise<void>) => Promise<unknown>;
 }
 
 /** The Home banner of a crash loop (plan 1.6.4). Never says blocked or filtering: nothing was. */
@@ -96,6 +102,18 @@ const DNS_CLIENT_CAPTURE = DNS_CLIENT_CAPTURE_KEY as SettingKey;
  * only ever the user's choice.
  */
 export const DNS_UNREACHABLE_BANNER = `No encrypted DNS server answers on this network, so sites may not load. Hotel and airport Wi-Fi often needs plain DNS to show its sign-in page: you can turn off ${REGISTRY[DNS_ENCRYPTION].label} in Settings > Filtering.`;
+/**
+ * The Home notice while the engine sees a Wi-Fi that wants a sign-in (the
+ * status's `wifi_sign_in`, not paused), and its one button. It says exactly what
+ * the click changes: only Windows' own lookups go plain, and only for a while.
+ */
+export const WIFI_SIGN_IN_NOTICE =
+  "This Wi-Fi wants you to sign in. Its sign-in page can't open while Sieve encrypts Windows' own lookups. The button sends only Windows' own lookups to this Wi-Fi's DNS server, in plain text, until encrypted DNS answers again, the network changes or 15 minutes pass. Lookups that apps send through Sieve stay encrypted.";
+export const WIFI_SIGN_IN_ACTION = "Sign in to this Wi-Fi";
+/** The Home line while that pause holds. */
+export const WIFI_SIGN_IN_PAUSED_BANNER =
+  "Paused for Wi-Fi sign-in: Windows' own lookups go to this Wi-Fi's DNS server in plain text so its sign-in page can open. Sieve resumes by itself.";
+const SIGN_IN_ERROR_PREFIX = "The Wi-Fi";
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const captureUnknownError = `This version of Sieve's engine does not know "${REGISTRY[DNS_CLIENT_CAPTURE].label}". Your other settings reached it.`;
 
@@ -188,7 +206,7 @@ function captureAsHeld(p: WantedPolicy, held: WantedPolicy): WantedPolicy {
   return held.skip_dns_capture ? { ...rest, skip_dns_capture: true } : rest;
 }
 
-export function createEngineController({ engine, store, clock, settings, checks, notices, filterLists }: EngineControllerDeps): EngineController {
+export function createEngineController({ engine, store, clock, settings, checks, notices, filterLists, guard = (fn) => fn() }: EngineControllerDeps): EngineController {
   let disposed = true;
   let policyInFlight = false;
   // The error on show is about the policy, so it ends when the engine holds what is wanted.
@@ -202,6 +220,11 @@ export function createEngineController({ engine, store, clock, settings, checks,
   let settingsReady = false;
   let banner: number | null = null;
   let dnsBanner: number | null = null;
+  // The sign-in notice on show and the network it names; a network whose notice the user dismissed is not offered again.
+  let signInNotice: { id: number; network: string } | null = null;
+  let signInDismissed: string | null = null;
+  let pausedBanner: number | null = null;
+  let signInInFlight = false;
   let update: { id: number; text: string } | null = null;
   let probeNow: () => Promise<void> = async () => {};
   // Null until the first read. The engine is a service that outlives this window,
@@ -211,6 +234,56 @@ export function createEngineController({ engine, store, clock, settings, checks,
   const get = () => store.getState().engine;
   const set = (patch: Partial<EngineSlice>) => {
     if (!disposed) store.setEngine({ ...get(), ...patch });
+  };
+
+  // The sign-in notice follows the engine's fact: offered for the network it
+  // names (unless the user dismissed it for that network), gone when the engine
+  // stops naming one; the paused line while the pause holds. Never a pause by itself.
+  const followSignIn = (offered: string | null, paused: boolean) => {
+    if (signInNotice !== null && !notices.list().some((n) => n.id === signInNotice?.id)) {
+      signInDismissed = signInNotice.network;
+      signInNotice = null;
+    }
+    if (signInNotice !== null && signInNotice.network !== offered) {
+      notices.dismiss(signInNotice.id);
+      signInNotice = null;
+    }
+    if (offered === null && !paused) signInDismissed = null;
+    if (offered !== null && signInNotice === null && signInDismissed !== offered) {
+      const network = offered;
+      signInNotice = { network, id: notices.push({ kind: "info", surface: "banner", desktop: true, text: WIFI_SIGN_IN_NOTICE, action: { label: WIFI_SIGN_IN_ACTION, run: () => void guard(() => pauseDnsCapture(network)) } }) };
+    }
+    if (paused && pausedBanner === null) pausedBanner = notices.push({ kind: "info", surface: "banner", text: WIFI_SIGN_IN_PAUSED_BANNER });
+    if (!paused && pausedBanner !== null) {
+      notices.dismiss(pausedBanner);
+      pausedBanner = null;
+    }
+  };
+
+  // One click, one request; the engine refuses a network it does not see now.
+  const signInRequest = async (run: () => Promise<EngineStatus>, failed: string) => {
+    if (signInInFlight) return;
+    signInInFlight = true;
+    try {
+      const next = await run();
+      const probe = get().probe;
+      if (probe?.pipe?.kind === "welcome") set({ probe: { ...probe, pipe: { ...probe.pipe, status: next } } });
+      if (get().actionError?.startsWith(SIGN_IN_ERROR_PREFIX)) set({ actionError: null });
+    } catch (e) {
+      set({ actionError: `${failed}: ${message(e)}` });
+    } finally {
+      signInInFlight = false;
+    }
+    if (!disposed) follow();
+  };
+  const pauseDnsCapture = (network: string) => {
+    // An engine from before the fact never named a network, so it is never sent the message.
+    if (engineStatus(get())?.wifi_sign_in?.network !== network) return Promise.resolve();
+    return signInRequest(() => engine.pauseDnsCapture(network), `${SIGN_IN_ERROR_PREFIX} sign-in did not pause`);
+  };
+  const resumeDnsCapture = () => {
+    if (engineStatus(get())?.wifi_sign_in === undefined) return Promise.resolve();
+    return signInRequest(() => engine.resumeDnsCapture(), `${SIGN_IN_ERROR_PREFIX} sign-in pause did not end`);
   };
 
   // Facts in, consequences out: passed check, banner, policy.
@@ -224,7 +297,10 @@ export function createEngineController({ engine, store, clock, settings, checks,
       notices.dismiss(banner);
       banner = null;
     }
-    const unreachable = engineStatus(e)?.dns_unreachable === true;
+    const signIn = engineStatus(e)?.wifi_sign_in;
+    followSignIn(signIn?.paused_left_s === undefined ? (signIn?.network ?? null) : null, signIn?.paused_left_s !== undefined);
+    // The sign-in notice says what the unreachable one would, with the step that helps here instead.
+    const unreachable = engineStatus(e)?.dns_unreachable === true && signIn === undefined;
     if (unreachable && dnsBanner === null) dnsBanner = notices.push({ kind: "error", surface: "banner", text: DNS_UNREACHABLE_BANNER });
     if (!unreachable && dnsBanner !== null) {
       notices.dismiss(dnsBanner);
@@ -536,6 +612,10 @@ export function createEngineController({ engine, store, clock, settings, checks,
         banner = null;
         if (dnsBanner !== null) notices.dismiss(dnsBanner);
         dnsBanner = null;
+        if (signInNotice !== null) notices.dismiss(signInNotice.id);
+        signInNotice = null;
+        if (pausedBanner !== null) notices.dismiss(pausedBanner);
+        pausedBanner = null;
         if (update !== null) notices.dismiss(update.id);
         update = null;
       };
@@ -546,5 +626,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
     installRoot,
     tryDecryptAgain,
     tryDecryptAllAgain,
+    pauseDnsCapture,
+    resumeDnsCapture,
   };
 }

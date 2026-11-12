@@ -379,7 +379,7 @@ export const REGISTRY = {
     label: "Also encrypt Windows' own lookups",
     help: "Windows' built-in lookups also go through Sieve's encrypted DNS, so the network can't read them. Off: Windows sends them to your network's DNS server in plain text, as it does without Sieve.",
     breaks:
-      "Names of nearby PCs found without DNS, and short names that don't exist, answer about 7 s slower. Hotel and café Wi-Fi sign-in pages may not open until you turn this off or sign in.",
+      "Names of nearby PCs found without DNS, and short names that don't exist, answer about 7 s slower. A hotel or café Wi-Fi's sign-in page needs one click: Sieve offers Sign in to this Wi-Fi, which pauses this for that network until you are signed in.",
     default: true,
     requires: "filtering.dnsEncryption",
   } satisfies BooleanSetting,

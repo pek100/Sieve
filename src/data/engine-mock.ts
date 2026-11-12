@@ -158,17 +158,29 @@ const PARTIAL_ISSUES = {
   ],
 };
 
+/** The mock's Wi-Fi that wants a sign-in (`signIn` option), its refusal for any other, and a pause's time left. */
+export const MOCK_SIGN_IN_NETWORK = "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}";
+export const MOCK_NO_SIGN_IN = "this network does not look like one that wants a sign-in, so the capture stays";
+export const MOCK_PAUSED_LEFT_S = 14 * 60 + 20;
+
 export function createMockEngine(
   start: EngineScenario = "missing",
-  options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean; run?: number; importAnswer?: (typeof IMPORT_ANSWERS)[number]; issues?: IssuesScenario; now?: () => number } = {},
+  options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean; run?: number; importAnswer?: (typeof IMPORT_ANSWERS)[number]; issues?: IssuesScenario; now?: () => number; signIn?: boolean } = {},
 ): EngineSource {
   let scenario = start;
   let held: Omit<EnginePolicy, "revision" | "engine"> | null = null;
   const holdsHttps = options.heal === true;
+  // A Wi-Fi that wants a sign-in, while routes are up and the capture is wanted (`signIn` option).
+  let signIn: "none" | "shown" | "paused" = options.signIn ? "shown" : "none";
   const echo = (status: EngineStatus): EngineStatus => {
     const policy = held ? { ...status.policy, ...held } : status.policy;
-    // As the engine: the capture's state while routes are up, off by the user's switch or with plain DNS.
-    if (status.routes_up) status = { ...status, dns_capture: policy.skip_dns_capture || policy.plain_dns ? { state: "off" } : { state: "working" } };
+    const captureWanted = !policy.skip_dns_capture && !policy.plain_dns;
+    // As the engine: the setting off ends a pause.
+    if (!captureWanted && signIn === "paused") signIn = "shown";
+    const paused = signIn === "paused";
+    // As the engine: the capture's state while routes are up, off by the user's switch, with plain DNS or while paused.
+    if (status.routes_up) status = { ...status, dns_capture: !captureWanted || paused ? { state: "off" } : { state: "working" } };
+    if (status.routes_up && captureWanted && signIn !== "none") status = { ...status, wifi_sign_in: { network: MOCK_SIGN_IN_NETWORK, ...(paused ? { paused_left_s: MOCK_PAUSED_LEFT_S } : {}) } };
     if (!holdsHttps) return { ...status, policy };
     // As the engine: its switch alone decrypts nothing, with routes down or sieving off.
     return { ...status, decrypting: status.routes_up && policy.sieving, policy: { ...policy, https: true } };
@@ -359,6 +371,18 @@ export function createMockEngine(
       const rev = Math.min(healReads - 1, first.hosts.length);
       const notice = { ...first, hosts: first.hosts.slice(0, rev), total: rev, rev };
       return { run, revision: rev, exclusions_revision: rowsRevision, notices: rev > after ? [notice] : [] };
+    },
+    pauseDnsCapture: async (network) => {
+      requireWelcome();
+      // As the engine: only the network it shows, only while it shows it.
+      if (signIn === "none" || network !== MOCK_SIGN_IN_NETWORK || !ROUTES.includes(scenario)) throw new Error(MOCK_NO_SIGN_IN);
+      signIn = "paused";
+      return echo(statusOf(scenario));
+    },
+    resumeDnsCapture: async () => {
+      requireWelcome();
+      if (signIn === "paused") signIn = "shown";
+      return echo(statusOf(scenario));
     },
   };
 }

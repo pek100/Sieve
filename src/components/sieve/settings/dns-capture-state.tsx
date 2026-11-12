@@ -3,9 +3,10 @@
 import { useState } from "react";
 import { CircleCheck, Info, TriangleAlert } from "lucide-react";
 import { FloatingTooltip } from "@/components/sieve/primitives/floating-tooltip";
+import { Button } from "@/components/ui/button";
 import { engineStatus } from "@/core/engine";
-import type { DnsCapture } from "@/data/protocol";
-import { useEngine } from "@/hooks/use-sieve";
+import type { DnsCapture, WifiSignIn } from "@/data/protocol";
+import { useEngine, useEngineActions } from "@/hooks/use-sieve";
 
 /** How the line reads: caught, a fact about this network (nothing is wrong), or a problem. */
 export type CaptureTone = "working" | "neutral" | "warning";
@@ -55,18 +56,45 @@ export function captureStateLine(c: DnsCapture | undefined): { tone: CaptureTone
   }
 }
 
+/** "about 14 min", or seconds under a minute. */
+function timeLeft(s: number): string {
+  return s >= 60 ? `about ${Math.ceil(s / 60)} min` : `${s} s`;
+}
+
+/** What the row says while the capture is paused for a Wi-Fi sign-in, or null when it is not. */
+export function signInPauseLine(w: WifiSignIn | undefined): string | null {
+  if (w?.paused_left_s === undefined) return null;
+  return `Paused for Wi-Fi sign-in, resumes by itself in ${timeLeft(w.paused_left_s)} at the latest, or sooner once encrypted DNS answers or the network changes. Until then only Windows' own lookups go to this Wi-Fi's DNS server in plain text; lookups that apps send through Sieve stay encrypted.`;
+}
+
 const ICONS = { working: CircleCheck, neutral: Info, warning: TriangleAlert } as const;
 const ICON_COLOR = { working: "text-primary", neutral: "text-on-surface-muted", warning: "text-warning" } as const;
 
 /**
  * The capture's live state under "Also encrypt Windows' own lookups", from the
- * engine's status (`dns_capture`). Nothing while the switch is off, while routes
+ * engine's status (`dns_capture`), or the Wi-Fi sign-in pause with its time left
+ * and "Resume now" (`wifi_sign_in`). Nothing while the switch is off, while routes
  * are down, or from an engine that does not report it. A Windows error code is
  * in words; the number itself is in the tooltip, for a support question.
  */
 export function DnsCaptureState() {
-  const line = captureStateLine(engineStatus(useEngine())?.dns_capture);
+  const status = engineStatus(useEngine());
+  const { resumeDnsCapture } = useEngineActions();
+  const line = captureStateLine(status?.dns_capture);
   const [at, setAt] = useState<{ x: number; y: number } | null>(null);
+  // The user's pause outranks the capture's own state, which reads off while it holds.
+  const paused = signInPauseLine(status?.wifi_sign_in);
+  if (paused !== null) {
+    return (
+      <div data-capture-state="paused" className="flex flex-wrap items-start gap-2 pt-1 text-label text-on-surface-muted">
+        <Info aria-hidden="true" className="size-4 shrink-0 text-on-surface-muted" strokeWidth={1.75} />
+        <p className="min-w-0 flex-1 basis-60">{paused}</p>
+        <Button variant="ghost" size="sm" onClick={() => void resumeDnsCapture()}>
+          Resume now
+        </Button>
+      </div>
+    );
+  }
   if (line === null) return null;
   const Icon = ICONS[line.tone];
   const code = line.code;
