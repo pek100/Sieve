@@ -2,7 +2,10 @@
 //!
 //! Every yamux stream starts with one request frame from the device, which the
 //! hub answers with one response frame; after an `Ok` to `Connect` the stream
-//! carries raw bytes. A `Control` stream carries keep-alive pings instead.
+//! carries raw bytes. A `Control` stream carries keep-alive pings instead,
+//! and two notices: the hub tells the device how many streams it may have
+//! open (`Limit`, at once and whenever the owner changes it), and the device
+//! tells the hub which address it reached the hub at (`Observed`, once).
 //!
 //! Frame: `u16` big-endian body length (1..=MAX_FRAME), then the body. The
 //! body's first byte is its tag:
@@ -14,11 +17,17 @@
 //! | 0x03 | Pair     | proof [32], name length u8 (0..=64), name (UTF-8)    |
 //! | 0x10 | Ping     | nonce u64                                            |
 //! | 0x11 | Pong     | nonce u64                                            |
+//! | 0x12 | Limit    | streams u32 (1..=65535): the device's concurrency    |
+//! | 0x13 | Observed | family u8 (4 or 6), address [4] or [16]              |
 //! | 0x80 | Response | status u8 (0..=7), message length u8, message (UTF-8) |
 //!
 //! A frame longer than MAX_FRAME is refused before its body is read, so a
 //! peer cannot make the reader allocate; bodies land in a fixed stack buffer.
-//! Every field is length-checked and trailing bytes are an error.
+//! Every field is length-checked and trailing bytes are an error. A response
+//! status this version does not know is its own error (`UnknownStatus`), so a
+//! device can say the hub is newer instead of calling the frame garbage.
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -83,6 +92,10 @@ pub enum Message {
     Pair { proof: [u8; 32], name: String },
     Ping(u64),
     Pong(u64),
+    /// Hub to device: streams the device may have open at once.
+    Limit(u32),
+    /// Device to hub: the address the device sees the hub at.
+    Observed(IpAddr),
     Response { status: Status, message: String },
 }
 
@@ -92,6 +105,9 @@ pub enum WireError {
     Length(usize),
     #[error("malformed frame: {0}")]
     Malformed(&'static str),
+    /// A well-formed response whose status this version does not know.
+    #[error("answer status {0} is unknown to this version (the peer speaks a newer one)")]
+    UnknownStatus(u8),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -145,6 +161,26 @@ impl Message {
                 b.push(0x11);
                 b.extend_from_slice(&n.to_be_bytes());
             }
+            Message::Limit(n) => {
+                if !(1..=u16::MAX as u32).contains(n) {
+                    return Err(WireError::Malformed("limit out of range"));
+                }
+                b.push(0x12);
+                b.extend_from_slice(&n.to_be_bytes());
+            }
+            Message::Observed(ip) => {
+                b.push(0x13);
+                match ip {
+                    IpAddr::V4(v4) => {
+                        b.push(4);
+                        b.extend_from_slice(&v4.octets());
+                    }
+                    IpAddr::V6(v6) => {
+                        b.push(6);
+                        b.extend_from_slice(&v6.octets());
+                    }
+                }
+            }
             Message::Response { status, message } => {
                 let m = clip(message, 255);
                 b.push(0x80);
@@ -188,10 +224,26 @@ impl Message {
             }
             0x10 => Message::Ping(u64::from_be_bytes(r.take::<8>()?)),
             0x11 => Message::Pong(u64::from_be_bytes(r.take::<8>()?)),
+            0x12 => {
+                let n = u32::from_be_bytes(r.take::<4>()?);
+                if !(1..=u16::MAX as u32).contains(&n) {
+                    return Err(WireError::Malformed("limit out of range"));
+                }
+                Message::Limit(n)
+            }
+            0x13 => match r.u8()? {
+                4 => Message::Observed(IpAddr::V4(Ipv4Addr::from(r.take::<4>()?))),
+                6 => Message::Observed(IpAddr::V6(Ipv6Addr::from(r.take::<16>()?))),
+                _ => return Err(WireError::Malformed("address family")),
+            },
             0x80 => {
-                let status = Status::from_u8(r.u8()?).ok_or(WireError::Malformed("status"))?;
+                let code = r.u8()?;
                 let len = r.u8()? as usize;
                 let m = std::str::from_utf8(r.bytes(len)?).map_err(|_| WireError::Malformed("message"))?;
+                if !r.0.is_empty() {
+                    return Err(WireError::Malformed("trailing bytes"));
+                }
+                let status = Status::from_u8(code).ok_or(WireError::UnknownStatus(code))?;
                 Message::Response { status, message: m.to_string() }
             }
             _ => return Err(WireError::Malformed("unknown tag")),
@@ -265,6 +317,20 @@ mod tests {
         roundtrip(Message::Ping(42));
         roundtrip(Message::Pong(u64::MAX));
         roundtrip(Message::Response { status: Status::Denied, message: "private address".into() });
+        roundtrip(Message::Limit(64));
+        roundtrip(Message::Observed("203.0.113.9".parse().unwrap()));
+        roundtrip(Message::Observed("2a01:4f8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn an_unknown_status_is_its_own_error() {
+        // A well-formed response with status 9: a newer peer, not garbage.
+        assert!(matches!(Message::decode(&[0x80, 9, 2, b'h', b'i']), Err(WireError::UnknownStatus(9))));
+        // Malformed stays malformed.
+        assert!(matches!(Message::decode(&[0x80, 9, 5, b'h']), Err(WireError::Malformed(_))));
+        assert!(Message::Limit(0).encode().is_err());
+        assert!(Message::decode(&[0x12, 0, 0, 0, 0]).is_err());
+        assert!(Message::decode(&[0x13, 5, 1, 2, 3, 4]).is_err());
     }
 
     #[test]

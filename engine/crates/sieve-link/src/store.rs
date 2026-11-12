@@ -3,8 +3,11 @@
 //! - `identity.key`  the hub's private key (PKCS#8)
 //! - `hub.json`      name, paired devices with their rules and limits,
 //!   outstanding pairing codes (deleted on use or expiry), defaults for new
-//!   devices, the owner's manual LAN blocks
-//! - `audit.log`     the audit log, rotated by size (`audit`)
+//!   devices, the owner's manual LAN blocks and LAN / audit settings
+//! - `audit.log`     the audit log, rotated by size (`audit.log.N`, `audit`)
+//! - `status.json`   what the running hub reports for `sieve-hub status` and
+//!   `sieve-hub lan` (rewritten when it changes and at least every 10 s;
+//!   read-only for the CLI)
 //! - `hub.lock`      an empty file the writers lock
 //!
 //! A device directory holds `identity.key` and `device.json` (the hub's
@@ -35,6 +38,7 @@ pub const IDENTITY_FILE: &str = "identity.key";
 pub const HUB_FILE: &str = "hub.json";
 pub const DEVICE_FILE: &str = "device.json";
 pub const AUDIT_FILE: &str = "audit.log";
+pub const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "hub.lock";
 
 /// Longest device name kept, in characters (a fingerprint-like name gets a
@@ -118,11 +122,34 @@ pub struct HubFile {
     #[serde(default)]
     pub defaults: Defaults,
     /// The owner's manual blocks, denied on top of the ones the hub detects
-    /// from its interfaces (e.g. its public IPv4 address as seen from
-    /// outside, which no interface shows behind a home router). Always
-    /// denied unless a device's allow_cidrs says otherwise.
+    /// from its interfaces and routes and the public addresses it learns
+    /// from its links. Denied unless a device's `allow_lan` says otherwise.
     #[serde(default)]
     pub lan_cidrs: Vec<Cidr>,
+    /// The IPv6 site prefix denied around each global IPv6 address of the
+    /// hub (`netif::DEFAULT_V6_SITE_PREFIX` when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_v6_prefix: Option<u8>,
+    /// The audit log's size cap in MiB (`audit::DEFAULT_CAP_MIB` when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_cap_mib: Option<u64>,
+    /// The audit log's retention floor in days (`audit::DEFAULT_MIN_DAYS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_min_days: Option<u32>,
+}
+
+impl HubFile {
+    pub fn v6_site_prefix(&self) -> u8 {
+        self.lan_v6_prefix.unwrap_or(crate::netif::DEFAULT_V6_SITE_PREFIX)
+    }
+
+    /// The audit settings this store asks for.
+    pub fn audit_config(&self) -> crate::audit::AuditConfig {
+        crate::audit::AuditConfig::with_retention(
+            self.audit_cap_mib.unwrap_or(crate::audit::DEFAULT_CAP_MIB),
+            self.audit_min_days.unwrap_or(crate::audit::DEFAULT_MIN_DAYS),
+        )
+    }
 }
 
 impl HubFile {

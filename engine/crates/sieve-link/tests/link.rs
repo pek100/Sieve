@@ -8,18 +8,19 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use sieve_link::audit::AuditConfig;
 use sieve_link::device::{PairVia, pair};
-use sieve_link::hub::revoke_at;
+use sieve_link::hub::{read_status, revoke_at};
 use sieve_link::mux::{self, Mode};
 use sieve_link::netif::{FixedInterfaces, HostNet, IfAddr, InterfaceSource};
 use sieve_link::resolve::StaticResolver;
 use sieve_link::store::HubStore;
-use sieve_link::tls::{self, Pinned};
+use sieve_link::tls::{self, PeerPolicy, Pinned};
 use sieve_link::wire::{Message, Status, read_msg, write_msg};
 use sieve_link::{Fingerprint, Hub, HubConfig, HubRoute, Identity, LinkClient, LinkConfig, LinkError, Limits, OnHubDown, PairingCode, Rules};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 
 const T: Duration = Duration::from_secs(10);
@@ -37,13 +38,14 @@ fn resolver() -> StaticResolver {
     StaticResolver(m)
 }
 
-/// A home network: private IPv4, a global IPv6 /64 from the ISP, a public
-/// /28, and the gateways.
+/// A home network: private IPv4, a global IPv6 /64 from the ISP (inside its
+/// /56), a public /28, the gateways, and a route to a VPN subnet.
 fn fake_net() -> HostNet {
     let a = |s: &str, prefix: u8| IfAddr { addr: s.parse().unwrap(), prefix };
     HostNet {
         addrs: vec![a("192.168.1.10", 24), a("2a01:4f8:1:2::10", 64), a("fe80::10", 64), a("81.2.69.163", 28)],
         gateways: vec!["192.168.1.1".parse().unwrap(), "fe80::1".parse().unwrap()],
+        routes: vec!["0.0.0.0/0".parse().unwrap(), "45.10.20.0/24".parse().unwrap()],
     }
 }
 
@@ -125,8 +127,10 @@ async fn pair_new(h: &TestHub, name: &str) -> Identity {
     id
 }
 
+/// The echo servers run on this machine's loopback: reaching them is
+/// reaching the hub itself, which takes `allow_self`.
 fn allow_loopback(h: &TestHub, id: &Identity) {
-    let rules = Rules { allow_cidrs: vec!["127.0.0.1/32".parse().unwrap()], ..Default::default() };
+    let rules = Rules { allow_self: vec!["127.0.0.1/32".parse().unwrap()], ..Default::default() };
     h.hub.set_rules(&id.fingerprint().short(), rules).unwrap();
 }
 
@@ -408,6 +412,7 @@ async fn silent_sockets_do_not_lock_out_a_device() {
         c.gate.slots = 4;
         c.gate.wait = Duration::from_secs(5);
         c.accept_timeout = Duration::from_secs(1);
+        c.audit.refusal_window = Duration::from_millis(1500);
     })
     .await;
     let id = pair_new(&h, "d").await;
@@ -419,8 +424,14 @@ async fn silent_sockets_do_not_lock_out_a_device() {
     let c = LinkClient::start(&id, link_cfg(h.hub.fingerprint(), HubRoute::Dial(h.addr.to_string()))).await.unwrap();
     assert!(c.wait_up(Duration::from_secs(4)).await, "the device waited for a slot and got in");
     c.shutdown();
-    // The silent ones were coalesced in the audit log, not one row each.
+    // The four silent ones timed out (1 s): one row, then the other three
+    // coalesced into one summary row once the window (1.5 s) is over.
+    tokio::time::sleep(Duration::from_millis(3200)).await;
     h.hub.flush_audit();
+    let rows: Vec<_> = audit_rows(&h).into_iter().filter(|r| r["event"] == "handshake_refused" && r["peer"] == "127.0.0.3").collect();
+    assert_eq!(rows.len(), 2, "one written, one summary: {rows:#?}");
+    assert!(rows[0]["count"].is_null());
+    assert_eq!(rows[1]["count"], 3, "{rows:#?}");
     drop(silent);
 }
 
@@ -429,12 +440,25 @@ async fn the_hubs_own_network_is_denied() {
     let h = start_hub().await;
     let id = pair_new(&h, "d").await;
     let c = client(&h, &id).await;
-    // Global IPv6 neighbours, the hub's own address, its gateway, a public
-    // /28 at home: all the hub's LAN, by name and by literal.
-    for (host, port) in [("nas.test", 445), ("me.test", 80), ("gw.test", 80), ("neighbour.test", 80), ("2a01:4f8:1:2::99", 22), ("81.2.69.160", 80)] {
+    // Global IPv6 neighbours, its gateway, a public /28 at home, a sibling
+    // /64 in the /56, a routed VPN subnet: the hub's LAN, by name and by
+    // literal. The hub's own address is the hub itself.
+    let lan = "the hub's local network";
+    for (host, port, want) in [
+        ("nas.test", 445, lan),
+        ("me.test", 80, "the hub itself"),
+        ("192.168.1.10", 80, "the hub itself"),
+        ("gw.test", 80, lan),
+        ("neighbour.test", 80, lan),
+        ("2a01:4f8:1:2::99", 22, lan),
+        ("81.2.69.160", 80, lan),
+        ("2a01:4f8:1:3::5", 443, lan),
+        ("45.10.20.5", 443, lan),
+        ("64:ff9b::5102:45aa", 80, lan),
+    ] {
         match c.open(host, port).await {
             Err(LinkError::Refused { status: Status::Denied, message }) => {
-                assert_eq!(message, "the hub's local network", "{host}");
+                assert_eq!(message, want, "{host}");
             }
             other => panic!("{host}: expected a denial, got {:?}", other.map(|_| ())),
         }
@@ -546,7 +570,7 @@ async fn deny_rules_refuse_and_are_logged() {
     assert_eq!(refused_status(c.open("192.168.1.1", 80).await), Status::Denied);
     assert_eq!(refused_status(c.open("::1", 80).await), Status::Denied);
     // A denied domain is refused before it is resolved.
-    let rules = Rules { deny_suffixes: vec!["blocked.test".into()], allow_cidrs: vec!["127.0.0.1/32".parse().unwrap()], ..Default::default() };
+    let rules = Rules { deny_suffixes: vec!["blocked.test".into()], allow_self: vec!["127.0.0.1/32".parse().unwrap()], ..Default::default() };
     h.hub.set_rules(&id.fingerprint().short(), rules).unwrap();
     assert_eq!(refused_status(c.open("blocked.test", echo).await), Status::Denied);
     let mut ok = c.open("echo.test", echo).await.unwrap();
@@ -584,14 +608,21 @@ async fn rate_and_concurrency_limits() {
     }
     assert!(freed);
 
-    // A raised concurrency limit relinks the device (its link is sized to
-    // the limit); it comes straight back.
-    h.hub.set_limits(&key, Limits { max_concurrent: 10, opens_per_minute: 2, bytes_per_sec: 0 }).unwrap();
+    // A raise beyond the link's spare streams (1 -> 10 on a link made for
+    // 1) relinks the device; an open right then waits for the new link
+    // instead of failing, and promptly (a stream on the old link must not
+    // hang: it once waited out the 15 s request timeout).
+    h.hub.set_limits(&key, Limits { max_concurrent: 10, opens_per_minute: 100, bytes_per_sec: 0 }).unwrap();
+    let started = std::time::Instant::now();
+    let _a = c.open("127.0.0.1", echo).await.expect("the open waited for the new link");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     wait_audit(&h, |r| r["event"] == "link_down" && r["outcome"].as_str().unwrap().contains("raised limit")).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(c.wait_up(T).await);
-    let _a = c.open("127.0.0.1", echo).await.unwrap();
+    assert_eq!(c.stream_limit(), Some(10), "the new link announced the new limit");
+    // The rate: a new capacity of 2 leaves 2 tokens.
+    h.hub.set_limits(&key, Limits { max_concurrent: 10, opens_per_minute: 2, bytes_per_sec: 0 }).unwrap();
     let _b = c.open("127.0.0.1", echo).await.unwrap();
+    let _c = c.open("127.0.0.1", echo).await.unwrap();
     assert_eq!(refused_status(c.open("127.0.0.1", echo).await), Status::RateLimited);
     wait_audit(&h, |r| r["event"] == "denied" && r["outcome"].as_str().unwrap().contains("per minute")).await;
     c.shutdown();
@@ -652,10 +683,11 @@ async fn streams_count_from_arrival_and_one_control_stream_per_link() {
     allow_loopback(&h, &id);
     h.hub.set_limits(&id.fingerprint().short(), Limits { max_concurrent: 2, opens_per_minute: 100, bytes_per_sec: 0 }).unwrap();
     let (mh, stop) = raw_session(&h, &id).await;
-    // A control stream does not use a slot.
+    // A control stream does not use a slot; the hub announces the limit on it.
     let mut ctl = mh.open().await.unwrap();
     write_msg(&mut ctl, &Message::Control).await.unwrap();
     write_msg(&mut ctl, &Message::Ping(1)).await.unwrap();
+    assert_eq!(read_msg(&mut ctl).await.unwrap(), Message::Limit(2));
     assert_eq!(read_msg(&mut ctl).await.unwrap(), Message::Pong(1));
     // A second control stream on the same link is refused.
     let mut ctl2 = mh.open().await.unwrap();
@@ -670,7 +702,7 @@ async fn streams_count_from_arrival_and_one_control_stream_per_link() {
     s1.write_all(&[0]).await.unwrap();
     s2.write_all(&[0]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    // ...so a third is told Busy at once, before any request is read.
+    // ...so a third is told Busy (after the hub's short wait for a slot).
     let mut s3 = mh.open().await.unwrap();
     write_msg(&mut s3, &Message::Connect { host: "127.0.0.1".into(), port: echo }).await.unwrap();
     match tokio::time::timeout(Duration::from_secs(2), read_msg(&mut s3)).await.unwrap().unwrap() {
@@ -882,7 +914,7 @@ async fn local_proxy_speaks_socks5_and_http_connect() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
-    let rules = Rules { allow_cidrs: vec!["127.0.0.1/32".parse().unwrap()], deny_suffixes: vec!["blocked.test".into()], ..Default::default() };
+    let rules = Rules { allow_self: vec!["127.0.0.1/32".parse().unwrap()], deny_suffixes: vec!["blocked.test".into()], ..Default::default() };
     h.hub.set_rules(&id.fingerprint().short(), rules).unwrap();
     let c = client(&h, &id).await;
     let listener = sieve_link::proxy::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
@@ -939,4 +971,280 @@ async fn local_proxy_speaks_socks5_and_http_connect() {
     assert!(resp.starts_with("HTTP/1.1 405"));
     stop.cancel();
     c.shutdown();
+}
+
+fn link_downs(h: &TestHub) -> Vec<serde_json::Value> {
+    audit_rows(h).into_iter().filter(|r| r["event"] == "link_down").collect()
+}
+
+fn no_link_down(h: &TestHub) {
+    let downs = link_downs(h);
+    assert!(downs.is_empty(), "the link went down: {downs:#?}");
+}
+
+/// P2-E: limit 2, two streams open, a burst of more opens. Through the
+/// device: each extra one is answered Busy by the device itself. Below the
+/// device (a raw session that ignores the announced limit): each extra one
+/// is answered Busy by the hub on its spare streams. Either way both open
+/// streams keep working and the link stays up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_over_the_limit_gets_busy_and_healthy_streams_survive() {
+    let h = start_hub().await;
+    let echo = echo_server().await;
+    let id = pair_new(&h, "d").await;
+    allow_loopback(&h, &id);
+    h.hub.set_limits(&id.fingerprint().short(), Limits { max_concurrent: 2, opens_per_minute: 1000, bytes_per_sec: 0 }).unwrap();
+
+    let c = client(&h, &id).await;
+    assert_eq!(c.stream_limit(), Some(2), "the hub announced the limit");
+    let mut s1 = c.open("127.0.0.1", echo).await.unwrap();
+    let mut s2 = c.open("127.0.0.1", echo).await.unwrap();
+    let burst = (0..6).map(|_| c.open("127.0.0.1", echo));
+    for r in futures::future::join_all(burst).await {
+        assert_eq!(refused_status(r), Status::Busy);
+    }
+    echo_once(&mut s1, b"one still works").await;
+    echo_once(&mut s2, b"two still works").await;
+    assert!(c.is_up());
+    no_link_down(&h);
+    c.shutdown();
+    drop((s1, s2));
+    // That link's own end (the shutdown above), before the raw part.
+    wait_audit(&h, |r| r["event"] == "link_down").await;
+    let downs_before = link_downs(&h).len();
+
+    // Below the device: a raw session opens two, then spare(2) = 8 more at once.
+    let (mh, stop) = raw_session(&h, &id).await;
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut s = mh.open().await.unwrap();
+        write_msg(&mut s, &Message::Connect { host: "127.0.0.1".into(), port: echo }).await.unwrap();
+        assert!(matches!(read_msg(&mut s).await.unwrap(), Message::Response { status: Status::Ok, .. }));
+        held.push(s);
+    }
+    let extra = (0..mux::spare(2)).map(|_| {
+        let mh = mh.clone();
+        async move {
+            let mut s = mh.open().await.unwrap();
+            write_msg(&mut s, &Message::Connect { host: "127.0.0.1".into(), port: echo }).await.unwrap();
+            tokio::time::timeout(T, read_msg(&mut s)).await.expect("answered").expect("an answer, not a reset")
+        }
+    });
+    for m in futures::future::join_all(extra).await {
+        assert!(matches!(m, Message::Response { status: Status::Busy, .. }), "{m:?}");
+    }
+    for s in &mut held {
+        echo_once(s, b"raw still works").await;
+    }
+    assert!(!mh.is_closed());
+    assert_eq!(link_downs(&h).len(), downs_before, "the raw link went down: {:#?}", link_downs(&h));
+    stop.cancel();
+}
+
+/// P2-A: a plain allow-cidr never reopens the hub, its LAN or loopback,
+/// even 0.0.0.0/0; allow-lan opens a LAN block but not the hub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_cidr_does_not_reopen_the_lan() {
+    let h = start_hub().await;
+    let echo = echo_server().await;
+    let id = pair_new(&h, "d").await;
+    let rules = Rules { allow_cidrs: vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()], ..Default::default() };
+    h.hub.set_rules(&id.fingerprint().short(), rules).unwrap();
+    let c = client(&h, &id).await;
+    for (host, port) in [("127.0.0.1", echo), ("192.168.1.10", 80), ("192.168.1.20", 445), ("81.2.69.170", 80), ("10.0.0.1", 80), ("nas.test", 445), ("::1", 80)] {
+        assert_eq!(refused_status(c.open(host, port).await), Status::Denied, "{host}");
+    }
+    // allow-lan opens the NAS's block; the hub's own address stays closed.
+    let rules = Rules { allow_lan: vec!["192.168.1.0/24".parse().unwrap()], ..Default::default() };
+    h.hub.set_rules(&id.fingerprint().short(), rules).unwrap();
+    match c.open("192.168.1.10", 80).await {
+        Err(LinkError::Refused { status: Status::Denied, message }) => assert_eq!(message, "the hub itself"),
+        other => panic!("expected the hub itself, got {:?}", other.map(|_| ())),
+    }
+    c.shutdown();
+}
+
+/// P2-C, hub dials out: the device sees the hub's (public) address as its
+/// TCP peer and reports it; the hub denies it to that link as itself,
+/// mapped and NAT64 forms included, and shows it in status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dialling_hub_learns_its_public_address_from_the_device() {
+    let h = start_hub_with(Duration::from_secs(5), false).await;
+    let device_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let device_addr = device_listener.local_addr().unwrap();
+    let code = h.hub.create_pairing_code(60, None, "vm").unwrap();
+    let id = Identity::generate().unwrap();
+    h.hub.dial(device_addr.to_string());
+    pair(&id, &code, "vm", PairVia::Listener(&device_listener), T).await.unwrap();
+    let mut cfg = link_cfg(h.hub.fingerprint(), HubRoute::Listen(device_addr));
+    cfg.report_hub_addr = Some("93.184.0.77".parse().unwrap());
+    let c = LinkClient::start_with_listener(&id, cfg, device_listener).unwrap();
+    assert!(c.wait_up(T).await);
+    wait_audit(&h, |r| r["event"] == "hub_address_learned" && r["addr"] == "93.184.0.77").await;
+    // Denied before any connection is tried (nothing leaves this machine).
+    for host in ["93.184.0.77", "::ffff:93.184.0.77", "64:ff9b::5db8:4d"] {
+        match c.open(host, 443).await {
+            Err(LinkError::Refused { status: Status::Denied, message }) => assert_eq!(message, "the hub itself", "{host}"),
+            other => panic!("{host}: expected a denial, got {:?}", other.map(|_| ())),
+        }
+    }
+    let learned = h.hub.learned_addresses();
+    assert_eq!(learned.len(), 1);
+    assert_eq!(learned[0].device, id.fingerprint().short());
+    assert!(learned[0].addrs.contains(&"93.184.0.77/32".parse().unwrap()));
+    // Only that link: the hub-wide blocks do not have it.
+    assert!(!h.hub.lan_blocks().contains(&"93.184.0.77/32".parse().unwrap()));
+    h.hub.write_status();
+    let st = read_status(h.hub.audit_path().parent().unwrap()).unwrap();
+    assert!(st.learned.iter().any(|l| l.addrs.contains(&"93.184.0.77/32".parse().unwrap())));
+    c.shutdown();
+}
+
+/// P2-C, hub listens: the local address the device reached is the hub's
+/// own when it is public (injected: loopback stands in for it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listening_hub_learns_the_address_it_was_reached_on() {
+    let h = start_hub_cfg(true, |c| c.test_local_addr = Some("93.184.0.88".parse().unwrap())).await;
+    let id = pair_new(&h, "d").await;
+    let c = client(&h, &id).await;
+    wait_audit(&h, |r| r["event"] == "hub_address_learned" && r["addr"] == "93.184.0.88").await;
+    match c.open("93.184.0.88", 443).await {
+        Err(LinkError::Refused { status: Status::Denied, message }) => assert_eq!(message, "the hub itself"),
+        other => panic!("expected a denial, got {:?}", other.map(|_| ())),
+    }
+    c.shutdown();
+}
+
+/// P2-F: when making room would delete rows younger than the floor, the
+/// hub opens no new streams and says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_audit_log_within_the_floor_stops_new_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    Hub::init(dir.path(), "test-hub").unwrap();
+    // Three rotated files of fresh rows, one more than `keep` allows.
+    let fresh = format!("{{\"ts_ms\":{},\"event\":\"stream\",\"outcome\":\"x\"}}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+    for i in 1..=3 {
+        std::fs::write(dir.path().join(format!("audit.log.{i}")), &fresh).unwrap();
+    }
+    let mut cfg = test_cfg(dir.path(), Duration::from_secs(5));
+    cfg.audit = AuditConfig { max_bytes: 4096, keep: 2, ..AuditConfig::default() };
+    let hub = Hub::open(cfg).unwrap();
+    let addr = hub.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let h = TestHub { _dir: dir, hub, addr };
+    let echo = echo_server().await;
+    let id = pair_new(&h, "d").await;
+    allow_loopback(&h, &id);
+    let c = client(&h, &id).await;
+    match c.open("127.0.0.1", echo).await {
+        Err(LinkError::Refused { status: Status::Unavailable, message }) => assert!(message.contains("retention floor"), "{message}"),
+        other => panic!("expected Unavailable, got {:?}", other.map(|_| ())),
+    }
+    // Nothing was deleted.
+    for i in 1..=3 {
+        assert!(h.hub.audit_path().with_extension(format!("log.{i}")).exists());
+    }
+    h.hub.write_status();
+    let st = read_status(h.hub.audit_path().parent().unwrap()).unwrap();
+    assert!(st.unavailable.unwrap().contains("retention floor"));
+    // The owner moves the oldest away: streams again.
+    std::fs::remove_file(h.hub.audit_path().with_extension("log.1")).unwrap();
+    h.hub.flush_audit();
+    let mut s = c.open("127.0.0.1", echo).await.unwrap();
+    echo_once(&mut s, b"room again").await;
+    c.shutdown();
+}
+
+/// P3: a store unreadable past the grace cuts every link; readable again,
+/// the device comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_unreadable_past_the_grace_cuts_the_links() {
+    let h = start_hub_cfg(true, |c| c.store_grace = Duration::from_millis(500)).await;
+    let id = pair_new(&h, "d").await;
+    let c = client(&h, &id).await;
+    let path = h.hub.audit_path().parent().unwrap().join("hub.json");
+    let good = std::fs::read(&path).unwrap();
+    std::fs::write(&path, b"{ damaged").unwrap();
+    wait_audit(&h, |r| r["event"] == "store_unreadable_links_cut").await;
+    wait_audit(&h, |r| r["event"] == "link_down" && r["outcome"] == "cut off").await;
+    std::fs::write(&path, &good).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(c.wait_up(T).await, "the device linked again once the store read");
+    c.shutdown();
+}
+
+/// P3: a rule change that denies an open stream's destination cuts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rule_change_cuts_streams_it_now_denies() {
+    let h = start_hub().await;
+    let echo = echo_server().await;
+    let id = pair_new(&h, "d").await;
+    allow_loopback(&h, &id);
+    let c = client(&h, &id).await;
+    let mut s = c.open("echo.test", echo).await.unwrap();
+    echo_once(&mut s, b"before").await;
+    // A deny-suffix for the name: the open stream ends.
+    let rules = Rules { allow_self: vec!["127.0.0.1/32".parse().unwrap()], deny_suffixes: vec!["echo.test".into()], ..Default::default() };
+    h.hub.set_rules(&id.fingerprint().short(), rules).unwrap();
+    let mut buf = [0u8; 8];
+    let _ = s.write_all(b"after").await;
+    let n = tokio::time::timeout(T, s.read(&mut buf)).await.expect("the stream was not cut");
+    assert!(matches!(n, Ok(0) | Err(_)), "{n:?}");
+    let row = wait_audit(&h, |r| r["event"] == "stream" && r["outcome"].as_str().unwrap().starts_with("cut off: now denied")).await;
+    assert!(row["outcome"].as_str().unwrap().contains("domain denied"), "{row}");
+    // Other streams of the device are left alone; the link stays up.
+    let mut other = c.open("127.0.0.1", echo).await.unwrap();
+    echo_once(&mut other, b"other").await;
+    no_link_down(&h);
+    c.shutdown();
+}
+
+#[derive(Debug)]
+struct AnyKey;
+
+impl PeerPolicy for AnyKey {
+    fn accepts(&self, _: &Fingerprint) -> bool {
+        true
+    }
+}
+
+/// P3: a pairing answer with a status this device does not know says the
+/// hub is newer, not that the code was used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_newer_hubs_pairing_answer_says_so() {
+    let hub_id = Identity::generate().unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let scfg = tls::server_config(&hub_id, Arc::new(AnyKey)).unwrap();
+    let fake = tokio::spawn(async move {
+        let (tcp, _) = l.accept().await.unwrap();
+        let est = tls::accept(tcp, scfg, T).await.unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut tx = Some(tx);
+        let stop = CancellationToken::new();
+        let (_h, task) = mux::spawn_with(
+            est.io.compat(),
+            Mode::Server,
+            mux::config(),
+            move |s| {
+                if let Some(t) = tx.take() {
+                    let _ = t.send(s);
+                }
+            },
+            stop.clone(),
+        );
+        let mut io = rx.await.unwrap().compat();
+        assert!(matches!(read_msg(&mut io).await.unwrap(), Message::Pair { .. }));
+        // A response with status 9: well-formed, unknown to this version.
+        io.write_all(&[0, 3, 0x80, 9, 0]).await.unwrap();
+        io.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        stop.cancel();
+        let _ = task.await;
+    });
+    let code = PairingCode::new(hub_id.fingerprint(), 60, Some(addr.to_string())).unwrap();
+    let id = Identity::generate().unwrap();
+    let err = pair(&id, &code, "d", PairVia::Dial(addr.to_string()), T).await.unwrap_err();
+    assert!(err.to_string().contains("newer version"), "{err}");
+    assert!(!err.to_string().contains("used"), "{err}");
+    fake.await.unwrap();
 }

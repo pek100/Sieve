@@ -3,7 +3,7 @@
 //! streams through it. `LinkClient::open` is the seed of the SDK.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tokio_util::sync::CancellationToken;
 
@@ -22,7 +22,7 @@ use crate::identity::{Fingerprint, Identity};
 use crate::mux::{self, LinkIo, Mode, MuxHandle};
 use crate::pairing::{self, PairingCode};
 use crate::tls::{self, Established, PeerPolicy, Pinned};
-use crate::wire::{Message, Status, read_msg, write_msg};
+use crate::wire::{Message, Status, WireError, read_msg, write_msg};
 
 /// What `open` does while the hub is unreachable. A per-device setting.
 ///
@@ -75,6 +75,13 @@ pub struct LinkConfig {
     /// `Listen`: admission before authentication.
     pub gate: GateConfig,
     pub request_timeout: Duration,
+    /// How long `open` waits for one of the hub's stream slots (the limit the
+    /// hub announced) before answering `Busy` itself.
+    pub busy_wait: Duration,
+    /// Test hook: the hub address reported on the control stream instead of
+    /// the link's real TCP peer (loopback tests stand in for public ones).
+    #[doc(hidden)]
+    pub report_hub_addr: Option<IpAddr>,
 }
 
 impl LinkConfig {
@@ -90,6 +97,8 @@ impl LinkConfig {
             accept_timeout: Duration::from_secs(3),
             gate: GateConfig::device(),
             request_timeout: Duration::from_secs(15),
+            busy_wait: Duration::from_secs(2),
+            report_hub_addr: None,
         }
     }
 }
@@ -98,9 +107,84 @@ impl LinkConfig {
 /// finish the handshake while pairing.
 const PAIR_ACCEPT_LIMIT: Duration = Duration::from_secs(3);
 
+/// How long an open whose stream ended before the hub answered waits to see
+/// whether the whole link is going (then it retries on the new link).
+const LINK_GONE_GRACE: Duration = Duration::from_secs(1);
+
+/// Streams one link may have open on this side, the control stream aside:
+/// the device's own yamux session holds `mux::MAX_STREAMS`.
+const DEVICE_STREAM_CAP: u32 = mux::MAX_STREAMS as u32 - 1;
+
+/// The streams this device may have open on one link: the hub's announced
+/// limit, counted here so an open over it is answered `Busy` on the device
+/// instead of reaching the hub's yamux ceiling (which would end the link).
+#[derive(Debug)]
+struct Slots {
+    state: std::sync::Mutex<(u32, u32)>,
+    freed: Notify,
+}
+
+impl Slots {
+    fn new(limit: u32) -> Arc<Self> {
+        Arc::new(Slots { state: std::sync::Mutex::new((0, limit.clamp(1, DEVICE_STREAM_CAP))), freed: Notify::new() })
+    }
+
+    fn set_limit(&self, limit: u32) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = limit.clamp(1, DEVICE_STREAM_CAP);
+        self.freed.notify_waiters();
+    }
+
+    fn limit(&self) -> u32 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+
+    fn try_take(self: &Arc<Self>) -> Option<Slot> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.0 >= st.1 {
+            return None;
+        }
+        st.0 += 1;
+        Some(Slot(self.clone()))
+    }
+
+    /// Takes a slot, waiting up to `wait` for one to free.
+    async fn take(self: &Arc<Self>, wait: Duration) -> Option<Slot> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let freed = self.freed.notified();
+            if let Some(s) = self.try_take() {
+                return Some(s);
+            }
+            if tokio::time::timeout_at(deadline, freed).await.is_err() {
+                return self.try_take();
+            }
+        }
+    }
+}
+
+/// One of the hub's stream slots, held by an open stream; freed on drop.
+#[derive(Debug)]
+struct Slot(Arc<Slots>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.0 = st.0.saturating_sub(1);
+        drop(st);
+        self.0.freed.notify_waiters();
+    }
+}
+
+/// The link in use: its session and its stream slots.
+#[derive(Clone, Debug)]
+struct Current {
+    handle: MuxHandle,
+    slots: Arc<Slots>,
+}
+
 struct ClientInner {
     cfg: LinkConfig,
-    link: watch::Sender<Option<MuxHandle>>,
+    link: watch::Sender<Option<Current>>,
     shutdown: CancellationToken,
     listen_addr: Option<SocketAddr>,
 }
@@ -146,35 +230,56 @@ impl LinkClient {
     }
 
     pub fn is_up(&self) -> bool {
-        self.inner.link.borrow().as_ref().is_some_and(|h| !h.is_closed())
+        self.inner.link.borrow().as_ref().is_some_and(|c| !c.handle.is_closed())
     }
 
     /// Waits up to `limit` for the link to be up.
     pub async fn wait_up(&self, limit: Duration) -> bool {
-        self.current(limit).await.is_some()
+        self.current(limit, None).await.is_some()
     }
 
-    async fn current(&self, limit: Duration) -> Option<MuxHandle> {
+    /// The streams the hub currently lets this device have open (once the
+    /// link is up).
+    pub fn stream_limit(&self) -> Option<u32> {
+        self.inner.link.borrow().as_ref().map(|c| c.slots.limit())
+    }
+
+    /// The link in use, waiting up to `limit` for one; `not` skips a link
+    /// that just failed (so a relink race waits for the NEW link).
+    async fn current(&self, limit: Duration, not: Option<u64>) -> Option<Current> {
         let mut rx = self.inner.link.subscribe();
-        let r = tokio::time::timeout(limit, rx.wait_for(|h| h.as_ref().is_some_and(|h| !h.is_closed()))).await;
+        let ok = |c: &Option<Current>| c.as_ref().is_some_and(|c| !c.handle.is_closed() && Some(c.handle.id()) != not);
+        let r = tokio::time::timeout(limit, rx.wait_for(ok)).await;
         match r {
-            Ok(Ok(h)) => h.clone(),
+            Ok(Ok(c)) => c.clone(),
             _ => None,
         }
     }
 
     /// Opens a TCP connection to `host:port` that exits through the hub. The
-    /// hub resolves `host`. While the hub is unreachable the device's
+    /// hub resolves `host`. At most the hub's announced limit of streams are
+    /// open at once: an open over it waits up to `busy_wait` for one to close
+    /// and is then refused `Busy` here, without reaching the hub. If the link
+    /// drops during the open, the open waits up to `hub_wait` for the new
+    /// link and tries once more. While the hub is unreachable the device's
     /// `on_hub_down` setting decides: refuse (`Stop`) or go direct.
     pub async fn open(&self, host: &str, port: u16) -> Result<LinkStream> {
         let cfg = &self.inner.cfg;
-        let Some(h) = self.current(cfg.hub_wait).await else {
-            return self.hub_down(host, port).await;
-        };
-        match open_on(&h, host, port, cfg.request_timeout).await {
-            Err(LinkError::HubDown) => self.hub_down(host, port).await,
-            other => other.map(LinkStream::Link),
+        let mut failed = None;
+        for _ in 0..2 {
+            let Some(cur) = self.current(cfg.hub_wait, failed).await else {
+                return self.hub_down(host, port).await;
+            };
+            let Some(slot) = cur.slots.take(cfg.busy_wait).await else {
+                let n = cur.slots.limit();
+                return Err(LinkError::Refused { status: Status::Busy, message: format!("{n} connections already open (this device's limit at the hub)") });
+            };
+            match open_on(&cur.handle, host, port, cfg.request_timeout).await {
+                Err(LinkError::HubDown) => failed = Some(cur.handle.id()),
+                other => return other.map(|io| LinkStream::Link(HubStream { io, _slot: slot })),
+            }
         }
+        self.hub_down(host, port).await
     }
 
     async fn hub_down(&self, host: &str, port: u16) -> Result<LinkStream> {
@@ -203,11 +308,17 @@ async fn open_on(h: &MuxHandle, host: &str, port: u16, limit: Duration) -> Resul
     };
     let resp = match tokio::time::timeout(limit, fut).await {
         Err(_) => return Err(LinkError::Timeout("hub answer")),
-        Ok(Err(e)) if h.is_closed() => {
-            let _ = e;
-            return Err(LinkError::HubDown);
+        Ok(Err(e)) => {
+            // A stream that ends before the hub's answer: the hub only does
+            // that when the link itself is going (cut, replaced, relinked),
+            // which this side may learn a moment later.
+            let gone = h.cancel_token();
+            if tokio::time::timeout(LINK_GONE_GRACE, gone.cancelled()).await.is_ok() {
+                return Err(LinkError::HubDown);
+            }
+            return Err(e.into());
         }
-        Ok(r) => r?,
+        Ok(Ok(r)) => r,
     };
     match resp {
         Message::Response { status: Status::Ok, .. } => Ok(s),
@@ -278,23 +389,27 @@ async fn run_link(inner: Arc<ClientInner>, est: Established) {
     let cancel = inner.shutdown.child_token();
     // The hub never opens streams toward a device: drop any it tries.
     let (handle, task) = mux::spawn(est.io.compat(), Mode::Client, |_s| {}, cancel.clone());
+    // The address this device reached the hub at, for the hub to deny to
+    // devices as its own (its public address, behind a router).
+    let seen = inner.cfg.report_hub_addr.unwrap_or(est.remote.ip());
     // In TLS 1.3 the client finishes its handshake before the server has
     // checked the client's key, so a finished handshake does not mean the
     // hub accepted us. The link counts as up only after the hub answers a
     // first ping on the control stream.
-    match tokio::time::timeout(inner.cfg.handshake_timeout, control_open(&handle)).await {
-        Ok(Ok(io)) => {
-            let old = inner.link.send_replace(Some(handle.clone()));
+    match tokio::time::timeout(inner.cfg.handshake_timeout, control_open(&handle, seen)).await {
+        Ok(Ok((io, limit))) => {
+            let slots = Slots::new(limit);
+            let old = inner.link.send_replace(Some(Current { handle: handle.clone(), slots: slots.clone() }));
             if let Some(old) = old {
-                old.close();
+                old.handle.close();
             }
-            tokio::spawn(keepalive(handle.clone(), io, inner.cfg.keepalive, inner.cfg.dead_after));
+            tokio::spawn(keepalive(handle.clone(), slots, io, inner.cfg.keepalive, inner.cfg.dead_after));
         }
         _ => handle.close(),
     }
     let _ = task.await;
     inner.link.send_if_modified(|cur| {
-        if cur.as_ref().is_some_and(|h| h.id() == handle.id()) {
+        if cur.as_ref().is_some_and(|c| c.handle.id() == handle.id()) {
             *cur = None;
             true
         } else {
@@ -303,38 +418,54 @@ async fn run_link(inner: Arc<ClientInner>, est: Established) {
     });
 }
 
-/// Opens the control stream and completes a first ping.
-async fn control_open(h: &MuxHandle) -> Result<LinkIo> {
+/// Opens the control stream, reports the hub's address as seen from here,
+/// and completes a first ping. Returns the stream and the hub's limit (sent
+/// before the first pong; a hub that sends none gets this side's own cap).
+async fn control_open(h: &MuxHandle, seen: IpAddr) -> Result<(LinkIo, u32)> {
     let mut io = h.open().await?;
     write_msg(&mut io, &Message::Control).await?;
+    write_msg(&mut io, &Message::Observed(seen)).await?;
     write_msg(&mut io, &Message::Ping(0)).await?;
-    match read_msg(&mut io).await? {
-        Message::Pong(0) => Ok(io),
-        _ => Err(LinkError::Protocol("the hub did not answer the first ping".into())),
+    let mut limit = DEVICE_STREAM_CAP;
+    loop {
+        match read_msg(&mut io).await? {
+            Message::Limit(n) => limit = n,
+            Message::Pong(0) => return Ok((io, limit)),
+            _ => return Err(LinkError::Protocol("the hub did not answer the first ping".into())),
+        }
     }
 }
 
-async fn keepalive(h: MuxHandle, mut io: LinkIo, every: Duration, dead_after: Duration) {
+/// Pings every `every`; reads pongs and limit changes as they come. Nothing
+/// read for `dead_after` (pings go out more often than that) ends the link.
+async fn keepalive(h: MuxHandle, slots: Arc<Slots>, io: LinkIo, every: Duration, dead_after: Duration) {
     let stop = h.cancel_token();
-    let mut n: u64 = 0;
-    loop {
-        tokio::select! {
-            _ = stop.cancelled() => return,
-            _ = tokio::time::sleep(every) => {}
-        }
-        n += 1;
-        if write_msg(&mut io, &Message::Ping(n)).await.is_err() {
-            h.close();
-            return;
-        }
-        match tokio::time::timeout(dead_after, read_msg(&mut io)).await {
-            Ok(Ok(Message::Pong(m))) if m == n => {}
-            _ => {
-                h.close();
+    let (mut r, mut w) = tokio::io::split(io);
+    let pinger = async {
+        let mut n: u64 = 0;
+        loop {
+            tokio::time::sleep(every).await;
+            n += 1;
+            if write_msg(&mut w, &Message::Ping(n)).await.is_err() {
                 return;
             }
         }
+    };
+    let reader = async {
+        loop {
+            match tokio::time::timeout(dead_after, read_msg(&mut r)).await {
+                Ok(Ok(Message::Pong(_))) => {}
+                Ok(Ok(Message::Limit(n))) => slots.set_limit(n),
+                _ => return,
+            }
+        }
+    };
+    tokio::select! {
+        _ = stop.cancelled() => return,
+        _ = pinger => {}
+        _ = reader => {}
     }
+    h.close();
 }
 
 /// Where the device meets the hub to pair.
@@ -402,7 +533,13 @@ pub async fn pair(identity: &Identity, code: &PairingCode, name: &str, via: Pair
         let r = async {
             let mut s = h.open().await.map_err(|_| LinkError::Pairing("the hub closed the link".into()))?;
             write_msg(&mut s, &Message::Pair { proof, name: name.to_string() }).await?;
-            read_msg(&mut s).await.map_err(LinkError::from)
+            read_msg(&mut s).await.map_err(|e| match e {
+                WireError::UnknownStatus(n) => LinkError::Pairing(format!(
+                    "this hub speaks a newer version of sieve-link (it answered with status {n}, which this device does not know); \
+                     update sieve-link on this device and pair again"
+                )),
+                other => LinkError::from(other),
+            })
         }
         .await;
         cancel.cancel();
@@ -427,10 +564,23 @@ pub async fn pair(identity: &Identity, code: &PairingCode, name: &str, via: Pair
     tokio::time::timeout(limit, fut).await.map_err(|_| LinkError::Timeout("pairing"))?
 }
 
+/// A stream through the hub; holds one of the hub's stream slots until
+/// dropped.
+pub struct HubStream {
+    io: LinkIo,
+    _slot: Slot,
+}
+
+impl HubStream {
+    pub fn get_mut(&mut self) -> &mut LinkIo {
+        &mut self.io
+    }
+}
+
 /// A connection opened by `LinkClient::open`.
 pub enum LinkStream {
     /// Through the hub.
-    Link(LinkIo),
+    Link(HubStream),
     /// Direct from this device (only with `OnHubDown::Direct`).
     Direct(TcpStream),
 }
@@ -444,7 +594,7 @@ impl LinkStream {
 impl AsyncRead for LinkStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            LinkStream::Link(s) => Pin::new(s).poll_read(cx, buf),
+            LinkStream::Link(s) => Pin::new(&mut s.io).poll_read(cx, buf),
             LinkStream::Direct(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -453,19 +603,19 @@ impl AsyncRead for LinkStream {
 impl AsyncWrite for LinkStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         match self.get_mut() {
-            LinkStream::Link(s) => Pin::new(s).poll_write(cx, buf),
+            LinkStream::Link(s) => Pin::new(&mut s.io).poll_write(cx, buf),
             LinkStream::Direct(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            LinkStream::Link(s) => Pin::new(s).poll_flush(cx),
+            LinkStream::Link(s) => Pin::new(&mut s.io).poll_flush(cx),
             LinkStream::Direct(s) => Pin::new(s).poll_flush(cx),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            LinkStream::Link(s) => Pin::new(s).poll_shutdown(cx),
+            LinkStream::Link(s) => Pin::new(&mut s.io).poll_shutdown(cx),
             LinkStream::Direct(s) => Pin::new(s).poll_shutdown(cx),
         }
     }

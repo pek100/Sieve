@@ -51,7 +51,7 @@ pub struct Gate {
 
 /// The source key: an IPv4 address, or the /64 an IPv6 address sits in
 /// (one subscriber usually has a whole /64).
-fn source_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn source_key(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !((1u128 << 64) - 1)).into()),
         v4 => v4,

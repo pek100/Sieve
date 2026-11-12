@@ -33,7 +33,7 @@ pub use error::LinkError;
 pub use hub::{Hub, HubConfig};
 pub use identity::{Fingerprint, Identity};
 pub use pairing::PairingCode;
-pub use rules::{Cidr, Limits, Rules};
+pub use rules::{Cidr, Limits, LocalNet, Rules};
 
 /// Milliseconds since the Unix epoch (audit rows, keep-alive bookkeeping).
 pub(crate) fn now_ms() -> u64 {

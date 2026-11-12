@@ -175,6 +175,8 @@ pub struct Established {
     /// Keying material unique to this session (RFC 8446 7.5), for pairing.
     pub exporter: [u8; 32],
     pub remote: SocketAddr,
+    /// This side's address on the connection (the one the peer reached).
+    pub local: SocketAddr,
     /// The negotiated key-exchange group (for tests and logs).
     pub kx_group: Option<rustls::NamedGroup>,
 }
@@ -187,7 +189,7 @@ pub(crate) fn tune(tcp: &TcpStream) {
     let _ = socket2::SockRef::from(tcp).set_tcp_keepalive(&ka);
 }
 
-fn finish(io: TlsStream<TcpStream>, remote: SocketAddr) -> Result<Established> {
+fn finish(io: TlsStream<TcpStream>, remote: SocketAddr, local: SocketAddr) -> Result<Established> {
     let (peer, exporter, alpn_ok, kx_group) = {
         let common: &rustls::CommonState = match &io {
             TlsStream::Client(c) => c.get_ref().1,
@@ -209,7 +211,7 @@ fn finish(io: TlsStream<TcpStream>, remote: SocketAddr) -> Result<Established> {
     if !alpn_ok {
         return Err(LinkError::Tls("the peer does not speak sieve-link/1".into()));
     }
-    Ok(Established { io, peer, exporter, remote, kx_group })
+    Ok(Established { io, peer, exporter, remote, local, kx_group })
 }
 
 /// Dials `addr` and runs the handshake as the TLS client.
@@ -229,18 +231,20 @@ pub async fn connect(tcp: TcpStream, cfg: Arc<ClientConfig>, limit: Duration) ->
 async fn client_handshake(tcp: TcpStream, cfg: Arc<ClientConfig>) -> Result<Established> {
     tune(&tcp);
     let remote = tcp.peer_addr()?;
+    let local = tcp.local_addr()?;
     let name = ServerName::try_from(SERVER_NAME).expect("static name");
     let tls = TlsConnector::from(cfg).connect(name, tcp).await.map_err(|e| LinkError::Tls(e.to_string()))?;
-    finish(TlsStream::Client(tls), remote)
+    finish(TlsStream::Client(tls), remote, local)
 }
 
 /// Runs the handshake on an accepted socket as the TLS server.
 pub async fn accept(tcp: TcpStream, cfg: Arc<ServerConfig>, limit: Duration) -> Result<Established> {
     tune(&tcp);
     let remote = tcp.peer_addr()?;
+    let local = tcp.local_addr()?;
     let fut = async {
         let tls = TlsAcceptor::from(cfg).accept(tcp).await.map_err(|e| LinkError::Tls(e.to_string()))?;
-        finish(TlsStream::Server(tls), remote)
+        finish(TlsStream::Server(tls), remote, local)
     };
     tokio::time::timeout(limit, fut).await.map_err(|_| LinkError::Timeout("handshake"))?
 }
