@@ -131,7 +131,9 @@ clubcard-crlite = "0.6"
 # interface metric (route::apply), the DNS Client probe that proves it (Dns),
 # and a block in a dynamic WFP session that
 # the base filtering engine deletes with the engine's handle
-# (WindowsFilteringPlatform, route::wfp only).
+# (WindowsFilteringPlatform, route::wfp only). Windows' connectivity verdict
+# for the Wi-Fi sign-in notice, read only (NetworkListManager and its property
+# bag, Com_StructuredStorage; route::nlm only).
 # Attribution reads: a real-time ETW session (Diagnostics_Etw, Time) and WMI
 # queries of NAT state on its own COM thread (Com, Ole for VARIANT, Rpc,
 # Variant, Wmi).
@@ -147,12 +149,14 @@ windows = { workspace = true, features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Networking_NetworkListManager",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",

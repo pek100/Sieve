@@ -44,7 +44,7 @@ use crate::inject::content::ContentHook;
 use crate::lists::https::HttpsFetcher;
 use crate::policy::wall_ms;
 use crate::route::apply::{self, AddressState, SieveLuid};
-use crate::route::capture;
+use crate::route::{capture, nlm, sign_in};
 use sieve_ipc::{CaptureReason, DnsCapture};
 use crate::route::wfp;
 use crate::route::journal::Journal;
@@ -89,6 +89,8 @@ struct Up {
     /// Empty when it is refused or could not open or be proven; routing goes on
     /// without it.
     capture: CaptureSlot,
+    /// The last failure reading Windows' connectivity verdict, reported once.
+    verdict_error: Option<String>,
 }
 
 fn journal(engine: &Engine) -> Option<Journal> {
@@ -238,7 +240,57 @@ async fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
         kept.sort();
         Up { routes: kept, ..up }
     };
+    let up = follow_sign_in(engine, up).await;
     follow_capture(engine, up, network_moved).await
+}
+
+/// One pass of the Wi-Fi sign-in state (`route::sign_in`), before the capture's,
+/// so a pause asked for or ended takes effect in the same pass. Windows' verdict
+/// is read only when the state needs it (encrypted DNS failing, or a notice or a
+/// pause standing), for the adapter the engine's traffic leaves by. While paused,
+/// an encrypted lookup is tried on its schedule and the first answer ends the
+/// pause. A verdict that cannot be read is no verdict: no notice, and a pause
+/// ends as for a changed network, so the capture comes back.
+async fn follow_sign_in(engine: &Engine, mut up: Up) -> Up {
+    let dns = up.relay.dns.clone();
+    let wanted = capture::wanted(&engine.policy());
+    let unreachable = dns.unreachable();
+    let leaves_by = up.relay.tables.read().unwrap_or_else(|p| p.into_inner()).default_adapter().map(|a| a.luid);
+    let needs = engine.sign_in().needs_verdict(unreachable);
+    let verdict = match leaves_by.filter(|_| needs) {
+        None => None,
+        Some(luid) => {
+            let read = tokio::time::timeout(TASKS_BOUND, tokio::task::spawn_blocking(move || nlm::verdict(luid))).await;
+            let read = match read {
+                Ok(Ok(read)) => read,
+                Ok(Err(e)) => Err(format!("the connectivity check's task: {e}")),
+                Err(_) => Err(format!("Windows did not say within {} s whether the network wants a sign-in", TASKS_BOUND.as_secs())),
+            };
+            match read {
+                Ok(verdict) => {
+                    up.verdict_error = None;
+                    verdict
+                }
+                Err(why) => {
+                    if up.verdict_error.as_deref() != Some(why.as_str()) {
+                        engine.add_error(format!("Wi-Fi sign-in is not detected: {why}"));
+                    }
+                    up.verdict_error = Some(why);
+                    None
+                }
+            }
+        }
+    };
+    let now = std::time::Instant::now();
+    let probe = {
+        let mut sign_in = engine.sign_in();
+        sign_in.observe(now, sign_in::Seen { wanted, network: verdict.as_ref(), encrypted_unreachable: unreachable });
+        sign_in.probe_due(now)
+    };
+    if probe && dns.encrypted_answers().await {
+        engine.sign_in().encrypted_answered();
+    }
+    up
 }
 
 /// The DNS Client capture of one routing run (`route::capture`): its filter
@@ -429,7 +481,10 @@ fn routes_v6(routes: &[Prefix]) -> bool {
 /// service hears whether every network is blocked, and the status what holds.
 async fn follow_capture(engine: &Engine, mut up: Up, network_moved: bool) -> Up {
     let tables = up.relay.tables.read().unwrap_or_else(|p| p.into_inner()).clone();
-    let wanted = capture::wanted(&engine.policy());
+    // The user's Wi-Fi sign-in pause holds no capture, as the setting off does
+    // (`route::sign_in`): only the DNS Client's own lookups change path.
+    let paused = engine.sign_in().paused();
+    let wanted = capture::wanted(&engine.policy()) && !paused;
     let blocks = capture::blocks(&tables, &up.routes);
     let dns = up.relay.dns.clone();
     let keep_v6 = routes_v6(&up.routes);
@@ -768,7 +823,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn()
     engine.beats.relay.end();
     engine.beats.tun.end();
     engine.arm.set(true);
-    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, exclusions, etw, capture })
+    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, exclusions, etw, capture, verdict_error: None })
 }
 
 /// Interception as this engine run wires it (task D1, D2). Nothing here runs
@@ -875,6 +930,8 @@ async fn take_down(engine: &Engine, mut up: Up) {
     if let Some(c) = up.capture.held.take() {
         close_capture(engine, &up.relay.dns, c).await;
     }
+    // A sign-in pause is for this routing run's network: the next run starts with none.
+    engine.sign_in().forget();
     engine.arm.set(false);
     *super::lock(&engine.beats.path) = None;
     let _ = up.tun.session.shutdown();

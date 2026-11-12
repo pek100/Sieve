@@ -25,7 +25,10 @@
 //!   `Policy.skip_dns_capture` and the status's `dns_capture`, left out while
 //!   false or unknown, so the default, capture on, reads the same bytes; the
 //!   Hello's `capabilities`, left out while empty, and the status's
-//!   `dns_capture` sent only to an app that names it there).
+//!   `dns_capture` sent only to an app that names it there; the status's
+//!   `wifi_sign_in`, left out while there is nothing to say and sent only to an
+//!   app that names it, with `pause_dns_capture` and `resume_dns_capture`, which
+//!   an app sends only to an engine whose status carried that fact).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -79,7 +82,7 @@ pub const LOG_URL_MAX: usize = 2048;
 pub const LOG_RULE_MAX: usize = 1024;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices", "list_refresh", "list_import", "list_rules", "issues"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices", "list_refresh", "list_import", "list_rules", "issues", "pause_dns_capture", "resume_dns_capture"];
 /// The `type` names of [`EngineMessage`], in declaration order.
 pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status", "exclusions", "heal_notices", "list_imported", "list_rules", "issues"];
 /// At most this many apps in [`EngineMessage::Issues`]: past it the app whose
@@ -121,9 +124,19 @@ pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "ref
 /// field added to a message the app reads strictly goes only to an app that names
 /// it, so an app from before the field keeps reading the message. An engine
 /// ignores a name it does not know.
-pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE];
+pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE, CAPABILITY_WIFI_SIGN_IN];
 /// [`EngineStatus::dns_capture`].
 pub const CAPABILITY_DNS_CAPTURE: &str = "dns_capture";
+/// [`EngineStatus::wifi_sign_in`]. An app that names it may send
+/// [`ClientMessage::PauseDnsCapture`] and [`ClientMessage::ResumeDnsCapture`],
+/// and only to an engine whose status carried the fact: an engine from before
+/// them ends the conversation on a message type it does not know.
+pub const CAPABILITY_WIFI_SIGN_IN: &str = "wifi_sign_in";
+/// The longest a Wi-Fi sign-in pause of the DNS Client capture lasts, in seconds.
+pub const SIGN_IN_PAUSE_MAX_S: u32 = 15 * 60;
+/// [`WifiSignIn::network`] and [`ClientMessage::PauseDnsCapture`]'s `network` are
+/// at most this many bytes (a network GUID is 36).
+pub const NETWORK_ID_MAX: usize = 64;
 /// A log row carries at most this many [`LogChange`]s: one per protection.
 pub const MAX_LOG_CHANGES: usize = TRACKING_NAMES.len();
 /// A flow event's rule text is cut to this many bytes: a list rule can run to
@@ -209,6 +222,16 @@ pub enum ClientMessage {
     /// Asks for [`EngineMessage::Issues`]: the apps' recent problems, when their
     /// revision is above `after` (0 asks for them whatever it is).
     Issues { after: u64 },
+    /// The user's one click on "Sign in to this Wi-Fi": stop catching the Windows
+    /// DNS Client's queries on `network`, the id the status's
+    /// [`WifiSignIn::network`] named, until encrypted DNS answers again, the
+    /// network changes or [`SIGN_IN_PAUSE_MAX_S`] passed, whichever is first.
+    /// Refused with an Error unless the engine itself sees that network as one
+    /// that wants a sign-in right now. Kept in memory only. Answered with Status.
+    PauseDnsCapture { network: String },
+    /// "Resume now": ends a sign-in pause, if there is one. No field (a struct
+    /// variant, as [`ClientMessage::RequestUpdate`]). Answered with Status.
+    ResumeDnsCapture {},
 }
 
 /// Engine to app. Read and written one frame at a time and never stored, so the
@@ -854,6 +877,11 @@ pub struct EngineStatus {
     /// while routes are up; left out otherwise and by an engine from before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_capture: Option<DnsCapture>,
+    /// The network looks like a Wi-Fi that wants a sign-in (a captive portal), or
+    /// the DNS Client capture is paused for one; left out otherwise and by an
+    /// engine from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wifi_sign_in: Option<WifiSignIn>,
     /// Signed updates (protocol 3).
     pub update: UpdateStatus,
 }
@@ -867,8 +895,28 @@ impl EngineStatus {
         if !capabilities.iter().any(|c| c == CAPABILITY_DNS_CAPTURE) {
             self.dns_capture = None;
         }
+        if !capabilities.iter().any(|c| c == CAPABILITY_WIFI_SIGN_IN) {
+            self.wifi_sign_in = None;
+        }
         self
     }
+}
+
+/// A Wi-Fi that wants a sign-in, as the engine sees it: Windows says the network
+/// has a sign-in page or no internet, and no encrypted DNS server answers. Takes
+/// unknown fields, as [`EngineStatus`] does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WifiSignIn {
+    /// The network: Windows' Network List Manager id for it (`{GUID}`), opaque to
+    /// the app, which hands it back in [`ClientMessage::PauseDnsCapture`], so a
+    /// click can only pause the network it was shown for. At most
+    /// [`NETWORK_ID_MAX`] bytes.
+    pub network: String,
+    /// Present while the DNS Client capture is paused for this network: the
+    /// seconds until it resumes by itself at the latest. Absent: not paused, the
+    /// app may offer the pause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_left_s: Option<u32>,
 }
 
 /// The Windows DNS Client capture as the app shows it. Takes unknown fields, as
@@ -1416,6 +1464,8 @@ mod tests {
             ClientMessage::ListImport { .. } => "list_import",
             ClientMessage::ListRules { .. } => "list_rules",
             ClientMessage::Issues { .. } => "issues",
+            ClientMessage::PauseDnsCapture { .. } => "pause_dns_capture",
+            ClientMessage::ResumeDnsCapture {} => "resume_dns_capture",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -1843,13 +1893,60 @@ mod tests {
         assert_eq!(serde_json::to_value(&parsed).unwrap(), bare, "empty is left out");
         let named = ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.2.0".into(), capabilities: APP_CAPABILITIES.iter().map(ToString::to_string).collect() };
         let wire = serde_json::to_value(&named).unwrap();
-        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture"]));
+        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture", "wifi_sign_in"]));
         assert_eq!(serde_json::from_value::<ClientMessage>(wire).unwrap(), named);
 
         let status = EngineStatus { routes_up: true, dns_capture: Some(DnsCapture::Working), ..EngineStatus::default() };
         let old_app = serde_json::to_value(status.clone().for_app(&[])).unwrap();
         assert!(old_app.get("dns_capture").is_none(), "an app that named nothing gets the status of an engine from before it");
         assert_eq!(status.clone().for_app(&["later".into(), CAPABILITY_DNS_CAPTURE.into()]), status, "an unknown name is ignored");
+    }
+
+    /// The sign-in fact goes only to an app that names it, is left out while
+    /// there is nothing to say, and reads with fields from a later engine. An
+    /// engine from before it sends none, so the app offers no pause; an app from
+    /// before it names no capability, so it reads the status it always did.
+    #[test]
+    fn wifi_sign_in_goes_only_to_an_app_that_names_it_and_both_ways_of_old_and_new_read() {
+        assert!(serde_json::to_value(EngineStatus::default()).unwrap().get("wifi_sign_in").is_none(), "nothing to say is left out");
+        let states: Vec<WifiSignIn> = serde_json::from_value(fixture()["wifiSignInStates"].clone()).unwrap();
+        assert_eq!(states, [WifiSignIn { network: "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}".into(), paused_left_s: None }, WifiSignIn { network: "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}".into(), paused_left_s: Some(840) }]);
+        assert_eq!(serde_json::to_value(&states).unwrap(), fixture()["wifiSignInStates"], "the app reads the same bytes");
+        assert!(states.iter().all(|s| s.network.len() <= NETWORK_ID_MAX && s.paused_left_s.is_none_or(|l| l <= SIGN_IN_PAUSE_MAX_S)));
+
+        let status = EngineStatus { routes_up: true, dns_capture: Some(DnsCapture::Working), wifi_sign_in: Some(states[1].clone()), ..EngineStatus::default() };
+        assert_eq!(serde_json::from_value::<EngineStatus>(serde_json::to_value(&status).unwrap()).unwrap(), status, "the round trip");
+        // An app from before it: named only the capture, and gets that alone.
+        let older_app = status.clone().for_app(&[CAPABILITY_DNS_CAPTURE.into()]);
+        assert!(older_app.wifi_sign_in.is_none() && older_app.dns_capture.is_some());
+        assert!(serde_json::to_value(&older_app).unwrap().get("wifi_sign_in").is_none());
+        assert!(status.clone().for_app(&[]).wifi_sign_in.is_none());
+        assert_eq!(status.clone().for_app(&APP_CAPABILITIES.iter().map(ToString::to_string).collect::<Vec<_>>()), status);
+        // An engine from before it: its status has no such field, and reads as nothing to say.
+        let f = fixture();
+        let old_engine = f["engine"].as_array().unwrap().iter().find(|m| m["type"] == "status").unwrap().clone();
+        let EngineMessage::Status(read) = serde_json::from_value(old_engine.clone()).unwrap() else { panic!("a status") };
+        assert!(read.wifi_sign_in.is_none());
+        // A later engine's fact with a field this build does not know still reads.
+        let mut newer = old_engine;
+        newer["wifi_sign_in"] = serde_json::json!({ "network": "n", "paused_left_s": 9, "later": true });
+        let EngineMessage::Status(read) = serde_json::from_value(newer).unwrap() else { panic!("a status") };
+        assert_eq!(read.wifi_sign_in, Some(WifiSignIn { network: "n".into(), paused_left_s: Some(9) }));
+    }
+
+    /// The pause names the network and nothing else; the resume names nothing.
+    /// An engine from before them does not know the type, which is why the app
+    /// sends them only after a status carried `wifi_sign_in`.
+    #[test]
+    fn pause_and_resume_carry_only_the_network_and_refuse_anything_else() {
+        let pause = ClientMessage::PauseDnsCapture { network: "{n}".into() };
+        assert_eq!(serde_json::to_value(&pause).unwrap(), serde_json::json!({"type": "pause_dns_capture", "network": "{n}"}));
+        assert_eq!(serde_json::from_str::<ClientMessage>(r#"{"type":"pause_dns_capture","network":"{n}"}"#).unwrap(), pause);
+        assert_eq!(serde_json::to_value(ClientMessage::ResumeDnsCapture {}).unwrap(), serde_json::json!({"type": "resume_dns_capture"}));
+        assert_eq!(serde_json::from_str::<ClientMessage>(r#"{"type":"resume_dns_capture"}"#).unwrap(), ClientMessage::ResumeDnsCapture {});
+        for bad in [r#"{"type":"pause_dns_capture"}"#, r#"{"type":"pause_dns_capture","network":"n","minutes":600}"#, r#"{"type":"pause_dns_capture","network":"n","forever":true}"#, r#"{"type":"resume_dns_capture","network":"n"}"#] {
+            assert!(serde_json::from_str::<ClientMessage>(bad).is_err(), "{bad}");
+        }
     }
 
     /// The status and its display facts take fields they do not know, so an app

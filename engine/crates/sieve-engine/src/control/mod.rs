@@ -30,6 +30,7 @@ use crate::heal::{Heal, Retry};
 use crate::ipc::{Backend, HealAnswer, IssuesAnswer, Subscription};
 use crate::lists::Lists;
 use crate::policy::{self, Runs};
+use crate::route::sign_in::SignIn;
 use crate::stack::Meters;
 use crate::stack::book::FlowBook;
 use crate::update::cycle::UpdateControl;
@@ -130,6 +131,9 @@ pub struct Engine {
     reinstall: AtomicBool,
     /// Signed updates: `not_configured` until the service attaches its worker.
     pub updates: Arc<UpdateControl>,
+    /// A Wi-Fi that wants a sign-in and the user's pause of the DNS Client
+    /// capture for it (`route::sign_in`). Memory only: a restart starts empty.
+    sign_in: Mutex<SignIn>,
 }
 
 /// `install_root`'s refusal while the switch is off (plan 7.3: no root
@@ -202,7 +206,13 @@ impl Engine {
             ca_wake: Notify::new(),
             reinstall: AtomicBool::new(false),
             updates: Arc::default(),
+            sign_in: Mutex::default(),
         }
+    }
+
+    /// The sign-in state, for the routing loop and the pipe.
+    pub fn sign_in(&self) -> std::sync::MutexGuard<'_, SignIn> {
+        lock(&self.sign_in)
     }
 
     /// Gives the running engine its CA (once, from the runner).
@@ -493,6 +503,7 @@ impl Engine {
             filter: self.lists.facts(),
             dns_unreachable,
             dns_capture: if f.routes_up { f.dns_capture } else { None },
+            wifi_sign_in: if f.routes_up { self.sign_in().report(std::time::Instant::now()) } else { None },
             update,
         }
     }
@@ -532,6 +543,24 @@ impl Backend for Engine {
         self.wake.notify_one();
         self.ca_wake.notify_one();
         Ok(self.status())
+    }
+
+    /// The user's click: refused unless routes are up, the capture is wanted and
+    /// the routing loop sees `network` as one that wants a sign-in now
+    /// (`SignIn::pause`). The loop is woken to close the capture at once.
+    fn pause_dns_capture(&self, network: &str) -> Result<EngineStatus, String> {
+        let wanted = self.facts().routes_up && crate::route::capture::wanted(&self.policy());
+        self.sign_in().pause(std::time::Instant::now(), network, wanted)?;
+        self.wake.notify_one();
+        Ok(self.status())
+    }
+
+    /// "Resume now": the loop is woken to open the capture again.
+    fn resume_dns_capture(&self) -> EngineStatus {
+        if self.sign_in().resume().is_some() {
+            self.wake.notify_one();
+        }
+        self.status()
     }
 
     fn set_dns_upstreams(&self, asked: DnsUpstreams) -> Result<DnsUpstreams, String> {
@@ -736,6 +765,35 @@ mod tests {
         let s = engine(Policy::default(), None).status();
         assert!(!s.routes_up && !s.filtering && !s.policy.engine);
         assert_eq!(s.blocker, None);
+    }
+
+    /// The pause is no general off switch: refused with routes down, with nothing
+    /// detected, for another network, and with the setting off; taken for the
+    /// network the routing loop saw; said in the status only while routes are up;
+    /// and forgotten by a new engine (a restart).
+    #[test]
+    fn the_engine_pauses_only_a_detected_network_and_a_restart_forgets_it() {
+        use crate::route::sign_in::{NO_SIGN_IN, NOT_WANTED, OTHER_NETWORK, Seen, Verdict};
+        const HOTEL: &str = "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}";
+        let e = engine(Policy { engine: true, ..Policy::default() }, None);
+        assert_eq!(e.pause_dns_capture(HOTEL), Err(NOT_WANTED.to_string()), "routes down");
+        e.set_facts(|f| f.routes_up = true);
+        assert_eq!(e.pause_dns_capture(HOTEL), Err(NO_SIGN_IN.to_string()));
+        let hotel = Verdict { network: HOTEL.into(), luid: 7, wants_sign_in: true };
+        e.sign_in().observe(std::time::Instant::now(), Seen { wanted: true, network: Some(&hotel), encrypted_unreachable: true });
+        assert_eq!(e.status().wifi_sign_in, Some(sieve_ipc::WifiSignIn { network: HOTEL.into(), paused_left_s: None }));
+        assert_eq!(e.pause_dns_capture("{another}"), Err(OTHER_NETWORK.to_string()));
+        let paused = e.pause_dns_capture(HOTEL).unwrap();
+        assert!(paused.wifi_sign_in.and_then(|w| w.paused_left_s).is_some_and(|s| s > sieve_ipc::SIGN_IN_PAUSE_MAX_S - 5));
+        assert!(e.sign_in().paused());
+        e.set_facts(|f| f.routes_up = false);
+        assert_eq!(e.status().wifi_sign_in, None, "nothing to say while routes are down");
+        e.set_facts(|f| f.routes_up = true);
+        assert!(e.resume_dns_capture().wifi_sign_in.is_some_and(|w| w.paused_left_s.is_none()), "resumed; the notice stands");
+        assert!(!e.sign_in().paused());
+        e.set_policy(Policy { revision: 1, engine: true, skip_dns_capture: true, ..Policy::default() }).unwrap();
+        assert_eq!(e.pause_dns_capture(HOTEL), Err(NOT_WANTED.to_string()), "the setting off is the off switch");
+        assert!(!engine(Policy::default(), None).sign_in().paused(), "a restarted engine holds no pause");
     }
 
     fn switches(revision: u64, engine: bool) -> Policy {

@@ -79,6 +79,8 @@ pub const NXDOMAIN_AS_NODATA: bool = true;
 const OPCODE_UPDATE: u16 = 5;
 /// Probe names the service remembers having seen at [`TUN_DNS`].
 const PROBES_KEPT: usize = 8;
+/// NS, the type [`Service::encrypted_answers`] asks the root for.
+const ROOT_NS_TYPE: u16 = 2;
 
 /// Where a lookup no LAN rule claims goes: the user's choice, encrypted unless
 /// they turned it off (`Policy::plain_dns`).
@@ -295,6 +297,29 @@ impl Service {
     /// failed on every encrypted resolver, and none has answered since.
     pub fn unreachable(&self) -> bool {
         self.mode() == Mode::Encrypted && self.failed_in_a_row.load(Ordering::SeqCst) >= UNREACHABLE_AFTER
+    }
+
+    /// One real lookup through the encrypted resolvers, for the Wi-Fi sign-in
+    /// pause (`route::sign_in`): the root's name servers, which every resolver
+    /// answers and which names nothing of the user. True only for a NOERROR
+    /// reply to this very query, which only a resolver past its TLS check can
+    /// give. In [`Mode::Plain`] nothing is sent and the answer is false. It
+    /// counts as any lookup does ([`Service::unreachable`]).
+    pub async fn encrypted_answers(&self) -> bool {
+        if self.mode() != Mode::Encrypted {
+            return false;
+        }
+        let Some(_permit) = self.try_permit() else { return false };
+        let mut id = [0u8; 2];
+        if getrandom::fill(&mut id).is_err() {
+            return false;
+        }
+        // Header (ID, RD, one question), the root name, NS, IN.
+        let mut query = vec![id[0], id[1], 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(&ROOT_NS_TYPE.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        let Ok(reply) = self.exchange(Path::Encrypted, &query).await else { return false };
+        reply.len() >= 2 && reply[..2] == query[..2] && flags_of(&reply).is_some_and(|f| f & FLAG_QR != 0 && f & 0xf == 0)
     }
 
     fn active(&self) -> Arc<Active> {
@@ -1173,6 +1198,40 @@ mod tests {
         b.service.set_mode(Mode::Plain);
         b.service.set_mode(Mode::Encrypted);
         assert!(!b.service.unreachable(), "a real change starts it over");
+    }
+
+    /// The Wi-Fi sign-in pause ends on a real encrypted answer: a NOERROR reply
+    /// to the very query, never a refusal, a SERVFAIL or a connect alone, and
+    /// nothing is sent in plain mode.
+    #[tokio::test]
+    async fn an_encrypted_answer_is_a_real_noerror_reply_to_the_root_query() {
+        let ca = Ca::new();
+        let (b, _refusing) = unreachable_bed(&ca).await;
+        assert!(!b.service.encrypted_answers().await, "an HTTP 500");
+        assert!(b.service.unreachable(), "it counted as a failure");
+        let echo = |rcode: u8| -> Script {
+            Arc::new(move |q: &[u8]| {
+                let mut r = q.to_vec();
+                r[2] |= 0x80;
+                r[3] = (r[3] & 0xf0) | rcode;
+                Step::Answer(r)
+            })
+        };
+        let servfail = Server::start(Kind::Https, &ca, Options { script: echo(2), ..Options::default() }).await;
+        b.service.set_list(vec![servfail.url().parse().unwrap()]);
+        assert!(!b.service.encrypted_answers().await, "SERVFAIL is no answer");
+        let silent: Script = Arc::new(|_| Step::Silent);
+        let mute = Server::start(Kind::Tls, &ca, Options { script: silent, ..Options::default() }).await;
+        b.service.set_list(vec![mute.url().parse().unwrap()]);
+        assert!(!b.service.encrypted_answers().await, "connected, never answered");
+        let answering = Server::start(Kind::Https, &ca, Options { script: echo(0), ..Options::default() }).await;
+        b.service.set_list(vec![answering.url().parse().unwrap()]);
+        assert!(b.service.encrypted_answers().await);
+        assert!(!b.service.unreachable(), "the answer ends the unreachable run too");
+        b.service.set_mode(Mode::Plain);
+        let before = answering.seen().len();
+        assert!(!b.service.encrypted_answers().await, "plain mode: nothing to prove");
+        assert_eq!(answering.seen().len(), before, "and nothing sent");
     }
 
     #[tokio::test]

@@ -97,7 +97,13 @@
     { "type": "list_refresh", "id": "custom-a1" },
     { "type": "list_import", "id": "custom-b2", "text": "! Title: Mine\n||ads.example^\n" },
     { "type": "list_rules", "id": "adguard-dns", "query": "ads" },
-    { "type": "issues", "after": 0 }
+    { "type": "issues", "after": 0 },
+    { "type": "pause_dns_capture", "network": "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}" },
+    { "type": "resume_dns_capture" }
+  ],
+  "wifiSignInStates": [
+    { "network": "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}" },
+    { "network": "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}", "paused_left_s": 840 }
   ],
   "engine": [
     { "type": "welcome", "protocol": 3, "engine_version": "0.1.0", "session_id": 1 },
