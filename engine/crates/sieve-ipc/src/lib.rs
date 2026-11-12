@@ -902,9 +902,11 @@ impl EngineStatus {
     }
 }
 
-/// A Wi-Fi that wants a sign-in, as the engine sees it: Windows says the network
-/// has a sign-in page or no internet, and no encrypted DNS server answers. Takes
-/// unknown fields, as [`EngineStatus`] does.
+/// A network that wants a sign-in, as the engine sees it: no encrypted DNS server
+/// answers, and a sign-in page is seen without DNS (the engine's own check, or
+/// Windows' captive-portal flag), while the DNS Client capture holds. Takes
+/// unknown fields, as [`EngineStatus`] does. (Named for Wi-Fi, where it is
+/// usual; [`WifiSignIn::wifi`] says whether it is.)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WifiSignIn {
     /// The network: Windows' Network List Manager id for it (`{GUID}`), opaque to
@@ -917,6 +919,10 @@ pub struct WifiSignIn {
     /// app may offer the pause.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_left_s: Option<u32>,
+    /// The network is on a Wi-Fi adapter, so the app may say "Wi-Fi"; left out
+    /// while false (Ethernet and the rest: the app says "network").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wifi: bool,
 }
 
 /// The Windows DNS Client capture as the app shows it. Takes unknown fields, as
@@ -1910,7 +1916,16 @@ mod tests {
     fn wifi_sign_in_goes_only_to_an_app_that_names_it_and_both_ways_of_old_and_new_read() {
         assert!(serde_json::to_value(EngineStatus::default()).unwrap().get("wifi_sign_in").is_none(), "nothing to say is left out");
         let states: Vec<WifiSignIn> = serde_json::from_value(fixture()["wifiSignInStates"].clone()).unwrap();
-        assert_eq!(states, [WifiSignIn { network: "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}".into(), paused_left_s: None }, WifiSignIn { network: "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}".into(), paused_left_s: Some(840) }]);
+        let hotel = || "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}".to_string();
+        assert_eq!(
+            states,
+            [
+                WifiSignIn { network: hotel(), paused_left_s: None, wifi: false },
+                WifiSignIn { network: hotel(), paused_left_s: Some(840), wifi: false },
+                WifiSignIn { network: hotel(), paused_left_s: Some(840), wifi: true },
+            ]
+        );
+        assert!(serde_json::to_value(&states[0]).unwrap().get("wifi").is_none(), "not Wi-Fi is left out: an engine from before the field reads the same");
         assert_eq!(serde_json::to_value(&states).unwrap(), fixture()["wifiSignInStates"], "the app reads the same bytes");
         assert!(states.iter().all(|s| s.network.len() <= NETWORK_ID_MAX && s.paused_left_s.is_none_or(|l| l <= SIGN_IN_PAUSE_MAX_S)));
 
@@ -1931,7 +1946,7 @@ mod tests {
         let mut newer = old_engine;
         newer["wifi_sign_in"] = serde_json::json!({ "network": "n", "paused_left_s": 9, "later": true });
         let EngineMessage::Status(read) = serde_json::from_value(newer).unwrap() else { panic!("a status") };
-        assert_eq!(read.wifi_sign_in, Some(WifiSignIn { network: "n".into(), paused_left_s: Some(9) }));
+        assert_eq!(read.wifi_sign_in, Some(WifiSignIn { network: "n".into(), paused_left_s: Some(9), wifi: false }));
     }
 
     /// The pause names the network and nothing else; the resume names nothing.

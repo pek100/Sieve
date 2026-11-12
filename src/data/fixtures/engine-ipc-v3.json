@@ -103,7 +103,8 @@
   ],
   "wifiSignInStates": [
     { "network": "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}" },
-    { "network": "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}", "paused_left_s": 840 }
+    { "network": "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}", "paused_left_s": 840 },
+    { "network": "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}", "paused_left_s": 840, "wifi": true }
   ],
   "engine": [
     { "type": "welcome", "protocol": 3, "engine_version": "0.1.0", "session_id": 1 },

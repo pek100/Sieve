@@ -351,3 +351,123 @@ fn an_ipv4_only_plan_gives_the_adapter_no_ipv6_address() {
     let v4: Vec<Prefix> = vec!["0.0.0.0/5".parse().unwrap()];
     assert_eq!(adapter_addresses(&v4), [std::net::IpAddr::V4(crate::tun::TUN_V4)]);
 }
+
+mod sign_in_pass {
+    use std::time::{Duration, Instant};
+
+    use super::super::routing::{Outstanding, Unread, capture_wanted, sign_in_pass, verdict_of};
+    use super::engine;
+    use crate::ipc::Backend;
+    use crate::route::sign_in::{Ended, PROBE_EVERY, Seen, Verdict};
+
+    const HOTEL: &str = "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}";
+
+    fn hotel() -> Verdict {
+        Verdict { network: HOTEL.into(), luid: 0x0047_0000_0000_0001, hijacked: false }
+    }
+
+    /// A pass on the portal, with the capture as given.
+    fn pass(v: Option<&Verdict>, held: bool) -> Seen<'_> {
+        Seen { wanted: true, held, network: v, portal: true, encrypted_unreachable: true }
+    }
+
+    /// The engine with a notice shown, then paused by the user's click.
+    fn paused_at(t0: Instant) -> crate::control::Engine {
+        let e = engine();
+        e.sign_in().observe(t0, pass(Some(&hotel()), true));
+        e.sign_in().pause(t0, HOTEL, true, true).unwrap();
+        e
+    }
+
+    async fn never_asked() -> bool {
+        panic!("no encrypted lookup is due")
+    }
+
+    #[tokio::test]
+    async fn the_capture_is_held_as_none_while_paused_and_comes_back_when_it_ends() {
+        let t0 = Instant::now();
+        let e = engine();
+        assert!(capture_wanted(&e), "the setting on: wanted");
+        let e = paused_at(t0);
+        assert!(!capture_wanted(&e), "paused: the capture step closes it");
+        assert_eq!(sign_in_pass(&e, t0 + Duration::from_secs(1), pass(Some(&hotel()), false), never_asked).await, None);
+        assert!(!capture_wanted(&e), "still paused");
+        assert_eq!(e.sign_in().resume(), Some(Ended::User));
+        assert!(capture_wanted(&e), "resumed: wanted again");
+    }
+
+    /// Windows' word that cannot be read is no word: reported once while it keeps
+    /// failing, and a pause ends as for a changed network, in the same pass, so the
+    /// capture step after it opens the capture again.
+    #[tokio::test]
+    async fn a_verdict_that_cannot_be_read_ends_a_pause_in_the_same_pass() {
+        let t0 = Instant::now();
+        let e = paused_at(t0);
+        let mut last = None;
+        let why = "Windows did not say within 5 s which network this is";
+        let verdict = verdict_of(&e, Err(why.into()), &mut last);
+        assert_eq!(verdict, None);
+        assert_eq!(sign_in_pass(&e, t0 + Duration::from_secs(1), pass(verdict.as_ref(), false), never_asked).await, Some(Ended::NetworkChanged));
+        assert!(capture_wanted(&e), "the capture comes back in this very pass");
+        let reported = e.facts().last_error.unwrap_or_default();
+        assert!(reported.contains(why), "{reported}");
+        verdict_of(&e, Err(why.into()), &mut last);
+        assert_eq!(e.facts().last_error.unwrap_or_default().matches(why).count(), 1, "said once while it keeps failing the same way");
+        assert_eq!(verdict_of(&e, Ok(Some(hotel())), &mut last), Some(hotel()));
+        assert_eq!(last, None, "a read that works ends it");
+    }
+
+    /// While paused, the encrypted lookup runs on its schedule, and its answer ends
+    /// the pause in the same pass: the capture step after it opens the capture.
+    #[tokio::test]
+    async fn an_encrypted_answer_reopens_the_capture_in_the_same_pass() {
+        let t0 = Instant::now();
+        let e = paused_at(t0);
+        let early = t0 + PROBE_EVERY - Duration::from_secs(1);
+        assert_eq!(sign_in_pass(&e, early, pass(Some(&hotel()), false), never_asked).await, None, "not due yet: nothing asked");
+        let due = t0 + PROBE_EVERY;
+        assert_eq!(sign_in_pass(&e, due, pass(Some(&hotel()), false), || async { false }).await, None, "asked, no answer: still paused");
+        assert!(!capture_wanted(&e));
+        e.set_facts(|f| f.routes_up = true);
+        assert!(e.status().wifi_sign_in.is_some_and(|w| w.paused_left_s.is_some()), "the status says paused");
+        let next = due + PROBE_EVERY;
+        assert_eq!(sign_in_pass(&e, next, pass(Some(&hotel()), false), || async { true }).await, Some(Ended::Answered));
+        assert!(capture_wanted(&e), "opened again in the same pass");
+        assert_eq!(e.status().wifi_sign_in, None, "and nothing to say");
+    }
+
+    /// A read that hangs costs one thread, never one per pass: while it runs, the
+    /// next pass starts none, and once it ends late its answer is dropped as stale.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_read_is_not_started_again_while_it_runs() {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = std::sync::Arc::new(std::sync::Mutex::new(hold));
+        let mut read: Outstanding<u32> = Outstanding::default();
+        let start = |answer: u32| {
+            let (started, hold) = (started.clone(), hold.clone());
+            move || {
+                tokio::task::spawn_blocking(move || {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = hold.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                    answer
+                })
+            }
+        };
+        assert_eq!(read.read(Duration::from_millis(50), start(1)).await, Err(Unread::TimedOut));
+        for _ in 0..3 {
+            assert_eq!(read.read(Duration::from_millis(50), start(2)).await, Err(Unread::StillRunning));
+        }
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1, "one thread, not one per pass");
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while read.read(Duration::from_secs(5), start(3)).await == Err(Unread::StillRunning) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2, "the next read started only after the hung one ended");
+    }
+}

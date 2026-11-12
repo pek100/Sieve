@@ -44,7 +44,7 @@ use crate::inject::content::ContentHook;
 use crate::lists::https::HttpsFetcher;
 use crate::policy::wall_ms;
 use crate::route::apply::{self, AddressState, SieveLuid};
-use crate::route::{capture, nlm, sign_in};
+use crate::route::{capture, nlm, portal, sign_in};
 use sieve_ipc::{CaptureReason, DnsCapture};
 use crate::route::wfp;
 use crate::route::journal::Journal;
@@ -89,8 +89,8 @@ struct Up {
     /// Empty when it is refused or could not open or be proven; routing goes on
     /// without it.
     capture: CaptureSlot,
-    /// The last failure reading Windows' connectivity verdict, reported once.
-    verdict_error: Option<String>,
+    /// What the sign-in passes of this run carry from one to the next.
+    sign_in: SignInReads,
 }
 
 fn journal(engine: &Engine) -> Option<Journal> {
@@ -240,57 +240,176 @@ async fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
         kept.sort();
         Up { routes: kept, ..up }
     };
-    let up = follow_sign_in(engine, up).await;
+    let up = follow_sign_in(engine, up, network_moved).await;
     follow_capture(engine, up, network_moved).await
 }
 
-/// One pass of the Wi-Fi sign-in state (`route::sign_in`), before the capture's,
-/// so a pause asked for or ended takes effect in the same pass. Windows' verdict
-/// is read only when the state needs it (encrypted DNS failing, or a notice or a
-/// pause standing), for the adapter the engine's traffic leaves by. While paused,
-/// an encrypted lookup is tried on its schedule and the first answer ends the
-/// pause. A verdict that cannot be read is no verdict: no notice, and a pause
-/// ends as for a changed network, so the capture comes back.
-async fn follow_sign_in(engine: &Engine, mut up: Up) -> Up {
+/// A read off the routing pass that may outlive the bound the pass waits for it.
+/// Its task is kept, and no second one starts while it still runs, so a read
+/// that hangs costs one thread, never one per pass.
+pub(super) struct Outstanding<T>(Option<JoinHandle<T>>);
+
+impl<T> Default for Outstanding<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<T> Drop for Outstanding<T> {
+    /// The routes went down: an async read stops (a blocking one ends by itself).
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Why [`Outstanding::read`] has no answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Unread {
+    /// The read started by an earlier pass still runs: none was started.
+    StillRunning,
+    /// Started now, not done within the bound: kept running, the next pass starts none.
+    TimedOut,
+    /// Its task panicked.
+    Failed(String),
+}
+
+impl<T: Send + 'static> Outstanding<T> {
+    /// Starts a read (`start`) and waits up to `bound` for it, unless the last one
+    /// still runs. One that finished after its pass gave up on it is stale, and
+    /// its answer is dropped.
+    pub(super) async fn read(&mut self, bound: Duration, start: impl FnOnce() -> JoinHandle<T>) -> Result<T, Unread> {
+        if self.0.as_ref().is_some_and(|task| !task.is_finished()) {
+            return Err(Unread::StillRunning);
+        }
+        self.0 = None;
+        let mut task = start();
+        match tokio::time::timeout(bound, &mut task).await {
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(e)) => Err(Unread::Failed(e.to_string())),
+            Err(_) => {
+                self.0 = Some(task);
+                Err(Unread::TimedOut)
+            }
+        }
+    }
+}
+
+/// What the sign-in passes of one routing run carry from one to the next.
+#[derive(Default)]
+struct SignInReads {
+    /// Windows' word on the network (`route::nlm`, blocking).
+    nlm: Outstanding<Result<Option<sign_in::Verdict>, String>>,
+    /// The DNS-free portal check (`route::portal`, a task).
+    portal: Outstanding<bool>,
+    /// The portal check's last answer, for the network it ran on.
+    probed: Option<sign_in::Probed>,
+    /// When the portal check last started: it runs at most every `sign_in::PORTAL_EVERY`.
+    portal_tried: Option<std::time::Instant>,
+    /// The last failure reading Windows' word, reported once.
+    verdict_error: Option<String>,
+}
+
+/// The portal check's whole run: its addresses are asked at once, each bounded.
+const PORTAL_BOUND: Duration = Duration::from_secs(portal::ASK_WITHIN.as_secs() + 1);
+
+/// One pass of the sign-in state (`route::sign_in`), before the capture's, so a
+/// pause asked for or ended takes effect in the same pass. Only while the state
+/// needs it (encrypted DNS failing, or a notice or a pause standing), and for the
+/// adapter the engine's traffic leaves by, two reads run at once: Windows' word
+/// on the network (which network, and its own portal flag) and, at most every
+/// `sign_in::PORTAL_EVERY`, the DNS-free portal check, out of the egress (pinned
+/// to the physical adapter, never Sieve's). Neither starts while its last one
+/// still runs. The pure rest is [`sign_in_pass`].
+async fn follow_sign_in(engine: &Engine, mut up: Up, network_moved: bool) -> Up {
     let dns = up.relay.dns.clone();
     let wanted = capture::wanted(&engine.policy());
+    let held = up.capture.held.is_some();
     let unreachable = dns.unreachable();
     let leaves_by = up.relay.tables.read().unwrap_or_else(|p| p.into_inner()).default_adapter().map(|a| a.luid);
     let needs = engine.sign_in().needs_verdict(unreachable);
-    let verdict = match leaves_by.filter(|_| needs) {
-        None => None,
+    let now = std::time::Instant::now();
+    let SignInReads { nlm: nlm_read, portal: portal_read, probed, portal_tried, verdict_error } = &mut up.sign_in;
+    if network_moved {
+        // The same adapter may be on another Wi-Fi now: what the check saw is over.
+        *probed = None;
+        *portal_tried = None;
+    }
+    let (read, checked) = match leaves_by.filter(|_| needs) {
+        None => (Ok(None), None),
         Some(luid) => {
-            let read = tokio::time::timeout(TASKS_BOUND, tokio::task::spawn_blocking(move || nlm::verdict(luid))).await;
-            let read = match read {
-                Ok(Ok(read)) => read,
-                Ok(Err(e)) => Err(format!("the connectivity check's task: {e}")),
-                Err(_) => Err(format!("Windows did not say within {} s whether the network wants a sign-in", TASKS_BOUND.as_secs())),
+            let due = portal_tried.is_none_or(|t| now.saturating_duration_since(t) >= sign_in::PORTAL_EVERY);
+            let egress = up.relay.egress.clone();
+            let windows = async {
+                match nlm_read.read(TASKS_BOUND, || tokio::task::spawn_blocking(move || nlm::verdict(luid))).await {
+                    Ok(read) => read,
+                    Err(Unread::Failed(e)) => Err(format!("the network check's task: {e}")),
+                    Err(Unread::StillRunning | Unread::TimedOut) => Err(format!("Windows did not say within {} s which network this is", TASKS_BOUND.as_secs())),
+                }
             };
-            match read {
-                Ok(verdict) => {
-                    up.verdict_error = None;
-                    verdict
+            let check = async {
+                if !due {
+                    return None;
                 }
-                Err(why) => {
-                    if up.verdict_error.as_deref() != Some(why.as_str()) {
-                        engine.add_error(format!("Wi-Fi sign-in is not detected: {why}"));
-                    }
-                    up.verdict_error = Some(why);
-                    None
-                }
-            }
+                *portal_tried = Some(now);
+                portal_read.read(PORTAL_BOUND, || tokio::spawn(async move { portal::probe(|t| egress.connect(t)).await })).await.ok()
+            };
+            tokio::join!(windows, check)
         }
     };
-    let now = std::time::Instant::now();
-    let probe = {
-        let mut sign_in = engine.sign_in();
-        sign_in.observe(now, sign_in::Seen { wanted, network: verdict.as_ref(), encrypted_unreachable: unreachable });
-        sign_in.probe_due(now)
-    };
-    if probe && dns.encrypted_answers().await {
-        engine.sign_in().encrypted_answered();
+    let verdict = verdict_of(engine, read, verdict_error);
+    if let (Some(portal), Some(v)) = (checked, &verdict) {
+        *probed = Some(sign_in::Probed { network: v.network.clone(), luid: v.luid, at: now, portal });
     }
+    let portal = verdict.as_ref().is_some_and(|v| probed.as_ref().is_some_and(|p| p.portal_on(v, now)));
+    let seen = sign_in::Seen { wanted, held, network: verdict.as_ref(), portal, encrypted_unreachable: unreachable };
+    sign_in_pass(engine, now, seen, || dns.encrypted_answers()).await;
     up
+}
+
+/// Windows' word as a pass uses it: a read that failed (or still runs) is no
+/// word, reported once while it keeps failing the same way. No word means no
+/// notice, and a pause ends as for a changed network: the capture comes back.
+/// A read that fails for a moment ends a pause the user still wanted; that is
+/// the safe way, and they can click again.
+pub(super) fn verdict_of(engine: &Engine, read: Result<Option<sign_in::Verdict>, String>, last_error: &mut Option<String>) -> Option<sign_in::Verdict> {
+    match read {
+        Ok(verdict) => {
+            *last_error = None;
+            verdict
+        }
+        Err(why) => {
+            if last_error.as_deref() != Some(why.as_str()) {
+                engine.add_error(format!("a sign-in network is not detected: {why}"));
+            }
+            *last_error = Some(why);
+            None
+        }
+    }
+}
+
+/// The pure step of a sign-in pass, after its reads: the state sees them; while
+/// paused, an encrypted lookup is tried on its schedule (`encrypted_answers`),
+/// and its answer ends the pause in this very pass, so the capture step after it
+/// ([`capture_wanted`]) opens the capture again. What ended a pause, if any.
+pub(super) async fn sign_in_pass<F: Future<Output = bool>>(engine: &Engine, now: std::time::Instant, seen: sign_in::Seen<'_>, encrypted_answers: impl FnOnce() -> F) -> Option<sign_in::Ended> {
+    let (ended, probe) = {
+        let mut state = engine.sign_in();
+        let ended = state.observe(now, seen);
+        (ended, state.probe_due(now))
+    };
+    if probe && encrypted_answers().await {
+        return engine.sign_in().encrypted_answered();
+    }
+    ended
+}
+
+/// The capture's want for this pass: the user's setting, unless the user's
+/// sign-in pause holds it closed (`route::sign_in`), as the setting off does.
+/// Only the DNS Client's own lookups change path.
+pub(super) fn capture_wanted(engine: &Engine) -> bool {
+    capture::wanted(&engine.policy()) && !engine.sign_in().paused()
 }
 
 /// The DNS Client capture of one routing run (`route::capture`): its filter
@@ -481,10 +600,7 @@ fn routes_v6(routes: &[Prefix]) -> bool {
 /// service hears whether every network is blocked, and the status what holds.
 async fn follow_capture(engine: &Engine, mut up: Up, network_moved: bool) -> Up {
     let tables = up.relay.tables.read().unwrap_or_else(|p| p.into_inner()).clone();
-    // The user's Wi-Fi sign-in pause holds no capture, as the setting off does
-    // (`route::sign_in`): only the DNS Client's own lookups change path.
-    let paused = engine.sign_in().paused();
-    let wanted = capture::wanted(&engine.policy()) && !paused;
+    let wanted = capture_wanted(engine);
     let blocks = capture::blocks(&tables, &up.routes);
     let dns = up.relay.dns.clone();
     let keep_v6 = routes_v6(&up.routes);
@@ -823,7 +939,7 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn()
     engine.beats.relay.end();
     engine.beats.tun.end();
     engine.arm.set(true);
-    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, exclusions, etw, capture, verdict_error: None })
+    Ok(Up { tun, luid, routes: added, relay, stop_accept, accept, batches, lists, exclusions, etw, capture, sign_in: SignInReads::default() })
 }
 
 /// Interception as this engine run wires it (task D1, D2). Nothing here runs

@@ -388,7 +388,7 @@ mod tests {
     impl Backend for Fake {
         fn status(&self) -> EngineStatus {
             let paused = *self.paused.lock().unwrap();
-            let sign_in = sieve_ipc::WifiSignIn { network: SIGN_IN_NETWORK.into(), paused_left_s: paused.then_some(sieve_ipc::SIGN_IN_PAUSE_MAX_S) };
+            let sign_in = sieve_ipc::WifiSignIn { network: SIGN_IN_NETWORK.into(), paused_left_s: paused.then_some(sieve_ipc::SIGN_IN_PAUSE_MAX_S), wifi: true };
             EngineStatus { policy: self.policy.lock().unwrap().clone(), dns_capture: Some(sieve_ipc::DnsCapture::Working), wifi_sign_in: Some(sign_in), ..EngineStatus::default() }
         }
         fn set_policy(&self, p: Policy) -> Result<EngineStatus, String> {
@@ -488,7 +488,7 @@ mod tests {
         assert!(matches!(recv(&mut c).await, EngineMessage::Welcome { .. }));
         send(&mut c, &ClientMessage::Status).await;
         let EngineMessage::Status(s) = recv(&mut c).await else { panic!("a status") };
-        assert_eq!(s.wifi_sign_in, Some(sieve_ipc::WifiSignIn { network: SIGN_IN_NETWORK.into(), paused_left_s: None }));
+        assert_eq!(s.wifi_sign_in, Some(sieve_ipc::WifiSignIn { network: SIGN_IN_NETWORK.into(), paused_left_s: None, wifi: true }));
         send(&mut c, &ClientMessage::PauseDnsCapture { network: "{another}".into() }).await;
         assert!(matches!(recv(&mut c).await, EngineMessage::Error { message } if message == crate::route::sign_in::OTHER_NETWORK));
         send(&mut c, &ClientMessage::PauseDnsCapture { network: SIGN_IN_NETWORK.into() }).await;

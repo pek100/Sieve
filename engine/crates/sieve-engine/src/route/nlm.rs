@@ -1,14 +1,18 @@
-//! Windows' own connectivity verdict, read only (`route::sign_in`'s seam).
+//! Windows' word on the network, read only (`route::sign_in`'s seam): which
+//! network it is, and whether Windows itself found a sign-in page there.
 //!
 //! The documented Network List Manager API: `INetworkListManager`
 //! (CLSID `NetworkListManager`) enumerates the connected network connections;
-//! each `INetworkConnection` names its adapter (`GetAdapterId`), its network
-//! (`GetNetwork`, `INetwork::GetNetworkId`) and its `NLM_CONNECTIVITY`
-//! (`GetConnectivity`), and its `IPropertyBag` holds `NA_InternetConnectivityV4`
-//! and `V6`, whose `NLM_INTERNET_CONNECTIVITY_WEBHIJACK` flag is Windows' "this
-//! network has a sign-in page" (Windows 10 1709 and later). Nothing is written,
-//! no event is subscribed: one read, on a blocking thread with its own COM
-//! apartment, only when `SignIn::needs_verdict` says so.
+//! each `INetworkConnection` names its adapter (`GetAdapterId`) and its network
+//! (`GetNetwork`, `INetwork::GetNetworkId`), and its `IPropertyBag` holds
+//! `NA_InternetConnectivityV4` and `V6`, whose
+//! `NLM_INTERNET_CONNECTIVITY_WEBHIJACK` flag is Windows' "this network has a
+//! sign-in page" (Windows 10 1709 and later). Its `NLM_CONNECTIVITY` ("no
+//! internet") is not read: while the capture holds it only repeats that
+//! encrypted DNS fails (`route::sign_in`). Nothing is written, no event is
+//! subscribed: one read, on a blocking thread with its own COM apartment, only
+//! when `SignIn::needs_verdict` says so, and never a second while one still runs
+//! (`control::routing`).
 
 use windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceGuidToLuid;
 use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
@@ -20,7 +24,7 @@ use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
 use windows::Win32::System::Variant::{VARIANT, VT_I4, VT_UI4, VariantClear};
 use windows::core::{GUID, Interface, PCWSTR};
 
-use super::sign_in::{Verdict, wants_sign_in};
+use super::sign_in::{Verdict, hijacked};
 use crate::flow::nat::os::ComApartment;
 
 /// Connections read at most: a machine has a handful.
@@ -53,12 +57,10 @@ fn read(luid: u64) -> Result<Option<Verdict>, String> {
         if luid_of(&adapter) != Some(luid) {
             continue;
         }
-        // SAFETY: a live connection.
-        let connectivity = unsafe { connection.GetConnectivity() }.map_err(text)?;
         // SAFETY: a live connection; its network is a live object too.
         let network = unsafe { connection.GetNetwork().and_then(|n| n.GetNetworkId()) }.map_err(text)?;
         let (v4, v6) = (internet_flags(&connection, NA_InternetConnectivityV4), internet_flags(&connection, NA_InternetConnectivityV6));
-        return Ok(Some(Verdict { network: braced(&network), luid, wants_sign_in: wants_sign_in(connectivity.0, v4, v6) }));
+        return Ok(Some(Verdict { network: braced(&network), luid, hijacked: hijacked(v4, v6) }));
     }
     Ok(None)
 }

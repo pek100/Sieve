@@ -12,13 +12,15 @@
 //! - `apply` and `watch` (Windows): the writes and `NotifyRouteChange2`;
 //! - [`capture`]: what catches the DNS Client's queries while routes are up, and
 //!   `wfp` (Windows), the dynamic filter session it blocks their leak with;
-//! - [`sign_in`]: a Wi-Fi that wants a sign-in, and the user's pause of the
-//!   capture for it; `nlm` (Windows), Windows' connectivity verdict it reads.
+//! - [`sign_in`]: a network that wants a sign-in, and the user's pause of the
+//!   capture for it; [`portal`], the DNS-free check that finds a sign-in page,
+//!   and `nlm` (Windows), Windows' word on the network it reads.
 
 pub mod capture;
 pub mod journal;
 pub mod pin;
 pub mod plan;
+pub mod portal;
 pub mod prefix;
 pub mod sign_in;
 pub mod table;

@@ -1376,7 +1376,7 @@ mod tests {
         assert!(sieve_ipc::APP_CAPABILITIES.contains(&sieve_ipc::CAPABILITY_WIFI_SIGN_IN), "an app that can show the notice says so");
         let welcome = || EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 };
         let network = "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}".to_string();
-        let paused = EngineStatus { wifi_sign_in: Some(WifiSignIn { network: network.clone(), paused_left_s: Some(900) }), ..EngineStatus::default() };
+        let paused = EngineStatus { wifi_sign_in: Some(WifiSignIn { network: network.clone(), paused_left_s: Some(900), wifi: true }), ..EngineStatus::default() };
         let got = fake_engine(&test_pipe("pause"), welcome(), EngineMessage::Status(paused.clone()), ClientAsk::Pause(network.clone())).await;
         assert!(matches!(got, Ok(PipeFact::Welcome { status, .. }) if *status == paused));
         let refused = EngineMessage::Error { message: "that is not the network Sieve sees now, so the capture stays".into() };
