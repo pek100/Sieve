@@ -1,7 +1,8 @@
-import { act, fireEvent, render, within } from "@testing-library/react";
+import { act, fireEvent, render, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { DNS_CLIENT_CAPTURE, DNS_ENCRYPTION } from "@/core/engine";
+import { DNS_CLIENT_CAPTURE, DNS_ENCRYPTION, ENGINE_SWITCH } from "@/core/engine";
+import { createMockEngine, MOCK_SIGN_IN_NETWORK } from "@/data/engine-mock";
 import fixture from "@/data/fixtures/engine-probe-v3.json";
 import ipc from "@/data/fixtures/engine-ipc-v3.json";
 import { createMockSource } from "@/data/mock-source";
@@ -9,7 +10,7 @@ import { parseEngineProbe, type DnsCapture } from "@/data/protocol";
 import { memoryBackend } from "@/data/settings-store";
 import { createRuntime, type Runtime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
-import { captureStateLine } from "./dns-capture-state";
+import { captureStateLine, signInPauseLine } from "./dns-capture-state";
 import { SettingsScreen } from "./settings-screen";
 
 vi.mock("next/navigation", () => ({ usePathname: () => "/settings/" }));
@@ -50,7 +51,8 @@ describe("Also encrypt Windows' own lookups", () => {
     expect(sw).toBeEnabled();
     expect(sw).toHaveAccessibleDescription(/Windows' built-in lookups also go through Sieve's encrypted DNS, so the network can't read them/);
     expect(row()).toHaveTextContent(/Can break: Names of nearby PCs found without DNS, and short names that don't exist, answer about 7 s slower/);
-    expect(row()).toHaveTextContent(/sign-in pages may not open until you turn this off or sign in/);
+    expect(row()).toHaveTextContent(/When Sieve recognises such a network, it offers a one-click pause so the page can open: for up to 15 minutes, or until encrypted DNS answers or the network changes, nearly every app's lookups then go in plain text/);
+    expect(row()).toHaveTextContent(/When it doesn't, turning this setting off lets the sign-in page open/);
     expect(row().querySelectorAll("[data-slot=card], [data-slot=badge]"), "flat: no card or chip of its own").toHaveLength(0);
   });
 
@@ -115,6 +117,39 @@ describe("Also encrypt Windows' own lookups", () => {
     expect(stateLine()).toHaveAttribute("data-capture-tone", "neutral");
     report(rt, { state: "not_caught", reason: "no_answer", detail: "x" });
     expect(stateLine()).toHaveAttribute("data-capture-tone", "warning");
+  });
+
+  it("the sign-in pause says what it changes, for the kind of network, and its time left", () => {
+    expect(signInPauseLine(undefined)).toBeNull();
+    expect(signInPauseLine({ network: MOCK_SIGN_IN_NETWORK, wifi: true }), "shown, not paused: the notice on Home offers it").toBeNull();
+    const line = signInPauseLine({ network: MOCK_SIGN_IN_NETWORK, paused_left_s: 860, wifi: true })!;
+    expect(line).toMatch(/^Paused for sign-in\. Nearly every app's lookups go to this Wi-Fi's DNS server in plain text; only apps with their own encrypted DNS are not affected\./);
+    expect(line).toContain("Resumes by itself in about 15 min at the latest, or sooner once encrypted DNS answers or the network changes.");
+    expect(line, "never that only Windows' own lookups go plain").not.toMatch(/only Windows' own|stay encrypted/);
+    expect(signInPauseLine({ network: MOCK_SIGN_IN_NETWORK, paused_left_s: 42 }), "Ethernet, or an engine that does not say: the neutral word").toContain("go to this network's DNS server");
+    expect(signInPauseLine({ network: MOCK_SIGN_IN_NETWORK, paused_left_s: 42 })).toContain("in 42 s at the latest");
+  });
+
+  it("shows the live pause in the row with Resume now, which ends it with no other step", async () => {
+    const engine = createMockEngine("filtering", { signIn: true });
+    await engine.pauseDnsCapture(MOCK_SIGN_IN_NETWORK);
+    const resume = vi.spyOn(engine, "resumeDnsCapture");
+    const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings: memoryBackend({ schema: 5, values: { [ENGINE_SWITCH]: true } }), engine });
+    render(
+      <SieveProvider runtime={runtime}>
+        <SettingsScreen />
+      </SieveProvider>,
+    );
+    await act(async () => {
+      await runtime.settings.ready;
+    });
+    await waitFor(() => expect(stateLine()).toHaveAttribute("data-capture-state", "paused"));
+    expect(stateLine()).toHaveTextContent(/Paused for sign-in\. Nearly every app's lookups go to this Wi-Fi's DNS server in plain text/);
+    expect(stateLine()).toHaveTextContent(/Resumes by itself in about 15 min/);
+    expect(row().querySelectorAll("[data-slot=card], [data-slot=badge]"), "flat").toHaveLength(0);
+    await userEvent.click(within(row()).getByRole("button", { name: "Resume now" }));
+    expect(resume).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(stateLine()).toHaveAttribute("data-capture-state", "working"));
   });
 
   it("a Windows error code is said in words, the number in the tooltip", async () => {

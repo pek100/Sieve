@@ -58,6 +58,20 @@ describe("Tauri engine source", () => {
     await expect(createTauriEngine(async <T,>() => ({}) as T).requestUpdate()).rejects.toThrow(ProtocolError);
   });
 
+  it("the Wi-Fi sign-in pause names only the network, the resume nothing, and both validate the Status", async () => {
+    const calls: unknown[][] = [];
+    const status = (fixture.examples.update_available.pipe as { status: unknown }).status;
+    const invoke = async <T,>(...args: unknown[]): Promise<T> => {
+      calls.push(args);
+      return status as T;
+    };
+    const source = createTauriEngine(invoke);
+    await source.pauseDnsCapture("{n}");
+    await source.resumeDnsCapture();
+    expect(calls).toEqual([["engine_pause_dns_capture", { network: "{n}" }], ["engine_resume_dns_capture"]]);
+    await expect(createTauriEngine(async <T,>() => ({}) as T).pauseDnsCapture("{n}")).rejects.toThrow(ProtocolError);
+  });
+
   it("a malformed answer and a failed command reject, never become a fake state", async () => {
     const bad = async <T,>(): Promise<T> => ({ v: 3, service: "running", pipe: { kind: "welcome" } }) as T;
     await expect(createTauriEngine(bad).probe()).rejects.toThrow(ProtocolError);

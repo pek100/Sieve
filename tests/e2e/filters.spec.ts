@@ -148,7 +148,7 @@ test.describe("filters", () => {
     await open(page);
     await expect(page.locator("[data-own-lists]")).toBeVisible();
     await expect(page.locator("[data-tracking]")).toHaveCount(0);
-    await expect(page.getByText("Ask sites not to track you")).toHaveCount(0);
+    await expect(page.getByText("Send Global Privacy Control")).toHaveCount(0);
   });
 
   test("an own list by address: added, refused with a sentence when it is not https, its rules viewable with the engine", async ({ page }, info) => {

@@ -79,6 +79,12 @@ pub trait Backend: Send + Sync + 'static {
     fn heal_notices(&self, after: u64) -> HealAnswer;
     /// The apps of `session` (and the services' and the VMs') with recent problems.
     fn issues(&self, session: u32) -> IssuesAnswer;
+    /// "Sign in to this Wi-Fi": pauses the DNS Client capture for `network`, the
+    /// id the status's `wifi_sign_in` named. Refused unless the engine itself
+    /// sees that network as one that wants a sign-in now. Answers the Status.
+    fn pause_dns_capture(&self, network: &str) -> Result<EngineStatus, String>;
+    /// "Resume now": ends a sign-in pause, if there is one. Answers the Status.
+    fn resume_dns_capture(&self) -> EngineStatus;
 }
 
 /// What [`Backend::issues`] answers; the fields of `EngineMessage::Issues`.
@@ -220,6 +226,11 @@ where
                 EngineMessage::HealNotices { run, revision, exclusions_revision, notices: notices.into_iter().filter(|n| notice_visible_to(n, session_id)).collect() }
             }
             Ok(ClientMessage::Issues { after }) => issues_message(backend.issues(session_id), after),
+            Ok(ClientMessage::PauseDnsCapture { network }) => match backend.pause_dns_capture(&network) {
+                Ok(s) => status(s),
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::ResumeDnsCapture {}) => status(backend.resume_dns_capture()),
             Ok(ClientMessage::Hello { .. }) => return refuse(stream, HELLO_ONCE).await,
             Err(FrameError::Closed) => return Ok(()),
             Err(e) => return refuse(stream, &e.to_string()).await,
@@ -363,18 +374,22 @@ mod tests {
         retries: Mutex<Vec<Retry>>,
         notices: Mutex<Vec<HealNotice>>,
         book: Mutex<crate::stack::book::FlowBook>,
+        /// The sign-in pause, for [`SIGN_IN_NETWORK`], which always wants a sign-in here.
+        paused: Mutex<bool>,
     }
 
     impl Fake {
         fn new(open: Vec<FlowEvent>) -> Arc<Self> {
             let routes = tokio::sync::watch::channel(true).0;
-            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, log: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0), retries: Mutex::default(), notices: Mutex::default(), book: Mutex::default() })
+            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, log: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0), retries: Mutex::default(), notices: Mutex::default(), book: Mutex::default(), paused: Mutex::default() })
         }
     }
 
     impl Backend for Fake {
         fn status(&self) -> EngineStatus {
-            EngineStatus { policy: self.policy.lock().unwrap().clone(), dns_capture: Some(sieve_ipc::DnsCapture::Working), ..EngineStatus::default() }
+            let paused = *self.paused.lock().unwrap();
+            let sign_in = sieve_ipc::WifiSignIn { network: SIGN_IN_NETWORK.into(), paused_left_s: paused.then_some(sieve_ipc::SIGN_IN_PAUSE_MAX_S), wifi: true };
+            EngineStatus { policy: self.policy.lock().unwrap().clone(), dns_capture: Some(sieve_ipc::DnsCapture::Working), wifi_sign_in: Some(sign_in), ..EngineStatus::default() }
         }
         fn set_policy(&self, p: Policy) -> Result<EngineStatus, String> {
             let next = crate::policy::accept(&self.policy.lock().unwrap(), p)?;
@@ -439,6 +454,51 @@ mod tests {
             let mut book = self.book.lock().unwrap();
             IssuesAnswer { run: 7, revision: book.issues_revision(), apps: book.issues(session), dropped: book.issues_dropped() }
         }
+        fn pause_dns_capture(&self, network: &str) -> Result<EngineStatus, String> {
+            if network != SIGN_IN_NETWORK {
+                return Err(crate::route::sign_in::OTHER_NETWORK.into());
+            }
+            *self.paused.lock().unwrap() = true;
+            Ok(self.status())
+        }
+        fn resume_dns_capture(&self) -> EngineStatus {
+            *self.paused.lock().unwrap() = false;
+            self.status()
+        }
+    }
+
+    const SIGN_IN_NETWORK: &str = "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}";
+
+    /// Over the pipe: the sign-in fact reaches an app that names it and no other,
+    /// the pause carries the network and answers the Status, a refusal is an
+    /// Error that keeps the conversation, and the resume answers the Status.
+    #[tokio::test]
+    async fn the_sign_in_pause_and_resume_answer_over_the_pipe_and_only_a_naming_app_hears_it() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = welcomed(fake.clone(), 1).await;
+        send(&mut c, &ClientMessage::Status).await;
+        let EngineMessage::Status(s) = recv(&mut c).await else { panic!("a status") };
+        assert!(s.wifi_sign_in.is_none(), "an app naming no capability never hears it");
+        drop(c);
+        task.await.unwrap().unwrap();
+
+        let (mut c, task) = start_with(1, fake.clone());
+        let named = ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.2.0".into(), capabilities: sieve_ipc::APP_CAPABILITIES.iter().map(ToString::to_string).collect() };
+        send(&mut c, &named).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Welcome { .. }));
+        send(&mut c, &ClientMessage::Status).await;
+        let EngineMessage::Status(s) = recv(&mut c).await else { panic!("a status") };
+        assert_eq!(s.wifi_sign_in, Some(sieve_ipc::WifiSignIn { network: SIGN_IN_NETWORK.into(), paused_left_s: None, wifi: true }));
+        send(&mut c, &ClientMessage::PauseDnsCapture { network: "{another}".into() }).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Error { message } if message == crate::route::sign_in::OTHER_NETWORK));
+        send(&mut c, &ClientMessage::PauseDnsCapture { network: SIGN_IN_NETWORK.into() }).await;
+        let EngineMessage::Status(s) = recv(&mut c).await else { panic!("a status") };
+        assert_eq!(s.wifi_sign_in.and_then(|w| w.paused_left_s), Some(sieve_ipc::SIGN_IN_PAUSE_MAX_S));
+        send(&mut c, &ClientMessage::ResumeDnsCapture {}).await;
+        let EngineMessage::Status(s) = recv(&mut c).await else { panic!("a status") };
+        assert_eq!(s.wifi_sign_in.and_then(|w| w.paused_left_s), None);
+        drop(c);
+        task.await.unwrap().unwrap();
     }
 
     /// The whole way: a flow's problem in a real book, over the pipe, to the

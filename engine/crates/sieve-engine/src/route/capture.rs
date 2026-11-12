@@ -50,6 +50,13 @@
 //! on the adapter without the block leaves the parallel query to leak; the
 //! well-known `fec0:0:0:ffff::1-3` servers are never asked.
 //!
+//! On a network that wants a sign-in the user can pause the capture with one
+//! click, for that network and at most `sign_in::PAUSE_FOR` (`route::sign_in`):
+//! the routing loop then holds none, as with the switch off, and opens it again
+//! by itself. Meanwhile every lookup the DNS Client makes, which is nearly every
+//! app's (getaddrinfo and DnsQuery go through it), goes to the network's own DNS
+//! servers in plain text; only an app that resolves names itself is unaffected.
+//!
 //! Lifetime: the filter goes with the engine's process (a dynamic session), the
 //! server and the metric with the adapter. After a kill the server's registry
 //! value stays under the adapter's own GUID, which no existing adapter reads; the

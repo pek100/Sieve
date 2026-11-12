@@ -379,7 +379,7 @@ export const REGISTRY = {
     label: "Also encrypt Windows' own lookups",
     help: "Windows' built-in lookups also go through Sieve's encrypted DNS, so the network can't read them. Off: Windows sends them to your network's DNS server in plain text, as it does without Sieve.",
     breaks:
-      "Names of nearby PCs found without DNS, and short names that don't exist, answer about 7 s slower. Hotel and café Wi-Fi sign-in pages may not open until you turn this off or sign in.",
+      "Names of nearby PCs found without DNS, and short names that don't exist, answer about 7 s slower. A hotel or café network that wants a sign-in often can't show its page while this is on. When Sieve recognises such a network, it offers a one-click pause so the page can open: for up to 15 minutes, or until encrypted DNS answers or the network changes, nearly every app's lookups then go in plain text. When it doesn't, turning this setting off lets the sign-in page open.",
     default: true,
     requires: "filtering.dnsEncryption",
   } satisfies BooleanSetting,
@@ -445,8 +445,8 @@ export const REGISTRY = {
   // Keys are the names in the policy's `tracking` (sieve_ipc::TRACKING_NAMES), in
   // its order, which is append-only; the block shows them by level.
   "tracking.gpc": trackingOption({
-    label: "Ask sites not to track you",
-    help: "Sends the Global Privacy Control and Do Not Track signals with every request, which sites that honour them treat as a no to selling or sharing what you do.",
+    label: "Send Global Privacy Control",
+    help: "Asks every site you open not to sell or share what you do there.",
     preset: "minimal",
   }),
   "tracking.searchQueries": trackingOption({

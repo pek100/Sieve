@@ -610,7 +610,7 @@ describe("tracking protection, while the HTTPS switch waits for its live check",
     await setup("pending", { schema: 5, values: { "filtering.engine": true, "tracking.webRtc": true } }, { ...mock, setPolicy: (p) => (sent.push(p), mock.setPolicy(p)) });
     await settled();
     expect(document.querySelector("[data-tracking]")).toBeNull();
-    expect(screen.queryByText("Ask sites not to track you")).toBeNull();
+    expect(screen.queryByText("Send Global Privacy Control")).toBeNull();
     expect(sent.length).toBeGreaterThan(0);
     for (const p of sent) expect(p.tracking ?? []).toEqual([]);
   });

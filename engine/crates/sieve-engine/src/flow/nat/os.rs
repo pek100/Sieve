@@ -55,23 +55,31 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// This thread's COM apartment, for as long as the reader lives.
-pub struct ComApartment;
+pub struct ComApartment {
+    /// `CoInitializeEx` succeeded (S_OK or S_FALSE), so it is paired with one
+    /// `CoUninitialize`. False when the thread was already in another kind of
+    /// apartment (RPC_E_CHANGED_MODE): COM works in that one, and this took no
+    /// count of it, so it must give none back.
+    entered: bool,
+}
 
 impl ComApartment {
     pub fn enter() -> Result<Self, String> {
-        // SAFETY: plain call on this thread, paired with CoUninitialize in Drop.
+        // SAFETY: plain call on this thread, paired with CoUninitialize in Drop when it succeeds.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         if hr.is_err() && hr != RPC_E_CHANGED_MODE {
             return Err(format!("COM: {hr:?}"));
         }
-        Ok(Self)
+        Ok(Self { entered: hr.is_ok() })
     }
 }
 
 impl Drop for ComApartment {
     fn drop(&mut self) {
-        // SAFETY: this thread entered in `enter`.
-        unsafe { CoUninitialize() };
+        if self.entered {
+            // SAFETY: this thread entered in `enter`, once.
+            unsafe { CoUninitialize() };
+        }
     }
 }
 
@@ -453,6 +461,35 @@ mod tests {
         .unwrap();
         assert_ne!(entered_after, RPC_E_CHANGED_MODE, "still in the reader's apartment");
         assert!(entered_after.is_ok(), "{entered_after:?}");
+    }
+
+    /// On a thread already in a single-threaded apartment, entering is refused
+    /// with RPC_E_CHANGED_MODE and takes no count, so leaving gives none back: the
+    /// thread's own apartment stays as its owner left it.
+    #[test]
+    fn an_apartment_that_was_not_entered_is_not_left() {
+        use windows::Win32::Foundation::S_FALSE;
+        use windows::Win32::System::Com::COINIT_APARTMENTTHREADED;
+        let (inside, again) = std::thread::spawn(|| {
+            // SAFETY: plain call on this thread, paired at the end.
+            let own = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            assert!(own.is_ok(), "{own:?}");
+            let inside = ComApartment::enter().map(|a| a.entered);
+            // Still in it: entering the same kind again only counts (S_FALSE). Had
+            // the drop above left it, this would enter afresh (S_OK).
+            // SAFETY: as above; both counts are given back below.
+            let again = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            // SAFETY: the two entries of this thread.
+            unsafe {
+                CoUninitialize();
+                CoUninitialize();
+            }
+            (inside, again)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(inside, Ok(false), "usable, but not entered");
+        assert_eq!(again, S_FALSE, "the thread's own apartment was not left");
     }
 
     #[test]

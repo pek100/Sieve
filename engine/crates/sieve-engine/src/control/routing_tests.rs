@@ -351,3 +351,170 @@ fn an_ipv4_only_plan_gives_the_adapter_no_ipv6_address() {
     let v4: Vec<Prefix> = vec!["0.0.0.0/5".parse().unwrap()];
     assert_eq!(adapter_addresses(&v4), [std::net::IpAddr::V4(crate::tun::TUN_V4)]);
 }
+
+mod sign_in_pass {
+    use std::time::{Duration, Instant};
+
+    use super::super::routing::{Outstanding, SignInFacts, Unread, capture_wanted, sign_in_pass, verdict_of};
+    use super::engine;
+    use crate::ipc::Backend;
+    use crate::route::sign_in::{self, Ended, PROBE_EVERY, Seen, Verdict};
+
+    const HOTEL: &str = "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}";
+
+    fn hotel() -> Verdict {
+        Verdict { network: HOTEL.into(), luid: 0x0047_0000_0000_0001, hijacked: false }
+    }
+
+    /// A pass on the portal, with the capture as given.
+    fn pass(v: Option<&Verdict>, held: bool) -> Seen<'_> {
+        Seen { wanted: true, held, network: v, unread: false, portal: true, encrypted_unreachable: true }
+    }
+
+    /// The engine with a notice shown, then paused by the user's click.
+    fn paused_at(t0: Instant) -> crate::control::Engine {
+        let e = engine();
+        e.sign_in().observe(t0, pass(Some(&hotel()), true));
+        e.sign_in().pause(t0, HOTEL, true, true).unwrap();
+        e
+    }
+
+    async fn never_asked() -> bool {
+        panic!("no encrypted lookup is due")
+    }
+
+    #[tokio::test]
+    async fn the_capture_is_held_as_none_while_paused_and_comes_back_when_it_ends() {
+        let t0 = Instant::now();
+        let e = engine();
+        assert!(capture_wanted(&e), "the setting on: wanted");
+        let e = paused_at(t0);
+        assert!(!capture_wanted(&e), "paused: the capture step closes it");
+        assert_eq!(sign_in_pass(&e, t0 + Duration::from_secs(1), pass(Some(&hotel()), false), never_asked).await, None);
+        assert!(!capture_wanted(&e), "still paused");
+        assert_eq!(e.sign_in().resume(), Some(Ended::User));
+        assert!(capture_wanted(&e), "resumed: wanted again");
+    }
+
+    /// Windows' word that cannot be read: reported once while it keeps failing;
+    /// for a moment the last good word stands and the pause holds; past the bound
+    /// a pause ends in the same pass, so the capture step after it opens the
+    /// capture again, and it is not counted.
+    #[tokio::test]
+    async fn a_verdict_that_cannot_be_read_ends_a_pause_only_past_the_bound() {
+        let t0 = Instant::now();
+        let e = paused_at(t0);
+        let mut facts = SignInFacts::default();
+        let mut last = None;
+        let why = "Windows did not say within 5 s which network this is";
+        fn pass_with(heard: &sign_in::Heard) -> Seen<'_> {
+            Seen { unread: heard.unread, ..pass(heard.verdict.as_ref(), false) }
+        }
+        let (heard, _) = facts.heard(t0, verdict_of(&e, Ok(Some(hotel())), &mut last), None);
+        assert_eq!(sign_in_pass(&e, t0, pass_with(&heard), never_asked).await, None);
+        for s in [1, 2] {
+            let read = verdict_of(&e, Err(why.into()), &mut last);
+            assert_eq!(read, None);
+            let (heard, _) = facts.heard(t0 + Duration::from_secs(s), read, None);
+            assert_eq!(heard.verdict, Some(hotel()), "miss {s}: the last good word stands");
+            assert_eq!(sign_in_pass(&e, t0 + Duration::from_secs(s), pass_with(&heard), never_asked).await, None);
+            assert!(!capture_wanted(&e), "still paused");
+        }
+        let (heard, _) = facts.heard(t0 + Duration::from_secs(3), verdict_of(&e, Err(why.into()), &mut last), None);
+        assert!(heard.unread);
+        assert_eq!(sign_in_pass(&e, t0 + Duration::from_secs(3), pass_with(&heard), never_asked).await, Some(Ended::Unread));
+        assert!(capture_wanted(&e), "the capture comes back in this very pass");
+        let reported = e.facts().last_error.unwrap_or_default();
+        assert_eq!(reported.matches(why).count(), 1, "said once while it keeps failing the same way: {reported}");
+        assert_eq!(verdict_of(&e, Ok(Some(hotel())), &mut last), Some(Some(hotel())));
+        assert_eq!(last, None, "a read that works ends it");
+    }
+
+    /// The glue of `follow_sign_in`: the portal check's answer is stamped with the
+    /// network id and adapter Windows named in the same pass, counts only for
+    /// them, and a moved network clears it and makes the check due at once.
+    #[test]
+    fn the_portal_answer_is_stamped_with_its_network_and_cleared_when_it_moves() {
+        let t0 = Instant::now();
+        let mut facts = SignInFacts::default();
+        assert!(facts.portal_due(t0), "the first check is due");
+        assert!(!facts.portal_due(t0 + Duration::from_secs(1)), "counted as started");
+        let (heard, portal) = facts.heard(t0, Some(Some(hotel())), Some(true));
+        assert_eq!(heard.verdict, Some(hotel()));
+        assert!(portal, "found on the network Windows named");
+        let (_, portal) = facts.heard(t0 + Duration::from_secs(5), Some(Some(hotel())), None);
+        assert!(portal, "no check this pass: the last answer stands while fresh");
+        let cafe = Verdict { network: "{0d4b7e21-5a3c-4e8f-b1d2-9c6a5f3e8b47}".into(), ..hotel() };
+        let (_, portal) = facts.heard(t0 + Duration::from_secs(6), Some(Some(cafe)), None);
+        assert!(!portal, "another network on the same adapter: the answer was not for it");
+        let ethernet = Verdict { luid: 0x0006_0000_0000_0002, ..hotel() };
+        assert!(!facts.heard(t0 + Duration::from_secs(7), Some(Some(ethernet.clone())), None).1, "another adapter");
+        let (heard, portal) = facts.heard(t0 + Duration::from_secs(8), None, Some(true));
+        assert_eq!(heard.verdict, Some(ethernet), "a missed read: the last good word stands");
+        assert!(portal, "and the check is stamped with that word");
+        assert!(!facts.heard(t0 + Duration::from_secs(9), Some(Some(hotel())), None).1, "so it is not hotel's");
+        let mut facts = SignInFacts::default();
+        facts.portal_due(t0);
+        facts.heard(t0, Some(Some(hotel())), Some(true));
+        facts.moved();
+        assert!(facts.portal_due(t0 + Duration::from_secs(1)), "moved: due at once");
+        let (heard, portal) = facts.heard(t0 + Duration::from_secs(1), None, None);
+        assert!(heard.unread && !portal, "moved: neither the answer nor Windows' last word is kept");
+        let (_, portal) = facts.heard(t0 + Duration::from_secs(2), Some(Some(hotel())), None);
+        assert!(!portal, "moved: the old answer is gone even for the same network");
+    }
+
+    /// While paused, the encrypted lookup runs on its schedule, and its answer ends
+    /// the pause in the same pass: the capture step after it opens the capture.
+    #[tokio::test]
+    async fn an_encrypted_answer_reopens_the_capture_in_the_same_pass() {
+        let t0 = Instant::now();
+        let e = paused_at(t0);
+        let early = t0 + PROBE_EVERY - Duration::from_secs(1);
+        assert_eq!(sign_in_pass(&e, early, pass(Some(&hotel()), false), never_asked).await, None, "not due yet: nothing asked");
+        let due = t0 + PROBE_EVERY;
+        assert_eq!(sign_in_pass(&e, due, pass(Some(&hotel()), false), || async { false }).await, None, "asked, no answer: still paused");
+        assert!(!capture_wanted(&e));
+        e.set_facts(|f| f.routes_up = true);
+        assert!(e.status().wifi_sign_in.is_some_and(|w| w.paused_left_s.is_some()), "the status says paused");
+        let next = due + PROBE_EVERY;
+        assert_eq!(sign_in_pass(&e, next, pass(Some(&hotel()), false), || async { true }).await, Some(Ended::Answered));
+        assert!(capture_wanted(&e), "opened again in the same pass");
+        assert_eq!(e.status().wifi_sign_in, None, "and nothing to say");
+    }
+
+    /// A read that hangs costs one thread, never one per pass: while it runs, the
+    /// next pass starts none, and once it ends late its answer is dropped as stale.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_read_is_not_started_again_while_it_runs() {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = std::sync::Arc::new(std::sync::Mutex::new(hold));
+        let mut read: Outstanding<u32> = Outstanding::default();
+        let start = |answer: u32| {
+            let (started, hold) = (started.clone(), hold.clone());
+            move || {
+                tokio::task::spawn_blocking(move || {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = hold.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                    answer
+                })
+            }
+        };
+        assert_eq!(read.read(Duration::from_millis(50), start(1)).await, Err(Unread::TimedOut));
+        for _ in 0..3 {
+            assert_eq!(read.read(Duration::from_millis(50), start(2)).await, Err(Unread::StillRunning));
+        }
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1, "one thread, not one per pass");
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while read.read(Duration::from_secs(5), start(3)).await == Err(Unread::StillRunning) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2, "the next read started only after the hung one ended");
+    }
+}

@@ -495,8 +495,38 @@ export interface EngineStatus {
   dns_unreachable?: boolean;
   /** Whether Windows' own lookups are caught, while routes are up. Absent: routes down, or an older engine. */
   dns_capture?: DnsCapture;
+  /** A network that wants a sign-in, or the capture paused for one. Absent: nothing to say, or an engine or app from before it. */
+  wifi_sign_in?: WifiSignIn;
   update: EngineUpdate;
 }
+
+/** sieve-ipc `WifiSignIn`. `paused_left_s` present: paused, resumes by itself within that many seconds. */
+export interface WifiSignIn {
+  /** The engine's id for the network; handed back in `pause_dns_capture`. */
+  network: string;
+  paused_left_s?: number;
+  /** On a Wi-Fi adapter: the app says "Wi-Fi". Absent: another kind, or an engine from before it ("network"). */
+  wifi?: true;
+}
+
+/** sieve-ipc `SIGN_IN_PAUSE_MAX_S` and `NETWORK_ID_MAX`. */
+export const SIGN_IN_PAUSE_MAX_S = 15 * 60;
+export const NETWORK_ID_MAX = 64;
+
+/** A notice, as `dns_capture`: anything unexpected reads as nothing to say, never a refused Status. */
+export function parseWifiSignIn(raw: unknown): WifiSignIn | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const w = raw as Record<string, unknown>;
+  if (typeof w.network !== "string" || w.network.length === 0 || w.network.length > NETWORK_ID_MAX) return null;
+  // Only a true is Wi-Fi; anything else reads as the neutral "network", never a refusal.
+  const wifi = w.wifi === true ? { wifi: true as const } : {};
+  const left = w.paused_left_s;
+  if (left === undefined) return { network: w.network, ...wifi };
+  if (!Number.isInteger(left) || (left as number) < 0) return null;
+  return { network: w.network, paused_left_s: Math.min(left as number, SIGN_IN_PAUSE_MAX_S), ...wifi };
+}
+
+const withSignIn = (w: WifiSignIn | null): { wifi_sign_in?: WifiSignIn } => (w === null ? {} : { wifi_sign_in: w });
 
 /** sieve-ipc `CaptureReason`, in declaration order. */
 export const CAPTURE_REASONS = ["tie", "ipv6_off", "no_answer", "no_ipv4", "failed", "nothing_to_catch"] as const;
@@ -695,6 +725,7 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
     // A notice, like the update state: an odd value reads as nothing to say, never a refused Status.
     ...(s.dns_unreachable === true ? { dns_unreachable: true } : {}),
     ...withCapture(parseDnsCapture(s.dns_capture)),
+    ...withSignIn(parseWifiSignIn(s.wifi_sign_in)),
     update: engineUpdate(s.update),
   };
 }

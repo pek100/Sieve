@@ -12,7 +12,7 @@ import { REASON_TEXT, RETRY_TEXT } from "@/core/log";
 import { MAX_POLICY_BYTES } from "@/core/settings/registry";
 import fixture from "@/data/fixtures/engine-ipc-v3.json";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
-import { BLOCKER_KINDS, CAPTURE_REASONS, CAUSES, CERT_STATES, EXCLUSION_SCOPES, FIREFOX_TRUST, LOG_OUTCOMES, parseCertStatus, parseEngineLists, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseIssues, parseLogTail, RETRY_HOWS, SIGNALS, UPDATE_KINDS } from "@/data/protocol";
+import { BLOCKER_KINDS, CAPTURE_REASONS, CAUSES, CERT_STATES, EXCLUSION_SCOPES, FIREFOX_TRUST, LOG_OUTCOMES, NETWORK_ID_MAX, parseCertStatus, parseEngineLists, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseIssues, parseLogTail, RETRY_HOWS, SIGN_IN_PAUSE_MAX_S, SIGNALS, UPDATE_KINDS } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -121,6 +121,27 @@ describe("engine IPC law", () => {
     const crate = (RUST.match(/pub enum CaptureReason \{([\s\S]*?)\n\}/)?.[1] ?? "").match(/^\s{4}(\w+)\b/gm) ?? [];
     expect(crate.map((v) => v.trim().replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()))).toEqual([...CAPTURE_REASONS]);
     expect(fixture.dnsCaptureStates.flatMap((s) => ("reason" in s ? [s.reason] : []))).toEqual([...CAPTURE_REASONS]);
+  });
+
+  it("the app reads the Wi-Fi sign-in fact; absent, odd or from an older engine is nothing to say; its limits are the crate's", () => {
+    const status = fixture.engine.find((m) => m.type === "status")!;
+    const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
+    expect(parseEngineStatus(body), "an older engine says nothing").not.toHaveProperty("wifi_sign_in");
+    for (const state of fixture.wifiSignInStates) expect(parseEngineStatus({ ...body, wifi_sign_in: state }).wifi_sign_in).toEqual(state);
+    expect(parseEngineStatus({ ...body, wifi_sign_in: { network: "n", paused_left_s: 9, later: true } }).wifi_sign_in, "a later engine's field is ignored").toEqual({ network: "n", paused_left_s: 9 });
+    for (const odd of [1, {}, { network: "" }, { network: 7 }, { network: "x".repeat(NETWORK_ID_MAX + 1) }, { network: "n", paused_left_s: -1 }, { network: "n", paused_left_s: "soon" }]) {
+      expect(parseEngineStatus({ ...body, wifi_sign_in: odd }), `a notice never refuses the Status: ${JSON.stringify(odd)}`).not.toHaveProperty("wifi_sign_in");
+    }
+    expect(parseEngineStatus({ ...body, wifi_sign_in: { network: "n", paused_left_s: 10_000 } }).wifi_sign_in?.paused_left_s, "never past the cap").toBe(SIGN_IN_PAUSE_MAX_S);
+    expect(parseEngineStatus({ ...body, wifi_sign_in: { network: "n", wifi: "yes" } }).wifi_sign_in, "only a true says Wi-Fi; anything else is the neutral word").toEqual({ network: "n" });
+    expect(RUST).toMatch(/skip_serializing_if = "std::ops::Not::not"\)\]\s*pub wifi: bool/);
+    expect(rustConst("SIGN_IN_PAUSE_MAX_S")).toBe("15 * 60");
+    expect(Number(rustConst("NETWORK_ID_MAX"))).toBe(NETWORK_ID_MAX);
+    expect(RUST).toMatch(/skip_serializing_if = "Option::is_none"\)\]\s*pub wifi_sign_in: Option<WifiSignIn>/);
+    expect(fixture.client.filter((m) => m.type === "pause_dns_capture" || m.type === "resume_dns_capture")).toEqual([
+      { type: "pause_dns_capture", network: fixture.wifiSignInStates[0].network },
+      { type: "resume_dns_capture" },
+    ]);
   });
 
   it("the app reads every certificate status, and its enums are the crate's", () => {

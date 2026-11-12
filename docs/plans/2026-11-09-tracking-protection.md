@@ -45,7 +45,7 @@ What still gates them is the switch each needs (below).
 
 | Name (`Policy.tracking`) | What the engine does | Minimal | Balanced | Strict |
 |---|---|---|---|---|
-| `gpc` | Adds `Sec-GPC: 1` and `DNT: 1` to every request that lacks them; in a page rewritten anyway (content on, something else injected), `navigator.globalPrivacyControl` reads true and `navigator.doNotTrack` "1" | on | on | on |
+| `gpc` ("Send Global Privacy Control") | Adds `Sec-GPC: 1` to every request that lacks it; in a page rewritten anyway (content on, something else injected), `navigator.globalPrivacyControl` reads true. GPC only (owner's call, 2026-11-12): `DNT` is neither added nor removed and `navigator.doNotTrack` is not defined, as Do Not Track is deprecated, sites ignore it and one more header only sets the browser apart. A `DNT` the browser sends itself goes through as it is. An engine before this added both and logged `gpc` with a count of 2; the app words every count as "Sent Global Privacy Control". The option reads "Send Global Privacy Control" | on | on | on |
 | `clientData` | Removes `X-Client-Data` from every request | on | on | on |
 | `queryParams` (new) | Removes the built-in tracking parameters (`engine/crates/sieve-filter/data/tracking-params.txt`: `utm_*`, `fbclid`, `gclid`, `msclkid`, `yclid`, `mc_cid` and the rest; never a recipient id or a token, such as `mkt_tok`, `_hsenc`, `_hsmi`, `vero_id`, `oly_enc_id`, `oly_anon_id`, `mc_eid`, which sign a reader in, unsubscribe them or fill a form, and are left to the lists' `$removeparam`) from pages and frames, and from the `Location` of a site's own redirect answering one. A GET or HEAD page gets a 307 to the clean URL, as `$removeparam` does, so page script cannot read them; the lists' `$removeparam` rules act as before, whatever this says | off | on | on |
 | `searchQueries` | Cuts a cross-site `Referer` to its origin, so the site opened from a search does not get the search | off | on | on |
@@ -74,7 +74,7 @@ back to the parameter (second review P2-3). Two guards:
 
 Why these defaults:
 
-- Minimal is what cannot break a site: two signals and a header no site needs.
+- Minimal is what cannot break a site: one signal and a header no site needs.
 - Balanced, the recommended level, adds what changes no site's behaviour:
   tracking parameters carry nothing a page needs, and an origin-only cross-site
   referrer is what browsers send by default (`strict-origin-when-cross-origin`),
@@ -162,9 +162,9 @@ as `changes` did.
 - `document.referrer` for a navigation is the browser's own; removing the header
   does not change it, which a page script would (it needs `filtering.content`).
 - With `gpc` on, a page that is not rewritten (content off, or nothing else to
-  inject) reads the browser's own `navigator.globalPrivacyControl` and
-  `doNotTrack` while its requests carry the signals: accepted. Rewriting every
-  decrypted page for two values alone would change pages that have nothing else
+  inject) reads the browser's own `navigator.globalPrivacyControl` while its
+  requests carry the signal: accepted. Rewriting every decrypted page for one
+  value alone would change pages that have nothing else
   to change (second review P3-9).
 - Cookies a browser already holds are capped only when a site sets them again.
 - The `live-scope` test build (never released) can decrypt apps that are not
@@ -173,7 +173,7 @@ as `changes` did.
 ## Live checks for the test VM
 
 With HTTPS decryption on, in Edge and Firefox, against a page the VM serves:
-the request headers a test origin echoes (GPC, DNT, no X-Client-Data, the
+the request headers a test origin echoes (GPC and no DNT, no X-Client-Data, the
 referrer cut and removed cross-site), a link with `utm_source` and `fbclid`
 landing clean with one 307, a third-party `Set-Cookie` arriving capped, each
 change in the log's details, and with each option off the same requests arriving

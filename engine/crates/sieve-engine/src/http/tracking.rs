@@ -18,8 +18,9 @@ const SEC_FETCH_SITE: &str = "sec-fetch-site";
 const CROSS_SITE: &str = "cross-site";
 const SEC_FETCH_DEST: &str = "sec-fetch-dest";
 const DOCUMENT: &str = "document";
+/// Global Privacy Control only: `DNT` is retired (no legal weight, and one
+/// more bit that sets a browser apart), so it is neither added nor touched.
 const SEC_GPC: &str = "sec-gpc";
-const DNT: &str = "dnt";
 const SIGNAL_ON: &str = "1";
 const X_CLIENT_DATA: &str = "x-client-data";
 /// How long a capped cookie lives: an hour (the registry's words say so).
@@ -148,18 +149,12 @@ pub fn cookie_cap(on: Protections, party: Party) -> Option<Protection> {
     on.has(p).then_some(p)
 }
 
-/// The request's own changes, before it goes upstream: the signals, the header
-/// Chrome adds, and the referrer of a cross-site request.
+/// The request's own changes, before it goes upstream: the GPC signal, the
+/// header Chrome adds, and the referrer of a cross-site request.
 pub fn prepare_request(on: Protections, party: Party, headers: &mut HeaderMap, changes: &mut Changes) {
-    if on.has(Protection::Gpc) {
-        let mut added = 0;
-        for name in [SEC_GPC, DNT] {
-            if !headers.contains_key(name) {
-                headers.insert(HeaderName::from_static(name), HeaderValue::from_static(SIGNAL_ON));
-                added += 1;
-            }
-        }
-        changes.add(Protection::Gpc, added);
+    if on.has(Protection::Gpc) && !headers.contains_key(SEC_GPC) {
+        headers.insert(HeaderName::from_static(SEC_GPC), HeaderValue::from_static(SIGNAL_ON));
+        changes.add(Protection::Gpc, 1);
     }
     if on.has(Protection::ClientData) {
         let removed = headers.get_all(X_CLIENT_DATA).iter().count();
@@ -379,19 +374,25 @@ mod tests {
     }
 
     #[test]
-    fn gpc_adds_both_signals_once_and_counts_what_it_added() {
+    fn gpc_adds_only_sec_gpc_once_and_never_touches_dnt() {
         let mut h = browser_request("same-origin");
         let mut c = Changes::default();
         prepare_request(Protections::of(&[Protection::Gpc]), Party::First, &mut h, &mut c);
-        assert_eq!((h.get("sec-gpc").unwrap(), h.get("dnt").unwrap()), (&HeaderValue::from_static("1"), &HeaderValue::from_static("1")));
-        assert_eq!(changes_of(c), [("gpc".to_string(), 2)]);
-        // A browser that already sends GPC: only DNT is added.
+        assert_eq!(h.get("sec-gpc").unwrap(), &HeaderValue::from_static("1"));
+        assert!(!h.contains_key("dnt"), "DNT is no longer added");
+        assert_eq!(changes_of(c), [("gpc".to_string(), 1)]);
+        // A browser that already sends GPC: nothing added, nothing counted.
         let mut h = browser_request("same-origin");
         h.insert("sec-gpc", "1".parse().unwrap());
         let mut c = Changes::default();
         prepare_request(Protections::of(&[Protection::Gpc]), Party::First, &mut h, &mut c);
-        assert_eq!(changes_of(c), [("gpc".to_string(), 1)]);
+        assert!(c.is_empty());
         assert_eq!(h.get_all("sec-gpc").iter().count(), 1);
+        // A browser's own DNT is the browser's: neither removed nor changed.
+        let mut h = browser_request("same-origin");
+        h.insert("dnt", "0".parse().unwrap());
+        prepare_request(Protections::of(&[Protection::Gpc]), Party::First, &mut h, &mut Changes::default());
+        assert_eq!(h.get("dnt").unwrap(), "0");
     }
 
     #[test]

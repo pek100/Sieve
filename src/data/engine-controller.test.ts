@@ -5,8 +5,11 @@ import { createNoticeBus } from "@/core/notices";
 import { MAX_POLICY_BYTES, settingDef, type SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
-import { CRASH_LOOP_BANNER, DNS_UNREACHABLE_BANNER, createEngineController } from "./engine-controller";
-import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_CERT_ERROR, MOCK_ENGINE_ERROR, MOCK_HTTPS_OFF, MOCK_ISSUES_ERROR, type CertScenario, type EngineScenario, type IssuesScenario } from "./engine-mock";
+import { CRASH_LOOP_BANNER, DNS_UNREACHABLE_BANNER, DNS_UNREACHABLE_CAPTURED_BANNER, createEngineController, signInNoticeText, signInPausedText } from "./engine-controller";
+
+const WIFI_SIGN_IN_NOTICE = signInNoticeText(true);
+const WIFI_SIGN_IN_PAUSED_BANNER = signInPausedText(true);
+import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_CERT_ERROR, MOCK_ENGINE_ERROR, MOCK_HTTPS_OFF, MOCK_ISSUES_ERROR, MOCK_NO_SIGN_IN, MOCK_SIGN_IN_NETWORK, type CertScenario, type EngineScenario, type IssuesScenario } from "./engine-mock";
 import type { EngineSource } from "./engine-source";
 import { createMockFilterLists } from "./filter-lists-mock";
 import type { FilterListSource } from "./filter-lists-source";
@@ -64,6 +67,7 @@ function fakeEngine(start: EngineScenario) {
   let rowReads = 0;
   let noticeReads = 0;
   const issueReads: number[] = [];
+  const signInCalls: string[] = [];
   const source: EngineSource = {
     kind: "mock",
     probe: () => {
@@ -106,10 +110,20 @@ function fakeEngine(start: EngineScenario) {
       issueReads.push(after);
       return mock.issues(after);
     },
+    pauseDnsCapture: (network) => {
+      signInCalls.push(`pause ${network}`);
+      return mock.pauseDnsCapture(network);
+    },
+    resumeDnsCapture: () => {
+      signInCalls.push("resume");
+      return mock.resumeDnsCapture();
+    },
   };
   return {
     source,
     issueReads,
+    signInCalls,
+    withSignIn: (s: EngineScenario = start) => void (mock = createMockEngine(s, { signIn: true })),
     withIssues: (issues: IssuesScenario, run?: number) => void (mock = createMockEngine(start, { issues, run, now: () => ISSUES_NOW })),
     set: (s: EngineScenario) => void (mock = createMockEngine(s)),
     setCert: (c: CertScenario) => void (mock = createMockEngine(start, { cert: c })),
@@ -1275,13 +1289,134 @@ describe("engine controller", () => {
       };
       await s.fc.advance(ENGINE_POLL_MS);
       await s.fc.advance(ENGINE_POLL_MS);
-      expect(banners()).toEqual([DNS_UNREACHABLE_BANNER]);
-      expect(DNS_UNREACHABLE_BANNER).toContain(settingDef(DNS_ENCRYPTION as SettingKey).label);
+      expect(engineStatus(s.store.getState().engine)?.dns_capture?.state).toBe("working");
+      expect(banners(), "Windows' lookups caught: the capture is the smaller switch").toEqual([DNS_UNREACHABLE_CAPTURED_BANNER]);
+      expect(DNS_UNREACHABLE_CAPTURED_BANNER).toContain(`you can turn off ${settingDef(DNS_CLIENT_CAPTURE as SettingKey).label} in Settings > Filtering`);
+      await s.settings.set(DNS_CLIENT_CAPTURE as SettingKey, false);
+      await s.fc.flush();
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners(), "not caught: encryption is the switch").toEqual([DNS_UNREACHABLE_BANNER]);
+      expect(DNS_UNREACHABLE_BANNER).toContain(`you can turn off ${settingDef(DNS_ENCRYPTION as SettingKey).label} in Settings > Filtering`);
       expect(s.settings.get(DNS_ENCRYPTION as SettingKey), "said, never switched").toBe(true);
+      expect(s.settings.get(DNS_CLIENT_CAPTURE as SettingKey), "only by the user").toBe(false);
       expect(s.fake.policies.every((p) => p.plain_dns === false)).toBe(true);
       unreachable = false;
       await s.fc.advance(ENGINE_POLL_MS);
       expect(banners()).toEqual([]);
+      s.undo();
+    });
+
+    it("a Wi-Fi that wants a sign-in shows one notice with one button, in place of the unreachable one; one click pauses, nothing pauses by itself", async () => {
+      const s = setup("filtering", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      const banners = () => s.notices.list().filter((n) => n.surface === "banner");
+      await s.fc.flush();
+      s.fake.withSignIn("filtering");
+      const real = s.fake.source.probe;
+      s.fake.source.probe = async () => {
+        const facts = await real();
+        return facts.pipe?.kind === "welcome" ? { ...facts, pipe: { ...facts.pipe, status: { ...facts.pipe.status, dns_unreachable: true } } } : facts;
+      };
+      for (let i = 0; i < 4; i++) await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners().map((n) => n.text), "one notice, not the unreachable one beside it").toEqual([WIFI_SIGN_IN_NOTICE]);
+      expect(WIFI_SIGN_IN_NOTICE).toMatch(/^This Wi-Fi wants you to sign in\./);
+      expect(WIFI_SIGN_IN_NOTICE).toContain("sends them to this Wi-Fi's DNS server in plain text, and nearly every app and browser looks names up through Windows");
+      expect(WIFI_SIGN_IN_NOTICE).toContain("It lasts up to 15 minutes, and ends sooner once encrypted DNS answers or the network changes.");
+      expect(WIFI_SIGN_IN_NOTICE, "never that only Windows' own lookups go plain").not.toMatch(/sends only|stay encrypted/);
+      expect(WIFI_SIGN_IN_PAUSED_BANNER).toMatch(/^Paused for sign-in: nearly every app's lookups go to this Wi-Fi's DNS server in plain text/);
+      expect(signInNoticeText(undefined), "Ethernet, or an engine that does not say").toMatch(/^This network wants you to sign in\..*this network's DNS server/);
+      expect(signInPausedText(undefined)).toContain("this network's DNS server");
+      expect(banners()[0].action?.label).toBe("Sign in to this Wi-Fi");
+      expect(s.fake.signInCalls, "Sieve never pauses by itself").toEqual([]);
+      banners()[0].action!.run();
+      await s.fc.flush();
+      expect(s.fake.signInCalls).toEqual([`pause ${MOCK_SIGN_IN_NETWORK}`]);
+      expect(banners().map((n) => n.text), "the notice gives way to the paused line").toEqual([WIFI_SIGN_IN_PAUSED_BANNER]);
+      expect(engineStatus(s.store.getState().engine)?.wifi_sign_in?.paused_left_s).toBeGreaterThan(0);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners().map((n) => n.text), "no flapping while paused").toEqual([WIFI_SIGN_IN_PAUSED_BANNER]);
+      await s.controller.resumeDnsCapture();
+      expect(s.fake.signInCalls.at(-1)).toBe("resume");
+      expect(banners().map((n) => n.text), "resumed on a network that still wants a sign-in: offered again").toEqual([WIFI_SIGN_IN_NOTICE]);
+      expect(s.settings.get(DNS_CLIENT_CAPTURE as SettingKey), "the setting is never touched").toBe(true);
+      s.undo();
+    });
+
+    it("the sign-in notice dismissed while the engine still names the network: the unreachable banner shows again", async () => {
+      const s = setup("filtering", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      const banners = () => s.notices.list().filter((n) => n.surface === "banner");
+      await s.fc.flush();
+      s.fake.withSignIn("filtering");
+      const real = s.fake.source.probe;
+      s.fake.source.probe = async () => {
+        const facts = await real();
+        return facts.pipe?.kind === "welcome" ? { ...facts, pipe: { ...facts.pipe, status: { ...facts.pipe.status, dns_unreachable: true } } } : facts;
+      };
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners().map((n) => n.text)).toEqual([WIFI_SIGN_IN_NOTICE]);
+      s.notices.dismiss(banners()[0].id);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(engineStatus(s.store.getState().engine)?.wifi_sign_in?.network, "the engine still names it").toBe(MOCK_SIGN_IN_NETWORK);
+      expect(banners().map((n) => n.text), "never no notice at all").toEqual([DNS_UNREACHABLE_CAPTURED_BANNER]);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners().map((n) => n.text), "and the dismissed notice is not pushed again beside it").toEqual([DNS_UNREACHABLE_CAPTURED_BANNER]);
+      s.undo();
+    });
+
+    it("on Ethernet, or from an engine that does not say, the notice and its button say network, not Wi-Fi", async () => {
+      const s = setup("filtering", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      const banners = () => s.notices.list().filter((n) => n.surface === "banner");
+      await s.fc.flush();
+      s.fake.withSignIn("filtering");
+      const real = s.fake.source.probe;
+      s.fake.source.probe = async () => {
+        const facts = await real();
+        if (facts.pipe?.kind !== "welcome" || facts.pipe.status.wifi_sign_in === undefined) return facts;
+        const wired = { ...facts.pipe.status.wifi_sign_in };
+        delete wired.wifi;
+        return { ...facts, pipe: { ...facts.pipe, status: { ...facts.pipe.status, wifi_sign_in: wired } } };
+      };
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners().map((n) => n.text)).toEqual([signInNoticeText(false)]);
+      expect(banners()[0].action?.label).toBe("Sign in to this network");
+      s.undo();
+    });
+
+    it("the sign-in notice goes once the engine stops naming the network, is not offered again once dismissed, and an engine from before it is never sent the pause", async () => {
+      const s = setup("filtering", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      const banners = () => s.notices.list().filter((n) => n.surface === "banner");
+      await s.fc.flush();
+      await s.fc.advance(ENGINE_POLL_MS);
+      await s.controller.pauseDnsCapture(MOCK_SIGN_IN_NETWORK);
+      await s.controller.resumeDnsCapture();
+      expect(s.fake.signInCalls, "no fact, no message: an older engine would end the conversation").toEqual([]);
+      s.fake.withSignIn("filtering");
+      const real = s.fake.source.probe;
+      let named = true;
+      s.fake.source.probe = async () => {
+        const facts = await real();
+        if (named || facts.pipe?.kind !== "welcome") return facts;
+        const status = { ...facts.pipe.status };
+        delete status.wifi_sign_in;
+        return { ...facts, pipe: { ...facts.pipe, status } };
+      };
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners().map((n) => n.text)).toEqual([WIFI_SIGN_IN_NOTICE]);
+      named = false;
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners(), "signed in: the notice is gone").toEqual([]);
+      named = true;
+      await s.fc.advance(ENGINE_POLL_MS);
+      s.notices.dismiss(banners()[0].id);
+      await s.fc.advance(ENGINE_POLL_MS);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners(), "dismissed: not pushed again for that network").toEqual([]);
+      await s.controller.pauseDnsCapture("{another}");
+      expect(s.fake.signInCalls, "only the network the engine names").toEqual([]);
+      s.fake.source.pauseDnsCapture = async () => {
+        throw new Error(MOCK_NO_SIGN_IN);
+      };
+      await s.controller.pauseDnsCapture(MOCK_SIGN_IN_NETWORK);
+      expect(s.store.getState().engine.actionError).toBe(`The sign-in pause did not start: ${MOCK_NO_SIGN_IN}`);
       s.undo();
     });
 

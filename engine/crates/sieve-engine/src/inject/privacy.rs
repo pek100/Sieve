@@ -19,9 +19,9 @@ const PUSH: &str = "(function(){if(typeof PushManager==='undefined'){return;}var
 /// Every request for the position answers "permission denied", as a refusal does,
 /// and asking the permission's state reads denied, as it does after a refusal.
 const LOCATION: &str = "(function(){var g=navigator.geolocation;if(!g){return;}var denied={code:1,message:'User denied Geolocation',PERMISSION_DENIED:1,POSITION_UNAVAILABLE:2,TIMEOUT:3};var no=function(ok,fail){if(typeof fail==='function'){setTimeout(function(){fail(denied);},0);}};try{g.getCurrentPosition=no;g.watchPosition=function(ok,fail){no(ok,fail);return 0;};g.clearWatch=function(){};}catch(e){}var P=navigator.permissions;if(!P||typeof P.query!=='function'){return;}var q=P.query;var state={name:'geolocation',state:'denied',status:'denied',onchange:null,addEventListener:function(){},removeEventListener:function(){},dispatchEvent:function(){return false;}};try{P.query=function(d){if(d&&d.name==='geolocation'){return Promise.resolve(state);}return q.apply(P,arguments);};}catch(e){}})();";
-/// The page reads the signals the headers send: `navigator.globalPrivacyControl`
-/// true and `navigator.doNotTrack` "1".
-const SIGNALS: &str = "(function(){if(typeof Navigator==='undefined'){return;}var v={globalPrivacyControl:true,doNotTrack:'1'};for(var k in v){(function(k,x){try{Object.defineProperty(Navigator.prototype,k,{get:function(){return x;},configurable:true,enumerable:true});}catch(e){}})(k,v[k]);}})();";
+/// The page reads the signal the headers send: `navigator.globalPrivacyControl`
+/// true. `navigator.doNotTrack` is the browser's own and is left alone.
+const SIGNALS: &str = "(function(){if(typeof Navigator==='undefined'){return;}try{Object.defineProperty(Navigator.prototype,'globalPrivacyControl',{get:function(){return true;},configurable:true,enumerable:true});}catch(e){}})();";
 
 const PIECES: [(Protection, &str); 3] = [(Protection::WebRtc, WEB_RTC), (Protection::Push, PUSH), (Protection::Location, LOCATION)];
 
@@ -33,8 +33,8 @@ pub struct PageScript {
     pub script: String,
     /// What `script` changes, for the log.
     pub changes: Vec<LogChange>,
-    /// What rides along when the page is rewritten anyway (`gpc`'s signals, which
-    /// are on at every level: rewriting every page for them alone would change
+    /// What rides along when the page is rewritten anyway (`gpc`'s signal, which
+    /// is on at every level: rewriting every page for them alone would change
     /// pages that have nothing else to change). A page not rewritten keeps the
     /// browser's own values, unlike its headers.
     pub signals: String,
@@ -67,7 +67,7 @@ mod tests {
         let page = script(Protections::of(&[Protection::WebRtc, Protection::Location, Protection::Gpc]));
         assert!(page.script.contains("RTCPeerConnection") && page.script.contains("geolocation") && !page.script.contains("PushManager"));
         assert_eq!(page.changes.iter().map(|c| c.what.as_str()).collect::<Vec<_>>(), ["webRtc", "location"]);
-        assert!(page.signals.contains("globalPrivacyControl") && page.signals.contains("doNotTrack") && !page.script.contains("globalPrivacyControl"), "gpc rides along");
+        assert!(page.signals.contains("globalPrivacyControl") && !page.signals.contains("doNotTrack") && !page.script.contains("globalPrivacyControl"), "gpc rides along");
         assert!(script(Protections::of(&[Protection::WebRtc])).signals.is_empty());
     }
 
