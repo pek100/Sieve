@@ -1,21 +1,28 @@
 //! Per-device rules and limits, and the address classes denied by default.
 //!
-//! The hub sees only `host:port`, never payload, so rules are by domain and
-//! by address. Order of evaluation for a stream:
+//! The hub sees only `host:port`, never payload, so rules are by domain, by
+//! address and by port. Order of evaluation for a stream:
 //!
+//! 0. Port: the default-denied ports (25, SMTP) refuse unless the device's
+//!    `allow_ports` lists them.
 //! 1. Domain: a `deny_suffixes` match refuses. If `allow_suffixes` is not
 //!    empty, a name must match one of them, and an address literal must fall
-//!    inside `allow_cidrs`.
+//!    inside `allow_cidrs`. A name that is not a public DNS name (one label,
+//!    `localhost`, `.local`, `.home.arpa`, `.internal`, `.lan`) refuses unless
+//!    an `allow_suffixes` entry names it: on Windows such names resolve
+//!    through LLMNR, NetBIOS or mDNS to machines on the hub's own network.
 //! 2. The name is resolved AT THE HUB, and each address is checked; the hub
 //!    connects only to an address that passes (so a name cannot be made to
 //!    point somewhere else between check and connect):
-//!    `deny_cidrs` refuses; `allow_cidrs` admits; the hub's LAN list refuses;
-//!    then the default-denied classes refuse (loopback, private, link-local,
-//!    shared/CGNAT, unique-local, multicast, unspecified, reserved and
-//!    broadcast, plus those embedded in IPv4-mapped and NAT64 addresses).
+//!    `deny_cidrs` refuses; `allow_cidrs` admits; the hub's LAN blocks refuse
+//!    (detected from its interfaces, plus the owner's manual ones); then the
+//!    default-denied classes refuse (see `denied_class`).
 //!
 //! So a device cannot reach the host's own machine or local network unless
 //! the owner adds an `allow_cidrs` entry for it.
+//!
+//! A refusal's text, which goes back to the device, names the class only;
+//! the resolved address goes to the audit log.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -103,7 +110,20 @@ pub struct Rules {
     pub allow_cidrs: Vec<Cidr>,
     #[serde(default)]
     pub deny_cidrs: Vec<Cidr>,
+    /// Admits ports that are denied by default (`DEFAULT_DENIED_PORTS`).
+    #[serde(default)]
+    pub allow_ports: Vec<u16>,
 }
+
+/// Ports refused unless a device's `allow_ports` lists them: 25 (SMTP), so a
+/// device cannot send mail from the hub's address by default.
+pub const DEFAULT_DENIED_PORTS: &[u16] = &[25];
+
+/// Upper bounds accepted for limits (the CLI refuses more; the hub clamps a
+/// hand-edited store to them).
+pub const MAX_CONCURRENT: u32 = 256;
+pub const MAX_OPENS_PER_MINUTE: u32 = 60_000;
+pub const MAX_BYTES_PER_SEC: u64 = 10_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
@@ -122,8 +142,58 @@ impl Default for Limits {
     }
 }
 
+impl Limits {
+    /// Refuses values outside the accepted ranges.
+    pub fn validate(&self) -> Result<(), LinkError> {
+        if !(1..=MAX_CONCURRENT).contains(&self.max_concurrent) {
+            return Err(LinkError::Store(format!("concurrent must be 1..={MAX_CONCURRENT}")));
+        }
+        if !(1..=MAX_OPENS_PER_MINUTE).contains(&self.opens_per_minute) {
+            return Err(LinkError::Store(format!("per-minute must be 1..={MAX_OPENS_PER_MINUTE}")));
+        }
+        if self.bytes_per_sec > MAX_BYTES_PER_SEC {
+            return Err(LinkError::Store(format!("bytes-per-sec must be 0..={MAX_BYTES_PER_SEC}")));
+        }
+        Ok(())
+    }
+
+    /// The same limits forced into the accepted ranges (for a store that was
+    /// edited by hand).
+    pub fn clamped(self) -> Limits {
+        Limits {
+            max_concurrent: self.max_concurrent.clamp(1, MAX_CONCURRENT),
+            opens_per_minute: self.opens_per_minute.clamp(1, MAX_OPENS_PER_MINUTE),
+            bytes_per_sec: self.bytes_per_sec.min(MAX_BYTES_PER_SEC),
+        }
+    }
+}
+
 fn normalize(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Suffixes that never name a public DNS host: they resolve through mDNS,
+/// LLMNR, NetBIOS or the local network's own resolver.
+const NON_PUBLIC_SUFFIXES: &[&str] = &["localhost", "local", "home.arpa", "internal", "lan"];
+
+/// Why `host` (a name, not a literal) is not a public DNS name, if it is not.
+pub fn non_public_name(host: &str) -> Option<&'static str> {
+    let h = normalize(host);
+    if !h.contains('.') {
+        return Some("a single-label name (resolved on the hub's local network)");
+    }
+    NON_PUBLIC_SUFFIXES
+        .iter()
+        .any(|s| suffix_matches(&h, s))
+        .then_some("a local-only name (resolved on the hub's local network)")
+}
+
+/// Stage 0: the port.
+pub fn check_port(rules: &Rules, port: u16) -> Result<(), String> {
+    if DEFAULT_DENIED_PORTS.contains(&port) && !rules.allow_ports.contains(&port) {
+        return Err(format!("port {port} is denied by default"));
+    }
+    Ok(())
 }
 
 /// `suffix` matches the name itself and every name under it, on label
@@ -142,31 +212,39 @@ pub fn check_host(rules: &Rules, host: &str) -> Result<(), String> {
     {
         return Err(format!("domain denied ({s})"));
     }
+    let allowed_name = literal.is_none() && rules.allow_suffixes.iter().any(|s| suffix_matches(host, s));
+    if literal.is_none()
+        && !allowed_name
+        && let Some(why) = non_public_name(host)
+    {
+        return Err(why.into());
+    }
     if !rules.allow_suffixes.is_empty() {
         match literal {
             Some(ip) if rules.allow_cidrs.iter().any(|c| c.contains(ip)) => {}
             Some(_) => return Err("address literals are not allowed for this device".into()),
-            None if rules.allow_suffixes.iter().any(|s| suffix_matches(host, s)) => {}
+            None if allowed_name => {}
             None => return Err("domain not on this device's allow list".into()),
         }
     }
     Ok(())
 }
 
-/// Stage 2: one resolved address.
+/// Stage 2: one resolved address. The error names the class only, never
+/// the address (the caller logs the address).
 pub fn check_addr(rules: &Rules, lan: &[Cidr], ip: IpAddr) -> Result<(), String> {
     let ip = ip.to_canonical();
     if rules.deny_cidrs.iter().any(|c| c.contains(ip)) {
-        return Err(format!("address denied ({ip})"));
+        return Err("address denied by this device's rules".into());
     }
     if rules.allow_cidrs.iter().any(|c| c.contains(ip)) {
         return Ok(());
     }
     if lan.iter().any(|c| c.contains(ip)) {
-        return Err(format!("the hub's local network ({ip})"));
+        return Err("the hub's local network".into());
     }
     if let Some(class) = denied_class(ip) {
-        return Err(format!("{class} address ({ip})"));
+        return Err(format!("{class} address"));
     }
     Ok(())
 }
@@ -190,6 +268,8 @@ fn class_v4(ip: Ipv4Addr) -> Option<&'static str> {
         [169, 254, ..] => "link-local",
         [100, b, ..] if (64..=127).contains(&b) => "shared (CGNAT)",
         [192, 0, 0, _] => "protocol assignment",
+        [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _] => "documentation",
+        [192, 88, 99, _] => "6to4 relay anycast",
         [198, b, ..] if b == 18 || b == 19 => "benchmarking",
         [a, ..] if (224..=239).contains(&a) => "multicast",
         [a, ..] if a >= 240 => "reserved",
@@ -213,6 +293,40 @@ fn class_v6(ip: Ipv6Addr) -> Option<&'static str> {
     }
     if s[0] & 0xff00 == 0xff00 {
         return Some("multicast");
+    }
+    // ::/96, IPv4-compatible (deprecated; :: and ::1 are caught above).
+    if s[..6] == [0; 6] {
+        return Some("IPv4-compatible");
+    }
+    // ::ffff:0:0/96, SIIT IPv4-translated (::ffff:0:0:0/96 is IPv4-mapped,
+    // which `to_canonical` already turned into IPv4).
+    if s[..4] == [0; 4] && s[4] == 0xffff && s[5] == 0 {
+        return Some("IPv4-translated");
+    }
+    // 100::/64, discard-only.
+    if s[..4] == [0x100, 0, 0, 0] {
+        return Some("discard-only");
+    }
+    // 64:ff9b:1::/48, local-use NAT64 (RFC 8215): translated by a local box.
+    if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1 {
+        return Some("local-use NAT64");
+    }
+    // 2001::/32, Teredo (an IPv4 address and port inside, tunnelled).
+    if s[0] == 0x2001 && s[1] == 0 {
+        return Some("Teredo");
+    }
+    // 2001:2::/48, benchmarking.
+    if s[0] == 0x2001 && s[1] == 2 && s[2] == 0 {
+        return Some("benchmarking");
+    }
+    // 2001:db8::/32, documentation.
+    if s[0] == 0x2001 && s[1] == 0xdb8 {
+        return Some("documentation");
+    }
+    // ISATAP interface ids (::0:5efe:a.b.c.d and ::200:5efe:a.b.c.d in any
+    // prefix): an IPv4 address inside, tunnelled.
+    if s[4] & 0xfdff == 0 && s[5] == 0x5efe {
+        return Some("ISATAP");
     }
     // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) carry an IPv4 address.
     if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
@@ -238,7 +352,16 @@ pub struct Bucket {
 
 impl Bucket {
     pub fn new(capacity: f64, per_sec: f64) -> Self {
-        Bucket { capacity, tokens: capacity, per_sec, last: Instant::now() }
+        Self::new_at(capacity, per_sec, Instant::now())
+    }
+
+    pub fn new_at(capacity: f64, per_sec: f64, now: Instant) -> Self {
+        Bucket { capacity, tokens: capacity, per_sec, last: now }
+    }
+
+    pub fn is_full(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= self.capacity
     }
 
     fn refill(&mut self, now: Instant) {
@@ -257,14 +380,37 @@ impl Bucket {
         }
     }
 
+    /// A rate of 0 means unlimited: nothing is debited.
     pub fn debit(&mut self, n: f64, now: Instant) -> Duration {
+        if self.per_sec <= 0.0 {
+            return Duration::ZERO;
+        }
         self.refill(now);
         self.tokens -= n;
-        if self.tokens >= 0.0 || self.per_sec <= 0.0 {
+        if self.tokens >= 0.0 {
             Duration::ZERO
         } else {
             Duration::from_secs_f64(-self.tokens / self.per_sec)
         }
+    }
+
+    /// Changes capacity and rate without forgetting what was already taken:
+    /// the level is kept, cut to the new capacity (a debt stays a debt).
+    pub fn set_rate(&mut self, capacity: f64, per_sec: f64, now: Instant) {
+        if self.per_sec > 0.0 {
+            self.refill(now);
+        } else {
+            self.tokens = capacity;
+            self.last = now;
+        }
+        self.capacity = capacity;
+        self.per_sec = per_sec;
+        self.tokens = self.tokens.min(capacity);
+    }
+
+    /// Returns tokens taken for something that turned out not to count.
+    pub fn refund(&mut self, n: f64) {
+        self.tokens = (self.tokens + n).min(self.capacity);
     }
 }
 
@@ -279,16 +425,111 @@ mod tests {
     #[test]
     fn default_classes_are_denied() {
         let r = Rules::default();
-        for a in [
-            "127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.1.1", "100.64.0.1",
-            "0.0.0.0", "255.255.255.255", "224.0.0.1", "::1", "::", "fe80::1", "fd00::1", "ff02::1",
-            "::ffff:192.168.0.1", "64:ff9b::a00:1", "2002:c0a8:0101::1",
-        ] {
-            assert!(check_addr(&r, &[], ip(a)).is_err(), "{a} should be denied");
+        // (address, expected class), one row per form.
+        let denied: &[(&str, &str)] = &[
+            ("127.0.0.1", "loopback"),
+            ("10.1.2.3", "private"),
+            ("172.16.0.1", "private"),
+            ("172.31.255.255", "private"),
+            ("192.168.1.1", "private"),
+            ("169.254.1.1", "link-local"),
+            ("100.64.0.1", "shared (CGNAT)"),
+            ("0.0.0.0", "unspecified"),
+            ("255.255.255.255", "reserved"),
+            ("224.0.0.1", "multicast"),
+            ("192.0.0.8", "protocol assignment"),
+            ("192.0.2.1", "documentation"),
+            ("198.51.100.7", "documentation"),
+            ("203.0.113.9", "documentation"),
+            ("192.88.99.1", "6to4 relay anycast"),
+            ("198.18.0.1", "benchmarking"),
+            ("::1", "loopback"),
+            ("::", "unspecified"),
+            ("fe80::1", "link-local"),
+            ("fec0::1", "link-local"),
+            ("fd00::1", "unique-local"),
+            ("ff02::1", "multicast"),
+            ("::ffff:192.168.0.1", "private"),
+            ("::8.8.8.8", "IPv4-compatible"),
+            ("::0.0.0.2", "IPv4-compatible"),
+            ("::ffff:0:8.8.8.8", "IPv4-translated"),
+            ("::ffff:0:a00:1", "IPv4-translated"),
+            ("64:ff9b::a00:1", "private"),
+            ("64:ff9b:1::808:808", "local-use NAT64"),
+            ("2002:c0a8:0101::1", "private"),
+            ("2001:0:4136:e378:8000:63bf:3fff:fdd2", "Teredo"),
+            ("2001:db8::1", "documentation"),
+            ("2001:2::1", "benchmarking"),
+            ("100::1", "discard-only"),
+            ("2a01:4f8::5efe:c0a8:101", "ISATAP"),
+            ("2a01:4f8::200:5efe:808:808", "ISATAP"),
+        ];
+        for (a, class) in denied {
+            assert_eq!(denied_class(ip(a)), Some(*class), "{a}");
+            let why = check_addr(&r, &[], ip(a)).unwrap_err();
+            assert!(!why.contains(a.trim_start_matches("::ffff:")), "the refusal must not carry the address: {why}");
         }
-        for a in ["1.1.1.1", "172.32.0.1", "100.128.0.1", "2606:4700::1111", "::ffff:8.8.8.8"] {
+        for a in ["1.1.1.1", "172.32.0.1", "100.128.0.1", "2606:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808", "2002:808:808::1", "2001:4860::8888"] {
             assert!(check_addr(&r, &[], ip(a)).is_ok(), "{a} should be allowed");
         }
+    }
+
+    #[test]
+    fn non_public_names_are_refused_unless_allowed_by_name() {
+        let r = Rules::default();
+        for h in ["printer", "printer.", "localhost", "LOCALHOST.", "a.localhost", "nas.local", "router.home.arpa", "x.internal", "box.lan"] {
+            assert!(check_host(&r, h).is_err(), "{h} should be refused");
+        }
+        for h in ["example.com", "a.b.example.org", "1.2.3.4", "2001:4860::8888", "[2001:4860::8888]"] {
+            assert!(check_host(&r, h).is_ok(), "{h} should pass the name stage");
+        }
+        let r = Rules { allow_suffixes: vec!["printer".into(), "nas.local".into()], ..Default::default() };
+        assert!(check_host(&r, "printer").is_ok());
+        assert!(check_host(&r, "nas.local").is_ok());
+        assert!(check_host(&r, "other.local").is_err());
+    }
+
+    #[test]
+    fn port_25_is_denied_unless_allowed() {
+        assert!(check_port(&Rules::default(), 25).is_err());
+        assert!(check_port(&Rules::default(), 443).is_ok());
+        let r = Rules { allow_ports: vec![25], ..Default::default() };
+        assert!(check_port(&r, 25).is_ok());
+    }
+
+    #[test]
+    fn limits_are_range_checked() {
+        assert!(Limits::default().validate().is_ok());
+        assert!(Limits { max_concurrent: 0, ..Default::default() }.validate().is_err());
+        assert!(Limits { max_concurrent: MAX_CONCURRENT + 1, ..Default::default() }.validate().is_err());
+        assert!(Limits { opens_per_minute: 0, ..Default::default() }.validate().is_err());
+        assert!(Limits { bytes_per_sec: MAX_BYTES_PER_SEC + 1, ..Default::default() }.validate().is_err());
+        let c = Limits { max_concurrent: u32::MAX, opens_per_minute: 0, bytes_per_sec: u64::MAX }.clamped();
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn bucket_rate_change_keeps_what_was_taken() {
+        let t0 = Instant::now();
+        let mut b = Bucket::new(10.0, 1.0);
+        for _ in 0..8 {
+            assert!(b.take(1.0, t0));
+        }
+        // 2 left; a larger capacity does not refill it.
+        b.set_rate(100.0, 1.0, t0);
+        assert!(b.take(2.0, t0));
+        assert!(!b.take(1.0, t0));
+        // A smaller capacity cuts the level.
+        let mut b = Bucket::new(10.0, 1.0);
+        b.set_rate(3.0, 1.0, t0);
+        assert!(b.take(3.0, t0));
+        assert!(!b.take(1.0, t0));
+        // Unlimited debits nothing; a later limit starts full.
+        let mut b = Bucket::new(0.0, 0.0);
+        assert_eq!(b.debit(1e9, t0), Duration::ZERO);
+        b.set_rate(100.0, 100.0, t0);
+        assert_eq!(b.debit(100.0, t0), Duration::ZERO);
+        assert!(b.debit(50.0, t0) > Duration::ZERO);
     }
 
     #[test]
@@ -302,8 +543,11 @@ mod tests {
 
     #[test]
     fn hub_lan_is_denied() {
-        let lan: Vec<Cidr> = vec!["203.0.113.0/24".parse().unwrap()];
-        assert!(check_addr(&Rules::default(), &lan, ip("203.0.113.9")).is_err());
+        let lan: Vec<Cidr> = vec!["81.2.69.160/28".parse().unwrap(), "2a01:4f8:1:2::/64".parse().unwrap()];
+        let r = Rules::default();
+        assert_eq!(check_addr(&r, &lan, ip("81.2.69.161")).unwrap_err(), "the hub's local network");
+        assert!(check_addr(&r, &lan, ip("2a01:4f8:1:2::99")).is_err());
+        assert!(check_addr(&r, &lan, ip("81.2.69.200")).is_ok());
     }
 
     #[test]
