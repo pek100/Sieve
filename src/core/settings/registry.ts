@@ -445,8 +445,8 @@ export const REGISTRY = {
   // Keys are the names in the policy's `tracking` (sieve_ipc::TRACKING_NAMES), in
   // its order, which is append-only; the block shows them by level.
   "tracking.gpc": trackingOption({
-    label: "Ask sites not to track you",
-    help: "Sends the Global Privacy Control and Do Not Track signals with every request, which sites that honour them treat as a no to selling or sharing what you do.",
+    label: "Send Global Privacy Control",
+    help: "Asks every site you open not to sell or share what you do there.",
     preset: "minimal",
   }),
   "tracking.searchQueries": trackingOption({

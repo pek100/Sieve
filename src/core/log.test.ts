@@ -199,8 +199,8 @@ describe("tracking protection's changes (plan 2026-11-09)", () => {
   it.each([
     [{ what: "queryParams", count: 3 }, "Removed 3 tracking parameters"],
     [{ what: "queryParams", count: 1 }, "Removed 1 tracking parameter"],
-    [{ what: "gpc", count: 2 }, "Sent Global Privacy Control and Do Not Track"],
-    [{ what: "gpc", count: 1 }, "Sent a do-not-track signal"],
+    [{ what: "gpc", count: 2 }, "Sent Global Privacy Control"], // an older engine's row, which also counted DNT
+    [{ what: "gpc", count: 1 }, "Sent Global Privacy Control"],
     [{ what: "clientData", count: 1 }, "Removed the X-Client-Data header"],
     [{ what: "searchQueries", count: 1 }, "Told the site only where you came from, not the page"],
     [{ what: "referrer", count: 1 }, "Removed the page you came from"],

@@ -83,7 +83,9 @@ export function changeWords(change: LogChange): string {
     case "queryParams":
       return plural(n, "Removed 1 tracking parameter", "Removed # tracking parameters");
     case "gpc":
-      return n >= 2 ? "Sent Global Privacy Control and Do Not Track" : "Sent a do-not-track signal";
+      // Whatever the count: an engine before GPC-only also added DNT and
+      // counted 2, and what its rows still say is true of them.
+      return "Sent Global Privacy Control";
     case "clientData":
       return "Removed the X-Client-Data header";
     case "searchQueries":

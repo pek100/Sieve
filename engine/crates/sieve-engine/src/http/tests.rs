@@ -1405,12 +1405,12 @@ arms!(tracking_changes_a_requests_head_and_the_log_says_how, |arm| async move {
         let mut c = tracking_setup(arm, alpn, tracking_policy(&["gpc", "clientData", "referrer"], false)).await;
         assert_eq!(c.s.client.get(HOST, "/pixel.gif", &CROSS_SITE_IMAGE).await.status(), StatusCode::OK, "{alpn}");
         let asked = last_asked(&c.s.origin);
-        assert_eq!((asked.get("sec-gpc").map(|v| v.to_str().unwrap()), asked.get("dnt").map(|v| v.to_str().unwrap())), (Some("1"), Some("1")), "{alpn}");
+        assert_eq!((asked.get("sec-gpc").map(|v| v.to_str().unwrap()), asked.get("dnt")), (Some("1"), None), "{alpn}: GPC only, no DNT");
         assert!(!asked.contains_key("x-client-data") && !asked.contains_key("referer"), "{alpn}: {asked:?}");
         assert_eq!(asked.get("sec-fetch-dest").unwrap(), "image", "{alpn}: what no protection names is untouched");
         let log = rows(&c.s.rig);
         let row = log.iter().find(|r| r.url.as_deref() == Some("https://site.example/pixel.gif")).expect("a row");
-        assert_eq!(changes(row), [("gpc", 2), ("clientData", 1), ("referrer", 1)], "{alpn}");
+        assert_eq!(changes(row), [("gpc", 1), ("clientData", 1), ("referrer", 1)], "{alpn}");
         assert_eq!(row.outcome, LogOutcome::Passed { reason: "no_rule".into() }, "{alpn}: what the rules did stays the outcome");
         // A same-site request keeps its referrer: only cross-site ones lose it.
         let same = [("sec-fetch-dest", "image"), ("sec-fetch-site", "same-origin"), ("referer", "https://site.example/a?b=c")];
@@ -1632,11 +1632,12 @@ arms!(a_document_exception_keeps_the_page_script_out, |arm| async move {
     c.end().await;
 });
 
-// Second review P3-9: the headers said GPC and DNT while the page read neither.
+// Second review P3-9: the headers said GPC while the page did not read it.
+// GPC only: the page's doNotTrack stays the browser's own.
 arms!(gpc_tells_the_page_what_the_headers_say_when_the_page_is_rewritten, |arm| async move {
     let mut c = content_setup_with(arm, H2, list_rules(CONTENT_RULES), tracking_policy(&["gpc"], true), InjectLimits::default()).await;
     let page = String::from_utf8(body_of(c.s.client.get(HOST, "/page/identity", &NAVIGATION).await).await).unwrap();
-    assert!(page.contains("globalPrivacyControl") && page.contains("doNotTrack"), "{page}");
+    assert!(page.contains("globalPrivacyControl") && !page.contains("doNotTrack"), "{page}");
     c.end().await;
     let mut alone = tracking_setup(arm, H2, tracking_policy(&["gpc"], true)).await;
     let response = alone.s.client.get(HOST, "/page/identity", &NAVIGATION).await;
