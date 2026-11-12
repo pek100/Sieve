@@ -2424,7 +2424,9 @@ dependencies = [
  "aws-lc-rs",
  "data-encoding",
  "futures",
+ "libc",
  "proptest",
+ "rpassword",
  "rustls",
  "serde",
  "serde_json",
@@ -2434,7 +2436,9 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "windows-sys 0.61.2",
  "yamux",
+ "zeroize",
 ]
 
 [[package]]

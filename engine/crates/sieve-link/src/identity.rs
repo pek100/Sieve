@@ -86,7 +86,9 @@ impl<'de> serde::Deserialize<'de> for Fingerprint {
 /// An Ed25519 key pair. The private half never leaves this struct except to
 /// its own file (`save`); `Debug` shows the fingerprint only.
 pub struct Identity {
-    pkcs8: Vec<u8>,
+    /// Wiped when dropped. (The copy handed to rustls / aws-lc-rs for
+    /// signing is theirs; aws-lc frees its key with its own cleansing.)
+    pkcs8: zeroize::Zeroizing<Vec<u8>>,
     spki: Vec<u8>,
     key: Arc<CertifiedKey>,
 }
@@ -106,6 +108,8 @@ impl Identity {
 
     pub fn from_pkcs8(der: &[u8]) -> Result<Self> {
         let provider = crate::tls::provider();
+        // The provider parses this copy into its own key object; the DER
+        // wrapper is dropped inside rustls (not wiped: out of our hands).
         let signer = provider
             .key_provider
             .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der.to_vec())))
@@ -117,7 +121,7 @@ impl Identity {
             .to_vec();
         // A raw public key (RFC 7250) travels where a certificate would.
         let key = Arc::new(CertifiedKey::new(vec![CertificateDer::from(spki.clone())], signer));
-        Ok(Identity { pkcs8: der.to_vec(), spki, key })
+        Ok(Identity { pkcs8: zeroize::Zeroizing::new(der.to_vec()), spki, key })
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
@@ -134,8 +138,9 @@ impl Identity {
 
     /// Loads the key from `path`.
     pub fn load(path: &Path) -> Result<Self> {
-        let der = std::fs::read(path)
-            .map_err(|e| LinkError::Store(format!("cannot read {}: {e}", path.display())))?;
+        let der = zeroize::Zeroizing::new(
+            std::fs::read(path).map_err(|e| LinkError::Store(format!("cannot read {}: {e}", path.display())))?,
+        );
         Self::from_pkcs8(&der)
     }
 
@@ -169,11 +174,3 @@ impl Identity {
     }
 }
 
-impl Drop for Identity {
-    fn drop(&mut self) {
-        // Best effort: overwrite our copy of the private key.
-        for b in self.pkcs8.iter_mut() {
-            unsafe { std::ptr::write_volatile(b, 0) };
-        }
-    }
-}

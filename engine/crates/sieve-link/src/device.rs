@@ -12,11 +12,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{LinkError, Result};
+use crate::gate::{Gate, GateConfig};
 use crate::identity::{Fingerprint, Identity};
 use crate::mux::{self, LinkIo, Mode, MuxHandle};
 use crate::pairing::{self, PairingCode};
@@ -66,7 +67,13 @@ pub struct LinkConfig {
     pub hub_wait: Duration,
     pub keepalive: Duration,
     pub dead_after: Duration,
+    /// Dialling the hub: TCP connect plus TLS handshake.
     pub handshake_timeout: Duration,
+    /// `Listen`: an accepted connection must finish its handshake within
+    /// this (a silent socket frees its slot fast).
+    pub accept_timeout: Duration,
+    /// `Listen`: admission before authentication.
+    pub gate: GateConfig,
     pub request_timeout: Duration,
 }
 
@@ -80,10 +87,16 @@ impl LinkConfig {
             keepalive: Duration::from_secs(15),
             dead_after: Duration::from_secs(45),
             handshake_timeout: Duration::from_secs(10),
+            accept_timeout: Duration::from_secs(3),
+            gate: GateConfig::device(),
             request_timeout: Duration::from_secs(15),
         }
     }
 }
+
+/// How long a device waiting for its hub gives one accepted connection to
+/// finish the handshake while pairing.
+const PAIR_ACCEPT_LIMIT: Duration = Duration::from_secs(3);
 
 struct ClientInner {
     cfg: LinkConfig,
@@ -236,22 +249,23 @@ async fn dial_loop(inner: Arc<ClientInner>, addr: String, tls_cfg: Arc<rustls::C
 }
 
 async fn listen_loop(inner: Arc<ClientInner>, listener: TcpListener, tls_cfg: Arc<rustls::ServerConfig>) {
-    let slots = Arc::new(Semaphore::new(8));
+    let gate = Gate::new(inner.cfg.gate);
     loop {
         let r = tokio::select! {
             _ = inner.shutdown.cancelled() => return,
             r = listener.accept() => r,
         };
-        let Ok((tcp, _)) = r else {
+        let Ok((tcp, peer)) = r else {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
-        let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
+        let Some(ticket) = gate.admit(peer.ip()) else { continue };
         let inner = inner.clone();
         let tls_cfg = tls_cfg.clone();
         tokio::spawn(async move {
-            let est = tls::accept(tcp, tls_cfg, inner.cfg.handshake_timeout).await;
-            drop(permit);
+            let Some(pass) = ticket.enter().await else { return };
+            let est = tls::accept(tcp, tls_cfg, inner.cfg.accept_timeout).await;
+            drop(pass);
             if let Ok(est) = est {
                 run_link(inner, est).await;
             }
@@ -327,34 +341,61 @@ async fn keepalive(h: MuxHandle, mut io: LinkIo, every: Duration, dead_after: Du
 pub enum PairVia<'a> {
     /// Dial the hub (the code's address, or another).
     Dial(String),
-    /// Wait on this listener for the hub to dial in.
+    /// A TCP connection to the hub the caller made (e.g. from a chosen
+    /// local address, or through a proxy).
+    Connected(TcpStream),
+    /// Wait on this listener for the hub to dial in (as long as the caller
+    /// lets this future run).
     Listener(&'a TcpListener),
+}
+
+/// Waits on `l` for the pinned hub: handshakes run side by side behind a
+/// gate, so strangers' silent connections cannot hold the hub out.
+async fn accept_hub(l: &TcpListener, cfg: Arc<rustls::ServerConfig>) -> Result<Established> {
+    let gate = Gate::new(GateConfig::device());
+    let mut set = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            r = l.accept() => {
+                let Ok((tcp, peer)) = r else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                let Some(ticket) = gate.admit(peer.ip()) else { continue };
+                let cfg = cfg.clone();
+                set.spawn(async move {
+                    let _pass = ticket.enter().await?;
+                    tls::accept(tcp, cfg, PAIR_ACCEPT_LIMIT).await.ok()
+                });
+            }
+            Some(done) = set.join_next(), if !set.is_empty() => {
+                // Anyone may connect; only the pinned hub completes the handshake.
+                if let Ok(Some(est)) = done {
+                    return Ok(est);
+                }
+            }
+        }
+    }
 }
 
 /// Redeems a pairing code: connects to the hub the code names (pinning its
 /// key), proves knowledge of the code's secret bound to this session, and
 /// returns the hub's name. The caller stores the hub's fingerprint.
+///
+/// `limit` bounds dialling and, once connected, the exchange; waiting on a
+/// listener for the hub to dial in is bounded by the caller.
 pub async fn pair(identity: &Identity, code: &PairingCode, name: &str, via: PairVia<'_>, limit: Duration) -> Result<String> {
     if code.is_expired(crate::now_secs()) {
         return Err(LinkError::Pairing("the code has expired; ask the hub's owner for a new one".into()));
     }
     let policy: Arc<dyn PeerPolicy> = Arc::new(Pinned(code.hub));
+    let est = match via {
+        PairVia::Dial(addr) => tls::dial(&addr, tls::client_config(identity, policy)?, limit).await?,
+        PairVia::Connected(tcp) => tls::connect(tcp, tls::client_config(identity, policy)?, limit).await?,
+        PairVia::Listener(l) => accept_hub(l, tls::server_config(identity, policy)?).await?,
+    };
+    let me = identity.fingerprint();
     let fut = async {
-        let est = match via {
-            PairVia::Dial(addr) => tls::dial(&addr, tls::client_config(identity, policy)?, limit).await?,
-            PairVia::Listener(l) => {
-                let cfg = tls::server_config(identity, policy)?;
-                // Anyone may connect to the listener; only the pinned hub
-                // completes the handshake.
-                loop {
-                    let (tcp, _) = l.accept().await?;
-                    if let Ok(est) = tls::accept(tcp, cfg.clone(), limit).await {
-                        break est;
-                    }
-                }
-            }
-        };
-        let me = identity.fingerprint();
         let proof = pairing::proof(&code.secret, &est.exporter, &me, &code.hub);
         let cancel = CancellationToken::new();
         let (h, task) = mux::spawn(est.io.compat(), Mode::Client, |_s| {}, cancel.clone());
@@ -376,11 +417,14 @@ pub async fn pair(identity: &Identity, code: &PairingCode, name: &str, via: Pair
         });
         match r? {
             Message::Response { status: Status::Ok, message } => Ok(message),
+            Message::Response { status: Status::Busy, .. } => Err(LinkError::Pairing(
+                "the hub was busy (other pairing attempts were in progress); the code is still valid, try again in a few seconds".into(),
+            )),
             Message::Response { message, .. } => Err(LinkError::Pairing(format!("the hub refused: {message}"))),
             _ => Err(LinkError::Pairing("unexpected answer".into())),
         }
     };
-    tokio::time::timeout(limit * 3, fut).await.map_err(|_| LinkError::Timeout("pairing"))?
+    tokio::time::timeout(limit, fut).await.map_err(|_| LinkError::Timeout("pairing"))?
 }
 
 /// A connection opened by `LinkClient::open`.

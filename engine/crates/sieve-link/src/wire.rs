@@ -14,7 +14,7 @@
 //! | 0x03 | Pair     | proof [32], name length u8 (0..=64), name (UTF-8)    |
 //! | 0x10 | Ping     | nonce u64                                            |
 //! | 0x11 | Pong     | nonce u64                                            |
-//! | 0x80 | Response | status u8, message length u8, message (UTF-8)        |
+//! | 0x80 | Response | status u8 (0..=7), message length u8, message (UTF-8) |
 //!
 //! A frame longer than MAX_FRAME is refused before its body is read, so a
 //! peer cannot make the reader allocate; bodies land in a fixed stack buffer.
@@ -43,6 +43,9 @@ pub enum Status {
     BadRequest,
     /// The pairing proof matched no outstanding code.
     PairingRefused,
+    /// The hub cannot open streams now (its audit log or store cannot be
+    /// used, or it cannot read its own network); nothing to do with the target.
+    Unavailable,
 }
 
 impl Status {
@@ -55,6 +58,7 @@ impl Status {
             Status::Unreachable => 4,
             Status::BadRequest => 5,
             Status::PairingRefused => 6,
+            Status::Unavailable => 7,
         }
     }
     fn from_u8(b: u8) -> Option<Self> {
@@ -66,6 +70,7 @@ impl Status {
             4 => Status::Unreachable,
             5 => Status::BadRequest,
             6 => Status::PairingRefused,
+            7 => Status::Unavailable,
             _ => return None,
         })
     }

@@ -5,8 +5,8 @@
 //! with yamux. Roles come from the keys, not from who dialled: a hub behind a
 //! home router can dial out to a device and still be the hub. The device asks
 //! for `connect host:port` streams; the hub resolves the name, applies that
-//! device's rules and limits, relays bytes it never decrypts, and writes one
-//! audit row per stream.
+//! device's rules and limits (its own machine and network denied by
+//! default), relays bytes it never decrypts, and audits every stream.
 //!
 //! The crate is licensed apart from the rest of Sieve and depends on none of
 //! its other crates (see README.md).
@@ -14,10 +14,13 @@
 pub mod audit;
 pub mod device;
 pub mod error;
+pub mod gate;
 pub mod hub;
 pub mod identity;
 pub mod mux;
+pub mod netif;
 pub mod pairing;
+pub mod perms;
 pub mod proxy;
 pub mod resolve;
 pub mod rules;

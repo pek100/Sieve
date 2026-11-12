@@ -40,6 +40,28 @@ serde_json.workspace = true
 thiserror.workspace = true
 data-encoding = "2"
 socket2 = "0.6"
+# Wipes our own copies of key bytes and pairing secrets when dropped.
+zeroize = "1"
+# Reads a pairing code at a prompt without echoing it.
+rpassword = "7"
+
+# Interface list (GetAdaptersAddresses), file identity, and the owner-only
+# DACL on the store directory and its files.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+# getifaddrs, geteuid.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 proptest.workspace = true

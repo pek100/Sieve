@@ -216,13 +216,22 @@ fn finish(io: TlsStream<TcpStream>, remote: SocketAddr) -> Result<Established> {
 pub async fn dial(addr: &str, cfg: Arc<ClientConfig>, limit: Duration) -> Result<Established> {
     let fut = async {
         let tcp = TcpStream::connect(addr).await?;
-        tune(&tcp);
-        let remote = tcp.peer_addr()?;
-        let name = ServerName::try_from(SERVER_NAME).expect("static name");
-        let tls = TlsConnector::from(cfg).connect(name, tcp).await.map_err(|e| LinkError::Tls(e.to_string()))?;
-        finish(TlsStream::Client(tls), remote)
+        client_handshake(tcp, cfg).await
     };
     tokio::time::timeout(limit, fut).await.map_err(|_| LinkError::Timeout("handshake"))?
+}
+
+/// Runs the handshake as the TLS client on a socket the caller connected.
+pub async fn connect(tcp: TcpStream, cfg: Arc<ClientConfig>, limit: Duration) -> Result<Established> {
+    tokio::time::timeout(limit, client_handshake(tcp, cfg)).await.map_err(|_| LinkError::Timeout("handshake"))?
+}
+
+async fn client_handshake(tcp: TcpStream, cfg: Arc<ClientConfig>) -> Result<Established> {
+    tune(&tcp);
+    let remote = tcp.peer_addr()?;
+    let name = ServerName::try_from(SERVER_NAME).expect("static name");
+    let tls = TlsConnector::from(cfg).connect(name, tcp).await.map_err(|e| LinkError::Tls(e.to_string()))?;
+    finish(TlsStream::Client(tls), remote)
 }
 
 /// Runs the handshake on an accepted socket as the TLS server.

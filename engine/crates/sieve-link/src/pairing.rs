@@ -29,8 +29,12 @@ const VERSION: u8 = 1;
 const PROOF_LABEL: &[u8] = b"sieve-link pair proof v1";
 /// Default code lifetime.
 pub const DEFAULT_TTL_SECS: u64 = 600;
+/// Accepted code lifetimes.
+pub const MIN_TTL_SECS: u64 = 30;
+pub const MAX_TTL_SECS: u64 = 86_400;
 const MAX_ADDR: usize = 200;
 
+/// `Debug` never shows the secret, and our copy is wiped when dropped.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingCode {
     pub hub: Fingerprint,
@@ -52,14 +56,24 @@ impl std::fmt::Debug for PairingCode {
     }
 }
 
+impl Drop for PairingCode {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.secret);
+    }
+}
+
 impl PairingCode {
     pub fn new(hub: Fingerprint, ttl_secs: u64, addr: Option<String>) -> Result<Self> {
         if addr.as_ref().is_some_and(|a| a.is_empty() || a.len() > MAX_ADDR) {
             return Err(LinkError::Pairing("the address must be 1..=200 bytes".into()));
         }
+        if !(MIN_TTL_SECS..=MAX_TTL_SECS).contains(&ttl_secs) {
+            return Err(LinkError::Pairing(format!("the lifetime must be {MIN_TTL_SECS}..={MAX_TTL_SECS} seconds")));
+        }
+        let expires_at = crate::now_secs().checked_add(ttl_secs).ok_or_else(|| LinkError::Pairing("the clock is out of range".into()))?;
         let mut secret = [0u8; 16];
         aws_lc_rs::rand::fill(&mut secret).map_err(|_| LinkError::Pairing("no randomness".into()))?;
-        Ok(PairingCode { hub, secret, expires_at: crate::now_secs() + ttl_secs, addr })
+        Ok(PairingCode { hub, secret, expires_at, addr })
     }
 
     pub fn is_expired(&self, now_secs: u64) -> bool {
@@ -170,6 +184,16 @@ mod tests {
             // Case and spacing do not matter.
             assert_eq!(PairingCode::decode(&format!("  {}  ", s.to_ascii_lowercase().replacen("sl1-", "SL1-", 1))).unwrap(), c);
         }
+    }
+
+    #[test]
+    fn the_lifetime_is_range_checked() {
+        assert!(PairingCode::new(fp(1), 0, None).is_err());
+        assert!(PairingCode::new(fp(1), MIN_TTL_SECS - 1, None).is_err());
+        assert!(PairingCode::new(fp(1), MAX_TTL_SECS + 1, None).is_err());
+        assert!(PairingCode::new(fp(1), u64::MAX, None).is_err());
+        assert!(PairingCode::new(fp(1), MIN_TTL_SECS, None).is_ok());
+        assert!(PairingCode::new(fp(1), MAX_TTL_SECS, None).is_ok());
     }
 
     #[test]
