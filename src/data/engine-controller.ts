@@ -102,6 +102,12 @@ const DNS_CLIENT_CAPTURE = DNS_CLIENT_CAPTURE_KEY as SettingKey;
  * only ever the user's choice.
  */
 export const DNS_UNREACHABLE_BANNER = `No encrypted DNS server answers on this network, so sites may not load. Hotel and airport Wi-Fi often needs plain DNS to show its sign-in page: you can turn off ${REGISTRY[DNS_ENCRYPTION].label} in Settings > Filtering.`;
+/**
+ * The same while Windows' own lookups are caught (`dns_capture` working): then
+ * the capture is what keeps a sign-in page from opening, and the smaller switch
+ * is the capture's.
+ */
+export const DNS_UNREACHABLE_CAPTURED_BANNER = `No encrypted DNS server answers on this network, so sites may not load. Hotel and airport Wi-Fi often needs plain DNS to show its sign-in page: you can turn off ${REGISTRY[DNS_CLIENT_CAPTURE].label} in Settings > Filtering.`;
 /** "Wi-Fi" when the engine says the network is on a Wi-Fi adapter (`wifi_sign_in.wifi`), else "network". */
 export const signInPlace = (wifi: boolean | undefined) => (wifi === true ? "Wi-Fi" : "network");
 /**
@@ -225,7 +231,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
   // The switch is read only after the settings loaded: before that it reads as its default (off).
   let settingsReady = false;
   let banner: number | null = null;
-  let dnsBanner: number | null = null;
+  let dnsBanner: { id: number; text: string } | null = null;
   // The sign-in notice on show and the network it names; a network whose notice the user dismissed is not offered again.
   let signInNotice: { id: number; network: string } | null = null;
   let signInDismissed: string | null = null;
@@ -309,11 +315,13 @@ export function createEngineController({ engine, store, clock, settings, checks,
     const signIn = engineStatus(e)?.wifi_sign_in;
     followSignIn(signIn);
     // The sign-in notice says what the unreachable one would, with the step that helps here instead.
-    const unreachable = engineStatus(e)?.dns_unreachable === true && signIn === undefined;
-    if (unreachable && dnsBanner === null) dnsBanner = notices.push({ kind: "error", surface: "banner", text: DNS_UNREACHABLE_BANNER });
-    if (!unreachable && dnsBanner !== null) {
-      notices.dismiss(dnsBanner);
-      dnsBanner = null;
+    // Dismissed, the engine still names the network: the unreachable banner says what is true again.
+    const noticeGone = signIn !== undefined && signIn.paused_left_s === undefined && signIn.network === signInDismissed;
+    const unreachable = engineStatus(e)?.dns_unreachable === true && (signIn === undefined || noticeGone);
+    const dnsText = unreachable ? (engineStatus(e)?.dns_capture?.state === "working" ? DNS_UNREACHABLE_CAPTURED_BANNER : DNS_UNREACHABLE_BANNER) : null;
+    if (dnsText !== (dnsBanner?.text ?? null)) {
+      if (dnsBanner !== null) notices.dismiss(dnsBanner.id);
+      dnsBanner = dnsText === null ? null : { id: notices.push({ kind: "error", surface: "banner", text: dnsText }), text: dnsText };
     }
     const text = updateBanner(engineUpdate(e));
     if (text !== (update?.text ?? null)) {
@@ -619,7 +627,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
         probeNow = async () => {};
         if (banner !== null) notices.dismiss(banner);
         banner = null;
-        if (dnsBanner !== null) notices.dismiss(dnsBanner);
+        if (dnsBanner !== null) notices.dismiss(dnsBanner.id);
         dnsBanner = null;
         if (signInNotice !== null) notices.dismiss(signInNotice.id);
         signInNotice = null;

@@ -5,7 +5,7 @@ import { createNoticeBus } from "@/core/notices";
 import { MAX_POLICY_BYTES, settingDef, type SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
 import { createStore } from "@/core/store";
-import { CRASH_LOOP_BANNER, DNS_UNREACHABLE_BANNER, createEngineController, signInNoticeText, signInPausedText } from "./engine-controller";
+import { CRASH_LOOP_BANNER, DNS_UNREACHABLE_BANNER, DNS_UNREACHABLE_CAPTURED_BANNER, createEngineController, signInNoticeText, signInPausedText } from "./engine-controller";
 
 const WIFI_SIGN_IN_NOTICE = signInNoticeText(true);
 const WIFI_SIGN_IN_PAUSED_BANNER = signInPausedText(true);
@@ -1289,9 +1289,16 @@ describe("engine controller", () => {
       };
       await s.fc.advance(ENGINE_POLL_MS);
       await s.fc.advance(ENGINE_POLL_MS);
-      expect(banners()).toEqual([DNS_UNREACHABLE_BANNER]);
-      expect(DNS_UNREACHABLE_BANNER).toContain(settingDef(DNS_ENCRYPTION as SettingKey).label);
+      expect(engineStatus(s.store.getState().engine)?.dns_capture?.state).toBe("working");
+      expect(banners(), "Windows' lookups caught: the capture is the smaller switch").toEqual([DNS_UNREACHABLE_CAPTURED_BANNER]);
+      expect(DNS_UNREACHABLE_CAPTURED_BANNER).toContain(`you can turn off ${settingDef(DNS_CLIENT_CAPTURE as SettingKey).label} in Settings > Filtering`);
+      await s.settings.set(DNS_CLIENT_CAPTURE as SettingKey, false);
+      await s.fc.flush();
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners(), "not caught: encryption is the switch").toEqual([DNS_UNREACHABLE_BANNER]);
+      expect(DNS_UNREACHABLE_BANNER).toContain(`you can turn off ${settingDef(DNS_ENCRYPTION as SettingKey).label} in Settings > Filtering`);
       expect(s.settings.get(DNS_ENCRYPTION as SettingKey), "said, never switched").toBe(true);
+      expect(s.settings.get(DNS_CLIENT_CAPTURE as SettingKey), "only by the user").toBe(false);
       expect(s.fake.policies.every((p) => p.plain_dns === false)).toBe(true);
       unreachable = false;
       await s.fc.advance(ENGINE_POLL_MS);
@@ -1331,6 +1338,27 @@ describe("engine controller", () => {
       expect(s.fake.signInCalls.at(-1)).toBe("resume");
       expect(banners().map((n) => n.text), "resumed on a network that still wants a sign-in: offered again").toEqual([WIFI_SIGN_IN_NOTICE]);
       expect(s.settings.get(DNS_CLIENT_CAPTURE as SettingKey), "the setting is never touched").toBe(true);
+      s.undo();
+    });
+
+    it("the sign-in notice dismissed while the engine still names the network: the unreachable banner shows again", async () => {
+      const s = setup("filtering", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      const banners = () => s.notices.list().filter((n) => n.surface === "banner");
+      await s.fc.flush();
+      s.fake.withSignIn("filtering");
+      const real = s.fake.source.probe;
+      s.fake.source.probe = async () => {
+        const facts = await real();
+        return facts.pipe?.kind === "welcome" ? { ...facts, pipe: { ...facts.pipe, status: { ...facts.pipe.status, dns_unreachable: true } } } : facts;
+      };
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners().map((n) => n.text)).toEqual([WIFI_SIGN_IN_NOTICE]);
+      s.notices.dismiss(banners()[0].id);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(engineStatus(s.store.getState().engine)?.wifi_sign_in?.network, "the engine still names it").toBe(MOCK_SIGN_IN_NETWORK);
+      expect(banners().map((n) => n.text), "never no notice at all").toEqual([DNS_UNREACHABLE_CAPTURED_BANNER]);
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(banners().map((n) => n.text), "and the dismissed notice is not pushed again beside it").toEqual([DNS_UNREACHABLE_CAPTURED_BANNER]);
       s.undo();
     });
 

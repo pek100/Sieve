@@ -51,7 +51,8 @@ describe("Also encrypt Windows' own lookups", () => {
     expect(sw).toBeEnabled();
     expect(sw).toHaveAccessibleDescription(/Windows' built-in lookups also go through Sieve's encrypted DNS, so the network can't read them/);
     expect(row()).toHaveTextContent(/Can break: Names of nearby PCs found without DNS, and short names that don't exist, answer about 7 s slower/);
-    expect(row()).toHaveTextContent(/Sieve offers a one-click pause so its page can open: for up to 15 minutes, or until encrypted DNS answers or the network changes, nearly every app's lookups then go in plain text/);
+    expect(row()).toHaveTextContent(/When Sieve recognises such a network, it offers a one-click pause so the page can open: for up to 15 minutes, or until encrypted DNS answers or the network changes, nearly every app's lookups then go in plain text/);
+    expect(row()).toHaveTextContent(/When it doesn't, turning this setting off lets the sign-in page open/);
     expect(row().querySelectorAll("[data-slot=card], [data-slot=badge]"), "flat: no card or chip of its own").toHaveLength(0);
   });
 

@@ -794,7 +794,7 @@ mod tests {
         e.set_facts(|f| f.dns_capture = Some(sieve_ipc::DnsCapture::Working));
         assert_eq!(e.pause_dns_capture(HOTEL), Err(NO_SIGN_IN.to_string()));
         let hotel = Verdict { network: HOTEL.into(), luid: WIFI, hijacked: false };
-        e.sign_in().observe(std::time::Instant::now(), Seen { wanted: true, held: true, network: Some(&hotel), portal: true, encrypted_unreachable: true });
+        e.sign_in().observe(std::time::Instant::now(), Seen { wanted: true, held: true, network: Some(&hotel), unread: false, portal: true, encrypted_unreachable: true });
         assert_eq!(e.status().wifi_sign_in, Some(sieve_ipc::WifiSignIn { network: HOTEL.into(), paused_left_s: None, wifi: true }));
         assert_eq!(e.pause_dns_capture("{another}"), Err(OTHER_NETWORK.to_string()));
         let paused = e.pause_dns_capture(HOTEL).unwrap();

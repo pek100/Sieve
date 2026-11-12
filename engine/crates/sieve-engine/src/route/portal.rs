@@ -18,9 +18,11 @@
 //! of the addresses ([`portal`]), is the fact. One answering address alone is no
 //! verdict (some odd network routing one of them). The request names Windows'
 //! own test, `GET /connecttest.txt` with `Host: www.msftconnecttest.com`, so a
-//! transparent proxy that forwards by the Host header fetches Microsoft's real
-//! file and reads as online, never as a portal ([`classify`]); a proxy's own
-//! error page (4xx, 5xx) is no portal either.
+//! transparent proxy that is set to forward by the Host header fetches
+//! Microsoft's real file and reads as online, never as a portal ([`classify`]).
+//! Many do not: Squid's interception, by default, connects to the original
+//! address, which leads nowhere, and its error page (4xx, 5xx), like any
+//! proxy's, is no portal ([`Answer::Nothing`]).
 //!
 //! Each socket goes out through `stack::egress` (bound to the physical adapter's
 //! source and pinned to it, Sieve's routes ignored), so it cannot loop into
@@ -28,12 +30,14 @@
 //! failing, or a notice or pause standing), at most every
 //! `sign_in::PORTAL_EVERY`, each address bounded by [`ASK_WITHIN`].
 //!
-//! What it reveals to the network: that this machine checks for a sign-in page,
-//! as Windows itself does on every network. Up to four TCP connections to port
-//! 80 of addresses that lead nowhere, from the machine's own address, and on
-//! each that connects the same request Windows' own test sends, with no cookie,
-//! no user agent and nothing of the user. Nothing leaves when encrypted DNS
-//! works.
+//! What it reveals to the network: up to four TCP connections to port 80 of
+//! addresses that lead nowhere, from the machine's own address, and on each that
+//! connects the same request Windows' own test sends, with no cookie, no user
+//! agent and nothing of the user. Windows' own test asks a real name, not these
+//! addresses, so this is a pattern of its own: connections to documentation
+//! addresses while encrypted DNS fails mark the machine, to anyone watching the
+//! network, as one running Sieve. It carries nothing about the user. Nothing
+//! leaves when encrypted DNS works.
 //!
 //! Not seen by it: a portal that only answers DNS with its own address and
 //! intercepts nothing else. There no notice shows, and the unreachable-DNS
@@ -62,11 +66,9 @@ pub const REQUEST: &[u8] = b"GET /connecttest.txt HTTP/1.1\r\nHost: www.msftconn
 /// network answers in milliseconds; an address that leads nowhere is given up.
 pub const ASK_WITHIN: Duration = Duration::from_secs(3);
 /// At most this much of an answer is read: a status line, headers and the start
-/// of a page say all there is to say.
+/// of a page say all there is to say. A head longer than this is judged on the
+/// lines of it that came ([`classify`]).
 const READ_MAX: usize = 8 * 1024;
-/// A 200's body is judged once this much past [`EXPECTED`] came (a chunk-size
-/// line, a page's start), or at its Content-Length, or at the end.
-const BODY_ENOUGH: usize = EXPECTED.len() + 16;
 
 /// What one address answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,16 +138,31 @@ struct Head<'a> {
     body_at: usize,
 }
 
+/// The whole head: up to the first empty line, CRLF or bare LF.
 fn head(reply: &[u8]) -> Option<Head<'_>> {
-    let end = reply.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let text = std::str::from_utf8(&reply[..end]).ok()?;
-    let mut lines = text.split("\r\n");
+    let (end, body_at) = reply.iter().enumerate().filter(|(_, b)| **b == b'\n').find_map(|(i, _)| match &reply[i + 1..] {
+        [b'\n', ..] => Some((i, i + 2)),
+        [b'\r', b'\n', ..] => Some((i, i + 3)),
+        _ => None,
+    })?;
+    parse_head(&reply[..end], body_at)
+}
+
+/// A head cut by [`READ_MAX`]: its lines that came whole, and no body.
+fn cut_head(reply: &[u8]) -> Option<Head<'_>> {
+    let end = reply.iter().rposition(|b| *b == b'\n')?;
+    parse_head(&reply[..end], reply.len())
+}
+
+fn parse_head(head: &[u8], body_at: usize) -> Option<Head<'_>> {
+    let text = std::str::from_utf8(head).ok()?;
+    let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     let mut status = lines.next()?.splitn(3, ' ');
     if !status.next()?.starts_with("HTTP/1.") {
         return None;
     }
     let code = status.next()?.parse().ok()?;
-    let mut h = Head { code, location: None, length: None, chunked: false, body_at: end + 4 };
+    let mut h = Head { code, location: None, length: None, chunked: false, body_at };
     for line in lines {
         let Some((name, value)) = line.split_once(':') else { continue };
         let (name, value) = (name.trim(), value.trim());
@@ -160,24 +177,68 @@ fn head(reply: &[u8]) -> Option<Head<'_>> {
     Some(h)
 }
 
-/// The answer says enough to be judged before the peer closes.
+/// The answer says enough to be judged before the peer closes: not a 200, or a
+/// body long enough to say whether it starts with [`EXPECTED`], or complete (its
+/// Content-Length, its last chunk).
 fn enough(reply: &[u8]) -> bool {
     let Some(h) = head(reply) else { return false };
-    let body = reply.len() - h.body_at;
-    h.code != 200 || body >= BODY_ENOUGH || h.length.is_some_and(|l| body >= l)
+    let raw = &reply[h.body_at..];
+    if h.code != 200 {
+        return true;
+    }
+    if h.chunked {
+        let (body, done) = dechunk(raw);
+        return done || body.len() >= EXPECTED.len();
+    }
+    raw.len() >= EXPECTED.len() || h.length.is_some_and(|l| raw.len() >= l)
+}
+
+/// A chunked body's data, as much of it as came; true once its last chunk did.
+/// Bounded by what was read: every step takes at least one byte.
+fn dechunk(mut raw: &[u8]) -> (Vec<u8>, bool) {
+    let mut data = Vec::new();
+    loop {
+        let Some(line_end) = raw.iter().position(|b| *b == b'\n') else { return (data, false) };
+        let line = std::str::from_utf8(&raw[..line_end]).unwrap_or("");
+        let size = line.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size, 16) else { return (data, false) };
+        raw = &raw[line_end + 1..];
+        if size == 0 {
+            return (data, true);
+        }
+        let take = size.min(raw.len());
+        data.extend_from_slice(&raw[..take]);
+        if take < size {
+            return (data, false);
+        }
+        raw = &raw[take..];
+        raw = raw.strip_prefix(b"\r\n").or_else(|| raw.strip_prefix(b"\n")).unwrap_or(raw);
+    }
 }
 
 /// What one answer says. A 200 is Windows' file or a portal's page; a redirect
 /// goes to Windows' test host (a forwarding proxy: online) or elsewhere,
 /// relative ones included (a portal serving at the address it took); 511 is the
 /// status made for a sign-in (RFC 6585). Anything else, or no HTTP, is nothing.
+/// A head cut by [`READ_MAX`] is judged on the lines that came whole: a redirect
+/// whose Location came, a 511; a 200 whose head alone is that long is no
+/// Windows file, so a page.
 pub fn classify(reply: &[u8]) -> Answer {
-    let Some(h) = head(reply) else { return Answer::Nothing };
-    let mut body = &reply[h.body_at..];
-    if h.chunked {
-        // The first chunk's size line goes before its data.
-        body = body.windows(2).position(|w| w == b"\r\n").map_or(&[][..], |at| &body[at + 2..]);
-    }
+    let (h, body) = match head(reply) {
+        Some(h) if h.chunked => {
+            let body = dechunk(&reply[h.body_at..]).0;
+            (h, body)
+        }
+        Some(h) => {
+            let body = reply[h.body_at..].to_vec();
+            (h, body)
+        }
+        None if reply.len() >= READ_MAX => match cut_head(reply) {
+            Some(h) => (h, Vec::new()),
+            None => return Answer::Nothing,
+        },
+        None => return Answer::Nothing,
+    };
     match h.code {
         200 if body.starts_with(EXPECTED) => Answer::Online,
         200 => Answer::Portal,
@@ -191,19 +252,23 @@ pub fn classify(reply: &[u8]) -> Answer {
     }
 }
 
-/// The host of an absolute `http(s)://` Location; None for a relative one.
+/// The host of an absolute `http(s)://` or protocol-relative `//` Location,
+/// without a trailing dot (`host.` is the same host); None for a relative one.
 fn host_of(location: &str) -> Option<&str> {
-    let lower = location.get(..8).map(str::to_ascii_lowercase).unwrap_or_default();
+    let lower = location.get(..8).unwrap_or(location).to_ascii_lowercase();
     let rest = if lower.starts_with("http://") {
         &location[7..]
     } else if lower.starts_with("https://") {
         &location[8..]
+    } else if let Some(rest) = location.strip_prefix("//") {
+        rest
     } else {
         return None;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or("");
-    Some(host.split(':').next().unwrap_or(""))
+    let host = host.split(':').next().unwrap_or("");
+    Some(host.strip_suffix('.').unwrap_or(host))
 }
 
 #[cfg(test)]
@@ -231,6 +296,84 @@ mod tests {
         for nothing in [&b"HTTP/1.1 502 Bad Gateway\r\n\r\nupstream unreachable"[..], b"HTTP/1.1 403 Forbidden\r\n\r\n", b"HTTP/1.1 302 Found\r\n\r\n", b"SSH-2.0-OpenSSH\r\n", b"HTTP/1.1 302 Found\r\nLocation: http://x/", b""] {
             assert_eq!(classify(nothing), Answer::Nothing, "{}", String::from_utf8_lossy(nothing));
         }
+    }
+
+    /// (a) The real file in several chunks, with chunk extensions and bare LFs.
+    #[test]
+    fn the_real_file_in_several_chunks_reads_as_online() {
+        let split = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nMicrosoft\r\n1;x=y\r\n \r\nc\r\nConnect Test\r\n0\r\n\r\n";
+        assert_eq!(classify(split), Answer::Online);
+        assert!(enough(split), "its last chunk came");
+        let one_byte_each: Vec<u8> = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".iter().copied().chain(EXPECTED.iter().flat_map(|b| [b'1', b'\r', b'\n', *b, b'\r', b'\n'])).collect();
+        assert!(enough(&one_byte_each), "the whole text came, before the last chunk");
+        assert_eq!(classify(&one_byte_each), Answer::Online);
+        assert!(!enough(&one_byte_each[..one_byte_each.len() - 6]), "one byte short: not yet");
+        assert_eq!(classify(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nMicrosoft\r\n7\r\n<html>x\r\n0\r\n\r\n"), Answer::Portal, "a page that only starts like it");
+    }
+
+    /// (b), (c): a protocol-relative Location and a trailing dot name the test's host.
+    #[test]
+    fn a_protocol_relative_or_trailing_dot_location_is_the_test_host() {
+        assert_eq!(classify(b"HTTP/1.1 302 Found\r\nLocation: //www.msftconnecttest.com/connecttest.txt\r\n\r\n"), Answer::Online);
+        assert_eq!(classify(b"HTTP/1.1 302 Found\r\nLocation: http://www.msftconnecttest.com./connecttest.txt\r\n\r\n"), Answer::Online);
+        assert_eq!(classify(b"HTTP/1.1 302 Found\r\nLocation: //portal.hotel.example/login\r\n\r\n"), Answer::Portal, "protocol-relative, elsewhere");
+        assert_eq!(classify(b"HTTP/1.1 302 Found\r\nLocation: http://www.msftconnecttest.com.evil.example/\r\n\r\n"), Answer::Portal);
+        assert_eq!(host_of("//www.msftconnecttest.com.:80/x"), Some(TEST_HOST));
+        assert_eq!(host_of("/login"), None);
+    }
+
+    /// (d) Bare-LF line endings.
+    #[test]
+    fn bare_lf_answers_are_read() {
+        assert_eq!(classify(b"HTTP/1.1 200 OK\nContent-Length: 22\n\nMicrosoft Connect Test"), Answer::Online);
+        assert!(enough(b"HTTP/1.1 200 OK\nContent-Length: 22\n\nMicrosoft Connect Test"));
+        assert_eq!(classify(b"HTTP/1.1 302 Found\nLocation: http://portal.hotel.example/\n\n"), Answer::Portal);
+        assert_eq!(classify(b"HTTP/1.1 302 Found\nLocation: http://www.msftconnecttest.com/\r\n\r\n"), Answer::Online, "mixed");
+        assert_eq!(classify(b"HTTP/1.1 302 Found\nLocation: http://x/"), Answer::Nothing, "a head that never ended, under the bound");
+    }
+
+    /// (e) A head past the bound: still bounded, judged on the lines that came.
+    #[test]
+    fn a_head_past_the_bound_is_judged_on_what_came() {
+        let long = |start: &[u8]| -> Vec<u8> {
+            let mut r = start.to_vec();
+            while r.len() < READ_MAX {
+                r.extend_from_slice(b"Set-Cookie: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+            }
+            r.truncate(READ_MAX);
+            r
+        };
+        assert_eq!(classify(&long(b"HTTP/1.1 302 Found\r\nLocation: http://portal.hotel.example/login\r\n")), Answer::Portal);
+        assert_eq!(classify(&long(b"HTTP/1.1 302 Found\r\nLocation: //www.msftconnecttest.com/connecttest.txt\r\n")), Answer::Online);
+        assert_eq!(classify(&long(b"HTTP/1.1 302 Found\r\n")), Answer::Nothing, "no Location came");
+        assert_eq!(classify(&long(b"HTTP/1.1 200 OK\r\n")), Answer::Portal, "a 200 whose head alone fills the bound is no Windows file");
+        assert_eq!(classify(&long(b"HTTP/1.1 403 Forbidden\r\n")), Answer::Nothing);
+        assert_eq!(classify(&long(b"SSH-2.0-x\r\n")), Answer::Nothing);
+    }
+
+    /// (e) through [`ask`]: the read stops at the bound and judges at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_head_is_read_no_further_than_the_bound() {
+        let (mine, mut theirs) = tokio::io::duplex(64 * 1024);
+        let slot = Mutex::new(Some(mine));
+        let dial = |_t| {
+            let s = slot.lock().unwrap().take();
+            async move { s.ok_or_else(|| "once".to_string()) }
+        };
+        let keep = tokio::spawn(async move {
+            let mut request = vec![0u8; REQUEST.len()];
+            theirs.read_exact(&mut request).await.unwrap();
+            theirs.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://portal.hotel.example/\r\n").await.unwrap();
+            let filler = [b"X-Pad: ".as_slice(), &[b'a'; 100], b"\r\n"].concat();
+            for _ in 0..200 {
+                theirs.write_all(&filler).await.unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+        assert_eq!(ask(&dial, TARGETS[0]).await, Answer::Portal);
+        assert!(started.elapsed() < ASK_WITHIN, "judged at the bound, not at the close");
+        keep.abort();
     }
 
     #[test]

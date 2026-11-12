@@ -303,12 +303,53 @@ struct SignInReads {
     nlm: Outstanding<Result<Option<sign_in::Verdict>, String>>,
     /// The DNS-free portal check (`route::portal`, a task).
     portal: Outstanding<bool>,
+    /// What the reads said, kept from pass to pass.
+    facts: SignInFacts,
+    /// The last failure reading Windows' word, reported once.
+    verdict_error: Option<String>,
+}
+
+/// What the sign-in reads said, kept from pass to pass: the pure part of
+/// [`follow_sign_in`].
+#[derive(Default)]
+pub(super) struct SignInFacts {
     /// The portal check's last answer, for the network it ran on.
     probed: Option<sign_in::Probed>,
     /// When the portal check last started: it runs at most every `sign_in::PORTAL_EVERY`.
     portal_tried: Option<std::time::Instant>,
-    /// The last failure reading Windows' word, reported once.
-    verdict_error: Option<String>,
+    /// Windows' last good word, kept for a moment when a read fails.
+    word: sign_in::Word,
+}
+
+impl SignInFacts {
+    /// The network moved (the routing loop's whole-table compare): the same
+    /// adapter may be on another Wi-Fi now, so what the check saw and Windows'
+    /// last word are over, and the check is due at once.
+    pub(super) fn moved(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The portal check is due now; if so it is counted as started.
+    pub(super) fn portal_due(&mut self, now: std::time::Instant) -> bool {
+        let due = self.portal_tried.is_none_or(|t| now.saturating_duration_since(t) >= sign_in::PORTAL_EVERY);
+        if due {
+            self.portal_tried = Some(now);
+        }
+        due
+    }
+
+    /// This pass's reads: Windows' word (`read`, None when it failed or still
+    /// runs) and the portal check's answer (`checked`, None when it did not run or
+    /// finish). The answer is stamped with the network id and adapter it ran on;
+    /// what the pass sees, and whether the check found a portal on that network.
+    pub(super) fn heard(&mut self, now: std::time::Instant, read: Option<Option<sign_in::Verdict>>, checked: Option<bool>) -> (sign_in::Heard, bool) {
+        let heard = self.word.take(now, read);
+        if let (Some(portal), Some(v)) = (checked, &heard.verdict) {
+            self.probed = Some(sign_in::Probed { network: v.network.clone(), luid: v.luid, at: now, portal });
+        }
+        let portal = heard.verdict.as_ref().is_some_and(|v| self.probed.as_ref().is_some_and(|p| p.portal_on(v, now)));
+        (heard, portal)
+    }
 }
 
 /// The portal check's whole run: its addresses are asked at once, each bounded.
@@ -330,16 +371,14 @@ async fn follow_sign_in(engine: &Engine, mut up: Up, network_moved: bool) -> Up 
     let leaves_by = up.relay.tables.read().unwrap_or_else(|p| p.into_inner()).default_adapter().map(|a| a.luid);
     let needs = engine.sign_in().needs_verdict(unreachable);
     let now = std::time::Instant::now();
-    let SignInReads { nlm: nlm_read, portal: portal_read, probed, portal_tried, verdict_error } = &mut up.sign_in;
+    let SignInReads { nlm: nlm_read, portal: portal_read, facts, verdict_error } = &mut up.sign_in;
     if network_moved {
-        // The same adapter may be on another Wi-Fi now: what the check saw is over.
-        *probed = None;
-        *portal_tried = None;
+        facts.moved();
     }
     let (read, checked) = match leaves_by.filter(|_| needs) {
         None => (Ok(None), None),
         Some(luid) => {
-            let due = portal_tried.is_none_or(|t| now.saturating_duration_since(t) >= sign_in::PORTAL_EVERY);
+            let due = facts.portal_due(now);
             let egress = up.relay.egress.clone();
             let windows = async {
                 match nlm_read.read(TASKS_BOUND, || tokio::task::spawn_blocking(move || nlm::verdict(luid))).await {
@@ -352,32 +391,28 @@ async fn follow_sign_in(engine: &Engine, mut up: Up, network_moved: bool) -> Up 
                 if !due {
                     return None;
                 }
-                *portal_tried = Some(now);
                 portal_read.read(PORTAL_BOUND, || tokio::spawn(async move { portal::probe(|t| egress.connect(t)).await })).await.ok()
             };
             tokio::join!(windows, check)
         }
     };
-    let verdict = verdict_of(engine, read, verdict_error);
-    if let (Some(portal), Some(v)) = (checked, &verdict) {
-        *probed = Some(sign_in::Probed { network: v.network.clone(), luid: v.luid, at: now, portal });
-    }
-    let portal = verdict.as_ref().is_some_and(|v| probed.as_ref().is_some_and(|p| p.portal_on(v, now)));
-    let seen = sign_in::Seen { wanted, held, network: verdict.as_ref(), portal, encrypted_unreachable: unreachable };
+    let read = verdict_of(engine, read, verdict_error);
+    let (heard, portal) = facts.heard(now, read, checked);
+    let seen = sign_in::Seen { wanted, held, network: heard.verdict.as_ref(), unread: heard.unread, portal, encrypted_unreachable: unreachable };
     sign_in_pass(engine, now, seen, || dns.encrypted_answers()).await;
     up
 }
 
-/// Windows' word as a pass uses it: a read that failed (or still runs) is no
-/// word, reported once while it keeps failing the same way. No word means no
-/// notice, and a pause ends as for a changed network: the capture comes back.
-/// A read that fails for a moment ends a pause the user still wanted; that is
-/// the safe way, and they can click again.
-pub(super) fn verdict_of(engine: &Engine, read: Result<Option<sign_in::Verdict>, String>, last_error: &mut Option<String>) -> Option<sign_in::Verdict> {
+/// Windows' word as a pass reads it: a read that failed (or still runs) is
+/// None, reported once while it keeps failing the same way. [`SignInFacts::heard`]
+/// keeps the last good word through a moment of that (`sign_in::Word`); past it
+/// there is no word, so no notice, and a pause ends (`sign_in::Ended::Unread`):
+/// the capture comes back, and the pause is not counted.
+pub(super) fn verdict_of(engine: &Engine, read: Result<Option<sign_in::Verdict>, String>, last_error: &mut Option<String>) -> Option<Option<sign_in::Verdict>> {
     match read {
         Ok(verdict) => {
             *last_error = None;
-            verdict
+            Some(verdict)
         }
         Err(why) => {
             if last_error.as_deref() != Some(why.as_str()) {
