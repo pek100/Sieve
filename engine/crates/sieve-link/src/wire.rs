@@ -21,6 +21,10 @@
 //! | 0x13 | Observed | family u8 (4 or 6), address [4] or [16]              |
 //! | 0x80 | Response | status u8 (0..=7), message length u8, message (UTF-8) |
 //!
+//! On the control stream, a frame with a tag this version does not know is
+//! skipped (`UnknownTag`), so a newer peer can add notices; anywhere else
+//! it is a bad request.
+//!
 //! A frame longer than MAX_FRAME is refused before its body is read, so a
 //! peer cannot make the reader allocate; bodies land in a fixed stack buffer.
 //! Every field is length-checked and trailing bytes are an error. A response
@@ -108,6 +112,11 @@ pub enum WireError {
     /// A well-formed response whose status this version does not know.
     #[error("answer status {0} is unknown to this version (the peer speaks a newer one)")]
     UnknownStatus(u8),
+    /// A frame whose tag this version does not know. The whole frame has
+    /// been read, so a reader that only takes notices (the control stream)
+    /// can skip it and go on: a newer peer may send notices this one lacks.
+    #[error("message tag {0:#04x} is unknown to this version (the peer speaks a newer one)")]
+    UnknownTag(u8),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -246,7 +255,7 @@ impl Message {
                 let status = Status::from_u8(code).ok_or(WireError::UnknownStatus(code))?;
                 Message::Response { status, message: m.to_string() }
             }
-            _ => return Err(WireError::Malformed("unknown tag")),
+            t => return Err(WireError::UnknownTag(t)),
         };
         if !r.0.is_empty() {
             return Err(WireError::Malformed("trailing bytes"));
@@ -331,6 +340,13 @@ mod tests {
         assert!(Message::Limit(0).encode().is_err());
         assert!(Message::decode(&[0x12, 0, 0, 0, 0]).is_err());
         assert!(Message::decode(&[0x13, 5, 1, 2, 3, 4]).is_err());
+        // An unknown tag is its own error too (a control-stream reader skips it).
+        assert!(matches!(Message::decode(&[0x14, 1, 2, 3]), Err(WireError::UnknownTag(0x14))));
+        assert!(matches!(Message::decode(&[0x7f]), Err(WireError::UnknownTag(0x7f))));
+        // A hub's absurd limit never decodes: 0 and anything past u16.
+        assert!(matches!(Message::decode(&[0x12, 0xff, 0xff, 0xff, 0xff]), Err(WireError::Malformed(_))));
+        assert!(matches!(Message::decode(&[0x12, 0, 1, 0, 0]), Err(WireError::Malformed(_))));
+        assert_eq!(Message::decode(&[0x12, 0, 0, 0xff, 0xff]).unwrap(), Message::Limit(65535));
     }
 
     #[test]

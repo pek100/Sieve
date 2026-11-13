@@ -244,6 +244,18 @@ impl LinkClient {
         self.inner.link.borrow().as_ref().map(|c| c.slots.limit())
     }
 
+    /// The link in use and its stream slots (for a test that timed out).
+    #[doc(hidden)]
+    pub fn debug_state(&self) -> String {
+        match self.inner.link.borrow().as_ref() {
+            Some(c) => {
+                let (used, limit) = *c.slots.state.lock().unwrap_or_else(|e| e.into_inner());
+                format!("device: link {} closed={} slots {used}/{limit} shutdown={}", c.handle.id(), c.handle.is_closed(), self.inner.shutdown.is_cancelled())
+            }
+            None => format!("device: no link, shutdown={}", self.inner.shutdown.is_cancelled()),
+        }
+    }
+
     /// The link in use, waiting up to `limit` for one; `not` skips a link
     /// that just failed (so a relink race waits for the NEW link).
     async fn current(&self, limit: Duration, not: Option<u64>) -> Option<Current> {
@@ -428,10 +440,13 @@ async fn control_open(h: &MuxHandle, seen: IpAddr) -> Result<(LinkIo, u32)> {
     write_msg(&mut io, &Message::Ping(0)).await?;
     let mut limit = DEVICE_STREAM_CAP;
     loop {
-        match read_msg(&mut io).await? {
-            Message::Limit(n) => limit = n,
-            Message::Pong(0) => return Ok((io, limit)),
-            _ => return Err(LinkError::Protocol("the hub did not answer the first ping".into())),
+        match read_msg(&mut io).await {
+            Ok(Message::Limit(n)) => limit = n,
+            Ok(Message::Pong(0)) => return Ok((io, limit)),
+            // A notice from a newer hub.
+            Err(WireError::UnknownTag(_)) => {}
+            Ok(_) => return Err(LinkError::Protocol("the hub did not answer the first ping".into())),
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -456,6 +471,8 @@ async fn keepalive(h: MuxHandle, slots: Arc<Slots>, io: LinkIo, every: Duration,
             match tokio::time::timeout(dead_after, read_msg(&mut r)).await {
                 Ok(Ok(Message::Pong(_))) => {}
                 Ok(Ok(Message::Limit(n))) => slots.set_limit(n),
+                // A notice from a newer hub.
+                Ok(Err(WireError::UnknownTag(_))) => {}
                 _ => return,
             }
         }

@@ -66,9 +66,15 @@ pub use yamux::Mode;
 /// would wait on a session that has ended fails at once instead: yamux does
 /// not wake the streams of a session closed from this side, so each stream
 /// also watches the session's cancel token.
+///
+/// Reading and writing watch it separately: a cancellation future keeps
+/// only the last waker it was polled with, so with one shared watcher a
+/// reader and a writer in two tasks (`tokio::io::split`) would leave one of
+/// them asleep on a closed link.
 pub struct LinkIo {
     inner: Compat<yamux::Stream>,
-    gone: Pin<Box<WaitForCancellationFutureOwned>>,
+    read_gone: Pin<Box<WaitForCancellationFutureOwned>>,
+    write_gone: Pin<Box<WaitForCancellationFutureOwned>>,
 }
 
 impl std::fmt::Debug for LinkIo {
@@ -77,19 +83,19 @@ impl std::fmt::Debug for LinkIo {
     }
 }
 
+/// For a poll that came back pending: the error to give instead when the
+/// session has ended (polling registers the waker either way).
+fn ended<T>(gone: &mut Pin<Box<WaitForCancellationFutureOwned>>, cx: &mut Context<'_>) -> Poll<std::io::Result<T>> {
+    match gone.as_mut().poll(cx) {
+        Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "the link is closed"))),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
 impl LinkIo {
     /// A stream of the session that `session` cancels when it ends.
     pub fn new(s: yamux::Stream, session: CancellationToken) -> Self {
-        LinkIo { inner: s.compat(), gone: Box::pin(session.cancelled_owned()) }
-    }
-
-    /// For a poll that came back pending: the error to give instead when the
-    /// session has ended (polling registers the waker either way).
-    fn ended<T>(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<T>> {
-        match self.gone.as_mut().poll(cx) {
-            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "the link is closed"))),
-            Poll::Pending => Poll::Pending,
-        }
+        LinkIo { inner: s.compat(), read_gone: Box::pin(session.clone().cancelled_owned()), write_gone: Box::pin(session.cancelled_owned()) }
     }
 }
 
@@ -97,7 +103,7 @@ impl tokio::io::AsyncRead for LinkIo {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
-            Poll::Pending => this.ended(cx),
+            Poll::Pending => ended(&mut this.read_gone, cx),
             r => r,
         }
     }
@@ -107,7 +113,7 @@ impl tokio::io::AsyncWrite for LinkIo {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_write(cx, buf) {
-            Poll::Pending => this.ended(cx),
+            Poll::Pending => ended(&mut this.write_gone, cx),
             r => r,
         }
     }
@@ -115,7 +121,7 @@ impl tokio::io::AsyncWrite for LinkIo {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_flush(cx) {
-            Poll::Pending => this.ended(cx),
+            Poll::Pending => ended(&mut this.write_gone, cx),
             r => r,
         }
     }
@@ -123,7 +129,7 @@ impl tokio::io::AsyncWrite for LinkIo {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_shutdown(cx) {
-            Poll::Pending => this.ended(cx),
+            Poll::Pending => ended(&mut this.write_gone, cx),
             r => r,
         }
     }
@@ -369,6 +375,37 @@ mod tests {
                 assert!(!matches!(r.unwrap().unwrap(), Ok(n) if n > 0));
             }
         }
+    }
+
+    /// A stream split into a reader task and a writer task, both waiting
+    /// (nothing to read; the window used up), is woken on BOTH sides when
+    /// this side ends the session. With one shared watcher only the task
+    /// that polled last was woken and the other slept forever.
+    #[tokio::test]
+    async fn closing_a_session_wakes_a_split_streams_reader_and_writer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        // The server never reads its stream: the client's writes stall once
+        // the window is used up.
+        let (in_tx, mut in_rx) = mpsc::unbounded_channel();
+        let (_server, _st) = spawn(b.compat(), Mode::Server, move |s| drop(in_tx.send(s)), CancellationToken::new());
+        let client_cancel = CancellationToken::new();
+        let (client, _ct) = spawn(a.compat(), Mode::Client, |_| {}, client_cancel);
+        let mut c = client.open().await.unwrap();
+        c.write_all(b"x").await.unwrap();
+        let _held = in_rx.recv().await.unwrap();
+        let (mut r, mut w) = tokio::io::split(c);
+        let reader = tokio::spawn(async move { r.read(&mut [0u8; 8]).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let writer = tokio::spawn(async move { w.write_all(&vec![7u8; 4 * STREAM_WINDOW]).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!reader.is_finished() && !writer.is_finished(), "both wait before the close");
+        client.close();
+        let r = tokio::time::timeout(Duration::from_secs(2), reader).await.expect("the reader slept through the close");
+        assert!(!matches!(r.unwrap(), Ok(n) if n > 0), "the reader got data from a closed link");
+        let w = tokio::time::timeout(Duration::from_secs(2), writer).await.expect("the writer slept through the close");
+        assert!(w.unwrap().is_err(), "the writer must fail, the link is gone");
     }
 
     #[test]

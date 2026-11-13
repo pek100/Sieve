@@ -530,6 +530,12 @@ impl Bucket {
         Bucket { capacity, tokens: capacity, per_sec, last: now }
     }
 
+    /// The level now (negative while a debt from `debit` is outstanding).
+    pub fn level(&mut self, now: Instant) -> f64 {
+        self.refill(now);
+        self.tokens
+    }
+
     pub fn is_full(&mut self, now: Instant) -> bool {
         self.refill(now);
         self.tokens >= self.capacity
