@@ -91,6 +91,13 @@ Things that are true by design, and worth knowing before you rely on it:
   streams and `sieve-hub status` says why. Change both with `sieve-hub
   audit` (applies at the next start). Rotated files are `audit.log.N`, a
   higher N is newer.
+- **Each device has a share of the audit log.** So that one device cannot
+  fill the log (and so stop the hub for everyone), a device may write at most
+  half the rate the cap and the floor allow (with the defaults about 4.5 MB,
+  some 7,500 streams, a day, in bursts of up to 9 MB). Past it, that device's
+  new streams are refused (`RateLimited`) and its link rows are counted
+  rather than written until the share refills; other devices carry on.
+  Several devices doing this together can still fill the log.
 - **Raising a device's limit far closes its link once.** A link has room for
   its limit plus spare streams; a raise within that applies at once, a
   larger one makes the device relink (its open connections end), and

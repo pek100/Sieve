@@ -329,14 +329,26 @@ impl Live {
     }
 
     /// Registers a link; the oldest beyond the cap is closed (newest wins).
+    ///
+    /// A raise that lands between the caller sizing the link and this call
+    /// is caught here: `set_limits` stores the limit before it looks at the
+    /// links, and this looks at the limit after the link is in the list, so
+    /// one of the two always sees the other and a link too small for the
+    /// limit it will be told is closed (the device relinks at the new size).
     fn add_link(&self, id: u64, cancel: CancellationToken, streams: usize) -> Arc<AtomicU8> {
         let ended = Arc::new(AtomicU8::new(0));
-        let mut links = self.links.lock().unwrap_or_else(|e| e.into_inner());
-        links.push_back(LinkEntry { id, cancel, ended: ended.clone(), streams });
-        while links.len() > mux::MAX_LINKS_PER_DEVICE {
-            let old = links.pop_front().expect("non-empty");
-            old.ended.store(ENDED_REPLACED, Ordering::SeqCst);
-            old.cancel.cancel();
+        {
+            let mut links = self.links.lock().unwrap_or_else(|e| e.into_inner());
+            links.push_back(LinkEntry { id, cancel: cancel.clone(), ended: ended.clone(), streams });
+            while links.len() > mux::MAX_LINKS_PER_DEVICE {
+                let old = links.pop_front().expect("non-empty");
+                old.ended.store(ENDED_REPLACED, Ordering::SeqCst);
+                old.cancel.cancel();
+            }
+        }
+        if !mux::link_carries(streams, self.limits().max_concurrent) {
+            ended.store(ENDED_RESIZED, Ordering::SeqCst);
+            cancel.cancel();
         }
         ended
     }
@@ -660,6 +672,24 @@ impl Hub {
         self.inner.write_status();
     }
 
+    /// What the hub holds per device right now (for a test that timed out).
+    #[doc(hidden)]
+    pub fn debug_state(&self) -> String {
+        let lives: Vec<(Fingerprint, Arc<Live>)> = self.inner.live.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(f, l)| (*f, l.clone())).collect();
+        let mut out = format!("hub: store_ok={} lan_ok={} unavailable={:?}\n", self.inner.store_ok.load(Ordering::SeqCst), self.inner.lan_ok.load(Ordering::SeqCst), self.inner.unavailable());
+        for (fp, l) in lives {
+            let (limits, open) = {
+                let st = l.state.lock().unwrap_or_else(|e| e.into_inner());
+                (st.limits, st.open)
+            };
+            let links: Vec<String> =
+                l.links.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|k| format!("{}({} streams, cancelled={})", k.id, k.streams, k.cancel.is_cancelled())).collect();
+            let relays = l.streams.lock().unwrap_or_else(|e| e.into_inner()).len();
+            out += &format!("  device {}: cancelled={} {limits:?} open={open} relays={relays} links=[{}]\n", fp.short(), l.cancel.is_cancelled(), links.join(", "));
+        }
+        out
+    }
+
     /// Test hook: makes every audit write fail (or work again).
     #[doc(hidden)]
     pub fn fail_audit_writes(&self, on: bool) {
@@ -913,7 +943,7 @@ impl Inner {
             }
             v.push(c);
         }
-        self.audit.record(AuditRow { addr: Some(ip.to_string()), ..dev_row(dev, "hub_address_learned", format!("denied to this link as the hub itself ({how})")) });
+        self.audit.device_row(AuditRow { addr: Some(ip.to_string()), ..dev_row(dev, "hub_address_learned", format!("denied to this link as the hub itself ({how})")) });
     }
 
     fn learned_status(&self) -> Vec<LearnedStatus> {
@@ -1075,12 +1105,15 @@ async fn serve_device(inner: Arc<Inner>, est: Established, rec: DeviceRecord, ac
     }
     let conn_cancel = live.cancel.child_token();
     let link_id = inner.next_id();
-    let streams = mux::hub_streams(live.limits().max_concurrent);
+    // Sized once: the stream count registered is the one the session gets.
+    let sized_for = live.limits().max_concurrent;
+    let streams = mux::hub_streams(sized_for);
     let ended = live.add_link(link_id, conn_cancel.clone(), streams);
     let peer = est.remote;
     let link = Arc::new(LinkCtx {
         cancel: conn_cancel.clone(),
-        last_ping: Arc::new(AtomicU64::new(now_ms())),
+        born: tokio::time::Instant::now(),
+        last_ping: Arc::new(AtomicU64::new(0)),
         control_taken: AtomicBool::new(false),
         learned: Arc::new(RwLock::new(Vec::new())),
     });
@@ -1088,7 +1121,7 @@ async fn serve_device(inner: Arc<Inner>, est: Established, rec: DeviceRecord, ac
         link_id,
         Learned { device: rec.fingerprint.short(), name: rec.name.clone(), addrs: link.learned.clone() },
     );
-    inner.audit.record(AuditRow {
+    inner.audit.device_row(AuditRow {
         event: "link_up",
         device: Some(rec.fingerprint.short()),
         name: Some(rec.name.clone()),
@@ -1119,11 +1152,11 @@ async fn serve_device(inner: Arc<Inner>, est: Established, rec: DeviceRecord, ac
             tokio::spawn(handle_stream(inner.clone(), live.clone(), dev.clone(), io, link.clone(), admitted));
         }
     };
-    let (_handle, task) = mux::spawn_with(est.io.compat(), Mode::Server, mux::hub_config(live.limits().max_concurrent), handler, conn_cancel.clone());
-    // Watchdog: no ping for dead_after drops the link.
+    let (_handle, task) = mux::spawn_with(est.io.compat(), Mode::Server, mux::hub_config(sized_for), handler, conn_cancel.clone());    // Watchdog: no ping for dead_after drops the link.
     let dead_after = inner.cfg.dead_after;
     let wd_cancel = conn_cancel.clone();
     let wd_ping = link.last_ping.clone();
+    let born = link.born;
     tokio::spawn(async move {
         let tick = (dead_after / 4).max(Duration::from_millis(50));
         loop {
@@ -1131,7 +1164,10 @@ async fn serve_device(inner: Arc<Inner>, est: Established, rec: DeviceRecord, ac
                 _ = wd_cancel.cancelled() => return,
                 _ = tokio::time::sleep(tick) => {}
             }
-            if now_ms().saturating_sub(wd_ping.load(Ordering::Relaxed)) > dead_after.as_millis() as u64 {
+            // On the monotonic clock: a wall clock set back would keep a
+            // dead link up, one set forward would drop live ones.
+            let now = born.elapsed().as_millis() as u64;
+            if now.saturating_sub(wd_ping.load(Ordering::Relaxed)) > dead_after.as_millis() as u64 {
                 wd_cancel.cancel();
                 return;
             }
@@ -1150,7 +1186,7 @@ async fn serve_device(inner: Arc<Inner>, est: Established, rec: DeviceRecord, ac
             _ => "closed",
         }
     };
-    inner.audit.record(AuditRow {
+    inner.audit.device_row(AuditRow {
         event: "link_down",
         device: Some(dev.fp.short()),
         name: Some(dev.name.clone()),
@@ -1168,6 +1204,8 @@ struct DeviceCtx {
 
 struct LinkCtx {
     cancel: CancellationToken,
+    /// When the link came up; `last_ping` counts milliseconds from here.
+    born: tokio::time::Instant,
     last_ping: Arc<AtomicU64>,
     control_taken: AtomicBool,
     /// Public addresses of the hub learned on this link (denied as the hub).
@@ -1255,12 +1293,14 @@ async fn control_loop(inner: &Inner, live: &Live, dev: &DeviceCtx, link: &LinkCt
         loop {
             match tokio::time::timeout(inner.cfg.dead_after, read_msg(&mut r)).await {
                 Ok(Ok(Message::Ping(n))) => {
-                    link.last_ping.store(now_ms(), Ordering::Relaxed);
+                    link.last_ping.store(link.born.elapsed().as_millis() as u64, Ordering::Relaxed);
                     if pongs.send(n).await.is_err() {
                         return;
                     }
                 }
                 Ok(Ok(Message::Observed(ip))) => inner.learn(link, dev, ip, "the device reached the hub at this address"),
+                // A notice from a newer device (pings alone keep the link up).
+                Ok(Err(WireError::UnknownTag(_))) => {}
                 _ => return,
             }
         }
@@ -1321,6 +1361,13 @@ async fn connect(inner: &Inner, live: &Live, dev: &DeviceCtx, link: &LinkCtx, mu
     if let Some(why) = inner.unavailable() {
         respond(&mut io, Status::Unavailable, &why).await;
         inner.audit.denial(row("refused", why, None));
+        return;
+    }
+    // One device cannot fill the log for everyone (see `Audit::device_budget`).
+    if inner.audit.over_budget(&dev.fp.short()) {
+        let why = "this device has used up its share of the hub's audit log; it refills over time".to_string();
+        respond(&mut io, Status::RateLimited, &why).await;
+        inner.audit.denial(row("denied", why, None));
         return;
     }
     let current = {
@@ -1395,12 +1442,14 @@ async fn connect(inner: &Inner, live: &Live, dev: &DeviceCtx, link: &LinkCtx, mu
         OpenStream { host: host.clone(), port, addr: addr.ip(), learned: link.learned.clone(), cancel: cancel.clone(), why: why.clone() },
     );
     let _registered = Registered { live, id };
-    if write_msg(&mut io, &Message::Response { status: Status::Ok, message: String::new() }).await.is_err() {
+    // Bounded: a device that stops reading must not hold the target
+    // connection and its slot with no relay (and no idle limit) running.
+    let answered = tokio::time::timeout(inner.cfg.request_timeout, write_msg(&mut io, &Message::Response { status: Status::Ok, message: String::new() })).await;
+    if !matches!(answered, Ok(Ok(()))) {
         inner.audit.record(AuditRow { up: Some(0), down: Some(0), ..row("stream", "the device left before the answer".into(), Some(addr)) });
         return;
     }
-    let (up, down, how) = relay(io, tcp, &cancel, Some(live.bytes()), inner.cfg.idle_timeout).await;
-    let outcome = match why.lock().unwrap_or_else(|e| e.into_inner()).take() {
+    let (up, down, how) = relay(io, tcp, &cancel, Some(live.bytes()), inner.cfg.idle_timeout).await;    let outcome = match why.lock().unwrap_or_else(|e| e.into_inner()).take() {
         Some(w) => format!("cut off: now denied ({w})"),
         None => how.to_string(),
     };
@@ -1542,7 +1591,9 @@ async fn serve_pairing(inner: Arc<Inner>, est: Established, _pass: Option<Pass>)
                 let _ = inner.reload();
                 let hub_name = inner.read().name.clone();
                 respond(&mut io, Status::Ok, &hub_name).await;
-                let _ = io.shutdown().await;
+                // Bounded: a peer that stops reading must not hold this
+                // session (and its handshake slot) open.
+                let _ = tokio::time::timeout(Duration::from_secs(2), io.shutdown()).await;
                 // Let the device read the answer and close.
                 let _ = tokio::time::timeout(Duration::from_secs(5), async {
                     let mut b = [0u8; 1];
@@ -1701,5 +1752,24 @@ mod tests {
         assert!(live.set_limits(Limits { max_concurrent: 73, ..Limits::default() }));
         assert!(toks[2].is_cancelled());
         assert_eq!(flags[2].load(Ordering::SeqCst), ENDED_RESIZED);
+    }
+
+    /// A link sized before a raise and registered after it (the raise found
+    /// no link to cut) is cut as it registers: it would otherwise announce a
+    /// limit its session cannot carry, and the device blowing through it
+    /// would end the whole link.
+    #[test]
+    fn a_link_sized_before_a_raise_and_registered_after_it_is_resized() {
+        let live = live(Limits { max_concurrent: 1, ..Limits::default() });
+        let sized = mux::hub_streams(live.limits().max_concurrent);
+        assert!(!live.set_limits(Limits { max_concurrent: 10, ..Limits::default() }), "no link yet to cut");
+        let tok = CancellationToken::new();
+        let ended = live.add_link(7, tok.clone(), sized);
+        assert!(tok.is_cancelled(), "the undersized link is cut");
+        assert_eq!(ended.load(Ordering::SeqCst), ENDED_RESIZED);
+        // Sized after the raise: kept.
+        let tok = CancellationToken::new();
+        live.add_link(8, tok.clone(), mux::hub_streams(10));
+        assert!(!tok.is_cancelled());
     }
 }
