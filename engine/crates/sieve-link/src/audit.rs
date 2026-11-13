@@ -25,6 +25,14 @@
 //!   the size cap would need that, the hub opens no new streams
 //!   (`retention_problem`) and says why, until the owner raises the cap,
 //!   lowers the floor or moves old files away, or the rows age past it.
+//! - So that one paired device cannot bring that about for everyone by
+//!   writing rows fast (streams, denials, relinks), each device's rows are
+//!   charged to its own share of the log (`device_budget`: half the rate the
+//!   cap and the floor allow together). A device past its share has its new
+//!   streams refused and its link and learned-address rows counted instead
+//!   of written, until the share refills; other devices are not affected.
+//!   Several hostile devices together can still fill the cap: pair only
+//!   trusted devices, and revoke one that does this.
 //!
 //! The default cap is 256 MiB (8 files of 32 MiB). A relayed stream writes
 //! two rows (`stream_open`, `stream`), 590 bytes together with IPv6
@@ -155,11 +163,19 @@ struct DenialGate {
     suppressed: u64,
 }
 
+/// One device's share of the log (see `Audit::device_budget`).
+struct Share {
+    bucket: Bucket,
+    /// Rows of this device not written because its share was used up.
+    suppressed: u64,
+}
+
 struct State {
     file: Option<File>,
     size: u64,
     refusals: HashMap<(IpAddr, &'static str), Coalesce>,
     denials: HashMap<String, DenialGate>,
+    shares: HashMap<String, Share>,
     /// All sources' refusal rows together.
     refusal_rate: Bucket,
     /// Refusals neither written nor counted in a per-source summary.
@@ -283,6 +299,7 @@ impl Audit {
                 size,
                 refusals: HashMap::new(),
                 denials: HashMap::new(),
+                shares: HashMap::new(),
                 refusal_rate: Bucket::new(per_min, per_min / 60.0),
                 refusals_dropped: 0,
                 rotate_after: None,
@@ -332,9 +349,74 @@ impl Audit {
     }
 
     /// Writes one row. Returns whether it is on disk (in the OS's hands).
+    /// A device's row is charged to that device's share, and always written
+    /// (a stream's rows must be there, whatever the share).
     pub fn record(&self, row: AuditRow) -> bool {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.write_locked(&mut st, row)
+    }
+
+    /// One device's share of the log, as a rate in bytes per second and a
+    /// burst in bytes, or `None` when there is no retention floor (old rows
+    /// then make room freely and no device can stop the hub).
+    ///
+    /// With a floor, rows written faster than `cap / floor` fill the cap with
+    /// rows the floor forbids deleting, and the hub then opens no streams for
+    /// ANY device. So no one device may write faster than half that rate (a
+    /// day's worth of the whole rate as a burst, never more than a quarter of
+    /// the cap): a device that tries uses up its own share, and only its new
+    /// streams are refused (and its other rows counted instead of written)
+    /// until the share refills. With the defaults: about 4.5 MB a day (some
+    /// 7,500 streams), bursts up to 9 MB.
+    pub fn device_budget(&self) -> Option<(f64, f64)> {
+        let floor = self.cfg.min_retention.as_secs_f64();
+        if floor <= 0.0 {
+            return None;
+        }
+        let cap = self.cfg.cap_bytes() as f64;
+        let whole = cap / floor;
+        Some((whole / 2.0, (whole * DAY.as_secs_f64()).min(cap / 4.0)))
+    }
+
+    /// Whether `device` has used up its share of the log (its new streams
+    /// are then refused).
+    pub fn over_budget(&self, device: &str) -> bool {
+        self.over_budget_at(device, Instant::now())
+    }
+
+    pub(crate) fn over_budget_at(&self, device: &str, now: Instant) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.shares.get_mut(device).is_some_and(|s| s.bucket.level(now) <= 0.0)
+    }
+
+    /// A device's row that may be counted instead of written when the
+    /// device's share is used up (link up and down, learned addresses).
+    /// Returns whether it was written.
+    pub fn device_row(&self, row: AuditRow) -> bool {
+        self.device_row_at(row, Instant::now())
+    }
+
+    pub(crate) fn device_row_at(&self, row: AuditRow, now: Instant) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(dev) = &row.device
+            && let Some(s) = st.shares.get_mut(dev)
+            && s.bucket.level(now) <= 0.0
+        {
+            s.suppressed += 1;
+            return false;
+        }
+        self.write_locked_at(&mut st, row, now)
+    }
+
+    /// Charges `bytes` to `device`'s share.
+    fn charge(&self, st: &mut State, device: &str, bytes: u64, now: Instant) {
+        let Some((rate, burst)) = self.device_budget() else { return };
+        let s = match st.shares.get_mut(device) {
+            Some(s) => s,
+            None => st.shares.entry(device.to_string()).or_insert(Share { bucket: Bucket::new_at(burst, rate, now), suppressed: 0 }),
+        };
+        // Always taken (a debt is paid back by time).
+        let _ = s.bucket.debit(bytes as f64, now);
     }
 
     /// `true` when the log can be written. While unhealthy, tries a write of
@@ -346,12 +428,19 @@ impl Audit {
         self.record(AuditRow { event: "audit_resumed", outcome: "the audit log can be written again".into(), ..Default::default() })
     }
 
-    fn write_locked(&self, st: &mut State, mut row: AuditRow) -> bool {
+    fn write_locked(&self, st: &mut State, row: AuditRow) -> bool {
+        self.write_locked_at(st, row, Instant::now())
+    }
+
+    fn write_locked_at(&self, st: &mut State, mut row: AuditRow, now: Instant) -> bool {
         if row.ts_ms == 0 {
             row.ts_ms = crate::now_ms();
         }
         let Ok(mut line) = serde_json::to_vec(&row) else { return false };
         line.push(b'\n');
+        if let Some(dev) = &row.device {
+            self.charge(st, dev, line.len() as u64, now);
+        }
         let r = self.append(st, &line);
         let was = self.healthy.swap(r.is_ok(), Ordering::SeqCst);
         match (&r, was) {
@@ -513,11 +602,14 @@ impl Audit {
     }
 
     pub(crate) fn denial_at(&self, mut row: AuditRow, now: Instant) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = &mut *guard;
         let per_min = self.cfg.denials_per_minute.max(1) as f64;
         let dev = row.device.clone().unwrap_or_default();
+        let spent = st.shares.get_mut(&dev).is_some_and(|s| s.bucket.level(now) <= 0.0);
         let gate = st.denials.entry(dev).or_insert_with(|| DenialGate { bucket: Bucket::new_at(per_min, per_min / 60.0, now), suppressed: 0 });
-        if !gate.bucket.take(1.0, now) {
+        // Over the per-minute rate, or the device's share of the log is used up.
+        if spent || !gate.bucket.take(1.0, now) {
             gate.suppressed += 1;
             return;
         }
@@ -525,7 +617,7 @@ impl Audit {
             row.suppressed = Some(gate.suppressed);
             gate.suppressed = 0;
         }
-        self.write_locked(&mut st, row);
+        self.write_locked_at(st, row, now);
     }
 
     /// Writes the pending summaries: refusal counts whose window has ended,
@@ -569,10 +661,26 @@ impl Audit {
                 g.suppressed = 0;
             }
         }
+        for (dev, s) in st.shares.iter_mut() {
+            if s.suppressed > 0 {
+                rows.push(AuditRow {
+                    event: "device_rows_suppressed",
+                    device: Some(dev.clone()),
+                    count: Some(s.suppressed),
+                    outcome: format!(
+                        "{} rows of this device were not written one by one: it used up its share of the audit log (its new streams are refused until the share refills)",
+                        s.suppressed
+                    ),
+                    ..Default::default()
+                });
+                s.suppressed = 0;
+            }
+        }
         // Forget devices whose bucket is full again (idle).
         st.denials.retain(|_, g| !g.bucket.is_full(now));
+        st.shares.retain(|_, s| !s.bucket.is_full(now));
         for r in rows {
-            self.write_locked(&mut st, r);
+            self.write_locked_at(&mut st, r, now);
         }
         self.prune();
     }
@@ -861,6 +969,51 @@ mod tests {
         let c = AuditConfig::with_retention(1024, 90);
         assert_eq!(c.cap_bytes(), 1024 * MIB);
         assert_eq!(c.min_retention, DAY * 90);
+    }
+
+    /// One device writing fast uses up its own share, not the whole log:
+    /// its rows are counted instead of written, others are untouched, and
+    /// the share refills with time.
+    #[test]
+    fn one_device_cannot_spend_the_whole_log() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("audit.log");
+        // A 64 KiB cap held for 30 days: about 1 byte per minute per device.
+        let a = Audit::open_with(&p, AuditConfig { max_bytes: 8192, keep: 7, min_retention: DAY * 30, ..Default::default() }).unwrap();
+        let (rate, burst) = a.device_budget().unwrap();
+        assert!(burst <= 64.0 * 1024.0 / 4.0 && burst > 1000.0, "{burst}");
+        let t0 = Instant::now();
+        let dev = |d: &str, ev: &'static str| AuditRow { event: ev, device: Some(d.into()), outcome: "x".repeat(100), ..Default::default() };
+        let mut written = 0;
+        while !a.over_budget_at("aaaa", t0) {
+            assert!(a.record(dev("aaaa", "stream")), "stream rows are always written");
+            written += 1;
+            assert!(written < 1000, "the share never ran out");
+        }
+        // Spent: its link rows and denials are counted, not written...
+        let before = rows(&p).len();
+        assert!(!a.device_row_at(dev("aaaa", "link_up"), t0));
+        a.denial_at(dev("aaaa", "denied"), t0);
+        assert_eq!(rows(&p).len(), before);
+        // ...another device is not affected...
+        assert!(!a.over_budget_at("bbbb", t0));
+        assert!(a.device_row_at(dev("bbbb", "link_up"), t0));
+        // ...nothing stops the hub, and the count is written by `flush`.
+        assert!(a.retention_problem().is_none());
+        a.flush_at(t0);
+        let last = rows(&p).into_iter().rfind(|r| r["event"] == "device_rows_suppressed").expect("summary row");
+        assert_eq!(last["device"], "aaaa");
+        assert_eq!(last["count"], 1);
+        // The share refills at its rate.
+        let debt = 1000.0;
+        assert!(!a.over_budget_at("aaaa", t0 + Duration::from_secs_f64(debt / rate)), "refilled");
+        // No floor: no share at all.
+        let b = Audit::open_with(&t.path().join("b.log"), no_floor(4096, 2)).unwrap();
+        assert!(b.device_budget().is_none());
+        for _ in 0..200 {
+            b.record(dev("aaaa", "stream"));
+        }
+        assert!(!b.over_budget_at("aaaa", t0));
     }
 
     #[test]
