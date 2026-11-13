@@ -25,6 +25,59 @@ use tokio_util::sync::CancellationToken;
 
 const T: Duration = Duration::from_secs(10);
 
+/// Every test's hard limit, body and runtime shutdown together: a hang fails
+/// that test in a minute and says where things stood, instead of holding
+/// the suite forever.
+const TEST_LIMIT: Duration = Duration::from_secs(60);
+/// A runtime whose tasks are all asleep shuts down at once; one that takes
+/// longer has a worker stuck inside a task (a plain drop would wait forever).
+const SHUTDOWN_LIMIT: Duration = Duration::from_secs(10);
+
+thread_local! {
+    /// What the running test can say about its hub and devices if it times out.
+    static DUMPS: std::cell::RefCell<Vec<Box<dyn Fn() -> String>>> = std::cell::RefCell::new(Vec::new());
+}
+
+fn on_timeout_dump(f: impl Fn() -> String + 'static) {
+    DUMPS.with(|d| d.borrow_mut().push(Box::new(f)));
+}
+
+/// Runs one test body on its own four-worker runtime under `TEST_LIMIT`, then
+/// shuts the runtime down under `SHUTDOWN_LIMIT`. Either limit passed fails
+/// the test (with the hub's and devices' state); a panic in the body is
+/// re-raised after the shutdown.
+fn run(name: &str, body: impl std::future::Future<Output = ()>) {
+    // Last resort: a test thread blocked outside the runtime (where no
+    // timer can reach it) ends the test process instead of hanging it.
+    let (_done, watched) = std::sync::mpsc::channel::<()>();
+    let who = name.to_string();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watched.recv_timeout(TEST_LIMIT + SHUTDOWN_LIMIT + Duration::from_secs(10)) {
+            eprintln!("{who}: the test thread is blocked past every limit; ending the test process");
+            std::process::exit(101);
+        }
+    });
+    DUMPS.with(|d| d.borrow_mut().clear());
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    let started = std::time::Instant::now();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(async { tokio::time::timeout(TEST_LIMIT, body).await })));
+    let state = || DUMPS.with(|d| d.borrow().iter().map(|f| f()).collect::<Vec<_>>().join("\n"));
+    let timed_out = matches!(outcome, Ok(Err(_)));
+    let dump = if timed_out { state() } else { String::new() };
+    DUMPS.with(|d| d.borrow_mut().clear());
+    let stopping = std::time::Instant::now();
+    rt.shutdown_timeout(SHUTDOWN_LIMIT);
+    let shutdown = stopping.elapsed();
+    if shutdown > Duration::from_secs(1) {
+        eprintln!("{name}: the runtime took {shutdown:?} to shut down");
+    }
+    assert!(!timed_out, "{name}: timed out after {:?}\n{dump}", started.elapsed());
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(shutdown < SHUTDOWN_LIMIT, "{name}: the runtime took {shutdown:?} to shut down (a worker is stuck inside a task)");
+}
+
 fn resolver() -> StaticResolver {
     let mut m: HashMap<String, Vec<IpAddr>> = HashMap::new();
     m.insert("echo.test".into(), vec!["127.0.0.1".parse().unwrap()]);
@@ -78,6 +131,8 @@ async fn start_hub_cfg(listen: bool, tweak: impl FnOnce(&mut HubConfig)) -> Test
     tweak(&mut cfg);
     let hub = Hub::open(cfg).unwrap();
     let addr = if listen { hub.listen("127.0.0.1:0".parse().unwrap()).await.unwrap() } else { "127.0.0.1:9".parse().unwrap() };
+    let seen = hub.clone();
+    on_timeout_dump(move || seen.debug_state());
     TestHub { _dir: dir, hub, addr }
 }
 
@@ -145,6 +200,8 @@ fn link_cfg(hub: Fingerprint, route: HubRoute) -> LinkConfig {
 
 async fn client(h: &TestHub, id: &Identity) -> LinkClient {
     let c = LinkClient::start(id, link_cfg(h.hub.fingerprint(), HubRoute::Dial(h.addr.to_string()))).await.unwrap();
+    let seen = c.clone();
+    on_timeout_dump(move || seen.debug_state());
     assert!(c.wait_up(T).await, "link did not come up");
     c
 }
@@ -171,6 +228,17 @@ async fn wait_audit(h: &TestHub, pred: impl Fn(&serde_json::Value) -> bool) -> s
     panic!("no matching audit row; rows: {:#?}", audit_rows(h));
 }
 
+/// Waits up to `T` for `cond` (instead of sleeping a guessed time).
+async fn until(what: &str, cond: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("never happened: {what}");
+}
+
 fn refused_status(r: Result<sieve_link::LinkStream, LinkError>) -> Status {
     match r {
         Err(LinkError::Refused { status, .. }) => status,
@@ -179,8 +247,12 @@ fn refused_status(r: Result<sieve_link::LinkStream, LinkError>) -> Status {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pair_then_relay_echo_and_audit() {
+#[test]
+fn pair_then_relay_echo_and_audit() {
+    run("pair_then_relay_echo_and_audit", pair_then_relay_echo_and_audit_body());
+}
+
+async fn pair_then_relay_echo_and_audit_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "laptop").await;
@@ -215,8 +287,12 @@ async fn pair_then_relay_echo_and_audit() {
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reverse_dial_pairs_and_relays() {
+#[test]
+fn reverse_dial_pairs_and_relays() {
+    run("reverse_dial_pairs_and_relays", reverse_dial_pairs_and_relays_body());
+}
+
+async fn reverse_dial_pairs_and_relays_body() {
     // The hub never listens: it dials OUT to the device, and is still the hub.
     let h = start_hub_with(Duration::from_secs(5), false).await;
     let echo = echo_server().await;
@@ -239,8 +315,12 @@ async fn reverse_dial_pairs_and_relays() {
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unpaired_device_is_refused() {
+#[test]
+fn unpaired_device_is_refused() {
+    run("unpaired_device_is_refused", unpaired_device_is_refused_body());
+}
+
+async fn unpaired_device_is_refused_body() {
     let h = start_hub().await;
     let stranger = Identity::generate().unwrap();
     // No code outstanding: the handshake itself fails.
@@ -266,8 +346,12 @@ async fn unpaired_device_is_refused() {
     wait_audit(&h, |r| r["event"] == "pair_refused").await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn revoke_cuts_off_mid_stream_and_refuses_after() {
+#[test]
+fn revoke_cuts_off_mid_stream_and_refuses_after() {
+    run("revoke_cuts_off_mid_stream_and_refuses_after", revoke_cuts_off_mid_stream_and_refuses_after_body());
+}
+
+async fn revoke_cuts_off_mid_stream_and_refuses_after_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let a = pair_new(&h, "a").await;
@@ -309,8 +393,12 @@ async fn revoke_cuts_off_mid_stream_and_refuses_after() {
     cb.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn used_expired_and_wrong_codes_are_refused() {
+#[test]
+fn used_expired_and_wrong_codes_are_refused() {
+    run("used_expired_and_wrong_codes_are_refused", used_expired_and_wrong_codes_are_refused_body());
+}
+
+async fn used_expired_and_wrong_codes_are_refused_body() {
     let h = start_hub().await;
     let code = h.hub.create_pairing_code(60, Some(h.addr.to_string()), "x").unwrap();
     let first = Identity::generate().unwrap();
@@ -350,8 +438,12 @@ async fn used_expired_and_wrong_codes_are_refused() {
     assert_eq!(h.hub.devices().len(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_redeemers_racing_one_code_pair_once() {
+#[test]
+fn two_redeemers_racing_one_code_pair_once() {
+    run("two_redeemers_racing_one_code_pair_once", two_redeemers_racing_one_code_pair_once_body());
+}
+
+async fn two_redeemers_racing_one_code_pair_once_body() {
     let h = start_hub().await;
     let code = h.hub.create_pairing_code(60, Some(h.addr.to_string()), "x").unwrap();
     // From two sources, so neither is told "busy" for sharing one.
@@ -367,8 +459,12 @@ async fn two_redeemers_racing_one_code_pair_once() {
     assert_eq!(devs[0].fingerprint, winner.fingerprint());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn strangers_holding_pairing_slots_get_the_device_a_busy_answer() {
+#[test]
+fn strangers_holding_pairing_slots_get_the_device_a_busy_answer() {
+    run("strangers_holding_pairing_slots_get_the_device_a_busy_answer", strangers_holding_pairing_slots_get_the_device_a_busy_answer_body());
+}
+
+async fn strangers_holding_pairing_slots_get_the_device_a_busy_answer_body() {
     let h = start_hub().await;
     let code = h.hub.create_pairing_code(60, Some(h.addr.to_string()), "x").unwrap();
     // Four strangers from four sources finish TLS (a code is outstanding)
@@ -392,8 +488,12 @@ async fn strangers_holding_pairing_slots_get_the_device_a_busy_answer() {
     wait_audit(&h, |r| r["event"] == "pair_refused" && r["outcome"].as_str().unwrap().contains("no request in time")).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn silent_sockets_do_not_lock_out_a_device() {
+#[test]
+fn silent_sockets_do_not_lock_out_a_device() {
+    run("silent_sockets_do_not_lock_out_a_device", silent_sockets_do_not_lock_out_a_device_body());
+}
+
+async fn silent_sockets_do_not_lock_out_a_device_body() {
     // Many silent sockets from one source: only a few are admitted.
     let h = start_hub().await;
     let id = pair_new(&h, "d").await;
@@ -435,8 +535,12 @@ async fn silent_sockets_do_not_lock_out_a_device() {
     drop(silent);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_hubs_own_network_is_denied() {
+#[test]
+fn the_hubs_own_network_is_denied() {
+    run("the_hubs_own_network_is_denied", the_hubs_own_network_is_denied_body());
+}
+
+async fn the_hubs_own_network_is_denied_body() {
     let h = start_hub().await;
     let id = pair_new(&h, "d").await;
     let c = client(&h, &id).await;
@@ -490,8 +594,12 @@ async fn the_hubs_own_network_is_denied() {
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unreadable_interface_list_stops_the_hub_unless_overridden() {
+#[test]
+fn an_unreadable_interface_list_stops_the_hub_unless_overridden() {
+    run("an_unreadable_interface_list_stops_the_hub_unless_overridden", an_unreadable_interface_list_stops_the_hub_unless_overridden_body());
+}
+
+async fn an_unreadable_interface_list_stops_the_hub_unless_overridden_body() {
     struct Broken;
     impl InterfaceSource for Broken {
         fn snapshot(&self) -> std::io::Result<HostNet> {
@@ -511,8 +619,12 @@ async fn an_unreadable_interface_list_stops_the_hub_unless_overridden() {
     hub.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_failing_interface_refresh_stops_new_streams() {
+#[test]
+fn a_failing_interface_refresh_stops_new_streams() {
+    run("a_failing_interface_refresh_stops_new_streams", a_failing_interface_refresh_stops_new_streams_body());
+}
+
+async fn a_failing_interface_refresh_stops_new_streams_body() {
     use std::sync::atomic::{AtomicBool, Ordering};
     struct Flaky(Arc<AtomicBool>);
     impl InterfaceSource for Flaky {
@@ -533,16 +645,20 @@ async fn a_failing_interface_refresh_stops_new_streams() {
     let c = client(&h, &id).await;
     let _ok = c.open("127.0.0.1", echo).await.unwrap();
     broken.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    until("the failing refresh is seen", || h.hub.unavailable().is_some()).await;
     assert_eq!(refused_status(c.open("127.0.0.1", echo).await), Status::Unavailable);
     broken.store(false, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    until("the working refresh is seen", || h.hub.unavailable().is_none()).await;
     assert!(c.open("127.0.0.1", echo).await.is_ok());
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn wrong_pinned_key_is_refused() {
+#[test]
+fn wrong_pinned_key_is_refused() {
+    run("wrong_pinned_key_is_refused", wrong_pinned_key_is_refused_body());
+}
+
+async fn wrong_pinned_key_is_refused_body() {
     let h = start_hub().await;
     let mut code = h.hub.create_pairing_code(60, Some(h.addr.to_string()), "x").unwrap();
     let impostor = Identity::generate().unwrap();
@@ -558,8 +674,12 @@ async fn wrong_pinned_key_is_refused() {
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn deny_rules_refuse_and_are_logged() {
+#[test]
+fn deny_rules_refuse_and_are_logged() {
+    run("deny_rules_refuse_and_are_logged", deny_rules_refuse_and_are_logged_body());
+}
+
+async fn deny_rules_refuse_and_are_logged_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -584,8 +704,12 @@ async fn deny_rules_refuse_and_are_logged() {
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rate_and_concurrency_limits() {
+#[test]
+fn rate_and_concurrency_limits() {
+    run("rate_and_concurrency_limits", rate_and_concurrency_limits_body());
+}
+
+async fn rate_and_concurrency_limits_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -628,8 +752,12 @@ async fn rate_and_concurrency_limits() {
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_lower_limit_counts_streams_already_open() {
+#[test]
+fn a_lower_limit_counts_streams_already_open() {
+    run("a_lower_limit_counts_streams_already_open", a_lower_limit_counts_streams_already_open_body());
+}
+
+async fn a_lower_limit_counts_streams_already_open_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -656,8 +784,12 @@ async fn a_lower_limit_counts_streams_already_open() {
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn byte_rate_limit_slows_the_relay() {
+#[test]
+fn byte_rate_limit_slows_the_relay() {
+    run("byte_rate_limit_slows_the_relay", byte_rate_limit_slows_the_relay_body());
+}
+
+async fn byte_rate_limit_slows_the_relay_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -675,8 +807,12 @@ async fn byte_rate_limit_slows_the_relay() {
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn streams_count_from_arrival_and_one_control_stream_per_link() {
+#[test]
+fn streams_count_from_arrival_and_one_control_stream_per_link() {
+    run("streams_count_from_arrival_and_one_control_stream_per_link", streams_count_from_arrival_and_one_control_stream_per_link_body());
+}
+
+async fn streams_count_from_arrival_and_one_control_stream_per_link_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -694,14 +830,14 @@ async fn streams_count_from_arrival_and_one_control_stream_per_link() {
     write_msg(&mut ctl2, &Message::Control).await.unwrap();
     assert!(matches!(read_msg(&mut ctl2).await.unwrap(), Message::Response { status: Status::BadRequest, .. }));
     drop(ctl2);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until("the refused control stream holds no slot", || h.hub.debug_state().contains(" open=0 ")).await;
     // Two streams that never send a request hold both slots...
     // (One byte of a length prefix each: yamux opens a stream on its first byte.)
     let mut s1 = mh.open().await.unwrap();
     let mut s2 = mh.open().await.unwrap();
     s1.write_all(&[0]).await.unwrap();
     s2.write_all(&[0]).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    until("both silent streams hold a slot", || h.hub.debug_state().contains(" open=2 ")).await;
     // ...so a third is told Busy (after the hub's short wait for a slot).
     let mut s3 = mh.open().await.unwrap();
     write_msg(&mut s3, &Message::Connect { host: "127.0.0.1".into(), port: echo }).await.unwrap();
@@ -713,8 +849,12 @@ async fn streams_count_from_arrival_and_one_control_stream_per_link() {
     stop.cancel();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_holds_at_most_two_links_and_the_newest_wins() {
+#[test]
+fn a_device_holds_at_most_two_links_and_the_newest_wins() {
+    run("a_device_holds_at_most_two_links_and_the_newest_wins", a_device_holds_at_most_two_links_and_the_newest_wins_body());
+}
+
+async fn a_device_holds_at_most_two_links_and_the_newest_wins_body() {
     let h = start_hub().await;
     let id = pair_new(&h, "d").await;
     let (m1, s1) = raw_session(&h, &id).await;
@@ -736,8 +876,12 @@ async fn a_device_holds_at_most_two_links_and_the_newest_wins() {
     s3.cancel();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stream_open_is_on_record_before_the_stream_ends() {
+#[test]
+fn stream_open_is_on_record_before_the_stream_ends() {
+    run("stream_open_is_on_record_before_the_stream_ends", stream_open_is_on_record_before_the_stream_ends_body());
+}
+
+async fn stream_open_is_on_record_before_the_stream_ends_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -756,8 +900,12 @@ async fn stream_open_is_on_record_before_the_stream_ends() {
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_relaying_without_an_audit_record() {
+#[test]
+fn no_relaying_without_an_audit_record() {
+    run("no_relaying_without_an_audit_record", no_relaying_without_an_audit_record_body());
+}
+
+async fn no_relaying_without_an_audit_record_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -775,8 +923,12 @@ async fn no_relaying_without_an_audit_record() {
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unreadable_store_stops_new_streams_until_it_reads_again() {
+#[test]
+fn an_unreadable_store_stops_new_streams_until_it_reads_again() {
+    run("an_unreadable_store_stops_new_streams_until_it_reads_again", an_unreadable_store_stops_new_streams_until_it_reads_again_body());
+}
+
+async fn an_unreadable_store_stops_new_streams_until_it_reads_again_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -785,18 +937,22 @@ async fn an_unreadable_store_stops_new_streams_until_it_reads_again() {
     let path = h.hub.audit_path().parent().unwrap().join("hub.json");
     let good = std::fs::read(&path).unwrap();
     std::fs::write(&path, b"{ this is not json").unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    until("the damaged store is seen", || h.hub.unavailable().is_some()).await;
     assert_eq!(refused_status(c.open("127.0.0.1", echo).await), Status::Unavailable);
     std::fs::write(&path, &good).unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    until("the store reads again", || h.hub.unavailable().is_none()).await;
     assert!(c.open("127.0.0.1", echo).await.is_ok());
     wait_audit(&h, |r| r["event"] == "store_unreadable").await;
     wait_audit(&h, |r| r["event"] == "store_resumed").await;
     c.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn device_names_are_cleaned_unique_and_never_shadow_a_fingerprint() {
+#[test]
+fn device_names_are_cleaned_unique_and_never_shadow_a_fingerprint() {
+    run("device_names_are_cleaned_unique_and_never_shadow_a_fingerprint", device_names_are_cleaned_unique_and_never_shadow_a_fingerprint_body());
+}
+
+async fn device_names_are_cleaned_unique_and_never_shadow_a_fingerprint_body() {
     let h = start_hub().await;
     let a = pair_new_named(&h, "evil\u{202E}name\u{7}").await;
     let b = pair_new_named(&h, "evilname").await;
@@ -818,8 +974,12 @@ async fn pair_new_named(h: &TestHub, name: &str) -> Identity {
     id
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hub_down_stop_refuses_and_direct_goes_direct() {
+#[test]
+fn hub_down_stop_refuses_and_direct_goes_direct() {
+    run("hub_down_stop_refuses_and_direct_goes_direct", hub_down_stop_refuses_and_direct_goes_direct_body());
+}
+
+async fn hub_down_stop_refuses_and_direct_goes_direct_body() {
     let hub_fp = Identity::generate().unwrap().fingerprint();
     let dead = format!("127.0.0.1:{}", dead_port().await);
     let echo = echo_server().await;
@@ -849,8 +1009,12 @@ async fn raw_session(h: &TestHub, id: &Identity) -> (mux::MuxHandle, Cancellatio
     (mh, stop)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn malformed_and_oversized_frames_do_not_hurt_the_hub() {
+#[test]
+fn malformed_and_oversized_frames_do_not_hurt_the_hub() {
+    run("malformed_and_oversized_frames_do_not_hurt_the_hub", malformed_and_oversized_frames_do_not_hurt_the_hub_body());
+}
+
+async fn malformed_and_oversized_frames_do_not_hurt_the_hub_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -891,8 +1055,12 @@ async fn malformed_and_oversized_frames_do_not_hurt_the_hub() {
     stop.cancel();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_silent_link_is_dropped_by_the_hub() {
+#[test]
+fn a_silent_link_is_dropped_by_the_hub() {
+    run("a_silent_link_is_dropped_by_the_hub", a_silent_link_is_dropped_by_the_hub_body());
+}
+
+async fn a_silent_link_is_dropped_by_the_hub_body() {
     let h = start_hub_with(Duration::from_millis(800), true).await;
     let id = pair_new(&h, "quiet").await;
     // No control stream, no pings.
@@ -909,8 +1077,12 @@ async fn a_silent_link_is_dropped_by_the_hub() {
     stop.cancel();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn local_proxy_speaks_socks5_and_http_connect() {
+#[test]
+fn local_proxy_speaks_socks5_and_http_connect() {
+    run("local_proxy_speaks_socks5_and_http_connect", local_proxy_speaks_socks5_and_http_connect_body());
+}
+
+async fn local_proxy_speaks_socks5_and_http_connect_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -987,8 +1159,12 @@ fn no_link_down(h: &TestHub) {
 /// device (a raw session that ignores the announced limit): each extra one
 /// is answered Busy by the hub on its spare streams. Either way both open
 /// streams keep working and the link stays up.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_burst_over_the_limit_gets_busy_and_healthy_streams_survive() {
+#[test]
+fn a_burst_over_the_limit_gets_busy_and_healthy_streams_survive() {
+    run("a_burst_over_the_limit_gets_busy_and_healthy_streams_survive", a_burst_over_the_limit_gets_busy_and_healthy_streams_survive_body());
+}
+
+async fn a_burst_over_the_limit_gets_busy_and_healthy_streams_survive_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -1043,8 +1219,12 @@ async fn a_burst_over_the_limit_gets_busy_and_healthy_streams_survive() {
 
 /// P2-A: a plain allow-cidr never reopens the hub, its LAN or loopback,
 /// even 0.0.0.0/0; allow-lan opens a LAN block but not the hub.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn allow_cidr_does_not_reopen_the_lan() {
+#[test]
+fn allow_cidr_does_not_reopen_the_lan() {
+    run("allow_cidr_does_not_reopen_the_lan", allow_cidr_does_not_reopen_the_lan_body());
+}
+
+async fn allow_cidr_does_not_reopen_the_lan_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -1067,8 +1247,12 @@ async fn allow_cidr_does_not_reopen_the_lan() {
 /// P2-C, hub dials out: the device sees the hub's (public) address as its
 /// TCP peer and reports it; the hub denies it to that link as itself,
 /// mapped and NAT64 forms included, and shows it in status.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dialling_hub_learns_its_public_address_from_the_device() {
+#[test]
+fn a_dialling_hub_learns_its_public_address_from_the_device() {
+    run("a_dialling_hub_learns_its_public_address_from_the_device", a_dialling_hub_learns_its_public_address_from_the_device_body());
+}
+
+async fn a_dialling_hub_learns_its_public_address_from_the_device_body() {
     let h = start_hub_with(Duration::from_secs(5), false).await;
     let device_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let device_addr = device_listener.local_addr().unwrap();
@@ -1102,8 +1286,12 @@ async fn a_dialling_hub_learns_its_public_address_from_the_device() {
 
 /// P2-C, hub listens: the local address the device reached is the hub's
 /// own when it is public (injected: loopback stands in for it).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_listening_hub_learns_the_address_it_was_reached_on() {
+#[test]
+fn a_listening_hub_learns_the_address_it_was_reached_on() {
+    run("a_listening_hub_learns_the_address_it_was_reached_on", a_listening_hub_learns_the_address_it_was_reached_on_body());
+}
+
+async fn a_listening_hub_learns_the_address_it_was_reached_on_body() {
     let h = start_hub_cfg(true, |c| c.test_local_addr = Some("93.184.0.88".parse().unwrap())).await;
     let id = pair_new(&h, "d").await;
     let c = client(&h, &id).await;
@@ -1117,8 +1305,12 @@ async fn a_listening_hub_learns_the_address_it_was_reached_on() {
 
 /// P2-F: when making room would delete rows younger than the floor, the
 /// hub opens no new streams and says why.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_full_audit_log_within_the_floor_stops_new_streams() {
+#[test]
+fn a_full_audit_log_within_the_floor_stops_new_streams() {
+    run("a_full_audit_log_within_the_floor_stops_new_streams", a_full_audit_log_within_the_floor_stops_new_streams_body());
+}
+
+async fn a_full_audit_log_within_the_floor_stops_new_streams_body() {
     let dir = tempfile::tempdir().unwrap();
     Hub::init(dir.path(), "test-hub").unwrap();
     // Three rotated files of fresh rows, one more than `keep` allows.
@@ -1127,7 +1319,8 @@ async fn a_full_audit_log_within_the_floor_stops_new_streams() {
         std::fs::write(dir.path().join(format!("audit.log.{i}")), &fresh).unwrap();
     }
     let mut cfg = test_cfg(dir.path(), Duration::from_secs(5));
-    cfg.audit = AuditConfig { max_bytes: 4096, keep: 2, ..AuditConfig::default() };
+    // Large files (so each device's share of the cap is roomy), few of them.
+    cfg.audit = AuditConfig { max_bytes: 1024 * 1024, keep: 2, ..AuditConfig::default() };
     let hub = Hub::open(cfg).unwrap();
     let addr = hub.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let h = TestHub { _dir: dir, hub, addr };
@@ -1154,10 +1347,53 @@ async fn a_full_audit_log_within_the_floor_stops_new_streams() {
     c.shutdown();
 }
 
+/// A device that writes the audit log fast uses up its own share: its new
+/// streams are refused, another device's are not, and the hub stays open
+/// (it would stop for everyone if the cap filled inside the floor).
+#[test]
+fn a_device_past_its_audit_share_is_refused_alone() {
+    run("a_device_past_its_audit_share_is_refused_alone", a_device_past_its_audit_share_is_refused_alone_body());
+}
+
+async fn a_device_past_its_audit_share_is_refused_alone_body() {
+    // A 64 KiB cap held 30 days: each device's burst is about 2 KB.
+    let h = start_hub_cfg(true, |c| c.audit = AuditConfig { max_bytes: 8192, keep: 7, min_retention: Duration::from_secs(30 * 86_400), ..AuditConfig::default() }).await;
+    let echo = echo_server().await;
+    let greedy = pair_new(&h, "greedy").await;
+    let quiet = pair_new(&h, "quiet").await;
+    allow_loopback(&h, &greedy);
+    allow_loopback(&h, &quiet);
+    let g = client(&h, &greedy).await;
+    let mut refused = None;
+    for _ in 0..50 {
+        match g.open("127.0.0.1", echo).await {
+            Ok(s) => drop(s),
+            Err(e) => {
+                refused = Some(e);
+                break;
+            }
+        }
+    }
+    match refused {
+        Some(LinkError::Refused { status: Status::RateLimited, message }) => assert!(message.contains("share of the hub's audit log"), "{message}"),
+        other => panic!("expected the greedy device to be refused, got {other:?}"),
+    }
+    assert!(h.hub.unavailable().is_none(), "the hub stays open for everyone");
+    let q = client(&h, &quiet).await;
+    let mut s = q.open("127.0.0.1", echo).await.expect("another device is not affected");
+    echo_once(&mut s, b"quiet").await;
+    g.shutdown();
+    q.shutdown();
+}
+
 /// P3: a store unreadable past the grace cuts every link; readable again,
 /// the device comes back.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_store_unreadable_past_the_grace_cuts_the_links() {
+#[test]
+fn a_store_unreadable_past_the_grace_cuts_the_links() {
+    run("a_store_unreadable_past_the_grace_cuts_the_links", a_store_unreadable_past_the_grace_cuts_the_links_body());
+}
+
+async fn a_store_unreadable_past_the_grace_cuts_the_links_body() {
     let h = start_hub_cfg(true, |c| c.store_grace = Duration::from_millis(500)).await;
     let id = pair_new(&h, "d").await;
     let c = client(&h, &id).await;
@@ -1173,8 +1409,12 @@ async fn a_store_unreadable_past_the_grace_cuts_the_links() {
 }
 
 /// P3: a rule change that denies an open stream's destination cuts it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rule_change_cuts_streams_it_now_denies() {
+#[test]
+fn a_rule_change_cuts_streams_it_now_denies() {
+    run("a_rule_change_cuts_streams_it_now_denies", a_rule_change_cuts_streams_it_now_denies_body());
+}
+
+async fn a_rule_change_cuts_streams_it_now_denies_body() {
     let h = start_hub().await;
     let echo = echo_server().await;
     let id = pair_new(&h, "d").await;
@@ -1209,8 +1449,12 @@ impl PeerPolicy for AnyKey {
 
 /// P3: a pairing answer with a status this device does not know says the
 /// hub is newer, not that the code was used.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_newer_hubs_pairing_answer_says_so() {
+#[test]
+fn a_newer_hubs_pairing_answer_says_so() {
+    run("a_newer_hubs_pairing_answer_says_so", a_newer_hubs_pairing_answer_says_so_body());
+}
+
+async fn a_newer_hubs_pairing_answer_says_so_body() {
     let hub_id = Identity::generate().unwrap();
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
