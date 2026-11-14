@@ -55,7 +55,7 @@ fn relay(sink: Arc<FakeSink>) -> Arc<Relay> {
     let dns = Arc::new(Service::new(Vec::new(), context, tables.clone(), names.clone(), meters.clone(), usize::from(MTU), Box::new(|_| false)));
     let nat = Arc::new(NatTable::spawn(|| (Vec::new(), Box::new(NoDirectory) as Box<dyn VmDirectory>)));
     let egress = Arc::new(Egress::new(0, tables.clone()));
-    Arc::new(Relay::new(RelayParts { tables, egress, dns, book: Arc::default(), names, meters, filter, witness: Box::new(Unwitnessed), nat, https: Arc::default(), sink }))
+    Arc::new(Relay::new(RelayParts { tables, egress, dns, book: Arc::default(), names, meters, filter, witness: Box::new(Unwitnessed), nat, https: Arc::default(), sink, link: Arc::new(crate::link::LinkManager::new(None, Box::new(|| Err("no network in this test".into())), crate::policy::wall_ms)) }))
 }
 
 struct Wire {
@@ -304,7 +304,7 @@ impl TcpBed {
         let (upstream, server) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
         let tuple = FiveTuple { proto: Proto::Tcp, local, remote };
         let admitted = ctx.admit(&tuple, &ctx.attribute(tuple).await, FlowProto::Tcp, FlowKind::Other).expect("admitted");
-        let task = tokio::spawn(serve_admitted(ctx.clone(), app, tuple, admitted, upstream.unwrap(), monotonic_ms()));
+        let task = tokio::spawn(serve_admitted(ctx.clone(), app, tuple, admitted, crate::link::exit::Upstream::Tcp(upstream.unwrap()), monotonic_ms(), None));
         let mut bed = Self { ctx, wire, local, remote, server_next: 0, client_next: CLIENT_ISN + 1, server: server.unwrap().0, task };
         let syn_ack = bed.next_segment().await;
         assert!(syn_ack.syn && syn_ack.ack, "{syn_ack:?}");
@@ -336,6 +336,88 @@ impl TcpBed {
             }
         }
     }
+}
+
+impl TcpBed {
+    /// A flow that exits through a hub (`relay::handle_exiting`'s path): no
+    /// SYN-time socket, an upstream the decision opens. `server` is an unused
+    /// loopback pair, as no server is dialled from here.
+    async fn through(flow: (&str, &str), plan: crate::link::Plan) -> Self {
+        let (local, remote) = ends(flow);
+        let ctx = relay(Arc::default());
+        let mut wire = wire();
+        wire.to_stack.send(segment(local, remote, CLIENT_ISN, Flags { syn: true, ..Flags::default() }, &[])).unwrap();
+        let Ok(IpStackStream::Tcp(app)) = wire.stack.accept().await else { panic!("no TCP stream") };
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (_unused, server) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+        let tuple = FiveTuple { proto: Proto::Tcp, local, remote };
+        let admitted = ctx.admit(&tuple, &ctx.attribute(tuple).await, FlowProto::Tcp, FlowKind::Other).expect("admitted");
+        let (upstream, starter) = crate::link::exit::lazy();
+        let exit = super::relay::FlowExit::for_test(&ctx, starter, plan, admitted.id, remote);
+        let task = tokio::spawn(serve_admitted(ctx.clone(), app, tuple, admitted, crate::link::exit::Upstream::Lazy(upstream), monotonic_ms(), Some(exit)));
+        let mut bed = Self { ctx, wire, local, remote, server_next: 0, client_next: CLIENT_ISN + 1, server: server.unwrap().0, task };
+        let syn_ack = bed.next_segment().await;
+        assert!(syn_ack.syn && syn_ack.ack, "{syn_ack:?}");
+        bed.send(&[]);
+        bed
+    }
+
+    /// The app's received bytes, until `len` of them came.
+    async fn received(&mut self, len: usize) -> Vec<u8> {
+        let mut got = Vec::new();
+        while got.len() < len {
+            let packet = tokio::time::timeout(WAIT, self.wire.from_stack.recv()).await.expect("a segment").unwrap();
+            let headers = PacketHeaders::from_ip_slice(&packet).unwrap();
+            let Some(TransportHeader::Tcp(header)) = headers.transport else { continue };
+            let payload = headers.payload.slice();
+            self.server_next = header.sequence_number.wrapping_add(u32::try_from(payload.len()).unwrap());
+            got.extend_from_slice(payload);
+            self.send(&[]);
+        }
+        got
+    }
+}
+
+/// Exiting through a hub, through the real relay and a real `IpStack`: a blocked
+/// flow never reaches the hub and is reset as before; a passed one opens through
+/// the hub by the name it carries, its bytes go both ways, and its row says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exiting_flow_opens_through_the_hub_only_once_passed_and_by_the_name_it_carries() {
+    use crate::link::tests as lt;
+    let h = lt::hub(true).await;
+    let port = lt::echo().await;
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(lt::LoopNet::default());
+    let m = lt::manager(dir.path(), net.clone());
+    lt::paired(&m, &h).await;
+    m.set(lt::exiting(sieve_ipc::LinkRoute::Dial { address: h.addr.to_string() }, sieve_ipc::LinkHubDown::Stop)).unwrap();
+    m.routes_up(net.clone(), lt::noop_reset());
+    lt::until("up", || m.status().state == sieve_ipc::LinkState::Up).await;
+    let plan = m.plan(lt::SITE.parse().unwrap()).unwrap();
+    let remote = format!("{}:{port}", lt::SITE);
+
+    let mut bed = TcpBed::through(("10.9.0.2:50001", &remote), plan.clone()).await;
+    let expected_seq = bed.server_next;
+    bed.send(&hello(BLOCKED));
+    let end = bed.until_the_end().await;
+    assert!(end.rst && !end.fin && end.sequence_number == expected_seq, "{end:?}");
+    ended(&mut bed.task).await.unwrap();
+    assert_blocked_once(&bed.ctx, BLOCKED);
+
+    let mut bed = TcpBed::through(("10.9.0.2:50002", &remote), plan).await;
+    let request = hello("echo.test");
+    bed.send(&request);
+    assert_eq!(bed.received(request.len()).await, request, "echoed through the hub");
+    let rows = bed.ctx.book.lock().unwrap().take_log();
+    assert!(
+        rows.iter().any(|r| r.outcome == LogOutcome::Exit { via: sieve_ipc::ExitVia::Hub, target: Some(format!("echo.test:{port}")), reason: None }),
+        "{rows:?}"
+    );
+    let audit = std::fs::read_to_string(h.hub.audit_path()).unwrap_or_default();
+    assert!(audit.contains(&format!("echo.test:{port}")), "the hub was asked by name");
+    assert!(!audit.contains(BLOCKED), "the blocked flow never reached the hub");
+    bed.task.abort();
+    m.routes_down();
 }
 
 /// First bytes that name the host in one segment.

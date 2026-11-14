@@ -111,7 +111,7 @@ pub struct Engine {
     /// `filtering.https`: built by the routing loop while it is wanted and
     /// routes are up, empty otherwise.
     #[cfg(windows)]
-    pub https: Arc<crate::tls::intercept::HttpsSlot<crate::stack::egress::Egress>>,
+    pub https: Arc<crate::tls::intercept::HttpsSlot<crate::link::exit::Exit>>,
     pub flows: broadcast::Sender<Arc<Vec<FlowEvent>>>,
     /// What the filter did, on the same cadence (plan 8.3).
     pub log: broadcast::Sender<Arc<Vec<LogRow>>>,
@@ -134,6 +134,22 @@ pub struct Engine {
     /// A Wi-Fi that wants a sign-in and the user's pause of the DNS Client
     /// capture for it (`route::sign_in`). Memory only: a restart starts empty.
     sign_in: Mutex<SignIn>,
+    /// Exiting through another device (`crate::link`): the pairing, the owner's
+    /// choices and the running link, which runs only while routes are up.
+    pub link: Arc<crate::link::LinkManager>,
+}
+
+/// Where the link finds the network while Sieve does not route (to pair): the
+/// tables as they are, read fresh, pinned as every engine socket is.
+#[cfg(windows)]
+fn net_now() -> Result<Arc<dyn crate::link::LinkNet>, String> {
+    let tables = crate::route::table::read::tables()?;
+    Ok(Arc::new(crate::stack::egress::Egress::new(0, Arc::new(std::sync::RwLock::new(tables)))))
+}
+
+#[cfg(not(windows))]
+fn net_now() -> Result<Arc<dyn crate::link::LinkNet>, String> {
+    Err("not on this platform".into())
 }
 
 /// `install_root`'s refusal while the switch is off (plan 7.3: no root
@@ -173,6 +189,7 @@ impl Engine {
         let meters: Arc<Meters> = Arc::default();
         let heal = Arc::new(Heal::new(exclusions.clone(), meters.clone()));
         let validation = Arc::new(crate::tls::validation::ValidationSlot::new(meters.clone()));
+        let link = Arc::new(crate::link::LinkManager::new(dir.as_deref(), Box::new(net_now), policy::wall_ms));
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: dir.as_deref().map(crate::experiments::Loaded::load).unwrap_or_else(crate::experiments::Loaded::absent),
@@ -207,6 +224,7 @@ impl Engine {
             reinstall: AtomicBool::new(false),
             updates: Arc::default(),
             sign_in: Mutex::default(),
+            link,
         }
     }
 
@@ -260,7 +278,7 @@ impl Engine {
     /// here, or finds this published and empties it, so no flow decrypts after off.
     /// Each outcome replaces the last, and one that no longer matters says nothing.
     #[cfg(windows)]
-    pub fn publish_https(&self, built: Result<crate::tls::intercept::Interception<crate::stack::egress::Egress>, String>) {
+    pub fn publish_https(&self, built: Result<crate::tls::intercept::Interception<crate::link::exit::Exit>, String>) {
         let policy = lock(&self.policy);
         if !https_can_run(&policy) {
             return;
@@ -505,6 +523,7 @@ impl Engine {
             dns_capture: if f.routes_up { f.dns_capture } else { None },
             wifi_sign_in: if f.routes_up { self.sign_in().report(std::time::Instant::now()) } else { None },
             update,
+            link: Some(self.link.status()),
         }
     }
 }
@@ -555,6 +574,25 @@ impl Backend for Engine {
         let held = facts.dns_capture == Some(sieve_ipc::DnsCapture::Working);
         self.sign_in().pause(std::time::Instant::now(), network, wanted, held)?;
         self.wake.notify_one();
+        Ok(self.status())
+    }
+
+    /// The code goes to the link manager and no further: nothing here logs it,
+    /// and a refusal's words never hold it.
+    fn link_pair(&self, code: String, route: Option<sieve_ipc::LinkRoute>) -> Result<EngineStatus, String> {
+        let paired = self.link.pair(&code, route);
+        drop(code);
+        paired?;
+        Ok(self.status())
+    }
+
+    fn link_unpair(&self) -> Result<EngineStatus, String> {
+        self.link.unpair()?;
+        Ok(self.status())
+    }
+
+    fn set_link(&self, settings: sieve_ipc::LinkSettings) -> Result<EngineStatus, String> {
+        self.link.set(settings)?;
         Ok(self.status())
     }
 
@@ -1422,7 +1460,7 @@ mod tests {
         let e = Engine::new(None, PathBuf::new(), on.clone(), Runs::default(), None);
         let egress = Arc::new(crate::stack::egress::Egress::new(0, Arc::new(std::sync::RwLock::new(crate::route::table::NetTables::default()))));
         let interception = Interception {
-            connector: egress,
+            connector: Arc::new(crate::link::exit::Exit { net: egress, link: e.link.clone() }),
             exclusions: e.exclusions.clone(),
             verifier: Arc::new(Verifier::new(crate::tls::public_roots(), Arc::new(PlatformTrust::new().unwrap()), TRUST_TIMEOUT, e.validation.clone()).unwrap()),
             verdicts: VerdictCache::default(),

@@ -37,6 +37,8 @@ use super::progress::{Progress, Watched};
 use super::retry;
 use super::{DNS_PORT, Meters, close_blocked, kind_of, record_decision};
 use crate::dns::NameMap;
+use crate::link::exit::{self, Exit, ExitReport, Upstream};
+use crate::link::{LinkManager, Plan};
 use crate::dns::service::Service;
 use crate::domain::{FilterSlot, Flow};
 use crate::flow::classify::{Decoded, UdpClassifier};
@@ -74,6 +76,11 @@ pub fn tcp_config() -> ipstack::TcpConfig {
     config
 }
 const DATAGRAM: usize = 65_535;
+
+/// The log's words for UDP while exiting through a hub (`handle_udp`).
+const QUIC_ON_LINK: &str = "QUIC is refused while exiting through the other device, so the app uses TCP, which goes through it";
+const UDP_ON_LINK: &str = "UDP is not carried through the other device, so it was dropped, as set";
+const UDP_DIRECT: &str = "UDP is not carried through the other device; it went directly from this computer, as set";
 
 type ExeLookup = fn(u32) -> Option<String>;
 type ProductLookup = fn(&str) -> Option<String>;
@@ -132,9 +139,11 @@ pub struct Relay {
     pub book: Arc<Mutex<FlowBook>>,
     pub meters: Arc<Meters>,
     /// `filtering.https`: empty means every flow takes `relay_tcp`.
-    pub https: Arc<HttpsSlot<Egress>>,
+    pub https: Arc<HttpsSlot<Exit>>,
     /// Where a refused QUIC flow's answers go: the adapter.
     pub sink: Arc<dyn PacketSink>,
+    /// Exiting through another device (`crate::link`).
+    pub link: Arc<LinkManager>,
 }
 
 pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -160,12 +169,13 @@ pub struct RelayParts {
     pub filter: Arc<FilterSlot>,
     pub witness: Witness,
     pub nat: Arc<NatTable>,
-    pub https: Arc<HttpsSlot<Egress>>,
+    pub https: Arc<HttpsSlot<Exit>>,
     pub sink: Arc<dyn PacketSink>,
+    pub link: Arc<LinkManager>,
 }
 
 impl Relay {
-    pub fn new(RelayParts { tables, egress, dns, book, names, meters, filter, witness, nat, https, sink }: RelayParts) -> Self {
+    pub fn new(RelayParts { tables, egress, dns, book, names, meters, filter, witness, nat, https, sink, link }: RelayParts) -> Self {
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: crate::experiments::Settings::default(),
@@ -183,6 +193,7 @@ impl Relay {
             meters,
             https,
             sink,
+            link,
         }
     }
 
@@ -323,16 +334,29 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
         return dns_flow::tcp(ctx, app, flow).await;
     }
     let accepted_ms = monotonic_ms();
-    // The name map is read only once the connect failed or its race is due (`retry`).
-    let alternates = || {
-        let filter = ctx.filter.get();
-        retry::alternates(&lock(&ctx.names), flow.remote.ip(), monotonic_ms(), |name| filter.blocks_name(name))
-    };
-    let (attributed, connected) = tokio::join!(ctx.attribute(flow), retry::connect(&*ctx.egress, flow.remote, alternates));
+    // Exiting through a hub: its own path (`handle_exiting`), which keeps this
+    // one for the flows that do not exit.
+    if let Some(plan) = ctx.link.plan(flow.remote.ip()) {
+        return handle_exiting(ctx, app, flow, plan, accepted_ms).await;
+    }
+    let (attributed, connected) = tokio::join!(ctx.attribute(flow), retry::connect(&*ctx.egress, flow.remote, || alternates(&ctx, flow)));
     if guard_tcp(attributed.own, flow.remote.port()) == Guard::RelayOwn {
         return relay_own(app, connected.result).await;
     }
     let Some(admitted) = ctx.admit_with(&flow, &attributed, FlowProto::Tcp, FlowKind::Other, Some(Box::new(app.handle()))) else { return close_app(&mut app).await };
+    serve_connected(ctx, app, flow, admitted, connected, accepted_ms).await;
+}
+
+/// The other addresses a failed connect may try; the name map is read only once
+/// the connect failed or its race is due (`retry`).
+fn alternates(ctx: &Relay, flow: FiveTuple) -> Vec<std::net::IpAddr> {
+    let filter = ctx.filter.get();
+    retry::alternates(&lock(&ctx.names), flow.remote.ip(), monotonic_ms(), |name| filter.blocks_name(name))
+}
+
+/// An admitted flow whose SYN-time connect has its result: served, or closed
+/// with its problem.
+async fn serve_connected(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple, admitted: Admitted, connected: retry::Connected<TcpStream>, accepted_ms: u64) {
     if let Some(how) = connected.retry() {
         lock(&ctx.book).retried(admitted.id, how, connected.result.is_ok());
     }
@@ -347,7 +371,66 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
             return close_app(&mut app).await;
         }
     };
-    serve_admitted(ctx, app, flow, admitted, upstream, accepted_ms).await;
+    serve_admitted(ctx, app, flow, admitted, Upstream::Tcp(upstream), accepted_ms, None).await;
+}
+
+/// A TCP flow while exiting through a hub. Its origin is found first, as the
+/// path depends on it: the engine's own plain HTTP, an app that is Off and every
+/// flow while the global switch is off connect at once from this computer, as
+/// without the hub. Any other flow gets an upstream that opens through the hub
+/// only once decided (`link::exit`): nothing reaches the hub for a blocked flow,
+/// no retry to another address (the hub resolves names and tries its own), and
+/// the hub is asked for the name the flow carries.
+async fn handle_exiting(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple, plan: Plan, accepted_ms: u64) {
+    let attributed = ctx.attribute(flow).await;
+    if guard_tcp(attributed.own, flow.remote.port()) == Guard::RelayOwn {
+        let connected = retry::connect(&*ctx.egress, flow.remote, || alternates(&ctx, flow)).await;
+        return relay_own(app, connected.result).await;
+    }
+    let Some(admitted) = ctx.admit_with(&flow, &attributed, FlowProto::Tcp, FlowKind::Other, Some(Box::new(app.handle()))) else { return close_app(&mut app).await };
+    let exits = {
+        let filter = ctx.filter.get();
+        filter.enabled && !filter.is_off(admitted.owner.as_owner())
+    };
+    if !exits {
+        let connected = retry::connect(&*ctx.egress, flow.remote, || alternates(&ctx, flow)).await;
+        return serve_connected(ctx, app, flow, admitted, connected, accepted_ms).await;
+    }
+    let (upstream, starter) = exit::lazy();
+    let starter = FlowExit { starter, plan, net: ctx.egress.clone(), book: ctx.book.clone(), names: ctx.names.clone(), id: admitted.id, remote: flow.remote };
+    serve_admitted(ctx, app, flow, admitted, Upstream::Lazy(upstream), accepted_ms, Some(starter)).await;
+}
+
+/// Opens an exiting flow's upstream once it is decided, and logs how it went.
+pub(super) struct FlowExit {
+    starter: exit::Starter,
+    plan: Plan,
+    net: Arc<Egress>,
+    book: Arc<Mutex<FlowBook>>,
+    names: Arc<Mutex<NameMap>>,
+    id: u64,
+    remote: std::net::SocketAddr,
+}
+
+impl FlowExit {
+    #[cfg(test)]
+    pub(super) fn for_test(ctx: &Relay, starter: exit::Starter, plan: Plan, id: u64, remote: std::net::SocketAddr) -> Self {
+        Self { starter, plan, net: ctx.egress.clone(), book: ctx.book.clone(), names: ctx.names.clone(), id, remote }
+    }
+
+    /// The flow passed with what its first bytes said: the hub is asked for it.
+    fn start(&self, decoded: &Decoded) {
+        let host = {
+            let names = lock(&self.names);
+            exit::choose_host(decoded.domain.as_deref(), &names.names(self.remote.ip(), monotonic_ms()), self.remote.ip())
+        };
+        let (plan, net, book, id, remote) = (self.plan.clone(), self.net.clone(), self.book.clone(), self.id, self.remote);
+        self.starter.start(async move {
+            let (opened, report) = exit::open(&plan, &*net, &host, remote.port(), remote).await;
+            lock(&book).exit(id, report);
+            opened
+        });
+    }
 }
 
 /// The engine's own plain HTTP ([`guard_tcp`]): not the user's flow, so no book
@@ -360,9 +443,18 @@ async fn relay_own(mut app: IpStackTcpStream, upstream: Result<TcpStream, retry:
     close_app(&mut app).await;
 }
 
-/// An admitted flow with its SYN-time socket, to its end.
-pub(super) async fn serve_admitted(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple, admitted: Admitted, upstream: TcpStream, accepted_ms: u64) {
-    let decide = |d: &Decoded| ctx.decide(&admitted, d, &flow);
+/// An admitted flow with its SYN-time socket, or with an upstream that `exit`
+/// opens through the hub once the flow passed, to its end.
+pub(super) async fn serve_admitted(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple, admitted: Admitted, upstream: Upstream, accepted_ms: u64, exit: Option<FlowExit>) {
+    let decide = |d: &Decoded| {
+        let action = ctx.decide(&admitted, d, &flow);
+        if action != Action::Drop
+            && let Some(exit) = &exit
+        {
+            exit.start(d);
+        }
+        action
+    };
     // One path per flow, chosen once (task D1): no slot is today's relay.
     if let Some(https) = ctx.https.get() {
         let event = lock(&ctx.book).snapshot_of(admitted.id);
@@ -460,6 +552,49 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         // in between reads as an unknown app: relayed, which is the fail-open way.
         let event = ctx.https.get().and_then(|_| lock(&ctx.book).snapshot_of(id));
         let owner = admitted.owner.as_owner();
+        // Exiting through a hub, which carries TCP only: QUIC is refused so the app
+        // falls back to TCP (through the hub); other UDP to a public address is
+        // dropped or sent directly, as the owner set. An app that is Off and
+        // everything while the global switch is off are left as they are.
+        let exiting = || {
+            let filter = ctx.filter.get();
+            filter.enabled && !filter.is_off(owner) && ctx.link.plan(flow.remote.ip()).is_some()
+        };
+        let on_link = (action != Action::Drop && exiting())
+            .then(|| ctx.link.plan(flow.remote.ip()))
+            .flatten()
+            .map(|plan| exit::udp_on_link(decided.kind == Some(crate::flow::classify::Kind::Quic), plan.udp));
+        if let Some(on_link) = on_link {
+            match on_link {
+                exit::UdpOnLink::RefuseQuic => {
+                    lock(&ctx.book).exit(id, ExitReport { via: sieve_ipc::ExitVia::Dropped, target: None, reason: Some(QUIC_ON_LINK.into()), signal: None });
+                    quic::close_refused(&ctx.book, id);
+                    let reply = Reply { ends: (flow.local, flow.remote), refusal: quic::REFUSAL, sink: &*ctx.sink, meters: &ctx.meters.quic };
+                    held = quic::refuse(&mut app, &reply, held, &mut buf, UDP_IDLE, exiting).await;
+                    if held.is_empty() {
+                        return;
+                    }
+                    continue;
+                }
+                exit::UdpOnLink::Drop => {
+                    {
+                        let mut book = lock(&ctx.book);
+                        book.exit(id, ExitReport { via: sieve_ipc::ExitVia::Dropped, target: None, reason: Some(UDP_ON_LINK.into()), signal: Some(sieve_ipc::Signal::UdpDropped) });
+                        book.close(id, FlowAction::Relayed, 0, 0);
+                    }
+                    // Swallowed until idle, so a retransmit is no new flow.
+                    while let Ok(Ok(n)) = tokio::time::timeout(UDP_IDLE, app.read(&mut buf)).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    return;
+                }
+                exit::UdpOnLink::Direct => {
+                    lock(&ctx.book).exit(id, ExitReport { via: sieve_ipc::ExitVia::Direct, target: None, reason: Some(UDP_DIRECT.into()), signal: None });
+                }
+            }
+        }
         let who = Who {
             remote: flow.remote,
             exe: event.as_ref().and_then(|e| e.exe.as_deref()),

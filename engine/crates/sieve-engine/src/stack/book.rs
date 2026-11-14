@@ -216,6 +216,21 @@ impl FlowBook {
         }
     }
 
+    /// Exiting through a hub: how an open flow went out (`link::exit::ExitReport`),
+    /// as one row, and the app's problem when there is one. The row stands for
+    /// the problem's own row, so a stop or a refusal is said once, with the hub's
+    /// reason; the problem is named, so the flow's close adds no other.
+    pub fn exit(&mut self, id: u64, report: crate::link::exit::ExitReport) {
+        let now = (self.clock)();
+        let host = self.open.get(&id).map(|e| e.host.clone().unwrap_or_else(|| remote_ip(&e.remote)));
+        if let (Some(signal), Some(host), Some(o)) = (report.signal, host, self.owners.get_mut(&id)) {
+            o.named = true;
+            self.issues.problem(&o.app, o.exe.as_deref(), signal, Some(&host), now);
+        }
+        let reason = report.reason.map(|r| cap_text(&r, sieve_ipc::LINK_TEXT_MAX).to_string());
+        self.push_row(id, now, None, LogOutcome::Exit { via: report.via, target: report.target, reason }, None, None, Vec::new());
+    }
+
     /// Sieve tried an open flow's connect again (`stack::retry`): a row, so a
     /// retry is never silent, and a count for the app.
     pub fn retried(&mut self, id: u64, how: RetryHow, recovered: bool) {

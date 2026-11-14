@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use sieve_ipc::nonblocking::{read_frame, write_frame};
 use sieve_filter::exclusions::{AutoReason, exe_file_name, parse_line};
-use sieve_ipc::{AppIssues, CertStatus, ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, ExclusionsView, FLOWS_PER_FRAME, FlowEvent, FrameError, HealNotice, ListStatus, LogRow, Policy, answer_hello, exclusions_page, log_frames};
+use sieve_ipc::{AppIssues, CertStatus, ClientMessage, DnsUpstreams, EngineMessage, EngineStatus, ExclusionsView, FLOWS_PER_FRAME, FlowEvent, FrameError, HealNotice, LinkRoute, LinkSettings, ListStatus, LogRow, Policy, answer_hello, exclusions_page, log_frames};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 
@@ -85,6 +85,13 @@ pub trait Backend: Send + Sync + 'static {
     fn pause_dns_capture(&self, network: &str) -> Result<EngineStatus, String>;
     /// "Resume now": ends a sign-in pause, if there is one. Answers the Status.
     fn resume_dns_capture(&self) -> EngineStatus;
+    /// Starts redeeming a pairing code and answers the Status at once (its link
+    /// reads `pairing`). The code is never logged, echoed or kept.
+    fn link_pair(&self, code: String, route: Option<LinkRoute>) -> Result<EngineStatus, String>;
+    /// Forgets the hub and the key for it. Answers the Status.
+    fn link_unpair(&self) -> Result<EngineStatus, String>;
+    /// The owner's choices for the paired hub. Answers the Status.
+    fn set_link(&self, settings: LinkSettings) -> Result<EngineStatus, String>;
 }
 
 /// What [`Backend::issues`] answers; the fields of `EngineMessage::Issues`.
@@ -231,6 +238,18 @@ where
                 Err(message) => EngineMessage::Error { message },
             },
             Ok(ClientMessage::ResumeDnsCapture {}) => status(backend.resume_dns_capture()),
+            Ok(ClientMessage::LinkPair { code, route }) => match backend.link_pair(code, route) {
+                Ok(s) => status(s),
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::LinkUnpair {}) => match backend.link_unpair() {
+                Ok(s) => status(s),
+                Err(message) => EngineMessage::Error { message },
+            },
+            Ok(ClientMessage::SetLink(settings)) => match backend.set_link(settings) {
+                Ok(s) => status(s),
+                Err(message) => EngineMessage::Error { message },
+            },
             Ok(ClientMessage::Hello { .. }) => return refuse(stream, HELLO_ONCE).await,
             Err(FrameError::Closed) => return Ok(()),
             Err(e) => return refuse(stream, &e.to_string()).await,
@@ -376,12 +395,14 @@ mod tests {
         book: Mutex<crate::stack::book::FlowBook>,
         /// The sign-in pause, for [`SIGN_IN_NETWORK`], which always wants a sign-in here.
         paused: Mutex<bool>,
+        /// The paired hub's settings; None while unpaired.
+        link: Mutex<Option<LinkSettings>>,
     }
 
     impl Fake {
         fn new(open: Vec<FlowEvent>) -> Arc<Self> {
             let routes = tokio::sync::watch::channel(true).0;
-            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, log: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0), retries: Mutex::default(), notices: Mutex::default(), book: Mutex::default(), paused: Mutex::default() })
+            Arc::new(Self { policy: Mutex::new(Policy::default()), open, flows: broadcast::channel(4).0, log: broadcast::channel(4).0, routes, refreshes: Mutex::default(), update_requests: Mutex::new(0), retries: Mutex::default(), notices: Mutex::default(), book: Mutex::default(), paused: Mutex::default(), link: Mutex::default() })
         }
     }
 
@@ -389,7 +410,7 @@ mod tests {
         fn status(&self) -> EngineStatus {
             let paused = *self.paused.lock().unwrap();
             let sign_in = sieve_ipc::WifiSignIn { network: SIGN_IN_NETWORK.into(), paused_left_s: paused.then_some(sieve_ipc::SIGN_IN_PAUSE_MAX_S), wifi: true };
-            EngineStatus { policy: self.policy.lock().unwrap().clone(), dns_capture: Some(sieve_ipc::DnsCapture::Working), wifi_sign_in: Some(sign_in), ..EngineStatus::default() }
+            EngineStatus { policy: self.policy.lock().unwrap().clone(), dns_capture: Some(sieve_ipc::DnsCapture::Working), wifi_sign_in: Some(sign_in), link: Some(self.link_status()), ..EngineStatus::default() }
         }
         fn set_policy(&self, p: Policy) -> Result<EngineStatus, String> {
             let next = crate::policy::accept(&self.policy.lock().unwrap(), p)?;
@@ -465,6 +486,76 @@ mod tests {
             *self.paused.lock().unwrap() = false;
             self.status()
         }
+        fn link_pair(&self, code: String, route: Option<LinkRoute>) -> Result<EngineStatus, String> {
+            if !code.starts_with("SL1-") {
+                return Err(crate::link::NOT_A_CODE.into());
+            }
+            let route = route.ok_or(crate::link::NO_ADDRESS)?;
+            *self.link.lock().unwrap() = Some(LinkSettings { exit: false, on_hub_down: sieve_ipc::LinkHubDown::Stop, udp: sieve_ipc::LinkUdp::Drop, route });
+            Ok(self.status())
+        }
+        fn link_unpair(&self) -> Result<EngineStatus, String> {
+            *self.link.lock().unwrap() = None;
+            Ok(self.status())
+        }
+        fn set_link(&self, settings: LinkSettings) -> Result<EngineStatus, String> {
+            let mut held = self.link.lock().unwrap();
+            if held.is_none() {
+                return Err(crate::link::NOT_PAIRED.into());
+            }
+            *held = Some(settings);
+            drop(held);
+            Ok(self.status())
+        }
+    }
+
+    impl Fake {
+        fn link_status(&self) -> sieve_ipc::LinkStatus {
+            let settings = self.link.lock().unwrap().clone();
+            let state = match &settings {
+                None => sieve_ipc::LinkState::Unpaired,
+                Some(s) if s.exit => sieve_ipc::LinkState::Connecting,
+                Some(_) => sieve_ipc::LinkState::Off,
+            };
+            sieve_ipc::LinkStatus { state, hub_name: settings.as_ref().map(|_| "home".into()), hub_fingerprint: None, device_fingerprint: None, settings, since_ms: None, last_error: None, listening: None }
+        }
+    }
+
+    /// Over the pipe: the link fact reaches only an app that names it; pairing,
+    /// the settings and unpairing answer the Status; a refusal is an Error that
+    /// keeps the conversation and never holds the code.
+    #[tokio::test]
+    async fn the_link_verbs_answer_over_the_pipe_and_only_a_naming_app_hears_the_fact() {
+        let fake = Fake::new(vec![]);
+        let (mut c, task) = welcomed(fake.clone(), 1).await;
+        send(&mut c, &ClientMessage::Status).await;
+        let EngineMessage::Status(s) = recv(&mut c).await else { panic!("a status") };
+        assert!(s.link.is_none(), "an app naming no capability never hears it");
+        drop(c);
+        task.await.unwrap().unwrap();
+
+        let (mut c, task) = start_with(1, fake.clone());
+        let named = ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.2.0".into(), capabilities: vec![sieve_ipc::CAPABILITY_LINK.into()] };
+        send(&mut c, &named).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Welcome { .. }));
+        send(&mut c, &ClientMessage::LinkPair { code: "not-a-code-secret".into(), route: None }).await;
+        let EngineMessage::Error { message } = recv(&mut c).await else { panic!("an error") };
+        assert!(!message.contains("not-a-code-secret"), "the code is never echoed: {message}");
+        let route = sieve_ipc::LinkRoute::Listen { port: 7443 };
+        send(&mut c, &ClientMessage::LinkPair { code: "SL1-X".into(), route: Some(route.clone()) }).await;
+        let EngineMessage::Status(s) = recv(&mut c).await else { panic!("a status") };
+        assert_eq!(s.link.as_ref().map(|l| l.state), Some(sieve_ipc::LinkState::Off));
+        let on = LinkSettings { exit: true, on_hub_down: sieve_ipc::LinkHubDown::Stop, udp: sieve_ipc::LinkUdp::Drop, route };
+        send(&mut c, &ClientMessage::SetLink(on.clone())).await;
+        let EngineMessage::Status(s) = recv(&mut c).await else { panic!("a status") };
+        assert_eq!(s.link.and_then(|l| l.settings), Some(on.clone()));
+        send(&mut c, &ClientMessage::LinkUnpair {}).await;
+        let EngineMessage::Status(s) = recv(&mut c).await else { panic!("a status") };
+        assert_eq!(s.link.map(|l| l.state), Some(sieve_ipc::LinkState::Unpaired));
+        send(&mut c, &ClientMessage::SetLink(on)).await;
+        assert!(matches!(recv(&mut c).await, EngineMessage::Error { message } if message == crate::link::NOT_PAIRED));
+        drop(c);
+        task.await.unwrap().unwrap();
     }
 
     const SIGN_IN_NETWORK: &str = "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}";

@@ -41,6 +41,7 @@ use crate::flow::nat::{NatTable, os as nat_os};
 use crate::flow::tasks::FlowTasks;
 use crate::inject::InjectLimits;
 use crate::inject::content::ContentHook;
+use crate::link::exit::{DnsExit, Exit};
 use crate::lists::https::HttpsFetcher;
 use crate::policy::wall_ms;
 use crate::route::apply::{self, AddressState, SieveLuid};
@@ -220,6 +221,8 @@ async fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
     };
     if network_moved {
         up.relay.dns.reset();
+        // A listening link moves to the adapter's new address.
+        engine.link.network_changed();
     }
     let up = if routes == up.routes {
         engine.routes_settled();
@@ -888,7 +891,10 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn()
     add_addresses(&mut os, &addresses)?;
     let shared_tables = Arc::new(RwLock::new(tables.clone()));
     let egress = Arc::new(Egress::new(tun.index, shared_tables.clone()));
-    let context = Context { connector: egress.clone(), tls: resolver_tls, resolvers };
+    // Encrypted resolvers' sessions follow the link (`link::exit::DnsExit`); plain,
+    // LAN and DNS over QUIC stay on the egress.
+    let dns_connector = Arc::new(DnsExit { inner: egress.clone(), net: egress.clone(), link: engine.link.clone() });
+    let context = Context { connector: dns_connector, tls: resolver_tls, resolvers };
     #[cfg(not(feature = "relay-experiments"))]
     let mtu = MTU;
     #[cfg(feature = "relay-experiments")]
@@ -914,7 +920,15 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn()
     };
 
     sync_https(engine, &egress).await;
-    let parts = RelayParts { tables: shared_tables, egress, dns, book: engine.book.clone(), names: engine.names.clone(), meters: engine.meters.clone(), filter: engine.filter.clone(), witness, nat, https: engine.https.clone(), sink: Arc::new(TunSink::new(&tun.session, engine.meters.clone())) };
+    // The link runs while routes are up; each up, down or change of path drops
+    // the resolver sessions so they reopen by the path in force.
+    let weak_dns = Arc::downgrade(&dns);
+    engine.link.routes_up(egress.clone(), Arc::new(move || {
+        if let Some(dns) = weak_dns.upgrade() {
+            dns.reset();
+        }
+    }));
+    let parts = RelayParts { tables: shared_tables, egress, dns, book: engine.book.clone(), names: engine.names.clone(), meters: engine.meters.clone(), filter: engine.filter.clone(), witness, nat, https: engine.https.clone(), sink: Arc::new(TunSink::new(&tun.session, engine.meters.clone())), link: engine.link.clone() };
     #[cfg(not(feature = "relay-experiments"))]
     let relay = Arc::new(Relay::new(parts));
     #[cfg(feature = "relay-experiments")]
@@ -979,14 +993,14 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn()
 
 /// Interception as this engine run wires it (task D1, D2). Nothing here runs
 /// while the slot is empty, and a failure here means every flow takes the relay.
-fn build_interception(engine: &Engine, egress: &Arc<Egress>) -> Result<Interception<Egress>, String> {
+fn build_interception(engine: &Engine, egress: &Arc<Egress>) -> Result<Interception<Exit>, String> {
     engine.exclusions.set_browsers(BrowserSet::read(&WindowsRegistry), wall_ms());
     let trust = Arc::new(PlatformTrust::new()?);
     let verifier = Arc::new(Verifier::new(crate::tls::public_roots(), trust, TRUST_TIMEOUT, engine.validation.clone())?);
     let lookup = super::lock(&engine.dns_service).clone().ok_or("the DNS service is not running")?;
     let ca = engine.ca();
     Ok(Interception {
-        connector: egress.clone(),
+        connector: Arc::new(Exit { net: egress.clone(), link: engine.link.clone() }),
         exclusions: engine.exclusions.clone(),
         verifier,
         verdicts: VerdictCache::default(),
@@ -1021,7 +1035,7 @@ async fn sync_https(engine: &Engine, egress: &Arc<Egress>) {
 /// decrypt what the data on disk forbids, and a flow's verdict lasts as long as it
 /// does. The build takes a while, so it is published only if it is still wanted by
 /// then ([`Engine::publish_https`]).
-pub(super) async fn sync_https_by(engine: &Engine, load: impl Future<Output = ()>, build: impl FnOnce() -> Result<Interception<Egress>, String>) {
+pub(super) async fn sync_https_by(engine: &Engine, load: impl Future<Output = ()>, build: impl FnOnce() -> Result<Interception<Exit>, String>) {
     if !wanted(&engine.policy()) {
         engine.https.set(None);
     } else if engine.https.get().is_none() {
@@ -1084,6 +1098,8 @@ async fn take_down(engine: &Engine, mut up: Up) {
     // A sign-in pause is for this routing run's network: the next run starts with none.
     engine.sign_in().forget();
     engine.arm.set(false);
+    // The link and its listening port end with the routes.
+    engine.link.routes_down();
     *super::lock(&engine.beats.path) = None;
     let _ = up.tun.session.shutdown();
     engine.https.set(None);

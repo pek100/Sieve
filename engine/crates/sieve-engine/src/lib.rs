@@ -45,6 +45,7 @@ pub mod http;
 pub mod inject;
 pub mod ipc;
 pub mod issues;
+pub mod link;
 pub mod lists;
 pub mod lru;
 pub mod policy;
