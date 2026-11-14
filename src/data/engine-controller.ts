@@ -49,7 +49,8 @@ import type { SieveStore } from "@/core/store";
 import type { EngineSource } from "./engine-source";
 import type { FilterListSource } from "./filter-lists-source";
 import type { Clock } from "./poller";
-import { ProtocolError, type EngineDomainList, type EnginePolicy, type EngineStatus, type ExclusionsPage, type FilterCatalogue, type WifiSignIn } from "./protocol";
+import { NO_LINK_TEXT, withoutCode } from "@/core/link";
+import { ProtocolError, type EngineDomainList, type EnginePolicy, type EngineStatus, type ExclusionsPage, type FilterCatalogue, type LinkRoute, type LinkSettings, type WifiSignIn } from "./protocol";
 import type { SettingsStore } from "./settings-store";
 
 export interface EngineController {
@@ -71,6 +72,16 @@ export interface EngineController {
   pauseDnsCapture(network: string): Promise<void>;
   /** "Resume now": ends the sign-in pause. */
   resumeDnsCapture(): Promise<void>;
+  /**
+   * Pair with another device: the code goes to the engine once and is never
+   * kept, logged or put in an error. `route` absent dials the address in the
+   * code. Sent only to an engine whose status carries `link`.
+   */
+  linkPair(code: string, route?: LinkRoute): Promise<void>;
+  /** Forget the other device. Sent only to an engine whose status carries `link`. */
+  linkUnpair(): Promise<void>;
+  /** The owner's choices for the paired device, whole. Sent only to an engine whose status carries `link`. */
+  setLink(settings: LinkSettings): Promise<void>;
 }
 
 export interface EngineControllerDeps {
@@ -300,6 +311,31 @@ export function createEngineController({ engine, store, clock, settings, checks,
     if (engineStatus(get())?.wifi_sign_in === undefined) return Promise.resolve();
     return signInRequest(() => engine.resumeDnsCapture(), `${SIGN_IN_ERROR_PREFIX} did not end`);
   };
+
+  // Exiting through another device: one request at a time, only to an engine whose
+  // status carries the fact (an older one ends the conversation on these types).
+  // The answer's Status replaces the probe's; a refusal is said without the code.
+  const linkRequest = async (run: () => Promise<EngineStatus>, failed: string, code = "") => {
+    if (engineStatus(get())?.link === undefined) {
+      set({ linkActionError: `${failed}: ${NO_LINK_TEXT}.` });
+      return;
+    }
+    if (get().linkBusy) return;
+    set({ linkBusy: true, linkActionError: null });
+    try {
+      const next = await run();
+      const probe = get().probe;
+      if (probe?.pipe?.kind === "welcome") set({ probe: { ...probe, pipe: { ...probe.pipe, status: next } } });
+    } catch (e) {
+      set({ linkActionError: withoutCode(`${failed}: ${message(e)}`, code) });
+    } finally {
+      set({ linkBusy: false });
+    }
+    if (!disposed) follow();
+  };
+  const linkPair = (code: string, route?: LinkRoute) => linkRequest(() => engine.linkPair(code.trim(), route), "Pairing did not start", code);
+  const linkUnpair = () => linkRequest(() => engine.linkUnpair(), "The other device was not forgotten");
+  const setLink = (settings: LinkSettings) => linkRequest(() => engine.setLink(settings), "The change did not reach the engine");
 
   // Facts in, consequences out: passed check, banner, policy.
   const follow = () => {
@@ -645,5 +681,8 @@ export function createEngineController({ engine, store, clock, settings, checks,
     tryDecryptAllAgain,
     pauseDnsCapture,
     resumeDnsCapture,
+    linkPair,
+    linkUnpair,
+    setLink,
   };
 }

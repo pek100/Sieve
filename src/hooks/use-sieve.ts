@@ -8,6 +8,7 @@ import { effectiveOn, GLOBAL_SWITCH, offKeys, type AppStates } from "@/core/poli
 import { readValue } from "@/core/settings/document";
 import { isSettingKey, type SettingKey, type SettingValue } from "@/core/settings/registry";
 import type { SieveState } from "@/core/store";
+import type { LinkRoute, LinkSettings } from "@/data/protocol";
 import { useRuntime } from "./sieve-provider";
 
 /**
@@ -93,6 +94,23 @@ export function useEngineActions(): { stopAdguard: () => Promise<void>; startAdg
       tryDecryptAllAgain: (apps) => lockController.guard(() => engineController.tryDecryptAllAgain(apps)),
       // Not behind the lock: it only gives back the protection the setting asks for.
       resumeDnsCapture: () => engineController.resumeDnsCapture(),
+    }),
+    [engineController, lockController],
+  );
+}
+
+/**
+ * Exiting through another device: pairing, unpairing and every change, each
+ * behind the settings password (reading the state is not). The pairing code is
+ * handed on and kept nowhere here.
+ */
+export function useLinkActions(): { linkPair: (code: string, route?: LinkRoute) => Promise<void>; linkUnpair: () => Promise<void>; setLink: (settings: LinkSettings) => Promise<void> } {
+  const { engineController, lockController } = useRuntime();
+  return useMemo(
+    () => ({
+      linkPair: async (code, route) => void (await lockController.guard(() => engineController.linkPair(code, route))),
+      linkUnpair: async () => void (await lockController.guard(() => engineController.linkUnpair())),
+      setLink: async (settings) => void (await lockController.guard(() => engineController.setLink(settings))),
     }),
     [engineController, lockController],
   );

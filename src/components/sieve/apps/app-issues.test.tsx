@@ -50,7 +50,7 @@ afterEach(() => {
 describe("apps having trouble", () => {
   it("lists each failing app with its likely cause in words, and its sheet shows the problems even after it exited", async () => {
     const { user } = await setup(engineWith("some"));
-    await waitFor(() => expect(troubleRows()).toHaveLength(2));
+    await waitFor(() => expect(troubleRows()).toHaveLength(3));
     const game = troubleRows()[0];
     expect(game.dataset.app).toBe("game launcher");
     expect(game).toHaveTextContent("9 of 40 connections had trouble, 6 blocked by a filter rule");
@@ -63,9 +63,23 @@ describe("apps having trouble", () => {
     expect(within(sheet).getByText(/Sieve tried 3 connections again before the app noticed; 2 then worked/)).toBeInTheDocument();
   });
 
+  it("an app failing through the other device it exits by blames that device, offers no Off and no report, and counts dropped UDP apart", async () => {
+    const { user } = await setup(engineWith("some"));
+    await waitFor(() => expect(troubleRows()).toHaveLength(3));
+    const browser = troubleRows().find((r) => r.dataset.app === "browser")!;
+    expect(browser.dataset.verdict).toBe("hub");
+    expect(browser).toHaveTextContent(VERDICT_TEXT.hub);
+    expect(browser).toHaveTextContent("5 of 30 connections had trouble, 2 UDP connections dropped, as set");
+    await user.click(within(browser).getByRole("button"));
+    const sheet = await screen.findByTestId("app-problems");
+    expect(within(sheet).getAllByTestId("problem").map((p) => p.dataset.cause)).toEqual(["hub", "hub", "sieve"]);
+    expect(within(sheet).queryByRole("button", { name: "Turn Sieve off for this app" })).toBeNull();
+    expect(within(sheet).queryByRole("button", { name: "Copy a report" })).toBeNull();
+  });
+
   it("a fix shows its exact line first, then writes it to the user's own list", async () => {
     const { runtime, user } = await setup(engineWith("some"));
-    await waitFor(() => expect(troubleRows()).toHaveLength(2));
+    await waitFor(() => expect(troubleRows()).toHaveLength(3));
     await user.click(within(troubleRows()[0]).getByRole("button"));
     const sheet = await screen.findByTestId("app-problems");
     await user.click(within(sheet).getByRole("button", { name: "Stop decrypting it for this app: cdn.game.example" }));
@@ -107,7 +121,7 @@ describe("apps having trouble", () => {
     const tried = vi.fn(engine.tryDecryptAgain);
     engine.tryDecryptAgain = tried;
     const { runtime, user } = await setup(engine);
-    await waitFor(() => expect(troubleRows()).toHaveLength(2));
+    await waitFor(() => expect(troubleRows()).toHaveLength(3));
     await user.click(within(troubleRows()[0]).getByRole("button"));
     const sheet = await screen.findByTestId("app-problems");
     expect(await within(sheet).findByTestId("app-untouched")).toHaveTextContent("Sieve passes this app through untouched for a day");

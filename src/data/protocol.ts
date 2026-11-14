@@ -497,8 +497,97 @@ export interface EngineStatus {
   dns_capture?: DnsCapture;
   /** A network that wants a sign-in, or the capture paused for one. Absent: nothing to say, or an engine or app from before it. */
   wifi_sign_in?: WifiSignIn;
+  /** Exiting through another device. Absent: an engine that cannot do it (or an app that did not name `link`); the app then shows nothing of it. */
+  link?: LinkStatus;
   update: EngineUpdate;
 }
+
+// ---------------------------------------------------------------------------
+// Exiting through another device (sieve-ipc `LinkStatus`, `LinkSettings`).
+
+/** sieve-ipc `LinkState`, in declaration order; `unknown` is a state a newer engine sent. */
+export const LINK_STATES = ["unpaired", "pairing", "off", "connecting", "up", "down", "unknown"] as const;
+export type LinkState = (typeof LINK_STATES)[number];
+/** sieve-ipc `LinkHubDown`. */
+export const LINK_HUB_DOWN = ["stop", "direct"] as const;
+export type LinkHubDown = (typeof LINK_HUB_DOWN)[number];
+/** sieve-ipc `LinkUdp`. */
+export const LINK_UDP = ["drop", "direct"] as const;
+export type LinkUdp = (typeof LINK_UDP)[number];
+/** sieve-ipc `LinkRoute`: this computer dials the other device, or listens for it on a TCP port. */
+export type LinkRoute = { how: "dial"; address: string } | { how: "listen"; port: number };
+
+export interface LinkSettings {
+  exit: boolean;
+  on_hub_down: LinkHubDown;
+  udp: LinkUdp;
+  route: LinkRoute;
+}
+
+export interface LinkStatus {
+  state: LinkState;
+  hub_name?: string;
+  /** 64 hex: SHA-256 of the other device's key. */
+  hub_fingerprint?: string;
+  /** 64 hex: this computer's key, as the other device lists it. */
+  device_fingerprint?: string;
+  settings?: LinkSettings;
+  since_ms?: number;
+  last_error?: string;
+  /** "ip:port" open for the other device while listening. */
+  listening?: string;
+}
+
+/** sieve-ipc `LINK_CODE_MAX`, `LINK_ADDRESS_MAX`, `LINK_TEXT_MAX`. */
+export const LINK_CODE_MAX = 512;
+export const LINK_ADDRESS_MAX = 253 + 1 + 5;
+export const LINK_TEXT_MAX = 256;
+
+const FINGERPRINT = /^[0-9a-f]{64}$/i;
+const isPort = (x: unknown): x is number => Number.isInteger(x) && (x as number) >= 1 && (x as number) <= 65_535;
+
+/** A route, or null when it is not one. */
+export function parseLinkRoute(raw: unknown): LinkRoute | null {
+  if (!isRec(raw)) return null;
+  if (raw.how === "dial" && typeof raw.address === "string" && raw.address !== "" && raw.address.length <= LINK_ADDRESS_MAX) return { how: "dial", address: raw.address };
+  if (raw.how === "listen" && isPort(raw.port)) return { how: "listen", port: raw.port };
+  return null;
+}
+
+/** The choices, or null when any part is not readable: the app never shows a choice it did not read. */
+export function parseLinkSettings(raw: unknown): LinkSettings | null {
+  if (!isRec(raw) || typeof raw.exit !== "boolean" || !isOneOf(raw.on_hub_down, LINK_HUB_DOWN) || !isOneOf(raw.udp, LINK_UDP)) return null;
+  const route = parseLinkRoute(raw.route);
+  return route === null ? null : { exit: raw.exit, on_hub_down: raw.on_hub_down, udp: raw.udp, route };
+}
+
+const cut = (s: string) => {
+  const bytes = new TextEncoder().encode(s);
+  return bytes.length <= LINK_TEXT_MAX ? s : new TextDecoder().decode(bytes.slice(0, LINK_TEXT_MAX)).replace(/�$/, "");
+};
+
+/**
+ * The link fact, as a notice reads: anything without a state reads as nothing to
+ * say (no section), never a refused Status. A state this build does not know is
+ * `unknown`; an odd field is left out, alone.
+ */
+export function parseLinkStatus(raw: unknown): LinkStatus | null {
+  if (!isRec(raw) || typeof raw.state !== "string") return null;
+  const state: LinkState = isOneOf(raw.state, LINK_STATES) ? raw.state : "unknown";
+  const settings = parseLinkSettings(raw.settings);
+  return {
+    state,
+    ...(typeof raw.hub_name === "string" && raw.hub_name !== "" ? { hub_name: raw.hub_name } : {}),
+    ...(typeof raw.hub_fingerprint === "string" && FINGERPRINT.test(raw.hub_fingerprint) ? { hub_fingerprint: raw.hub_fingerprint } : {}),
+    ...(typeof raw.device_fingerprint === "string" && FINGERPRINT.test(raw.device_fingerprint) ? { device_fingerprint: raw.device_fingerprint } : {}),
+    ...(settings === null ? {} : { settings }),
+    ...(isCount(raw.since_ms) ? { since_ms: raw.since_ms } : {}),
+    ...(typeof raw.last_error === "string" && raw.last_error !== "" ? { last_error: cut(raw.last_error) } : {}),
+    ...(typeof raw.listening === "string" && raw.listening !== "" ? { listening: raw.listening } : {}),
+  };
+}
+
+const withLink = (l: LinkStatus | null): { link?: LinkStatus } => (l === null ? {} : { link: l });
 
 /** sieve-ipc `WifiSignIn`. `paused_left_s` present: paused, resumes by itself within that many seconds. */
 export interface WifiSignIn {
@@ -726,6 +815,7 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
     ...(s.dns_unreachable === true ? { dns_unreachable: true } : {}),
     ...withCapture(parseDnsCapture(s.dns_capture)),
     ...withSignIn(parseWifiSignIn(s.wifi_sign_in)),
+    ...withLink(parseLinkStatus(s.link)),
     update: engineUpdate(s.update),
   };
 }
@@ -737,7 +827,7 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
 
 export const LOG_TAIL_VERSION = 1 as const;
 /** sieve-ipc `LogOutcome` kinds, in declaration order. */
-export const LOG_OUTCOMES = ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted", "problem", "retried"] as const;
+export const LOG_OUTCOMES = ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted", "problem", "retried", "exit"] as const;
 
 /** sieve-ipc `Signal`, in declaration order: what went wrong for a flow. */
 export const SIGNALS = [
@@ -753,16 +843,22 @@ export const SIGNALS = [
   "blocked",
   "quic_refused",
   "handshake_abandoned",
+  "hub_down",
+  "hub_refused",
+  "udp_dropped",
   // What the Rust reader makes of a signal a newer engine sent that this build does not know.
   "unknown",
 ] as const;
 export type Signal = (typeof SIGNALS)[number];
 /** sieve-ipc `Cause`: who most likely caused it. The engine decides; the app only says it. */
-export const CAUSES = ["sieve", "network", "unknown"] as const;
+export const CAUSES = ["sieve", "network", "hub", "unknown"] as const;
 export type Cause = (typeof CAUSES)[number];
 /** sieve-ipc `RetryHow`. */
 export const RETRY_HOWS = ["next_address", "reconnect"] as const;
 export type RetryHow = (typeof RETRY_HOWS)[number];
+/** sieve-ipc `ExitVia`, in declaration order; `unknown` is a way a newer engine sent. */
+export const EXIT_VIAS = ["hub", "direct", "stopped", "refused", "dropped", "unknown"] as const;
+export type ExitVia = (typeof EXIT_VIAS)[number];
 
 export type LogOutcome =
   | { kind: "blocked" }
@@ -773,7 +869,9 @@ export type LogOutcome =
   | { kind: "passed"; reason: string }
   | { kind: "not_decrypted"; reason: string }
   | { kind: "problem"; signal: Signal; cause: Cause }
-  | { kind: "retried"; how: RetryHow; recovered: boolean };
+  | { kind: "retried"; how: RetryHow; recovered: boolean }
+  /** Exiting through another device was on: how this flow went out. `target` is what the other device was asked to reach, `reason` its word or the engine's. */
+  | { kind: "exit"; via: ExitVia; target?: string; reason?: string };
 
 export interface LogRow {
   id: number;
@@ -846,6 +944,16 @@ function logOutcome(raw: unknown): LogOutcome | null {
       return isOneOf(raw.signal, SIGNALS) && isOneOf(raw.cause, CAUSES) ? { kind: "problem", signal: raw.signal, cause: raw.cause } : null;
     case "retried":
       return isOneOf(raw.how, RETRY_HOWS) && typeof raw.recovered === "boolean" ? { kind: "retried", how: raw.how, recovered: raw.recovered } : null;
+    case "exit":
+      // A way this build does not know still reads, as `unknown`, as the Rust reader makes it.
+      return typeof raw.via === "string"
+        ? {
+            kind: "exit",
+            via: isOneOf(raw.via, EXIT_VIAS) ? raw.via : "unknown",
+            ...(typeof raw.target === "string" && raw.target !== "" ? { target: raw.target } : {}),
+            ...(typeof raw.reason === "string" && raw.reason !== "" ? { reason: raw.reason } : {}),
+          }
+        : null;
     default:
       return null;
   }

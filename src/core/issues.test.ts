@@ -6,6 +6,9 @@ import { outcomeWords } from "./log";
 import { rowActions } from "./log-actions";
 import {
   appFixes,
+  CAUSE_TEXT,
+  isIntended,
+  VERDICT_TEXT,
   failingOpen,
   failures,
   fixPreview,
@@ -52,6 +55,37 @@ describe("issues in words", () => {
   it("the summary counts what failed of what was seen, and what was blocked by a filter rule", () => {
     expect(summaryText(app([problem("stall", "unknown", { count: 2 }), problem("blocked", "sieve", { count: 4 })]))).toBe("2 of 10 connections had trouble, 4 blocked by a filter rule");
     expect(summaryText(app([problem("stall", "unknown")], { flows: 0 }))).toBe("1 connection had trouble");
+  });
+});
+
+describe("exiting through another device", () => {
+  it("the other device's refusals and outages are its own: never Sieve's filtering, never the app's, no fix, no notice", () => {
+    const hub = app([problem("hub_down", "hub", { count: 9 }), problem("hub_refused", "hub", { count: 3 })]);
+    expect(verdict(hub)).toBe("hub");
+    expect(VERDICT_TEXT.hub).toMatch(/other device/);
+    expect(VERDICT_TEXT.hub).toMatch(/Neither the app nor Sieve's filtering/);
+    expect(appFixes(hub, null, true), "turning the app off would send it out directly: not offered").toEqual([]);
+    expect(problemFixes(problem("hub_refused", "hub"), "launcher.exe")).toEqual([]);
+    expect(startedFailing(hub), "never 'failing since Sieve started filtering it'").toBe(false);
+    expect(CAUSE_TEXT.hub).not.toMatch(/^Likely Sieve$/);
+    expect(problemText(problem("hub_refused", "hub"))).toBe("The other device it exits through refused the connection: cdn.game.example, once");
+    expect(verdict(app([problem("hub_down", "hub"), problem("stall", "unknown")])), "Sieve may still be why: cannot tell outranks").toBe("unknown");
+    expect(verdict(app([problem("hub_down", "hub"), problem("connect_refused", "network")]))).toBe("hub");
+  });
+
+  it("UDP the link does not carry is dropped as set: meant, counted apart, never trouble", () => {
+    const dropped = app([problem("udp_dropped", "sieve", { count: 4 })]);
+    expect(isIntended({ signal: "udp_dropped" })).toBe(true);
+    expect(troubled([dropped])).toEqual([]);
+    expect(verdict(dropped)).toBe("intended");
+    expect(summaryText(app([problem("udp_dropped", "sieve", { count: 2 }), problem("blocked", "sieve", { count: 1 })]))).toBe("1 blocked by a filter rule, 2 UDP connections dropped, as set");
+  });
+
+  it("the fixture's app with the new signals reads, and is in trouble for the other device's outage alone", () => {
+    const body = Object.fromEntries(Object.entries(fixture.engine.find((m) => m.type === "issues")!).filter(([k]) => k !== "type"));
+    const browser = parseIssues(body).apps.find((a) => a.key === "browser")!;
+    expect(browser.problems.map((p) => p.signal)).toEqual(["hub_down", "hub_refused", "udp_dropped"]);
+    expect(verdict(browser)).toBe("hub");
   });
 });
 
@@ -148,7 +182,7 @@ describe("problems and retries in the log", () => {
 describe("degraded data", () => {
   it("the fixture's apps read whole; partial, old-schema and broken apps degrade or drop, never throw", () => {
     const body = Object.fromEntries(Object.entries(fixture.engine.find((m) => m.type === "issues")!).filter(([k]) => k !== "type"));
-    expect(parseIssues(body).apps).toHaveLength(2);
+    expect(parseIssues(body).apps).toHaveLength(3);
     const parsed = parseIssues({
       run: 1,
       revision: 2,

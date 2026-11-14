@@ -35,6 +35,8 @@ import {
   type Issues,
   type ListImported,
   type ListRules,
+  type LinkRoute,
+  type LinkSettings,
   type LogTail,
 } from "./protocol";
 
@@ -98,6 +100,17 @@ export interface EngineSource {
   pauseDnsCapture(network: string): Promise<EngineStatus>;
   /** "Resume now": ends the sign-in pause. Sent only to an engine whose status carried `wifi_sign_in`. */
   resumeDnsCapture(): Promise<EngineStatus>;
+  /**
+   * Pairs this computer with another device: `code` goes to the engine and
+   * nowhere else (never kept, logged or echoed); `route` absent dials the address
+   * the code carries. Sent only to an engine whose status carried `link`. Rejects
+   * with the engine's reason (a bad or expired code, a bad address or port).
+   */
+  linkPair(code: string, route?: LinkRoute): Promise<EngineStatus>;
+  /** Forgets the other device and this computer's key for it. Sent only to an engine whose status carried `link`. */
+  linkUnpair(): Promise<EngineStatus>;
+  /** The owner's choices for the paired device, whole. Sent only to an engine whose status carried `link`. Rejects while unpaired. */
+  setLink(settings: LinkSettings): Promise<EngineStatus>;
 }
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -126,5 +139,9 @@ export function createTauriEngine(invoke: Invoke = tauriInvoke): EngineSource {
     issues: async (after) => parseIssues(await invoke<unknown>("engine_issues", { after })),
     pauseDnsCapture: async (network) => parseEngineStatus(await invoke<unknown>("engine_pause_dns_capture", { network })),
     resumeDnsCapture: async () => parseEngineStatus(await invoke<unknown>("engine_resume_dns_capture")),
+    // `route` null is "dial the address in the code" (Rust `Option<LinkRoute>`).
+    linkPair: async (code, route) => parseEngineStatus(await invoke<unknown>("engine_link_pair", { code, route: route ?? null })),
+    linkUnpair: async () => parseEngineStatus(await invoke<unknown>("engine_link_unpair")),
+    setLink: async (settings) => parseEngineStatus(await invoke<unknown>("engine_set_link", { settings })),
   };
 }

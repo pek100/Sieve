@@ -2,6 +2,7 @@
 
 import type { ReactNode } from "react";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { exitReasonWords } from "@/core/link";
 import { changeWords, listName, outcomeWords, rowOwner } from "@/core/log";
 import type { LogAction } from "@/core/log-actions";
 import type { LogRow } from "@/data/protocol";
@@ -56,6 +57,12 @@ export function LogDetailsSheet({
                   </ul>
                 </Fact>
               )}
+              {row.outcome?.kind === "exit" && row.outcome.target && (
+                <Fact label="The other device was asked to reach" mono>
+                  {row.outcome.target}
+                </Fact>
+              )}
+              {row.outcome?.kind === "exit" && row.outcome.reason && <Fact label="Why">{exitReasonWords(row.outcome.reason)}</Fact>}
               <Fact label="App" mono={row.exe != null}>
                 {row.exe ?? rowOwner(row)}
               </Fact>

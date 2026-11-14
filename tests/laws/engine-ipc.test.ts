@@ -12,7 +12,8 @@ import { REASON_TEXT, RETRY_TEXT } from "@/core/log";
 import { MAX_POLICY_BYTES } from "@/core/settings/registry";
 import fixture from "@/data/fixtures/engine-ipc-v3.json";
 import logFixture from "@/data/fixtures/engine-log-v1.json";
-import { BLOCKER_KINDS, CAPTURE_REASONS, CAUSES, CERT_STATES, EXCLUSION_SCOPES, FIREFOX_TRUST, LOG_OUTCOMES, NETWORK_ID_MAX, parseCertStatus, parseEngineLists, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseIssues, parseLogTail, RETRY_HOWS, SIGN_IN_PAUSE_MAX_S, SIGNALS, UPDATE_KINDS } from "@/data/protocol";
+import { EXIT_VIA_TEXT } from "@/core/link";
+import { BLOCKER_KINDS, CAPTURE_REASONS, CAUSES, CERT_STATES, EXCLUSION_SCOPES, EXIT_VIAS, FIREFOX_TRUST, LINK_ADDRESS_MAX, LINK_CODE_MAX, LINK_HUB_DOWN, LINK_STATES, LINK_TEXT_MAX, LINK_UDP, LOG_OUTCOMES, NETWORK_ID_MAX, parseLinkRoute, parseLinkSettings, parseCertStatus, parseEngineLists, parseEngineStatus, parseExclusionsPage, parseHealNotices, parseIssues, parseLogTail, RETRY_HOWS, SIGN_IN_PAUSE_MAX_S, SIGNALS, UPDATE_KINDS } from "@/data/protocol";
 import { read } from "./files";
 
 const RUST = read("engine/crates/sieve-ipc/src/lib.rs");
@@ -56,7 +57,8 @@ describe("engine IPC law", () => {
 
   it("every reason in the fixtures has words in the app", () => {
     const logRows = parseLogTail(logFixture).rows.map((e) => e.row.outcome);
-    const reasons = [...fixture.outcomes, ...logRows].flatMap((o) => ("reason" in o && o.reason ? [o.reason] : []));
+    // An exit row's reason is the other device's or the engine's own words, shown as they came (`exitReasonWords`): not a slug.
+    const reasons = [...fixture.outcomes, ...logRows].filter((o) => o.kind !== "exit").flatMap((o) => ("reason" in o && o.reason ? [o.reason] : []));
     expect(reasons.length).toBeGreaterThan(0);
     for (const reason of reasons) expect(REASON_TEXT, reason).toHaveProperty(reason);
   });
@@ -236,6 +238,44 @@ describe("engine IPC law", () => {
     expect(SIGNALS.filter((s) => isIntended({ signal: s }))).toEqual(crateIntended);
     const body = Object.fromEntries(Object.entries(fixture.engine.find((m) => m.type === "issues")!).filter(([k]) => k !== "type"));
     expect(parseIssues(body)).toEqual(body);
+  });
+
+  it("the app reads the link fact; absent, odd or from an older engine is no section; its enums and limits are the crate's", () => {
+    const status = fixture.engine.find((m) => m.type === "status")!;
+    const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
+    expect(parseEngineStatus(body), "an older engine says nothing, so the app shows nothing").not.toHaveProperty("link");
+    for (const l of fixture.linkStatuses) expect(parseEngineStatus({ ...body, link: l }).link, l.state).toEqual(l);
+    expect(fixture.linkStatuses.map((l) => l.state)).toEqual(expect.arrayContaining(LINK_STATES.filter((s) => s !== "unknown")));
+    expect(parseEngineStatus({ ...body, link: { state: "teleporting", later: 1 } }).link, "a newer engine's state still reads").toEqual({ state: "unknown" });
+    for (const odd of [1, "up", {}, { state: 7 }, null]) expect(parseEngineStatus({ ...body, link: odd }), `never a refused Status: ${JSON.stringify(odd)}`).not.toHaveProperty("link");
+    const up = fixture.linkStatuses.find((l) => l.state === "up")!;
+    expect(parseEngineStatus({ ...body, link: { ...up, hub_fingerprint: "not hex", settings: { ...up.settings, udp: "maybe" } } }).link, "an odd part is left out alone").toEqual(
+      Object.fromEntries(Object.entries(up).filter(([k]) => k !== "hub_fingerprint" && k !== "settings")),
+    );
+    expect(parseEngineStatus({ ...body, link: { state: "down", last_error: "x".repeat(LINK_TEXT_MAX + 50) } }).link?.last_error).toHaveLength(LINK_TEXT_MAX);
+    const variants = (name: string) =>
+      ((RUST.match(new RegExp(`pub enum ${name} \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? "").match(/^\s{4}([A-Z]\w+),/gm) ?? []).map((v) =>
+        v.trim().replace(",", "").replace(/[A-Z]/g, (c, i) => (i ? "_" : "") + c.toLowerCase()),
+      );
+    expect(variants("LinkState")).toEqual([...LINK_STATES]);
+    expect(variants("LinkHubDown")).toEqual([...LINK_HUB_DOWN]);
+    expect(variants("LinkUdp")).toEqual([...LINK_UDP]);
+    expect(variants("ExitVia")).toEqual([...EXIT_VIAS]);
+    for (const via of EXIT_VIAS) expect(EXIT_VIA_TEXT[via], via).toBeTruthy();
+    expect(fixture.outcomes.flatMap((o) => (o.kind === "exit" ? [(o as { via: string }).via] : []))).toEqual(EXIT_VIAS.filter((v) => v !== "unknown"));
+    expect(Number(rustConst("LINK_CODE_MAX"))).toBe(LINK_CODE_MAX);
+    expect(rustConst("LINK_ADDRESS_MAX")).toBe("253 + 1 + 5");
+    expect(LINK_ADDRESS_MAX).toBe(253 + 1 + 5);
+    expect(Number(rustConst("LINK_TEXT_MAX"))).toBe(LINK_TEXT_MAX);
+    expect(rustConst("CAPABILITY_LINK")).toBe('"link"');
+    expect(RUST).toMatch(/skip_serializing_if = "Option::is_none"\)\]\s*pub link: Option<LinkStatus>/);
+    expect(fixture.client.filter((m) => m.type.startsWith("link_") || m.type === "set_link").map((m) => m.type)).toEqual(["link_pair", "link_unpair", "set_link"]);
+    // The client examples are what the app sends: a route the app reads back, settings it reads back whole.
+    const pair = fixture.client.find((m) => m.type === "link_pair") as unknown as { route: unknown };
+    expect(parseLinkRoute(pair.route)).toEqual(pair.route);
+    const set = Object.fromEntries(Object.entries(fixture.client.find((m) => m.type === "set_link")!).filter(([k]) => k !== "type"));
+    expect(parseLinkSettings(set)).toEqual(set);
+    expect(JSON.stringify(fixture.linkStatuses), "a status never carries a code").not.toMatch(/SL1-/);
   });
 
   it("no message can sign, export or mint", () => {

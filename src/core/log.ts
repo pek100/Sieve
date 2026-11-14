@@ -7,6 +7,7 @@
 import type { LogChange, LogEntry, LogOutcome, LogRow, RetryHow } from "@/data/protocol";
 import { exclusionReasonWords, isExclusionReason } from "./exclusions";
 import { CAUSE_TEXT, SIGNAL_TEXT } from "./issues";
+import { exitWords } from "./link";
 
 /** How Sieve tried a connection again, before the app saw anything. */
 export const RETRY_TEXT: Readonly<Record<RetryHow, string>> = {
@@ -173,6 +174,8 @@ export function outcomeWords(outcome: LogOutcome | null | undefined): string {
     }
     case "retried":
       return `${RETRY_TEXT[outcome.how] ?? "Sieve tried again"}: ${outcome.recovered ? "it worked" : "it still failed"}`;
+    case "exit":
+      return exitWords(outcome.via, outcome.reason);
     default:
       return "Unknown";
   }
