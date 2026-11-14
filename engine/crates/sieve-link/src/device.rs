@@ -54,7 +54,11 @@ impl std::str::FromStr for OnHubDown {
 /// traffic must keep the link's own socket out of its own tunnel). Takes the
 /// dial address as given in the route.
 #[derive(Clone)]
-pub struct Dialer(pub Arc<dyn Fn(String) -> Pin<Box<dyn std::future::Future<Output = io::Result<TcpStream>> + Send>> + Send + Sync>);
+pub struct Dialer(pub Arc<DialFn>);
+
+/// A dial: the address in, the connected socket out.
+pub type DialFn = dyn Fn(String) -> DialFuture + Send + Sync;
+pub type DialFuture = Pin<Box<dyn std::future::Future<Output = io::Result<TcpStream>> + Send>>;
 
 impl std::fmt::Debug for Dialer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
