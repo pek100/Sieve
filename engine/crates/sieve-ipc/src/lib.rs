@@ -28,7 +28,11 @@
 //!   `dns_capture` sent only to an app that names it there; the status's
 //!   `wifi_sign_in`, left out while there is nothing to say and sent only to an
 //!   app that names it, with `pause_dns_capture` and `resume_dns_capture`, which
-//!   an app sends only to an engine whose status carried that fact).
+//!   an app sends only to an engine whose status carried that fact; the
+//!   status's `link`, sent only to an app that names `link`, with `link_pair`,
+//!   `link_unpair` and `set_link`, which an app sends only to an engine whose
+//!   status carried it; the signals `hub_down`, `hub_refused`, `udp_dropped`,
+//!   the cause `hub` and the log outcome `exit`, appended as `retried` was).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -82,7 +86,7 @@ pub const LOG_URL_MAX: usize = 2048;
 pub const LOG_RULE_MAX: usize = 1024;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices", "list_refresh", "list_import", "list_rules", "issues", "pause_dns_capture", "resume_dns_capture"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices", "list_refresh", "list_import", "list_rules", "issues", "pause_dns_capture", "resume_dns_capture", "link_pair", "link_unpair", "set_link"];
 /// The `type` names of [`EngineMessage`], in declaration order.
 pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status", "exclusions", "heal_notices", "list_imported", "list_rules", "issues"];
 /// At most this many apps in [`EngineMessage::Issues`]: past it the app whose
@@ -124,7 +128,21 @@ pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "ref
 /// field added to a message the app reads strictly goes only to an app that names
 /// it, so an app from before the field keeps reading the message. An engine
 /// ignores a name it does not know.
-pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE, CAPABILITY_WIFI_SIGN_IN];
+pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE, CAPABILITY_WIFI_SIGN_IN, CAPABILITY_LINK];
+/// [`EngineStatus::link`]: exiting through another device (a Sieve link hub).
+/// An app that names it may send [`ClientMessage::LinkPair`],
+/// [`ClientMessage::LinkUnpair`] and [`ClientMessage::SetLink`], and only to an
+/// engine whose status carried the fact: an engine from before them ends the
+/// conversation on a message type it does not know.
+pub const CAPABILITY_LINK: &str = "link";
+/// A pairing code is at most this many bytes on the wire (a `sieve-link` code
+/// is about 143 characters; the rest is room for a later version).
+pub const LINK_CODE_MAX: usize = 512;
+/// A hub address to dial (`host:port`) is at most this many bytes.
+pub const LINK_ADDRESS_MAX: usize = 253 + 1 + 5;
+/// [`LinkStatus::last_error`] and an [`LogOutcome::Exit`] reason are cut to this
+/// many bytes.
+pub const LINK_TEXT_MAX: usize = 256;
 /// [`EngineStatus::dns_capture`].
 pub const CAPABILITY_DNS_CAPTURE: &str = "dns_capture";
 /// [`EngineStatus::wifi_sign_in`]. An app that names it may send
@@ -232,6 +250,149 @@ pub enum ClientMessage {
     /// "Resume now": ends a sign-in pause, if there is one. No field (a struct
     /// variant, as [`ClientMessage::RequestUpdate`]). Answered with Status.
     ResumeDnsCapture {},
+    /// Pair this engine with a hub: `code` is the hub's pairing code, at most
+    /// [`LINK_CODE_MAX`] bytes, never logged, echoed or kept after use. `route`
+    /// says how the link is made; None dials the address the code carries.
+    /// Answered at once with Status (its `link` reads `pairing` while the engine
+    /// redeems the code, which can wait for a hub that dials in); a code that
+    /// does not parse or has expired is an Error. Sent only to an engine whose
+    /// status carried `link` ([`CAPABILITY_LINK`]).
+    LinkPair {
+        code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<LinkRoute>,
+    },
+    /// Forget the hub: its record and this engine's key for it are deleted and
+    /// nothing exits through it any more. Answered with Status.
+    LinkUnpair {},
+    /// The owner's choices for the paired hub, applied at once and kept
+    /// (`link.json`). Refused with an Error while unpaired. Answered with Status.
+    SetLink(LinkSettings),
+}
+
+/// How the engine and its hub meet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "how", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LinkRoute {
+    /// The engine dials the hub at `address` (`ip:port`, `[v6]:port` or
+    /// `name:port`), at most [`LINK_ADDRESS_MAX`] bytes.
+    Dial { address: String },
+    /// The engine listens on this TCP port of the adapter Windows uses for the
+    /// internet, and the hub dials in (a hub behind a home router). The port is
+    /// open only while exiting through the hub is on and Sieve routes.
+    Listen { port: u16 },
+}
+
+/// What happens to a sieved app's new connection while the hub cannot be reached.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkHubDown {
+    /// It fails: nothing leaves from this computer's own address. The default.
+    #[default]
+    Stop,
+    /// It goes out directly from this computer, as without the hub.
+    Direct,
+}
+
+/// What happens to a sieved app's UDP to a public address while exiting through
+/// the hub (the link carries TCP only; QUIC is refused either way so browsers
+/// use TCP).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkUdp {
+    /// Dropped, with a log row. The default.
+    #[default]
+    Drop,
+    /// Sent directly from this computer.
+    Direct,
+}
+
+/// The owner's choices for the paired hub. Strict both ways (it arrives in
+/// [`ClientMessage::SetLink`], where an unknown field could carry a decision):
+/// a field added here goes only to an app that names a new capability, as
+/// [`EngineStatus::for_app`] does for the status's facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkSettings {
+    /// "Exit through the hub": sieved apps' connections leave through it.
+    pub exit: bool,
+    pub on_hub_down: LinkHubDown,
+    pub udp: LinkUdp,
+    pub route: LinkRoute,
+}
+
+/// Where the link stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkState {
+    /// No hub.
+    Unpaired,
+    /// A code is being redeemed (waiting for the hub, when it dials in).
+    Pairing,
+    /// Paired, and exiting through the hub is off.
+    Off,
+    /// Exiting is on and the link is not up yet (or Sieve does not route, so
+    /// nothing needs it).
+    Connecting,
+    /// Exiting is on and the link is up: sieved apps leave through the hub.
+    Up,
+    /// Exiting is on and the link was up and is gone; `last_error` says why
+    /// when the engine knows.
+    Down,
+    /// Decode only: a state a newer engine sent.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Exiting through another device, as the app shows it. Present (with
+/// `Unpaired` when there is no hub) from an engine that can do it, sent only
+/// to an app that names [`CAPABILITY_LINK`]. Takes unknown fields, as
+/// [`EngineStatus`] does. Never carries a key or a pairing code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkStatus {
+    pub state: LinkState,
+    /// The hub's own name, as it answered the pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_name: Option<String>,
+    /// The hub's key fingerprint (SHA-256 of its public key, hex): what the
+    /// owner compares with `sieve-hub` on the other device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_fingerprint: Option<String>,
+    /// This engine's own key fingerprint, as the hub lists the device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_fingerprint: Option<String>,
+    /// The choices in force; None while unpaired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<LinkSettings>,
+    /// Wall ms since the state is what it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    /// Why the last attempt failed, at most [`LINK_TEXT_MAX`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// While listening: the exact address and port open for the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listening: Option<String>,
+}
+
+/// How a flow went out while exiting through a hub was on ([`LogOutcome::Exit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitVia {
+    /// Through the hub: sites see the hub's address.
+    Hub,
+    /// Directly from this computer: the hub was unreachable and the setting
+    /// says go direct, or UDP whose setting says so.
+    Direct,
+    /// Not at all: the hub was unreachable and the setting says stop.
+    Stopped,
+    /// The hub answered and refused it (`reason` is the hub's word).
+    Refused,
+    /// UDP the link does not carry, dropped.
+    Dropped,
+    /// Decode only: a way a newer engine sent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Engine to app. Read and written one frame at a time and never stored, so the
@@ -322,6 +483,14 @@ pub enum Signal {
     /// `QuicRefused` (the TENSION at [`LogOutcome`] holds for it too: an older app
     /// and this engine ship together).
     HandshakeAbandoned,
+    /// Exiting through another device: it could not be reached, and the setting
+    /// stops connections then. Appended (as `HandshakeAbandoned`).
+    HubDown,
+    /// Exiting through another device: it answered and refused the connection
+    /// (its rules, its limits, or it could not reach the server itself).
+    HubRefused,
+    /// Exiting through another device: UDP the link does not carry was dropped.
+    UdpDropped,
     /// Decode only: a signal a newer engine sent that this build does not know. It
     /// reads as this, so one new kind never fails a whole `Log` or `Issues` frame
     /// for an app and engine out of step. The engine never sends it; not in
@@ -338,6 +507,10 @@ pub enum Cause {
     Sieve,
     /// The same would happen without Sieve: the server or the network refused it.
     Network,
+    /// The other device this computer exits through: it was down, or it refused.
+    /// Neither the app nor Sieve's filtering did it. Appended; an app from before
+    /// it reads `Unknown`.
+    Hub,
     /// The signal cannot tell. A cause a newer engine sent that this build does not
     /// know reads as this too, as [`Signal::Unknown`] does.
     #[serde(other)]
@@ -345,7 +518,7 @@ pub enum Cause {
 }
 
 impl Signal {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 15] = [
         Self::ConnectRefused,
         Self::ConnectTimeout,
         Self::Unreachable,
@@ -358,6 +531,9 @@ impl Signal {
         Self::Blocked,
         Self::QuicRefused,
         Self::HandshakeAbandoned,
+        Self::HubDown,
+        Self::HubRefused,
+        Self::UdpDropped,
     ];
 
     /// The classification table, the only one: a signal decides its cause.
@@ -368,18 +544,23 @@ impl Signal {
     ///   broke it, and a lookup with no answer may be the resolvers Sieve asks or
     ///   the network that blocks them; a handshake the app gave up on says nothing
     ///   of why.
+    /// - Hub: the device this computer exits through was down or refused; the
+    ///   app is not at fault and neither is the filtering. UDP the link does not
+    ///   carry is dropped by Sieve, on the owner's setting: Sieve's, and meant.
     pub fn cause(self) -> Cause {
         match self {
-            Self::EgressFailed | Self::AppRefusedCertificate | Self::Blocked | Self::QuicRefused => Cause::Sieve,
+            Self::EgressFailed | Self::AppRefusedCertificate | Self::Blocked | Self::QuicRefused | Self::UdpDropped => Cause::Sieve,
             Self::ConnectRefused | Self::ConnectTimeout | Self::Unreachable => Cause::Network,
+            Self::HubDown | Self::HubRefused => Cause::Hub,
             Self::ConnectFailed | Self::ConnectionLost | Self::Stall | Self::DnsUnanswered | Self::HandshakeAbandoned | Self::Unknown => Cause::Unknown,
         }
     }
 
-    /// Sieve meant it: a rule's block, or a QUIC refusal the app answers by
-    /// falling back to TCP. Shown, but never read as the app failing.
+    /// Sieve meant it: a rule's block, a QUIC refusal the app answers by falling
+    /// back to TCP, or UDP dropped because the link carries none. Shown, but
+    /// never read as the app failing.
     pub fn intended(self) -> bool {
-        matches!(self, Self::Blocked | Self::QuicRefused)
+        matches!(self, Self::Blocked | Self::QuicRefused | Self::UdpDropped)
     }
 }
 
@@ -884,6 +1065,10 @@ pub struct EngineStatus {
     pub wifi_sign_in: Option<WifiSignIn>,
     /// Signed updates (protocol 3).
     pub update: UpdateStatus,
+    /// Exiting through another device; left out by an engine from before it and
+    /// for an app that does not name [`CAPABILITY_LINK`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkStatus>,
 }
 
 impl EngineStatus {
@@ -897,6 +1082,9 @@ impl EngineStatus {
         }
         if !capabilities.iter().any(|c| c == CAPABILITY_WIFI_SIGN_IN) {
             self.wifi_sign_in = None;
+        }
+        if !capabilities.iter().any(|c| c == CAPABILITY_LINK) {
+            self.link = None;
         }
         self
     }
@@ -1171,6 +1359,17 @@ pub enum LogOutcome {
     Problem { signal: Signal, cause: Cause },
     /// Sieve's connect failed and was tried again before the app saw anything.
     Retried { how: RetryHow, recovered: bool },
+    /// Exiting through another device was on: how this flow went out. `target`
+    /// is what the hub was asked to connect to (a name, else an address, with
+    /// its port), `reason` the hub's own word for a refusal or the engine's for
+    /// a stop or a drop, at most [`LINK_TEXT_MAX`] bytes. Appended, as `Retried`.
+    Exit {
+        via: ExitVia,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// One row of the filtering log. A host-level row leaves `url` and
@@ -1472,6 +1671,9 @@ mod tests {
             ClientMessage::Issues { .. } => "issues",
             ClientMessage::PauseDnsCapture { .. } => "pause_dns_capture",
             ClientMessage::ResumeDnsCapture {} => "resume_dns_capture",
+            ClientMessage::LinkPair { .. } => "link_pair",
+            ClientMessage::LinkUnpair {} => "link_unpair",
+            ClientMessage::SetLink(_) => "set_link",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -1659,16 +1861,70 @@ mod tests {
             LogOutcome::NotDecrypted { .. } => "not_decrypted",
             LogOutcome::Problem { .. } => "problem",
             LogOutcome::Retried { .. } => "retried",
+            LogOutcome::Exit { .. } => "exit",
         };
         let mut seen = Vec::new();
+        let mut vias = Vec::new();
         for o in outcomes {
             let parsed: LogOutcome = serde_json::from_value(o.clone()).unwrap();
             assert_eq!(&serde_json::to_value(&parsed).unwrap(), o);
             assert_eq!(name(&parsed), o["kind"]);
             seen.push(name(&parsed));
+            if let LogOutcome::Exit { via, reason, .. } = &parsed {
+                vias.push(*via);
+                assert!(reason.as_ref().is_none_or(|r| r.len() <= LINK_TEXT_MAX));
+            }
         }
         seen.dedup();
-        assert_eq!(seen, ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted", "problem", "retried"]);
+        assert_eq!(seen, ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted", "problem", "retried", "exit"]);
+        assert_eq!(vias, [ExitVia::Hub, ExitVia::Direct, ExitVia::Stopped, ExitVia::Refused, ExitVia::Dropped], "every way, so the TS law sees each name");
+        let later: LogOutcome = serde_json::from_value(serde_json::json!({ "kind": "exit", "via": "carrier_pigeon" })).unwrap();
+        assert_eq!(later, LogOutcome::Exit { via: ExitVia::Unknown, target: None, reason: None }, "a way from a newer engine reads as unknown");
+    }
+
+    /// The link fact goes only to an app that names `link`; every fixture state
+    /// round trips; an engine from before it sends none; the messages that
+    /// change it are strict and carry nothing but their fields.
+    #[test]
+    fn link_status_goes_only_to_an_app_that_names_it_and_its_messages_are_strict() {
+        let states: Vec<LinkStatus> = serde_json::from_value(fixture()["linkStatuses"].clone()).unwrap();
+        assert_eq!(serde_json::to_value(&states).unwrap(), fixture()["linkStatuses"], "the app reads the same bytes");
+        let seen: Vec<LinkState> = states.iter().map(|s| s.state).collect();
+        for state in [LinkState::Unpaired, LinkState::Pairing, LinkState::Off, LinkState::Connecting, LinkState::Up, LinkState::Down] {
+            assert!(seen.contains(&state), "{state:?} has a fixture example");
+        }
+        assert!(states.iter().all(|s| s.last_error.as_ref().is_none_or(|e| e.len() <= LINK_TEXT_MAX)));
+        let text = fixture()["linkStatuses"].to_string();
+        for banned in ["SL1-", "secret", "pkcs8", "private"] {
+            assert!(!text.contains(banned), "a status never carries a code or a key: {banned}");
+        }
+
+        let status = EngineStatus { link: Some(states[3].clone()), ..EngineStatus::default() };
+        assert!(status.clone().for_app(&[CAPABILITY_DNS_CAPTURE.into(), CAPABILITY_WIFI_SIGN_IN.into()]).link.is_none(), "an app from before it");
+        assert!(serde_json::to_value(status.clone().for_app(&[])).unwrap().get("link").is_none());
+        assert_eq!(status.clone().for_app(&[CAPABILITY_LINK.into()]), status);
+        assert_eq!(serde_json::from_value::<EngineStatus>(serde_json::to_value(&status).unwrap()).unwrap(), status);
+        let old_engine = fixture()["engine"].as_array().unwrap().iter().find(|m| m["type"] == "status").unwrap().clone();
+        let EngineMessage::Status(read) = serde_json::from_value(old_engine.clone()).unwrap() else { panic!("a status") };
+        assert!(read.link.is_none(), "an engine from before it: no section");
+        let mut newer = old_engine;
+        newer["link"] = serde_json::json!({ "state": "teleporting", "later": 1 });
+        let EngineMessage::Status(read) = serde_json::from_value(newer).unwrap() else { panic!("a status") };
+        assert_eq!(read.link.map(|l| l.state), Some(LinkState::Unknown), "a newer engine's state still reads");
+
+        let pair = ClientMessage::LinkPair { code: "SL1-X".into(), route: None };
+        assert_eq!(serde_json::to_value(&pair).unwrap(), serde_json::json!({ "type": "link_pair", "code": "SL1-X" }));
+        for bad in [
+            r#"{"type":"link_pair"}"#,
+            r#"{"type":"link_pair","code":"c","log":true}"#,
+            r#"{"type":"link_pair","code":"c","route":{"how":"listen","port":7443,"any":1}}"#,
+            r#"{"type":"link_unpair","hub":"h"}"#,
+            r#"{"type":"set_link","exit":true,"on_hub_down":"stop","udp":"drop"}"#,
+            r#"{"type":"set_link","exit":true,"on_hub_down":"stop","udp":"drop","route":{"how":"dial","address":"a:1"},"key":"k"}"#,
+            r#"{"type":"set_link","exit":true,"on_hub_down":"maybe","udp":"drop","route":{"how":"dial","address":"a:1"}}"#,
+        ] {
+            assert!(serde_json::from_str::<ClientMessage>(bad).is_err(), "{bad}");
+        }
     }
 
     /// The status's filter facts are additive: without them the wire is as
@@ -1899,7 +2155,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&parsed).unwrap(), bare, "empty is left out");
         let named = ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.2.0".into(), capabilities: APP_CAPABILITIES.iter().map(ToString::to_string).collect() };
         let wire = serde_json::to_value(&named).unwrap();
-        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture", "wifi_sign_in"]));
+        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture", "wifi_sign_in", "link"]));
         assert_eq!(serde_json::from_value::<ClientMessage>(wire).unwrap(), named);
 
         let status = EngineStatus { routes_up: true, dns_capture: Some(DnsCapture::Working), ..EngineStatus::default() };
@@ -2217,7 +2473,7 @@ mod tests {
     /// `cause` or `intended` has to change this table too.
     #[test]
     fn every_signal_has_its_cause() {
-        use Cause::{Network, Sieve, Unknown};
+        use Cause::{Hub, Network, Sieve, Unknown};
         let table = [
             (Signal::ConnectRefused, Network, false),
             (Signal::ConnectTimeout, Network, false),
@@ -2231,6 +2487,9 @@ mod tests {
             (Signal::Blocked, Sieve, true),
             (Signal::QuicRefused, Sieve, true),
             (Signal::HandshakeAbandoned, Unknown, false),
+            (Signal::HubDown, Hub, false),
+            (Signal::HubRefused, Hub, false),
+            (Signal::UdpDropped, Sieve, true),
         ];
         assert_eq!(table.map(|(s, _, _)| s), Signal::ALL, "every signal, in order");
         for (signal, cause, intended) in table {
@@ -2266,7 +2525,7 @@ mod tests {
         for s in Signal::ALL {
             assert!(f.contains(&serde_json::to_string(&s).unwrap()), "{s:?}");
         }
-        for c in [Cause::Sieve, Cause::Network, Cause::Unknown] {
+        for c in [Cause::Sieve, Cause::Network, Cause::Hub, Cause::Unknown] {
             assert!(f.contains(&serde_json::to_string(&c).unwrap()), "{c:?}");
         }
     }
