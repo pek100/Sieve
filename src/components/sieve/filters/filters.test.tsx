@@ -1,18 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-/**
- * The tracking options wait for the HTTPS switch in this build; `offer.tracking`
- * makes those that need only it available, as the build with that switch will
- * (page filtering, which the others need, comes later still).
- */
-const offer = vi.hoisted(() => ({ tracking: false }));
-vi.mock("@/core/settings/registry", async (importOriginal) => {
-  const real = await importOriginal<typeof import("@/core/settings/registry")>();
-  const offered = (k: string) => offer.tracking && real.settingDef(k as never).requires === "filtering.https";
-  return { ...real, isAvailable: (k: string) => (k.startsWith("tracking.") ? offered(k) : real.isAvailable(k as never)) };
-});
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { NoticeToaster } from "@/components/sieve/shell/notice-toaster";
 import { MAX_POLICY_BYTES } from "@/core/settings/registry";
 import fixture from "@/data/fixtures/filter-lists-v1.json";
@@ -467,8 +455,10 @@ describe("protection level", () => {
   it("a catalogue that cannot be read is said once, by the lists, and no level can be picked", async () => {
     await setup("error");
     expect(screen.getAllByRole("alert")).toHaveLength(1);
-    expect(document.querySelector("[data-protection-level]")).toHaveTextContent("none can be picked now");
-    expect(screen.queryByRole("radio", { name: /^Balanced/ })).toBeNull();
+    const level = document.querySelector<HTMLElement>("[data-protection-level]")!;
+    expect(level).toHaveTextContent("none can be picked now");
+    // The tracking block has a level of its own; the lists' one offers none.
+    expect(within(level).queryByRole("radio", { name: /^Balanced/ })).toBeNull();
   });
 });
 
@@ -603,28 +593,8 @@ describe("your own lists", () => {
   });
 });
 
-describe("tracking protection, while the HTTPS switch waits for its live check", () => {
-  it("is not shown, so nothing claims a protection in force, and a stored wish is never sent", async () => {
-    const sent: EnginePolicy[] = [];
-    const mock = createMockEngine("idle");
-    await setup("pending", { schema: 5, values: { "filtering.engine": true, "tracking.webRtc": true } }, { ...mock, setPolicy: (p) => (sent.push(p), mock.setPolicy(p)) });
-    await settled();
-    expect(document.querySelector("[data-tracking]")).toBeNull();
-    expect(screen.queryByText("Send Global Privacy Control")).toBeNull();
-    expect(sent.length).toBeGreaterThan(0);
-    for (const p of sent) expect(p.tracking ?? []).toEqual([]);
-  });
-});
-
-/** The block itself, as the build that offers the options will show it. */
-describe("tracking protection, once offered", () => {
-  beforeEach(() => {
-    offer.tracking = true;
-  });
-  afterEach(() => {
-    offer.tracking = false;
-  });
-
+/** The options are offered since the HTTPS switch is (2026-11-20); with it off on a fresh install, each waits for it. */
+describe("tracking protection, offered with the HTTPS switch", () => {
   it("is at Balanced, the recommended level, every option locked with the reason once, and nothing can change it", async () => {
     await setup();
     const block = document.querySelector<HTMLElement>("[data-tracking]")!;
@@ -632,18 +602,19 @@ describe("tracking protection, once offered", () => {
     expect(within(block).getByRole("radio", { name: /^Balanced/ })).toHaveAttribute("aria-checked", "true");
     expect(within(block).getByRole("radio", { name: /^Balanced/ })).toBeDisabled();
     expect(block.querySelectorAll("[data-lock]")).toHaveLength(1);
-    expect(block.querySelector("[data-tracking-locked]")).toHaveTextContent("which this version of Sieve does not offer yet");
+    // A fresh install: the first switch on the way is the engine's, named once for every option.
+    expect(block.querySelector("[data-tracking-locked]")).toHaveTextContent("Needs Route traffic through the engine, which is off.");
     expect(block.querySelector("[data-tracking-locked]")).toHaveTextContent("None of these is in effect yet");
     for (const s of within(block).getAllByRole("switch")) expect(s).toBeDisabled();
   });
 
-  it("says what each option off at Balanced can break, and shows only the options offered, by level", async () => {
+  it("says what each option off at Balanced can break, and shows every option, by level", async () => {
     await setup();
     const referrer = document.querySelector<HTMLElement>('[data-tracking-option="tracking.referrer"]')!;
     expect(referrer).toHaveTextContent("Can break: Some downloads");
     expect(within(referrer).getByRole("switch")).not.toBeChecked();
     const shown = [...document.querySelectorAll("[data-tracking-option]")].map((e) => e.getAttribute("data-tracking-option"));
-    expect(shown, "the in-page ones wait for page filtering").toEqual(["tracking.gpc", "tracking.clientData", "tracking.searchQueries", "tracking.queryParams", "tracking.referrer", "tracking.thirdPartyCookies", "tracking.firstPartyCookies"]);
+    expect(shown).toEqual(["tracking.gpc", "tracking.clientData", "tracking.searchQueries", "tracking.queryParams", "tracking.referrer", "tracking.thirdPartyCookies", "tracking.webRtc", "tracking.push", "tracking.location", "tracking.firstPartyCookies"]);
   });
 
   it("a stored custom choice reads Custom and stays a wish: never sent while locked", async () => {

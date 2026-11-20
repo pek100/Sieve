@@ -659,7 +659,7 @@ describe("engine controller", () => {
     s.undo();
   });
 
-  it("sends the person's own lists, and a tracking option stored on only once HTTPS decryption is in force: never while it is locked", async () => {
+  it("sends the person's own lists, and the tracking options stored on whose switch is on: an in-page one waits for page filtering", async () => {
     const own = [
       { id: "custom-a1", title: "Mine", url: "https://lists.example/a.txt", enabled: true },
       { id: "custom-b2", title: "From a file", url: null, enabled: false },
@@ -669,8 +669,8 @@ describe("engine controller", () => {
     await s.fc.flush();
     expect(s.fake.policies).toHaveLength(1);
     expect(s.fake.policies[0].custom_lists).toEqual(own);
-    expect(s.fake.policies[0]).not.toHaveProperty("tracking");
-    expect(s.fake.policies[0].https).toBe(false);
+    expect(s.fake.policies[0].https).toBe(true);
+    expect(s.fake.policies[0].tracking, "WebRTC lives in the page: content is off").toEqual(["gpc", "searchQueries", "clientData", "queryParams"]);
     await s.fc.advance(ENGINE_POLL_MS * 2);
     expect(s.fake.policies, "the engine holds them: nothing more to send").toHaveLength(1);
     await s.settings.set("filters.custom", own.slice(1));
@@ -1172,18 +1172,34 @@ describe("engine controller", () => {
       s.undo();
     });
 
-    it("the unavailable switch reads off, so the policy sends https false whatever is stored", async () => {
+    it("the HTTPS switch is off on a fresh install, and sent as stored once the person turns it on", async () => {
+      const fresh = setup("idle", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      await fresh.fc.flush();
+      expect(fresh.fake.policies).toEqual([policy(1, true)]);
+      expect(fresh.fake.policies[0].https).toBe(false);
+      fresh.undo();
       const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true, [HTTPS_SWITCH]: true } }));
       await s.fc.flush();
-      expect(s.fake.policies).toEqual([policy(1, true)]);
+      expect(s.fake.policies[0]).toMatchObject({ engine: true, https: true, content: false });
       s.undo();
     });
 
-    it("the unavailable content switch reads off, so the policy sends content false whatever is stored", async () => {
+    it("page filtering is sent as stored, and its check passes only while the engine decrypts and holds it", async () => {
       const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true, [HTTPS_SWITCH]: true, [CONTENT_SWITCH]: true } }));
       await s.fc.flush();
-      expect(s.fake.policies).toEqual([policy(1, true)]);
-      expect(s.fake.policies[0].content).toBe(false);
+      expect(s.fake.policies[0]).toMatchObject({ https: true, content: true });
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(engineStatus(s.store.getState().engine)?.decrypting, "the mock engine decrypts while it routes with https").toBe(true);
+      expect([s.checks.has(ENGINE_SWITCH), s.checks.has(HTTPS_SWITCH), s.checks.has(CONTENT_SWITCH)]).toEqual([true, true, true]);
+      await s.settings.set(CONTENT_SWITCH as SettingKey, false);
+      await s.fc.flush();
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect([s.checks.has(HTTPS_SWITCH), s.checks.has(CONTENT_SWITCH)], "pages off: only HTTPS stays proven").toEqual([true, false]);
+      await s.settings.set(HTTPS_SWITCH as SettingKey, false);
+      await s.fc.flush();
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(s.checks.has(HTTPS_SWITCH)).toBe(false);
+      expect(engineStatus(s.store.getState().engine)?.upstream_checks, "nothing decrypted, nothing to say").toBeUndefined();
       s.undo();
     });
 

@@ -1,4 +1,4 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { STRANDED_DNS_TEXT } from "@/core/dns";
@@ -210,6 +210,27 @@ describe("home copy and KPIs", () => {
     await vi.waitFor(() => expect(engine()).toHaveAttribute("data-engine-phase", "filtering"));
     expect(within(engine()).getByText("Filtering hosts")).toBeInTheDocument();
     expect(document.body.textContent ?? "").not.toMatch(CLAIMS);
+    // HTTPS filtering is off on a fresh install: the tile points at its switch, and claims nothing.
+    expect(within(engine()).getByRole("link", { name: "Filter inside web pages too" })).toHaveAttribute("href", expect.stringMatching(/^\/settings\/?#setting-filtering\.https$/));
+  });
+
+  it("with HTTPS filtering held on, the tile has no way to it, and with the engine not routing neither", async () => {
+    const runtime = createRuntime({
+      source: createMockSource({ seed: 1 }),
+      settings: memoryBackend({ schema: 5, values: { "filtering.engine": true, "filtering.https": true } }),
+      engine: createMockEngine("hosts"),
+    });
+    render(
+      <SieveProvider runtime={runtime}>
+        <HomeScreen />
+      </SieveProvider>,
+    );
+    const engine = () => screen.getByRole("group", { name: "Right now" }).querySelector<HTMLElement>('section[data-kpi="engine"]')!;
+    await vi.waitFor(() => expect(engine()).toHaveAttribute("data-engine-phase", "filtering"));
+    await vi.waitFor(() => expect(engine().querySelector("[data-home-https]")).toBeNull());
+    cleanup();
+    await setup();
+    expect(document.querySelector("[data-home-https]"), "not installed: nothing routes").toBeNull();
   });
 
   it("law, settings from an old build with DNS filtering on: nothing starts, Home never says blocked, the safety banner points to Windows only", async () => {

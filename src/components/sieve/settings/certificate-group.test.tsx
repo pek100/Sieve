@@ -12,13 +12,6 @@ import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { CertificateGroup } from "./certificate-group";
 
-// `filtering.https` is unavailable until slice 6, which reads it as off and so
-// sends the engine off. These tests are about the group, with the switch real:
-// law 11 holds the real registry (the same split as settings/unavailable.test.ts).
-vi.mock("@/core/settings/registry", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/core/settings/registry")>()),
-  isAvailable: () => true,
-}));
 vi.setConfig({ testTimeout: 20_000 });
 
 afterEach(cleanup);
@@ -64,6 +57,26 @@ describe("Certificate group", () => {
     expect(rows).toHaveTextContent("Valid until");
     expect(rows).toHaveTextContent(THUMBPRINT);
     expect(rows).toHaveTextContent(firefox);
+  });
+
+  it("says plainly which upstream checks are skipped, and nothing while both run or nothing is decrypted", async () => {
+    const runtime = await setup(mock("idle"));
+    await settled("Not installed");
+    const e = runtime.store.getState().engine;
+    const pipe = e.probe!.pipe!;
+    if (pipe.kind !== "welcome") throw new Error("idle answers with a Status");
+    const checks = (u?: { ct: boolean; crlite: boolean }) =>
+      act(() => runtime.store.setEngine({ ...e, probe: { ...e.probe!, pipe: { ...pipe, status: { ...pipe.status, ...(u ? { upstream_checks: u } : {}) } } } }));
+    const line = () => group().querySelector("[data-upstream-checks]");
+    checks({ ct: false, crlite: false });
+    expect(line()).toHaveTextContent("The Certificate Transparency and CRLite checks are skipped until Sieve publishes their data. Windows still checks each site's certificate, revocation included.");
+    expect(line()).not.toHaveAttribute("role", "alert");
+    checks({ ct: true, crlite: false });
+    expect(line()).toHaveTextContent(/^The CRLite check is skipped/);
+    checks({ ct: true, crlite: true });
+    expect(line()).toBeNull();
+    checks();
+    expect(line()).toBeNull();
   });
 
   it("not installed: only the state line, no rows and no Remove", async () => {

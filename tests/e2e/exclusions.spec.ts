@@ -2,7 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 /**
  * Settings > Filtering, "Not decrypted", against the mock engine that holds HTTPS on
- * (`?heal=1`: the app cannot turn it on while `filtering.https` is unavailable).
+ * (`?heal=1`: an engine holding it on whatever the app sends).
  */
 const noHorizontalScroll = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
 

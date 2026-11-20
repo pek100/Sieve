@@ -3,13 +3,13 @@
  * construction: they are words and read-only facts. The one action, pausing
  * AdGuard, is the existing engine controller's, on the person's click (plan D14).
  */
-import { engineInForce, enginePhase, type EnginePhase, type EngineSlice } from "./engine";
+import { HTTPS_INVITE, engineInForce, enginePhase, httpsInForce, type EnginePhase, type EngineSlice } from "./engine";
 import { REGISTRY, SETTING_KEYS, isAvailable, settingDef, type SettingKey } from "./settings/registry";
 
 /** The setting the guide writes, and the only one. */
 export const WELCOME_DONE = "startup.welcomeDone" satisfies SettingKey;
 
-export const WELCOME_STEP_IDS = ["what", "switches", "adguard"] as const;
+export const WELCOME_STEP_IDS = ["what", "switches", "https", "adguard"] as const;
 export type WelcomeStepId = (typeof WELCOME_STEP_IDS)[number];
 
 export interface WelcomeStep {
@@ -77,6 +77,9 @@ export function welcomeSteps(e: EngineSlice, keepAdguard: boolean, switches: Swi
     },
     { id: "switches", ...SWITCHES_STEP[switches] },
   ];
+  // What HTTPS filtering does and where to turn it on: words and a link only, the
+  // guide still writes no switch. Left out while the engine already holds it on.
+  if (!httpsInForce(e)) steps.push({ id: "https", title: HTTPS_INVITE.title, body: HTTPS_INVITE.body });
   if (keepAdguard || welcomeAdguard(e)) {
     steps.push({
       id: "adguard",

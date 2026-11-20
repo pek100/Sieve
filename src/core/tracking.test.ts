@@ -1,12 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-
-/** The options wait for the HTTPS switch in this build; `offer.tracking` makes them available, as the build with that switch will. */
-const offer = vi.hoisted(() => ({ tracking: false }));
-vi.mock("./settings/registry", async (importOriginal) => {
-  const real = await importOriginal<typeof import("./settings/registry")>();
-  return { ...real, isAvailable: (k: string) => (k.startsWith("tracking.") ? offer.tracking : real.isAvailable(k as never)) };
-});
-
+import { describe, expect, it } from "vitest";
 import ipc from "@/data/fixtures/engine-ipc-v3.json";
 import { CUSTOM } from "./profiles";
 import { EMPTY_DOC, readValue, writeValue, type SettingsDoc } from "./settings/document";
@@ -85,49 +77,28 @@ describe("tracking level", () => {
   });
 });
 
-describe("while the HTTPS switch waits for its live check", () => {
-  it("no option is offered, each waits for that switch, and none is in force whatever its default", () => {
-    expect(TRACKING_KEYS.filter(isAvailable)).toEqual([]);
-    expect(trackingOffered()).toBe(false);
-    expect(offeredTrackingKeys()).toEqual([]);
-    for (const k of TRACKING_KEYS) expect(unavailableUntil(k), k).toBe(unavailableUntil(IN_PAGE.includes(k) ? "filtering.content" : "filtering.https"));
-    expect(defaultValue("tracking.gpc"), "on by default: so availability, not the value, keeps it out").toBe(true);
-    const values: Record<string, boolean> = { ...trackingValues("strict"), "filtering.https": true };
-    expect(trackingInForce((k) => values[k])).toEqual([]);
-  });
-
-  it("a stored wish is kept unread and no new one is written", () => {
-    const doc = withValues({ "tracking.webRtc": true });
-    expect(readValue(doc, "tracking.webRtc")).toBe(false);
-    expect(doc.values["tracking.webRtc"]).toBe(true);
-    expect(() => writeValue(EMPTY_DOC, "tracking.webRtc", true)).toThrow(/not available.*slice 9/);
-    expect(() => writeValue(EMPTY_DOC, "tracking.referrer", true)).toThrow(/not available.*slice 6/);
-  });
-});
-
+/** The HTTPS and content switches are available since 2026-11-20, so every option is offered. */
 describe("once offered, a locked option is never sent as on", () => {
-  const offered = () => {
-    offer.tracking = true;
-  };
-  afterEach(() => {
-    offer.tracking = false;
+  it("every option is offered, waiting for no plan step of its own", () => {
+    expect(isAvailable("filtering.https")).toBe(true);
+    expect(TRACKING_KEYS.filter(isAvailable)).toEqual(TRACKING_KEYS);
+    expect(trackingOffered()).toBe(true);
+    for (const k of TRACKING_KEYS) expect(unavailableUntil(k), k).toBeNull();
   });
 
   it("is shown by level, mildest first, those in no level last", () => {
-    offered();
     expect(offeredTrackingKeys().map(trackingName)).toEqual(["gpc", "clientData", "searchQueries", "queryParams", "referrer", "thirdPartyCookies", "webRtc", "push", "location", "firstPartyCookies"]);
   });
 
-  it("is not sent while the HTTPS switch is unavailable, whatever is stored", () => {
-    offered();
-    expect(isAvailable("filtering.https")).toBe(false);
-    const doc = withValues({ "filtering.https": true, ...Object.fromEntries(TRACKING_KEYS.map((k) => [k, true])) });
+  it("is not sent while HTTPS filtering is off, whatever is stored, and the default is off", () => {
+    const doc = withValues(Object.fromEntries(TRACKING_KEYS.map((k) => [k, true])));
+    expect(readValue(doc, "filtering.https"), "a fresh install: off").toBe(false);
     expect(readValue(doc, "tracking.webRtc"), "the wish is kept").toBe(true);
     expect(trackingInForce(readOf(doc))).toEqual([]);
+    expect(defaultValue("tracking.gpc"), "on by default: so the switch, not the value, keeps it out").toBe(true);
   });
 
   it("is sent only with the switch it requires on", () => {
-    offered();
     const values: Record<string, boolean> = { ...trackingValues("balanced"), "tracking.webRtc": true };
     const with_ = (on: Record<string, boolean>) => trackingInForce((k) => (k in on ? on[k] : values[k]));
     expect(with_({ "filtering.https": false })).toEqual([]);
@@ -136,7 +107,6 @@ describe("once offered, a locked option is never sent as on", () => {
   });
 
   it("an option stays writable while locked, so a wish is kept for later", () => {
-    offered();
     expect(readValue(writeValue(EMPTY_DOC, "tracking.webRtc", true), "tracking.webRtc")).toBe(true);
   });
 });

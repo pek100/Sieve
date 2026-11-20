@@ -1,12 +1,13 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 import { Page } from "@/components/sieve/shell/page";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { useSettingsView, valueInForce } from "@/components/sieve/settings/use-settings-view";
-import { ADGUARD_PAUSE_TEXT } from "@/core/engine";
+import { ADGUARD_PAUSE_TEXT, HTTPS_HREF, HTTPS_INVITE } from "@/core/engine";
 import type { Section } from "@/core/settings/registry";
 import { dataSwitchSummary, switchesState, welcomeAdguard, welcomeSteps } from "@/core/welcome";
 import { useEngine, useEngineActions } from "@/hooks/use-sieve";
@@ -62,6 +63,11 @@ export function WelcomeScreen({ onDone }: { onDone: () => void }) {
               </li>
             ))}
           </ul>
+        )}
+        {step.id === "https" && (
+          <Link href={HTTPS_HREF} onClick={onDone} className="text-label text-primary underline-offset-4 hover:underline" data-welcome-https="">
+            {HTTPS_INVITE.link}
+          </Link>
         )}
         {step.id === "adguard" && (
           <div className="flex flex-col items-start gap-2" data-welcome-adguard="">

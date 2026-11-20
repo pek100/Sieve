@@ -71,7 +71,10 @@ describe("a setting the engine carries out is locked while the engine cannot tak
         expect(s.runtime.settings.get(key), `${scenario} ${key}`).toBe(true);
       } else {
         expect(lock, `${scenario} ${key}`).toBeNull();
-        expect(sw, `${scenario} ${key}`).toBeEnabled();
+        // A switch that builds on another (HTTPS on routing, page filtering on HTTPS)
+        // may still wait for that one: that is its own lock, never the engine's.
+        if (r.querySelector("[data-lock]") === null) expect(sw, `${scenario} ${key}`).toBeEnabled();
+        else expect(r.querySelector("[data-lock=requires]"), `${scenario} ${key}`).not.toBeNull();
       }
     }
     if (unreached) expect(s.policies, scenario).toEqual([]);
@@ -126,6 +129,12 @@ describe("a setting the engine carries out is locked while the engine cannot tak
       await vi.waitFor(() => expect(s.phase()).toBe("routing"));
       expect(sw).toBeChecked();
     }
-    expect(s.policies).toEqual([{ revision: 1, engine: true, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false, content: false, plain_dns: false, user_rules: [], exclusions: [] }]);
+    expect(s.policies[0]).toEqual({ revision: 1, engine: true, sieving: true, off_apps: [], lists: null, domain_lists: [], https: false, content: false, plain_dns: false, user_rules: [], exclusions: [] });
+    // Each switch opens the next once the engine holds it: routing, then HTTPS, then pages.
+    expect(s.policies.map((p) => [p.engine, p.https, p.content])).toEqual([
+      [true, false, false],
+      [true, true, false],
+      [true, true, true],
+    ]);
   });
 });

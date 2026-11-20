@@ -307,6 +307,13 @@ export function createEngineController({ engine, store, clock, settings, checks,
     const phase = enginePhase(e);
     if (engineRoutes(e)) checks.add(ENGINE_SWITCH);
     else checks.delete(ENGINE_SWITCH);
+    // HTTPS is proven while the engine says it decrypts, and page filtering while
+    // it also holds `content`: what builds on each (the tracking protections) waits for that.
+    const decrypting = engineRoutes(e) && engineStatus(e)?.decrypting === true;
+    if (decrypting) checks.add(HTTPS);
+    else checks.delete(HTTPS);
+    if (decrypting && engineStatus(e)?.policy.content === true) checks.add(CONTENT);
+    else checks.delete(CONTENT);
     if (phase === "crash_loop" && banner === null) banner = notices.push({ kind: "error", surface: "banner", text: CRASH_LOOP_BANNER });
     if (phase !== "crash_loop" && banner !== null) {
       notices.dismiss(banner);
