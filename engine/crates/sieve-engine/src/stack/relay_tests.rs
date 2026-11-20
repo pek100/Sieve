@@ -48,6 +48,78 @@ fn relay(sink: Arc<FakeSink>) -> Arc<Relay> {
     relay_with(sink, no_link(), None)
 }
 
+/// The relay with `link`, whose UDP upstreams all go to `server` on loopback,
+/// whatever their target; `opened` counts them.
+fn relay_udp_to(sink: Arc<FakeSink>, link: Arc<crate::link::LinkManager>, server: SocketAddr, opened: Arc<std::sync::atomic::AtomicUsize>) -> Arc<Relay> {
+    let ctx = relay_with(sink, link, None);
+    let mut relay = Arc::into_inner(ctx).expect("not shared yet");
+    relay.udp = Arc::new(move |_target| {
+        opened.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let up = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.map_err(|e| e.to_string())?;
+            no_udp_resets(&up);
+            up.connect(server).await.map_err(|e| e.to_string())?;
+            Ok(up)
+        })
+    });
+    Arc::new(relay)
+}
+
+/// Where loopback UDP is filtered (see [`loopback_udp_works`]), an ICMP error for
+/// a datagram the filter refused would end the test's relay with a reset on its
+/// next receive (Windows reports it on a connected UDP socket): turned off for the
+/// test's own upstream sockets (`SIO_UDP_CONNRESET`), so only the relay's own
+/// decisions end a flow under test.
+fn no_udp_resets(socket: &tokio::net::UdpSocket) {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawSocket;
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn WSAIoctl(s: usize, code: u32, input: *const c_void, input_len: u32, output: *mut c_void, output_len: u32, returned: *mut u32, overlapped: *mut c_void, routine: *const c_void) -> i32;
+    }
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+    let off: u32 = 0;
+    let mut returned = 0u32;
+    // SAFETY: a live socket; the input is a 4-byte BOOL, nothing is written back,
+    // and the call is synchronous (no overlapped, no routine).
+    let r = unsafe { WSAIoctl(socket.as_raw_socket() as usize, SIO_UDP_CONNRESET, std::ptr::from_ref(&off).cast(), 4, std::ptr::null_mut(), 0, &mut returned, std::ptr::null_mut(), std::ptr::null()) };
+    assert_eq!(r, 0, "SIO_UDP_CONNRESET");
+}
+
+/// Whether a datagram between two loopback sockets of this process arrives. Not
+/// on the PC this was written on: its filtering proxy (AdGuard) drops the
+/// loopback UDP of new executables, so a test then proves what it can without
+/// an answer from the server, and says so.
+async fn loopback_udp_works() -> bool {
+    let (Ok(server), Ok(probe)) = (tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await, tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await) else { return false };
+    let Ok(to) = server.local_addr() else { return false };
+    if probe.send_to(b"probe", to).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 8];
+    let works = matches!(tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf)).await, Ok(Ok((5, _))));
+    if !works {
+        eprintln!("loopback UDP is filtered on this machine (e.g. AdGuard): the server's answers are not checked; run on the VM for them");
+    }
+    works
+}
+
+/// A UDP server on loopback that sends each datagram back, and counts them.
+async fn udp_echo() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let at = socket.local_addr().unwrap();
+    let got = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = got.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.send_to(&buf[..n], from).await;
+        }
+    });
+    (at, got)
+}
+
 /// A link manager with no pairing and no network: nothing exits.
 fn no_link() -> Arc<crate::link::LinkManager> {
     Arc::new(crate::link::LinkManager::new(None, Box::new(|| Err("no network in this test".into())), crate::policy::wall_ms))
@@ -304,6 +376,9 @@ struct TcpBed {
     server_next: u32,
     client_next: u32,
     server: TcpStream,
+    /// The upstream's own address and the one the server saw it from: they differ
+    /// when a filtering proxy on this machine sits in loopback ([`Self::needs_plain_loopback`]).
+    upstream_ends: (SocketAddr, SocketAddr),
     task: JoinHandle<()>,
 }
 
@@ -316,14 +391,26 @@ impl TcpBed {
         let Ok(IpStackStream::Tcp(app)) = wire.stack.accept().await else { panic!("no TCP stream") };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let (upstream, server) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+        let (upstream, (server, seen_from)) = (upstream.unwrap(), server.unwrap());
+        let upstream_ends = (upstream.local_addr().unwrap(), seen_from);
         let tuple = FiveTuple { proto: Proto::Tcp, local, remote };
         let admitted = ctx.admit(&tuple, &ctx.attribute(tuple).await, FlowProto::Tcp, FlowKind::Other).expect("admitted");
-        let task = tokio::spawn(serve_admitted(ctx.clone(), app, tuple, admitted, crate::link::exit::Upstream::Tcp(upstream.unwrap()), monotonic_ms(), None));
-        let mut bed = Self { ctx, wire, local, remote, server_next: 0, client_next: CLIENT_ISN + 1, server: server.unwrap().0, task };
+        let task = tokio::spawn(serve_admitted(ctx.clone(), app, tuple, admitted, crate::link::exit::Upstream::Tcp(upstream), monotonic_ms(), None));
+        let mut bed = Self { ctx, wire, local, remote, server_next: 0, client_next: CLIENT_ISN + 1, server, upstream_ends, task };
         let syn_ack = bed.next_segment().await;
         assert!(syn_ack.syn && syn_ack.ack, "{syn_ack:?}");
         bed.send(&[]);
         bed
+    }
+
+    /// For a test whose server must see the relay's own TCP segments (a reset, a
+    /// half-close, a FIN): a filtering proxy that sits in this machine's loopback
+    /// (AdGuard proxies the loopback TCP of new executables: a client's reset
+    /// reaches the server as a FIN) would fail it with a confusing assertion, so it
+    /// fails here, saying so. Not ignored: on the VM it runs and must pass.
+    fn needs_plain_loopback(&self) {
+        let (ours, seen) = self.upstream_ends;
+        assert_eq!(ours, seen, "loopback is proxied on this machine (e.g. AdGuard); run on the VM (the server saw {seen}, the relay's socket is {ours})");
     }
 
     fn send(&mut self, payload: &[u8]) {
@@ -369,7 +456,8 @@ impl TcpBed {
         let (upstream, starter) = crate::link::exit::lazy();
         let exit = super::relay::FlowExit::for_test(&ctx, starter, plan, admitted.id, remote);
         let task = tokio::spawn(serve_admitted(ctx.clone(), app, tuple, admitted, crate::link::exit::Upstream::Lazy(upstream), monotonic_ms(), Some(exit)));
-        let mut bed = Self { ctx, wire, local, remote, server_next: 0, client_next: CLIENT_ISN + 1, server: server.unwrap().0, task };
+        let (server, seen_from) = server.unwrap();
+        let mut bed = Self { ctx, wire, local, remote, server_next: 0, client_next: CLIENT_ISN + 1, server, upstream_ends: (seen_from, seen_from), task };
         let syn_ack = bed.next_segment().await;
         assert!(syn_ack.syn && syn_ack.ack, "{syn_ack:?}");
         bed.send(&[]);
@@ -399,7 +487,7 @@ impl TcpBed {
 async fn an_exiting_flow_opens_through_the_hub_only_once_passed_and_by_the_name_it_carries() {
     use crate::link::tests as lt;
     let h = lt::hub(true).await;
-    let port = lt::echo().await;
+    let port = lt::http_echo().await;
     let dir = tempfile::tempdir().unwrap();
     let net = Arc::new(lt::LoopNet::default());
     let m = lt::manager(dir.path(), net.clone());
@@ -421,11 +509,10 @@ async fn an_exiting_flow_opens_through_the_hub_only_once_passed_and_by_the_name_
     let mut bed = TcpBed::through(("10.9.0.2:50002", &remote), plan).await;
     let request = hello("echo.test");
     bed.send(&request);
-    // The echo's bytes, but for a filtering proxy on the test machine that answers
-    // the hub's loopback HTTP itself (AdGuard, seen 2026-11-20: its 502 page came
-    // back while the hub's audit showed the stream to the echo): the row and the
-    // hub's audit are the proof of the way the flow went.
-    assert!(!bed.received(request.len()).await.is_empty(), "an answer came back through the hub");
+    // The server's whole answer, byte for byte, through the hub (an HTTP answer, so
+    // a filtering proxy in this machine's loopback passes it as it is).
+    let expected = lt::http_wrapped(&request);
+    assert_eq!(bed.received(expected.len()).await, expected, "the answer came back through the hub");
     let rows = bed.ctx.book.lock().unwrap().take_log();
     assert!(
         rows.iter().any(|r| r.outcome == LogOutcome::Exit { via: sieve_ipc::ExitVia::Hub, target: Some(format!("echo.test:{port}")), reason: None }),
@@ -477,16 +564,15 @@ async fn through_handle_tcp(ctx: &Arc<Relay>, local: SocketAddr, remote: SocketA
         let server_next = syn_ack.sequence_number.wrapping_add(1);
         wire.to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { ack: Some(server_next), ..Flags::default() }, &[])).unwrap();
         wire.to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { psh: true, ack: Some(server_next), ..Flags::default() }, &first)).unwrap();
-        // The answer through the hub. Its bytes are the echo's, except on a machine
-        // whose filtering proxy (AdGuard) answers loopback HTTP itself: the rows
-        // and the hub's audit are the proof of the way it went.
+        // The server's whole answer through the hub ([`lt::http_echo`]).
+        let expected = crate::link::tests::http_wrapped(&first);
         let mut got = Vec::new();
-        while got.len() < first.len() {
+        while got.len() < expected.len() {
             let packet = tokio::time::timeout(WAIT, wire.from_stack.recv()).await.expect("the echo").unwrap();
             let headers = PacketHeaders::from_ip_slice(&packet).unwrap();
             got.extend_from_slice(headers.payload.slice());
         }
-        assert!(!got.is_empty(), "an answer came back through the hub");
+        assert_eq!(got, expected, "the answer came back through the hub");
         task.abort();
         return wire;
     }
@@ -537,7 +623,7 @@ async fn while_exiting_a_public_alternate_of_a_local_destination_is_never_dialle
 async fn handle_tcp_takes_the_exit_path_and_dials_no_alternate() {
     use crate::link::tests as lt;
     let h = lt::hub(true).await;
-    let port = lt::echo().await;
+    let port = lt::http_echo().await;
     let dir = tempfile::tempdir().unwrap();
     let net = Arc::new(lt::LoopNet::default());
     let m = exiting_manager(&h, dir.path(), net.clone()).await;
@@ -563,7 +649,7 @@ async fn handle_tcp_takes_the_exit_path_and_dials_no_alternate() {
 async fn the_engines_own_plain_http_goes_through_the_hub_by_its_host() {
     use crate::link::tests as lt;
     let h = lt::hub(true).await;
-    let port = lt::echo().await;
+    let port = lt::http_echo().await;
     let dir = tempfile::tempdir().unwrap();
     let net = Arc::new(lt::LoopNet::default());
     let m = exiting_manager(&h, dir.path(), net.clone()).await;
@@ -582,14 +668,13 @@ async fn the_engines_own_plain_http_goes_through_the_hub_by_its_host() {
     let Some(TransportHeader::Tcp(syn_ack)) = PacketHeaders::from_ip_slice(&packet).unwrap().transport else { panic!("not TCP") };
     let server_next = syn_ack.sequence_number.wrapping_add(1);
     wire.to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { psh: true, ack: Some(server_next), ..Flags::default() }, &request)).unwrap();
+    let expected = lt::http_wrapped(&request);
     let mut got = Vec::new();
-    while got.len() < request.len() {
+    while got.len() < expected.len() {
         let packet = tokio::time::timeout(WAIT, wire.from_stack.recv()).await.expect("the echo").unwrap();
         got.extend_from_slice(PacketHeaders::from_ip_slice(&packet).unwrap().payload.slice());
     }
-    // The echo's bytes, but for a filtering proxy on the test machine (see
-    // `through_handle_tcp`): the audit is the proof.
-    assert!(!got.is_empty(), "an answer came back through the hub");
+    assert_eq!(got, expected, "the answer came back through the hub");
     let audit = std::fs::read_to_string(h.hub.audit_path()).unwrap_or_default();
     assert!(audit.contains(&format!("echo.test:{port}")), "the hub was asked by the Host");
     assert!(ctx.book.lock().unwrap().take_log().is_empty(), "the engine's own flow has no row");
@@ -682,6 +767,7 @@ async fn an_apps_reset_reaches_the_server_as_a_reset() {
     for flow in FLOWS {
         for reset in [true, false] {
             let mut bed = TcpBed::new(flow).await;
+            bed.needs_plain_loopback();
             let head = format!("POST /upload HTTP/1.1\r\nHost: {ALLOWED}\r\nContent-Length: 100000\r\n\r\n").into_bytes();
             bed.send(&head);
             let mut got = vec![0u8; head.len()];
@@ -708,6 +794,7 @@ async fn a_half_closed_app_gets_the_servers_answer_through_the_relay() {
     const ANSWER: &[u8] = b"HTTP/1.0 200 OK\r\n\r\nthe answer, close-delimited";
     for flow in FLOWS {
         let mut bed = TcpBed::new(flow).await;
+        bed.needs_plain_loopback();
         let request = format!("GET / HTTP/1.0\r\nHost: {ALLOWED}\r\n\r\n").into_bytes();
         bed.send(&request);
         let (seq, ack) = (bed.client_next, bed.server_next);
@@ -738,11 +825,224 @@ async fn a_half_closed_app_gets_the_servers_answer_through_the_relay() {
     }
 }
 
+/// A connect that turns exiting on while it runs (after the guard let it through,
+/// so it races the change), then connects to `server` on loopback whatever its
+/// target.
+struct TurnsExitingOn {
+    link: Arc<crate::link::LinkManager>,
+    settings: sieve_ipc::LinkSettings,
+    server: SocketAddr,
+    turn: bool,
+}
+
+impl super::retry::Attempt for TurnsExitingOn {
+    type Stream = TcpStream;
+    fn attempt(&self, _target: SocketAddr) -> super::retry::AttemptFuture<'_, TcpStream> {
+        if self.turn {
+            self.link.set(self.settings.clone()).unwrap();
+        }
+        let server = self.server;
+        Box::pin(async move { TcpStream::connect(server).await.map_err(|e| super::retry::Failure::from_io(&e)) })
+    }
+}
+
+/// Round 2's P3: a direct connect that started just before exiting turned on is
+/// in the book only after the change ended the open connections: it ends too (a
+/// reset, one row), never stays on this computer's address. The control, with no
+/// change, is served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_direct_connect_that_raced_exiting_turning_on_is_ended() {
+    use crate::link::tests as lt;
+    let h = lt::hub(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(lt::LoopNet::default());
+    let m = lt::manager(dir.path(), net.clone());
+    lt::paired(&m, &h).await;
+    m.routes_up(net.clone(), lt::noop_reset());
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let server = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut kept = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            kept.push(s);
+        }
+    });
+    let on = lt::exiting(sieve_ipc::LinkRoute::Dial { address: h.addr.to_string() }, sieve_ipc::LinkHubDown::Stop);
+    let remote: SocketAddr = format!("{}:443", lt::SITE).parse().unwrap();
+    for turn in [true, false] {
+        let dial = Arc::new(TurnsExitingOn { link: m.clone(), settings: on.clone(), server, turn });
+        let ctx = relay_with(Arc::default(), m.clone(), Some(dial));
+        let local: SocketAddr = if turn { "10.9.0.2:50020" } else { "10.9.0.2:50021" }.parse().unwrap();
+        let mut wire = wire();
+        wire.to_stack.send(segment(local, remote, CLIENT_ISN, Flags { syn: true, ..Flags::default() }, &[])).unwrap();
+        let Ok(IpStackStream::Tcp(app)) = wire.stack.accept().await else { panic!("no TCP stream") };
+        let task = tokio::spawn(super::relay::handle_tcp(ctx.clone(), app));
+        let ended_row = |rows: &[sieve_ipc::LogRow]| rows.iter().any(|r| matches!(&r.outcome, LogOutcome::Exit { via: sieve_ipc::ExitVia::Hub, target: None, reason: Some(r) } if r.contains("1 open connection ended")));
+        if turn {
+            ended(task).await.unwrap();
+            // The app hears a reset, so it reconnects the new way.
+            loop {
+                let packet = tokio::time::timeout(WAIT, wire.from_stack.recv()).await.expect("a reset").unwrap();
+                if let Some(TransportHeader::Tcp(t)) = PacketHeaders::from_ip_slice(&packet).unwrap().transport {
+                    assert!(!t.fin, "a FIN would end the connection as complete: {t:?}");
+                    if t.rst {
+                        break;
+                    }
+                }
+            }
+            let mut book = ctx.book.lock().unwrap();
+            assert_eq!(book.live(), 0, "nothing left open");
+            assert!(ended_row(&book.take_log()), "one row says it ended");
+        } else {
+            // Its owner lookup gives up first (no owner in a test), then it is served.
+            until("the control admitted", || ctx.book.lock().unwrap().live() == 1).await;
+            tokio::time::sleep(SETTLE).await;
+            let mut book = ctx.book.lock().unwrap();
+            let (rows, batch) = (book.take_log(), book.take_batch());
+            assert!(!task.is_finished() && book.live() == 1, "the control is served: {rows:?} {batch:?}");
+            assert!(!ended_row(&rows));
+            drop(book);
+            task.abort();
+        }
+        // Off again for the control.
+        m.set(sieve_ipc::LinkSettings { exit: false, ..on.clone() }).unwrap();
+    }
+    m.routes_down();
+}
+
+/// Rows of the book read so far, kept across polls.
+fn rows_so_far(ctx: &Relay, seen: &Mutex<Vec<sieve_ipc::LogRow>>) -> Vec<sieve_ipc::LogRow> {
+    let mut seen = seen.lock().unwrap();
+    seen.extend(ctx.book.lock().unwrap().take_log());
+    seen.clone()
+}
+
+/// Round 2's P1: an open UDP flow that was relayed from this computer stops
+/// leaving directly once exiting applies to it: when exiting turns on (the
+/// change ends it in the book, and the way out moves), when sieving resumes after
+/// a pause, and when UDP is set from Direct to Drop (the way out moves only). It
+/// is decided again: dropped, as set, or, QUIC, refused. A LAN flow is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_udp_flow_stops_leaving_directly_once_exiting_applies() {
+    use crate::link::tests as lt;
+    use sieve_ipc::{ExitVia, LinkHubDown, LinkRoute, LinkSettings, LinkUdp};
+    let h = lt::hub(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(lt::LoopNet::default());
+    let m = lt::manager(dir.path(), net.clone());
+    lt::paired(&m, &h).await;
+    m.routes_up(net.clone(), lt::noop_reset());
+    let (echo, echoed) = udp_echo().await;
+    let answers = loopback_udp_works().await;
+    let on =lt::exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Stop);
+    let off = LinkSettings { exit: false, ..on.clone() };
+    const GAME: &[u8] = b"\x00\x01 a game's datagram";
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Case {
+        ExitTurnsOn,
+        Resumes,
+        UdpToDrop,
+        QuicExitTurnsOn,
+        LanExitTurnsOn,
+    }
+    for (n, case) in [Case::ExitTurnsOn, Case::Resumes, Case::UdpToDrop, Case::QuicExitTurnsOn, Case::LanExitTurnsOn].into_iter().enumerate() {
+        // Before: the flow relays from this computer.
+        match case {
+            Case::Resumes => {
+                m.set(on.clone()).unwrap();
+                m.set_sieving(false);
+            }
+            Case::UdpToDrop => m.set(LinkSettings { udp: LinkUdp::Direct, ..on.clone() }).unwrap(),
+            _ => m.set(off.clone()).unwrap(),
+        }
+        let sink = Arc::new(FakeSink::default());
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ctx = relay_udp_to(sink.clone(), m.clone(), echo, opened.clone());
+        if case == Case::ExitTurnsOn {
+            // The engine's own registration: a change of the way out ends what it concerns.
+            let (book, filter) = (ctx.book.clone(), ctx.filter.clone());
+            m.on_exit_change(Arc::new(move |concerns: &dyn Fn(std::net::IpAddr) -> bool, change: crate::link::Change| {
+                super::relay::reconnect_the_new_way(&book, &filter, concerns, change);
+            }));
+        } else {
+            m.on_exit_change(Arc::new(|_: &dyn Fn(std::net::IpAddr) -> bool, _: crate::link::Change| {}));
+        }
+        let remote = if case == Case::LanExitTurnsOn { "10.0.0.9:4000" } else { "81.2.69.170:4000" };
+        let (local, remote) = ends((&format!("10.9.0.2:{}", 40_000 + n), remote));
+        let mut wire = wire();
+        let first: Vec<Vec<u8>> = if case == Case::QuicExitTurnsOn { sealed_initials(ALLOWED).to_vec() } else { vec![GAME.to_vec()] };
+        for d in &first {
+            wire.to_stack.send(udp_packet(local, remote, d)).unwrap();
+        }
+        let task = tokio::spawn(handle_udp(ctx.clone(), accept_udp(&mut wire).await));
+        until(&format!("{case:?}: relayed from this computer"), || opened.load(Ordering::SeqCst) == 1).await;
+        if answers {
+            for d in &first {
+                assert_eq!(&next_datagram(&mut wire, local, remote).await, d, "{case:?}: relayed, and answered");
+            }
+        } else {
+            tokio::time::sleep(SETTLE).await;
+        }
+        let before = echoed.load(Ordering::SeqCst);
+        let seen = Mutex::new(Vec::new());
+        assert!(!rows_so_far(&ctx, &seen).iter().any(|r| matches!(r.outcome, LogOutcome::Exit { via: ExitVia::Dropped, .. })), "{case:?}: not dropped before the change");
+        {
+            let mut book = ctx.book.lock().unwrap();
+            assert_eq!(book.live(), 1, "{case:?}: open: {:?}", book.take_batch());
+        }
+
+        // The change.
+        match case {
+            Case::Resumes => m.set_sieving(true),
+            _ => m.set(on.clone()).unwrap(),
+        }
+        if case == Case::LanExitTurnsOn {
+            tokio::time::sleep(SETTLE).await;
+            wire.to_stack.send(udp_packet(local, remote, GAME)).unwrap();
+            if answers {
+                assert_eq!(next_datagram(&mut wire, local, remote).await, GAME, "a LAN flow keeps going");
+            } else {
+                tokio::time::sleep(SETTLE).await;
+            }
+            assert!(!rows_so_far(&ctx, &seen).iter().any(|r| matches!(r.outcome, LogOutcome::Exit { .. })), "a LAN flow is not touched");
+            assert_eq!((ctx.book.lock().unwrap().live(), opened.load(Ordering::SeqCst)), (1, 1), "the same flow, on the same socket");
+            assert!(!task.is_finished());
+        } else {
+            let why = if case == Case::QuicExitTurnsOn { "QUIC is refused" } else { "UDP is not carried" };
+            until(&format!("{case:?}: decided again"), || {
+                rows_so_far(&ctx, &seen).iter().any(|r| matches!(&r.outcome, LogOutcome::Exit { via: ExitVia::Dropped, reason: Some(r), .. } if r.starts_with(why)))
+            })
+            .await;
+            // Whatever came back while it was still relayed (late, where loopback UDP is filtered).
+            while wire.from_stack.try_recv().is_ok() {}
+            wire.to_stack.send(udp_packet(local, remote, &first[0])).unwrap();
+            tokio::time::sleep(SETTLE).await;
+            assert_eq!(opened.load(Ordering::SeqCst), 1, "{case:?}: no new socket from this computer");
+            if answers {
+                // Where loopback UDP is filtered it may also arrive late: counted only where it does not.
+                assert_eq!(echoed.load(Ordering::SeqCst), before, "{case:?}: nothing more left from this computer");
+            }
+            assert_eq!(ctx.book.lock().unwrap().live(), 0, "{case:?}: the relayed row closed, the dropped one too");
+            if case == Case::QuicExitTurnsOn {
+                assert!(ctx.meters.quic.replies.load(Ordering::Relaxed) >= 1, "refused, so the browser falls back to TCP");
+            } else {
+                assert!(wire.from_stack.try_recv().is_err(), "{case:?}: nothing back");
+            }
+            let batch = ctx.book.lock().unwrap().take_batch();
+            assert!(batch.iter().all(|e| !e.open), "{case:?}: the relayed row closed, the new one too: {batch:?}");
+            assert!(batch.iter().any(|e| e.bytes_up > 0 && e.action == FlowAction::Relayed), "{case:?}: the relayed row kept its bytes");
+        }
+        task.abort();
+    }
+    m.routes_down();
+}
+
 /// The control: a flow no rule blocks still ends with a FIN when its server does.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_passed_flow_still_closes_with_a_fin() {
     for flow in FLOWS {
         let mut bed = TcpBed::new(flow).await;
+        bed.needs_plain_loopback();
         let hello = hello(ALLOWED);
         bed.send(&hello);
         let mut got = vec![0u8; hello.len()];

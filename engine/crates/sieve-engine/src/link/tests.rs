@@ -129,6 +129,45 @@ pub(crate) async fn echo() -> u16 {
     port
 }
 
+/// What [`http_echo`] answers `request` with: an HTTP answer whose body is the
+/// request's own bytes.
+pub(crate) fn http_wrapped(request: &[u8]) -> Vec<u8> {
+    let mut answer = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n", request.len()).into_bytes();
+    answer.extend_from_slice(request);
+    answer
+}
+
+/// An HTTP server on loopback that answers each request (head only, no body) with
+/// [`http_wrapped`]. A raw echo of an HTTP request does not survive a filtering
+/// proxy in this machine's loopback (AdGuard answers it with its own 502 page);
+/// this answer comes back byte for byte, so a test can say exactly what it got.
+pub(crate) async fn http_echo() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    request.extend_from_slice(&buf[..n]);
+                    while let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let one: Vec<u8> = request.drain(..end + 4).collect();
+                        if s.write_all(&http_wrapped(&one)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
 async fn echo_once<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(s: &mut S, msg: &[u8]) {
     s.write_all(msg).await.unwrap();
     let mut back = vec![0u8; msg.len()];
@@ -478,10 +517,13 @@ async fn tls_echo(config: Arc<rustls::ServerConfig>) -> u16 {
             let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
             tokio::spawn(async move {
                 if let Ok(mut tls) = acceptor.accept(s).await {
+                    // Every read echoed until the client closes: a message may come
+                    // in parts (through the hub, and a proxy in loopback).
                     let mut buf = [0u8; 64];
-                    if let Ok(n) = tls.read(&mut buf).await {
-                        let _ = tls.write_all(&buf[..n]).await;
-                        let _ = tls.flush().await;
+                    while let Ok(n) = tls.read(&mut buf).await {
+                        if n == 0 || tls.write_all(&buf[..n]).await.is_err() || tls.flush().await.is_err() {
+                            break;
+                        }
                     }
                 }
             });
@@ -612,15 +654,21 @@ fn a_change_of_the_way_out_is_told_with_what_it_concerns() {
         let m = manager(dir.path(), net.clone());
         paired(&m, &h).await;
         let told: Arc<Mutex<Vec<(ExitVia, bool, bool)>>> = Arc::default();
-        let into = told.clone();
-        m.on_exit_change(Arc::new(move |concerns: &dyn Fn(IpAddr) -> bool, via: ExitVia| {
-            into.lock().unwrap().push((via, concerns(SITE.parse().unwrap()), concerns("10.0.0.1".parse().unwrap())));
+        let hub_back = Arc::new(AtomicUsize::new(0));
+        let (into, back) = (told.clone(), hub_back.clone());
+        m.on_exit_change(Arc::new(move |concerns: &dyn Fn(IpAddr) -> bool, change: Change| match change {
+            Change::Way(via) => into.lock().unwrap().push((via, concerns(SITE.parse().unwrap()), concerns("10.0.0.1".parse().unwrap()))),
+            Change::WentDirect { hub_back: true } => {
+                back.fetch_add(1, Ordering::SeqCst);
+            }
+            Change::WentDirect { hub_back: false } => panic!("Stop was never set from Direct here"),
         }));
         m.routes_up(net.clone(), noop_reset());
         assert!(told.lock().unwrap().is_empty(), "exit is off: nothing changed");
         let on = exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Stop);
         m.set(on.clone()).unwrap();
         assert_eq!(*told.lock().unwrap(), [(ExitVia::Hub, true, false)], "on: public destinations, through the hub");
+        until("up, and the hub's return told", || hub_back.load(Ordering::SeqCst) >= 1).await;
         m.set(LinkSettings { udp: LinkUdp::Direct, ..on.clone() }).unwrap();
         assert_eq!(told.lock().unwrap().len(), 1, "the UDP choice is no change of the way out for TCP");
         m.network_changed();
@@ -647,43 +695,167 @@ impl crate::stack::book::Idle for Ends {
     }
 }
 
-/// P2-3: the open TCP connections of sieved apps to destinations the change
-/// concerns are ended, once, with one row; an app that is Off, a local
-/// destination and UDP are left alone.
-#[test]
-fn a_change_of_the_way_out_ends_the_open_connections_it_concerns() {
-    use crate::domain::{DomainFilter, FilterSlot};
+/// The book with one open flow per `(app key, remote, proto, went directly)`, each
+/// with a handle that says whether it was ended.
+fn book_of(flows: &[(Option<&str>, &str, sieve_ipc::FlowProto, bool)]) -> (Mutex<crate::stack::book::FlowBook>, Vec<Arc<std::sync::atomic::AtomicBool>>) {
     use crate::stack::book::{FlowBook, tests_event};
     let book = Mutex::new(FlowBook::default());
-    let policy = sieve_ipc::Policy { sieving: true, off_apps: vec!["turned-off".into()], ..sieve_ipc::Policy::default() };
-    let filter = FilterSlot::new(DomainFilter::new(&policy, sieve_filter::rules::RuleSet::empty()));
-    let mut flows = Vec::new();
-    for (key, remote, proto) in [
-        (Some("browser"), "81.2.69.170:443", sieve_ipc::FlowProto::Tcp),
-        (None, "81.2.69.170:443", sieve_ipc::FlowProto::Tcp),
-        (Some("Turned-Off"), "81.2.69.170:443", sieve_ipc::FlowProto::Tcp),
-        (Some("browser"), "10.0.0.1:443", sieve_ipc::FlowProto::Tcp),
-        (Some("browser"), "81.2.69.170:443", sieve_ipc::FlowProto::Udp),
-    ] {
+    let mut handles = Vec::new();
+    for &(key, remote, proto, direct) in flows {
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut b = book.lock().unwrap();
         let mut e = tests_event(Some(1));
         e.remote = remote.into();
         e.proto = proto;
-        let idle: Option<Box<dyn crate::stack::book::Idle>> = (proto == sieve_ipc::FlowProto::Tcp).then(|| Box::new(Ends(ended.clone())) as _);
-        let id = b.open_with(e, idle).unwrap();
+        let id = b.open_with(e, Some(Box::new(Ends(ended.clone())))).unwrap();
         b.own(id, key.map(str::to_string));
-        flows.push(ended);
+        if direct {
+            b.exit(id, ExitReport { via: ExitVia::Direct, target: None, reason: Some("went directly, as set".into()), signal: None });
+        }
+        handles.push(ended);
     }
+    book.lock().unwrap().take_log();
+    (book, handles)
+}
+
+fn off_filter() -> crate::domain::FilterSlot {
+    let policy = sieve_ipc::Policy { sieving: true, off_apps: vec!["turned-off".into()], ..sieve_ipc::Policy::default() };
+    crate::domain::FilterSlot::new(crate::domain::DomainFilter::new(&policy, sieve_filter::rules::RuleSet::empty()))
+}
+
+/// P2-3, and round 2's P1: the open TCP and UDP flows of sieved apps to
+/// destinations the change concerns are ended, once, with one row; an app that
+/// is Off and a local destination are left alone.
+#[test]
+fn a_change_of_the_way_out_ends_the_open_connections_it_concerns() {
+    use sieve_ipc::FlowProto::{Tcp, Udp};
+    let (book, flows) = book_of(&[
+        (Some("browser"), "81.2.69.170:443", Tcp, false),
+        (None, "81.2.69.170:443", Tcp, false),
+        (Some("Turned-Off"), "81.2.69.170:443", Tcp, false),
+        (Some("browser"), "10.0.0.1:443", Tcp, false),
+        (Some("browser"), "81.2.69.170:443", Udp, false),
+        (Some("Turned-Off"), "81.2.69.170:443", Udp, false),
+        (Some("browser"), "10.0.0.1:443", Udp, false),
+    ]);
     let concerns = |ip: IpAddr| sieve_link::rules::denied_class(ip).is_none();
-    let n = crate::stack::relay::reconnect_the_new_way(&book, &filter, &concerns, ExitVia::Hub);
+    let n = crate::stack::relay::reconnect_the_new_way(&book, &off_filter(), &concerns, Change::Way(ExitVia::Hub));
     let ended: Vec<bool> = flows.iter().map(|f| f.load(Ordering::SeqCst)).collect();
-    assert_eq!(ended, [true, true, false, false, false], "a sieved app's and an unknown app's public TCP only");
-    assert_eq!(n, 2);
+    assert_eq!(ended, [true, true, false, false, true, false, false], "a sieved app's and an unknown app's public flows only, UDP too");
+    assert_eq!(n, 3);
     let rows = book.lock().unwrap().take_log();
     assert_eq!(rows.len(), 1, "one summary row: {rows:?}");
-    assert!(matches!(&rows[0].outcome, sieve_ipc::LogOutcome::Exit { via: ExitVia::Hub, target: None, reason: Some(r) } if r.contains("2 open connections")), "{rows:?}");
+    assert!(matches!(&rows[0].outcome, sieve_ipc::LogOutcome::Exit { via: ExitVia::Hub, target: None, reason: Some(r) } if r.contains("3 open connections")), "{rows:?}");
     assert_eq!(rows[0].session, Some(0), "every client sees it");
+}
+
+/// Round 2's P3: once the hub is back, or Stop is set, the TCP flows that went
+/// directly while it could not be reached end (one row); the rest stay, and UDP
+/// sent directly as the UDP choice says stays too.
+#[test]
+fn the_hubs_return_or_stop_ends_only_what_went_directly() {
+    use sieve_ipc::FlowProto::{Tcp, Udp};
+    for hub_back in [true, false] {
+        let (book, flows) = book_of(&[
+            (Some("browser"), "81.2.69.170:443", Tcp, true),
+            (Some("browser"), "81.2.69.170:443", Tcp, false),
+            (Some("browser"), "81.2.69.170:443", Udp, true),
+            (Some("Turned-Off"), "81.2.69.170:443", Tcp, true),
+            (Some("browser"), "10.0.0.1:443", Tcp, true),
+        ]);
+        let concerns = |ip: IpAddr| sieve_link::rules::denied_class(ip).is_none();
+        let n = crate::stack::relay::reconnect_the_new_way(&book, &off_filter(), &concerns, Change::WentDirect { hub_back });
+        let ended: Vec<bool> = flows.iter().map(|f| f.load(Ordering::SeqCst)).collect();
+        assert_eq!(ended, [true, false, false, false, false], "hub back {hub_back}");
+        assert_eq!(n, 1);
+        let rows = book.lock().unwrap().take_log();
+        assert_eq!(rows.len(), 1, "one summary row: {rows:?}");
+        assert!(matches!(&rows[0].outcome, sieve_ipc::LogOutcome::Exit { via: ExitVia::Hub, target: None, reason: Some(r) } if r.contains("1 connection that went directly")), "{rows:?}");
+    }
+}
+
+/// Round 2's P3: the manager tells of the hub's return each time the link comes
+/// up, and of a change from Direct to Stop, so what went directly ends.
+#[test]
+fn the_manager_tells_of_the_hubs_return_and_of_stop_set() {
+    run(async {
+        let h = hub(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        paired(&m, &h).await;
+        let told: Arc<Mutex<Vec<Change>>> = Arc::default();
+        let into = told.clone();
+        m.on_exit_change(Arc::new(move |concerns: &dyn Fn(IpAddr) -> bool, change: Change| {
+            assert!(concerns(SITE.parse().unwrap()) && !concerns("10.0.0.1".parse().unwrap()));
+            into.lock().unwrap().push(change);
+        }));
+        m.routes_up(net.clone(), noop_reset());
+        let direct = exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Direct);
+        m.set(direct.clone()).unwrap();
+        until("up", || m.status().state == LinkState::Up).await;
+        until("the hub's return told", || told.lock().unwrap().contains(&Change::WentDirect { hub_back: true })).await;
+        m.set(LinkSettings { on_hub_down: LinkHubDown::Stop, ..direct }).unwrap();
+        assert_eq!(told.lock().unwrap().last(), Some(&Change::WentDirect { hub_back: false }), "{:?}", told.lock().unwrap());
+        m.routes_down();
+    });
+}
+
+/// The clock of [`a_stop_that_never_reached_the_hub_reads_down_after_a_while`] only.
+static CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000_000);
+
+fn fake_clock() -> u64 {
+    CLOCK.load(Ordering::SeqCst)
+}
+
+/// Round 2's P2: a link that never reached its hub on this network (a move, a
+/// reboot) is said down once it has tried for long enough, so the app offers its
+/// way out of a stop; it starts over as connecting on a restart.
+#[test]
+fn a_stop_that_never_reached_the_hub_reads_down_after_a_while() {
+    run(async {
+        let h = hub(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let fallback = net.clone();
+        let m = Arc::new(LinkManager::new(Some(dir.path()), Box::new(move || Ok(fallback.clone() as Arc<dyn LinkNet>)), fake_clock));
+        paired(&m, &h).await;
+        // Nothing answers there: this network never reaches the hub.
+        m.set(exiting(LinkRoute::Dial { address: "127.0.0.1:9".into() }, LinkHubDown::Stop)).unwrap();
+        m.routes_up(net.clone(), noop_reset());
+        assert_eq!(m.status().state, LinkState::Connecting);
+        CLOCK.fetch_add(CONNECTING_LIMIT_MS - 1_000, Ordering::SeqCst);
+        assert_eq!(m.status().state, LinkState::Connecting, "not yet");
+        CLOCK.fetch_add(2_000, Ordering::SeqCst);
+        assert_eq!(m.status().state, LinkState::Down, "never up, and tried long enough");
+        m.network_changed();
+        assert_eq!(m.status().state, LinkState::Connecting, "a restart starts over");
+        CLOCK.fetch_add(CONNECTING_LIMIT_MS + 1, Ordering::SeqCst);
+        assert_eq!(m.status().state, LinkState::Down);
+        assert!(m.plan(SITE.parse().unwrap()).is_some(), "still stopped as set: never direct by itself");
+        m.routes_down();
+    });
+}
+
+/// Round 2's P3: a dial address is kept in its one form, so the hub's own
+/// address is recognised by every reader (it never exits) and the link dials it.
+#[test]
+fn a_dial_address_is_kept_trimmed_so_every_reader_parses_it() {
+    run(async {
+        let h = hub(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        paired(&m, &h).await;
+        m.set(exiting(LinkRoute::Dial { address: " \t81.2.69.200:7443  ".into() }, LinkHubDown::Stop)).unwrap();
+        let kept = LinkRoute::Dial { address: "81.2.69.200:7443".into() };
+        assert_eq!(m.status().settings.unwrap().route, kept);
+        assert_eq!(manager(dir.path(), net.clone()).status().settings.unwrap().route, kept, "on disk too");
+        m.routes_up(net.clone(), noop_reset());
+        assert!(m.plan("81.2.69.200".parse().unwrap()).is_none(), "the hub's own address never exits");
+        until("the link dialled the hub's address", || net.asked("81.2.69.200".parse().unwrap())).await;
+        m.routes_down();
+    });
 }
 
 /// P2-6: a flow decided after the link restarted (a network move, here) opens on

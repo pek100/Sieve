@@ -105,11 +105,29 @@ impl Plan {
     }
 }
 
-/// Told when the way out changed (exiting turned on or off, the link restarted
-/// on another route or network, sieving turned on or off): open connections of
-/// sieved apps to public destinations are ended, so they reconnect the new way.
-/// The argument says which destinations exiting concerns.
-pub type ExitChanged = Arc<dyn Fn(&dyn Fn(IpAddr) -> bool, ExitVia) + Send + Sync>;
+/// What changed about the way out, for [`ExitChanged`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// The way out itself changed (exiting turned on or off, the link restarted
+    /// on another route or network, sieving turned on or off): every open
+    /// connection of a sieved app it concerns ends, so it reconnects this way.
+    Way(ExitVia),
+    /// Only the connections that went directly from this computer while the hub
+    /// could not be reached (hub-down set to Direct) end, so they reconnect
+    /// through it: the hub is back (`hub_back`), or the owner chose Stop.
+    WentDirect { hub_back: bool },
+}
+
+/// Told when the way out changed: open connections of sieved apps to public
+/// destinations are ended, so they reconnect the new way. The first argument
+/// says which destinations exiting concerns.
+pub type ExitChanged = Arc<dyn Fn(&dyn Fn(IpAddr) -> bool, Change) + Send + Sync>;
+
+/// A link that has not reached its hub for this long since it started is said
+/// to be down, as one that was up and went: the owner is then offered the way
+/// out of a stop (the app's "Turn off exiting"), whether or not this network
+/// ever reached the hub. 20 s is a few of the link's own dial attempts.
+pub const CONNECTING_LIMIT_MS: u64 = 20_000;
 
 struct Running {
     client: LinkClient,
@@ -117,6 +135,8 @@ struct Running {
     /// The address actually listened on (listen mode).
     listening: Option<SocketAddr>,
     generation: u64,
+    /// When this link started (`LinkManager::clock`).
+    started_ms: u64,
     ever_up: bool,
     up: bool,
     watcher: tokio::task::AbortHandle,
@@ -170,6 +190,8 @@ pub struct LinkManager {
     /// The running link's client, read by every plan when its open starts.
     current: ClientSlot,
     generation: AtomicU64,
+    /// Moves on every change of what exiting means for a flow ([`Self::way_out`]).
+    way: tokio::sync::watch::Sender<u64>,
     clock: fn() -> u64,
 }
 
@@ -188,6 +210,18 @@ fn is_bidi_control(c: char) -> bool {
 pub fn said(text: impl AsRef<str>) -> String {
     let one_line: String = text.as_ref().chars().map(|c| if c.is_control() || is_bidi_control(c) { ' ' } else { c }).collect();
     cap_text(&one_line, LINK_TEXT_MAX).to_string()
+}
+
+/// The route as it is kept and used, and its address: a dial address in its one
+/// written form (no spaces around it), so every reader of the kept route
+/// (`concerns`, the dialer) parses exactly what was checked.
+pub fn canonical_route(route: LinkRoute) -> Result<(LinkRoute, SocketAddr), String> {
+    let at = check_route(&route)?;
+    let route = match route {
+        LinkRoute::Dial { .. } => LinkRoute::Dial { address: at.to_string() },
+        listen @ LinkRoute::Listen { .. } => listen,
+    };
+    Ok((route, at))
 }
 
 /// A route the engine can use: a dial address is an IP address with a port (a
@@ -240,19 +274,42 @@ impl LinkManager {
                 Err(why) => state.last_error = Some(said(format!("the stored pairing could not be read, so Sieve is not paired: {why}"))),
             }
         }
-        Self { dir, fallback_net, name: computer_name(), state: Mutex::new(state), current: ClientSlot::default(), generation: AtomicU64::new(0), clock }
+        Self { dir, fallback_net, name: computer_name(), state: Mutex::new(state), current: ClientSlot::default(), generation: AtomicU64::new(0), way: tokio::sync::watch::Sender::new(0), clock }
+    }
+
+    /// Follows the way out: its value moves whenever what exiting means for a
+    /// flow may have changed (exiting on or off, sieving on or off, a pairing or
+    /// an unpair, routes up or down, the link restarted, up or down, any choice
+    /// changed). An open flow decided once watches it and decides again.
+    pub fn way_out(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.way.subscribe()
+    }
+
+    /// The way out's value now ([`Self::way_out`]): a flow that read it before its
+    /// direct connect and reads another after it may have raced a change.
+    pub fn way_now(&self) -> u64 {
+        *self.way.borrow()
+    }
+
+    /// The way out moved. Called with the state's lock held, after the change, so
+    /// whoever sees the new value sees the new state too.
+    fn moved(&self) {
+        self.way.send_modify(|g| *g = g.wrapping_add(1));
     }
 
     /// The status line.
     pub fn status(&self) -> LinkStatus {
         let st = lock(&self.state);
+        let now = (self.clock)();
         let state = match (&st.stored, &st.running) {
             (None, _) if st.pairing.is_some() => LinkState::Pairing,
             (None, _) => LinkState::Unpaired,
             // Paused (the global switch off): nothing runs, as when exiting is off.
             (Some(s), _) if !s.settings.exit || !st.sieving => LinkState::Off,
             (Some(_), Some(r)) if r.up => LinkState::Up,
-            (Some(_), Some(r)) if r.ever_up => LinkState::Down,
+            // Down once it was up, or once it has tried for long enough: a network
+            // that never reaches the hub is no less down than one that lost it.
+            (Some(_), Some(r)) if r.ever_up || now.saturating_sub(r.started_ms) > CONNECTING_LIMIT_MS => LinkState::Down,
             (Some(_), _) => LinkState::Connecting,
         };
         let client_error = st.running.as_ref().filter(|r| !r.up).and_then(|r| r.client.last_error());
@@ -331,6 +388,7 @@ impl LinkManager {
             stop(r);
         }
         *lock(&self.current) = None;
+        self.moved();
     }
 
     /// The network moved: the link restarts on it, a dialling link as well as a
@@ -354,7 +412,7 @@ impl LinkManager {
             Some(r) => r,
             None => LinkRoute::Dial { address: code.addr.clone().ok_or(NO_ADDRESS)? },
         };
-        let target = check_route(&route)?;
+        let (route, target) = canonical_route(route)?;
         let dir = self.dir.clone().ok_or(NO_FOLDER)?;
         let net = {
             let st = lock(&self.state);
@@ -437,10 +495,11 @@ impl LinkManager {
             let was_running = st.running.take().map(stop).is_some();
             *lock(&self.current) = None;
             let route = st.stored.take().map(|s| s.settings.route);
-            let changed = route.filter(|_| was_running).and_then(|r| change_of_way(&st, &r, false));
+            let changed = route.filter(|_| was_running).and_then(|r| change_of_way(&st, &r, Change::Way(ExitVia::Direct)));
             st.identity = None;
             st.since_ms = (self.clock)();
             st.last_error = None;
+            self.moved();
             (st.dns_reset.clone(), changed)
         };
         if let Some(reset) = reset {
@@ -456,22 +515,33 @@ impl LinkManager {
     }
 
     /// The owner's choices: kept, and in force at once.
-    pub fn set(self: &Arc<Self>, settings: LinkSettings) -> Result<(), String> {
-        check_route(&settings.route)?;
-        {
+    pub fn set(self: &Arc<Self>, mut settings: LinkSettings) -> Result<(), String> {
+        settings.route = canonical_route(settings.route)?.0;
+        let stop_set = {
             let mut st = lock(&self.state);
             let Some(stored) = st.stored.as_mut() else { return Err(NOT_PAIRED.into()) };
             let next = Stored { settings, ..stored.clone() };
             if let Some(dir) = &self.dir {
                 write_stored(dir, &next)?;
             }
-            if stored.settings.exit != next.settings.exit {
+            let toggled = stored.settings.exit != next.settings.exit;
+            // Direct to Stop: what went directly while the hub was down ends.
+            let to_stop = stored.settings.on_hub_down == LinkHubDown::Direct && next.settings.on_hub_down == LinkHubDown::Stop;
+            if toggled {
                 st.since_ms = (self.clock)();
             }
+            let stop_set = to_stop && next.settings.exit && st.sieving;
+            let route = next.settings.route.clone();
             *st.stored.as_mut().expect("checked") = next;
             st.last_error = None;
-        }
+            // Any choice may change a flow's way (the UDP choice, the hub-down one).
+            self.moved();
+            stop_set.then(|| change_of_way(&st, &route, Change::WentDirect { hub_back: false })).flatten()
+        };
         self.sync();
+        if let Some(tell) = stop_set {
+            tell();
+        }
         Ok(())
     }
 
@@ -514,11 +584,14 @@ impl LinkManager {
                 }
                 st.since_ms = (self.clock)();
             }
+            if changed {
+                self.moved();
+            }
             // The destinations exiting concerns, by the route in force now (or,
             // turned off, by the one that was).
             let tell = match (&wanted, route_before) {
-                (Some((s, _, _)), _) => change_of_way(&st, &s.settings.route, true),
-                (None, Some(before)) => change_of_way(&st, &before, false),
+                (Some((s, _, _)), _) => change_of_way(&st, &s.settings.route, Change::Way(ExitVia::Hub)),
+                (None, Some(before)) => change_of_way(&st, &before, Change::Way(ExitVia::Direct)),
                 (None, None) => None,
             };
             (changed.then(|| st.dns_reset.clone()).flatten(), tell)
@@ -553,21 +626,30 @@ impl LinkManager {
         let weak = Arc::downgrade(self);
         let watched = client.clone();
         let watcher = tokio::spawn(watch(weak, watched, generation)).abort_handle();
-        Ok(Running { client, route: stored.settings.route.clone(), listening, generation, ever_up: false, up: false, watcher })
+        Ok(Running { client, route: stored.settings.route.clone(), listening, generation, started_ms: (self.clock)(), ever_up: false, up: false, watcher })
     }
 
-    /// The running link of `generation` went up or down.
+    /// The running link of `generation` went up or down. Up, the connections that
+    /// went directly while it could not be reached (hub-down Direct) end, so they
+    /// reconnect through it: none stays on this computer's address once the hub
+    /// is back.
     fn turned(&self, generation: u64, up: bool) {
-        let reset = {
+        let (reset, tell) = {
             let mut st = lock(&self.state);
             let Some(r) = st.running.as_mut().filter(|r| r.generation == generation) else { return };
             r.up = up;
             r.ever_up |= up;
+            let route = r.route.clone();
             st.since_ms = (self.clock)();
-            st.dns_reset.clone()
+            self.moved();
+            let tell = up.then(|| change_of_way(&st, &route, Change::WentDirect { hub_back: true })).flatten();
+            (st.dns_reset.clone(), tell)
         };
         if let Some(reset) = reset {
             reset();
+        }
+        if let Some(tell) = tell {
+            tell();
         }
     }
 }
@@ -605,12 +687,11 @@ fn concerns(route: &LinkRoute, net: &dyn LinkNet, dest: IpAddr) -> bool {
 
 /// What to tell [`ExitChanged`] of a change of the way out, to be called once the
 /// state's lock is let go: None while routes are down or nobody listens.
-fn change_of_way(st: &State, route: &LinkRoute, now_exiting: bool) -> Option<Box<dyn FnOnce() + Send>> {
+fn change_of_way(st: &State, route: &LinkRoute, change: Change) -> Option<Box<dyn FnOnce() + Send>> {
     let tell = st.exit_changed.clone()?;
     let net = st.net.clone()?;
     let route = route.clone();
-    let via = if now_exiting { ExitVia::Hub } else { ExitVia::Direct };
-    Some(Box::new(move || tell(&|ip| concerns(&route, &*net, ip), via)))
+    Some(Box::new(move || tell(&|ip| concerns(&route, &*net, ip), change)))
 }
 
 /// A listening link whose address is no longer the one to listen on restarts.
@@ -672,8 +753,9 @@ fn load(dir: &Path) -> Result<Option<(Stored, Identity)>, String> {
     if !file.exists() {
         return Ok(None);
     }
-    let stored: Stored = sieve_link::store::read_json(&file).map_err(|e| e.to_string())?;
-    check_route(&stored.settings.route)?;
+    let mut stored: Stored = sieve_link::store::read_json(&file).map_err(|e| e.to_string())?;
+    // A record from before routes were kept in their one form reads as if it were.
+    stored.settings.route = canonical_route(stored.settings.route)?.0;
     let identity = Identity::load(&dir.join(KEY_FILE)).map_err(|e| e.to_string())?;
     Ok(Some((stored, identity)))
 }

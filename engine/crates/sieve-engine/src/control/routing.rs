@@ -926,8 +926,8 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn()
     // A change of the way out ends the open connections it concerns, so they
     // reconnect the new way (`stack::relay::reconnect_the_new_way`).
     let (book, filter) = (engine.book.clone(), engine.filter.clone());
-    engine.link.on_exit_change(Arc::new(move |concerns: &dyn Fn(std::net::IpAddr) -> bool, via: sieve_ipc::ExitVia| {
-        crate::stack::relay::reconnect_the_new_way(&book, &filter, concerns, via);
+    engine.link.on_exit_change(Arc::new(move |concerns: &dyn Fn(std::net::IpAddr) -> bool, change: crate::link::Change| {
+        crate::stack::relay::reconnect_the_new_way(&book, &filter, concerns, change);
     }));
     engine.link.routes_up(egress.clone(), Arc::new(move || {
         if let Some(dns) = weak_dns.upgrade() {

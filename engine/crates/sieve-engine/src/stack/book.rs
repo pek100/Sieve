@@ -148,6 +148,10 @@ pub struct FlowBook {
     candidates: Vec<u64>,
     /// Until when the last look, which found no flow idle, stands.
     none_idle_until: Option<std::time::Instant>,
+    /// Open flows that went directly from this computer while exiting was on
+    /// (`exit` with [`ExitVia::Direct`]), so they can be ended once that way out
+    /// no longer holds (the hub is back, or Stop is set).
+    went_direct: BTreeSet<u64>,
 }
 
 impl std::fmt::Debug for FlowBook {
@@ -181,6 +185,7 @@ impl FlowBook {
             evicted: 0,
             candidates: Vec::new(),
             none_idle_until: None,
+            went_direct: BTreeSet::new(),
         }
     }
 
@@ -226,6 +231,9 @@ impl FlowBook {
         if let (Some(signal), Some(host), Some(o)) = (report.signal, host, self.owners.get_mut(&id)) {
             o.named = true;
             self.issues.problem(&o.app, o.exe.as_deref(), signal, Some(&host), now);
+        }
+        if report.via == sieve_ipc::ExitVia::Direct && self.open.contains_key(&id) {
+            self.went_direct.insert(id);
         }
         let reason = report.reason.map(|r| cap_text(&r, sieve_ipc::LINK_TEXT_MAX).to_string());
         self.push_row(id, now, None, LogOutcome::Exit { via: report.via, target: report.target, reason }, None, None, Vec::new());
@@ -337,11 +345,13 @@ impl FlowBook {
         }
     }
 
-    /// Ends every open TCP flow `which` names (by its event and its row's key, None
-    /// for an unknown app), as the cap does: a reset, and its relay closes it as
-    /// usual. Returns how many. Bounded by the flows open, under one lock.
-    pub fn end_where(&mut self, which: impl Fn(&FlowEvent, Option<&str>) -> bool) -> usize {
-        let ids: Vec<u64> = self.idle.keys().copied().filter(|id| self.open.get(id).is_some_and(|e| which(e, self.owners.get(id).map(|o| o.app.key.as_str())))).collect();
+    /// Ends every open flow `which` names (by its event, its row's key, None for an
+    /// unknown app, and whether it went directly while exiting was on), as the cap
+    /// does: a TCP flow is reset, a UDP flow's relay stops, and its relay closes it
+    /// as usual. Only a flow registered with a handle can be ended. Returns how
+    /// many. Bounded by the flows open, under one lock.
+    pub fn end_where(&mut self, which: impl Fn(&FlowEvent, Option<&str>, bool) -> bool) -> usize {
+        let ids: Vec<u64> = self.idle.keys().copied().filter(|id| self.open.get(id).is_some_and(|e| which(e, self.owners.get(id).map(|o| o.app.key.as_str()), self.went_direct.contains(id)))).collect();
         for id in &ids {
             if let Some(connection) = self.idle.remove(id) {
                 connection.evict();
@@ -469,6 +479,7 @@ impl FlowBook {
     pub fn close(&mut self, id: u64, action: FlowAction, bytes_up: u64, bytes_down: u64) {
         self.idle.remove(&id);
         self.evicting.remove(&id);
+        self.went_direct.remove(&id);
         if self.owners.get(&id).is_some_and(|o| !o.named) {
             match action {
                 FlowAction::Blocked => self.problem(id, Signal::Blocked),
