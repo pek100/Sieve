@@ -473,7 +473,7 @@ export function createMockEngine(
     setLink: async (settings) => {
       requireLink("set_link");
       if (link === null || link.settings === undefined || link.state === "unpaired" || link.state === "pairing") throw new Error(MOCK_UNPAIRED);
-      // A route it already holds is not judged again (the fixture's `connecting` example dials a name).
+      // A route it already holds is not judged again.
       const problem = JSON.stringify(settings.route) === JSON.stringify(link.settings.route) ? null : routeProblem(settings.route);
       if (problem !== null) throw new Error(problem);
       const wasOn = link.settings.exit;

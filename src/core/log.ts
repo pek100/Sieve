@@ -175,7 +175,7 @@ export function outcomeWords(outcome: LogOutcome | null | undefined): string {
     case "retried":
       return `${RETRY_TEXT[outcome.how] ?? "Sieve tried again"}: ${outcome.recovered ? "it worked" : "it still failed"}`;
     case "exit":
-      return exitWords(outcome.via, outcome.reason);
+      return exitWords(outcome.via, outcome.reason, outcome.target);
     default:
       return "Unknown";
   }

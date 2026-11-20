@@ -5,10 +5,10 @@ import type { ReactNode } from "react";
 import { IconButton } from "@/components/sieve/primitives/icon-button";
 import { Button } from "@/components/ui/button";
 import { engineRoutes, engineStatus } from "@/core/engine";
-import { linkHomeLine } from "@/core/link";
+import { LINK_OFF_LABEL, linkHomeLine, withSetting } from "@/core/link";
 import type { SieveState } from "@/core/store";
 import { useRuntime } from "@/hooks/sieve-provider";
-import { useEngine, useNotices, useSieve } from "@/hooks/use-sieve";
+import { useEngine, useLinkActions, useNotices, useSieve } from "@/hooks/use-sieve";
 
 const selectPausedUntil = (s: SieveState) => s.status.pausedUntil;
 
@@ -39,22 +39,36 @@ function Banner({ text, tone = "warning", children, ...data }: { text: string; t
  * goes when sampling resumes. It has no action of its own: Resume is the
  * pill. Exiting through another device is derived the same way from the
  * engine's `link` fact: a short line while it is up, a notice while it cannot
- * be reached. Other banners come from the notice bus (B7, surface "banner").
+ * be reached, and while that stops connections on a network that reached it
+ * before or wants a sign-in, the one button that turns exiting off. Other
+ * banners come from the notice bus (B7, surface "banner").
  */
 export function HomeBanner() {
   const { notices } = useRuntime();
   const pausedUntil = useSieve(selectPausedUntil);
   const banners = useNotices().filter((n) => n.surface === "banner");
   const e = useEngine();
+  const { setLink } = useLinkActions();
   // Derived from the engine's link fact, as the paused line is from status: true for as long as it holds.
-  const exit = linkHomeLine(engineStatus(e)?.link, engineRoutes(e));
+  const status = engineStatus(e);
+  const link = status?.link;
+  const exit = linkHomeLine(link, engineRoutes(e), status?.wifi_sign_in !== undefined);
   if (pausedUntil === null && banners.length === 0 && exit === null) return null;
   return (
     <div className="flex flex-col gap-2">
       {pausedUntil !== null && (
         <Banner text={`Sampling is paused until ${clock(pausedUntil)}. The chart and counts hold their last values.`} />
       )}
-      {exit !== null && <Banner text={exit.text} tone={exit.tone} data-link-home={exit.tone} />}
+      {exit !== null && (
+        <Banner text={exit.text} tone={exit.tone} data-link-home={exit.tone}>
+          {/* The one way out of a stop Sieve never ends by itself; the settings password guards it like every change. */}
+          {exit.offerOff && link?.settings && (
+            <Button variant="ghost" size="sm" disabled={e.linkBusy === true} onClick={() => void setLink(withSetting(link.settings!, "exit", false))} data-link-off="">
+              {LINK_OFF_LABEL}
+            </Button>
+          )}
+        </Banner>
+      )}
       {banners.map((n) => (
         <Banner key={n.id} text={n.text}>
           {n.action && (

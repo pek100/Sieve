@@ -62,8 +62,29 @@ describe("Home's line", () => {
     expect(linkHomeLine(example("off"), true), "exit off").toBeNull();
     expect(linkHomeLine(example("up"), false), "Sieve not routing: the normal network").toBeNull();
     expect(linkHomeLine(example("up"), true)).toEqual({ tone: "neutral", text: "Exiting through home: sites see its address, not this computer's." });
-    expect(linkHomeLine(example("down"), true)).toEqual({ tone: "warning", text: "Home cannot be reached, so sieved apps' new connections are stopped rather than leaving from this computer's own address." });
     expect(linkHomeLine(example("connecting"), true)?.text).toBe("Connecting to home. Until it answers, sieved apps leave directly from this computer, from its own address.");
+    const directDown = { ...example("down"), settings: { ...example("down").settings!, on_hub_down: "direct" as const } };
+    expect(linkHomeLine(directDown, true)).toEqual({ tone: "warning", text: "Home cannot be reached, so sieved apps leave directly from this computer, from its own address." });
+  });
+
+  // P2-5 (2026-11-20 review): stopped is never left by itself, so the line says why and offers the way out.
+  it("stopped on a network that reached the hub before, or one that wants a sign-in, says why and offers to turn exiting off", () => {
+    const down = linkHomeLine(example("down"), true);
+    expect(down).toEqual({ tone: "warning", text: expect.stringMatching(/^Home cannot be reached from this network, though it was before\. Sieved apps' connections are stopped, as set: Sieve never sends them from this computer's own address by itself\. To get online, turn exiting off;/), offerOff: true });
+    const stopConnecting = { ...example("connecting"), settings: { ...example("connecting").settings!, on_hub_down: "stop" as const } };
+    expect(linkHomeLine(stopConnecting, true, false)?.offerOff, "still connecting on a network with no sign-in: no offer yet").toBeUndefined();
+    const signIn = linkHomeLine(stopConnecting, true, true);
+    expect(signIn?.offerOff).toBe(true);
+    expect(signIn?.text).toMatch(/^This network wants a sign-in, and home cannot be reached from it until you sign in\./);
+    expect(signIn?.text, "it names the sign-in button's part too, so the two never contradict").toMatch(/turn exiting off, and use the sign-in button too/);
+    expect(linkHomeLine(example("connecting"), true, true)?.offerOff, "go direct: nothing is stopped").toBeUndefined();
+    expect(linkHomeLine(example("up"), true, true)?.offerOff, "up: nothing is stopped").toBeUndefined();
+  });
+
+  it("paused, the engine says off while exiting stays on: the line says it waits", () => {
+    const paused = { ...example("down"), state: "off" as const };
+    expect(linkStateLine(paused, true, NOW).text).toMatch(/^Paired with home\. Exiting through it is on, and waits while Sieve is paused/);
+    expect(linkHomeLine(paused, true, true)).toBeNull();
   });
 });
 
@@ -88,6 +109,10 @@ describe("what the owner types", () => {
     expect(dialAddressProblem("", false)).toMatch(/address and port/);
     expect(dialAddressProblem("203.0.113.20", false)).toMatch(/with its port/);
     expect(dialAddressProblem("203.0.113.20:70000", false)).toMatch(/1 to 65535/);
+    // As the engine takes it: an IP address, never a name.
+    expect(dialAddressProblem("home.example.net:7443", false)).toMatch(/IP address, not a name/);
+    expect(dialAddressProblem("203.0.113.300:7443", false)).toMatch(/IP address/);
+    expect(dialAddressProblem("[home]:7443", false)).not.toBeNull();
     expect([parsePort("7443"), parsePort("0"), parsePort("65536"), parsePort("74x")]).toEqual([7443, null, null, null]);
   });
 
@@ -101,13 +126,14 @@ describe("the log's exit rows", () => {
     for (const via of EXIT_VIAS) expect(EXIT_VIA_TEXT[via], via).toMatch(/^[A-Z]/);
     expect(exitWords("refused", "denied: shop.example is not on this device's allow-list")).toBe("The other device refused it: denied: shop.example is not on this device's allow-list");
     expect(exitWords("refused")).toBe("The other device refused it");
-    expect(exitWords("hub", "ignored")).toBe("Left through the other device");
     for (const o of fixture.outcomes.filter((x) => x.kind === "exit")) {
       const words = outcomeWords(o as never);
       expect(words, JSON.stringify(o)).not.toMatch(/^Unknown$|Sieve blocked|the app/);
     }
     expect(outcomeWords({ kind: "exit", via: "unknown" })).toBe("Went out in a way this version of Sieve cannot name");
-    expect(exitReasonWords("udp")).toMatch(/^UDP/);
     expect(exitReasonWords("the hub is not reachable")).toBe("the hub is not reachable");
+    const note = fixture.outcomes.find((x) => x.kind === "exit" && x.target === undefined && x.via === "hub");
+    expect(outcomeWords(note as never), "the engine's own note says itself").toMatch(/^The way out changed: 3 open connections ended/);
+    expect(exitWords("hub", "ignored", "video.example:443")).toBe("Left through the other device");
   });
 });

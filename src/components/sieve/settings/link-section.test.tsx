@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { HomeBanner } from "@/components/sieve/home/home-banner";
 import { UnlockDialog } from "@/components/sieve/lock/unlock-dialog";
 import { ENGINE_SWITCH } from "@/core/engine";
-import { LINK_TITLE, UDP_TEXT } from "@/core/link";
+import { LINK_OFF_LABEL, LINK_TITLE, UDP_TEXT } from "@/core/link";
 import { createMockEngine, MOCK_NOT_A_CODE, type LinkScenario } from "@/data/engine-mock";
 import { createMockLock, MOCK_PASSWORD, type LockScenario } from "@/data/lock-mock";
 import { createMockSource } from "@/data/mock-source";
@@ -115,7 +115,7 @@ describe("exit through another device, in Settings", () => {
     await user.hover(screen.getByRole("button", { name: `Copy its fingerprint ${HUB_FP}` }));
     expect(await screen.findByRole("tooltip")).toHaveTextContent(HUB_FP);
     expect(s).toHaveTextContent(UDP_TEXT.drop);
-    for (const words of [/sites see its address, not this computer's/, /apps you turned off in Sieve, and everything while Sieve is paused/, /DNS over QUIC server stays on this computer's own connection/, /never the content of encrypted connections/, /always return this computer to its normal network/]) {
+    for (const words of [/sites see its address, not this computer's/, /apps you turned off in Sieve, and everything while Sieve is paused/, /DNS over QUIC server is asked over this computer's own connection, still encrypted: that server sees this computer's address and every name looked up/, /Sieve cannot tell which app asked for a name/, /never the content of encrypted connections/, /always return this computer to its normal network/]) {
       expect(s).toHaveTextContent(words);
     }
     const setLink = vi.spyOn(engine, "setLink");
@@ -154,11 +154,31 @@ describe("exit through another device, in Settings", () => {
 });
 
 describe("exit through another device, on Home", () => {
-  it("while it cannot be reached and the setting stops: says new connections are stopped", async () => {
-    await setup("down");
+  it("while it cannot be reached and the setting stops: says connections are stopped, why, and offers the one way out", async () => {
+    const { engine, user } = await setup("down");
     await waitFor(() => expect(homeLine()).toHaveAttribute("data-link-home", "warning"));
-    expect(homeLine()).toHaveTextContent("Home cannot be reached, so sieved apps' new connections are stopped rather than leaving from this computer's own address.");
+    expect(homeLine()).toHaveTextContent("Home cannot be reached from this network, though it was before. Sieved apps' connections are stopped, as set: Sieve never sends them from this computer's own address by itself.");
     expect(section()).toHaveTextContent("The last error: dial 203.0.113.20:7443: timed out: connect.");
+    const setLink = vi.spyOn(engine, "setLink");
+    await user.click(within(homeLine()!).getByRole("button", { name: LINK_OFF_LABEL }));
+    expect(setLink).toHaveBeenLastCalledWith({ exit: false, on_hub_down: "stop", udp: "drop", route: { how: "dial", address: "203.0.113.20:7443" } });
+    await waitFor(() => expect(homeLine()).toBeNull());
+  });
+
+  it("the way out passes the settings password like every change", async () => {
+    const { engine, user } = await setup("down", "set");
+    await waitFor(() => expect(homeLine()).toHaveAttribute("data-link-home", "warning"));
+    const setLink = vi.spyOn(engine, "setLink");
+    await user.click(within(homeLine()!).getByRole("button", { name: LINK_OFF_LABEL }));
+    expect(setLink).not.toHaveBeenCalled();
+    await user.type(await screen.findByLabelText("Password"), `${MOCK_PASSWORD}{Enter}`);
+    await waitFor(() => expect(setLink).toHaveBeenLastCalledWith(expect.objectContaining({ exit: false })));
+  });
+
+  it("while it is only connecting and the setting goes direct: no offer, nothing is stopped", async () => {
+    await setup("connecting");
+    await waitFor(() => expect(homeLine()).not.toBeNull());
+    expect(within(homeLine()!).queryByRole("button", { name: LINK_OFF_LABEL })).toBeNull();
   });
 
   it("while connecting with the setting direct: says they leave directly from this computer", async () => {

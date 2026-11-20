@@ -70,6 +70,9 @@ export function linkStateLine(l: LinkStatus, routes: boolean, now: number): { to
           : "Pairing with the other device. When the other device dials this computer, Sieve waits for it as long as the code is valid (about 10 minutes).",
       };
     case "off":
+      // The engine says off while Sieve is paused too: exiting stops with it.
+      if (l.settings?.exit === true)
+        return { tone: "neutral", text: `Paired with ${name}. Exiting through it is on, and waits while Sieve is paused: until Sieve is on again, apps leave from this computer's own address.${why}` };
       return { tone: "neutral", text: `Paired with ${name}${at}. Exiting through it is off: apps leave from this computer's own address.${why}` };
     case "connecting":
       if (!routes) return { tone: "neutral", text: `Exiting through ${name} is on. It starts when Sieve routes traffic; until then this computer's network works as usual.` };
@@ -83,15 +86,38 @@ export function linkStateLine(l: LinkStatus, routes: boolean, now: number): { to
   }
 }
 
+/** Home's line about exiting. `offerOff`: the line comes with one button that turns exiting off. */
+export type LinkHomeLine = { tone: "neutral" | "warning"; text: string; offerOff?: true };
+
+/** The button that ends a stop Sieve never ends by itself. */
+export const LINK_OFF_LABEL = "Turn off exiting";
+
 /**
  * Home's line while exiting through the other device is on and Sieve routes:
  * a short line while it is up, a notice while it cannot be reached (what the
  * hub-down setting does to sieved apps). Null otherwise: nothing to say.
+ *
+ * Stopped is the one state Sieve never leaves by itself (it never goes direct
+ * on its own): when the other device was reached before and now is not, or the
+ * network wants a sign-in (`signIn`: the status's `wifi_sign_in`) while the
+ * connections are stopped, the line says why plainly and offers to turn exiting
+ * off. It sits beside the sign-in notice, which is about DNS: both may be needed.
  */
-export function linkHomeLine(l: LinkStatus | null | undefined, routes: boolean): { tone: "neutral" | "warning"; text: string } | null {
+export function linkHomeLine(l: LinkStatus | null | undefined, routes: boolean, signIn = false): LinkHomeLine | null {
   if (!l || l.settings?.exit !== true || !routes) return null;
   const name = hubName(l);
   const onDown = l.settings.on_hub_down;
+  const stuck = onDown === "stop" && (l.state === "down" || (l.state === "connecting" && signIn));
+  if (stuck) {
+    const why = signIn ? `This network wants a sign-in, and ${name} cannot be reached from it until you sign in` : `${capital(name)} cannot be reached from this network, though it was before`;
+    // The sign-in notice's button is about lookups; this one is about connections. Signing in can need both.
+    const how = signIn ? "To sign in, turn exiting off, and use the sign-in button too if its page still does not open" : "To get online, turn exiting off";
+    return {
+      tone: "warning",
+      text: `${why}. Sieved apps' connections are stopped, as set: Sieve never sends them from this computer's own address by itself. ${how}; turn it on again in Settings when ${name} can be reached.`,
+      offerOff: true,
+    };
+  }
   switch (l.state) {
     case "up":
       return { tone: "neutral", text: `Exiting through ${name}: sites see its address, not this computer's.` };
@@ -118,11 +144,11 @@ export const UDP_TEXT: Readonly<Record<LinkUdp, string>> = {
 
 /** What goes through the other device and what Sieve still does first. */
 export const linkThroughText = (name: string) =>
-  `While this is on and Sieve routes traffic, every TCP connection a sieved app makes to the internet leaves through ${name}, and sites see its address, not this computer's. Sieve asks ${name} to connect by the site's name when it knows it, else by its address. Sieve still filters first: blocking, apps you turned off, HTTPS filtering (the real site's certificate is still checked end to end), tracking protection and the log work as before.`;
+  `While this is on and Sieve routes traffic, every TCP connection a sieved app makes to the internet leaves through ${name}, and sites see its address, not this computer's. Sieve asks ${name} to connect by the name the connection itself carries (the site's name in HTTPS and web requests), else by the address the app chose. Turning this on or off, or a change of network, ends sieved apps' open connections to the internet, so they reconnect the new way. Sieve still filters first: blocking, apps you turned off, HTTPS filtering (the real site's certificate is still checked end to end), tracking protection and the log work as before.`;
 
 /** What never goes through it. */
 export const LINK_NOT_THROUGH_TEXT =
-  "Not through it: apps you turned off in Sieve, and everything while Sieve is paused (they go out directly, as without it); this computer's own local network; Sieve's own filter list and update downloads and its Wi-Fi sign-in checks.";
+  "Not through it: connections of apps you turned off in Sieve, and everything while Sieve is paused (they go out directly, as without it); this computer's own local network; Sieve's own filter list and update downloads and its Wi-Fi sign-in checks. Sieve's encrypted DNS lookups are the exception for apps you turned off: Sieve cannot tell which app asked for a name, so their lookups go through the other device too.";
 
 /** UDP and QUIC. */
 export const linkUdpText = (name: string) =>
@@ -130,7 +156,7 @@ export const linkUdpText = (name: string) =>
 
 /** DNS: encryption stays the owner's choice, never turned off by this. */
 export const linkDnsText = (name: string) =>
-  `DNS: Sieve's encrypted lookups (DNS over HTTPS and DNS over TLS) go through ${name} too, for every app, so the DNS server sees its address. A DNS over QUIC server stays on this computer's own connection, still encrypted. If you turned DNS encryption off, lookups go out in plain text from this computer, as before.`;
+  `DNS: Sieve's encrypted lookups (DNS over HTTPS and DNS over TLS) go through ${name} too, for every app, so the DNS server sees its address. A DNS over QUIC server is asked over this computer's own connection, still encrypted: that server sees this computer's address and every name looked up. The DNS server's own name is looked up from this computer. If you turned DNS encryption off, lookups go out in plain text from this computer, as before.`;
 
 /** What the other device's owner and the sites see. */
 export const linkPrivacyText = (name: string) =>
@@ -153,13 +179,23 @@ export function routeWords(route: LinkRoute): string {
   return route.how === "dial" ? `This computer dials ${route.address}` : `The other device dials this computer on port ${route.port}`;
 }
 
-/** Why a typed address cannot be sent, or null. An empty one is allowed only when the code carries one (`optional`). */
+/** An IPv4 address in dotted form, each part 0 to 255. */
+const isIpv4 = (s: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(s) && s.split(".").every((p) => Number(p) <= 255);
+
+/**
+ * Why a typed address cannot be sent, or null. An empty one is allowed only when
+ * the code carries one (`optional`). As the engine takes it: an IP address with
+ * its port (`203.0.113.20:7443`, `[2001:db8::1]:7443`), never a name.
+ */
 export function dialAddressProblem(text: string, optional: boolean): string | null {
   const t = text.trim();
   if (t === "") return optional ? null : "Type the other device's address and port.";
-  const m = /^(\[[0-9a-fA-F:.]+\]|[^\s:[\]]+):(\d{1,5})$/.exec(t);
+  const m = /^(\[([0-9a-fA-F:.]+)\]|[^\s:[\]]+):(\d{1,5})$/.exec(t);
   if (!m) return "Type an address with its port, such as 203.0.113.20:7443.";
-  const port = Number(m[2]);
+  const ip = m[2] ?? m[1];
+  const isIp = m[2] !== undefined ? m[2].includes(":") : isIpv4(ip);
+  if (!isIp) return "Type an IP address, not a name, such as 203.0.113.20:7443.";
+  const port = Number(m[3]);
   return port >= 1 && port <= 65_535 ? null : "The port is a number from 1 to 65535.";
 }
 
@@ -202,13 +238,19 @@ export const EXIT_VIA_TEXT: Readonly<Record<ExitVia, string>> = {
   unknown: "Went out in a way this version of Sieve cannot name",
 };
 
-/** An exit row's reason, in words: the engine's slug for UDP, else the other device's or the engine's own words as they came. */
+/** An exit row's reason, in words: the other device's or the engine's own words, as they came. */
 export function exitReasonWords(reason: string): string {
-  return reason === "udp" ? "UDP, which the link to the other device does not carry" : reason;
+  return reason;
 }
 
-/** The row's words: a refusal carries the other device's own reason. */
-export function exitWords(via: ExitVia, reason?: string): string {
+/**
+ * The row's words: a refusal carries the other device's own reason. A row with no
+ * target about a way out (through it, or directly) is the engine's own note on
+ * no single connection, such as the open connections it ended when the way out
+ * changed: its reason is its words.
+ */
+export function exitWords(via: ExitVia, reason?: string, target?: string): string {
+  if ((via === "hub" || via === "direct") && target === undefined && reason) return reason;
   const text = EXIT_VIA_TEXT[via] ?? EXIT_VIA_TEXT.unknown;
   return via === "refused" && reason ? `${text}: ${reason}` : text;
 }
