@@ -464,6 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn doq_answers_with_the_clients_id_and_sends_the_wire_id_the_rfc_requires() {
+        crate::loopback_check::needs_plain_udp();
         let f = fixture(Kind::Quic, Options::default()).await;
         assert_answer(&f.ask(0x1234).await.unwrap(), 0x1234);
         assert_eq!(id_of(&f.server.seen()[0].message), Some(0), "RFC 9250 4.2.1");
@@ -472,6 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_connection_serves_many_queries() {
+        crate::loopback_check::needs_plain_udp();
         for kind in KINDS {
             let f = fixture(kind, Options::default()).await;
             for id in 1..=5 {
@@ -500,6 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_slow_handshake_outlives_a_cancelled_query_and_the_next_query_reuses_it() {
+        crate::loopback_check::needs_plain_udp();
         for kind in KINDS {
             let f = fixture(kind, Options { handshake_delay: Duration::from_millis(500), ..Options::default() }).await;
             f.abandon(1).await;
@@ -511,6 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_queries_share_one_connect() {
+        crate::loopback_check::needs_plain_udp();
         for kind in KINDS {
             let f = fixture(kind, Options { handshake_delay: Duration::from_millis(200), ..Options::default() }).await;
             let (a, b, c) = tokio::join!(f.ask(1), f.ask(2), f.ask(3));
@@ -521,6 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_that_stopped_answering_is_replaced() {
+        crate::loopback_check::needs_plain_udp();
         for kind in KINDS {
             let f = fixture(kind, scripted(first_then_answers(Step::Silent))).await;
             f.abandon_after_connect().await;
@@ -542,6 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_closed_idle_session_is_retried_once_on_a_fresh_one() {
+        crate::loopback_check::needs_plain_udp();
         for kind in KINDS {
             let count = AtomicUsize::new(0);
             // The second query finds its reused session closing under it.
@@ -628,6 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_doq_or_doh_reply_with_a_nonzero_id_is_refused() {
+        crate::loopback_check::needs_plain_udp();
         for kind in [Kind::Https, Kind::Quic] {
             let script: Script = Arc::new(|query| Step::Answer(crate::dns::with_id(&answer_to(query), 9)));
             let f = fixture(kind, scripted(script)).await;
@@ -656,6 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn doq_offers_x25519mlkem768() {
+        crate::loopback_check::needs_plain_udp();
         // The server accepts that one group alone, so a client not offering it
         // fails the handshake: the control arm below shows the check can fail.
         let only_pq = || Options { groups: Some(vec![X25519MLKEM768]), ..Options::default() };

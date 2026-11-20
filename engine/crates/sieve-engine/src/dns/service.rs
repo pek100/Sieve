@@ -843,6 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_mode_forwards_to_the_server_the_client_addressed_and_never_to_an_encrypted_upstream() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let original = Plain::start(answering(), answering()).await;
@@ -868,6 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_mode_retries_a_truncated_answer_over_tcp_to_the_same_server() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let cut: Script = Arc::new(|query| Step::Answer(crate::dns::truncated(&answer_to(query)).unwrap()));
@@ -902,6 +904,7 @@ mod tests {
     /// The mode turns encrypted between the truncated datagram and its TCP retry.
     #[tokio::test]
     async fn the_tcp_retry_of_a_plain_query_is_not_sent_once_encryption_is_back_on() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let service: Arc<std::sync::OnceLock<Arc<Service>>> = Arc::default();
@@ -924,6 +927,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_mode_keeps_the_split_horizon_the_private_reverse_and_the_local_answers() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let router = Plain::start(answering(), answering()).await;
@@ -961,6 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_engines_own_lookup_in_plain_mode_asks_the_first_server_windows_names() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let router = Plain::start(answering(), answering()).await;
@@ -978,6 +983,7 @@ mod tests {
     /// into the adapter; encrypted, it goes encrypted like any other.
     #[tokio::test]
     async fn a_query_to_the_adapters_own_server_in_plain_mode_asks_the_first_server_windows_names() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let router = Plain::start(answering(), answering()).await;
@@ -1057,6 +1063,7 @@ mod tests {
     /// that reaches the engine goes on, LAN only.
     #[tokio::test]
     async fn an_update_goes_to_the_lan_server_it_addressed_and_nowhere_else() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let accepted: Script = Arc::new(|query| Step::Answer(crate::dns::nodata(query).unwrap()));
@@ -1089,6 +1096,7 @@ mod tests {
     /// same messages to any other server are REFUSED and nothing leaves.
     #[tokio::test]
     async fn a_key_negotiation_and_a_signed_update_go_only_to_the_lan_server_addressed() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let accepted: Script = Arc::new(|query| Step::Answer(crate::dns::nodata(query).unwrap()));
@@ -1125,6 +1133,7 @@ mod tests {
     /// Windows tries a network's servers in order, then the next network's.
     #[tokio::test]
     async fn plain_mode_tries_each_server_windows_would_in_order_within_the_budget() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let silent: Script = Arc::new(|_| Step::Silent);
@@ -1296,6 +1305,7 @@ mod tests {
     /// stays on the LAN, and one with nowhere to go goes nowhere, never public.
     #[tokio::test]
     async fn the_engines_own_lookup_takes_the_path_a_client_would() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let router = Plain::start(answering(), answering()).await;
@@ -1344,6 +1354,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_name_the_parser_refuses_stays_under_its_suffix() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let echo: Script = Arc::new(|query| {
@@ -1387,6 +1398,7 @@ mod tests {
     /// What `parse` refuses: a label outside a hostname's, or several questions.
     #[tokio::test]
     async fn a_private_reverse_name_the_parser_refuses_stays_off_the_public_upstream() {
+        crate::loopback_check::needs_plain_udp();
         const ZONE: [&[u8]; 5] = [b"7", b"168", b"192", b"in-addr", b"arpa"];
         const PUBLIC: [&[u8]; 2] = [b"a", b"example"];
         let star: Vec<&[u8]> = [&b"*"[..]].into_iter().chain(ZONE).collect();
@@ -1460,6 +1472,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_matched_name_goes_only_to_the_lan_server() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let router = Plain::start(answering(), answering()).await;
@@ -1487,6 +1500,7 @@ mod tests {
 
     #[tokio::test]
     async fn tc_from_the_lan_server_retries_over_tcp() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let cut: Script = Arc::new(|query| Step::Answer(crate::dns::truncated(&answer_to(query)).unwrap()));
@@ -1902,6 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lan_answer_keeps_ech() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = publishing_doh(&ca).await;
         let router = Plain::start(publishing(ECH_VALUE.to_vec()), publishing(ECH_VALUE.to_vec())).await;
@@ -1984,6 +1999,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_private_reverse_lookup_goes_only_to_the_router() {
+        crate::loopback_check::needs_plain_udp();
         let ca = Ca::new();
         let doh = Server::start(Kind::Https, &ca, Options::default()).await;
         let router = Plain::start(answering(), answering()).await;

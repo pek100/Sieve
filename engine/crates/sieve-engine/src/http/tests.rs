@@ -1015,6 +1015,7 @@ arms!(a_server_sent_stream_is_not_held, |arm| async move {
 const SMALL_DECODE: InjectLimits = InjectLimits { max_decoded_bytes: 64 * 1024, max_ratio: 256, ratio_floor_bytes: 1024 * 1024, zstd_window_log_max: 23, rewriter_max_memory_bytes: 1024 * 1024 };
 
 arms!(a_cap_breach_resets_the_stream, |arm| async move {
+    crate::tls::tests::needs_plain_loopback(arm);
     for alpn in BOTH {
         let mut c = content_setup_with(arm, alpn, list_rules(CONTENT_RULES), content_policy(true), SMALL_DECODE).await;
         let req = c.s.client.request(Method::GET, HOST, "/page/bomb").header("sec-fetch-dest", "document").body(empty()).unwrap();
@@ -1044,6 +1045,7 @@ arms!(a_truncated_gzip_page_resets_rather_than_ending_clean, |arm| async move {
 });
 
 arms!(content_gzip_tail_does_not_reset_the_page, |arm| async move {
+    crate::tls::tests::needs_plain_loopback(arm);
     for alpn in BOTH {
         // One connection per page: h1 ends with a reset, and none may happen here.
         for what in ["tail-junk-one-frame", "tail-junk-own-frame", "tail-member-one-frame", "tail-member-own-frame"] {

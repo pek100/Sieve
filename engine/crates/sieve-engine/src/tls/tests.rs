@@ -85,6 +85,14 @@ impl Arm {
     }
 }
 
+/// For a test whose loopback arm fails behind a filtering proxy in this
+/// machine's loopback (seen on the dev PC with AdGuard): it fails saying so.
+pub(crate) fn needs_plain_loopback(arm: Arm) {
+    if matches!(arm, Arm::Loopback) {
+        crate::loopback_check::needs_plain_tcp();
+    }
+}
+
 macro_rules! arms {
     ($name:ident, $body:expr) => {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1490,6 +1498,7 @@ async fn alpn_matrix() {
     assert!(offer(&["acme-tls/1"]).is_empty());
     for arm in ARMS {
         let _guard = arm.guard().await;
+        crate::tls::tests::needs_plain_loopback(arm);
         for row in &rows {
             let case = tokio::time::timeout(LIMIT, alpn_case(arm, row.offered, row.server, row.port)).await.unwrap_or_else(|_| panic!("{:?} {:?} timed out", row.offered, row.server));
             assert_eq!(case.intercepted, row.intercepted, "{arm:?} offered {:?} server {:?} port {}", row.offered, row.server, row.port);
@@ -1710,6 +1719,7 @@ async fn intercepted_of(rig: &Rig, alpn: &str, owner: Owner<'static>) -> (Client
 }
 
 arms!(only_a_close_by_the_client_counts_as_a_silent_client, |arm| async move {
+    crate::tls::tests::needs_plain_loopback(arm);
     for alpn in ["h2", "http/1.1"] {
         // The engine ends it: a revocation, or the switch.
         let watched = Arc::new(Watched::default());
@@ -1740,6 +1750,7 @@ arms!(only_a_close_by_the_client_counts_as_a_silent_client, |arm| async move {
 // The browser holds an h2 connection, the user turns it Off and reloads: the
 // reload must not reuse a decrypted connection (plan 4.4).
 arms!(an_app_turned_off_loses_its_decrypted_connections_and_its_next_one_passes_through, |arm| async move {
+    crate::tls::tests::needs_plain_loopback(arm);
     for alpn in ["h2", "http/1.1"] {
         let watched = Arc::new(Watched::default());
         let rig = watched_rig(arm, alpn, true, watched.clone());
@@ -2148,6 +2159,7 @@ fn tls_is_h2(io: &hyper_util::rt::TokioIo<tokio_rustls::server::TlsStream<BoxStr
 }
 
 arms!(a_used_connection_between_silent_closes_stays_decrypted, |arm| async move {
+    crate::tls::tests::needs_plain_loopback(arm);
     for alpn in ["h2", "http/1.1"] {
         let (rig, heal) = answering_rig(arm, alpn);
         silent_client(&rig, &[alpn]).await;
@@ -2236,6 +2248,7 @@ async fn alert_after_handshake(rig: &Rig, alpn: &[&str], alert: rustls::AlertDes
 }
 
 arms!(an_alert_right_after_the_handshake_is_strong_evidence, |arm| async move {
+    crate::tls::tests::needs_plain_loopback(arm);
     // The empty one: no ALPN at all, where the first decrypted read meets the alert.
     for alpn in [&["h2"][..], &["http/1.1"], &[]] {
         let (rig, heal, upstream_leaf) = healing_rig(arm, alpn);
