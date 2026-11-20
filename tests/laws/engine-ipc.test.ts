@@ -262,7 +262,8 @@ describe("engine IPC law", () => {
     expect(variants("LinkUdp")).toEqual([...LINK_UDP]);
     expect(variants("ExitVia")).toEqual([...EXIT_VIAS]);
     for (const via of EXIT_VIAS) expect(EXIT_VIA_TEXT[via], via).toBeTruthy();
-    expect(fixture.outcomes.flatMap((o) => (o.kind === "exit" ? [(o as { via: string }).via] : []))).toEqual(EXIT_VIAS.filter((v) => v !== "unknown"));
+    // Every way once, then the engine's own note on no single connection (a way with no target).
+    expect(fixture.outcomes.flatMap((o) => (o.kind === "exit" ? [(o as { via: string }).via] : []))).toEqual([...EXIT_VIAS.filter((v) => v !== "unknown"), "hub"]);
     expect(Number(rustConst("LINK_CODE_MAX"))).toBe(LINK_CODE_MAX);
     expect(rustConst("LINK_ADDRESS_MAX")).toBe("253 + 1 + 5");
     expect(LINK_ADDRESS_MAX).toBe(253 + 1 + 5);
