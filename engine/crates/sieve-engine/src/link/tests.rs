@@ -100,7 +100,10 @@ pub(crate) async fn hub(listen: bool) -> TestHub {
     cfg.resolver = Arc::new(StaticResolver(names));
     let a = |s: &str, prefix: u8| IfAddr { addr: s.parse().unwrap(), prefix };
     cfg.interfaces = Arc::new(FixedInterfaces(HostNet { addrs: vec![a("192.168.1.10", 24)], gateways: vec!["192.168.1.1".parse().unwrap()], routes: vec!["0.0.0.0/0".parse().unwrap()] }));
-    cfg.dead_after = Duration::from_secs(3);
+    // Above the engine's device keepalive (a ping every 15 s): a hub that cut a
+    // silent device after 3 s cut every test link a few seconds in, and a test
+    // still running then saw its link go down under it.
+    cfg.dead_after = Duration::from_secs(60);
     cfg.reload_every = Duration::from_millis(100);
     cfg.connect_timeout = Duration::from_secs(3);
     let hub = Hub::open(cfg).unwrap();
