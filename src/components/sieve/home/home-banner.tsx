@@ -39,8 +39,9 @@ function Banner({ text, tone = "warning", children, ...data }: { text: string; t
  * goes when sampling resumes. It has no action of its own: Resume is the
  * pill. Exiting through another device is derived the same way from the
  * engine's `link` fact: a short line while it is up, a notice while it cannot
- * be reached, and while that stops connections on a network that reached it
- * before or wants a sign-in, the one button that turns exiting off. Other
+ * be reached, and while that stops connections (the engine says it cannot be
+ * reached, or the network wants a sign-in), the one button that turns exiting
+ * off. Other
  * banners come from the notice bus (B7, surface "banner").
  */
 export function HomeBanner() {

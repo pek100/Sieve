@@ -98,10 +98,13 @@ export const LINK_OFF_LABEL = "Turn off exiting";
  * hub-down setting does to sieved apps). Null otherwise: nothing to say.
  *
  * Stopped is the one state Sieve never leaves by itself (it never goes direct
- * on its own): when the other device was reached before and now is not, or the
- * network wants a sign-in (`signIn`: the status's `wifi_sign_in`) while the
- * connections are stopped, the line says why plainly and offers to turn exiting
- * off. It sits beside the sign-in notice, which is about DNS: both may be needed.
+ * on its own): when the other device cannot be reached (the engine says down
+ * once the link was up and went, and also once it has tried for about 20
+ * seconds without ever reaching it, as after a move to another network or a
+ * restart), or the network wants a sign-in (`signIn`: the status's
+ * `wifi_sign_in`) while the connections are stopped, the line says why plainly
+ * and offers to turn exiting off. It sits beside the sign-in notice, which is
+ * about DNS: both may be needed.
  */
 export function linkHomeLine(l: LinkStatus | null | undefined, routes: boolean, signIn = false): LinkHomeLine | null {
   if (!l || l.settings?.exit !== true || !routes) return null;
@@ -109,7 +112,7 @@ export function linkHomeLine(l: LinkStatus | null | undefined, routes: boolean, 
   const onDown = l.settings.on_hub_down;
   const stuck = onDown === "stop" && (l.state === "down" || (l.state === "connecting" && signIn));
   if (stuck) {
-    const why = signIn ? `This network wants a sign-in, and ${name} cannot be reached from it until you sign in` : `${capital(name)} cannot be reached from this network, though it was before`;
+    const why = signIn ? `This network wants a sign-in, and ${name} cannot be reached from it until you sign in` : `${capital(name)} cannot be reached from this network`;
     // The sign-in notice's button is about lookups; this one is about connections. Signing in can need both.
     const how = signIn ? "To sign in, turn exiting off, and use the sign-in button too if its page still does not open" : "To get online, turn exiting off";
     return {

@@ -68,9 +68,13 @@ describe("Home's line", () => {
   });
 
   // P2-5 (2026-11-20 review): stopped is never left by itself, so the line says why and offers the way out.
-  it("stopped on a network that reached the hub before, or one that wants a sign-in, says why and offers to turn exiting off", () => {
+  it("stopped where the hub cannot be reached, or on a network that wants a sign-in, says why and offers to turn exiting off", () => {
     const down = linkHomeLine(example("down"), true);
-    expect(down).toEqual({ tone: "warning", text: expect.stringMatching(/^Home cannot be reached from this network, though it was before\. Sieved apps' connections are stopped, as set: Sieve never sends them from this computer's own address by itself\. To get online, turn exiting off;/), offerOff: true });
+    expect(down).toEqual({ tone: "warning", text: expect.stringMatching(/^Home cannot be reached from this network\. Sieved apps' connections are stopped, as set: Sieve never sends them from this computer's own address by itself\. To get online, turn exiting off;/), offerOff: true });
+    // Round 2's P2: after a move or a restart the link may never have been up on
+    // this network; the engine says down once it has tried long enough, and the
+    // line claims nothing about before.
+    expect(down?.text).not.toMatch(/before/);
     const stopConnecting = { ...example("connecting"), settings: { ...example("connecting").settings!, on_hub_down: "stop" as const } };
     expect(linkHomeLine(stopConnecting, true, false)?.offerOff, "still connecting on a network with no sign-in: no offer yet").toBeUndefined();
     const signIn = linkHomeLine(stopConnecting, true, true);

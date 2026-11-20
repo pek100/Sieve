@@ -157,7 +157,7 @@ describe("exit through another device, on Home", () => {
   it("while it cannot be reached and the setting stops: says connections are stopped, why, and offers the one way out", async () => {
     const { engine, user } = await setup("down");
     await waitFor(() => expect(homeLine()).toHaveAttribute("data-link-home", "warning"));
-    expect(homeLine()).toHaveTextContent("Home cannot be reached from this network, though it was before. Sieved apps' connections are stopped, as set: Sieve never sends them from this computer's own address by itself.");
+    expect(homeLine()).toHaveTextContent("Home cannot be reached from this network. Sieved apps' connections are stopped, as set: Sieve never sends them from this computer's own address by itself.");
     expect(section()).toHaveTextContent("The last error: dial 203.0.113.20:7443: timed out: connect.");
     const setLink = vi.spyOn(engine, "setLink");
     await user.click(within(homeLine()!).getByRole("button", { name: LINK_OFF_LABEL }));
