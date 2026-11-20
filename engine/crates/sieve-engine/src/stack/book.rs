@@ -337,6 +337,48 @@ impl FlowBook {
         }
     }
 
+    /// Ends every open TCP flow `which` names (by its event and its row's key, None
+    /// for an unknown app), as the cap does: a reset, and its relay closes it as
+    /// usual. Returns how many. Bounded by the flows open, under one lock.
+    pub fn end_where(&mut self, which: impl Fn(&FlowEvent, Option<&str>) -> bool) -> usize {
+        let ids: Vec<u64> = self.idle.keys().copied().filter(|id| self.open.get(id).is_some_and(|e| which(e, self.owners.get(id).map(|o| o.app.key.as_str())))).collect();
+        for id in &ids {
+            if let Some(connection) = self.idle.remove(id) {
+                connection.evict();
+            }
+        }
+        ids.len()
+    }
+
+    /// One row of the engine's own, about no single flow (the services' session,
+    /// so every client sees it).
+    pub fn note(&mut self, outcome: LogOutcome) {
+        if self.log.len() >= MAX_PENDING_LOG {
+            self.next_log_id += 1;
+            return;
+        }
+        self.next_log_id += 1;
+        let row = LogRow {
+            id: self.next_log_id,
+            t: (self.clock)(),
+            flow_id: 0,
+            pid: None,
+            exe: None,
+            session: Some(0),
+            kind: sieve_ipc::FlowKind::Other,
+            host: "Sieve".into(),
+            remote: String::new(),
+            url: None,
+            request_type: None,
+            outcome,
+            rule: None,
+            list: None,
+            forwarded: None,
+            changes: Vec::new(),
+        };
+        self.log.push(row);
+    }
+
     /// Flows ended to make room since the engine started.
     pub fn evicted(&self) -> u64 {
         self.evicted

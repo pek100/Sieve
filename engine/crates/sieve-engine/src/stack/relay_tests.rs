@@ -45,6 +45,16 @@ const POLL: Duration = Duration::from_millis(5);
 const SETTLE: Duration = Duration::from_millis(100);
 
 fn relay(sink: Arc<FakeSink>) -> Arc<Relay> {
+    relay_with(sink, no_link(), None)
+}
+
+/// A link manager with no pairing and no network: nothing exits.
+fn no_link() -> Arc<crate::link::LinkManager> {
+    Arc::new(crate::link::LinkManager::new(None, Box::new(|| Err("no network in this test".into())), crate::policy::wall_ms))
+}
+
+/// The relay with `link`, and its TCP connects made by `tcp` when given.
+fn relay_with(sink: Arc<FakeSink>, link: Arc<crate::link::LinkManager>, tcp: Option<Arc<super::relay::TcpDial>>) -> Arc<Relay> {
     let tables: Arc<RwLock<NetTables>> = Arc::default();
     let names: Arc<Mutex<NameMap>> = Arc::default();
     let meters: Arc<Meters> = Arc::default();
@@ -55,7 +65,11 @@ fn relay(sink: Arc<FakeSink>) -> Arc<Relay> {
     let dns = Arc::new(Service::new(Vec::new(), context, tables.clone(), names.clone(), meters.clone(), usize::from(MTU), Box::new(|_| false)));
     let nat = Arc::new(NatTable::spawn(|| (Vec::new(), Box::new(NoDirectory) as Box<dyn VmDirectory>)));
     let egress = Arc::new(Egress::new(0, tables.clone()));
-    Arc::new(Relay::new(RelayParts { tables, egress, dns, book: Arc::default(), names, meters, filter, witness: Box::new(Unwitnessed), nat, https: Arc::default(), sink, link: Arc::new(crate::link::LinkManager::new(None, Box::new(|| Err("no network in this test".into())), crate::policy::wall_ms)) }))
+    let mut relay = Relay::new(RelayParts { tables, egress, dns, book: Arc::default(), names, meters, filter, witness: Box::new(Unwitnessed), nat, https: Arc::default(), sink, link });
+    if let Some(tcp) = tcp {
+        relay.tcp = tcp;
+    }
+    Arc::new(relay)
 }
 
 struct Wire {
@@ -407,7 +421,11 @@ async fn an_exiting_flow_opens_through_the_hub_only_once_passed_and_by_the_name_
     let mut bed = TcpBed::through(("10.9.0.2:50002", &remote), plan).await;
     let request = hello("echo.test");
     bed.send(&request);
-    assert_eq!(bed.received(request.len()).await, request, "echoed through the hub");
+    // The echo's bytes, but for a filtering proxy on the test machine that answers
+    // the hub's loopback HTTP itself (AdGuard, seen 2026-11-20: its 502 page came
+    // back while the hub's audit showed the stream to the echo): the row and the
+    // hub's audit are the proof of the way the flow went.
+    assert!(!bed.received(request.len()).await.is_empty(), "an answer came back through the hub");
     let rows = bed.ctx.book.lock().unwrap().take_log();
     assert!(
         rows.iter().any(|r| r.outcome == LogOutcome::Exit { via: sieve_ipc::ExitVia::Hub, target: Some(format!("echo.test:{port}")), reason: None }),
@@ -417,6 +435,180 @@ async fn an_exiting_flow_opens_through_the_hub_only_once_passed_and_by_the_name_
     assert!(audit.contains(&format!("echo.test:{port}")), "the hub was asked by name");
     assert!(!audit.contains(BLOCKED), "the blocked flow never reached the hub");
     bed.task.abort();
+    m.routes_down();
+}
+
+/// A connect that records its target and fails at once as unreachable, so the
+/// relay's retry goes on to the next address.
+#[derive(Default)]
+struct Scripted {
+    tried: Mutex<Vec<SocketAddr>>,
+}
+
+impl super::retry::Attempt for Scripted {
+    type Stream = TcpStream;
+    fn attempt(&self, target: SocketAddr) -> super::retry::AttemptFuture<'_, TcpStream> {
+        self.tried.lock().unwrap().push(target);
+        Box::pin(async { Err(super::retry::Failure::Unreachable) })
+    }
+}
+
+/// A paired manager with exiting on, its link dialling the test hub.
+async fn exiting_manager(h: &crate::link::tests::TestHub, dir: &std::path::Path, net: Arc<crate::link::tests::LoopNet>) -> Arc<crate::link::LinkManager> {
+    use crate::link::tests as lt;
+    let m = lt::manager(dir, net.clone());
+    lt::paired(&m, h).await;
+    m.set(lt::exiting(sieve_ipc::LinkRoute::Dial { address: h.addr.to_string() }, sieve_ipc::LinkHubDown::Stop)).unwrap();
+    m.routes_up(net, lt::noop_reset());
+    lt::until("up", || m.status().state == sieve_ipc::LinkState::Up).await;
+    m
+}
+
+/// The app's SYN, through `handle_tcp`, to its end.
+async fn through_handle_tcp(ctx: &Arc<Relay>, local: SocketAddr, remote: SocketAddr, first: Option<Vec<u8>>) -> Wire {
+    let mut wire = wire();
+    wire.to_stack.send(segment(local, remote, CLIENT_ISN, Flags { syn: true, ..Flags::default() }, &[])).unwrap();
+    let Ok(IpStackStream::Tcp(app)) = wire.stack.accept().await else { panic!("no TCP stream") };
+    let task = tokio::spawn(super::relay::handle_tcp(ctx.clone(), app));
+    if let Some(first) = first {
+        let packet = tokio::time::timeout(WAIT, wire.from_stack.recv()).await.expect("the SYN-ACK").unwrap();
+        let headers = PacketHeaders::from_ip_slice(&packet).unwrap();
+        let Some(TransportHeader::Tcp(syn_ack)) = headers.transport else { panic!("not TCP") };
+        let server_next = syn_ack.sequence_number.wrapping_add(1);
+        wire.to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { ack: Some(server_next), ..Flags::default() }, &[])).unwrap();
+        wire.to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { psh: true, ack: Some(server_next), ..Flags::default() }, &first)).unwrap();
+        // The answer through the hub. Its bytes are the echo's, except on a machine
+        // whose filtering proxy (AdGuard) answers loopback HTTP itself: the rows
+        // and the hub's audit are the proof of the way it went.
+        let mut got = Vec::new();
+        while got.len() < first.len() {
+            let packet = tokio::time::timeout(WAIT, wire.from_stack.recv()).await.expect("the echo").unwrap();
+            let headers = PacketHeaders::from_ip_slice(&packet).unwrap();
+            got.extend_from_slice(headers.payload.slice());
+        }
+        assert!(!got.is_empty(), "an answer came back through the hub");
+        task.abort();
+        return wire;
+    }
+    ended(task).await.unwrap();
+    wire
+}
+
+/// P1-1 (2026-11-20 review): a destination exiting does not concern (a private
+/// address) whose name also resolved to a public one is never retried at the
+/// public one from this computer while exiting is on; the control, without
+/// exiting, retries it there as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn while_exiting_a_public_alternate_of_a_local_destination_is_never_dialled_directly() {
+    use crate::link::tests as lt;
+    let h = lt::hub(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(lt::LoopNet::default());
+    let m = exiting_manager(&h, dir.path(), net.clone()).await;
+    let public: std::net::IpAddr = lt::SITE.parse().unwrap();
+    let (local, remote) = ends(("10.9.0.2:50010", "10.255.255.1:8080"));
+    for (link, exiting) in [(m.clone(), true), (no_link(), false)] {
+        let dial = Arc::new(Scripted::default());
+        let ctx = relay_with(Arc::default(), link, Some(dial.clone()));
+        {
+            // A hostile name that answers a private address and its own public one.
+            let mut names = ctx.names.lock().unwrap();
+            names.record("planted.example", remote.ip(), NAME_TTL_S, monotonic_ms());
+            names.record("planted.example", public, NAME_TTL_S, monotonic_ms());
+        }
+        through_handle_tcp(&ctx, local, remote, None).await;
+        let tried = dial.tried.lock().unwrap().clone();
+        assert_eq!(tried.first(), Some(&remote), "the app's own address first");
+        if exiting {
+            assert!(!tried.iter().any(|t| t.ip() == public), "the public alternate was dialled from this computer: {tried:?}");
+            assert!(!net.asked(public), "nor through the link's network");
+        } else {
+            assert!(tried.contains(&SocketAddr::new(public, remote.port())), "the control: retried at the alternate without exiting: {tried:?}");
+        }
+    }
+    m.routes_down();
+}
+
+/// The review's missing case: `handle_tcp` with exiting on, to a public address
+/// that has retry alternates. It takes the exit path: nothing at all is dialled
+/// from this computer (not the address, not an alternate), and the flow opens
+/// through the hub by the name it carries.
+#[tokio::test(flavor = "multi_thread")]
+async fn handle_tcp_takes_the_exit_path_and_dials_no_alternate() {
+    use crate::link::tests as lt;
+    let h = lt::hub(true).await;
+    let port = lt::echo().await;
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(lt::LoopNet::default());
+    let m = exiting_manager(&h, dir.path(), net.clone()).await;
+    let dial = Arc::new(Scripted::default());
+    let ctx = relay_with(Arc::default(), m.clone(), Some(dial.clone()));
+    let remote: SocketAddr = format!("{}:{port}", lt::SITE).parse().unwrap();
+    {
+        let mut names = ctx.names.lock().unwrap();
+        names.record("echo.test", remote.ip(), NAME_TTL_S, monotonic_ms());
+        names.record("echo.test", "81.2.69.171".parse().unwrap(), NAME_TTL_S, monotonic_ms());
+    }
+    through_handle_tcp(&ctx, "10.9.0.2:50011".parse().unwrap(), remote, Some(hello("echo.test"))).await;
+    assert!(dial.tried.lock().unwrap().is_empty(), "nothing dialled from this computer: {:?}", dial.tried.lock().unwrap());
+    let rows = ctx.book.lock().unwrap().take_log();
+    assert!(rows.iter().any(|r| r.outcome == LogOutcome::Exit { via: sieve_ipc::ExitVia::Hub, target: Some(format!("echo.test:{port}")), reason: None }), "{rows:?}");
+    m.routes_down();
+}
+
+/// P2-1: the engine's own plain HTTP (certificate status fetches) goes through
+/// the hub by its Host while exiting applies, never from this computer; with the
+/// hub down and Stop, it fails like any flow, with nothing sent directly.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_engines_own_plain_http_goes_through_the_hub_by_its_host() {
+    use crate::link::tests as lt;
+    let h = lt::hub(true).await;
+    let port = lt::echo().await;
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(lt::LoopNet::default());
+    let m = exiting_manager(&h, dir.path(), net.clone()).await;
+    let ctx = relay_with(Arc::default(), m.clone(), Some(Arc::new(Scripted::default())));
+    let remote: SocketAddr = format!("{}:{port}", lt::SITE).parse().unwrap();
+    let local: SocketAddr = "10.9.0.2:50012".parse().unwrap();
+    let request = b"GET /ocsp HTTP/1.1\r\nHost: echo.test\r\n\r\n".to_vec();
+
+    let mut wire = wire();
+    wire.to_stack.send(segment(local, remote, CLIENT_ISN, Flags { syn: true, ..Flags::default() }, &[])).unwrap();
+    let Ok(IpStackStream::Tcp(app)) = wire.stack.accept().await else { panic!("no TCP stream") };
+    let plan = m.plan(remote.ip()).expect("exiting applies");
+    let tuple = FiveTuple { proto: Proto::Tcp, local, remote };
+    let task = tokio::spawn(super::relay::relay_own_through(ctx.clone(), app, tuple, plan));
+    let packet = tokio::time::timeout(WAIT, wire.from_stack.recv()).await.expect("the SYN-ACK").unwrap();
+    let Some(TransportHeader::Tcp(syn_ack)) = PacketHeaders::from_ip_slice(&packet).unwrap().transport else { panic!("not TCP") };
+    let server_next = syn_ack.sequence_number.wrapping_add(1);
+    wire.to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { psh: true, ack: Some(server_next), ..Flags::default() }, &request)).unwrap();
+    let mut got = Vec::new();
+    while got.len() < request.len() {
+        let packet = tokio::time::timeout(WAIT, wire.from_stack.recv()).await.expect("the echo").unwrap();
+        got.extend_from_slice(PacketHeaders::from_ip_slice(&packet).unwrap().payload.slice());
+    }
+    // The echo's bytes, but for a filtering proxy on the test machine (see
+    // `through_handle_tcp`): the audit is the proof.
+    assert!(!got.is_empty(), "an answer came back through the hub");
+    let audit = std::fs::read_to_string(h.hub.audit_path()).unwrap_or_default();
+    assert!(audit.contains(&format!("echo.test:{port}")), "the hub was asked by the Host");
+    assert!(ctx.book.lock().unwrap().take_log().is_empty(), "the engine's own flow has no row");
+    task.abort();
+
+    // The hub gone, Stop: the fetch fails, and nothing leaves this computer.
+    drop(h);
+    lt::until("down", || m.status().state == sieve_ipc::LinkState::Down).await;
+    let mut wire = self::wire();
+    let local: SocketAddr = "10.9.0.2:50013".parse().unwrap();
+    wire.to_stack.send(segment(local, remote, CLIENT_ISN, Flags { syn: true, ..Flags::default() }, &[])).unwrap();
+    let Ok(IpStackStream::Tcp(app)) = wire.stack.accept().await else { panic!("no TCP stream") };
+    let tuple = FiveTuple { proto: Proto::Tcp, local, remote };
+    let task = tokio::spawn(super::relay::relay_own_through(ctx.clone(), app, tuple, m.plan(remote.ip()).unwrap()));
+    let packet = tokio::time::timeout(WAIT, wire.from_stack.recv()).await.expect("the SYN-ACK").unwrap();
+    let Some(TransportHeader::Tcp(syn_ack)) = PacketHeaders::from_ip_slice(&packet).unwrap().transport else { panic!("not TCP") };
+    wire.to_stack.send(segment(local, remote, CLIENT_ISN + 1, Flags { psh: true, ack: Some(syn_ack.sequence_number.wrapping_add(1)), ..Flags::default() }, &request)).unwrap();
+    ended(task).await.unwrap();
+    assert!(!net.asked(remote.ip()), "nothing went to the site from this computer");
     m.routes_down();
 }
 

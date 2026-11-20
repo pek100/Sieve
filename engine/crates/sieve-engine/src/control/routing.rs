@@ -221,7 +221,7 @@ async fn follow(engine: &Engine, up: Up, tables: NetTables) -> Up {
     };
     if network_moved {
         up.relay.dns.reset();
-        // A listening link moves to the adapter's new address.
+        // The link restarts on the new network (a listening one on its new address).
         engine.link.network_changed();
     }
     let up = if routes == up.routes {
@@ -923,6 +923,12 @@ async fn bring_up(engine: &Arc<Engine>, tables: &NetTables, still_on: &(dyn Fn()
     // The link runs while routes are up; each up, down or change of path drops
     // the resolver sessions so they reopen by the path in force.
     let weak_dns = Arc::downgrade(&dns);
+    // A change of the way out ends the open connections it concerns, so they
+    // reconnect the new way (`stack::relay::reconnect_the_new_way`).
+    let (book, filter) = (engine.book.clone(), engine.filter.clone());
+    engine.link.on_exit_change(Arc::new(move |concerns: &dyn Fn(std::net::IpAddr) -> bool, via: sieve_ipc::ExitVia| {
+        crate::stack::relay::reconnect_the_new_way(&book, &filter, concerns, via);
+    }));
     engine.link.routes_up(egress.clone(), Arc::new(move || {
         if let Some(dns) = weak_dns.upgrade() {
             dns.reset();
@@ -1000,7 +1006,7 @@ fn build_interception(engine: &Engine, egress: &Arc<Egress>) -> Result<Intercept
     let lookup = super::lock(&engine.dns_service).clone().ok_or("the DNS service is not running")?;
     let ca = engine.ca();
     Ok(Interception {
-        connector: Arc::new(Exit { net: egress.clone(), link: engine.link.clone() }),
+        connector: Arc::new(Exit { net: egress.clone(), link: engine.link.clone(), book: engine.book.clone() }),
         exclusions: engine.exclusions.clone(),
         verifier,
         verdicts: VerdictCache::default(),

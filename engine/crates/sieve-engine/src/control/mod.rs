@@ -190,6 +190,7 @@ impl Engine {
         let heal = Arc::new(Heal::new(exclusions.clone(), meters.clone()));
         let validation = Arc::new(crate::tls::validation::ValidationSlot::new(meters.clone()));
         let link = Arc::new(crate::link::LinkManager::new(dir.as_deref(), Box::new(net_now), policy::wall_ms));
+        link.set_sieving(policy.sieving);
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: dir.as_deref().map(crate::experiments::Loaded::load).unwrap_or_else(crate::experiments::Loaded::absent),
@@ -260,6 +261,8 @@ impl Engine {
         self.lists.set_selection(now.lists.clone());
         self.lists.set_custom(now.custom_lists.clone(), policy::wall_ms());
         self.exclusions.set_user(&now.exclusions, policy::wall_ms());
+        // Paused, nothing exits through another device: its link stops.
+        self.link.set_sieving(now.sieving);
         // Off closes every decrypted flow now; on waits for the routing loop,
         // which holds the pinned sockets.
         #[cfg(windows)]
@@ -579,8 +582,9 @@ impl Backend for Engine {
 
     /// The code goes to the link manager and no further: nothing here logs it,
     /// and a refusal's words never hold it.
-    fn link_pair(&self, code: String, route: Option<sieve_ipc::LinkRoute>) -> Result<EngineStatus, String> {
-        let paired = self.link.pair(&code, route);
+    fn link_pair(&self, code: sieve_ipc::LinkCode, route: Option<sieve_ipc::LinkRoute>) -> Result<EngineStatus, String> {
+        let paired = self.link.pair(code.expose(), route);
+        // Wiped as it is dropped (`LinkCode`).
         drop(code);
         paired?;
         Ok(self.status())
@@ -1460,7 +1464,7 @@ mod tests {
         let e = Engine::new(None, PathBuf::new(), on.clone(), Runs::default(), None);
         let egress = Arc::new(crate::stack::egress::Egress::new(0, Arc::new(std::sync::RwLock::new(crate::route::table::NetTables::default()))));
         let interception = Interception {
-            connector: Arc::new(crate::link::exit::Exit { net: egress, link: e.link.clone() }),
+            connector: Arc::new(crate::link::exit::Exit { net: egress, link: e.link.clone(), book: e.book.clone() }),
             exclusions: e.exclusions.clone(),
             verifier: Arc::new(Verifier::new(crate::tls::public_roots(), Arc::new(PlatformTrust::new().unwrap()), TRUST_TIMEOUT, e.validation.clone()).unwrap()),
             verdicts: VerdictCache::default(),

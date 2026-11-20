@@ -258,7 +258,7 @@ pub enum ClientMessage {
     /// does not parse or has expired is an Error. Sent only to an engine whose
     /// status carried `link` ([`CAPABILITY_LINK`]).
     LinkPair {
-        code: String,
+        code: LinkCode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<LinkRoute>,
     },
@@ -270,12 +270,58 @@ pub enum ClientMessage {
     SetLink(LinkSettings),
 }
 
+/// A pairing code as [`ClientMessage::LinkPair`] carries it: on the wire a plain
+/// string; in memory never printed (its `Debug` says only that it is there) and
+/// wiped when dropped.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LinkCode(String);
+
+impl LinkCode {
+    /// The code itself, for the one place that redeems it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for LinkCode {
+    fn from(code: String) -> Self {
+        Self(code)
+    }
+}
+
+impl From<&str> for LinkCode {
+    fn from(code: &str) -> Self {
+        Self(code.to_string())
+    }
+}
+
+impl std::fmt::Debug for LinkCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LinkCode(<redacted>)")
+    }
+}
+
+/// Overwritten with zeros before its memory is freed (no dependency for it: the
+/// app's build shares this crate).
+impl Drop for LinkCode {
+    fn drop(&mut self) {
+        // SAFETY: zero bytes are valid UTF-8, and each write stays inside the
+        // string's own initialised bytes.
+        for b in unsafe { self.0.as_bytes_mut() } {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// How the engine and its hub meet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "how", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LinkRoute {
-    /// The engine dials the hub at `address` (`ip:port`, `[v6]:port` or
-    /// `name:port`), at most [`LINK_ADDRESS_MAX`] bytes.
+    /// The engine dials the hub at `address`: an IP address with its port
+    /// (`ip:port` or `[v6]:port`; a name is refused, as it would need DNS, which
+    /// may itself go through the link), at most [`LINK_ADDRESS_MAX`] bytes.
     Dial { address: String },
     /// The engine listens on this TCP port of the adapter Windows uses for the
     /// internet, and the hub dials in (a hub behind a home router). The port is
@@ -1877,7 +1923,8 @@ mod tests {
         }
         seen.dedup();
         assert_eq!(seen, ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted", "problem", "retried", "exit"]);
-        assert_eq!(vias, [ExitVia::Hub, ExitVia::Direct, ExitVia::Stopped, ExitVia::Refused, ExitVia::Dropped], "every way, so the TS law sees each name");
+        // The last is the engine's own note on no single connection (the way out changed).
+        assert_eq!(vias, [ExitVia::Hub, ExitVia::Direct, ExitVia::Stopped, ExitVia::Refused, ExitVia::Dropped, ExitVia::Hub], "every way, so the TS law sees each name");
         let later: LogOutcome = serde_json::from_value(serde_json::json!({ "kind": "exit", "via": "carrier_pigeon" })).unwrap();
         assert_eq!(later, LogOutcome::Exit { via: ExitVia::Unknown, target: None, reason: None }, "a way from a newer engine reads as unknown");
     }
@@ -1914,6 +1961,11 @@ mod tests {
 
         let pair = ClientMessage::LinkPair { code: "SL1-X".into(), route: None };
         assert_eq!(serde_json::to_value(&pair).unwrap(), serde_json::json!({ "type": "link_pair", "code": "SL1-X" }));
+        let secret = ClientMessage::LinkPair { code: "SL1-SECRETCODEVALUE".into(), route: Some(LinkRoute::Listen { port: 7443 }) };
+        let printed = format!("{secret:?} {secret:#?}");
+        assert!(!printed.contains("SECRETCODEVALUE") && printed.contains("<redacted>"), "Debug never prints the code: {printed}");
+        let read: ClientMessage = serde_json::from_str(r#"{"type":"link_pair","code":"SL1-SECRETCODEVALUE"}"#).unwrap();
+        assert!(matches!(&read, ClientMessage::LinkPair { code, .. } if code.expose() == "SL1-SECRETCODEVALUE"), "the wire is a plain string");
         for bad in [
             r#"{"type":"link_pair"}"#,
             r#"{"type":"link_pair","code":"c","log":true}"#,

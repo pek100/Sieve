@@ -11,16 +11,20 @@
 //! 1. the flow's own name (TLS SNI, HTTP Host) when it has one: the name the
 //!    app asked the server for, already judged by Sieve's filter, and what the
 //!    server's certificate must match anyway;
-//! 2. else the one name Sieve's DNS gave the app for this address, when there
-//!    is exactly one (an opaque protocol to a host the app looked up);
-//! 3. else the address.
+//! 2. else the address the app connected to.
+//!
+//! Never a name Sieve's DNS recorded for the address: any page can make the
+//! resolver record `x.attacker.example` for a victim's address, and a nameless
+//! protocol to that address (SSH or Redis by IP, say) would then be sent by the
+//! hub to wherever the attacker's DNS points.
 //!
 //! Trade-offs: an app that chose one of a name's addresses on purpose (a pinned
 //! edge, a game server picked by address) reaches whichever address the hub
-//! resolves for the name instead; with several names on one address the
-//! engine cannot know which the app meant, so it sends the address; a name the
-//! local DNS answered differently (split horizon) resolves the hub's way,
-//! which is the point, and a local-only name is refused by the hub; a name
+//! resolves for the name instead; a nameless protocol reaches exactly the
+//! address the app chose, as the hub sees it (an address this computer's DNS
+//! gave that the hub's network would answer differently is not re-resolved); a
+//! name the local DNS answered differently (split horizon) resolves the hub's
+//! way, which is the point, and a local-only name is refused by the hub; a name
 //! Sieve's DNS blocked never gets here, because the flow carrying it is
 //! blocked by the same decision first.
 
@@ -30,8 +34,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use sieve_ipc::{ExitVia, LINK_TEXT_MAX, LinkHubDown, Signal, cap_text};
-use sieve_link::{LinkError, LinkStream};
+use sieve_ipc::{ExitVia, LinkHubDown, Signal};
+use sieve_link::{LinkClient, LinkError, LinkStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
@@ -78,8 +82,9 @@ pub fn shown(host: &str, port: u16) -> String {
     }
 }
 
+/// A row's reason: one plain line, capped (the hub's refusal is the hub's text).
 fn reason(text: impl AsRef<str>) -> Option<String> {
-    Some(cap_text(text.as_ref(), LINK_TEXT_MAX).to_string())
+    Some(super::said(text))
 }
 
 /// A host name the hub can be asked for: letters, digits, `-`, `_` and dots,
@@ -94,14 +99,12 @@ fn is_name(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
-/// What the hub is asked to connect to (the module's rules 1 to 3).
-pub fn choose_host(carried: Option<&str>, resolved: &[&str], ip: IpAddr) -> String {
-    if let Some(name) = carried.map(|n| n.trim_end_matches('.')).filter(|n| is_name(n)) {
-        return name.to_ascii_lowercase();
-    }
-    match resolved {
-        [one] if is_name(one) => one.to_ascii_lowercase(),
-        _ => ip.to_string(),
+/// What the hub is asked to connect to (the module's rules 1 and 2): the name
+/// the flow's own bytes carry, else its address.
+pub fn choose_host(carried: Option<&str>, ip: IpAddr) -> String {
+    match carried.map(|n| n.trim_end_matches('.')).filter(|n| is_name(n)) {
+        Some(name) => name.to_ascii_lowercase(),
+        None => ip.to_string(),
     }
 }
 
@@ -128,31 +131,56 @@ pub fn udp_on_link(quic: bool, setting: sieve_ipc::LinkUdp) -> UdpOnLink {
     }
 }
 
+/// How an open through the link failed, for what follows it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Failed {
+    /// The hub answered no, or is linked and did not answer usably: never direct.
+    Refused(String),
+    /// The link is not there: the hub-down setting decides.
+    Down(String),
+}
+
+/// Sorts a failed open: only a link that is not there (none, down, or its own
+/// socket broken) is `Down`. `linked`: the link is up now.
+pub fn failed(e: LinkError, linked: bool) -> Failed {
+    match e {
+        LinkError::Refused { status, message } => Failed::Refused(format!("{}: {message}", format!("{status:?}").to_lowercase())),
+        LinkError::HubDown => Failed::Down("the other device cannot be reached".into()),
+        LinkError::Io(e) => Failed::Down(format!("the other device cannot be reached: {e}")),
+        // Linked, but no answer in time (a busy hub, a slow target), or an answer
+        // that made no sense: as a refusal, so a slow hub never sends a flow out
+        // from this computer.
+        LinkError::Timeout(_) if linked => Failed::Refused("the other device did not answer in time".into()),
+        e if linked => Failed::Refused(format!("the other device's answer could not be used: {e}")),
+        e => Failed::Down(format!("the other device cannot be reached: {e}")),
+    }
+}
+
 /// Opens one connection for `remote` through the hub as `host:port`, or, when
-/// the hub cannot be reached, as the plan's hub-down setting says: stop (an
-/// error) or directly from this computer to `remote`. A hub that answered and
-/// refused is never a reason to go direct.
+/// the link is not up, as the plan's hub-down setting says: stop (an error) or
+/// directly from this computer to `remote`. A hub that answered and refused, or
+/// that is linked but did not answer in time (busy, slow, a target that takes
+/// long), is never a reason to go direct: only a link that is not there is.
+/// The running link is read now, not when the flow began.
 pub async fn open(plan: &Plan, net: &dyn LinkNet, host: &str, port: u16, remote: SocketAddr) -> (io::Result<Opened>, ExitReport) {
     let target = Some(shown(host, port));
     let down = |why: String| -> (io::Result<Opened>, ExitReport) {
         (Err(io::Error::new(io::ErrorKind::ConnectionRefused, why.clone())), ExitReport { via: ExitVia::Stopped, target: target.clone(), reason: reason(&why), signal: Some(Signal::HubDown) })
     };
-    let outcome = match &plan.client {
+    let refused = |why: String| -> (io::Result<Opened>, ExitReport) {
+        (Err(io::Error::new(io::ErrorKind::ConnectionRefused, why.clone())), ExitReport { via: ExitVia::Refused, target: target.clone(), reason: reason(&why), signal: Some(Signal::HubRefused) })
+    };
+    let client = plan.client();
+    let outcome = match &client {
         Some(client) => client.open(host, port).await,
         None => Err(LinkError::HubDown),
     };
     let why_down = match outcome {
         Ok(stream) => return (Ok(Opened::Hub(stream)), ExitReport { via: ExitVia::Hub, target, reason: None, signal: None }),
-        Err(LinkError::Refused { status, message }) => {
-            let why = format!("{}: {message}", format!("{status:?}").to_lowercase());
-            return (
-                Err(io::Error::new(io::ErrorKind::ConnectionRefused, why.clone())),
-                ExitReport { via: ExitVia::Refused, target, reason: reason(&why), signal: Some(Signal::HubRefused) },
-            );
-        }
-        Err(LinkError::HubDown) => "the other device cannot be reached".to_string(),
-        // The link broke or timed out under this open: the hub is not there.
-        Err(e) => format!("the other device cannot be reached: {e}"),
+        Err(e) => match failed(e, client.as_ref().is_some_and(LinkClient::is_up)) {
+            Failed::Refused(why) => return refused(why),
+            Failed::Down(why) => why,
+        },
     };
     match plan.on_hub_down {
         LinkHubDown::Stop => down(format!("{why_down}; stopped, as set")),
@@ -364,27 +392,39 @@ impl Reset for Upstream {
 }
 
 /// Interception's connector (`tls::intercept::Dial`) while routes are up: a
-/// fresh connection of a flow whose host is known exits through the hub when
-/// the plan says so, and every other one leaves through `net` as before.
+/// fresh connection exits through the hub when the plan says so (by the flow's
+/// name when known, else by address), and every other one leaves through `net`
+/// as before. No dial of it leaves directly for a destination exiting concerns.
 pub struct Exit {
     pub net: Arc<dyn LinkNet>,
     pub link: Arc<LinkManager>,
+    /// Where a fresh dial's way out is written, on its flow's row.
+    pub book: Arc<Mutex<crate::stack::book::FlowBook>>,
+}
+
+impl Exit {
+    async fn fresh(&self, target: SocketAddr, host: Option<&str>, flow: Option<u64>) -> Result<Upstream, String> {
+        let Some(plan) = self.link.plan(target.ip()) else { return self.net.connect(target).await.map(Upstream::Tcp) };
+        let (opened, report) = open(&plan, &*self.net, &choose_host(host, target.ip()), target.port(), target).await;
+        // A stop or a refusal is the hub's problem on the flow's row, so the
+        // flow's failure that follows is not counted as the app's breakage.
+        if let Some(id) = flow {
+            self.book.lock().unwrap_or_else(|p| p.into_inner()).exit(id, report);
+        }
+        opened.map(Upstream::from).map_err(|e| e.to_string())
+    }
 }
 
 impl Dial for Exit {
     type Stream = Upstream;
 
+    /// By address: through the hub when the plan says so, as every dial here.
     fn dial(&self, target: SocketAddr) -> DialFuture<'_, Upstream> {
-        Box::pin(async move { self.net.connect(target).await.map(Upstream::Tcp) })
+        Box::pin(self.fresh(target, None, None))
     }
 
-    fn dial_named<'a>(&'a self, target: SocketAddr, host: &'a str) -> DialFuture<'a, Upstream> {
-        Box::pin(async move {
-            match self.link.plan(target.ip()) {
-                Some(plan) => open(&plan, &*self.net, &choose_host(Some(host), &[], target.ip()), target.port(), target).await.0.map(Upstream::from).map_err(|e| e.to_string()),
-                None => self.net.connect(target).await.map(Upstream::Tcp),
-            }
-        })
+    fn dial_named<'a>(&'a self, target: SocketAddr, host: &'a str, flow: u64) -> DialFuture<'a, Upstream> {
+        Box::pin(self.fresh(target, Some(host), Some(flow)))
     }
 
     fn ready<'a>(&'a self, stream: &'a mut Upstream) -> DialFuture<'a, ()> {

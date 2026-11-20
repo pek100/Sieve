@@ -37,12 +37,22 @@ fn run(body: impl std::future::Future<Output = ()>) {
 #[derive(Default)]
 pub(crate) struct LoopNet {
     pub(crate) connects: AtomicUsize,
+    /// Every target asked for, in order.
+    pub(crate) targets: Mutex<Vec<SocketAddr>>,
     local: Mutex<Vec<IpAddr>>,
+}
+
+impl LoopNet {
+    /// Whether anything was asked of `ip` (a direct connect to a site).
+    pub(crate) fn asked(&self, ip: IpAddr) -> bool {
+        self.targets.lock().unwrap().iter().any(|t| t.ip() == ip)
+    }
 }
 
 impl LinkNet for LoopNet {
     fn connect(&self, target: SocketAddr) -> BoxFuture<'_, Result<TcpStream, String>> {
         self.connects.fetch_add(1, Ordering::SeqCst);
+        self.targets.lock().unwrap().push(target);
         // This machine's network is off limits: loopback only.
         if !target.ip().is_loopback() {
             return Box::pin(async move { Err(format!("{target}: not on loopback, never dialled in a test")) });
@@ -128,6 +138,19 @@ async fn echo_once<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(s: &
 
 pub(crate) fn manager(dir: &Path, net: Arc<LoopNet>) -> Arc<LinkManager> {
     Arc::new(LinkManager::new(Some(dir), Box::new(move || Ok(net.clone() as Arc<dyn LinkNet>)), crate::policy::wall_ms))
+}
+
+/// Whether nothing listens on 127.0.0.1:`port` any more: it can be bound again
+/// (soon after a close). A connect would not say: a filtering proxy on the test
+/// machine (AdGuard) may accept a loopback connect whatever listens.
+pub(crate) async fn port_free(port: u16) -> bool {
+    for _ in 0..40 {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 pub(crate) async fn until(what: &str, cond: impl Fn() -> bool) {
@@ -244,13 +267,13 @@ fn exiting_relays_by_name_and_by_address_through_the_hub_and_its_own_socket_is_t
         let plan = m.plan(site).expect("a public address exits");
         let remote = SocketAddr::new(site, port);
         // By name: the hub resolves it.
-        let (opened, report) = exit::open(&plan, &*net, &exit::choose_host(Some("echo.test"), &[], site), port, remote).await;
+        let (opened, report) = exit::open(&plan, &*net, &exit::choose_host(Some("echo.test"), site), port, remote).await;
         assert_eq!(report, ExitReport { via: ExitVia::Hub, target: Some(format!("echo.test:{port}")), reason: None, signal: None });
         let mut s = opened.unwrap();
         assert!(matches!(s, Opened::Hub(_)));
         echo_once(&mut s, b"through the hub by name").await;
         // By address, when no name is known.
-        let (opened, report) = exit::open(&plan, &*net, &exit::choose_host(None, &[], "127.0.0.1".parse().unwrap()), port, remote).await;
+        let (opened, report) = exit::open(&plan, &*net, &exit::choose_host(None, "127.0.0.1".parse().unwrap()), port, remote).await;
         assert_eq!(report.target, Some(format!("127.0.0.1:{port}")));
         echo_once(&mut opened.unwrap(), b"through the hub by address").await;
         let row = h.hub.audit_path();
@@ -338,7 +361,7 @@ fn listening_pairs_and_links_when_the_hub_dials_in_and_says_where_it_listens() {
         let (opened, _) = exit::open(&plan, &*net, "echo.test", port, SocketAddr::new(SITE.parse().unwrap(), port)).await;
         echo_once(&mut opened.unwrap(), b"the hub dialled in").await;
         m.routes_down();
-        assert!(TcpStream::connect(("127.0.0.1", free)).await.is_err(), "the port closed with the routes");
+        assert!(port_free(free).await, "the port closed with the routes");
     });
 }
 
@@ -363,17 +386,19 @@ fn lan_loopback_private_and_the_hubs_own_address_never_exit() {
     });
 }
 
+/// P1-2 (2026-11-20 review): only the flow's own bytes name what the hub is
+/// asked for; a nameless flow goes by its address, never by a name Sieve's DNS
+/// recorded for that address (which any page can plant).
 #[test]
-fn the_hub_is_asked_for_the_carried_name_then_a_single_resolved_name_then_the_address() {
+fn the_hub_is_asked_for_the_carried_name_else_the_address() {
     let ip: IpAddr = "81.2.69.170".parse().unwrap();
-    assert_eq!(exit::choose_host(Some("Video.Example."), &["other.example"], ip), "video.example");
-    assert_eq!(exit::choose_host(None, &["only.example"], ip), "only.example");
-    assert_eq!(exit::choose_host(None, &["a.example", "b.example"], ip), "81.2.69.170", "several names: the app's choice is unknown");
-    assert_eq!(exit::choose_host(Some("81.2.69.170"), &[], ip), "81.2.69.170");
-    assert_eq!(exit::choose_host(Some("bad name"), &[], ip), "81.2.69.170");
-    assert_eq!(exit::choose_host(Some("localhost"), &[], ip), "81.2.69.170", "a single label is no name to ask for");
+    assert_eq!(exit::choose_host(Some("Video.Example."), ip), "video.example");
+    assert_eq!(exit::choose_host(None, ip), "81.2.69.170", "no name of its own: by address");
+    assert_eq!(exit::choose_host(Some("81.2.69.170"), ip), "81.2.69.170");
+    assert_eq!(exit::choose_host(Some("bad name"), ip), "81.2.69.170");
+    assert_eq!(exit::choose_host(Some("localhost"), ip), "81.2.69.170", "a single label is no name to ask for");
     let v6: IpAddr = "2a00:1450:4001::200e".parse().unwrap();
-    assert_eq!(exit::choose_host(None, &[], v6), "2a00:1450:4001::200e");
+    assert_eq!(exit::choose_host(None, v6), "2a00:1450:4001::200e");
     assert_eq!(exit::shown("2a00:1450:4001::200e", 443), "[2a00:1450:4001::200e]:443");
 }
 
@@ -412,7 +437,7 @@ fn a_lazy_upstream_wakes_both_halves_and_a_failed_open_is_an_error_not_a_hang() 
         assert!(tokio::time::timeout(T, up.read(&mut buf)).await.unwrap().is_err());
         let net: Arc<dyn LinkNet> = Arc::new(LoopNet::default());
         let dir = tempfile::tempdir().unwrap();
-        let ex = Exit { net, link: manager(dir.path(), Arc::new(LoopNet::default())) };
+        let ex = Exit { net, link: manager(dir.path(), Arc::new(LoopNet::default())), book: Arc::default() };
         let (lazy, starter) = exit::lazy();
         let mut up = Upstream::Lazy(lazy);
         starter.start(async { Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "stopped")) });
@@ -493,11 +518,11 @@ fn interception_and_encrypted_dns_through_the_link_validate_the_real_certificate
         until("up", || m.status().state == LinkState::Up).await;
         let remote = SocketAddr::new(SITE.parse().unwrap(), port);
 
-        let ex = Exit { net: net.clone(), link: m.clone() };
-        let fresh = ex.dial_named(remote, "site.test").await.unwrap();
+        let ex = Exit { net: net.clone(), link: m.clone(), book: Arc::default() };
+        let fresh = ex.dial_named(remote, "site.test", 1).await.unwrap();
         assert!(matches!(fresh, Upstream::Opened(Opened::Hub(_))), "by name through the hub");
         shake(fresh, roots.clone(), "site.test").await.unwrap();
-        let wrong = ex.dial_named(remote, "site.test").await.unwrap();
+        let wrong = ex.dial_named(remote, "site.test", 1).await.unwrap();
         assert!(shake(wrong, roots.clone(), "other.test").await.is_err(), "the certificate is checked against the name, end to end");
 
         let dns = DnsExit { inner: net.clone(), net: net.clone(), link: m.clone() };
@@ -534,4 +559,249 @@ fn an_exit_row_says_how_the_flow_went_and_a_hub_problem_counts_once_with_no_othe
     let problems: Vec<_> = issues.iter().flat_map(|a| &a.problems).collect();
     assert_eq!(problems.len(), 1);
     assert_eq!((problems[0].signal, problems[0].cause), (Signal::HubRefused, sieve_ipc::Cause::Hub), "the hub's, never Sieve's or the app's");
+}
+
+/// P2-2: with the global switch off nothing exits: the link stops, its port
+/// closes, the status says off, and DNS goes as without it. On again, it runs.
+#[test]
+fn with_sieving_off_nothing_exits_the_link_stops_and_its_port_closes() {
+    run(async {
+        let h = hub(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        let free = { TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port() };
+        let code = h.hub.create_pairing_code(60, None, "engine").unwrap().encode();
+        m.pair(&code, Some(LinkRoute::Listen { port: free })).unwrap();
+        h.hub.dial(format!("127.0.0.1:{free}"));
+        until("paired", || m.status().state == LinkState::Off).await;
+        m.set(exiting(LinkRoute::Listen { port: free }, LinkHubDown::Stop)).unwrap();
+        m.routes_up(net.clone(), noop_reset());
+        until("up", || m.status().state == LinkState::Up).await;
+        let site: IpAddr = SITE.parse().unwrap();
+        assert!(m.plan(site).is_some());
+
+        m.set_sieving(false);
+        assert!(m.plan(site).is_none(), "paused: nothing exits");
+        assert!(m.may_leave_directly(site));
+        let s = m.status();
+        assert_eq!((s.state, s.listening), (LinkState::Off, None), "stopped, and no port is said to be open");
+        assert!(port_free(free).await, "the port closed");
+        // DNS: the resolver session is not asked of the link (LoopNet refuses the
+        // non-loopback target itself, so the error is the direct path's).
+        let dns = DnsExit { inner: net.clone(), net: net.clone(), link: m.clone() };
+        let err = dns.resolver_stream(SocketAddr::new(site, 443), "doh.test").await.err().unwrap();
+        assert!(!err.contains("through the other device"), "{err}");
+        assert!(net.asked(site), "directly, as without the link");
+
+        m.set_sieving(true);
+        assert!(m.plan(site).is_some(), "on again: exiting applies");
+        assert_eq!(m.status().listening, Some(format!("127.0.0.1:{free}")));
+        m.routes_down();
+    });
+}
+
+/// P2-3: every change of the way out is told once, with the destinations it
+/// concerns and the new way; a change of another choice is not.
+#[test]
+fn a_change_of_the_way_out_is_told_with_what_it_concerns() {
+    run(async {
+        let h = hub(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        paired(&m, &h).await;
+        let told: Arc<Mutex<Vec<(ExitVia, bool, bool)>>> = Arc::default();
+        let into = told.clone();
+        m.on_exit_change(Arc::new(move |concerns: &dyn Fn(IpAddr) -> bool, via: ExitVia| {
+            into.lock().unwrap().push((via, concerns(SITE.parse().unwrap()), concerns("10.0.0.1".parse().unwrap())));
+        }));
+        m.routes_up(net.clone(), noop_reset());
+        assert!(told.lock().unwrap().is_empty(), "exit is off: nothing changed");
+        let on = exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Stop);
+        m.set(on.clone()).unwrap();
+        assert_eq!(*told.lock().unwrap(), [(ExitVia::Hub, true, false)], "on: public destinations, through the hub");
+        m.set(LinkSettings { udp: LinkUdp::Direct, ..on.clone() }).unwrap();
+        assert_eq!(told.lock().unwrap().len(), 1, "the UDP choice is no change of the way out for TCP");
+        m.network_changed();
+        assert_eq!(told.lock().unwrap().len(), 2, "a restart on a new network");
+        m.set_sieving(false);
+        assert_eq!(told.lock().unwrap().last(), Some(&(ExitVia::Direct, true, false)), "paused: directly from now on");
+        m.set_sieving(true);
+        m.set(LinkSettings { exit: false, ..on }).unwrap();
+        assert_eq!(told.lock().unwrap().last(), Some(&(ExitVia::Direct, true, false)));
+        assert_eq!(told.lock().unwrap().len(), 5);
+        m.routes_down();
+    });
+}
+
+/// An open flow's connection the book can end, as `ipstack`'s handle.
+struct Ends(Arc<std::sync::atomic::AtomicBool>);
+
+impl crate::stack::book::Idle for Ends {
+    fn idle(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn evict(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// P2-3: the open TCP connections of sieved apps to destinations the change
+/// concerns are ended, once, with one row; an app that is Off, a local
+/// destination and UDP are left alone.
+#[test]
+fn a_change_of_the_way_out_ends_the_open_connections_it_concerns() {
+    use crate::domain::{DomainFilter, FilterSlot};
+    use crate::stack::book::{FlowBook, tests_event};
+    let book = Mutex::new(FlowBook::default());
+    let policy = sieve_ipc::Policy { sieving: true, off_apps: vec!["turned-off".into()], ..sieve_ipc::Policy::default() };
+    let filter = FilterSlot::new(DomainFilter::new(&policy, sieve_filter::rules::RuleSet::empty()));
+    let mut flows = Vec::new();
+    for (key, remote, proto) in [
+        (Some("browser"), "81.2.69.170:443", sieve_ipc::FlowProto::Tcp),
+        (None, "81.2.69.170:443", sieve_ipc::FlowProto::Tcp),
+        (Some("Turned-Off"), "81.2.69.170:443", sieve_ipc::FlowProto::Tcp),
+        (Some("browser"), "10.0.0.1:443", sieve_ipc::FlowProto::Tcp),
+        (Some("browser"), "81.2.69.170:443", sieve_ipc::FlowProto::Udp),
+    ] {
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut b = book.lock().unwrap();
+        let mut e = tests_event(Some(1));
+        e.remote = remote.into();
+        e.proto = proto;
+        let idle: Option<Box<dyn crate::stack::book::Idle>> = (proto == sieve_ipc::FlowProto::Tcp).then(|| Box::new(Ends(ended.clone())) as _);
+        let id = b.open_with(e, idle).unwrap();
+        b.own(id, key.map(str::to_string));
+        flows.push(ended);
+    }
+    let concerns = |ip: IpAddr| sieve_link::rules::denied_class(ip).is_none();
+    let n = crate::stack::relay::reconnect_the_new_way(&book, &filter, &concerns, ExitVia::Hub);
+    let ended: Vec<bool> = flows.iter().map(|f| f.load(Ordering::SeqCst)).collect();
+    assert_eq!(ended, [true, true, false, false, false], "a sieved app's and an unknown app's public TCP only");
+    assert_eq!(n, 2);
+    let rows = book.lock().unwrap().take_log();
+    assert_eq!(rows.len(), 1, "one summary row: {rows:?}");
+    assert!(matches!(&rows[0].outcome, sieve_ipc::LogOutcome::Exit { via: ExitVia::Hub, target: None, reason: Some(r) } if r.contains("2 open connections")), "{rows:?}");
+    assert_eq!(rows[0].session, Some(0), "every client sees it");
+}
+
+/// P2-6: a flow decided after the link restarted (a network move, here) opens on
+/// the new link: the plan reads the running link when its open starts.
+#[test]
+fn a_plan_taken_before_a_restart_opens_on_the_new_link() {
+    run(async {
+        let h = hub(true).await;
+        let port = echo().await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        paired(&m, &h).await;
+        m.set(exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Stop)).unwrap();
+        m.routes_up(net.clone(), noop_reset());
+        until("up", || m.status().state == LinkState::Up).await;
+        let site: IpAddr = SITE.parse().unwrap();
+        let plan = m.plan(site).unwrap();
+        m.network_changed();
+        assert_eq!(m.status().state, LinkState::Connecting, "a dialling link restarts on a network move too");
+        until("up again", || m.status().state == LinkState::Up).await;
+        // The SYN-time plan's own client was shut down by the restart: an open on
+        // it would be stopped. The plan reads the running one.
+        let (opened, report) = exit::open(&plan, &*net, "echo.test", port, SocketAddr::new(site, port)).await;
+        assert_eq!(report.via, ExitVia::Hub, "{report:?}");
+        echo_once(&mut opened.unwrap(), b"on the new link").await;
+        m.routes_down();
+    });
+}
+
+/// P2-4: only a link that is not there is "down" (the hub-down setting then
+/// decides); a linked hub that is slow or answers oddly is as a refusal, never
+/// a reason to go direct. The hub answers before the device gives up.
+#[test]
+fn a_slow_hub_that_is_linked_is_a_refusal_and_answers_before_the_device_gives_up() {
+    use exit::{Failed, failed};
+    use sieve_link::LinkError;
+    assert!(matches!(failed(LinkError::Timeout("hub answer"), true), Failed::Refused(w) if w.contains("did not answer in time")));
+    assert!(matches!(failed(LinkError::Protocol("odd".into()), true), Failed::Refused(_)));
+    assert!(matches!(failed(LinkError::Timeout("hub answer"), false), Failed::Down(_)), "the link went away meanwhile");
+    assert!(matches!(failed(LinkError::HubDown, true), Failed::Down(_)));
+    assert!(matches!(failed(LinkError::Io(std::io::Error::other("reset")), true), Failed::Down(_)));
+    let refused = failed(LinkError::Refused { status: sieve_link::wire::Status::Denied, message: "no".into() }, false);
+    assert_eq!(refused, Failed::Refused("denied: no".into()));
+    run(async {
+        let h = hub(true).await;
+        let device = sieve_link::LinkConfig::new(h.hub.fingerprint(), sieve_link::HubRoute::Dial(h.addr.to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let hub = sieve_link::HubConfig::new(dir.path());
+        assert!(hub.slot_wait + hub.connect_timeout < device.request_timeout, "the hub's worst answer comes before the device gives up");
+    });
+}
+
+/// P3: a pairing that was finishing when the owner unpaired does not undo the
+/// unpair: nothing is kept, nothing is written.
+#[test]
+fn an_unpair_is_never_undone_by_a_pairing_that_was_finishing() {
+    run(async {
+        let h = hub(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let m = manager(dir.path(), Arc::new(LoopNet::default()));
+        let code = h.hub.create_pairing_code(60, None, "engine").unwrap().encode();
+        // A pairing that waits (the hub never dials in), then an unpair.
+        let free = { TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port() };
+        m.pair(&code, Some(LinkRoute::Listen { port: free })).unwrap();
+        let generation = lock(&m.state).pair_generation;
+        m.unpair().unwrap();
+        // The pairing's end arrives after the unpair, as when it raced it.
+        let outcome = Ok((sieve_link::Identity::generate().unwrap(), h.hub.fingerprint(), "home".to_string()));
+        m.paired(generation, &dir.path().join(LINK_DIR), LinkRoute::Listen { port: free }, outcome);
+        assert_eq!(m.status().state, LinkState::Unpaired);
+        assert!(!dir.path().join(LINK_DIR).join(LINK_FILE).exists(), "nothing written");
+    });
+}
+
+/// P3: the hub's refusal and any error reach the log and the app as one plain
+/// line: control and bidirectional characters are spaces.
+#[test]
+fn text_from_outside_is_one_plain_line() {
+    assert_eq!(said("denied:\u{202E}moc.evil\u{2066}\r\nnext"), "denied: moc.evil   next");
+    assert_eq!(said("x".repeat(LINK_TEXT_MAX + 50)).len(), LINK_TEXT_MAX);
+}
+
+/// P3: interception's fresh dials never leave directly for a destination exiting
+/// concerns (by address too: `Exit::dial`), and a stop is written on the flow's
+/// row as the hub's problem, so the flow's failure is not counted as the app's.
+#[test]
+fn interceptions_fresh_dials_go_only_through_the_link_and_say_so_on_the_row() {
+    run(async {
+        let h = hub(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        paired(&m, &h).await;
+        m.set(exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Stop)).unwrap();
+        m.routes_up(net.clone(), noop_reset());
+        until("up", || m.status().state == LinkState::Up).await;
+        drop(h);
+        until("down", || m.status().state == LinkState::Down).await;
+        let site: SocketAddr = format!("{SITE}:443").parse().unwrap();
+        let book: Arc<Mutex<crate::stack::book::FlowBook>> = Arc::default();
+        let id = {
+            let mut b = book.lock().unwrap();
+            let id = b.open(crate::stack::book::tests_event(Some(1))).unwrap();
+            b.own(id, Some("browser".into()));
+            id
+        };
+        let ex = Exit { net: net.clone(), link: m.clone(), book: book.clone() };
+        assert!(ex.dial(site).await.is_err(), "by address: stopped, as set");
+        assert!(ex.dial_named(site, "site.test", id).await.is_err(), "by name: stopped, as set");
+        assert!(!net.asked(site.ip()), "nothing went to the site from this computer");
+        let mut b = book.lock().unwrap();
+        b.close(id, sieve_ipc::FlowAction::Failed, 0, 0);
+        let rows = b.take_log();
+        assert_eq!(rows.iter().filter(|r| matches!(r.outcome, sieve_ipc::LogOutcome::Exit { via: ExitVia::Stopped, .. })).count(), 1, "{rows:?}");
+        let problems: Vec<_> = b.issues(1).into_iter().flat_map(|a| a.problems).collect();
+        assert_eq!(problems.iter().map(|p| p.signal).collect::<Vec<_>>(), [Signal::HubDown], "the hub's problem, no lost connection");
+        drop(b);
+        m.routes_down();
+    });
 }

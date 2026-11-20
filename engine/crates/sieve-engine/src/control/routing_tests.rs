@@ -41,7 +41,7 @@ fn engine() -> Engine {
 fn built(engine: &Engine) -> Interception<Exit> {
     let tables = Arc::new(RwLock::new(NetTables::default()));
     Interception {
-        connector: Arc::new(Exit { net: Arc::new(Egress::new(0, tables)), link: engine.link.clone() }),
+        connector: Arc::new(Exit { net: Arc::new(Egress::new(0, tables)), link: engine.link.clone(), book: engine.book.clone() }),
         exclusions: engine.exclusions.clone(),
         verifier: Arc::new(Verifier::new(Pki::new("Test Public Root").roots(), FakeTrust::says(TrustAnswer::Trusted), TRUST_TIMEOUT, engine.validation.clone()).unwrap()),
         verdicts: VerdictCache::default(),

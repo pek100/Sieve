@@ -546,7 +546,7 @@
       "hub_name": "home",
       "hub_fingerprint": "5e1a9c0d4b7f2e8a6c3d1f0b9e7a5c3d2b1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d",
       "device_fingerprint": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
-      "settings": { "exit": true, "on_hub_down": "direct", "udp": "direct", "route": { "how": "dial", "address": "home.example.net:7443" } },
+      "settings": { "exit": true, "on_hub_down": "direct", "udp": "direct", "route": { "how": "dial", "address": "[2001:db8::20]:7443" } },
       "since_ms": 1793000070000
     },
     {
@@ -575,7 +575,8 @@
     { "kind": "exit", "via": "direct", "target": "203.0.113.9:443", "reason": "the hub is not reachable; going direct, as set" },
     { "kind": "exit", "via": "stopped", "target": "video.example:443", "reason": "the hub is not reachable (hub-down setting: stop)" },
     { "kind": "exit", "via": "refused", "target": "shop.example:443", "reason": "denied: shop.example is not on this device's allow-list" },
-    { "kind": "exit", "via": "dropped", "reason": "udp" }
+    { "kind": "exit", "via": "dropped", "reason": "UDP is not carried through the other device, so it was dropped, as set" },
+    { "kind": "exit", "via": "hub", "reason": "The way out changed: 3 open connections ended so they reconnect through the other device" }
   ],
   "certStatuses": {
     "installed": {

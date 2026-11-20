@@ -937,6 +937,8 @@ pub fn without_code(text: String, code: &str) -> String {
 pub fn route_problem(route: &sieve_ipc::LinkRoute) -> Option<&'static str> {
     match route {
         sieve_ipc::LinkRoute::Dial { address } if address.trim().is_empty() || address.len() > sieve_ipc::LINK_ADDRESS_MAX => Some("Type the other device's address and port."),
+        // As the engine takes it: an IP address with its port, never a name.
+        sieve_ipc::LinkRoute::Dial { address } if address.trim().parse::<std::net::SocketAddr>().is_err() => Some("Type an IP address with its port, such as 203.0.113.20:7443."),
         sieve_ipc::LinkRoute::Listen { port: 0 } => Some("Choose a port from 1 to 65535."),
         _ => None,
     }
@@ -952,7 +954,7 @@ pub fn link_pair_message(code: String, route: Option<sieve_ipc::LinkRoute>) -> R
     if let Some(problem) = route.as_ref().and_then(route_problem) {
         return Err(problem.into());
     }
-    Ok(sieve_ipc::ClientMessage::LinkPair { code, route })
+    Ok(sieve_ipc::ClientMessage::LinkPair { code: code.into(), route })
 }
 
 /// Command: pair this computer with another device (a Sieve link hub). `code`
@@ -1502,7 +1504,7 @@ mod tests {
         use sieve_ipc::{ClientMessage, LinkRoute};
         let code = format!("SL1-{}", "A".repeat(139));
         let sent = link_pair_message(format!("  {code}\n"), None).unwrap();
-        assert_eq!(sent, ClientMessage::LinkPair { code: code.clone(), route: None });
+        assert_eq!(sent, ClientMessage::LinkPair { code: code.clone().into(), route: None });
         for bad in [String::new(), "   ".into(), "x".repeat(sieve_ipc::LINK_CODE_MAX + 1)] {
             let refused = link_pair_message(bad.clone(), None).unwrap_err();
             assert_eq!(refused, NOT_A_CODE);
@@ -1514,6 +1516,8 @@ mod tests {
         assert!(link_pair_message(code.clone(), dial).is_err());
         let ok = Some(LinkRoute::Dial { address: "203.0.113.20:7443".into() });
         assert!(link_pair_message(code.clone(), ok).is_ok());
+        let name = Some(LinkRoute::Dial { address: "home.example.net:7443".into() });
+        assert!(link_pair_message(code.clone(), name).unwrap_err().contains("IP address"), "a name is refused as the engine refuses it");
         let echoed = format!("bad code {code}: expired");
         assert_eq!(without_code(echoed, &code), "bad code (the pairing code): expired");
         assert_eq!(without_code("expired".into(), &code), "expired");

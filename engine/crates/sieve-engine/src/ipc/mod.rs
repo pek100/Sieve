@@ -87,7 +87,7 @@ pub trait Backend: Send + Sync + 'static {
     fn resume_dns_capture(&self) -> EngineStatus;
     /// Starts redeeming a pairing code and answers the Status at once (its link
     /// reads `pairing`). The code is never logged, echoed or kept.
-    fn link_pair(&self, code: String, route: Option<LinkRoute>) -> Result<EngineStatus, String>;
+    fn link_pair(&self, code: sieve_ipc::LinkCode, route: Option<LinkRoute>) -> Result<EngineStatus, String>;
     /// Forgets the hub and the key for it. Answers the Status.
     fn link_unpair(&self) -> Result<EngineStatus, String>;
     /// The owner's choices for the paired hub. Answers the Status.
@@ -486,8 +486,8 @@ mod tests {
             *self.paused.lock().unwrap() = false;
             self.status()
         }
-        fn link_pair(&self, code: String, route: Option<LinkRoute>) -> Result<EngineStatus, String> {
-            if !code.starts_with("SL1-") {
+        fn link_pair(&self, code: sieve_ipc::LinkCode, route: Option<LinkRoute>) -> Result<EngineStatus, String> {
+            if !code.expose().starts_with("SL1-") {
                 return Err(crate::link::NOT_A_CODE.into());
             }
             let route = route.ok_or(crate::link::NO_ADDRESS)?;

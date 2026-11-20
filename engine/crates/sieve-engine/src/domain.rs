@@ -161,6 +161,12 @@ impl DomainFilter {
         self.enabled && self.rules.check_host(name).verdict == HostVerdict::Block
     }
 
+    /// [`Self::is_off`] for a flow's row key (`HeldOwner::row_key`): an app's key
+    /// or a VM row's.
+    pub fn is_off_key(&self, key: &str) -> bool {
+        self.off.contains(key) || self.off.contains(&key.to_lowercase())
+    }
+
     pub fn is_off(&self, owner: Owner<'_>) -> bool {
         match owner {
             Owner::App { key } => self.off.contains(&key.to_lowercase()),
