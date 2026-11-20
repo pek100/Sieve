@@ -1,7 +1,14 @@
 //! The filter lists Sieve knows (plan 5.4). Every list is downloaded at run
 //! time by the engine and never vendored or bundled; this table only names
-//! them. `trusted` lists may use `trusted-*` scriptlets (uBO's own rule:
-//! only the lists of the projects that write those scriptlets).
+//! them.
+//!
+//! Trusted scriptlets (the permissioned `trusted-*` resources and
+//! `prevent-clipboard-write`) run only from a list its [`Author`] makes
+//! trusted: the uBO team's own lists (uAssets) and the AdGuard team's own
+//! filters. The owner's decision of 2026-11-20
+//! (docs/tasks/2026-11-06-open-decisions.md): a row is marked by who writes
+//! it, not by where it is served, so a third-party list mirrored on AdGuard's
+//! servers (EasyList, EasyPrivacy, regional community lists) is untrusted.
 //!
 //! Each row says what it is for (`kind`) and the lowest protection level that
 //! turns it on (`level`). The app's profiles are derived from the levels, and a
@@ -52,6 +59,24 @@ impl Level {
     }
 }
 
+/// Who writes a list's rules, whoever hosts the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Author {
+    /// The AdGuard team's own filters.
+    Adguard,
+    /// The uBlock Origin team's own lists (uAssets).
+    Ubo,
+    /// Anyone else, including a third-party list AdGuard's servers mirror.
+    ThirdParty,
+}
+
+impl Author {
+    /// Only the two teams that write the trusted scriptlets may use them.
+    pub const fn trusted(self) -> bool {
+        matches!(self, Author::Adguard | Author::Ubo)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct List {
     /// Stable id, used in settings and in the rule provenance map.
@@ -61,7 +86,8 @@ pub struct List {
     /// SPDX expression of the list's own licence.
     pub licence: &'static str,
     pub default: Default,
-    pub trusted: bool,
+    /// Who writes the list; its trust follows ([`List::trusted`]).
+    pub author: Author,
     /// The list's public project page; a report's issue page derives from it (plan 8.4).
     pub homepage: &'static str,
     pub kind: Kind,
@@ -70,6 +96,13 @@ pub struct List {
     pub description: &'static str,
     /// Primary language subtags (BCP 47) of the sites it is for; empty for every site.
     pub languages: &'static [&'static str],
+}
+
+impl List {
+    /// May this list's rules run trusted scriptlets? Derived from its author.
+    pub const fn trusted(&self) -> bool {
+        self.author.trusted()
+    }
 }
 
 /// Slice 10's rule, from plan 5.4: both arms pass, the gated rows turn on; only
@@ -87,7 +120,7 @@ macro_rules! adguard {
             url: concat!("https://filters.adtidy.org/extension/ublock/filters/", $n, ".txt"),
             licence: "GPL-3.0-only",
             default: Level::$level.default_of(),
-            trusted: true,
+            author: Author::Adguard,
             homepage: ADGUARD_HOME,
             kind: Kind::$kind,
             level: Level::$level,
@@ -105,7 +138,7 @@ macro_rules! uassets {
             url: concat!("https://ublockorigin.github.io/uAssets/filters/", $file),
             licence: "GPL-3.0-only",
             default: $default,
-            trusted: true,
+            author: Author::Ubo,
             homepage: UASSETS_HOME,
             kind: Kind::$kind,
             level: Level::$level,
@@ -126,7 +159,7 @@ pub const LISTS: &[List] = &[
         url: "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt",
         licence: "GPL-3.0-only",
         default: Level::Minimal.default_of(),
-        trusted: true,
+        author: Author::Adguard,
         homepage: "https://github.com/AdguardTeam/AdGuardSDNSFilter",
         kind: Kind::Ads,
         level: Level::Minimal,
@@ -240,6 +273,50 @@ mod tests {
         }
         assert_eq!(find("adguard-base").map(|l| l.homepage), Some(ADGUARD_HOME));
         assert_eq!(find("ubo-filters").map(|l| l.homepage), Some(UASSETS_HOME));
+    }
+
+    /// The owner's rule of 2026-11-20: trust follows the author. Every trusted
+    /// row is written by the uBO or the AdGuard team, and its author agrees with
+    /// its project page (the URL's host is not the test: AdGuard's servers also
+    /// mirror third-party lists).
+    #[test]
+    fn every_trusted_row_is_written_by_the_ubo_or_adguard_team() {
+        for l in LISTS {
+            assert_eq!(l.trusted(), matches!(l.author, Author::Adguard | Author::Ubo), "{}", l.id);
+            match l.author {
+                Author::Adguard => assert!(l.homepage.starts_with("https://github.com/AdguardTeam/"), "{}", l.id),
+                Author::Ubo => assert_eq!(l.homepage, UASSETS_HOME, "{}", l.id),
+                Author::ThirdParty => assert!(!l.trusted(), "{}", l.id),
+            }
+        }
+        assert!(!Author::ThirdParty.trusted());
+    }
+
+    /// A third-party list, even one served from AdGuard's own mirror, compiles
+    /// as untrusted: its trusted scriptlet injects nothing, while the same rule
+    /// from an AdGuard-authored row runs.
+    #[test]
+    fn a_third_party_list_cannot_run_a_trusted_scriptlet() {
+        use crate::resources::{load_bundle, sha256_hex};
+        use crate::rules::{ListText, RuleEngine};
+        const FIXTURE: &[u8] = include_bytes!("../testdata/resources-fixture.json");
+        const RULE: &str = "sieve-test.invalid##+js(trusted-sieve-flag, a)\n";
+        const URL: &str = "https://sieve-test.invalid/";
+        let mirrored = List {
+            id: "third-party-mirror",
+            title: "A community list",
+            url: concat!("https://filters.adtidy.org/extension/ublock/filters/", "101", ".txt"),
+            author: Author::ThirdParty,
+            ..*find("adguard-base").unwrap()
+        };
+        let scriptlets = |row: &List| {
+            let mut engine = RuleEngine::compile(&[ListText { id: row.id, text: RULE, trusted: row.trusted() }]);
+            engine.use_resources(&load_bundle(FIXTURE, &sha256_hex(FIXTURE)).unwrap());
+            engine.page_cosmetics(URL).scriptlets
+        };
+        assert!(scriptlets(&mirrored).is_empty(), "a third-party list gets no trusted scriptlet");
+        assert!(scriptlets(find("adguard-base").unwrap()).contains("sieveTrustedFlag"), "the control: AdGuard's own list does");
+        assert!(scriptlets(find("ubo-filters").unwrap()).contains("sieveTrustedFlag"), "and uBO's own list does");
     }
 
     #[test]

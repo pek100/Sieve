@@ -23,6 +23,8 @@ Each stage runs for a stated time while the owner works normally, then the check
 | 4. HTTPS filtering | Stage 3 plus the root certificate and HTTPS filtering, browsers only | 3 to 7 days | YouTube: no ads, no added stalls, mid-roll markers handled; in-page ads gone on the owner's usual sites; banking, health and other sensitive sites never decrypted; pinning apps self-heal; turning it off and removing the certificate leaves nothing |
 | 5. Daily use | Everything on, the owner's choice of settings | ongoing | Sieve replaces AdGuard; the owner reports anything odd through the log's report button |
 
+Gate before stage 4 (decided 2026-11-20, `docs/tasks/2026-11-06-open-decisions.md` item 5): slice 6's live checks U1 to U4 (`docs/live/engine-slice-6.md`) and slice 9's (`docs/live/engine-slice-9.md`) have passed on the VM, run through the owner's home connection. HTTPS filtering is available in the app before then; this PC does not turn it on until they pass.
+
 ## What only this PC can check
 
 - Attribution with WSL, local VMs and real daily apps (the slice 3 gate of 0.95 of all flows).

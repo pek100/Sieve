@@ -155,7 +155,7 @@ impl Lists {
     /// user's own lists that are on, in the policy's order.
     fn sources(&self) -> Vec<Source> {
         let inner = self.inner();
-        let rows = catalogue::selected(inner.selection.as_deref()).into_iter().map(|l| Source { id: l.id.to_string(), url: Some(l.url.to_string()), trusted: l.trusted });
+        let rows = catalogue::selected(inner.selection.as_deref()).into_iter().map(|l| Source { id: l.id.to_string(), url: Some(l.url.to_string()), trusted: l.trusted() });
         let own = inner.custom.iter().filter(|c| c.enabled).map(|c| Source { id: c.id.clone(), url: c.url.clone(), trusted: false });
         rows.chain(own).collect()
     }
