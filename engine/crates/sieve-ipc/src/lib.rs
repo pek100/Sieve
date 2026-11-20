@@ -28,7 +28,11 @@
 //!   `dns_capture` sent only to an app that names it there; the status's
 //!   `wifi_sign_in`, left out while there is nothing to say and sent only to an
 //!   app that names it, with `pause_dns_capture` and `resume_dns_capture`, which
-//!   an app sends only to an engine whose status carried that fact).
+//!   an app sends only to an engine whose status carried that fact; the
+//!   status's `link`, sent only to an app that names `link`, with `link_pair`,
+//!   `link_unpair` and `set_link`, which an app sends only to an engine whose
+//!   status carried it; the signals `hub_down`, `hub_refused`, `udp_dropped`,
+//!   the cause `hub` and the log outcome `exit`, appended as `retried` was).
 //!   A new message type is no shape change: a peer that never sends it is
 //!   unaffected, and the app and engine ship together.
 //!
@@ -82,7 +86,7 @@ pub const LOG_URL_MAX: usize = 2048;
 pub const LOG_RULE_MAX: usize = 1024;
 
 /// The `type` names of [`ClientMessage`], in declaration order.
-pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices", "list_refresh", "list_import", "list_rules", "issues", "pause_dns_capture", "resume_dns_capture"];
+pub const CLIENT_TYPES: &[&str] = &["hello", "status", "set_policy", "subscribe", "lists", "lists_refresh", "set_dns_upstreams", "dns_upstreams", "cert_status", "install_root", "request_update", "exclusions", "try_decrypt_again", "heal_notices", "list_refresh", "list_import", "list_rules", "issues", "pause_dns_capture", "resume_dns_capture", "link_pair", "link_unpair", "set_link"];
 /// The `type` names of [`EngineMessage`], in declaration order.
 pub const ENGINE_TYPES: &[&str] = &["welcome", "incompatible", "status", "error", "flows", "lists", "dns_upstreams", "log", "cert_status", "exclusions", "heal_notices", "list_imported", "list_rules", "issues"];
 /// At most this many apps in [`EngineMessage::Issues`]: past it the app whose
@@ -124,9 +128,23 @@ pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "ref
 /// field added to a message the app reads strictly goes only to an app that names
 /// it, so an app from before the field keeps reading the message. An engine
 /// ignores a name it does not know.
-pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE, CAPABILITY_WIFI_SIGN_IN, CAPABILITY_UPSTREAM_CHECKS];
+pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE, CAPABILITY_WIFI_SIGN_IN, CAPABILITY_UPSTREAM_CHECKS, CAPABILITY_LINK];
 /// [`EngineStatus::upstream_checks`].
 pub const CAPABILITY_UPSTREAM_CHECKS: &str = "upstream_checks";
+/// [`EngineStatus::link`]: exiting through another device (a Sieve link hub).
+/// An app that names it may send [`ClientMessage::LinkPair`],
+/// [`ClientMessage::LinkUnpair`] and [`ClientMessage::SetLink`], and only to an
+/// engine whose status carried the fact: an engine from before them ends the
+/// conversation on a message type it does not know.
+pub const CAPABILITY_LINK: &str = "link";
+/// A pairing code is at most this many bytes on the wire (a `sieve-link` code
+/// is about 143 characters; the rest is room for a later version).
+pub const LINK_CODE_MAX: usize = 512;
+/// A hub address to dial (`host:port`) is at most this many bytes.
+pub const LINK_ADDRESS_MAX: usize = 253 + 1 + 5;
+/// [`LinkStatus::last_error`] and an [`LogOutcome::Exit`] reason are cut to this
+/// many bytes.
+pub const LINK_TEXT_MAX: usize = 256;
 /// [`EngineStatus::dns_capture`].
 pub const CAPABILITY_DNS_CAPTURE: &str = "dns_capture";
 /// [`EngineStatus::wifi_sign_in`]. An app that names it may send
@@ -234,6 +252,222 @@ pub enum ClientMessage {
     /// "Resume now": ends a sign-in pause, if there is one. No field (a struct
     /// variant, as [`ClientMessage::RequestUpdate`]). Answered with Status.
     ResumeDnsCapture {},
+    /// Pair this engine with a hub: `code` is the hub's pairing code, at most
+    /// [`LINK_CODE_MAX`] bytes, never logged, echoed or kept after use. `route`
+    /// says how the link is made; None dials the address the code carries.
+    /// Answered at once with Status (its `link` reads `pairing` while the engine
+    /// redeems the code, which can wait for a hub that dials in); a code that
+    /// does not parse or has expired is an Error. Sent only to an engine whose
+    /// status carried `link` ([`CAPABILITY_LINK`]).
+    LinkPair {
+        code: LinkCode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<LinkRoute>,
+    },
+    /// Forget the hub: its record and this engine's key for it are deleted and
+    /// nothing exits through it any more. Answered with Status.
+    LinkUnpair {},
+    /// The owner's choices for the paired hub, applied at once and kept
+    /// (`link.json`). Refused with an Error while unpaired. Answered with Status.
+    SetLink(LinkSettings),
+}
+
+/// A pairing code as [`ClientMessage::LinkPair`] carries it: on the wire a plain
+/// string; in memory never printed (its `Debug` says only that it is there) and
+/// wiped when dropped.
+///
+/// Wiping is best effort, and what it covers is said here plainly. Wiped: this
+/// value (its whole allocation), the app's own copies (`engine_link_pair`), the
+/// frame the app writes it in ([`encode_secret`], built in one buffer so no
+/// outgrown copy is left behind) and the body every [`read_frame`] reads,
+/// the engine's included. Not wiped, out of this code's reach: the webview's
+/// JavaScript string and Tauri's IPC buffers on the app's side, serde's scratch
+/// space for a string with escapes (a code has none), and the named pipe's
+/// buffers in the OS and in tokio's I/O driver on both sides.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LinkCode(String);
+
+impl LinkCode {
+    /// The code itself, for the one place that redeems it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for LinkCode {
+    fn from(code: String) -> Self {
+        Self(code)
+    }
+}
+
+impl From<&str> for LinkCode {
+    fn from(code: &str) -> Self {
+        Self(code.to_string())
+    }
+}
+
+impl std::fmt::Debug for LinkCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LinkCode(<redacted>)")
+    }
+}
+
+/// Overwritten with zeros before its memory is freed (no dependency for it: the
+/// app's build shares this crate).
+impl Drop for LinkCode {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+/// Overwrites a string's whole allocation (its bytes and its spare capacity) with
+/// zeros and empties it: for a copy of a secret about to be dropped.
+pub fn wipe(s: &mut String) {
+    // SAFETY: the bytes are only zeroed and then the string is emptied, so it
+    // never holds anything but valid UTF-8 once this returns.
+    wipe_bytes(unsafe { s.as_mut_vec() });
+}
+
+/// [`wipe`] for bytes.
+pub fn wipe_bytes(v: &mut Vec<u8>) {
+    for b in v.iter_mut() {
+        // SAFETY: a valid, aligned pointer to an initialised byte of `v`.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    for b in v.spare_capacity_mut() {
+        // SAFETY: a valid, aligned pointer to a byte of `v`'s allocation; writing
+        // to spare capacity is allowed.
+        unsafe { std::ptr::write_volatile(b.as_mut_ptr(), 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    v.clear();
+}
+
+/// How the engine and its hub meet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "how", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LinkRoute {
+    /// The engine dials the hub at `address`: an IP address with its port
+    /// (`ip:port` or `[v6]:port`; a name is refused, as it would need DNS, which
+    /// may itself go through the link), at most [`LINK_ADDRESS_MAX`] bytes.
+    Dial { address: String },
+    /// The engine listens on this TCP port of the adapter Windows uses for the
+    /// internet, and the hub dials in (a hub behind a home router). The port is
+    /// open only while exiting through the hub is on and Sieve routes.
+    Listen { port: u16 },
+}
+
+/// What happens to a sieved app's new connection while the hub cannot be reached.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkHubDown {
+    /// It fails: nothing leaves from this computer's own address. The default.
+    #[default]
+    Stop,
+    /// It goes out directly from this computer, as without the hub.
+    Direct,
+}
+
+/// What happens to a sieved app's UDP to a public address while exiting through
+/// the hub (the link carries TCP only; QUIC is refused either way so browsers
+/// use TCP).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkUdp {
+    /// Dropped, with a log row. The default.
+    #[default]
+    Drop,
+    /// Sent directly from this computer.
+    Direct,
+}
+
+/// The owner's choices for the paired hub. Strict both ways (it arrives in
+/// [`ClientMessage::SetLink`], where an unknown field could carry a decision):
+/// a field added here goes only to an app that names a new capability, as
+/// [`EngineStatus::for_app`] does for the status's facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkSettings {
+    /// "Exit through the hub": sieved apps' connections leave through it.
+    pub exit: bool,
+    pub on_hub_down: LinkHubDown,
+    pub udp: LinkUdp,
+    pub route: LinkRoute,
+}
+
+/// Where the link stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkState {
+    /// No hub.
+    Unpaired,
+    /// A code is being redeemed (waiting for the hub, when it dials in).
+    Pairing,
+    /// Paired, and exiting through the hub is off.
+    Off,
+    /// Exiting is on and the link is not up yet (or Sieve does not route, so
+    /// nothing needs it).
+    Connecting,
+    /// Exiting is on and the link is up: sieved apps leave through the hub.
+    Up,
+    /// Exiting is on and the link was up and is gone; `last_error` says why
+    /// when the engine knows.
+    Down,
+    /// Decode only: a state a newer engine sent.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Exiting through another device, as the app shows it. Present (with
+/// `Unpaired` when there is no hub) from an engine that can do it, sent only
+/// to an app that names [`CAPABILITY_LINK`]. Takes unknown fields, as
+/// [`EngineStatus`] does. Never carries a key or a pairing code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkStatus {
+    pub state: LinkState,
+    /// The hub's own name, as it answered the pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_name: Option<String>,
+    /// The hub's key fingerprint (SHA-256 of its public key, hex): what the
+    /// owner compares with `sieve-hub` on the other device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_fingerprint: Option<String>,
+    /// This engine's own key fingerprint, as the hub lists the device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_fingerprint: Option<String>,
+    /// The choices in force; None while unpaired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<LinkSettings>,
+    /// Wall ms since the state is what it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    /// Why the last attempt failed, at most [`LINK_TEXT_MAX`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// While listening: the exact address and port open for the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listening: Option<String>,
+}
+
+/// How a flow went out while exiting through a hub was on ([`LogOutcome::Exit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitVia {
+    /// Through the hub: sites see the hub's address.
+    Hub,
+    /// Directly from this computer: the hub was unreachable and the setting
+    /// says go direct, or UDP whose setting says so.
+    Direct,
+    /// Not at all: the hub was unreachable and the setting says stop.
+    Stopped,
+    /// The hub answered and refused it (`reason` is the hub's word).
+    Refused,
+    /// UDP the link does not carry, dropped.
+    Dropped,
+    /// Decode only: a way a newer engine sent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Engine to app. Read and written one frame at a time and never stored, so the
@@ -324,6 +558,14 @@ pub enum Signal {
     /// `QuicRefused` (the TENSION at [`LogOutcome`] holds for it too: an older app
     /// and this engine ship together).
     HandshakeAbandoned,
+    /// Exiting through another device: it could not be reached, and the setting
+    /// stops connections then. Appended (as `HandshakeAbandoned`).
+    HubDown,
+    /// Exiting through another device: it answered and refused the connection
+    /// (its rules, its limits, or it could not reach the server itself).
+    HubRefused,
+    /// Exiting through another device: UDP the link does not carry was dropped.
+    UdpDropped,
     /// Decode only: a signal a newer engine sent that this build does not know. It
     /// reads as this, so one new kind never fails a whole `Log` or `Issues` frame
     /// for an app and engine out of step. The engine never sends it; not in
@@ -340,6 +582,10 @@ pub enum Cause {
     Sieve,
     /// The same would happen without Sieve: the server or the network refused it.
     Network,
+    /// The other device this computer exits through: it was down, or it refused.
+    /// Neither the app nor Sieve's filtering did it. Appended; an app from before
+    /// it reads `Unknown`.
+    Hub,
     /// The signal cannot tell. A cause a newer engine sent that this build does not
     /// know reads as this too, as [`Signal::Unknown`] does.
     #[serde(other)]
@@ -347,7 +593,7 @@ pub enum Cause {
 }
 
 impl Signal {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 15] = [
         Self::ConnectRefused,
         Self::ConnectTimeout,
         Self::Unreachable,
@@ -360,6 +606,9 @@ impl Signal {
         Self::Blocked,
         Self::QuicRefused,
         Self::HandshakeAbandoned,
+        Self::HubDown,
+        Self::HubRefused,
+        Self::UdpDropped,
     ];
 
     /// The classification table, the only one: a signal decides its cause.
@@ -370,18 +619,23 @@ impl Signal {
     ///   broke it, and a lookup with no answer may be the resolvers Sieve asks or
     ///   the network that blocks them; a handshake the app gave up on says nothing
     ///   of why.
+    /// - Hub: the device this computer exits through was down or refused; the
+    ///   app is not at fault and neither is the filtering. UDP the link does not
+    ///   carry is dropped by Sieve, on the owner's setting: Sieve's, and meant.
     pub fn cause(self) -> Cause {
         match self {
-            Self::EgressFailed | Self::AppRefusedCertificate | Self::Blocked | Self::QuicRefused => Cause::Sieve,
+            Self::EgressFailed | Self::AppRefusedCertificate | Self::Blocked | Self::QuicRefused | Self::UdpDropped => Cause::Sieve,
             Self::ConnectRefused | Self::ConnectTimeout | Self::Unreachable => Cause::Network,
+            Self::HubDown | Self::HubRefused => Cause::Hub,
             Self::ConnectFailed | Self::ConnectionLost | Self::Stall | Self::DnsUnanswered | Self::HandshakeAbandoned | Self::Unknown => Cause::Unknown,
         }
     }
 
-    /// Sieve meant it: a rule's block, or a QUIC refusal the app answers by
-    /// falling back to TCP. Shown, but never read as the app failing.
+    /// Sieve meant it: a rule's block, a QUIC refusal the app answers by falling
+    /// back to TCP, or UDP dropped because the link carries none. Shown, but
+    /// never read as the app failing.
     pub fn intended(self) -> bool {
-        matches!(self, Self::Blocked | Self::QuicRefused)
+        matches!(self, Self::Blocked | Self::QuicRefused | Self::UdpDropped)
     }
 }
 
@@ -892,6 +1146,10 @@ pub struct EngineStatus {
     pub upstream_checks: Option<UpstreamChecks>,
     /// Signed updates (protocol 3).
     pub update: UpdateStatus,
+    /// Exiting through another device; left out by an engine from before it and
+    /// for an app that does not name [`CAPABILITY_LINK`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkStatus>,
 }
 
 /// The local checks of an upstream chain (plan 2.6, slice 11) that have data.
@@ -920,6 +1178,9 @@ impl EngineStatus {
         }
         if !capabilities.iter().any(|c| c == CAPABILITY_UPSTREAM_CHECKS) {
             self.upstream_checks = None;
+        }
+        if !capabilities.iter().any(|c| c == CAPABILITY_LINK) {
+            self.link = None;
         }
         self
     }
@@ -1194,6 +1455,17 @@ pub enum LogOutcome {
     Problem { signal: Signal, cause: Cause },
     /// Sieve's connect failed and was tried again before the app saw anything.
     Retried { how: RetryHow, recovered: bool },
+    /// Exiting through another device was on: how this flow went out. `target`
+    /// is what the hub was asked to connect to (a name, else an address, with
+    /// its port), `reason` the hub's own word for a refusal or the engine's for
+    /// a stop or a drop, at most [`LINK_TEXT_MAX`] bytes. Appended, as `Retried`.
+    Exit {
+        via: ExitVia,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// One row of the filtering log. A host-level row leaves `url` and
@@ -1322,6 +1594,26 @@ pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
+/// How large a frame [`encode_secret`] builds at most.
+pub const SECRET_FRAME: usize = 4096;
+
+/// [`encode`] for a message that carries a secret (`LinkPair`'s code): built in
+/// one buffer of [`SECRET_FRAME`] bytes allocated once, so serializing leaves no
+/// copy behind in a buffer it outgrew; the caller wipes it ([`wipe_bytes`]) once
+/// written. A larger message is refused, and nothing it held is left.
+pub fn encode_secret<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
+    let mut frame = vec![0u8; SECRET_FRAME];
+    let mut body = std::io::Cursor::new(&mut frame[4..]);
+    let written = serde_json::to_writer(&mut body, msg).map(|()| body.position() as usize);
+    let Ok(len) = written else {
+        wipe_bytes(&mut frame);
+        return Err(FrameError::TooLarge(SECRET_FRAME));
+    };
+    frame[..4].copy_from_slice(&u32::try_from(len).expect("under SECRET_FRAME").to_le_bytes());
+    frame.truncate(4 + len);
+    Ok(frame)
+}
+
 /// The body length a frame header announces, refused over [`MAX_FRAME`].
 pub fn body_len(header: [u8; 4]) -> Result<usize, FrameError> {
     let len = u32::from_le_bytes(header) as usize;
@@ -1339,14 +1631,27 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Fra
     Ok(())
 }
 
+/// A frame's body being read: wiped when dropped, however the read ends (parsed,
+/// failed, or a future reading it dropped half way, as a timeout does), since it
+/// may carry a pairing code ([`LinkCode`]).
+struct Body<'a>(&'a mut Vec<u8>);
+
+impl Drop for Body<'_> {
+    fn drop(&mut self) {
+        wipe_bytes(self.0);
+    }
+}
+
 /// Reads one frame. A length over [`MAX_FRAME`] is refused without reading
-/// the body; EOF before the length is [`FrameError::Closed`].
+/// the body; EOF before the length is [`FrameError::Closed`]. The body is wiped
+/// once parsed: it may have carried a pairing code ([`LinkCode`]).
 pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
     let mut header = [0u8; 4];
     r.read_exact(&mut header).map_err(header_error)?;
-    let mut body = vec![0u8; body_len(header)?];
-    r.read_exact(&mut body)?;
-    Ok(serde_json::from_slice(&body)?)
+    let mut bytes = vec![0u8; body_len(header)?];
+    let body = Body(&mut bytes);
+    r.read_exact(&mut body.0[..])?;
+    Ok(serde_json::from_slice(&body.0[..])?)
 }
 
 /// The same framing over tokio streams (the engine's pipe server and the
@@ -1357,7 +1662,7 @@ pub mod nonblocking {
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-    use super::{FrameError, body_len, encode, header_error};
+    use super::{Body, FrameError, body_len, encode, encode_secret, header_error, wipe_bytes};
 
     pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
         w.write_all(&encode(msg)?).await?;
@@ -1365,12 +1670,26 @@ pub mod nonblocking {
         Ok(())
     }
 
+    /// [`write_frame`] for a message that carries a secret: [`encode_secret`], and
+    /// the frame wiped once written (or not).
+    pub async fn write_secret_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
+        let mut frame = encode_secret(msg)?;
+        let written = w.write_all(&frame).await;
+        wipe_bytes(&mut frame);
+        written?;
+        w.flush().await?;
+        Ok(())
+    }
+
+    /// Reads one frame; the body is wiped once parsed, and also when this future
+    /// is dropped half way through it (a timeout around it) (`super::read_frame`).
     pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
         let mut header = [0u8; 4];
         r.read_exact(&mut header).await.map_err(header_error)?;
-        let mut body = vec![0u8; body_len(header)?];
-        r.read_exact(&mut body).await?;
-        Ok(serde_json::from_slice(&body)?)
+        let mut bytes = vec![0u8; body_len(header)?];
+        let body = Body(&mut bytes);
+        r.read_exact(&mut body.0[..]).await?;
+        Ok(serde_json::from_slice(&body.0[..])?)
     }
 }
 
@@ -1495,6 +1814,9 @@ mod tests {
             ClientMessage::Issues { .. } => "issues",
             ClientMessage::PauseDnsCapture { .. } => "pause_dns_capture",
             ClientMessage::ResumeDnsCapture {} => "resume_dns_capture",
+            ClientMessage::LinkPair { .. } => "link_pair",
+            ClientMessage::LinkUnpair {} => "link_unpair",
+            ClientMessage::SetLink(_) => "set_link",
         };
         let engine = |m: &EngineMessage| match m {
             EngineMessage::Welcome { .. } => "welcome",
@@ -1563,6 +1885,20 @@ mod tests {
         let mut frame = (unknown.len() as u32).to_le_bytes().to_vec();
         frame.extend_from_slice(unknown);
         assert!(matches!(read_frame::<_, ClientMessage>(&mut frame.as_slice()), Err(FrameError::Json(_))));
+    }
+
+    /// A frame's body is wiped by its guard whenever the read ends, so a read cut
+    /// off half way (the future dropped by a timeout) leaves no copy of a code.
+    #[test]
+    fn a_frame_body_is_wiped_when_its_read_ends_any_way() {
+        let mut bytes = br#"{"code":"SL1-secret"}"#.to_vec();
+        bytes.reserve(64);
+        drop(Body(&mut bytes));
+        assert!(bytes.is_empty());
+        // The allocation itself holds zeros (its bytes and its spare capacity).
+        let all = bytes.spare_capacity_mut();
+        // SAFETY: wipe_bytes wrote every byte of the allocation.
+        assert!(all.iter().all(|b| unsafe { b.assume_init() } == 0));
     }
 
     #[cfg(feature = "tokio")]
@@ -1682,16 +2018,101 @@ mod tests {
             LogOutcome::NotDecrypted { .. } => "not_decrypted",
             LogOutcome::Problem { .. } => "problem",
             LogOutcome::Retried { .. } => "retried",
+            LogOutcome::Exit { .. } => "exit",
         };
         let mut seen = Vec::new();
+        let mut vias = Vec::new();
         for o in outcomes {
             let parsed: LogOutcome = serde_json::from_value(o.clone()).unwrap();
             assert_eq!(&serde_json::to_value(&parsed).unwrap(), o);
             assert_eq!(name(&parsed), o["kind"]);
             seen.push(name(&parsed));
+            if let LogOutcome::Exit { via, reason, .. } = &parsed {
+                vias.push(*via);
+                assert!(reason.as_ref().is_none_or(|r| r.len() <= LINK_TEXT_MAX));
+            }
         }
         seen.dedup();
-        assert_eq!(seen, ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted", "problem", "retried"]);
+        assert_eq!(seen, ["blocked", "redirected", "params_removed", "hidden", "scriptlets", "passed", "not_decrypted", "problem", "retried", "exit"]);
+        // The last is the engine's own note on no single connection (the way out changed).
+        assert_eq!(vias, [ExitVia::Hub, ExitVia::Direct, ExitVia::Stopped, ExitVia::Refused, ExitVia::Dropped, ExitVia::Hub], "every way, so the TS law sees each name");
+        let later: LogOutcome = serde_json::from_value(serde_json::json!({ "kind": "exit", "via": "carrier_pigeon" })).unwrap();
+        assert_eq!(later, LogOutcome::Exit { via: ExitVia::Unknown, target: None, reason: None }, "a way from a newer engine reads as unknown");
+    }
+
+    /// The link fact goes only to an app that names `link`; every fixture state
+    /// round trips; an engine from before it sends none; the messages that
+    /// change it are strict and carry nothing but their fields.
+    #[test]
+    fn link_status_goes_only_to_an_app_that_names_it_and_its_messages_are_strict() {
+        let states: Vec<LinkStatus> = serde_json::from_value(fixture()["linkStatuses"].clone()).unwrap();
+        assert_eq!(serde_json::to_value(&states).unwrap(), fixture()["linkStatuses"], "the app reads the same bytes");
+        let seen: Vec<LinkState> = states.iter().map(|s| s.state).collect();
+        for state in [LinkState::Unpaired, LinkState::Pairing, LinkState::Off, LinkState::Connecting, LinkState::Up, LinkState::Down] {
+            assert!(seen.contains(&state), "{state:?} has a fixture example");
+        }
+        assert!(states.iter().all(|s| s.last_error.as_ref().is_none_or(|e| e.len() <= LINK_TEXT_MAX)));
+        let text = fixture()["linkStatuses"].to_string();
+        for banned in ["SL1-", "secret", "pkcs8", "private"] {
+            assert!(!text.contains(banned), "a status never carries a code or a key: {banned}");
+        }
+
+        let status = EngineStatus { link: Some(states[3].clone()), ..EngineStatus::default() };
+        assert!(status.clone().for_app(&[CAPABILITY_DNS_CAPTURE.into(), CAPABILITY_WIFI_SIGN_IN.into()]).link.is_none(), "an app from before it");
+        assert!(serde_json::to_value(status.clone().for_app(&[])).unwrap().get("link").is_none());
+        assert_eq!(status.clone().for_app(&[CAPABILITY_LINK.into()]), status);
+        assert_eq!(serde_json::from_value::<EngineStatus>(serde_json::to_value(&status).unwrap()).unwrap(), status);
+        let old_engine = fixture()["engine"].as_array().unwrap().iter().find(|m| m["type"] == "status").unwrap().clone();
+        let EngineMessage::Status(read) = serde_json::from_value(old_engine.clone()).unwrap() else { panic!("a status") };
+        assert!(read.link.is_none(), "an engine from before it: no section");
+        let mut newer = old_engine;
+        newer["link"] = serde_json::json!({ "state": "teleporting", "later": 1 });
+        let EngineMessage::Status(read) = serde_json::from_value(newer).unwrap() else { panic!("a status") };
+        assert_eq!(read.link.map(|l| l.state), Some(LinkState::Unknown), "a newer engine's state still reads");
+
+        let pair = ClientMessage::LinkPair { code: "SL1-X".into(), route: None };
+        assert_eq!(serde_json::to_value(&pair).unwrap(), serde_json::json!({ "type": "link_pair", "code": "SL1-X" }));
+        let secret = ClientMessage::LinkPair { code: "SL1-SECRETCODEVALUE".into(), route: Some(LinkRoute::Listen { port: 7443 }) };
+        let printed = format!("{secret:?} {secret:#?}");
+        assert!(!printed.contains("SECRETCODEVALUE") && printed.contains("<redacted>"), "Debug never prints the code: {printed}");
+        let read: ClientMessage = serde_json::from_str(r#"{"type":"link_pair","code":"SL1-SECRETCODEVALUE"}"#).unwrap();
+        assert!(matches!(&read, ClientMessage::LinkPair { code, .. } if code.expose() == "SL1-SECRETCODEVALUE"), "the wire is a plain string");
+        for bad in [
+            r#"{"type":"link_pair"}"#,
+            r#"{"type":"link_pair","code":"c","log":true}"#,
+            r#"{"type":"link_pair","code":"c","route":{"how":"listen","port":7443,"any":1}}"#,
+            r#"{"type":"link_unpair","hub":"h"}"#,
+            r#"{"type":"set_link","exit":true,"on_hub_down":"stop","udp":"drop"}"#,
+            r#"{"type":"set_link","exit":true,"on_hub_down":"stop","udp":"drop","route":{"how":"dial","address":"a:1"},"key":"k"}"#,
+            r#"{"type":"set_link","exit":true,"on_hub_down":"maybe","udp":"drop","route":{"how":"dial","address":"a:1"}}"#,
+        ] {
+            assert!(serde_json::from_str::<ClientMessage>(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Round 2's P3: a secret's frame is the same frame, built in one buffer and
+    /// refused whole when too large; a wiped string is empty and its allocation
+    /// zeroed; a read frame parses as before (its body is wiped after).
+    #[test]
+    fn a_secrets_frame_is_the_same_frame_and_wiping_zeroes_the_whole_allocation() {
+        let pair = ClientMessage::LinkPair { code: "SL1-SECRETCODEVALUE".into(), route: Some(LinkRoute::Dial { address: "203.0.113.20:7443".into() }) };
+        let frame = encode_secret(&pair).unwrap();
+        assert_eq!(frame, encode(&pair).unwrap());
+        assert_eq!(frame.capacity(), SECRET_FRAME, "never outgrown, so never copied");
+        let read: ClientMessage = read_frame(&mut frame.as_slice()).unwrap();
+        assert_eq!(read, pair);
+        let huge = ClientMessage::LinkPair { code: "x".repeat(SECRET_FRAME).into(), route: None };
+        assert!(matches!(encode_secret(&huge), Err(FrameError::TooLarge(_))));
+
+        let mut s = String::with_capacity(64);
+        s.push_str("SL1-SECRETCODEVALUE");
+        let (at, capacity) = (s.as_ptr(), s.capacity());
+        wipe(&mut s);
+        assert!(s.is_empty());
+        assert_eq!((s.as_ptr(), s.capacity()), (at, capacity), "the same allocation, kept for the check");
+        // SAFETY: `s` still owns this allocation of `capacity` bytes, all zeroed above.
+        let bytes = unsafe { std::slice::from_raw_parts(at, capacity) };
+        assert!(bytes.iter().all(|&b| b == 0), "every byte of the allocation is zero");
     }
 
     /// The status's filter facts are additive: without them the wire is as
@@ -1922,7 +2343,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&parsed).unwrap(), bare, "empty is left out");
         let named = ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.2.0".into(), capabilities: APP_CAPABILITIES.iter().map(ToString::to_string).collect() };
         let wire = serde_json::to_value(&named).unwrap();
-        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture", "wifi_sign_in", "upstream_checks"]));
+        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture", "wifi_sign_in", "upstream_checks", "link"]));
         assert_eq!(serde_json::from_value::<ClientMessage>(wire).unwrap(), named);
 
         let status = EngineStatus { routes_up: true, dns_capture: Some(DnsCapture::Working), ..EngineStatus::default() };
@@ -2256,7 +2677,7 @@ mod tests {
     /// `cause` or `intended` has to change this table too.
     #[test]
     fn every_signal_has_its_cause() {
-        use Cause::{Network, Sieve, Unknown};
+        use Cause::{Hub, Network, Sieve, Unknown};
         let table = [
             (Signal::ConnectRefused, Network, false),
             (Signal::ConnectTimeout, Network, false),
@@ -2270,6 +2691,9 @@ mod tests {
             (Signal::Blocked, Sieve, true),
             (Signal::QuicRefused, Sieve, true),
             (Signal::HandshakeAbandoned, Unknown, false),
+            (Signal::HubDown, Hub, false),
+            (Signal::HubRefused, Hub, false),
+            (Signal::UdpDropped, Sieve, true),
         ];
         assert_eq!(table.map(|(s, _, _)| s), Signal::ALL, "every signal, in order");
         for (signal, cause, intended) in table {
@@ -2305,7 +2729,7 @@ mod tests {
         for s in Signal::ALL {
             assert!(f.contains(&serde_json::to_string(&s).unwrap()), "{s:?}");
         }
-        for c in [Cause::Sieve, Cause::Network, Cause::Unknown] {
+        for c in [Cause::Sieve, Cause::Network, Cause::Hub, Cause::Unknown] {
             assert!(f.contains(&serde_json::to_string(&c).unwrap()), "{c:?}");
         }
     }

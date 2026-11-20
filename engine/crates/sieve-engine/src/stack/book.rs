@@ -148,6 +148,10 @@ pub struct FlowBook {
     candidates: Vec<u64>,
     /// Until when the last look, which found no flow idle, stands.
     none_idle_until: Option<std::time::Instant>,
+    /// Open flows that went directly from this computer while exiting was on
+    /// (`exit` with [`ExitVia::Direct`]), so they can be ended once that way out
+    /// no longer holds (the hub is back, or Stop is set).
+    went_direct: BTreeSet<u64>,
 }
 
 impl std::fmt::Debug for FlowBook {
@@ -181,6 +185,7 @@ impl FlowBook {
             evicted: 0,
             candidates: Vec::new(),
             none_idle_until: None,
+            went_direct: BTreeSet::new(),
         }
     }
 
@@ -213,6 +218,34 @@ impl FlowBook {
         }
         if !signal.intended() {
             self.push_row(id, now, None, LogOutcome::Problem { signal, cause: signal.cause() }, None, None, Vec::new());
+        }
+    }
+
+    /// Exiting through a hub: how an open flow went out (`link::exit::ExitReport`),
+    /// as one row, and the app's problem when there is one. The row stands for
+    /// the problem's own row, so a stop or a refusal is said once, with the hub's
+    /// reason; the problem is named, so the flow's close adds no other.
+    pub fn exit(&mut self, id: u64, report: crate::link::exit::ExitReport) {
+        let now = (self.clock)();
+        let host = self.open.get(&id).map(|e| e.host.clone().unwrap_or_else(|| remote_ip(&e.remote)));
+        if let (Some(signal), Some(host), Some(o)) = (report.signal, host, self.owners.get_mut(&id)) {
+            o.named = true;
+            self.issues.problem(&o.app, o.exe.as_deref(), signal, Some(&host), now);
+        }
+        if report.via == sieve_ipc::ExitVia::Direct && self.open.contains_key(&id) {
+            self.went_direct.insert(id);
+        }
+        let reason = report.reason.map(|r| cap_text(&r, sieve_ipc::LINK_TEXT_MAX).to_string());
+        self.push_row(id, now, None, LogOutcome::Exit { via: report.via, target: report.target, reason }, None, None, Vec::new());
+    }
+
+    /// An open flow is about to connect directly from this computer while exiting
+    /// is on (hub down, Direct set): marked before its connect, so a change that
+    /// ends what went directly ([`Self::end_where`]) finds it while it connects.
+    /// Its row comes with [`Self::exit`] once the connect is done.
+    pub fn going_direct(&mut self, id: u64) {
+        if self.open.contains_key(&id) {
+            self.went_direct.insert(id);
         }
     }
 
@@ -322,6 +355,57 @@ impl FlowBook {
         }
     }
 
+    /// Ends every open flow `which` names (by its event, its row's key, None for an
+    /// unknown app, and whether it went directly while exiting was on), as the cap
+    /// does: a TCP flow is reset, a UDP flow's relay stops, and its relay closes it
+    /// as usual. Only a flow registered with a handle can be ended. Returns how
+    /// many. Bounded by the flows open, under one lock.
+    pub fn end_where(&mut self, which: impl Fn(&FlowEvent, Option<&str>, bool) -> bool) -> usize {
+        let ids: Vec<u64> = self.idle.keys().copied().filter(|id| self.open.get(id).is_some_and(|e| which(e, self.owners.get(id).map(|o| o.app.key.as_str()), self.went_direct.contains(id)))).collect();
+        for id in &ids {
+            if let Some(connection) = self.idle.remove(id) {
+                connection.evict();
+            }
+        }
+        ids.len()
+    }
+
+    /// Takes an open flow's handle back from the book, so nothing ends it any
+    /// more: true when it was still there, false when [`Self::end_where`] (or the
+    /// cap) ended the flow already.
+    pub fn release(&mut self, id: u64) -> bool {
+        self.idle.remove(&id).is_some()
+    }
+
+    /// One row of the engine's own, about no single flow (the services' session,
+    /// so every client sees it).
+    pub fn note(&mut self, outcome: LogOutcome) {
+        if self.log.len() >= MAX_PENDING_LOG {
+            self.next_log_id += 1;
+            return;
+        }
+        self.next_log_id += 1;
+        let row = LogRow {
+            id: self.next_log_id,
+            t: (self.clock)(),
+            flow_id: 0,
+            pid: None,
+            exe: None,
+            session: Some(0),
+            kind: sieve_ipc::FlowKind::Other,
+            host: "Sieve".into(),
+            remote: String::new(),
+            url: None,
+            request_type: None,
+            outcome,
+            rule: None,
+            list: None,
+            forwarded: None,
+            changes: Vec::new(),
+        };
+        self.log.push(row);
+    }
+
     /// Flows ended to make room since the engine started.
     pub fn evicted(&self) -> u64 {
         self.evicted
@@ -412,6 +496,7 @@ impl FlowBook {
     pub fn close(&mut self, id: u64, action: FlowAction, bytes_up: u64, bytes_down: u64) {
         self.idle.remove(&id);
         self.evicting.remove(&id);
+        self.went_direct.remove(&id);
         if self.owners.get(&id).is_some_and(|o| !o.named) {
             match action {
                 FlowAction::Blocked => self.problem(id, Signal::Blocked),

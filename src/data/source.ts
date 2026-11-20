@@ -10,7 +10,7 @@ import { createMockSource, MOCK_SCENARIOS, type MockScenario } from "./mock-sour
 import type { HistoryQuery } from "@/core/history";
 import type { AppIcon, History, Snapshot } from "./protocol";
 import { createTauriSource } from "./tauri-source";
-import { CERT_SCENARIOS, createMockEngine, ENGINE_SCENARIOS, ISSUES_SCENARIOS, type CertScenario, type EngineScenario, type IssuesScenario } from "./engine-mock";
+import { CERT_SCENARIOS, createMockEngine, ENGINE_SCENARIOS, ISSUES_SCENARIOS, LINK_SCENARIOS, type CertScenario, type EngineScenario, type IssuesScenario, type LinkScenario } from "./engine-mock";
 import { createTauriEngine, type EngineSource } from "./engine-source";
 import { createMockWindowsDns, createTauriWindowsDns, type WindowsDnsSource } from "./safety-net";
 import { FILTER_LIST_SCENARIOS, createMockFilterLists, type FilterListScenario } from "./filter-lists-mock";
@@ -64,6 +64,8 @@ export interface SourceOptions {
   heal: boolean;
   /** Mock: apps' recent problems (?issues=none|some|partial|error, default none). */
   issues: IssuesScenario;
+  /** Mock: exiting through another device (?link=none|unpaired|pairing|off|connecting|up|down, default none: an engine from before it). */
+  link: LinkScenario;
 }
 
 /** Read the source choice from the environment: query string and Tauri presence. */
@@ -85,6 +87,8 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
   const lock = (LOCK_SCENARIOS as readonly string[]).includes(lo ?? "") ? (lo as LockScenario) : "none";
   const is = q.get("issues");
   const issues = (ISSUES_SCENARIOS as readonly string[]).includes(is ?? "") ? (is as IssuesScenario) : "none";
+  const lk = q.get("link");
+  const link = (LINK_SCENARIOS as readonly string[]).includes(lk ?? "") ? (lk as LinkScenario) : "none";
   return {
     kind,
     seed,
@@ -99,6 +103,7 @@ export function sourceOptions(env: { search: string; isTauri: boolean }): Source
     welcome: q.get("welcome") === "1",
     heal: q.get("heal") === "1",
     issues,
+    link,
   };
 }
 
@@ -118,7 +123,7 @@ export function createWindowsDnsSource(o: SourceOptions): WindowsDnsSource {
 
 /** The engine seam follows the same choice: the Tauri command, or the mock. */
 export function createEngineSource(o: SourceOptions): EngineSource {
-  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine, { seed: o.seed, logError: o.logError, cert: o.cert, heal: o.heal, issues: o.issues });
+  return o.kind === "tauri" ? createTauriEngine() : createMockEngine(o.engine, { seed: o.seed, logError: o.logError, cert: o.cert, heal: o.heal, issues: o.issues, link: o.link });
 }
 
 /** The filter list seam follows the same choice. */

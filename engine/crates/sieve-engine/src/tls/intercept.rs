@@ -71,6 +71,21 @@ pub type DialFuture<'a, S> = Pin<Box<dyn Future<Output = Result<S, String>> + Se
 pub trait Dial: Send + Sync + 'static {
     type Stream: AsyncRead + AsyncWrite + Reset + Unpin + Send + 'static;
     fn dial(&self, target: SocketAddr) -> DialFuture<'_, Self::Stream>;
+    /// A fresh socket for flow `flow` whose host is known. Exiting through a hub
+    /// asks the hub for `host` by name and writes how it went on the flow's row
+    /// (`link::exit::Exit`); otherwise `dial`.
+    fn dial_named<'a>(&'a self, target: SocketAddr, host: &'a str, flow: u64) -> DialFuture<'a, Self::Stream> {
+        let _ = (host, flow);
+        self.dial(target)
+    }
+    /// Resolves once the SYN-time stream is connected, or with why not. A stream
+    /// opened only once the flow was decided (through a hub) is waited for here,
+    /// so its failure is the flow's and never a verdict on the site's
+    /// certificate; a socket is connected already.
+    fn ready<'a>(&'a self, stream: &'a mut Self::Stream) -> DialFuture<'a, ()> {
+        let _ = stream;
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// An (app, host) as slice 7's evidence reads it (plan 4.3).
@@ -336,11 +351,11 @@ impl<C: Dial> Interception<C> {
 
     /// The pass-through after an upstream handshake: its socket has spoken, so
     /// the client's bytes go on a fresh one. A failed connect closes the app.
-    async fn fresh_splice<A>(&self, app: &mut AppSide<A>, remote: SocketAddr, held: &[u8]) -> FlowAction
+    async fn fresh_splice<A>(&self, app: &mut AppSide<A>, id: u64, remote: SocketAddr, host: &str, held: &[u8]) -> FlowAction
     where
         A: AsyncRead + AsyncWrite + Abort + Unpin,
     {
-        let Ok(fresh) = self.connector.dial(remote).await else { return FlowAction::Failed };
+        let Ok(fresh) = self.connector.dial_named(remote, host, id).await else { return FlowAction::Failed };
         let closed = app.closed();
         if splice(app, fresh, held, closed).await { FlowAction::Relayed } else { FlowAction::Failed }
     }
@@ -349,7 +364,7 @@ impl<C: Dial> Interception<C> {
     /// an attempt with ECH leaves no verdict, marks the host and dials a fresh
     /// socket for the plain handshake; a failed dial is `Unavailable`, which ends
     /// in `fresh_splice`.
-    async fn shake(&self, upstream: C::Stream, host: &str, remote: SocketAddr, alpn: Vec<Vec<u8>>) -> HandshakeEnd<C::Stream> {
+    async fn shake(&self, upstream: C::Stream, id: u64, host: &str, remote: SocketAddr, alpn: Vec<Vec<u8>>) -> HandshakeEnd<C::Stream> {
         let now = (self.clock)();
         let config = self.ech.config_for(host, remote.port(), now).await.and_then(|list| usable_config(&list));
         let Some(config) = config else { return handshake(upstream, host, alpn, None).await };
@@ -359,7 +374,7 @@ impl<C: Dial> Interception<C> {
             HandshakeEnd::EchFailed => {
                 Meters::bump(&meters.ech_failed);
                 self.ech.mark_negative(host, now);
-                let Ok(fresh) = self.connector.dial(remote).await else { return HandshakeEnd::Failed(UpstreamVerdict::Unavailable) };
+                let Ok(fresh) = self.connector.dial_named(remote, host, id).await else { return HandshakeEnd::Failed(UpstreamVerdict::Unavailable) };
                 handshake(fresh, host, alpn, None).await
             }
             end => {
@@ -438,8 +453,13 @@ where
     }
     // `decrypt` said a name is there, or it would have been `floor:no-sni`.
     let (Some(host), Some(registered)) = (host, registered) else { return FlowAction::Relayed };
+    // A stream opened through a hub only now: its failure ends the flow, and
+    // leaves no verdict on the site.
+    if deps.connector.ready(&mut upstream).await.is_err() {
+        return FlowAction::Failed;
+    }
 
-    let (shaken, verdict) = match deps.shake(upstream, host, flow.remote, filter_alpn(&decoded.alpn)).await {
+    let (shaken, verdict) = match deps.shake(upstream, flow.id, host, flow.remote, filter_alpn(&decoded.alpn)).await {
         // Written down only if the chain is good: anyone can ask, and the rest
         // stay in the bounded verdict cache. No trust call: the flow passes
         // through either way.
@@ -503,7 +523,7 @@ where
             drop(shaken);
             drop(registered);
             deps.not_decrypted(flow.id, &reason);
-            return deps.fresh_splice(&mut app, flow.remote, &held).await;
+            return deps.fresh_splice(&mut app, flow.id, flow.remote, host, &held).await;
         }
     };
     intercept(deps, app, *shaken, leaf, registered, held, flow).await
@@ -556,10 +576,11 @@ where
     let config = match config {
         Ok(config) => config,
         Err(reason) => {
+            let host = host.to_string();
             drop(shaken);
             drop(registered);
             deps.not_decrypted(flow.id, &reason);
-            return deps.fresh_splice(&mut app, flow.remote, &held).await;
+            return deps.fresh_splice(&mut app, flow.id, flow.remote, &host, &held).await;
         }
     };
     let pair = Pair { exe: flow.exe.map(str::to_string), host: host.to_string(), session: flow.session };

@@ -26,8 +26,9 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
       welcome: false,
       heal: false,
       issues: "none",
+      link: "none",
     });
-    expect(sourceOptions({ search: "?seed=abc&scenario=nope", isTauri: false })).toEqual({
+    expect(sourceOptions({ search: "?seed=abc&scenario=nope&link=teleport", isTauri: false })).toEqual({
       kind: "mock",
       seed: 1,
       scenario: "steady",
@@ -41,7 +42,9 @@ describe("source choice (seam law: Tauri when present, mock forced by ?source=mo
       welcome: false,
       heal: false,
       issues: "none",
+      link: "none",
     });
+    expect(sourceOptions({ search: "?link=up", isTauri: false }).link).toBe("up");
   });
 
   it("?engine=<scenario> picks the mock engine's answer, default not installed; Tauri asks the command", async () => {

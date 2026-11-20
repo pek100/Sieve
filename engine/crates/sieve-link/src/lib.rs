@@ -28,7 +28,7 @@ pub mod store;
 pub mod tls;
 pub mod wire;
 
-pub use device::{HubRoute, LinkClient, LinkConfig, LinkStream, OnHubDown};
+pub use device::{Dialer, HubRoute, LinkClient, LinkConfig, LinkStream, OnHubDown};
 pub use error::LinkError;
 pub use hub::{Hub, HubConfig};
 pub use identity::{Fingerprint, Identity};

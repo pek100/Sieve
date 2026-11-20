@@ -1492,3 +1492,50 @@ async fn a_newer_hubs_pairing_answer_says_so_body() {
     assert!(!err.to_string().contains("used"), "{err}");
     fake.await.unwrap();
 }
+
+#[test]
+fn a_callers_dialer_makes_the_link_and_its_failures_are_said() {
+    run("a_callers_dialer_makes_the_link_and_its_failures_are_said", a_callers_dialer_makes_the_link_and_its_failures_are_said_body());
+}
+
+async fn a_callers_dialer_makes_the_link_and_its_failures_are_said_body() {
+    let h = start_hub().await;
+    let echo = echo_server().await;
+    let id = pair_new(&h, "pinned").await;
+    allow_loopback(&h, &id);
+    // The caller's dialer is the only way the link's socket is made: it counts
+    // its calls and connects from 127.0.0.7, a source of its own choosing.
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = dials.clone();
+    let mut cfg = link_cfg(h.hub.fingerprint(), HubRoute::Dial(h.addr.to_string()));
+    cfg.dialer = Some(sieve_link::Dialer(Arc::new(move |addr: String| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            let to: SocketAddr = addr.parse().map_err(|_| std::io::Error::other("not an address"))?;
+            let s = TcpSocket::new_v4()?;
+            s.bind("127.0.0.7:0".parse().unwrap())?;
+            s.connect(to).await
+        })
+    })));
+    let c = LinkClient::start(&id, cfg).await.unwrap();
+    assert!(c.wait_until(true).await && c.is_up());
+    assert!(dials.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    assert_eq!(c.last_error(), None);
+    let mut s = c.open("127.0.0.1", echo).await.unwrap();
+    echo_once(&mut s, b"through the dialer").await;
+    drop(s);
+    let up = wait_audit(&h, |r| r["event"] == "link_up").await;
+    assert!(up["peer"].as_str().unwrap_or_default().starts_with("127.0.0.7"), "{up}");
+    c.shutdown();
+    assert!(!c.wait_until(true).await || !c.is_up(), "a shut client waits for nothing");
+
+    // A dialer that fails: the link stays down and the client says why.
+    let mut cfg = link_cfg(h.hub.fingerprint(), HubRoute::Dial(h.addr.to_string()));
+    cfg.dialer = Some(sieve_link::Dialer(Arc::new(|_addr: String| Box::pin(async { Err(std::io::Error::other("no way out")) }))));
+    let c = LinkClient::start(&id, cfg).await.unwrap();
+    until("the dial failure is recorded", || c.last_error().is_some()).await;
+    assert!(c.last_error().unwrap().contains("no way out"), "{:?}", c.last_error());
+    assert!(!c.is_up());
+    assert!(matches!(c.open("127.0.0.1", echo).await, Err(LinkError::HubDown)));
+    c.shutdown();
+}

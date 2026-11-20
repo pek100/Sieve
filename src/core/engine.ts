@@ -105,6 +105,10 @@ export interface EngineSlice {
   issues?: Issues | null;
   /** Why the newest read of those failed; null after a good one. The apps stay. */
   issuesError?: string | null;
+  /** A pairing, unpairing or link change on its way to the engine. */
+  linkBusy?: boolean;
+  /** Why the user's last pairing, unpairing or link change failed, never holding the pairing code; null after a good one. */
+  linkActionError?: string | null;
 }
 
 export const EMPTY_ENGINE: EngineSlice = { probe: null, error: null, adguard: null, actionError: null, cert: null, certError: null, certActionError: null };

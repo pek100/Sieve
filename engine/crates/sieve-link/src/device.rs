@@ -49,6 +49,23 @@ impl std::str::FromStr for OnHubDown {
     }
 }
 
+/// Opens the TCP connection to the hub for `HubRoute::Dial`, for a caller
+/// that decides how its sockets leave (a program that routes this machine's
+/// traffic must keep the link's own socket out of its own tunnel). Takes the
+/// dial address as given in the route.
+#[derive(Clone)]
+pub struct Dialer(pub Arc<DialFn>);
+
+/// A dial: the address in, the connected socket out.
+pub type DialFn = dyn Fn(String) -> DialFuture + Send + Sync;
+pub type DialFuture = Pin<Box<dyn std::future::Future<Output = io::Result<TcpStream>> + Send>>;
+
+impl std::fmt::Debug for Dialer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Dialer(..)")
+    }
+}
+
 /// How the link is made.
 #[derive(Clone, Debug)]
 pub enum HubRoute {
@@ -78,6 +95,9 @@ pub struct LinkConfig {
     /// How long `open` waits for one of the hub's stream slots (the limit the
     /// hub announced) before answering `Busy` itself.
     pub busy_wait: Duration,
+    /// `Dial`: how the TCP connection to the hub is opened; None is
+    /// `TcpStream::connect`.
+    pub dialer: Option<Dialer>,
     /// Test hook: the hub address reported on the control stream instead of
     /// the link's real TCP peer (loopback tests stand in for public ones).
     #[doc(hidden)]
@@ -96,8 +116,12 @@ impl LinkConfig {
             handshake_timeout: Duration::from_secs(10),
             accept_timeout: Duration::from_secs(3),
             gate: GateConfig::device(),
+            // Above the hub's worst case for an answer (its `slot_wait`, 1 s, and
+            // its `connect_timeout`, 10 s, for the resolve and every connect), so
+            // a hub that is up is heard, never taken for one that is down.
             request_timeout: Duration::from_secs(15),
             busy_wait: Duration::from_secs(2),
+            dialer: None,
             report_hub_addr: None,
         }
     }
@@ -187,6 +211,14 @@ struct ClientInner {
     link: watch::Sender<Option<Current>>,
     shutdown: CancellationToken,
     listen_addr: Option<SocketAddr>,
+    /// Why the last attempt at a link failed; cleared once a link is up.
+    last_error: std::sync::Mutex<Option<String>>,
+}
+
+impl ClientInner {
+    fn set_error(&self, why: Option<String>) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = why;
+    }
 }
 
 /// A device's link to its hub. Cheap to clone.
@@ -222,7 +254,7 @@ impl LinkClient {
 
     fn new(cfg: LinkConfig, listen_addr: Option<SocketAddr>) -> Self {
         let (link, _) = watch::channel(None);
-        LinkClient { inner: Arc::new(ClientInner { cfg, link, shutdown: CancellationToken::new(), listen_addr }) }
+        LinkClient { inner: Arc::new(ClientInner { cfg, link, shutdown: CancellationToken::new(), listen_addr, last_error: std::sync::Mutex::new(None) }) }
     }
 
     pub fn listen_addr(&self) -> Option<SocketAddr> {
@@ -231,6 +263,25 @@ impl LinkClient {
 
     pub fn is_up(&self) -> bool {
         self.inner.link.borrow().as_ref().is_some_and(|c| !c.handle.is_closed())
+    }
+
+    /// Why the last attempt at a link failed (dialling, the handshake, or the
+    /// hub not answering the first ping); None once a link is up. A listening
+    /// device records only what the pinned hub's connections did, never a
+    /// stranger's.
+    pub fn last_error(&self) -> Option<String> {
+        self.inner.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Waits until the link is up (`up` true) or down, whichever is asked; at
+    /// once if it already is. Ends early (false) when the client shuts down.
+    pub async fn wait_until(&self, up: bool) -> bool {
+        let mut rx = self.inner.link.subscribe();
+        let is = |c: &Option<Current>| c.as_ref().is_some_and(|c| !c.handle.is_closed()) == up;
+        tokio::select! {
+            r = rx.wait_for(is) => r.is_ok(),
+            _ = self.inner.shutdown.cancelled() => false,
+        }
     }
 
     /// Waits up to `limit` for the link to be up.
@@ -345,12 +396,24 @@ fn jittered(d: Duration) -> Duration {
     d.mul_f64(0.75 + (b[0] as f64 / 255.0) * 0.5)
 }
 
+/// One dial: the caller's dialer when it gave one, then the handshake.
+async fn dial_once(inner: &ClientInner, addr: &str, tls_cfg: Arc<rustls::ClientConfig>) -> Result<Established> {
+    let limit = inner.cfg.handshake_timeout;
+    match &inner.cfg.dialer {
+        None => tls::dial(addr, tls_cfg, limit).await,
+        Some(dialer) => {
+            let tcp = tokio::time::timeout(limit, (dialer.0)(addr.to_string())).await.map_err(|_| LinkError::Timeout("connect"))??;
+            tls::connect(tcp, tls_cfg, limit).await
+        }
+    }
+}
+
 async fn dial_loop(inner: Arc<ClientInner>, addr: String, tls_cfg: Arc<rustls::ClientConfig>) {
     let mut backoff = Duration::from_millis(250);
     loop {
         let r = tokio::select! {
             _ = inner.shutdown.cancelled() => return,
-            r = tls::dial(&addr, tls_cfg.clone(), inner.cfg.handshake_timeout) => r,
+            r = dial_once(&inner, &addr, tls_cfg.clone()) => r,
         };
         match r {
             Ok(est) => {
@@ -358,7 +421,8 @@ async fn dial_loop(inner: Arc<ClientInner>, addr: String, tls_cfg: Arc<rustls::C
                 run_link(inner.clone(), est).await;
             }
             Err(e) => {
-                if backoff >= Duration::from_secs(8) {
+                inner.set_error(Some(format!("dial {addr}: {e}")));
+                if backoff >= Duration::from_secs(8) && inner.cfg.dialer.is_none() {
                     eprintln!("sieve-link: dial {addr}: {e}");
                 }
             }
@@ -410,6 +474,7 @@ async fn run_link(inner: Arc<ClientInner>, est: Established) {
     // first ping on the control stream.
     match tokio::time::timeout(inner.cfg.handshake_timeout, control_open(&handle, seen)).await {
         Ok(Ok((io, limit))) => {
+            inner.set_error(None);
             let slots = Slots::new(limit);
             let old = inner.link.send_replace(Some(Current { handle: handle.clone(), slots: slots.clone() }));
             if let Some(old) = old {
@@ -417,7 +482,14 @@ async fn run_link(inner: Arc<ClientInner>, est: Established) {
             }
             tokio::spawn(keepalive(handle.clone(), slots, io, inner.cfg.keepalive, inner.cfg.dead_after));
         }
-        _ => handle.close(),
+        Ok(Err(e)) => {
+            inner.set_error(Some(format!("the hub did not accept this device's link: {e}")));
+            handle.close();
+        }
+        Err(_) => {
+            inner.set_error(Some("the hub did not answer the link's first ping in time".into()));
+            handle.close();
+        }
     }
     let _ = task.await;
     inner.link.send_if_modified(|cur| {

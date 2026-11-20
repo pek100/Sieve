@@ -70,6 +70,32 @@ impl crate::tls::intercept::Dial for Egress {
     }
 }
 
+/// The link's network (`crate::link`): its own socket is one of these, so it
+/// never enters Sieve's adapter.
+impl crate::link::LinkNet for Egress {
+    fn connect(&self, target: SocketAddr) -> BoxFuture<'_, Result<TcpStream, String>> {
+        Box::pin(Egress::connect(self, target))
+    }
+
+    /// The first usable IPv4 address of the adapter Windows sends through
+    /// (`NetTables::default_adapter`, Sieve's own left out), else its IPv6 one.
+    fn listen_ip(&self) -> Option<std::net::IpAddr> {
+        let tables = self.tables.read().unwrap_or_else(|p| p.into_inner());
+        let adapter = tables.default_adapter()?;
+        let usable = |ip: &std::net::IpAddr| match ip {
+            std::net::IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()),
+            std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80),
+        };
+        let all: Vec<_> = adapter.addresses.iter().map(|a| a.ip).filter(usable).collect();
+        all.iter().copied().find(std::net::IpAddr::is_ipv4).or_else(|| all.first().copied())
+    }
+
+    fn is_local(&self, ip: std::net::IpAddr) -> bool {
+        let tables = self.tables.read().unwrap_or_else(|p| p.into_inner());
+        tables.others().flat_map(|a| a.addresses.iter()).filter_map(|a| a.on_link()).any(|p| p.length() > 0 && p.contains(ip))
+    }
+}
+
 impl Connector for Egress {
     fn tcp(&self, target: SocketAddr) -> BoxFuture<'_, Result<TcpStream, String>> {
         Box::pin(self.connect(target))

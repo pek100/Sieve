@@ -15,7 +15,9 @@
 //! closes at once and the task stays until idle, so a retransmit costs no new owner
 //! lookup, with nothing sent upstream. A blocked flow's client Initials are answered
 //! with Version Negotiation (`quic::answer_blocked`) and anything else is swallowed; a
-//! refused flow's datagrams with ICMP (`quic::refuse`). Port 53 goes to `stack::dns_flow` instead and is never
+//! refused flow's datagrams with ICMP (`quic::refuse`). A relayed UDP flow is decided
+//! again when its way out changes (`relay_udp`), so exiting turning on never leaves
+//! an open one going from this computer. Port 53 goes to `stack::dns_flow` instead and is never
 //! relayed or blocked. The upstream TCP connect happens before the decision, so
 //! server-first bytes may reach an app: a decoded name beats the IP map, so
 //! the decision cannot be earlier.
@@ -37,6 +39,8 @@ use super::progress::{Progress, Watched};
 use super::retry;
 use super::{DNS_PORT, Meters, close_blocked, kind_of, record_decision};
 use crate::dns::NameMap;
+use crate::link::exit::{self, Exit, ExitReport, Upstream};
+use crate::link::{Change, LinkManager, LinkNet, Plan};
 use crate::dns::service::Service;
 use crate::domain::{FilterSlot, Flow};
 use crate::flow::classify::{Decoded, UdpClassifier};
@@ -74,6 +78,84 @@ pub fn tcp_config() -> ipstack::TcpConfig {
     config
 }
 const DATAGRAM: usize = 65_535;
+
+/// The log's words for UDP while exiting through a hub (`handle_udp`).
+const QUIC_ON_LINK: &str = "QUIC is refused while exiting through the other device, so the app uses TCP, which goes through it";
+const UDP_ON_LINK: &str = "UDP is not carried through the other device, so it was dropped, as set";
+const UDP_DIRECT: &str = "UDP is not carried through the other device; it went directly from this computer, as set";
+
+/// One TCP connect of the relay's (`stack::retry`).
+pub type TcpDial = dyn retry::Attempt<Stream = TcpStream> + Send + Sync;
+
+/// One UDP upstream of the relay's, connected to its target.
+pub type UdpOpen = dyn Fn(std::net::SocketAddr) -> crate::dns::BoxFuture<'static, Result<UdpSocket, String>> + Send + Sync;
+
+/// The relay's UDP upstreams in production: from `egress`, pinned outside Sieve's
+/// routes, with path MTU discovery on (`path_mtu`).
+fn egress_udp(egress: Arc<Egress>) -> Arc<UdpOpen> {
+    Arc::new(move |remote| {
+        let egress = egress.clone();
+        Box::pin(async move {
+            let socket = egress.socket(remote, true)?;
+            path_mtu::discover(&socket, remote.is_ipv4())?;
+            let up = UdpSocket::from_std(socket.into()).map_err(|e| e.to_string())?;
+            up.connect(remote).await.map_err(|e| e.to_string())?;
+            Ok(up)
+        })
+    })
+}
+
+/// A UDP flow's handle in the book: ending it ([`FlowBook::end_where`]) stops its
+/// relay, and the flow is decided again, as a new one.
+#[derive(Clone, Default)]
+struct UdpEnd(Arc<tokio::sync::Notify>);
+
+impl super::book::Idle for UdpEnd {
+    /// Never a candidate at the cap: a UDP flow ends itself after [`UDP_IDLE`] of
+    /// silence.
+    fn idle(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn evict(&self) {
+        self.0.notify_one();
+    }
+}
+
+/// Why a guarded connect was not made.
+pub const LEAVES_THROUGH_HUB: &str = "while exiting through the other device, this address is reached only through it";
+
+/// The relay's TCP connects for a flow exiting may concern: a target exiting
+/// applies to now ([`LinkManager::may_leave_directly`]) is refused, never
+/// dialled from this computer. It covers the first connect and every retry,
+/// whatever address the retry came from: the one place a relayed flow's direct
+/// connect is decided while exiting is on.
+struct Guarded<'a> {
+    inner: &'a TcpDial,
+    link: &'a LinkManager,
+}
+
+impl retry::Attempt for Guarded<'_> {
+    type Stream = TcpStream;
+
+    fn attempt(&self, target: std::net::SocketAddr) -> retry::AttemptFuture<'_, TcpStream> {
+        if !self.link.may_leave_directly(target.ip()) {
+            return Box::pin(async { Err(retry::Failure::Egress(LEAVES_THROUGH_HUB.into())) });
+        }
+        self.inner.attempt(target)
+    }
+}
+
+/// A flow's direct connect with its retries, guarded: an alternate address
+/// exiting applies to is neither offered nor dialled.
+async fn connect_guarded(ctx: &Relay, flow: FiveTuple) -> retry::Connected<TcpStream> {
+    let guarded = Guarded { inner: &*ctx.tcp, link: &ctx.link };
+    retry::connect(&guarded, flow.remote, || {
+        let mut all = alternates(ctx, flow);
+        all.retain(|ip| ctx.link.may_leave_directly(*ip));
+        all
+    })
+    .await
+}
 
 type ExeLookup = fn(u32) -> Option<String>;
 type ProductLookup = fn(&str) -> Option<String>;
@@ -126,15 +208,23 @@ pub struct Relay {
     /// read this same table.
     pub tables: Arc<RwLock<NetTables>>,
     pub egress: Arc<Egress>,
+    /// The relay's TCP connects: `egress` in production, a scripted one in tests.
+    /// Every connect for a flow goes through [`connect_guarded`] unless the flow
+    /// is one exiting never concerns (an app that is Off, the switch off).
+    pub tcp: Arc<TcpDial>,
+    /// The relay's UDP upstreams: `egress` in production, a loopback one in tests.
+    pub udp: Arc<UdpOpen>,
     pub dns: Arc<Service>,
     /// The IP-to-names map the decision reads for an unnamed flow.
     pub names: Arc<Mutex<NameMap>>,
     pub book: Arc<Mutex<FlowBook>>,
     pub meters: Arc<Meters>,
     /// `filtering.https`: empty means every flow takes `relay_tcp`.
-    pub https: Arc<HttpsSlot<Egress>>,
+    pub https: Arc<HttpsSlot<Exit>>,
     /// Where a refused QUIC flow's answers go: the adapter.
     pub sink: Arc<dyn PacketSink>,
+    /// Exiting through another device (`crate::link`).
+    pub link: Arc<LinkManager>,
 }
 
 pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -160,12 +250,13 @@ pub struct RelayParts {
     pub filter: Arc<FilterSlot>,
     pub witness: Witness,
     pub nat: Arc<NatTable>,
-    pub https: Arc<HttpsSlot<Egress>>,
+    pub https: Arc<HttpsSlot<Exit>>,
     pub sink: Arc<dyn PacketSink>,
+    pub link: Arc<LinkManager>,
 }
 
 impl Relay {
-    pub fn new(RelayParts { tables, egress, dns, book, names, meters, filter, witness, nat, https, sink }: RelayParts) -> Self {
+    pub fn new(RelayParts { tables, egress, dns, book, names, meters, filter, witness, nat, https, sink, link }: RelayParts) -> Self {
         Self {
             #[cfg(feature = "relay-experiments")]
             experiments: crate::experiments::Settings::default(),
@@ -176,6 +267,8 @@ impl Relay {
             keys: AppKeys::new(crate::flow::flows::os::product_name as ProductLookup, crate::flow::flows::os::hidden_name as HiddenNameLookup),
             filter,
             tables,
+            tcp: egress.clone(),
+            udp: egress_udp(egress.clone()),
             egress,
             dns,
             names,
@@ -183,6 +276,7 @@ impl Relay {
             meters,
             https,
             sink,
+            link,
         }
     }
 
@@ -323,16 +417,125 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
         return dns_flow::tcp(ctx, app, flow).await;
     }
     let accepted_ms = monotonic_ms();
-    // The name map is read only once the connect failed or its race is due (`retry`).
-    let alternates = || {
-        let filter = ctx.filter.get();
-        retry::alternates(&lock(&ctx.names), flow.remote.ip(), monotonic_ms(), |name| filter.blocks_name(name))
-    };
-    let (attributed, connected) = tokio::join!(ctx.attribute(flow), retry::connect(&*ctx.egress, flow.remote, alternates));
+    // Read before the way is chosen, to see a change that comes before the flow is
+    // in the book (where a change finds it: `reconnect_the_new_way`).
+    let way = ctx.link.way_now();
+    // Exiting through a hub: its own path (`handle_exiting`), which keeps this
+    // one for the flows that do not exit.
+    if let Some(plan) = ctx.link.plan(flow.remote.ip()) {
+        return handle_exiting(ctx, app, flow, plan, accepted_ms).await;
+    }
+    // A destination exiting does not concern, but its retries may be other
+    // addresses of the same name: guarded, so none of those leaves directly while
+    // exiting applies to it (whose flow it is is not known yet, so an app that is
+    // Off loses those alternates too while exiting is on).
+    let (attributed, connected) = tokio::join!(ctx.attribute(flow), connect_guarded(&ctx, flow));
     if guard_tcp(attributed.own, flow.remote.port()) == Guard::RelayOwn {
         return relay_own(app, connected.result).await;
     }
     let Some(admitted) = ctx.admit_with(&flow, &attributed, FlowProto::Tcp, FlowKind::Other, Some(Box::new(app.handle()))) else { return close_app(&mut app).await };
+    // The way out changed while this flow connected directly, too late for the
+    // change to find it in the book: if exiting now applies to it, it ends here as
+    // the change ends every other (a reset; the app reconnects the new way).
+    if ctx.link.way_now() != way && exiting_applies(&ctx, admitted.owner.as_owner(), &flow).is_some() {
+        drop(connected);
+        app.abort();
+        let mut book = lock(&ctx.book);
+        // The change itself may have found it in the book already, and counted it
+        // in its own row: said once.
+        let unseen = book.release(admitted.id);
+        book.close(admitted.id, FlowAction::Relayed, 0, 0);
+        if unseen {
+            note_ended(&mut book, 1, Change::Way(sieve_ipc::ExitVia::Hub));
+        }
+        return;
+    }
+    serve_connected(ctx, app, flow, admitted, connected, accepted_ms).await;
+}
+
+/// The way out changed ([`crate::link::ExitChanged`]). [`Change::Way`]: every open
+/// TCP flow of a sieved app (not Off) to a destination exiting `concerns` is ended
+/// with a reset, so it reconnects the new way (through the hub, or from this
+/// computer). [`Change::WentDirect`]: only those that went directly while the hub
+/// could not be reached. One row says how many. A connection never changes its
+/// way in the middle: ending it is the only way the "every connection" the app
+/// promises holds. UDP is not ended here: each relayed UDP flow watches the way
+/// out itself and is decided again (`relay_udp`), and keeps its socket when the
+/// change leaves it going from this computer (exiting turned off, or UDP set to
+/// Direct), so a game or a call is not cut for nothing; UDP sent directly is the
+/// UDP choice's, which the hub's return does not change.
+pub fn reconnect_the_new_way(book: &Mutex<FlowBook>, filter: &FilterSlot, concerns: &dyn Fn(std::net::IpAddr) -> bool, change: Change) -> usize {
+    let filter = filter.get();
+    let mut book = lock(book);
+    let sieved_to = |e: &sieve_ipc::FlowEvent, key: Option<&str>| e.proto == FlowProto::Tcp && !key.is_some_and(|k| filter.is_off_key(k)) && to_concerned(e, concerns);
+    let ended = match change {
+        Change::Way(_) => book.end_where(|e, key, _| sieved_to(e, key)),
+        Change::WentDirect { .. } => book.end_where(|e, key, went_direct| went_direct && sieved_to(e, key)),
+    };
+    note_ended(&mut book, ended, change);
+    ended
+}
+
+/// Whether a flow's destination is one exiting `concerns`.
+fn to_concerned(e: &sieve_ipc::FlowEvent, concerns: &dyn Fn(std::net::IpAddr) -> bool) -> bool {
+    e.remote.parse::<std::net::SocketAddr>().is_ok_and(|a| concerns(a.ip()))
+}
+
+/// Apps were switched from Off back to sieved while exiting is on
+/// ([`LinkManager::sieved_again`]): their open TCP flows to destinations exiting
+/// `concerns` were made from this computer, as an Off app's are, and end with a
+/// reset so they reconnect through the hub; one row says how many. `was_off`
+/// names those apps by their row key. Their UDP flows follow the way out, which
+/// moved (`relay_udp`).
+pub fn reconnect_sieved_again(book: &Mutex<FlowBook>, concerns: &dyn Fn(std::net::IpAddr) -> bool, was_off: &dyn Fn(&str) -> bool) -> usize {
+    let mut book = lock(book);
+    let ended = book.end_where(|e, key, _| e.proto == FlowProto::Tcp && key.is_some_and(was_off) && to_concerned(e, concerns));
+    note_ended(&mut book, ended, Change::Way(sieve_ipc::ExitVia::Hub));
+    ended
+}
+
+/// The one row that says how many open flows a change of the way out ended.
+fn note_ended(book: &mut FlowBook, ended: usize, change: Change) {
+    if ended == 0 {
+        return;
+    }
+    let (s, they) = if ended == 1 { ("", "it reconnects") } else { ("s", "they reconnect") };
+    let (via, reason) = match change {
+        Change::Way(via) => {
+            let how = if via == sieve_ipc::ExitVia::Hub { "through the other device" } else { "directly from this computer" };
+            (via, format!("The way out changed: {ended} open connection{s} ended so {they} {how}"))
+        }
+        Change::WentDirect { hub_back: true } => {
+            (sieve_ipc::ExitVia::Hub, format!("The other device can be reached again: {ended} connection{s} that went directly from this computer ended so {they} through it"))
+        }
+        Change::WentDirect { hub_back: false } => (
+            sieve_ipc::ExitVia::Hub,
+            format!("Connections are now stopped while the other device cannot be reached: {ended} connection{s} that went directly from this computer ended"),
+        ),
+    };
+    book.note(sieve_ipc::LogOutcome::Exit { via, target: None, reason: Some(reason) });
+}
+
+/// Exiting through a hub applies to this flow now: its plan, or None (the switch
+/// off, the app Off, or exiting does not concern the destination now).
+fn exiting_applies(ctx: &Relay, owner: crate::domain::Owner<'_>, flow: &FiveTuple) -> Option<Plan> {
+    let filter = ctx.filter.get();
+    if !filter.enabled || filter.is_off(owner) {
+        return None;
+    }
+    ctx.link.plan(flow.remote.ip())
+}
+
+/// The other addresses a failed connect may try; the name map is read only once
+/// the connect failed or its race is due (`retry`).
+fn alternates(ctx: &Relay, flow: FiveTuple) -> Vec<std::net::IpAddr> {
+    let filter = ctx.filter.get();
+    retry::alternates(&lock(&ctx.names), flow.remote.ip(), monotonic_ms(), |name| filter.blocks_name(name))
+}
+
+/// An admitted flow whose SYN-time connect has its result: served, or closed
+/// with its problem.
+async fn serve_connected(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple, admitted: Admitted, connected: retry::Connected<TcpStream>, accepted_ms: u64) {
     if let Some(how) = connected.retry() {
         lock(&ctx.book).retried(admitted.id, how, connected.result.is_ok());
     }
@@ -347,7 +550,79 @@ pub async fn handle_tcp(ctx: Arc<Relay>, mut app: IpStackTcpStream) {
             return close_app(&mut app).await;
         }
     };
-    serve_admitted(ctx, app, flow, admitted, upstream, accepted_ms).await;
+    serve_admitted(ctx, app, flow, admitted, Upstream::Tcp(upstream), accepted_ms, None).await;
+}
+
+/// A TCP flow while exiting through a hub. Its origin is found first, as the
+/// path depends on it: an app that is Off and every flow while the global switch
+/// is off connect at once from this computer, as without the hub. Any other flow
+/// gets an upstream that opens through the hub only once decided (`link::exit`):
+/// nothing reaches the hub for a blocked flow, no retry to another address (the
+/// hub resolves names and tries its own), and the hub is asked for the name the
+/// flow carries. The engine's own plain HTTP (certificate status and issuer
+/// fetches) goes through the hub too, by its Host: from this computer it would
+/// say which site is being visited.
+async fn handle_exiting(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple, plan: Plan, accepted_ms: u64) {
+    let attributed = ctx.attribute(flow).await;
+    if guard_tcp(attributed.own, flow.remote.port()) == Guard::RelayOwn {
+        return relay_own_through(ctx, app, flow, plan).await;
+    }
+    let Some(admitted) = ctx.admit_with(&flow, &attributed, FlowProto::Tcp, FlowKind::Other, Some(Box::new(app.handle()))) else { return close_app(&mut app).await };
+    let exits = {
+        let filter = ctx.filter.get();
+        filter.enabled && !filter.is_off(admitted.owner.as_owner())
+    };
+    if !exits {
+        // Exiting never concerns this flow: as without the hub, unguarded.
+        let connected = retry::connect(&*ctx.tcp, flow.remote, || alternates(&ctx, flow)).await;
+        return serve_connected(ctx, app, flow, admitted, connected, accepted_ms).await;
+    }
+    let (upstream, starter) = exit::lazy();
+    let starter = FlowExit::new(&ctx, starter, plan, Some(admitted.id), flow.remote);
+    serve_admitted(ctx, app, flow, admitted, Upstream::Lazy(upstream), accepted_ms, Some(starter)).await;
+}
+
+/// Opens an exiting flow's upstream once it is decided, and logs how it went
+/// (on the flow's row; the engine's own flow has none).
+pub(super) struct FlowExit {
+    starter: exit::Starter,
+    plan: Plan,
+    link: Arc<LinkManager>,
+    net: Arc<dyn LinkNet>,
+    book: Arc<Mutex<FlowBook>>,
+    id: Option<u64>,
+    remote: std::net::SocketAddr,
+}
+
+impl FlowExit {
+    fn new(ctx: &Relay, starter: exit::Starter, plan: Plan, id: Option<u64>, remote: std::net::SocketAddr) -> Self {
+        Self { starter, plan, link: ctx.link.clone(), net: ctx.egress.clone(), book: ctx.book.clone(), id, remote }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(ctx: &Relay, starter: exit::Starter, plan: Plan, id: u64, remote: std::net::SocketAddr) -> Self {
+        Self::new(ctx, starter, plan, Some(id), remote)
+    }
+
+    /// The flow passed with what its first bytes said: the hub is asked for the
+    /// name they carry, else for the address (never a name only Sieve's DNS
+    /// recorded for it: `link::exit`).
+    fn start(&self, decoded: &Decoded) {
+        let host = exit::choose_host(decoded.domain.as_deref(), self.remote.ip());
+        let (plan, link, net, book, id, remote) = (self.plan.clone(), self.link.clone(), self.net.clone(), self.book.clone(), self.id, self.remote);
+        self.starter.start(async move {
+            let going_direct = || {
+                if let Some(id) = id {
+                    lock(&book).going_direct(id);
+                }
+            };
+            let (opened, report) = exit::open(&plan, &link, &*net, &host, remote.port(), remote, &going_direct).await;
+            if let Some(id) = id {
+                lock(&book).exit(id, report);
+            }
+            opened
+        });
+    }
 }
 
 /// The engine's own plain HTTP ([`guard_tcp`]): not the user's flow, so no book
@@ -360,9 +635,36 @@ async fn relay_own(mut app: IpStackTcpStream, upstream: Result<TcpStream, retry:
     close_app(&mut app).await;
 }
 
-/// An admitted flow with its SYN-time socket, to its end.
-pub(super) async fn serve_admitted(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple, admitted: Admitted, upstream: TcpStream, accepted_ms: u64) {
-    let decide = |d: &Decoded| ctx.decide(&admitted, d, &flow);
+/// The engine's own plain HTTP while exiting applies to its destination: its
+/// first bytes are read for the Host, then it opens through the hub as any flow
+/// does (stopped with the hub down when so set). No book entry, no decision.
+pub(super) async fn relay_own_through(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple, plan: Plan) {
+    let (upstream, starter) = exit::lazy();
+    let exit = FlowExit::new(&ctx, starter, plan, None, flow.remote);
+    let closed = app.closed();
+    let decide = |d: &Decoded| {
+        exit.start(d);
+        Action::Pass
+    };
+    let out = relay_tcp_until(&mut app, Upstream::Lazy(upstream), FIRST_BYTES_WAIT, decide, closed).await;
+    if out.reset_app {
+        drain_then_abort(&app).await;
+    }
+    close_app(&mut app).await;
+}
+
+/// An admitted flow with its SYN-time socket, or with an upstream that `exit`
+/// opens through the hub once the flow passed, to its end.
+pub(super) async fn serve_admitted(ctx: Arc<Relay>, mut app: IpStackTcpStream, flow: FiveTuple, admitted: Admitted, upstream: Upstream, accepted_ms: u64, exit: Option<FlowExit>) {
+    let decide = |d: &Decoded| {
+        let action = ctx.decide(&admitted, d, &flow);
+        if action != Action::Drop
+            && let Some(exit) = &exit
+        {
+            exit.start(d);
+        }
+        action
+    };
     // One path per flow, chosen once (task D1): no slot is today's relay.
     if let Some(https) = ctx.https.get() {
         let event = lock(&ctx.book).snapshot_of(admitted.id);
@@ -451,15 +753,65 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
         }
     };
     let Ok(attributed) = attribution.await else { return };
-    // Once more when a refusal ends on a datagram: that datagram is a new flow.
-    let id = loop {
-        let Some(admitted) = ctx.admit(&flow, &attributed, FlowProto::Udp, kind_of(&decided)) else { return };
+    let is_quic = decided.kind == Some(crate::flow::classify::Kind::Quic);
+    // Once more when a refusal ends on a datagram (that datagram is a new flow), and
+    // when a relayed flow's way out changed (decided again, as a new flow).
+    loop {
+        // Watched from before this pass decides its way out: a change at any point
+        // after (even one that only moves the value) is seen by what follows.
+        let mut way = ctx.link.way_out();
+        let end = UdpEnd::default();
+        let Some(admitted) = ctx.admit_with(&flow, &attributed, FlowProto::Udp, kind_of(&decided), Some(Box::new(end.clone()))) else { return };
         let id = admitted.id;
         let action = ctx.decide(&admitted, &decided, &flow);
         // Read only with the slot there, so off asks nothing new. A slot that comes up
         // in between reads as an unknown app: relayed, which is the fail-open way.
         let event = ctx.https.get().and_then(|_| lock(&ctx.book).snapshot_of(id));
         let owner = admitted.owner.as_owner();
+        // Exiting through a hub, which carries TCP only: QUIC is refused so the app
+        // falls back to TCP (through the hub); other UDP to a public address is
+        // dropped or sent directly, as the owner set. An app that is Off and
+        // everything while the global switch is off are left as they are.
+        let exiting = || exiting_applies(&ctx, owner, &flow).is_some();
+        let on_link = || (action != Action::Drop).then(|| exiting_applies(&ctx, owner, &flow)).flatten().map(|plan| exit::udp_on_link(is_quic, plan.udp));
+        let mut direct_as_set = false;
+        if let Some(way_now) = on_link() {
+            match way_now {
+                exit::UdpOnLink::RefuseQuic => {
+                    lock(&ctx.book).exit(id, ExitReport { via: sieve_ipc::ExitVia::Dropped, target: None, reason: Some(QUIC_ON_LINK.into()), signal: None });
+                    quic::close_refused(&ctx.book, id);
+                    let reply = Reply { ends: (flow.local, flow.remote), refusal: quic::REFUSAL, sink: &*ctx.sink, meters: &ctx.meters.quic };
+                    held = quic::refuse(&mut app, &reply, held, &mut buf, UDP_IDLE, exiting).await;
+                    if held.is_empty() {
+                        return;
+                    }
+                    continue;
+                }
+                exit::UdpOnLink::Drop => {
+                    {
+                        let mut book = lock(&ctx.book);
+                        book.exit(id, ExitReport { via: sieve_ipc::ExitVia::Dropped, target: None, reason: Some(UDP_ON_LINK.into()), signal: Some(sieve_ipc::Signal::UdpDropped) });
+                        book.close(id, FlowAction::Relayed, 0, 0);
+                    }
+                    // Swallowed until idle, so a retransmit is no new flow, while the
+                    // way out still drops it: looked at again when it moves and on
+                    // each datagram (as `quic::refuse`), so exiting turning off (or
+                    // UDP set to Direct) ends the drop; that datagram, if any, is
+                    // decided as a new flow.
+                    match swallow(&mut app, &mut way, &mut buf, || on_link() == Some(exit::UdpOnLink::Drop)).await {
+                        Some(next) => {
+                            held = next;
+                            continue;
+                        }
+                        None => return,
+                    }
+                }
+                exit::UdpOnLink::Direct => {
+                    lock(&ctx.book).exit(id, ExitReport { via: sieve_ipc::ExitVia::Direct, target: None, reason: Some(UDP_DIRECT.into()), signal: None });
+                    direct_as_set = true;
+                }
+            }
+        }
         let who = Who {
             remote: flow.remote,
             exe: event.as_ref().and_then(|e| e.exe.as_deref()),
@@ -483,47 +835,135 @@ pub async fn handle_udp(ctx: Arc<Relay>, mut app: IpStackUdpStream) {
                 if held.is_empty() {
                     return;
                 }
+                continue;
             }
-            UdpPath::Relay => break id,
+            UdpPath::Relay => {}
+        }
+        match relay_udp(&ctx, &mut app, flow, id, &end, way, std::mem::take(&mut held), &mut buf, on_link, direct_as_set).await {
+            Relayed::Ended => return,
+            Relayed::Again(rest) => held = rest,
+        }
+    }
+}
+
+/// A dropped UDP flow's datagrams, swallowed until it is idle (None) or until
+/// `dropping` no longer holds, looked at when the way out moves and on each
+/// datagram: Some with what is to be decided as a new flow (the datagram that
+/// found it so, or nothing when the way out moved).
+async fn swallow(app: &mut IpStackUdpStream, way: &mut tokio::sync::watch::Receiver<u64>, buf: &mut [u8], dropping: impl Fn() -> bool) -> Option<Vec<Vec<u8>>> {
+    let mut way_gone = false;
+    loop {
+        tokio::select! {
+            biased;
+            changed = way.changed(), if !way_gone => {
+                if changed.is_err() {
+                    way_gone = true;
+                } else if !dropping() {
+                    return Some(Vec::new());
+                }
+            }
+            r = tokio::time::timeout(UDP_IDLE, app.read(buf)) => match r {
+                Ok(Ok(n)) if n > 0 => {
+                    if !dropping() {
+                        return Some(vec![buf[..n].to_vec()]);
+                    }
+                }
+                _ => return None,
+            },
+        }
+    }
+}
+
+/// How a relayed UDP flow's relay ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Relayed {
+    /// The flow is over (idle, or a side closed or failed).
+    Ended,
+    /// Its way out changed: the flow is decided again, as a new one, with the
+    /// datagrams it held that were not sent.
+    Again(Vec<Vec<u8>>),
+}
+
+/// A decided UDP flow relayed from this computer until it ends, or until its way
+/// out changes ([`Relayed::Again`]): the way out moved ([`LinkManager::way_out`])
+/// and `on_link` now says drop or refuse (exiting turned on, sieving resumed, the
+/// app's Off lifted, UDP set to drop), or the book ended it (to make room). A move
+/// that leaves it going from this computer (exiting turned off, or on with UDP
+/// set to Direct) keeps its socket: a game or a call is not cut for a change that
+/// does not change its way. Its decision is taken once, at its start: without
+/// this an open flow would keep leaving from this computer's address after
+/// exiting turned on. `way` was taken before that decision, so a change made
+/// since is seen at once.
+#[allow(clippy::too_many_arguments)]
+async fn relay_udp(ctx: &Relay, app: &mut IpStackUdpStream, flow: FiveTuple, id: u64, end: &UdpEnd, mut way: tokio::sync::watch::Receiver<u64>, held: Vec<Vec<u8>>, buf: &mut [u8], on_link: impl Fn() -> Option<exit::UdpOnLink>, mut direct_as_set: bool) -> Relayed {
+    let up = match (ctx.udp)(flow.remote).await {
+        Ok(u) => u,
+        Err(_) => {
+            lock(&ctx.book).close(id, FlowAction::Failed, 0, 0);
+            return Relayed::Ended;
         }
     };
     let ipv4 = flow.remote.is_ipv4();
-    let socket = ctx.egress.socket(flow.remote, true).and_then(|s| path_mtu::discover(&s, ipv4).map(|()| s));
-    let up = match socket.and_then(|s| UdpSocket::from_std(s.into()).map_err(|e| e.to_string())) {
-        Ok(u) => u,
-        Err(_) => return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0),
-    };
-    if up.connect(flow.remote).await.is_err() {
-        return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0);
-    }
     // The adapter's MTU is larger than the real path: see `path_mtu`.
     let too_big = TooBig { ends: (flow.local, flow.remote), sink: &*ctx.sink, meters: &ctx.meters };
     let send_up = async |d: &[u8]| too_big.after_send(up.send(d).await, d, || path_mtu::of(&up, ipv4));
     let (mut bytes_up, mut bytes_down) = (0u64, 0u64);
+    // A change since the decision (or while the socket opened) is looked at before
+    // anything is sent from this computer.
+    if way.has_changed().unwrap_or(false) && matches!(on_link(), Some(exit::UdpOnLink::Drop | exit::UdpOnLink::RefuseQuic)) {
+        lock(&ctx.book).close(id, FlowAction::Relayed, 0, 0);
+        return Relayed::Again(held);
+    }
     for d in &held {
         match send_up(d).await {
             Ok(sent) => bytes_up += sent as u64,
-            Err(_) => return lock(&ctx.book).close(id, FlowAction::Failed, 0, 0),
+            Err(_) => {
+                lock(&ctx.book).close(id, FlowAction::Failed, 0, 0);
+                return Relayed::Ended;
+            }
         }
     }
     let mut down = vec![0u8; DATAGRAM];
-    loop {
+    let mut way_gone = false;
+    let ended = loop {
         tokio::select! {
-            r = tokio::time::timeout(UDP_IDLE, app.read(&mut buf)) => match r {
+            // A change first: no datagram leaves after it was seen.
+            biased;
+            () = end.0.notified() => break Relayed::Again(Vec::new()),
+            changed = way.changed(), if !way_gone => {
+                if changed.is_err() {
+                    // The manager is gone, so nothing exits any more: as it is.
+                    way_gone = true;
+                    continue;
+                }
+                match on_link() {
+                    // Exiting does not concern it (now): from this computer is right.
+                    None => {}
+                    Some(exit::UdpOnLink::Direct) => {
+                        if !direct_as_set {
+                            lock(&ctx.book).exit(id, ExitReport { via: sieve_ipc::ExitVia::Direct, target: None, reason: Some(UDP_DIRECT.into()), signal: None });
+                            direct_as_set = true;
+                        }
+                    }
+                    Some(exit::UdpOnLink::Drop | exit::UdpOnLink::RefuseQuic) => break Relayed::Again(Vec::new()),
+                }
+            }
+            r = tokio::time::timeout(UDP_IDLE, app.read(buf)) => match r {
                 Ok(Ok(n)) if n > 0 => match send_up(&buf[..n]).await {
                     Ok(sent) => bytes_up += sent as u64,
-                    Err(_) => break,
+                    Err(_) => break Relayed::Ended,
                 },
-                _ => break,
+                _ => break Relayed::Ended,
             },
             r = tokio::time::timeout(UDP_IDLE, up.recv(&mut down)) => match r {
                 Ok(Ok(n)) => {
-                    if app.write_all(&down[..n]).await.is_err() { break; }
+                    if app.write_all(&down[..n]).await.is_err() { break Relayed::Ended; }
                     bytes_down += n as u64;
                 }
-                _ => break,
+                _ => break Relayed::Ended,
             },
         }
-    }
+    };
     lock(&ctx.book).close(id, FlowAction::Relayed, bytes_up, bytes_down);
+    ended
 }

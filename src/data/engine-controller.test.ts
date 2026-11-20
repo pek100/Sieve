@@ -9,7 +9,7 @@ import { CRASH_LOOP_BANNER, DNS_UNREACHABLE_BANNER, DNS_UNREACHABLE_CAPTURED_BAN
 
 const WIFI_SIGN_IN_NOTICE = signInNoticeText(true);
 const WIFI_SIGN_IN_PAUSED_BANNER = signInPausedText(true);
-import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_CERT_ERROR, MOCK_ENGINE_ERROR, MOCK_HTTPS_OFF, MOCK_ISSUES_ERROR, MOCK_NO_SIGN_IN, MOCK_SIGN_IN_NETWORK, type CertScenario, type EngineScenario, type IssuesScenario } from "./engine-mock";
+import { createMockEngine, MOCK_ADGUARD_ERROR, MOCK_CERT_ERROR, MOCK_CODE_EXPIRED, MOCK_ENGINE_ERROR, MOCK_HTTPS_OFF, MOCK_ISSUES_ERROR, MOCK_NO_SIGN_IN, MOCK_NOT_A_CODE, MOCK_SIGN_IN_NETWORK, type CertScenario, type EngineScenario, type IssuesScenario, type LinkScenario } from "./engine-mock";
 import type { EngineSource } from "./engine-source";
 import { createMockFilterLists } from "./filter-lists-mock";
 import type { FilterListSource } from "./filter-lists-source";
@@ -68,6 +68,7 @@ function fakeEngine(start: EngineScenario) {
   let noticeReads = 0;
   const issueReads: number[] = [];
   const signInCalls: string[] = [];
+  const linkCalls: Record<string, unknown>[] = [];
   const source: EngineSource = {
     kind: "mock",
     probe: () => {
@@ -118,11 +119,25 @@ function fakeEngine(start: EngineScenario) {
       signInCalls.push("resume");
       return mock.resumeDnsCapture();
     },
+    linkPair: (code, route) => {
+      linkCalls.push({ type: "link_pair", code, route });
+      return mock.linkPair(code, route);
+    },
+    linkUnpair: () => {
+      linkCalls.push({ type: "link_unpair" });
+      return mock.linkUnpair();
+    },
+    setLink: (settings) => {
+      linkCalls.push({ type: "set_link", settings });
+      return mock.setLink(settings);
+    },
   };
   return {
     source,
     issueReads,
     signInCalls,
+    linkCalls,
+    withLink: (link: LinkScenario, s: EngineScenario = start) => void (mock = createMockEngine(s, { link, now: () => ISSUES_NOW })),
     withSignIn: (s: EngineScenario = start) => void (mock = createMockEngine(s, { signIn: true })),
     withIssues: (issues: IssuesScenario, run?: number) => void (mock = createMockEngine(start, { issues, run, now: () => ISSUES_NOW })),
     set: (s: EngineScenario) => void (mock = createMockEngine(s)),
@@ -422,7 +437,7 @@ describe("engine controller, apps' problems", () => {
     s.fake.withIssues("some");
     await s.fc.flush();
     const first = slice(s).issues;
-    expect(first?.apps.map((a) => a.key)).toEqual(["game launcher", "vm:devbox"]);
+    expect(first?.apps.map((a) => a.key)).toEqual(["game launcher", "vm:devbox", "browser"]);
     await s.fc.advance(ENGINE_POLL_MS);
     expect(s.fake.issueReads).toEqual([0, first?.revision]);
     expect(slice(s).issues, "an unchanged answer keeps the apps it had").toBe(first);
@@ -434,7 +449,7 @@ describe("engine controller, apps' problems", () => {
     await s.fc.flush();
     s.fake.withIssues("error");
     await s.fc.advance(ENGINE_POLL_MS);
-    expect(slice(s).issues?.apps).toHaveLength(2);
+    expect(slice(s).issues?.apps).toHaveLength(3);
     expect(slice(s).issuesError).toBe(MOCK_ISSUES_ERROR);
     s.fake.withIssues("some");
     await s.fc.advance(ENGINE_POLL_MS);
@@ -1492,5 +1507,80 @@ describe("engine controller", () => {
       expect(s.store.getState().engine.actionError).toBeNull();
       s.undo();
     });
+  });
+});
+
+describe("engine controller, exiting through another device", () => {
+  const CODE = "SL1-EXAMPLEONLYNOTAREALCODE0123456789";
+  const routing = () => setup("filtering", memoryBackend({ schema: 4, values: { [ENGINE_SWITCH]: true } }));
+  /** Routing, with an engine whose status carries the link fact as `start`, one probe in. */
+  const linked = async (start: LinkScenario) => {
+    const s = routing();
+    await s.fc.flush();
+    s.fake.withLink(start, "filtering");
+    await s.fc.advance(ENGINE_POLL_MS);
+    return s;
+  };
+  const link = (s: ReturnType<typeof setup>) => engineStatus(s.store.getState().engine)?.link;
+  const error = (s: ReturnType<typeof setup>) => s.store.getState().engine.linkActionError ?? null;
+
+  it("never sends a link message to an engine whose status lacks the fact, and says so without the code", async () => {
+    const s = routing();
+    await s.fc.flush();
+    expect(link(s)).toBeUndefined();
+    await s.controller.linkPair(CODE);
+    await s.controller.setLink({ exit: true, on_hub_down: "stop", udp: "drop", route: { how: "listen", port: 7443 } });
+    await s.controller.linkUnpair();
+    expect(s.fake.linkCalls).toEqual([]);
+    expect(error(s)).toMatch(/cannot exit through another device/);
+    expect(error(s)).not.toContain(CODE);
+    s.undo();
+  });
+
+  it("pairs: the code goes once, trimmed; the status reads pairing, then paired and off at the next probe", async () => {
+    const s = await linked("unpaired");
+    expect(link(s)).toEqual({ state: "unpaired" });
+    await s.controller.linkPair(`  ${CODE}\n`, { how: "listen", port: 7443 });
+    expect(s.fake.linkCalls).toEqual([{ type: "link_pair", code: CODE, route: { how: "listen", port: 7443 } }]);
+    expect(link(s)?.state).toBe("pairing");
+    expect(link(s)?.listening).toBe("198.51.100.30:7443");
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(link(s)).toMatchObject({ state: "off", hub_name: "home", settings: { exit: false, route: { how: "listen", port: 7443 } } });
+    expect(error(s)).toBeNull();
+    expect(JSON.stringify(s.store.getState())).not.toContain(CODE);
+    s.undo();
+  });
+
+  it("a refused or expired code is said, never with the code in it", async () => {
+    const s = await linked("unpaired");
+    await s.controller.linkPair("not-a-code-at-all");
+    expect(error(s)).toBe(`Pairing did not start: ${MOCK_NOT_A_CODE}`);
+    await s.controller.linkPair(`${CODE}EXPIRED`);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(link(s)).toMatchObject({ state: "unpaired", last_error: MOCK_CODE_EXPIRED });
+    s.undo();
+  });
+
+  it("an engine that says the code back has it taken out of the error", async () => {
+    const s = await linked("unpaired");
+    s.fake.source.linkPair = (code) => Promise.reject(new Error(`bad code ${code} (twice: ${code})`));
+    await s.controller.linkPair(CODE);
+    expect(error(s)).toBe("Pairing did not start: bad code (the pairing code) (twice: (the pairing code))");
+    s.undo();
+  });
+
+  it("set_link carries every choice; exit on while routing comes up; unpair forgets", async () => {
+    const s = await linked("off");
+    const held = link(s)!.settings!;
+    await s.controller.setLink({ ...held, exit: true });
+    expect(s.fake.linkCalls).toEqual([{ type: "set_link", settings: { ...held, exit: true } }]);
+    expect(link(s)?.state).toBe("up");
+    await s.controller.setLink({ ...held, exit: true, route: { how: "dial", address: "example.net" } });
+    expect(error(s)).toMatch(/^The change did not reach the engine: only an IP address/);
+    expect(link(s)?.settings?.route).toEqual(held.route);
+    await s.controller.linkUnpair();
+    expect(link(s)).toMatchObject({ state: "unpaired" });
+    expect(error(s)).toBeNull();
+    s.undo();
   });
 });

@@ -63,9 +63,8 @@ pub struct Session {
     _writer: Owned,
 }
 
-pub async fn connect(connector: &dyn Connector, addr: SocketAddr, name: ServerName<'static>, config: Arc<ClientConfig>) -> Result<(Session, TlsFacts), String> {
-    let tcp = connector.tcp(addr).await?;
-    tcp.set_nodelay(true).map_err(|e| format!("nodelay: {e}"))?;
+pub async fn connect(connector: &dyn Connector, addr: SocketAddr, host: &str, name: ServerName<'static>, config: Arc<ClientConfig>) -> Result<(Session, TlsFacts), String> {
+    let tcp = connector.resolver_stream(addr, host).await?;
     let tls = TlsConnector::from(config).connect(name, tcp).await.map_err(|e| format!("TLS to {addr}: {e}"))?;
     let facts = TlsFacts::of(tls.get_ref().1);
     let (reader, writer) = tokio::io::split(tls);

@@ -44,6 +44,10 @@ live-scope = []
 [dependencies]
 sieve-filter = { path = "../sieve-filter" }
 sieve-ipc = { path = "../sieve-ipc", features = ["tokio"] }
+# Exiting through another device (`link`): the device side of a Sieve link.
+# Its own licence (Apache-2.0 placeholder), which this GPL crate may use; it
+# depends on nothing here.
+sieve-link = { path = "../sieve-link" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

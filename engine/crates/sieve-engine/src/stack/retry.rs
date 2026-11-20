@@ -157,7 +157,7 @@ struct Running<'a, S> {
 
 /// Connects to `target` as the module says. `alternates` is asked at most once,
 /// and only once a connect failed or the race is due.
-pub async fn connect<A: Attempt>(dialer: &A, target: SocketAddr, alternates: impl FnOnce() -> Vec<IpAddr>) -> Connected<A::Stream> {
+pub async fn connect<A: Attempt + ?Sized>(dialer: &A, target: SocketAddr, alternates: impl FnOnce() -> Vec<IpAddr>) -> Connected<A::Stream> {
     let start = Instant::now();
     let deadline = start + BUDGET;
     let mut running = vec![Running { target, how: None, connect: dialer.attempt(target) }];

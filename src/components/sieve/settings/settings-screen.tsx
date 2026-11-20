@@ -11,6 +11,7 @@ import { Page } from "@/components/sieve/shell/page";
 import { Button } from "@/components/ui/button";
 import { CERTIFICATE_ANCHOR, DNS_CLIENT_CAPTURE, ENGINE_ANCHOR, ENGINE_SWITCH } from "@/core/engine";
 import { EXCLUSIONS_ANCHOR } from "@/core/exclusions";
+import { LINK_ANCHOR } from "@/core/link";
 import { readValue } from "@/core/settings/document";
 import { settingDef, type Section, type SettingKey } from "@/core/settings/registry";
 import { cn } from "@/lib/utils";
@@ -18,6 +19,7 @@ import { CertificateGroup } from "./certificate-group";
 import { DnsCaptureState } from "./dns-capture-state";
 import { EngineCard } from "./engine-card";
 import { ExclusionsGroup } from "./exclusions-group";
+import { LinkSection } from "./link-section";
 import { SettingRow } from "./setting-row";
 import { TransferMenu } from "./transfer-menu";
 import { useSettingsView } from "./use-settings-view";
@@ -40,7 +42,8 @@ const PASSWORD_SECTION = settingDef("password.idleMinutes").section;
  * export, import and reset. The section that owns the engine's switch also
  * carries the engine (EngineCard, read only, anchor ENGINE_ANCHOR) with the root certificate
  * under it (CertificateGroup, anchor CERTIFICATE_ANCHOR) and what is not decrypted
- * under that (ExclusionsGroup, anchor EXCLUSIONS_ANCHOR).
+ * under that (ExclusionsGroup, anchor EXCLUSIONS_ANCHOR), then exiting through
+ * another device (LinkSection, anchor LINK_ANCHOR), only from an engine that can.
  */
 export function SettingsScreen() {
   const [query, setQuery] = useState("");
@@ -114,6 +117,10 @@ export function SettingsScreen() {
                         <CardBoundary title="Not decrypted">
                           <ExclusionsGroup />
                         </CardBoundary>
+                      </div>
+                      {/* Nothing at all from an engine that cannot exit through another device. */}
+                      <div id={LINK_ANCHOR} className="scroll-mt-[4rem] empty:hidden">
+                        <LinkSection />
                       </div>
                     </div>
                   )}

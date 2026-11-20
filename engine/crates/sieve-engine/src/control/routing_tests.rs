@@ -14,6 +14,7 @@ use crate::ipc::Backend;
 use crate::policy::{Runs, wall_ms};
 use crate::route::prefix::Prefix;
 use crate::route::table::NetTables;
+use crate::link::exit::Exit;
 use crate::stack::egress::Egress;
 use crate::tls::active::Active;
 use crate::tls::ech::EchCache;
@@ -37,10 +38,10 @@ fn engine() -> Engine {
 }
 
 /// What `build_interception` makes.
-fn built(engine: &Engine) -> Interception<Egress> {
+fn built(engine: &Engine) -> Interception<Exit> {
     let tables = Arc::new(RwLock::new(NetTables::default()));
     Interception {
-        connector: Arc::new(Egress::new(0, tables)),
+        connector: Arc::new(Exit { net: Arc::new(Egress::new(0, tables)), link: engine.link.clone(), book: engine.book.clone() }),
         exclusions: engine.exclusions.clone(),
         verifier: Arc::new(Verifier::new(Pki::new("Test Public Root").roots(), FakeTrust::says(TrustAnswer::Trusted), TRUST_TIMEOUT, engine.validation.clone()).unwrap()),
         verdicts: VerdictCache::default(),
@@ -66,7 +67,7 @@ fn turn(engine: &Engine, change: Off) {
 }
 
 /// The slot's sync with nothing to load.
-async fn sync(engine: &Engine, build: impl FnOnce() -> Result<Interception<Egress>, String>) {
+async fn sync(engine: &Engine, build: impl FnOnce() -> Result<Interception<Exit>, String>) {
     sync_https_by(engine, async {}, build).await;
 }
 

@@ -408,6 +408,36 @@ mod imp {
         status_of(name, ClientMessage::ResumeDnsCapture {}).await
     }
 
+    /// A link message (`LinkPair`, `LinkUnpair`, `SetLink`), sent only to an
+    /// engine whose Status on this same connection carried `link`: an engine
+    /// from before them ends the conversation on a type it does not know, so
+    /// without the fact the message never leaves and the refusal is local.
+    /// The engine's Status after it, or its refusal.
+    pub async fn link(name: &str, msg: ClientMessage) -> Result<EngineStatus, String> {
+        let exchange = async {
+            let (mut pipe, _, _) = hello(name).await?.map_err(|fact| match fact {
+                PipeFact::Refused { message } | PipeFact::Unreachable { message } => message,
+                PipeFact::Incompatible { supported } => format!("the engine speaks protocol {} to {}", supported[0], supported[1]),
+                PipeFact::Welcome { .. } => "unexpected welcome".to_string(),
+            })?;
+            write_frame(&mut pipe, &ClientMessage::Status).await.map_err(|e| e.to_string())?;
+            match read_frame(&mut pipe).await.map_err(|e| e.to_string())? {
+                EngineMessage::Status(status) if status.link.is_some() => {}
+                EngineMessage::Status(_) => return Err(NO_LINK.to_string()),
+                EngineMessage::Error { message } => return Err(message),
+                other => return Err(format!("unexpected answer: {other:?}")),
+            }
+            // A pairing code's frame is wiped once written (`LinkCode`).
+            sieve_ipc::nonblocking::write_secret_frame(&mut pipe, &msg).await.map_err(|e| e.to_string())?;
+            match read_frame(&mut pipe).await.map_err(|e| e.to_string())? {
+                EngineMessage::Status(status) => Ok(status),
+                EngineMessage::Error { message } => Err(message),
+                other => Err(format!("unexpected answer: {other:?}")),
+            }
+        };
+        tokio::time::timeout(PROBE_TIMEOUT, exchange).await.unwrap_or_else(|_| Err(format!("no answer in {} s", PROBE_TIMEOUT.as_secs())))
+    }
+
     /// One request answered with a Status, or the reason it was not.
     async fn status_of(name: &str, msg: ClientMessage) -> Result<EngineStatus, String> {
         match tokio::time::timeout(PROBE_TIMEOUT, request(name, msg)).await {
@@ -889,6 +919,93 @@ pub async fn engine_resume_dns_capture() -> Result<EngineStatus, String> {
 #[cfg(not(windows))]
 #[tauri::command]
 pub async fn engine_resume_dns_capture() -> Result<EngineStatus, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// The local refusal of a link message to an engine whose status did not carry
+/// `link` (an engine from before it, or one that could not be asked).
+pub const NO_LINK: &str = "This version of Sieve's engine cannot exit through another device.";
+/// The local refusal of a pairing code that cannot be one. Never names the code.
+pub const NOT_A_CODE: &str = "That is not a pairing code.";
+
+/// `text` with every copy of the pairing code taken out, so the code never
+/// reaches an error string, whatever the engine or a failed frame said.
+pub fn without_code(text: String, code: &str) -> String {
+    if code.is_empty() || !text.contains(code) { text } else { text.replace(code, "(the pairing code)") }
+}
+
+/// Why a route cannot be sent, said without the engine; None when it may go.
+pub fn route_problem(route: &sieve_ipc::LinkRoute) -> Option<&'static str> {
+    match route {
+        sieve_ipc::LinkRoute::Dial { address } if address.trim().is_empty() || address.len() > sieve_ipc::LINK_ADDRESS_MAX => Some("Type the other device's address and port."),
+        // As the engine takes it: an IP address with its port, never a name.
+        sieve_ipc::LinkRoute::Dial { address } if address.trim().parse::<std::net::SocketAddr>().is_err() => Some("Type an IP address with its port, such as 203.0.113.20:7443."),
+        sieve_ipc::LinkRoute::Listen { port: 0 } => Some("Choose a port from 1 to 65535."),
+        _ => None,
+    }
+}
+
+/// `LinkPair` as it is sent: the code checked for size only (the engine reads
+/// it), never logged; the refusal local and without the code. The code given is
+/// wiped here; the one sent is a [`sieve_ipc::LinkCode`], wiped when dropped.
+pub fn link_pair_message(mut code: String, route: Option<sieve_ipc::LinkRoute>) -> Result<sieve_ipc::ClientMessage, String> {
+    let trimmed = sieve_ipc::LinkCode::from(code.trim());
+    sieve_ipc::wipe(&mut code);
+    if trimmed.expose().is_empty() || trimmed.expose().len() > sieve_ipc::LINK_CODE_MAX {
+        return Err(NOT_A_CODE.into());
+    }
+    if let Some(problem) = route.as_ref().and_then(route_problem) {
+        return Err(problem.into());
+    }
+    Ok(sieve_ipc::ClientMessage::LinkPair { code: trimmed, route })
+}
+
+/// Command: pair this computer with another device (a Sieve link hub). `code`
+/// is the hub's pairing code: it goes to the engine and nowhere else, and no
+/// error this returns contains it. `route` None dials the address in the code.
+/// Sent only to an engine whose status carries `link`. Every copy made here is
+/// wiped (see `sieve_ipc::LinkCode` for what is out of reach).
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_link_pair(code: String, route: Option<sieve_ipc::LinkRoute>) -> Result<EngineStatus, String> {
+    // Kept only to take the code out of an error: wiped when dropped.
+    let trimmed = sieve_ipc::LinkCode::from(code.trim());
+    let msg = link_pair_message(code, route)?;
+    imp::link(PIPE_NAME, msg).await.map_err(|e| without_code(e, trimmed.expose()))
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_link_pair(_code: String, _route: Option<sieve_ipc::LinkRoute>) -> Result<EngineStatus, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// Command: forget the other device. No argument.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_link_unpair() -> Result<EngineStatus, String> {
+    imp::link(PIPE_NAME, sieve_ipc::ClientMessage::LinkUnpair {}).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_link_unpair() -> Result<EngineStatus, String> {
+    Err("the engine runs on Windows only".into())
+}
+
+/// Command: the owner's choices for the paired device, whole.
+#[cfg(windows)]
+#[tauri::command]
+pub async fn engine_set_link(settings: sieve_ipc::LinkSettings) -> Result<EngineStatus, String> {
+    if let Some(problem) = route_problem(&settings.route) {
+        return Err(problem.into());
+    }
+    imp::link(PIPE_NAME, sieve_ipc::ClientMessage::SetLink(settings)).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn engine_set_link(_settings: sieve_ipc::LinkSettings) -> Result<EngineStatus, String> {
     Err("the engine runs on Windows only".into())
 }
 
@@ -1384,6 +1501,98 @@ mod tests {
         assert_eq!(got, Err("that is not the network Sieve sees now, so the capture stays".into()));
         let got = fake_engine(&test_pipe("resume"), welcome(), EngineMessage::Status(EngineStatus::default()), ClientAsk::Resume).await;
         assert!(matches!(got, Ok(PipeFact::Welcome { .. })));
+    }
+
+    /// The code is checked for size only, trimmed, and a refusal never holds it.
+    #[test]
+    fn a_pairing_code_is_checked_locally_and_never_echoed() {
+        use sieve_ipc::{ClientMessage, LinkRoute};
+        let code = format!("SL1-{}", "A".repeat(139));
+        let sent = link_pair_message(format!("  {code}\n"), None).unwrap();
+        assert_eq!(sent, ClientMessage::LinkPair { code: code.clone().into(), route: None });
+        for bad in [String::new(), "   ".into(), "x".repeat(sieve_ipc::LINK_CODE_MAX + 1)] {
+            let refused = link_pair_message(bad.clone(), None).unwrap_err();
+            assert_eq!(refused, NOT_A_CODE);
+            assert!(bad.trim().is_empty() || !refused.contains(bad.trim()));
+        }
+        let listen = Some(LinkRoute::Listen { port: 0 });
+        assert_eq!(link_pair_message(code.clone(), listen).unwrap_err(), "Choose a port from 1 to 65535.");
+        let dial = Some(LinkRoute::Dial { address: " ".into() });
+        assert!(link_pair_message(code.clone(), dial).is_err());
+        let ok = Some(LinkRoute::Dial { address: "203.0.113.20:7443".into() });
+        assert!(link_pair_message(code.clone(), ok).is_ok());
+        let name = Some(LinkRoute::Dial { address: "home.example.net:7443".into() });
+        assert!(link_pair_message(code.clone(), name).unwrap_err().contains("IP address"), "a name is refused as the engine refuses it");
+        let echoed = format!("bad code {code}: expired");
+        assert_eq!(without_code(echoed, &code), "bad code (the pairing code): expired");
+        assert_eq!(without_code("expired".into(), &code), "expired");
+        assert_eq!(without_code("expired".into(), ""), "expired");
+    }
+
+    /// The Hello names `link`, as every capability this app shows.
+    #[test]
+    fn the_hello_names_link() {
+        assert!(sieve_ipc::APP_CAPABILITIES.contains(&sieve_ipc::CAPABILITY_LINK));
+    }
+
+    /// A stand-in engine for the link messages: checks the Hello names `link`,
+    /// answers Status with `status`, and, only if the app then sends anything,
+    /// answers it with `then`. What the app sent after the Status.
+    #[cfg(windows)]
+    async fn link_engine(tag: &str, status: EngineStatus, then: sieve_ipc::EngineMessage, msg: sieve_ipc::ClientMessage) -> (Result<EngineStatus, String>, Option<sieve_ipc::ClientMessage>) {
+        use sieve_ipc::nonblocking::{read_frame, write_frame};
+        use sieve_ipc::{ClientMessage, EngineMessage};
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let name = test_pipe(tag);
+        let mut server = ServerOptions::new().first_pipe_instance(true).create(&name).unwrap();
+        let engine = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let hello: ClientMessage = read_frame(&mut server).await.unwrap();
+            assert!(matches!(&hello, ClientMessage::Hello { capabilities, .. } if capabilities.iter().any(|c| c == sieve_ipc::CAPABILITY_LINK)), "the Hello names link");
+            write_frame(&mut server, &EngineMessage::Welcome { protocol: PROTOCOL, engine_version: "0.1.0".into(), session_id: 1 }).await.unwrap();
+            let asked: ClientMessage = read_frame(&mut server).await.unwrap();
+            assert_eq!(asked, ClientMessage::Status);
+            write_frame(&mut server, &EngineMessage::Status(status)).await.unwrap();
+            // An engine from before the link would end the conversation here on the next message; this one reads what comes.
+            let next = read_frame::<_, ClientMessage>(&mut server).await.ok();
+            if next.is_some() {
+                write_frame(&mut server, &then).await.unwrap();
+            }
+            next
+        });
+        let got = imp::link(&name, msg).await;
+        (got, engine.await.unwrap())
+    }
+
+    /// No link message reaches an engine whose status lacks `link`; with it,
+    /// each message is sent as is and answered with the Status or the refusal.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_link_messages_go_only_to_an_engine_whose_status_carries_link() {
+        use sieve_ipc::{ClientMessage, EngineMessage, LinkHubDown, LinkRoute, LinkSettings, LinkState, LinkStatus, LinkUdp};
+        let unpaired = EngineStatus { link: Some(LinkStatus { state: LinkState::Unpaired, hub_name: None, hub_fingerprint: None, device_fingerprint: None, settings: None, since_ms: None, last_error: None, listening: None }), ..EngineStatus::default() };
+        let pairing = EngineStatus { link: Some(LinkStatus { state: LinkState::Pairing, ..unpaired.link.clone().unwrap() }), ..EngineStatus::default() };
+        let pair = ClientMessage::LinkPair { code: "SL1-EXAMPLEONLY".into(), route: Some(LinkRoute::Listen { port: 7443 }) };
+
+        let (got, sent) = link_engine("link-old", EngineStatus::default(), EngineMessage::Status(EngineStatus::default()), pair.clone()).await;
+        assert_eq!(got, Err(NO_LINK.to_string()));
+        assert_eq!(sent, None, "an engine without the fact is never sent the message");
+
+        let (got, sent) = link_engine("link-pair", unpaired.clone(), EngineMessage::Status(pairing.clone()), pair.clone()).await;
+        assert_eq!(got, Ok(pairing));
+        assert_eq!(sent, Some(pair.clone()));
+
+        let refused = EngineMessage::Error { message: "the code has expired".into() };
+        let (got, _) = link_engine("link-expired", unpaired.clone(), refused, pair).await;
+        assert_eq!(got, Err("the code has expired".to_string()));
+
+        let settings = LinkSettings { exit: true, on_hub_down: LinkHubDown::Stop, udp: LinkUdp::Drop, route: LinkRoute::Dial { address: "203.0.113.20:7443".into() } };
+        let set = ClientMessage::SetLink(settings);
+        let (_, sent) = link_engine("link-set", unpaired.clone(), EngineMessage::Status(unpaired.clone()), set.clone()).await;
+        assert_eq!(sent, Some(set));
+        let (got, sent) = link_engine("link-unpair", unpaired.clone(), EngineMessage::Status(unpaired.clone()), ClientMessage::LinkUnpair {}).await;
+        assert_eq!((got, sent), (Ok(unpaired), Some(ClientMessage::LinkUnpair {})));
     }
 
     #[cfg(windows)]

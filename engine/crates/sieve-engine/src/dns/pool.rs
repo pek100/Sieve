@@ -339,11 +339,11 @@ async fn open(links: &Links, upstream: &Upstream, address: SocketAddr) -> Result
     let (session, facts) = match upstream.kind {
         Kind::Https => {
             let uri = upstream.to_string().parse().map_err(|e| format!("{upstream}: {e}"))?;
-            let (s, f) = doh::connect(connector, address, name()?, uri, links.tls.doh.clone()).await?;
+            let (s, f) = doh::connect(connector, address, &upstream.host, name()?, uri, links.tls.doh.clone()).await?;
             (Session::Doh(s), f)
         }
         Kind::Tls => {
-            let (s, f) = dot::connect(connector, address, name()?, links.tls.dot.clone()).await?;
+            let (s, f) = dot::connect(connector, address, &upstream.host, name()?, links.tls.dot.clone()).await?;
             (Session::Dot(s), f)
         }
         Kind::Quic => {

@@ -57,7 +57,10 @@ import {
   type EngineLists,
   type EnginePolicy,
   type EngineStatus,
+  type LinkRoute,
+  type LinkStatus,
   type LogEntry,
+  parseLinkStatus,
 } from "./protocol";
 
 export const ENGINE_SCENARIOS = [
@@ -158,6 +161,31 @@ const PARTIAL_ISSUES = {
   ],
 };
 
+/**
+ * `?link=`: `none`, the default, is an engine from before exiting through
+ * another device (its status has no `link`, so the app shows nothing of it);
+ * the others start at the IPC fixture's `linkStatuses` example of that state.
+ */
+export const LINK_SCENARIOS = ["none", "unpaired", "pairing", "off", "connecting", "up", "down"] as const;
+export type LinkScenario = (typeof LINK_SCENARIOS)[number];
+/** The mock engine's refusals of the link messages. None of them holds the code. */
+export const MOCK_NOT_A_CODE = "that is not a pairing code";
+export const MOCK_CODE_EXPIRED = "the pairing code has expired; ask the other device for a new one";
+export const MOCK_ALREADY_PAIRED = "this computer is already paired; unpair it first";
+export const MOCK_UNPAIRED = "there is no paired device to change";
+export const MOCK_BAD_ADDRESS = "only an IP address with a port is accepted, such as 203.0.113.20:7443";
+export const MOCK_BAD_PORT = "the port must be a number from 1 to 65535";
+/** An engine from before the link messages ends the conversation on them, with serde's words. */
+export const MOCK_OLD_ENGINE_LINK = "malformed frame: unknown variant";
+/** The address the mock "listens" on, and the one a code carries. */
+export const MOCK_LISTEN_ADDRESS = "198.51.100.30";
+export const MOCK_CODE_ADDRESS = "203.0.113.20:7443";
+
+const LINK_EXAMPLES = ipc.linkStatuses.map((s) => parseLinkStatus(s)).filter((s): s is LinkStatus => s !== null);
+const linkExample = (state: LinkStatus["state"]): LinkStatus => structuredClone(LINK_EXAMPLES.find((s) => s.state === state) ?? { state });
+const PAIRED = linkExample("off");
+const IP_PORT = /^(?:\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-f:.]+\]):(\d{1,5})$/i;
+
 /** The mock's Wi-Fi that wants a sign-in (`signIn` option), its refusal for any other, and a pause's time left. */
 export const MOCK_SIGN_IN_NETWORK = "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}";
 export const MOCK_NO_SIGN_IN = "this network does not look like one that wants a sign-in, so the capture stays";
@@ -165,14 +193,54 @@ export const MOCK_PAUSED_LEFT_S = 14 * 60 + 20;
 
 export function createMockEngine(
   start: EngineScenario = "missing",
-  options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean; run?: number; importAnswer?: (typeof IMPORT_ANSWERS)[number]; issues?: IssuesScenario; now?: () => number; signIn?: boolean } = {},
+  options: { seed?: number; logError?: boolean; cert?: CertScenario; heal?: boolean; run?: number; importAnswer?: (typeof IMPORT_ANSWERS)[number]; issues?: IssuesScenario; now?: () => number; signIn?: boolean; link?: LinkScenario } = {},
 ): EngineSource {
   let scenario = start;
+  const now = options.now ?? Date.now;
+  // Exiting through another device: null is an engine from before it.
+  let link: LinkStatus | null = options.link && options.link !== "none" ? linkExample(options.link) : null;
+  // A pairing in progress: the route it was asked for, and whether its code fails.
+  let pairing: { route: LinkRoute | undefined; expired: boolean } | null = null;
+  const routesUp = () => statusOf(scenario).routes_up;
+  const requireLink = (type: string) => {
+    requireWelcome();
+    if (link === null) throw new Error(`${MOCK_OLD_ENGINE_LINK} \`${type}\``);
+  };
+  const routeProblem = (route: LinkRoute | undefined): string | null => {
+    if (route === undefined) return null;
+    if (route.how === "listen") return Number.isInteger(route.port) && route.port >= 1 && route.port <= 65_535 ? null : MOCK_BAD_PORT;
+    const port = Number(IP_PORT.exec(route.address.trim())?.[1] ?? 0);
+    return port >= 1 && port <= 65_535 ? null : MOCK_BAD_ADDRESS;
+  };
+  // As the engine: a pairing ends at the next look, paired and off, or back to unpaired with the reason.
+  const settlePairing = () => {
+    if (link?.state !== "pairing" || pairing === null) return;
+    const { route, expired } = pairing;
+    pairing = null;
+    link = expired
+      ? { state: "unpaired", since_ms: now(), last_error: MOCK_CODE_EXPIRED }
+      : { ...PAIRED, since_ms: now(), settings: { exit: false, on_hub_down: "stop", udp: "drop", route: route ?? { how: "dial", address: MOCK_CODE_ADDRESS } } };
+  };
+  // What the status says of the link: an exit that is up needs routes, so with none it reads connecting.
+  const linkNow = (routes: boolean): LinkStatus | null => {
+    if (link === null) return null;
+    if (link.state === "up" && !routes) {
+      const rest = { ...link };
+      delete rest.listening;
+      return { ...rest, state: "connecting" };
+    }
+    return link;
+  };
   let held: Omit<EnginePolicy, "revision" | "engine"> | null = null;
   const holdsHttps = options.heal === true;
   // A Wi-Fi that wants a sign-in, while routes are up and the capture is wanted (`signIn` option).
   let signIn: "none" | "shown" | "paused" = options.signIn ? "shown" : "none";
   const echo = (status: EngineStatus): EngineStatus => {
+    const out = echoPolicy(status);
+    const l = linkNow(out.routes_up);
+    return l === null ? out : { ...out, link: l };
+  };
+  const echoPolicy = (status: EngineStatus): EngineStatus => {
     const policy = held ? { ...status.policy, ...held } : status.policy;
     const captureWanted = !policy.skip_dns_capture && !policy.plain_dns;
     // As the engine: the setting off ends a pause.
@@ -251,6 +319,7 @@ export function createMockEngine(
     kind: "mock",
     probe: async () => {
       if (scenario === "error") throw new Error(MOCK_ENGINE_ERROR);
+      settlePairing();
       const probe = parseEngineProbe(fixture.examples[scenario]);
       const withHeld = probe.pipe?.kind === "welcome" ? { ...probe, pipe: { ...probe.pipe, status: echo(probe.pipe.status) } } : probe;
       return adguardWhileIdle === null ? withHeld : { ...withHeld, adguard: adguardWhileIdle };
@@ -385,6 +454,39 @@ export function createMockEngine(
     resumeDnsCapture: async () => {
       requireWelcome();
       if (signIn === "paused") signIn = "shown";
+      return echo(statusOf(scenario));
+    },
+    linkPair: async (code, route) => {
+      requireLink("link_pair");
+      // As the engine: the code is read, never said back.
+      if (!code.trim().startsWith("SL1-")) throw new Error(MOCK_NOT_A_CODE);
+      if (link !== null && link.state !== "unpaired") throw new Error(MOCK_ALREADY_PAIRED);
+      const problem = routeProblem(route);
+      if (problem !== null) throw new Error(problem);
+      pairing = { route, expired: /EXPIRED/.test(code) };
+      link = { state: "pairing", since_ms: now(), ...(route?.how === "listen" ? { listening: `${MOCK_LISTEN_ADDRESS}:${route.port}` } : {}) };
+      return echo(statusOf(scenario));
+    },
+    linkUnpair: async () => {
+      requireLink("link_unpair");
+      pairing = null;
+      link = { state: "unpaired", since_ms: now() };
+      return echo(statusOf(scenario));
+    },
+    setLink: async (settings) => {
+      requireLink("set_link");
+      if (link === null || link.settings === undefined || link.state === "unpaired" || link.state === "pairing") throw new Error(MOCK_UNPAIRED);
+      // A route it already holds is not judged again.
+      const problem = JSON.stringify(settings.route) === JSON.stringify(link.settings.route) ? null : routeProblem(settings.route);
+      if (problem !== null) throw new Error(problem);
+      const wasOn = link.settings.exit;
+      // Exit stays down or connecting while it stays on; turned on, it comes up when Sieve routes.
+      const state = !settings.exit ? "off" : wasOn && (link.state === "down" || link.state === "connecting") ? link.state : routesUp() ? "up" : "connecting";
+      const listening = settings.exit && settings.route.how === "listen" && routesUp() ? { listening: `${MOCK_LISTEN_ADDRESS}:${settings.route.port}` } : {};
+      const rest = { ...link };
+      delete rest.listening;
+      delete rest.last_error;
+      link = { ...rest, state, settings: structuredClone(settings), since_ms: state === link.state ? link.since_ms : now(), ...listening, ...(state === "down" && link.last_error ? { last_error: link.last_error } : {}) };
       return echo(statusOf(scenario));
     },
   };

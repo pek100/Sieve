@@ -99,7 +99,10 @@
     { "type": "list_rules", "id": "adguard-dns", "query": "ads" },
     { "type": "issues", "after": 0 },
     { "type": "pause_dns_capture", "network": "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}" },
-    { "type": "resume_dns_capture" }
+    { "type": "resume_dns_capture" },
+    { "type": "link_pair", "code": "SL1-EXAMPLEONLYNOTAREALCODE", "route": { "how": "listen", "port": 7443 } },
+    { "type": "link_unpair" },
+    { "type": "set_link", "exit": true, "on_hub_down": "stop", "udp": "drop", "route": { "how": "dial", "address": "203.0.113.20:7443" } }
   ],
   "wifiSignInStates": [
     { "network": "{6f1c2a9e-0b7d-4c55-9a31-2f1d8e4b7c10}" },
@@ -499,9 +502,61 @@
             { "signal": "dns_unanswered", "cause": "unknown", "host": null, "count": 5, "first_ms": 1793000044000, "last_ms": 1793000045000 },
             { "signal": "handshake_abandoned", "cause": "unknown", "host": "chat.example", "count": 1, "first_ms": 1793000046000, "last_ms": 1793000046000 }
           ]
+        },
+        {
+          "key": "browser",
+          "exe": "browser.exe",
+          "session": 1,
+          "since_ms": 1793000000000,
+          "flows": 30,
+          "retried": 0,
+          "recovered": 0,
+          "problems": [
+            { "signal": "hub_down", "cause": "hub", "host": "video.example", "count": 4, "first_ms": 1793000050000, "last_ms": 1793000058000 },
+            { "signal": "hub_refused", "cause": "hub", "host": "shop.example", "count": 1, "first_ms": 1793000051000, "last_ms": 1793000051000 },
+            { "signal": "udp_dropped", "cause": "sieve", "host": "198.51.100.7", "count": 2, "first_ms": 1793000052000, "last_ms": 1793000053000 }
+          ]
         }
       ],
       "dropped": 0
+    }
+  ],
+  "linkStatuses": [
+    { "state": "unpaired" },
+    { "state": "pairing", "since_ms": 1793000000000 },
+    {
+      "state": "off",
+      "hub_name": "home",
+      "hub_fingerprint": "5e1a9c0d4b7f2e8a6c3d1f0b9e7a5c3d2b1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d",
+      "device_fingerprint": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "settings": { "exit": false, "on_hub_down": "stop", "udp": "drop", "route": { "how": "dial", "address": "203.0.113.20:7443" } },
+      "since_ms": 1793000000000
+    },
+    {
+      "state": "up",
+      "hub_name": "home",
+      "hub_fingerprint": "5e1a9c0d4b7f2e8a6c3d1f0b9e7a5c3d2b1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d",
+      "device_fingerprint": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "settings": { "exit": true, "on_hub_down": "stop", "udp": "drop", "route": { "how": "listen", "port": 7443 } },
+      "since_ms": 1793000060000,
+      "listening": "198.51.100.30:7443"
+    },
+    {
+      "state": "connecting",
+      "hub_name": "home",
+      "hub_fingerprint": "5e1a9c0d4b7f2e8a6c3d1f0b9e7a5c3d2b1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d",
+      "device_fingerprint": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "settings": { "exit": true, "on_hub_down": "direct", "udp": "direct", "route": { "how": "dial", "address": "[2001:db8::20]:7443" } },
+      "since_ms": 1793000070000
+    },
+    {
+      "state": "down",
+      "hub_name": "home",
+      "hub_fingerprint": "5e1a9c0d4b7f2e8a6c3d1f0b9e7a5c3d2b1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d",
+      "device_fingerprint": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "settings": { "exit": true, "on_hub_down": "stop", "udp": "drop", "route": { "how": "dial", "address": "203.0.113.20:7443" } },
+      "since_ms": 1793000080000,
+      "last_error": "dial 203.0.113.20:7443: timed out: connect"
     }
   ],
   "outcomes": [
@@ -515,7 +570,13 @@
     { "kind": "passed", "reason": "app_off" },
     { "kind": "not_decrypted", "reason": "no_rule" },
     { "kind": "problem", "signal": "blocked", "cause": "sieve" },
-    { "kind": "retried", "how": "reconnect", "recovered": false }
+    { "kind": "retried", "how": "reconnect", "recovered": false },
+    { "kind": "exit", "via": "hub", "target": "video.example:443" },
+    { "kind": "exit", "via": "direct", "target": "203.0.113.9:443", "reason": "the hub is not reachable; going direct, as set" },
+    { "kind": "exit", "via": "stopped", "target": "video.example:443", "reason": "the hub is not reachable (hub-down setting: stop)" },
+    { "kind": "exit", "via": "refused", "target": "shop.example:443", "reason": "denied: shop.example is not on this device's allow-list" },
+    { "kind": "exit", "via": "dropped", "reason": "UDP is not carried through the other device, so it was dropped, as set" },
+    { "kind": "exit", "via": "hub", "reason": "The way out changed: 3 open connections ended so they reconnect through the other device" }
   ],
   "certStatuses": {
     "installed": {

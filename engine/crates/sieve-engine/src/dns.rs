@@ -103,7 +103,25 @@ pub trait Connector: Send + Sync + 'static {
     fn address(&self, target: SocketAddr) -> SocketAddr {
         target
     }
+    /// The stream an encrypted resolver's session (DNS over HTTPS or TLS) runs
+    /// on, to `target`, the resolver named `host`. A plain or LAN lookup never
+    /// comes here (it takes `tcp`). Exiting through a hub sends these through
+    /// the link (`link::exit::DnsExit`); otherwise it is `tcp`.
+    fn resolver_stream<'a>(&'a self, target: SocketAddr, host: &'a str) -> BoxFuture<'a, Result<ResolverStream, String>> {
+        let _ = host;
+        Box::pin(async move {
+            let tcp = self.tcp(target).await?;
+            tcp.set_nodelay(true).map_err(|e| format!("nodelay: {e}"))?;
+            Ok(Box::new(tcp) as ResolverStream)
+        })
+    }
 }
+
+/// A byte stream a resolver session runs on: a TCP socket, or a stream
+/// through the link.
+pub trait ResolverIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ResolverIo for T {}
+pub type ResolverStream = Box<dyn ResolverIo>;
 
 /// A spawned task that ends with its owner, so nothing outlives the engine.
 pub(crate) struct Owned(tokio::task::AbortHandle);

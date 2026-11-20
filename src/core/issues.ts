@@ -23,28 +23,33 @@ export const SIGNAL_TEXT: Readonly<Record<Signal, string>> = {
   blocked: "Sieve blocked it with a filter rule",
   quic_refused: "Sieve asked it to use a regular connection, so it can be filtered",
   handshake_abandoned: "It stopped before its secure connection with Sieve was set up",
+  hub_down: "The other device it exits through could not be reached, so the connection was stopped",
+  hub_refused: "The other device it exits through refused the connection",
+  udp_dropped: "UDP does not go through the other device, so Sieve dropped it, as set",
   // A kind of problem this version of Sieve does not know yet: said plainly, no fix offered.
   unknown: "A connection had a problem this version of Sieve cannot name",
 };
 
-/** Sieve meant these: a rule's block, a QUIC refusal the app answers by falling back. The engine's `Signal::intended`. */
-const INTENDED: ReadonlySet<Signal> = new Set(["blocked", "quic_refused"]);
+/** Sieve meant these: a rule's block, a QUIC refusal the app answers by falling back, UDP dropped as the owner set. The engine's `Signal::intended`. */
+const INTENDED: ReadonlySet<Signal> = new Set(["blocked", "quic_refused", "udp_dropped"]);
 export const isIntended = (p: Pick<Problem, "signal">) => INTENDED.has(p.signal);
 
 export const CAUSE_TEXT: Readonly<Record<Cause, string>> = {
   sieve: "Likely Sieve",
   network: "Likely the network or the server, not Sieve",
+  hub: "Likely the other device this computer exits through, not the app or Sieve's filtering",
   unknown: "Sieve cannot tell",
 };
 
-/** One app's likely cause, from its problems: Sieve if any failure was Sieve's, else unknown, else the network. */
+/** One app's likely cause, from its problems: Sieve if any failure was Sieve's, else unknown, else the other device, else the network. */
 export type Verdict = Cause | "intended";
 
 export const VERDICT_TEXT: Readonly<Record<Verdict, string>> = {
   sieve: "Sieve is the likely cause.",
   unknown: "Sieve cannot tell whether it is the cause.",
+  hub: "The other device this computer exits through is the likely cause: it could not be reached or it refused. Neither the app nor Sieve's filtering did it.",
   network: "The network or the server is the likely cause. The same would happen without Sieve.",
-  intended: "Only connections a filter rule blocked.",
+  intended: "Only connections Sieve meant to stop: a filter rule's blocks, or UDP the other device does not carry.",
 };
 
 /** The problems the app felt: everything but what Sieve meant. */
@@ -54,7 +59,7 @@ const sum = (problems: readonly Problem[]) => problems.reduce((n, p) => n + (p.c
 
 export function verdict(app: Pick<AppIssues, "problems">): Verdict {
   const felt = failures(app);
-  for (const cause of ["sieve", "unknown", "network"] as const) if (felt.some((p) => p.cause === cause)) return cause;
+  for (const cause of ["sieve", "unknown", "hub", "network"] as const) if (felt.some((p) => p.cause === cause)) return cause;
   return "intended";
 }
 
@@ -69,9 +74,14 @@ export function issueName(app: Pick<AppIssues, "key" | "exe">, known: readonly {
 /** The app's line under its name: how many connections had trouble, of how many. */
 export function summaryText(app: AppIssues): string {
   const felt = sum(failures(app));
-  const blocked = sum((app.problems ?? []).filter(isIntended));
   const of = app.flows > 0 ? ` of ${app.flows}` : "";
-  const parts = [felt > 0 ? `${felt}${of} ${plural(felt, "connection")} had trouble` : null, blocked > 0 ? `${blocked} blocked by a filter rule` : null].filter(Boolean);
+  const blocked = sum((app.problems ?? []).filter((p) => isIntended(p) && p.signal !== "udp_dropped"));
+  const dropped = sum((app.problems ?? []).filter((p) => p.signal === "udp_dropped"));
+  const parts = [
+    felt > 0 ? `${felt}${of} ${plural(felt, "connection")} had trouble` : null,
+    blocked > 0 ? `${blocked} blocked by a filter rule` : null,
+    dropped > 0 ? `${dropped} UDP ${plural(dropped, "connection")} dropped, as set` : null,
+  ].filter(Boolean);
   return parts.join(", ");
 }
 
@@ -99,10 +109,11 @@ export const NOTIFY_AFTER_START_MS = 10 * 60_000;
 
 /**
  * True when the app started failing repeatedly right after Sieve began filtering
- * it, and Sieve may be why: failures the network alone explains never tell.
+ * it, and Sieve may be why: failures the network or the other device this
+ * computer exits through explain never tell.
  */
 export function startedFailing(app: AppIssues): boolean {
-  const suspect = failures(app).filter((p) => p.cause !== "network");
+  const suspect = failures(app).filter((p) => p.cause === "sieve" || p.cause === "unknown");
   if (sum(suspect) < NOTIFY_FAILURES) return false;
   const first = Math.min(...suspect.map((p) => p.first_ms));
   return first - app.since_ms <= NOTIFY_AFTER_START_MS;
