@@ -1,0 +1,38 @@
+ubo-resources.json: the scriptlet and redirect resource bundle Sieve ships
+
+What it is
+  A JSON array of adblock-rust Resource values: uBlock Origin's scriptlets
+  (and their helper functions) and its redirect resources (neutered ad and
+  analytics scripts, 1x1 images, empty media files). Filter lists name them in
+  +js(...) and $redirect rules; the engine injects the scriptlets into
+  decrypted pages and serves the redirects. Nothing in it runs in the engine.
+
+Where it comes from
+  uBlock Origin, https://github.com/gorhill/uBlock, release tag 1.76.6
+  (commit bb0648c77ee67a8732d914a13c663cffc20fb583, dist/version 1.76.6),
+  fetched with `git clone --depth 1 --branch 1.76.6` on 2026-11-20 and
+  assembled with this repository's scripts/resources/assemble-ubo.mjs:
+
+    node scripts/resources/assemble-ubo.mjs <uBlock checkout> ubo-resources.json
+
+  The output is sorted by name, so the same tag gives the same bytes. Two runs
+  on 2026-11-20 gave the same hash.
+
+  SHA-256: 21dc25d59fe301f5625dd09aaaa48e987e175ded250fa566cc1fb1bf790d066e
+  Pinned in engine/crates/sieve-engine/src/lists/resources.rs (RESOURCE_PIN).
+  A file with any other hash is refused whole.
+
+Licence
+  uBlock Origin is GPL-3.0 (Copyright (C) Raymond Hill and contributors), the
+  same licence as Sieve. Some redirect resources carry their own notices in
+  their text: google-ima.js derives from Mozilla's webcompat shims (MPL-2.0,
+  compatible with GPL-3.0), google-ima-dai.js from AdGuard Scriptlets
+  (GPL-3.0). Those notices are kept, base64-encoded, inside the bundle. The
+  source of every resource is the uBlock repository at the tag above.
+
+To update
+  Clone a newer reviewed tag into an empty folder, run the assembler, review
+  the result, replace this file, change RESOURCE_PIN and the tag above. The
+  review steps of 2026-11-20 are in docs/tasks/2026-11-06-open-decisions.md
+  (content Q1). Once releases are public (slice 13), a signed copy delivered
+  as an update (updates\resources) takes precedence over this one.

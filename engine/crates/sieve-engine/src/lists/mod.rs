@@ -415,7 +415,7 @@ impl Lists {
             }).collect();
             let texts: Vec<ListText<'_>> = copies.iter().filter_map(|(s, t)| t.as_deref().map(|text| ListText { id: &s.id, text, trusted: s.trusted })).collect();
             let mut engine = compile(&texts);
-            let (loaded, resource_error) = dir.as_deref().map_or((None, None), |d| resources::load(d, resources::RESOURCE_PIN));
+            let (loaded, resource_error) = resources::load(dir.as_deref(), resources::SHIPPED, resources::RESOURCE_PIN);
             if let Some(l) = &loaded {
                 engine.use_resources(&l.bundle);
             }
@@ -805,7 +805,8 @@ mod tests {
         cache.write_text(LIST_A, BODY).unwrap();
         let l = lists_at(dir.path(), &[LIST_A]);
         l.compile_and_swap().await;
-        assert_eq!(l.facts().unwrap().resource_pin, None, "no bundle yet");
+        let shipped = Some(format!("sha256:{}", resources::RESOURCE_PIN));
+        assert_eq!(l.facts().unwrap().resource_pin, shipped, "no signed copy yet: the shipped bundle");
 
         let path = crate::update::data_path(dir.path(), &crate::update::Kind::Resources).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -816,7 +817,7 @@ mod tests {
 
         std::fs::write(&path, b"not json").unwrap();
         l.compile_and_swap().await;
-        assert_eq!(l.facts().unwrap().resource_pin, None);
+        assert_eq!(l.facts().unwrap().resource_pin, shipped, "a broken signed copy falls back to the shipped one");
         assert!(l.compile_error().unwrap().contains("signed resource library"));
         assert!(blocks(&l, "ads.example"), "the lists still decide");
     }

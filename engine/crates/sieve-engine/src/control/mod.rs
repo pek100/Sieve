@@ -1506,7 +1506,7 @@ mod tests {
         crate::lists::cache::Cache::new(dir.path()).write_text("adguard-dns", "! Version: 2026.11.1\n||ads.example^\n||b.example^\nnot/a/$bad-option\n").unwrap();
         e.lists.compile_and_swap().await;
         let facts = e.status().filter.unwrap();
-        assert_eq!(facts.resource_pin, None, "no bundle in this folder");
+        assert_eq!(facts.resource_pin, Some(format!("sha256:{}", crate::lists::resources::RESOURCE_PIN)), "no signed bundle in this folder: the shipped one");
         let [fact] = facts.lists.as_slice() else { panic!("{facts:?}") };
         assert_eq!((fact.id.as_str(), fact.version.as_deref(), fact.applied), ("adguard-dns", Some("2026.11.1"), 2));
         assert_eq!(fact.title, sieve_filter::catalogue::find("adguard-dns").unwrap().title);
