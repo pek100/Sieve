@@ -4,3 +4,4 @@ engine/crates/sieve-filter/testdata/** -text
 tests/fixtures/ubo-tree/** -text
 engine/crates/sieve-engine/fixtures/validation/** -text
 engine/crates/sieve-engine/data/ct-log-list-pubkey.der -text
+engine/crates/sieve-engine/data/ubo-resources.json -text

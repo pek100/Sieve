@@ -6,9 +6,9 @@ import type { ReactNode } from "react";
 import { SectionIcon, type SectionIconTone } from "@/components/sieve/primitives/section-icon";
 import { CardBoundary } from "@/components/sieve/shell/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ENGINE_HREF, ENGINE_STATE_TEXT, enginePhase, engineRoutes } from "@/core/engine";
+import { ENGINE_HREF, ENGINE_STATE_TEXT, HTTPS_HREF, HTTPS_LINK_HIDDEN, enginePhase, engineRoutes, showHttpsLink } from "@/core/engine";
 import type { DeltaDir, Kpi, KpiId } from "@/core/kpis";
-import { useEngine } from "@/hooks/use-sieve";
+import { useEngine, useSetting } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
 import { useTicker } from "./use-home";
 
@@ -78,6 +78,7 @@ function Tile({ id, kpi, phase }: { id: KpiId; kpi: Kpi | null; phase: "loading"
 function EngineTile() {
   const e = useEngine();
   const phase = enginePhase(e);
+  const [hidden, setHidden] = useSetting(HTTPS_LINK_HIDDEN);
   return (
     <section aria-label="Engine" data-kpi="engine" data-engine-phase={phase} className="flex min-w-0 flex-col text-on-surface">
       <p data-kpi-label="" className="flex h-(--section-header-h) items-center gap-2 text-label text-on-surface-muted">
@@ -94,6 +95,23 @@ function EngineTile() {
           Details in Settings
         </Link>
       </p>
+      {/* The way to HTTPS filtering, off on a fresh install, while the engine routes without it,
+          until the person hides it or HTTPS filtering has been on once. */}
+      {showHttpsLink(e, hidden) && (
+        <p className="flex flex-wrap items-baseline gap-x-3" data-home-https="">
+          <Link href={HTTPS_HREF} className="text-label text-primary underline-offset-4 hover:underline">
+            Filter inside web pages too
+          </Link>
+          <button
+            type="button"
+            onClick={() => void setHidden(true)}
+            className="text-label text-on-surface-muted underline-offset-4 hover:underline"
+            data-home-https-hide=""
+          >
+            Don&apos;t show again
+          </button>
+        </p>
+      )}
     </section>
   );
 }

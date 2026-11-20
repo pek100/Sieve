@@ -97,7 +97,14 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
       }
       if (d.requires) {
         const label = isSettingKey(d.requires) ? REGISTRY[d.requires].label : d.requires;
-        if (!switchOn(d.requires)) return { kind: "requires", label, checking: false, unavailable: isSettingKey(d.requires) && !isAvailable(d.requires) };
+        if (!switchOn(d.requires)) {
+          // Name the first switch to turn on: what is required may itself wait for one that is off
+          // (an in-page protection needs page filtering, which needs HTTPS).
+          let first = d.requires;
+          for (let up = isSettingKey(first) ? settingDef(first).requires : undefined; up !== undefined && !switchOn(up); up = isSettingKey(up) ? settingDef(up).requires : undefined) first = up;
+          const firstLabel = isSettingKey(first) ? REGISTRY[first].label : first;
+          return { kind: "requires", label: firstLabel, checking: false, unavailable: isSettingKey(first) && !isAvailable(first) };
+        }
         // A data switch is proven by its live check; what builds on it waits for that.
         if (isSettingKey(d.requires) && settingDef(d.requires).kind === "dataSwitch" && !passed(d.requires)) {
           return { kind: "requires", label, checking: true };

@@ -82,7 +82,7 @@ pub fn catalogue() -> FilterCatalogue {
             url: l.url,
             licence: l.licence,
             default: default_name(l.default),
-            trusted: l.trusted,
+            trusted: l.trusted(),
             kind: kind_name(l.kind),
             level: level_name(l.level),
             description: l.description,

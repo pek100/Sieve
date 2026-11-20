@@ -46,6 +46,14 @@ function catalogueRows(): Row[] {
   };
   const adguardBase = base("adguard");
   const uassetsBase = base("uassets");
+  // Trust follows a row's author (owner, 2026-11-20): only the uBO and AdGuard teams' own lists.
+  const trustedAuthor = (author: string) => author === "Adguard" || author === "Ubo";
+  const macroTrusted = (name: string) => {
+    const m = src.match(new RegExp(`macro_rules! ${name}[\\s\\S]*?author: Author::(\\w+),`));
+    if (!m) throw new Error(`macro ${name} names no author`);
+    return trustedAuthor(m[1]);
+  };
+  const trustedOf = { adguard: macroTrusted("adguard"), uassets: macroTrusted("uassets") };
   const table = src.slice(src.indexOf("pub const LISTS"), src.indexOf("/// The list with this id."));
   const rows: { at: number; row: Row }[] = [];
   // adguard!(id, title, n, Kind, Level, &[langs], description) and uassets!(id, title, file, Kind, Level, default, description).
@@ -55,13 +63,13 @@ function catalogueRows(): Row[] {
     const url = which === "adguard" ? `${adguardBase}${n}.txt` : `${uassetsBase}${n}`;
     const languages = which === "adguard" ? [...extra.matchAll(/"([a-z]+)"/g)].map((x) => x[1]) : [];
     const def = defaultName(which === "adguard" ? `Level::${level}.default_of()` : extra, level);
-    rows.push({ at: m.index, row: { id, title, url, licence: "GPL-3.0-only", default: def, trusted: true, kind: kind.toLowerCase(), level: level.toLowerCase(), description, languages } });
+    rows.push({ at: m.index, row: { id, title, url, licence: "GPL-3.0-only", default: def, trusted: trustedOf[which as "adguard" | "uassets"], kind: kind.toLowerCase(), level: level.toLowerCase(), description, languages } });
   }
   const plainRow =
-    /List \{\s*id: "([^"]+)",\s*title: "([^"]+)",\s*url: "([^"]+)",\s*licence: "([^"]+)",\s*default: ([^,]+),\s*trusted: (true|false),\s*homepage: "[^"]+",\s*kind: Kind::(\w+),\s*level: Level::(\w+),\s*description: "([^"]+)",\s*languages: &\[([^\]]*)\],/g;
+    /List \{\s*id: "([^"]+)",\s*title: "([^"]+)",\s*url: "([^"]+)",\s*licence: "([^"]+)",\s*default: ([^,]+),\s*author: Author::(\w+),\s*homepage: "[^"]+",\s*kind: Kind::(\w+),\s*level: Level::(\w+),\s*description: "([^"]+)",\s*languages: &\[([^\]]*)\],/g;
   for (const m of table.matchAll(plainRow)) {
     const languages = [...m[10].matchAll(/"([a-z]+)"/g)].map((x) => x[1]);
-    rows.push({ at: m.index, row: { id: m[1], title: m[2], url: m[3], licence: m[4], default: defaultName(m[5], m[8]), trusted: m[6] === "true", kind: m[7].toLowerCase(), level: m[8].toLowerCase(), description: m[9], languages } });
+    rows.push({ at: m.index, row: { id: m[1], title: m[2], url: m[3], licence: m[4], default: defaultName(m[5], m[8]), trusted: trustedAuthor(m[6]), kind: m[7].toLowerCase(), level: m[8].toLowerCase(), description: m[9], languages } });
   }
   return rows.sort((a, b) => a.at - b.at).map((r) => r.row);
 }

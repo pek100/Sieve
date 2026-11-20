@@ -155,7 +155,7 @@ impl Lists {
     /// user's own lists that are on, in the policy's order.
     fn sources(&self) -> Vec<Source> {
         let inner = self.inner();
-        let rows = catalogue::selected(inner.selection.as_deref()).into_iter().map(|l| Source { id: l.id.to_string(), url: Some(l.url.to_string()), trusted: l.trusted });
+        let rows = catalogue::selected(inner.selection.as_deref()).into_iter().map(|l| Source { id: l.id.to_string(), url: Some(l.url.to_string()), trusted: l.trusted() });
         let own = inner.custom.iter().filter(|c| c.enabled).map(|c| Source { id: c.id.clone(), url: c.url.clone(), trusted: false });
         rows.chain(own).collect()
     }
@@ -415,7 +415,7 @@ impl Lists {
             }).collect();
             let texts: Vec<ListText<'_>> = copies.iter().filter_map(|(s, t)| t.as_deref().map(|text| ListText { id: &s.id, text, trusted: s.trusted })).collect();
             let mut engine = compile(&texts);
-            let (loaded, resource_error) = dir.as_deref().map_or((None, None), |d| resources::load(d, resources::RESOURCE_PIN));
+            let (loaded, resource_error) = resources::load(dir.as_deref(), resources::THIS_BUILD);
             if let Some(l) = &loaded {
                 engine.use_resources(&l.bundle);
             }
@@ -795,6 +795,14 @@ mod tests {
         assert_eq!(f.asked_urls().len(), 4, "once");
     }
 
+    /// What the update cycle records after placing a signed bundle: its signed
+    /// version, here the shipped one's (a copy as new as the shipped one wins).
+    fn record_signed_resources(dir: &std::path::Path) {
+        let mut record = crate::update::state::Record::default();
+        record.versions.insert(crate::update::Kind::Resources.to_string(), resources::SHIPPED_VERSION);
+        crate::update::state::save_record(dir, &record).unwrap();
+    }
+
     /// Plan 7.5 meets plan 5.5: a bundle the signed path placed is what the next
     /// compile uses, and the report quotes it. A broken one costs scriptlets and
     /// is said; filtering carries on.
@@ -805,18 +813,20 @@ mod tests {
         cache.write_text(LIST_A, BODY).unwrap();
         let l = lists_at(dir.path(), &[LIST_A]);
         l.compile_and_swap().await;
-        assert_eq!(l.facts().unwrap().resource_pin, None, "no bundle yet");
+        let shipped = Some(format!("sha256:{}", resources::RESOURCE_PIN));
+        assert_eq!(l.facts().unwrap().resource_pin, shipped, "no signed copy yet: the shipped bundle");
 
         let path = crate::update::data_path(dir.path(), &crate::update::Kind::Resources).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"[]").unwrap();
+        record_signed_resources(dir.path());
         l.compile_and_swap().await;
         assert_eq!(l.facts().unwrap().resource_pin, Some(format!("sha256:{}", sieve_filter::resources::sha256_hex(b"[]"))));
         assert_eq!(l.compile_error(), None);
 
         std::fs::write(&path, b"not json").unwrap();
         l.compile_and_swap().await;
-        assert_eq!(l.facts().unwrap().resource_pin, None);
+        assert_eq!(l.facts().unwrap().resource_pin, shipped, "a broken signed copy falls back to the shipped one");
         assert!(l.compile_error().unwrap().contains("signed resource library"));
         assert!(blocks(&l, "ads.example"), "the lists still decide");
     }
@@ -839,6 +849,7 @@ mod tests {
         let path = crate::update::data_path(dir.path(), &crate::update::Kind::Resources).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, FIXTURE).unwrap();
+        record_signed_resources(dir.path());
         l.compile_and_swap().await;
         assert!(scriptlets(&l).contains("sieveSetFlag"), "the bundle reaches the user's engine at the swap");
         assert!(l.user_engine_for(UserRules::of(&policy)).page_cosmetics(URL).scriptlets.contains("sieveSetFlag"), "and a later policy's engine");

@@ -15,6 +15,7 @@ import {
   engineLockReason,
   factDay,
   httpsInForce,
+  upstreamChecksText,
 } from "@/core/engine";
 import { useEngine, useEngineActions, useSetting } from "@/hooks/use-sieve";
 import { useRuntime } from "@/hooks/sieve-provider";
@@ -34,7 +35,8 @@ function RemoveDialog({ onCancel, onRemove }: { onCancel: () => void; onRemove: 
       <DialogHeader>
         <DialogTitle className="text-title">Remove certificate</DialogTitle>
         <DialogDescription className="text-body text-on-surface-muted">
-          This turns HTTPS filtering off and removes Sieve&apos;s certificate from Windows and Firefox.
+          This turns HTTPS filtering off and removes Sieve&apos;s certificate from Windows and Firefox once Windows allows it. That can take a
+          moment; until then the certificate shows as Removal pending.
         </DialogDescription>
       </DialogHeader>
       <div className="flex flex-wrap justify-end gap-2">
@@ -76,6 +78,7 @@ export function CertificateGroup() {
   // Beside an installed root, this is the one a pending removal has not reached.
   const thumbprint = cert?.thumbprint ?? null;
   const firefox = installed && cert ? (FIREFOX_TEXT[cert.firefox] ?? null) : null;
+  const checks = upstreamChecksText(e);
 
   const copy = () => {
     const done = navigator.clipboard?.writeText(thumbprint ?? "") ?? Promise.reject(new Error("no clipboard"));
@@ -110,6 +113,11 @@ export function CertificateGroup() {
           {problem && (
             <p role="alert" className="text-label text-blocked break-words" data-certificate-error="">
               {problem}
+            </p>
+          )}
+          {checks && (
+            <p className="text-label text-on-surface-muted break-words" data-upstream-checks="">
+              {checks}
             </p>
           )}
         </div>

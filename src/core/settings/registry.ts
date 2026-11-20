@@ -199,10 +199,6 @@ export type SettingDef =
   | ListSetting<unknown>
   | DataSwitchSetting;
 
-/** The plan step that brings interception, without which the HTTPS switch means nothing. */
-const ENGINE_SLICE_6 = "engine slice 6 (docs/plans/2026-10-17-https-filtering.md)";
-/** The plan step whose live check opens rewriting pages to the user. */
-const ENGINE_SLICE_9 = "engine slice 9 (docs/plans/2026-10-17-https-filtering.md)";
 const enumSetting = <const O extends string>(d: Omit<EnumSetting<O>, "kind">): EnumSetting<O> => ({
   kind: "enum",
   ...d,
@@ -320,33 +316,32 @@ export const REGISTRY = {
     default: [] as readonly string[],
     of: { type: "domain" },
   } satisfies ListSetting<string>,
-  // The root certificate (docs/plans/2026-10-17-https-filtering.md, slice 5).
-  // Hidden until interception exists: it "cannot be on without slice 6". The
-  // app therefore sends off, and the live check drives it with the app closed
-  // (docs/live/engine-slice-5.md). Settings' Certificate group turns it off.
+  // The root certificate and interception (docs/plans/2026-10-17-https-filtering.md,
+  // slices 5 and 6). Available since the owner's decisions of 2026-11-20
+  // (docs/tasks/2026-11-06-open-decisions.md). Off by default: turning it on
+  // installs a root certificate, which is the user's explicit choice (law 4).
+  // Settings' Certificate group turns it off; uninstall removes the root.
   "filtering.https": {
     kind: "dataSwitch",
     section: "filtering",
     label: "Decrypt HTTPS traffic",
-    help: "Installs Sieve's own certificate on this computer so the engine can filter inside HTTPS. Off: the certificate is removed from Windows and Firefox.",
+    help: "Your browsers' encrypted traffic is opened here on this computer, so Sieve can block ads and trackers inside pages, video ads included. Only browsers are decrypted: other apps are never opened, and neither are the sites on Sieve's never-decrypt list, such as many banks and payment, health, government, password and sign-in sites. It installs Sieve's own certificate; off removes it from Windows and Firefox once Windows allows it, which can take a moment. While on, a browser set to Off in Apps loses Encrypted Client Hello, so the name of the site it opens can be seen on the network.",
     default: false,
     liveCheck: "live_https_intercepts_public_and_passes_floor",
     requires: "filtering.engine",
     needsEngine: true,
-    unavailableUntil: ENGINE_SLICE_6,
   } satisfies DataSwitchSetting,
-  // Rewriting decrypted pages (slice 9). Hidden until its live check has run; the
-  // app sends off, and docs/live/engine-slice-9.md drives it with the app closed.
+  // Rewriting decrypted pages (slice 9), available with the HTTPS switch since
+  // 2026-11-20. The scriptlets come from the uBO bundle the engine ships.
   "filtering.content": {
     kind: "dataSwitch",
     section: "filtering",
     label: "Filter inside pages",
-    help: "Hides page elements and runs the lists' page fixes on decrypted pages. Off: pages arrive exactly as the site sent them.",
+    help: "Hides ads and other page elements and runs the lists' page fixes, such as those that remove video ads, on decrypted pages. Off: pages arrive exactly as the site sent them.",
     default: false,
     liveCheck: "live_content_injects_into_test_page",
     requires: "filtering.https",
     needsEngine: true,
-    unavailableUntil: ENGINE_SLICE_9,
   } satisfies DataSwitchSetting,
   // Plan 1.4: the engine forwards every lookup encrypted, tried in order.
   "filtering.upstreams": {
@@ -409,6 +404,16 @@ export const REGISTRY = {
     section: "startup",
     label: "Welcome guide finished",
     help: "Off shows the welcome guide the next time Sieve opens.",
+    default: false,
+    keptByResetAll: true,
+  } satisfies BooleanSetting,
+  // Home's link to HTTPS filtering stays hidden: the person hid it, or HTTPS
+  // filtering was turned on once (hooks/runtime bindHttpsInvite). Changes no traffic.
+  "appearance.httpsLinkHidden": {
+    kind: "boolean",
+    section: "appearance",
+    label: "Home's link to HTTPS filtering hidden",
+    help: "Off shows Home's Filter inside web pages too link again while HTTPS filtering is off. It turns on by itself once HTTPS filtering has been on.",
     default: false,
     keptByResetAll: true,
   } satisfies BooleanSetting,
@@ -551,9 +556,9 @@ export function isSettingKey(key: string): key is SettingKey {
  * answer comes from: the settings document, export, import, search and the
  * Settings view all ask it. A setting is unavailable by its own
  * `unavailableUntil`, or because the setting it requires is: what needs a switch
- * this build does not offer could never act (law 11). `filtering.https` and
- * `filtering.content` are unavailable today, and with them the tracking
- * protections that require them.
+ * this build does not offer could never act (law 11). No setting is
+ * unavailable today: `filtering.https` and `filtering.content` became available
+ * on 2026-11-20, and with them the tracking protections that require them.
  */
 export function isAvailable(key: SettingKey): boolean {
   return unavailableUntil(key) === null;

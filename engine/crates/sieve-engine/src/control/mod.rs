@@ -488,12 +488,13 @@ impl Engine {
             (book.live(), book.guests())
         };
         let dns_unreachable = lock(&self.dns_service).as_ref().is_some_and(|s| s.unreachable());
+        let decrypting = self.decrypting();
         EngineStatus {
             filtering: f.routes_up,
             routes_up: f.routes_up,
             blocking: f.routes_up && self.filter.get().blocks_anything(),
             flows: u32::try_from(live).unwrap_or(u32::MAX),
-            decrypting: self.decrypting(),
+            decrypting,
             last_error: [f.dns_file_error, f.route_error, f.https_error, f.attribution_error, f.policy_save_error, self.lists.compile_error()].into_iter().fold(f.last_error, beside),
             policy,
             blocker,
@@ -504,6 +505,7 @@ impl Engine {
             dns_unreachable,
             dns_capture: if f.routes_up { f.dns_capture } else { None },
             wifi_sign_in: if f.routes_up { self.sign_in().report(std::time::Instant::now()) } else { None },
+            upstream_checks: decrypting.then(|| self.validation.in_use(crate::policy::wall_ms())),
             update,
         }
     }
@@ -1506,7 +1508,7 @@ mod tests {
         crate::lists::cache::Cache::new(dir.path()).write_text("adguard-dns", "! Version: 2026.11.1\n||ads.example^\n||b.example^\nnot/a/$bad-option\n").unwrap();
         e.lists.compile_and_swap().await;
         let facts = e.status().filter.unwrap();
-        assert_eq!(facts.resource_pin, None, "no bundle in this folder");
+        assert_eq!(facts.resource_pin, Some(format!("sha256:{}", crate::lists::resources::RESOURCE_PIN)), "no signed bundle in this folder: the shipped one");
         let [fact] = facts.lists.as_slice() else { panic!("{facts:?}") };
         assert_eq!((fact.id.as_str(), fact.version.as_deref(), fact.applied), ("adguard-dns", Some("2026.11.1"), 2));
         assert_eq!(fact.title, sieve_filter::catalogue::find("adguard-dns").unwrap().title);

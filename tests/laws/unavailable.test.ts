@@ -1,13 +1,15 @@
 /**
  * Law 11, unavailable settings. `unavailableUntil` stays as a mechanism (its
  * behaviour is pinned in src/core/settings/unavailable.test.ts, with real keys
- * mocked unavailable), and today the HTTPS and content switches carry it; the
- * tracking protections, which the engine carries out, wait for the switch each
- * requires (registry `isAvailable`). The DNS
- * filter's keys waited for engine slice 4, which retired `filtering.dns` and
- * brought `filtering.upstreams` back. Real registry here, never mocked. An
- * unavailable key must name a plan that exists and names it, and no available
- * key may require it.
+ * mocked unavailable). No key carries it today: the HTTPS and content switches
+ * carried it until the owner's decisions of 2026-11-20
+ * (docs/tasks/2026-11-06-open-decisions.md), and with them the tracking
+ * protections, which the engine carries out and which wait for the switch each
+ * requires (registry `isAvailable`), are offered too. The DNS filter's keys
+ * waited for engine slice 4, which retired `filtering.dns` and brought
+ * `filtering.upstreams` back. Real registry here, never mocked. An unavailable
+ * key must name a plan that exists and names it, and no available key may
+ * require it.
  */
 import { describe, expect, it } from "vitest";
 import { CONTENT_SWITCH, HTTPS_SWITCH } from "@/core/engine";
@@ -24,20 +26,23 @@ const RETIRED = ["filtering.dns", "filtering.perApp"];
 const unavailable = SETTING_KEYS.filter((k) => !isAvailable(k));
 
 describe("unavailable settings law", () => {
-  it("the HTTPS and content switches are unavailable, until their live checks have run, and with them the tracking protections that require them", () => {
-    expect(unavailable).toEqual([HTTPS_SWITCH, CONTENT_SWITCH, ...TRACKING_KEYS]);
-    expect(SETTING_KEYS.filter((k) => settingDef(k).unavailableUntil !== undefined), "only the switches wait for a plan step of their own").toEqual([HTTPS_SWITCH, CONTENT_SWITCH]);
-    for (const k of TRACKING_KEYS) expect(unavailableUntil(k), k).toBe(unavailableUntil(settingDef(k).requires as SettingKey));
-    expect(trackingInForce(() => true), "none is ever sent, whatever is read").toEqual([]);
+  it("no setting is unavailable: the HTTPS and content switches are offered, and with them the tracking protections that require them", () => {
+    expect(unavailable).toEqual([]);
+    expect(SETTING_KEYS.filter((k) => settingDef(k).unavailableUntil !== undefined), "no key waits for a plan step").toEqual([]);
+    for (const k of [HTTPS_SWITCH, CONTENT_SWITCH, ...TRACKING_KEYS]) expect(unavailableUntil(k as SettingKey), k).toBeNull();
+    for (const k of TRACKING_KEYS) expect(settingDef(k).requires, k).toMatch(/^filtering\.(https|content)$/);
+    // Offered is not on: each is sent only once the switch it requires is on.
+    expect(trackingInForce((k) => (k === HTTPS_SWITCH || k === CONTENT_SWITCH ? false : settingDef(k).default)), "with HTTPS off, none is sent").toEqual([]);
   });
 
-  it("the content switch is not searched, exported or reset, and reads off whatever is stored", () => {
-    const stored = { schema: SETTINGS_SCHEMA, values: { [CONTENT_SWITCH]: true, "appearance.theme": "light" } };
-    expect(searchSettings("")).not.toContain(CONTENT_SWITCH);
-    expect(searchSettings("filter inside pages")).toEqual([]);
-    expect(JSON.parse(exportText(stored)).values).toEqual({ "appearance.theme": "light" });
-    expect(resetPlan(stored).changes.map((c) => c.key)).toEqual(["appearance.theme"]);
-    expect(readValue(stored, CONTENT_SWITCH)).toBe(false);
+  it("the switches are searched, exported and reset like any setting, and read what is stored", () => {
+    const stored = { schema: SETTINGS_SCHEMA, values: { [CONTENT_SWITCH]: true, [HTTPS_SWITCH]: true, "appearance.theme": "light" } };
+    expect(searchSettings("filter inside pages")).toContain(CONTENT_SWITCH);
+    expect(searchSettings("decrypt https")).toContain(HTTPS_SWITCH);
+    expect(JSON.parse(exportText(stored)).values).toEqual(stored.values);
+    expect(resetPlan(stored).changes.map((c) => c.key).sort()).toEqual(["appearance.theme", CONTENT_SWITCH, HTTPS_SWITCH].sort());
+    expect(readValue(stored, CONTENT_SWITCH)).toBe(true);
+    expect(readValue({ schema: SETTINGS_SCHEMA, values: {} }, HTTPS_SWITCH), "off on a fresh install: it installs a root certificate").toBe(false);
   });
 
   it("every key unavailable of its own names a plan step whose plan exists and names the key", () => {

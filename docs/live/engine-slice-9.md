@@ -2,7 +2,7 @@
 
 Run by the user, from an admin prompt. Nothing here was run by the stream that built it: every item is UNVERIFIED until you run it. `filtering.content` and `filtering.https` stay hidden in the app, so `scripts/live/engine-content.ps1` drives them with the app closed, as slice 5's script does. Read it first. It touches only `policy.json` and the engine's own service.
 
-Run `docs/live/engine-slice-6.md` first: this check rides on interception. The scriptlet rows also need a real resource bundle, which does not exist yet: `RESOURCE_PIN` is None until open question Q1 of `docs/tasks/2026-11-06-content-wire.md` is answered. For a live run only, edit the pin on a local build and place the JSON as `lists\resources.json`.
+Run `docs/live/engine-slice-6.md` first: this check rides on interception. The scriptlet rows also need a real resource bundle: since 2026-11-20 the engine ships uBO 1.76.6's, embedded and pinned (`lists::resources::RESOURCE_PIN`), so nothing needs placing.
 
 Traffic really goes through the engine during this check, so do it when nothing else on this PC depends on the network. Before you start, record `route print`, `Get-DnsClientServerAddress`, `netsh winhttp show proxy` and the firewall rule list. The way out at any point is the engine switch off, or `sieve-engine.exe restore`.
 

@@ -144,6 +144,18 @@ describe("engine IPC law", () => {
     ]);
   });
 
+  it("the app reads the upstream checks' fact; absent or odd is nothing to say, never a refused Status", () => {
+    const status = fixture.engine.find((m) => m.type === "status")!;
+    const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
+    expect(parseEngineStatus(body), "an older engine says nothing").not.toHaveProperty("upstream_checks");
+    expect(parseEngineStatus({ ...body, upstream_checks: { ct: false, crlite: true } }).upstream_checks).toEqual({ ct: false, crlite: true });
+    expect(parseEngineStatus({ ...body, upstream_checks: { ct: true, later: 1 } }).upstream_checks, "a missing field is false, a later one ignored").toEqual({ ct: true, crlite: false });
+    expect(parseEngineStatus({ ...body, upstream_checks: { ct: "yes", crlite: 1 } }).upstream_checks, "only a true is true").toEqual({ ct: false, crlite: false });
+    for (const odd of [1, "x", [true]]) expect(parseEngineStatus({ ...body, upstream_checks: odd }), JSON.stringify(odd)).not.toHaveProperty("upstream_checks");
+    expect(RUST).toMatch(/skip_serializing_if = "Option::is_none"\)\]\s*pub upstream_checks: Option<UpstreamChecks>/);
+    expect(rustConst("CAPABILITY_UPSTREAM_CHECKS")).toBe('"upstream_checks"');
+  });
+
   it("the app reads every certificate status, and its enums are the crate's", () => {
     const message = fixture.engine.find((m) => m.type === "cert_status")!;
     const body = Object.fromEntries(Object.entries(message).filter(([k]) => k !== "type"));

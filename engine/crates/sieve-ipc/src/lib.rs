@@ -124,7 +124,9 @@ pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "ref
 /// field added to a message the app reads strictly goes only to an app that names
 /// it, so an app from before the field keeps reading the message. An engine
 /// ignores a name it does not know.
-pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE, CAPABILITY_WIFI_SIGN_IN];
+pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE, CAPABILITY_WIFI_SIGN_IN, CAPABILITY_UPSTREAM_CHECKS];
+/// [`EngineStatus::upstream_checks`].
+pub const CAPABILITY_UPSTREAM_CHECKS: &str = "upstream_checks";
 /// [`EngineStatus::dns_capture`].
 pub const CAPABILITY_DNS_CAPTURE: &str = "dns_capture";
 /// [`EngineStatus::wifi_sign_in`]. An app that names it may send
@@ -882,8 +884,26 @@ pub struct EngineStatus {
     /// engine from before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wifi_sign_in: Option<WifiSignIn>,
+    /// Which of the local upstream checks have data to run on, while HTTPS is
+    /// decrypted; left out otherwise and by an engine from before it. Until the
+    /// owner publishes the data (validation Q2, 2026-11-20) both are false, and
+    /// the app says the checks are skipped; the OS revocation check runs either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_checks: Option<UpstreamChecks>,
     /// Signed updates (protocol 3).
     pub update: UpdateStatus,
+}
+
+/// The local checks of an upstream chain (plan 2.6, slice 11) that have data.
+/// Takes unknown fields, as [`EngineStatus`] does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamChecks {
+    /// A Certificate Transparency log list is held and no older than its limit.
+    #[serde(default)]
+    pub ct: bool,
+    /// A CRLite revocation bundle is held.
+    #[serde(default)]
+    pub crlite: bool,
 }
 
 impl EngineStatus {
@@ -897,6 +917,9 @@ impl EngineStatus {
         }
         if !capabilities.iter().any(|c| c == CAPABILITY_WIFI_SIGN_IN) {
             self.wifi_sign_in = None;
+        }
+        if !capabilities.iter().any(|c| c == CAPABILITY_UPSTREAM_CHECKS) {
+            self.upstream_checks = None;
         }
         self
     }
@@ -1899,7 +1922,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&parsed).unwrap(), bare, "empty is left out");
         let named = ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.2.0".into(), capabilities: APP_CAPABILITIES.iter().map(ToString::to_string).collect() };
         let wire = serde_json::to_value(&named).unwrap();
-        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture", "wifi_sign_in"]));
+        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture", "wifi_sign_in", "upstream_checks"]));
         assert_eq!(serde_json::from_value::<ClientMessage>(wire).unwrap(), named);
 
         let status = EngineStatus { routes_up: true, dns_capture: Some(DnsCapture::Working), ..EngineStatus::default() };
@@ -1947,6 +1970,22 @@ mod tests {
         newer["wifi_sign_in"] = serde_json::json!({ "network": "n", "paused_left_s": 9, "later": true });
         let EngineMessage::Status(read) = serde_json::from_value(newer).unwrap() else { panic!("a status") };
         assert_eq!(read.wifi_sign_in, Some(WifiSignIn { network: "n".into(), paused_left_s: Some(9), wifi: false }));
+    }
+
+    /// The upstream checks' fact goes only to an app that names it, is left out
+    /// when the engine has nothing to say, and reads with fields from a later engine.
+    #[test]
+    fn upstream_checks_go_only_to_an_app_that_names_them() {
+        assert!(serde_json::to_value(EngineStatus::default()).unwrap().get("upstream_checks").is_none());
+        let status = EngineStatus { decrypting: true, upstream_checks: Some(UpstreamChecks { ct: false, crlite: true }), ..EngineStatus::default() };
+        assert_eq!(serde_json::from_value::<EngineStatus>(serde_json::to_value(&status).unwrap()).unwrap(), status, "the round trip");
+        let older_app = status.clone().for_app(&[CAPABILITY_DNS_CAPTURE.into(), CAPABILITY_WIFI_SIGN_IN.into()]);
+        assert!(serde_json::to_value(&older_app).unwrap().get("upstream_checks").is_none(), "an app from before it reads what it always did");
+        assert_eq!(status.clone().for_app(&APP_CAPABILITIES.iter().map(ToString::to_string).collect::<Vec<_>>()), status);
+        let mut newer = serde_json::to_value(&status).unwrap();
+        newer["upstream_checks"] = serde_json::json!({ "ct": true, "later": 1 });
+        let read: EngineStatus = serde_json::from_value(newer).unwrap();
+        assert_eq!(read.upstream_checks, Some(UpstreamChecks { ct: true, crlite: false }), "a missing field reads false, an unknown one is ignored");
     }
 
     /// The pause names the network and nothing else; the resume names nothing.

@@ -14,7 +14,7 @@ import type { EngineSource } from "./engine-source";
 import { createMockFilterLists } from "./filter-lists-mock";
 import type { FilterListSource } from "./filter-lists-source";
 import type { Clock } from "./poller";
-import type { EngineDnsUpstreams, EnginePolicy, EngineProbe } from "./protocol";
+import type { CertStatus, EngineDnsUpstreams, EnginePolicy, EngineProbe } from "./protocol";
 import { createSettingsStore, memoryBackend, type SettingsBackend } from "./settings-store";
 
 const SWITCH = ENGINE_SWITCH as SettingKey;
@@ -659,7 +659,7 @@ describe("engine controller", () => {
     s.undo();
   });
 
-  it("sends the person's own lists, and a tracking option stored on only once HTTPS decryption is in force: never while it is locked", async () => {
+  it("sends the person's own lists, and the tracking options stored on whose switch is on: an in-page one waits for page filtering", async () => {
     const own = [
       { id: "custom-a1", title: "Mine", url: "https://lists.example/a.txt", enabled: true },
       { id: "custom-b2", title: "From a file", url: null, enabled: false },
@@ -669,8 +669,8 @@ describe("engine controller", () => {
     await s.fc.flush();
     expect(s.fake.policies).toHaveLength(1);
     expect(s.fake.policies[0].custom_lists).toEqual(own);
-    expect(s.fake.policies[0]).not.toHaveProperty("tracking");
-    expect(s.fake.policies[0].https).toBe(false);
+    expect(s.fake.policies[0].https).toBe(true);
+    expect(s.fake.policies[0].tracking, "WebRTC lives in the page: content is off").toEqual(["gpc", "searchQueries", "clientData", "queryParams"]);
     await s.fc.advance(ENGINE_POLL_MS * 2);
     expect(s.fake.policies, "the engine holds them: nothing more to send").toHaveLength(1);
     await s.settings.set("filters.custom", own.slice(1));
@@ -1172,18 +1172,60 @@ describe("engine controller", () => {
       s.undo();
     });
 
-    it("the unavailable switch reads off, so the policy sends https false whatever is stored", async () => {
+    it("the HTTPS switch is off on a fresh install, and sent as stored once the person turns it on", async () => {
+      const fresh = setup("idle", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      await fresh.fc.flush();
+      expect(fresh.fake.policies).toEqual([policy(1, true)]);
+      expect(fresh.fake.policies[0].https).toBe(false);
+      fresh.undo();
       const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true, [HTTPS_SWITCH]: true } }));
       await s.fc.flush();
-      expect(s.fake.policies).toEqual([policy(1, true)]);
+      expect(s.fake.policies[0]).toMatchObject({ engine: true, https: true, content: false });
       s.undo();
     });
 
-    it("the unavailable content switch reads off, so the policy sends content false whatever is stored", async () => {
+    it("page filtering is sent as stored, and its check passes only while the engine decrypts and holds it", async () => {
       const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true, [HTTPS_SWITCH]: true, [CONTENT_SWITCH]: true } }));
       await s.fc.flush();
-      expect(s.fake.policies).toEqual([policy(1, true)]);
-      expect(s.fake.policies[0].content).toBe(false);
+      expect(s.fake.policies[0]).toMatchObject({ https: true, content: true });
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(engineStatus(s.store.getState().engine)?.decrypting, "the mock engine decrypts while it routes with https").toBe(true);
+      expect([s.checks.has(ENGINE_SWITCH), s.checks.has(HTTPS_SWITCH), s.checks.has(CONTENT_SWITCH)]).toEqual([true, true, true]);
+      await s.settings.set(CONTENT_SWITCH as SettingKey, false);
+      await s.fc.flush();
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect([s.checks.has(HTTPS_SWITCH), s.checks.has(CONTENT_SWITCH)], "pages off: only HTTPS stays proven").toEqual([true, false]);
+      await s.settings.set(HTTPS_SWITCH as SettingKey, false);
+      await s.fc.flush();
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(s.checks.has(HTTPS_SWITCH)).toBe(false);
+      expect(engineStatus(s.store.getState().engine)?.upstream_checks, "nothing decrypted, nothing to say").toBeUndefined();
+      s.undo();
+    });
+
+    it("HTTPS and page filtering are proven only while the root is installed and trusted", async () => {
+      const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true, [HTTPS_SWITCH]: true, [CONTENT_SWITCH]: true } }));
+      await s.fc.flush();
+      await s.fc.advance(ENGINE_POLL_MS);
+      const proven = () => [s.checks.has(HTTPS_SWITCH), s.checks.has(CONTENT_SWITCH)];
+      expect(proven(), "decrypting, root installed").toEqual([true, true]);
+      const real = s.fake.source.certStatus;
+      const root = (state: CertStatus["state"]): CertStatus => ({ state, valid_until_ms: null, thumbprint: null, firefox: "uses_windows", last_rotation_ms: null, last_error: null });
+      for (const state of ["removal_pending", "not_installed"] as const) {
+        s.fake.source.certStatus = async () => root(state);
+        await s.fc.advance(ENGINE_POLL_MS);
+        expect(engineStatus(s.store.getState().engine)?.decrypting, state).toBe(true);
+        expect(proven(), state).toEqual([false, false]);
+      }
+      s.fake.source.certStatus = async () => root("expires_soon");
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(proven(), "an expiring root is still trusted").toEqual([true, true]);
+      s.fake.source.certStatus = async () => Promise.reject(new Error("no answer"));
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(proven(), "a failed read is no root").toEqual([false, false]);
+      s.fake.source.certStatus = real;
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(proven()).toEqual([true, true]);
       s.undo();
     });
 

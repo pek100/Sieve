@@ -1,4 +1,4 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { STRANDED_DNS_TEXT } from "@/core/dns";
@@ -210,6 +210,67 @@ describe("home copy and KPIs", () => {
     await vi.waitFor(() => expect(engine()).toHaveAttribute("data-engine-phase", "filtering"));
     expect(within(engine()).getByText("Filtering hosts")).toBeInTheDocument();
     expect(document.body.textContent ?? "").not.toMatch(CLAIMS);
+    // HTTPS filtering is off on a fresh install: the tile points at its switch, and claims nothing.
+    expect(within(engine()).getByRole("link", { name: "Filter inside web pages too" })).toHaveAttribute("href", expect.stringMatching(/^\/settings\/?#setting-filtering\.https$/));
+  });
+
+  it("with HTTPS filtering held on, the tile has no way to it, and with the engine not routing neither", async () => {
+    const runtime = createRuntime({
+      source: createMockSource({ seed: 1 }),
+      settings: memoryBackend({ schema: 5, values: { "filtering.engine": true, "filtering.https": true } }),
+      engine: createMockEngine("hosts"),
+    });
+    render(
+      <SieveProvider runtime={runtime}>
+        <HomeScreen />
+      </SieveProvider>,
+    );
+    const engine = () => screen.getByRole("group", { name: "Right now" }).querySelector<HTMLElement>('section[data-kpi="engine"]')!;
+    await vi.waitFor(() => expect(engine()).toHaveAttribute("data-engine-phase", "filtering"));
+    await vi.waitFor(() => expect(engine().querySelector("[data-home-https]")).toBeNull());
+    cleanup();
+    await setup();
+    expect(document.querySelector("[data-home-https]"), "not installed: nothing routes").toBeNull();
+  });
+
+  /** Home with the mock engine filtering hosts, over `backend`. */
+  async function filteringHome(backend: ReturnType<typeof memoryBackend>) {
+    const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings: backend, engine: createMockEngine("hosts") });
+    render(
+      <SieveProvider runtime={runtime}>
+        <HomeScreen />
+      </SieveProvider>,
+    );
+    const engine = () => screen.getByRole("group", { name: "Right now" }).querySelector<HTMLElement>('section[data-kpi="engine"]')!;
+    await vi.waitFor(() => expect(engine()).toHaveAttribute("data-engine-phase", "filtering"));
+    return { runtime, engine };
+  }
+
+  it("the link to HTTPS filtering can be hidden for good, and the choice is kept", async () => {
+    const backend = memoryBackend({ schema: 5, values: { "filtering.engine": true } });
+    const first = await filteringHome(backend);
+    await vi.waitFor(() => expect(first.engine().querySelector("[data-home-https]")).not.toBeNull());
+    await userEvent.click(within(first.engine()).getByRole("button", { name: "Don't show again" }));
+    await vi.waitFor(() => expect(first.engine().querySelector("[data-home-https]")).toBeNull());
+    expect(first.runtime.settings.get("appearance.httpsLinkHidden")).toBe(true);
+    expect(document.body.textContent ?? "").not.toMatch(CLAIMS);
+    cleanup();
+    const again = await filteringHome(backend);
+    await act(() => new Promise<void>((r) => setTimeout(r, 0)));
+    expect(again.engine().querySelector("[data-home-https]"), "a new window keeps it hidden").toBeNull();
+  });
+
+  it("once HTTPS filtering has been on, the link never shows again, even with it off", async () => {
+    const backend = memoryBackend({ schema: 5, values: { "filtering.engine": true, "filtering.https": true } });
+    const first = await filteringHome(backend);
+    await vi.waitFor(() => expect(first.runtime.settings.get("appearance.httpsLinkHidden")).toBe(true));
+    await act(() => first.runtime.settings.set("filtering.https", false));
+    await act(() => new Promise<void>((r) => setTimeout(r, 0)));
+    expect(first.runtime.settings.get("appearance.httpsLinkHidden"), "turning it off does not bring the link back").toBe(true);
+    cleanup();
+    const again = await filteringHome(backend);
+    await act(() => new Promise<void>((r) => setTimeout(r, 0)));
+    expect(again.engine().querySelector("[data-home-https]")).toBeNull();
   });
 
   it("law, settings from an old build with DNS filtering on: nothing starts, Home never says blocked, the safety banner points to Windows only", async () => {

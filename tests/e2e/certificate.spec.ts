@@ -60,8 +60,11 @@ test.describe("certificate", () => {
     expect(errors).toEqual([]);
   });
 
-  test("the HTTPS switch has no row until interception exists", async ({ page }) => {
+  test("the HTTPS switch has its row, off on a fresh install, beside page filtering", async ({ page }) => {
     await openCertificate(page, "engine=idle");
-    await expect(page.locator('[data-setting="filtering.https"]')).toHaveCount(0);
+    const https = page.locator('[data-setting="filtering.https"]');
+    await expect(https).toHaveCount(1);
+    await expect(https.getByRole("switch")).not.toBeChecked();
+    await expect(page.locator('[data-setting="filtering.content"]')).toHaveCount(1);
   });
 });

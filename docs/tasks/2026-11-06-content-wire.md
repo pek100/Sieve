@@ -254,6 +254,8 @@ Not a change, a fact for slice 10's reader: `check_request` re-asks a block as a
 
 ## Open questions
 
+**Decided 2026-11-20, owner took the recommendation.** Q1: the uBO 1.76.6 bundle ships embedded and pinned (content task Q1; review in `docs/tasks/2026-11-06-open-decisions.md`), so no `RESOURCE_PIN` edit or placed `lists\resources.json` is needed for a live run any more. Q2 and Q3: the defaults stand (the allowlist stays `@@||host^`; `Cache-Control` of rewritten pages is left alone). O2: `PROTOCOL` stays 3. `filtering.content` is available from branch `https-unlock`.
+
 Decisions for the user:
 
 **Q1. Where the real scriptlet bundle comes from** (content task Q1, still open; F8). Until it is answered no scriptlet runs on a real machine and slice 10 cannot pass. Default: option (a) there: the user runs `assemble-ubo.mjs` at a reviewed uBO tag and pins the hash. For the live run only, the runbook says edit `RESOURCE_PIN` on a local build and place the JSON as `lists\resources.json`. This stream adds no mechanism for it and does not choose a tag.

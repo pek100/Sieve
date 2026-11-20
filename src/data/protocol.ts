@@ -497,7 +497,24 @@ export interface EngineStatus {
   dns_capture?: DnsCapture;
   /** A network that wants a sign-in, or the capture paused for one. Absent: nothing to say, or an engine or app from before it. */
   wifi_sign_in?: WifiSignIn;
+  /** Which local upstream checks have data, while HTTPS is decrypted. Absent: not decrypting, or an engine or app from before it. */
+  upstream_checks?: UpstreamChecks;
   update: EngineUpdate;
+}
+
+/** sieve-ipc `UpstreamChecks`: true means the check has its data and runs. */
+export interface UpstreamChecks {
+  /** Certificate Transparency: a log list is held and fresh. */
+  ct: boolean;
+  /** CRLite: a revocation bundle is held. */
+  crlite: boolean;
+}
+
+/** A fact, as `wifi_sign_in`: anything unexpected reads as nothing to say, never a refused Status. */
+export function parseUpstreamChecks(raw: unknown): UpstreamChecks | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const u = raw as Record<string, unknown>;
+  return { ct: u.ct === true, crlite: u.crlite === true };
 }
 
 /** sieve-ipc `WifiSignIn`. `paused_left_s` present: paused, resumes by itself within that many seconds. */
@@ -527,6 +544,7 @@ export function parseWifiSignIn(raw: unknown): WifiSignIn | null {
 }
 
 const withSignIn = (w: WifiSignIn | null): { wifi_sign_in?: WifiSignIn } => (w === null ? {} : { wifi_sign_in: w });
+const withUpstreamChecks = (u: UpstreamChecks | null): { upstream_checks?: UpstreamChecks } => (u === null ? {} : { upstream_checks: u });
 
 /** sieve-ipc `CaptureReason`, in declaration order. */
 export const CAPTURE_REASONS = ["tie", "ipv6_off", "no_answer", "no_ipv4", "failed", "nothing_to_catch"] as const;
@@ -726,6 +744,7 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
     ...(s.dns_unreachable === true ? { dns_unreachable: true } : {}),
     ...withCapture(parseDnsCapture(s.dns_capture)),
     ...withSignIn(parseWifiSignIn(s.wifi_sign_in)),
+    ...withUpstreamChecks(parseUpstreamChecks(s.upstream_checks)),
     update: engineUpdate(s.update),
   };
 }

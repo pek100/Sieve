@@ -12,13 +12,6 @@ import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { CertificateGroup } from "./certificate-group";
 
-// `filtering.https` is unavailable until slice 6, which reads it as off and so
-// sends the engine off. These tests are about the group, with the switch real:
-// law 11 holds the real registry (the same split as settings/unavailable.test.ts).
-vi.mock("@/core/settings/registry", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/core/settings/registry")>()),
-  isAvailable: () => true,
-}));
 vi.setConfig({ testTimeout: 20_000 });
 
 afterEach(cleanup);
@@ -64,6 +57,42 @@ describe("Certificate group", () => {
     expect(rows).toHaveTextContent("Valid until");
     expect(rows).toHaveTextContent(THUMBPRINT);
     expect(rows).toHaveTextContent(firefox);
+  });
+
+  it("says plainly which upstream checks are skipped, and nothing while both run or HTTPS filtering is not working", async () => {
+    const runtime = await setup(mock("idle", "installed"));
+    await settled("Installed");
+    const e = runtime.store.getState().engine;
+    const pipe = e.probe!.pipe!;
+    if (pipe.kind !== "welcome") throw new Error("idle answers with a Status");
+    const both = { ct: false, crlite: false };
+    // An engine that routes and says it decrypts, beside the root as `cert` says.
+    const checks = (u?: { ct: boolean; crlite: boolean }, over: { decrypting?: boolean; cert?: CertStatus | null } = {}) =>
+      act(() =>
+        runtime.store.setEngine({
+          ...e,
+          cert: over.cert === undefined ? e.cert : over.cert,
+          probe: { ...e.probe!, pipe: { ...pipe, status: { ...pipe.status, filtering: true, decrypting: over.decrypting ?? true, ...(u ? { upstream_checks: u } : {}) } } },
+        }),
+      );
+    const line = () => group().querySelector("[data-upstream-checks]");
+    checks(both);
+    expect(line()).toHaveTextContent(
+      "The Certificate Transparency and CRLite checks are skipped until Sieve publishes their data. Windows still checks each site's certificate, and its revocation when it can reach the revocation server.",
+    );
+    expect(line()).not.toHaveAttribute("role", "alert");
+    checks({ ct: true, crlite: false });
+    expect(line()).toHaveTextContent(/^The CRLite check is skipped/);
+    checks({ ct: true, crlite: true });
+    expect(line()).toBeNull();
+    checks();
+    expect(line()).toBeNull();
+    checks(both, { decrypting: false });
+    expect(line(), "not decrypting").toBeNull();
+    checks(both, { cert: ipc.certStatuses.removal_pending as CertStatus });
+    expect(line(), "the root is on its way out").toBeNull();
+    checks(both, { cert: null });
+    expect(line(), "no root read yet").toBeNull();
   });
 
   it("not installed: only the state line, no rows and no Remove", async () => {

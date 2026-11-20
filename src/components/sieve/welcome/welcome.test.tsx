@@ -2,6 +2,7 @@ import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { AppShell } from "@/components/sieve/shell/app-shell";
+import { HTTPS_HREF, HTTPS_INVITE, HTTPS_SWITCH } from "@/core/engine";
 import { SETTING_KEYS, isAvailable, settingDef } from "@/core/settings/registry";
 import { resetPlan } from "@/core/settings/transfer";
 import { dataSwitchSummary } from "@/core/welcome";
@@ -118,6 +119,7 @@ describe("when the guide shows", () => {
 
     const b = await setup();
     await press("Next");
+    await press("Next");
     await press("Finish");
     await settle();
     expect(b.settings.get("startup.welcomeDone")).toBe(true);
@@ -206,6 +208,7 @@ describe("when the guide shows", () => {
 
     const b = await setup({ lock });
     await press("Next");
+    await press("Next");
     await press("Finish");
     await settle();
     expect(b.settings.get("startup.welcomeDone")).toBe(true);
@@ -217,6 +220,7 @@ describe("when the guide shows", () => {
   it("the password still holds every other write, the guide's AdGuard pause among them", async () => {
     const spy = spyEngine("adguard");
     const rt = await setup({ lock: "set", engine: spy.engine });
+    await press("Next");
     await press("Next");
     await press("Next");
     await press("Pause AdGuard");
@@ -277,6 +281,8 @@ describe("the network proof", () => {
   async function walkToEnd() {
     await press("Next");
     await press("Next");
+    expect(step()).toBe("https");
+    await press("Next");
     expect(step()).toBe("adguard");
   }
 
@@ -316,9 +322,29 @@ describe("the network proof", () => {
     const spy = spyEngine("idle");
     await setup({ engine: spy.engine });
     await press("Next");
+    await press("Next");
+    expect(step()).toBe("https");
     await press("Finish");
     await settle();
     expect(spy.stop).not.toHaveBeenCalled();
+  });
+
+  it("the HTTPS step explains in plain words and links to the switch, which it never turns on", async () => {
+    const spy = spyEngine("idle");
+    const rt = await setup({ engine: spy.engine });
+    await press("Next");
+    await press("Next");
+    expect(step()).toBe("https");
+    expect(screen.getByText(HTTPS_INVITE.title)).toBeInTheDocument();
+    expect(screen.getByText(/opens your browsers' encrypted traffic here on this computer/)).toBeInTheDocument();
+    expect(screen.getByText(/Only browsers are decrypted: other apps are never opened/)).toBeInTheDocument();
+    expect(screen.getByText(/such as many banks and payment, health, government/)).toBeInTheDocument();
+    expect(screen.getByText(/turn it off at any time/)).toBeInTheDocument();
+    expect(screen.getByText(/removes Sieve's own certificate once Windows allows it, which can take a moment, and leaves every other certificate as it was/)).toBeInTheDocument();
+    expect(HTTPS_HREF).toBe("/settings/#setting-filtering.https");
+    expect(screen.getByRole("link", { name: HTTPS_INVITE.link })).toHaveAttribute("href", expect.stringMatching(/^\/settings\/?#setting-filtering\.https$/));
+    expect(rt.settings.get(HTTPS_SWITCH)).toBe(false);
+    expect(spy.policies.filter((p) => p.https)).toEqual([]);
   });
 
   it("a stopping failure is said on the step", async () => {

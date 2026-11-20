@@ -157,6 +157,35 @@ mod tests {
         assert!(!parsed.entries.is_empty());
     }
 
+    /// The regional-bank globs reach the banks' own hosts and stop at the stem:
+    /// a host that merely contains the word is not passed through.
+    #[test]
+    fn the_seed_globs_reach_regional_banks_and_stop_at_the_stem() {
+        let entries = parse(SEED).entries;
+        let held = |host: &str| entries.iter().any(|e| e.matches(Some(host), None, None));
+        for host in [
+            "sparkasse.de",
+            "www.sparkasse.de",
+            "sparkasse-hannover.de",
+            "www.sparkasse-koelnbonn.de",
+            "berliner-sparkasse.de",
+            "www.frankfurter-sparkasse.de",
+            "ksk-koeln.de",
+            "banking.ksk-koeln.de",
+            "www.sparda-bw.de",
+            "nwolb.com",
+            "www.rbsdigital.com",
+            "secure.halifax-online.co.uk",
+            "hb2.bankleumi.co.il",
+            "start.telebank.co.il",
+        ] {
+            assert!(held(host), "{host} should never be decrypted");
+        }
+        for host in ["notsparkasse.de", "sparkasse.example", "kskkoeln.de", "www.sparkasseblog.example", "ksk.de"] {
+            assert!(!held(host), "{host} is not a bank host");
+        }
+    }
+
     #[test]
     fn signed_copy_replaces_the_seed() {
         let dir = tempfile::tempdir().unwrap();
