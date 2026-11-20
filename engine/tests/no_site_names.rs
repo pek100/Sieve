@@ -27,7 +27,7 @@ const EXEMPT_PATH: &str = "sieve-engine/src/bin/probe/";
 const CRATES: &str = "crates";
 
 /// (file below `crates`, token, why).
-const EXCEPTIONS: [(&str, &str, &str); 13] = [
+const EXCEPTIONS: [(&str, &str, &str); 15] = [
     ("sieve-engine/src/route/portal.rs", "msftconnecttest.com", "the Host of Windows' own connectivity test, which the sign-in check asks as Windows does so a forwarding proxy answers it truly"),
     ("sieve-engine/src/dns/upstream.rs", "cloudflare-dns.com", "a decided DoH default (plan decision table, encrypted DNS)"),
     ("sieve-engine/src/dns/upstream.rs", "dns.quad9.net", "a decided DoH default (plan decision table, encrypted DNS)"),
@@ -36,6 +36,8 @@ const EXCEPTIONS: [(&str, &str, &str); 13] = [
     ("sieve-filter/src/catalogue.rs", "adguardteam.github.io", "a list's URL is its identity (plan 5.4)"),
     ("sieve-filter/src/catalogue.rs", "github.com", "a list's project page, which its report link derives from (plan 8.4)"),
     ("sieve-engine/src/exclusions/lists.rs", "raw.githubusercontent.com", "a list URL like the catalogue's, disabled until Q1 of the TLS task"),
+    ("sieve-engine/src/exclusions/lists.rs", "nwolb.com", "the test's subject is the shipped never-decrypt seed, data the user decided to ship, and a bank's real host is what its glob must reach"),
+    ("sieve-engine/src/exclusions/lists.rs", "rbsdigital.com", "the test's subject is the shipped never-decrypt seed, data the user decided to ship, and a bank's real host is what its glob must reach"),
     ("sieve-filter/src/exclusions.rs", "go.com", "the test's subject is the public suffix table, and .example is no suffix"),
     ("sieve-filter/src/exclusions.rs", "example.gov", "the test's subject is the public suffix table, and .example is no suffix"),
     ("sieve-engine/src/dns/service.rs", "use-application-dns.net", "Mozilla's protocol signal, which nothing can derive (dns-extras D9)"),

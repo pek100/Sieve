@@ -1,7 +1,7 @@
 import { act, render, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { ENGINE_LOCK_TEXT, ENGINE_UNREACHED, enginePhase, engineStatus, type EngineUnreached } from "@/core/engine";
+import { ENGINE_LOCK_TEXT, ENGINE_POLL_MS, ENGINE_UNREACHED, enginePhase, engineStatus, type EngineUnreached } from "@/core/engine";
 import { SETTING_KEYS, isAvailable, needsEngine, type SettingKey } from "@/core/settings/registry";
 import { createMockEngine, ENGINE_SCENARIOS, type EngineScenario } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
@@ -124,7 +124,9 @@ describe("a setting the engine carries out is locked while the engine cannot tak
     const s = await setup("idle", false);
     for (const key of ENGINE_KEYS) {
       const sw = within(row(key)).getByRole("switch");
-      expect(sw).toBeEnabled();
+      // A switch that builds on HTTPS opens once a probe has read the root as trusted
+      // (httpsWorking), which is the next poll after the engine took HTTPS.
+      await vi.waitFor(() => expect(sw).toBeEnabled(), { timeout: 2 * ENGINE_POLL_MS });
       await userEvent.click(sw);
       await vi.waitFor(() => expect(s.phase()).toBe("routing"));
       expect(sw).toBeChecked();
