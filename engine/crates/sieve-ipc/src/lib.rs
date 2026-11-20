@@ -1608,17 +1608,27 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Fra
     Ok(())
 }
 
+/// A frame's body being read: wiped when dropped, however the read ends (parsed,
+/// failed, or a future reading it dropped half way, as a timeout does), since it
+/// may carry a pairing code ([`LinkCode`]).
+struct Body<'a>(&'a mut Vec<u8>);
+
+impl Drop for Body<'_> {
+    fn drop(&mut self) {
+        wipe_bytes(self.0);
+    }
+}
+
 /// Reads one frame. A length over [`MAX_FRAME`] is refused without reading
 /// the body; EOF before the length is [`FrameError::Closed`]. The body is wiped
 /// once parsed: it may have carried a pairing code ([`LinkCode`]).
 pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
     let mut header = [0u8; 4];
     r.read_exact(&mut header).map_err(header_error)?;
-    let mut body = vec![0u8; body_len(header)?];
-    let read = r.read_exact(&mut body);
-    let parsed = read.map_err(FrameError::from).and_then(|()| serde_json::from_slice(&body).map_err(FrameError::from));
-    wipe_bytes(&mut body);
-    parsed
+    let mut bytes = vec![0u8; body_len(header)?];
+    let body = Body(&mut bytes);
+    r.read_exact(&mut body.0[..])?;
+    Ok(serde_json::from_slice(&body.0[..])?)
 }
 
 /// The same framing over tokio streams (the engine's pipe server and the
@@ -1629,7 +1639,7 @@ pub mod nonblocking {
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-    use super::{FrameError, body_len, encode, encode_secret, header_error, wipe_bytes};
+    use super::{Body, FrameError, body_len, encode, encode_secret, header_error, wipe_bytes};
 
     pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
         w.write_all(&encode(msg)?).await?;
@@ -1648,15 +1658,15 @@ pub mod nonblocking {
         Ok(())
     }
 
-    /// Reads one frame; the body is wiped once parsed (`super::read_frame`).
+    /// Reads one frame; the body is wiped once parsed, and also when this future
+    /// is dropped half way through it (a timeout around it) (`super::read_frame`).
     pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
         let mut header = [0u8; 4];
         r.read_exact(&mut header).await.map_err(header_error)?;
-        let mut body = vec![0u8; body_len(header)?];
-        let read = r.read_exact(&mut body).await;
-        let parsed = read.map_err(FrameError::from).and_then(|_| serde_json::from_slice(&body).map_err(FrameError::from));
-        wipe_bytes(&mut body);
-        parsed
+        let mut bytes = vec![0u8; body_len(header)?];
+        let body = Body(&mut bytes);
+        r.read_exact(&mut body.0[..]).await?;
+        Ok(serde_json::from_slice(&body.0[..])?)
     }
 }
 
@@ -1852,6 +1862,20 @@ mod tests {
         let mut frame = (unknown.len() as u32).to_le_bytes().to_vec();
         frame.extend_from_slice(unknown);
         assert!(matches!(read_frame::<_, ClientMessage>(&mut frame.as_slice()), Err(FrameError::Json(_))));
+    }
+
+    /// A frame's body is wiped by its guard whenever the read ends, so a read cut
+    /// off half way (the future dropped by a timeout) leaves no copy of a code.
+    #[test]
+    fn a_frame_body_is_wiped_when_its_read_ends_any_way() {
+        let mut bytes = br#"{"code":"SL1-secret"}"#.to_vec();
+        bytes.reserve(64);
+        drop(Body(&mut bytes));
+        assert!(bytes.is_empty());
+        // The allocation itself holds zeros (its bytes and its spare capacity).
+        let all = bytes.spare_capacity_mut();
+        // SAFETY: wipe_bytes wrote every byte of the allocation.
+        assert!(all.iter().all(|b| unsafe { b.assume_init() } == 0));
     }
 
     #[cfg(feature = "tokio")]
