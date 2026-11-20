@@ -263,6 +263,7 @@ impl Engine {
         self.exclusions.set_user(&now.exclusions, policy::wall_ms());
         // Paused, nothing exits through another device: its link stops.
         self.link.set_sieving(now.sieving);
+        self.exit_for_apps_sieved_again(before, now);
         // Off closes every decrypted flow now; on waits for the routing loop,
         // which holds the pinned sockets.
         #[cfg(windows)]
@@ -274,6 +275,27 @@ impl Engine {
                 self.set_facts(|f| f.https_error = None);
             }
         }
+    }
+
+    /// Apps switched from Off back to sieved while exiting through another device
+    /// is on: their open connections left from this computer, as an Off app's do,
+    /// and would keep doing so. The way out moves for them (a flow of theirs being
+    /// decided or connecting looks again, and their UDP is decided again), and
+    /// their open TCP connections to the destinations exiting concerns end so they
+    /// reconnect through the hub, with one row. Called after the filter took the
+    /// new Off set. (The global switch turning on is the link's own change.)
+    fn exit_for_apps_sieved_again(&self, before: &Policy, now: &Policy) {
+        let off = |p: &Policy| p.off_apps.iter().map(|k| k.to_lowercase()).collect::<std::collections::HashSet<_>>();
+        let still_off = off(now);
+        let was_off: std::collections::HashSet<String> = off(before).into_iter().filter(|k| !still_off.contains(k)).collect();
+        if was_off.is_empty() {
+            return;
+        }
+        let Some(concerns) = self.link.sieved_again() else { return };
+        #[cfg(windows)]
+        crate::stack::relay::reconnect_sieved_again(&self.book, &*concerns, &|key: &str| was_off.contains(&key.to_lowercase()));
+        #[cfg(not(windows))]
+        let _ = concerns;
     }
 
     /// What building interception came to. Under the policy's lock, as `set_policy`

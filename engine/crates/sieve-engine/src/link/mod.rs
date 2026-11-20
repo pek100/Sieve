@@ -91,10 +91,11 @@ struct Stored {
 type ClientSlot = Arc<Mutex<Option<LinkClient>>>;
 
 /// What exiting through the hub means for one destination, while it applies.
+/// The hub-down choice is not in it: an open reads it when it needs it
+/// ([`LinkManager::on_hub_down`]), as the owner may change it in between.
 #[derive(Clone)]
 pub struct Plan {
     current: ClientSlot,
-    pub on_hub_down: LinkHubDown,
     pub udp: LinkUdp,
 }
 
@@ -338,7 +339,27 @@ impl LinkManager {
         if !concerns(&stored.settings.route, &**net, dest) {
             return None;
         }
-        Some(Plan { current: self.current.clone(), on_hub_down: stored.settings.on_hub_down, udp: stored.settings.udp })
+        Some(Plan { current: self.current.clone(), udp: stored.settings.udp })
+    }
+
+    /// The hub-down choice in force now; Stop once nothing is paired any more.
+    pub fn on_hub_down(&self) -> LinkHubDown {
+        lock(&self.state).stored.as_ref().map_or(LinkHubDown::Stop, |s| s.settings.on_hub_down)
+    }
+
+    /// Apps were switched from Off back to sieved: while exiting applies, the way
+    /// out moved for their flows. Moves [`Self::way_out`] (a flow of theirs
+    /// deciding or connecting meanwhile looks again) and returns which
+    /// destinations exiting concerns, so their open connections can be ended
+    /// ([`ExitChanged`]'s first argument); None while exiting is not in force.
+    /// Called after the filter took the new Off set.
+    pub fn sieved_again(&self) -> Option<Box<dyn Fn(IpAddr) -> bool + Send>> {
+        let st = lock(&self.state);
+        let stored = st.stored.as_ref().filter(|s| s.settings.exit && st.sieving)?;
+        let net = st.net.clone()?;
+        let route = stored.settings.route.clone();
+        self.moved();
+        Some(Box::new(move |ip| concerns(&route, &*net, ip)))
     }
 
     /// Whether a connection to `dest` may leave directly from this computer for

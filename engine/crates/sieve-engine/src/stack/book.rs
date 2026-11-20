@@ -239,6 +239,16 @@ impl FlowBook {
         self.push_row(id, now, None, LogOutcome::Exit { via: report.via, target: report.target, reason }, None, None, Vec::new());
     }
 
+    /// An open flow is about to connect directly from this computer while exiting
+    /// is on (hub down, Direct set): marked before its connect, so a change that
+    /// ends what went directly ([`Self::end_where`]) finds it while it connects.
+    /// Its row comes with [`Self::exit`] once the connect is done.
+    pub fn going_direct(&mut self, id: u64) {
+        if self.open.contains_key(&id) {
+            self.went_direct.insert(id);
+        }
+    }
+
     /// Sieve tried an open flow's connect again (`stack::retry`): a row, so a
     /// retry is never silent, and a count for the app.
     pub fn retried(&mut self, id: u64, how: RetryHow, recovered: bool) {
@@ -358,6 +368,13 @@ impl FlowBook {
             }
         }
         ids.len()
+    }
+
+    /// Takes an open flow's handle back from the book, so nothing ends it any
+    /// more: true when it was still there, false when [`Self::end_where`] (or the
+    /// cap) ended the flow already.
+    pub fn release(&mut self, id: u64) -> bool {
+        self.idle.remove(&id).is_some()
     }
 
     /// One row of the engine's own, about no single flow (the services' session,

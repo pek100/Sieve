@@ -872,6 +872,11 @@ async fn a_direct_connect_that_raced_exiting_turning_on_is_ended() {
     for turn in [true, false] {
         let dial = Arc::new(TurnsExitingOn { link: m.clone(), settings: on.clone(), server, turn });
         let ctx = relay_with(Arc::default(), m.clone(), Some(dial));
+        // The engine's own registration: the change ends what it finds in the book.
+        let (book, filter) = (ctx.book.clone(), ctx.filter.clone());
+        m.on_exit_change(Arc::new(move |concerns: &dyn Fn(std::net::IpAddr) -> bool, change: crate::link::Change| {
+            super::relay::reconnect_the_new_way(&book, &filter, concerns, change);
+        }));
         let local: SocketAddr = if turn { "10.9.0.2:50020" } else { "10.9.0.2:50021" }.parse().unwrap();
         let mut wire = wire();
         wire.to_stack.send(segment(local, remote, CLIENT_ISN, Flags { syn: true, ..Flags::default() }, &[])).unwrap();
@@ -892,7 +897,10 @@ async fn a_direct_connect_that_raced_exiting_turning_on_is_ended() {
             }
             let mut book = ctx.book.lock().unwrap();
             assert_eq!(book.live(), 0, "nothing left open");
-            assert!(ended_row(&book.take_log()), "one row says it ended");
+            let rows = book.take_log();
+            assert!(ended_row(&rows), "a row says it ended");
+            let said = rows.iter().filter(|r| matches!(&r.outcome, LogOutcome::Exit { reason: Some(r), .. } if r.contains("ended"))).count();
+            assert_eq!(said, 1, "said once: {rows:?}");
         } else {
             // Its owner lookup gives up first (no owner in a test), then it is served.
             until("the control admitted", || ctx.book.lock().unwrap().live() == 1).await;
@@ -1034,6 +1042,151 @@ async fn an_open_udp_flow_stops_leaving_directly_once_exiting_applies() {
         }
         task.abort();
     }
+    m.routes_down();
+}
+
+/// A paired manager with routes up and exiting as `settings` (the link need not be
+/// up: what a UDP flow decides reads only the choices), and a relay on it whose
+/// UDP upstreams go to `server`, with the engine's own registration: a change of
+/// the way out ends what it concerns.
+async fn udp_bed(h: &crate::link::tests::TestHub, dir: &std::path::Path, server: SocketAddr, opened: Arc<std::sync::atomic::AtomicUsize>) -> (Arc<crate::link::LinkManager>, Arc<Relay>) {
+    use crate::link::tests as lt;
+    let net = Arc::new(lt::LoopNet::default());
+    let m = lt::manager(dir, net.clone());
+    lt::paired(&m, h).await;
+    m.routes_up(net, lt::noop_reset());
+    let ctx = relay_udp_to(Arc::default(), m.clone(), server, opened);
+    let (book, filter) = (ctx.book.clone(), ctx.filter.clone());
+    m.on_exit_change(Arc::new(move |concerns: &dyn Fn(std::net::IpAddr) -> bool, change: crate::link::Change| {
+        super::relay::reconnect_the_new_way(&book, &filter, concerns, change);
+    }));
+    (m, ctx)
+}
+
+/// Round 3's P3-c: a change of the way out that leaves a UDP flow going from this
+/// computer does not end it: a game or a call sent directly as set keeps its
+/// socket when the link restarts, when exiting turns off, and when it turns on
+/// again with UDP still Direct.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_udp_flow_whose_way_does_not_change_keeps_its_socket() {
+    use crate::link::tests as lt;
+    use sieve_ipc::{ExitVia, LinkHubDown, LinkRoute, LinkSettings, LinkUdp};
+    let h = lt::hub(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (echo, _) = udp_echo().await;
+    let answers = loopback_udp_works().await;
+    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (m, ctx) = udp_bed(&h, dir.path(), echo, opened.clone()).await;
+    let direct = LinkSettings { udp: LinkUdp::Direct, ..lt::exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Stop) };
+    m.set(direct.clone()).unwrap();
+    const GAME: &[u8] = b"\x00\x02 a call's datagram";
+    let (local, remote) = ends(("10.9.0.2:42000", "81.2.69.170:4000"));
+    let mut wire = wire();
+    wire.to_stack.send(udp_packet(local, remote, GAME)).unwrap();
+    let task = tokio::spawn(handle_udp(ctx.clone(), accept_udp(&mut wire).await));
+    until("relayed from this computer, as set", || opened.load(Ordering::SeqCst) == 1).await;
+    let seen = Mutex::new(Vec::new());
+    until("its row says direct", || rows_so_far(&ctx, &seen).iter().any(|r| matches!(r.outcome, LogOutcome::Exit { via: ExitVia::Direct, .. }))).await;
+    for what in ["the link restarts", "exiting turns off", "exiting turns on, UDP Direct"] {
+        match what {
+            "the link restarts" => m.network_changed(),
+            "exiting turns off" => m.set(LinkSettings { exit: false, ..direct.clone() }).unwrap(),
+            _ => m.set(direct.clone()).unwrap(),
+        }
+        tokio::time::sleep(SETTLE).await;
+        wire.to_stack.send(udp_packet(local, remote, GAME)).unwrap();
+        if answers {
+            assert_eq!(next_datagram(&mut wire, local, remote).await, GAME, "{what}: still answered");
+        } else {
+            tokio::time::sleep(SETTLE).await;
+        }
+        assert_eq!(opened.load(Ordering::SeqCst), 1, "{what}: the same socket");
+        assert_eq!(ctx.book.lock().unwrap().live(), 1, "{what}: the same flow");
+        assert!(!task.is_finished(), "{what}");
+        let rows = rows_so_far(&ctx, &seen);
+        assert!(!rows.iter().any(|r| matches!(&r.outcome, LogOutcome::Exit { reason: Some(r), .. } if r.contains("ended"))), "{what}: nothing ended: {rows:?}");
+    }
+    task.abort();
+    m.routes_down();
+}
+
+/// Round 3's P3-d: a UDP flow dropped while exiting is on is decided again once
+/// the way out no longer drops it: when the way out moves (exiting turned off),
+/// at once, and on its next datagram when only the filter changed (the switch
+/// paused there first): relayed from this computer, never black-holed until idle.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_udp_flow_is_decided_again_once_it_is_no_longer_dropped() {
+    use crate::link::tests as lt;
+    use sieve_ipc::{ExitVia, LinkHubDown, LinkRoute, LinkSettings};
+    let h = lt::hub(true).await;
+    let (echo, _) = udp_echo().await;
+    const GAME: &[u8] = b"\x00\x03 a game's datagram";
+    for (n, by_datagram) in [false, true].into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (m, ctx) = udp_bed(&h, dir.path(), echo, opened.clone()).await;
+        let on = lt::exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Stop);
+        m.set(on.clone()).unwrap();
+        let (local, remote) = ends((&format!("10.9.0.2:{}", 43_000 + n), "81.2.69.170:4000"));
+        let mut wire = wire();
+        wire.to_stack.send(udp_packet(local, remote, GAME)).unwrap();
+        let task = tokio::spawn(handle_udp(ctx.clone(), accept_udp(&mut wire).await));
+        let seen = Mutex::new(Vec::new());
+        until("dropped, as set", || rows_so_far(&ctx, &seen).iter().any(|r| matches!(r.outcome, LogOutcome::Exit { via: ExitVia::Dropped, .. }))).await;
+        assert_eq!(opened.load(Ordering::SeqCst), 0, "nothing from this computer while dropped");
+        if by_datagram {
+            // Paused in the filter only: the way out did not move; the next datagram finds it.
+            ctx.filter.update(|f| DomainFilter::new(&Policy { sieving: false, ..Policy::default() }, f.rules.clone()));
+            tokio::time::sleep(SETTLE).await;
+            assert_eq!(opened.load(Ordering::SeqCst), 0, "nothing sent until a datagram comes");
+            wire.to_stack.send(udp_packet(local, remote, GAME)).unwrap();
+        } else {
+            m.set(LinkSettings { exit: false, ..on.clone() }).unwrap();
+        }
+        until(&format!("by datagram {by_datagram}: decided again and relayed"), || opened.load(Ordering::SeqCst) == 1).await;
+        assert!(!task.is_finished());
+        assert_eq!(ctx.book.lock().unwrap().live(), 1, "a new flow, relayed");
+        task.abort();
+        m.routes_down();
+    }
+}
+
+/// Round 3's P3-a: a change that only moves the way out (UDP set from Direct to
+/// Drop, which ends nothing in the book) made after a flow decided its way, here
+/// while its socket opens, is seen before anything is sent: its held datagram
+/// never leaves, and it is decided again (dropped).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_set_only_change_after_the_decision_is_seen_before_anything_is_sent() {
+    use crate::link::tests as lt;
+    use sieve_ipc::{ExitVia, LinkHubDown, LinkRoute, LinkSettings, LinkUdp};
+    let h = lt::hub(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (echo, echoed) = udp_echo().await;
+    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (m, ctx) = udp_bed(&h, dir.path(), echo, opened.clone()).await;
+    let on = lt::exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Stop);
+    m.set(LinkSettings { udp: LinkUdp::Direct, ..on.clone() }).unwrap();
+    // The upstream's open sets UDP to Drop on its way.
+    let mut relay = Arc::into_inner(ctx).expect("not shared yet");
+    let (link, drop_now) = (m.clone(), on.clone());
+    let inner = relay.udp.clone();
+    relay.udp = Arc::new(move |target| {
+        link.set(drop_now.clone()).unwrap();
+        inner(target)
+    });
+    let ctx = Arc::new(relay);
+    let (local, remote) = ends(("10.9.0.2:44000", "81.2.69.170:4000"));
+    let mut wire = wire();
+    wire.to_stack.send(udp_packet(local, remote, b"\x00\x04 held")).unwrap();
+    let task = tokio::spawn(handle_udp(ctx.clone(), accept_udp(&mut wire).await));
+    let seen = Mutex::new(Vec::new());
+    until("decided again: dropped", || rows_so_far(&ctx, &seen).iter().any(|r| matches!(r.outcome, LogOutcome::Exit { via: ExitVia::Dropped, .. }))).await;
+    assert_eq!(opened.load(Ordering::SeqCst), 1);
+    let batch = ctx.book.lock().unwrap().take_batch();
+    assert!(batch.iter().filter(|e| !e.open).all(|e| e.bytes_up == 0), "nothing was sent from this computer: {batch:?}");
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(echoed.load(Ordering::SeqCst), 0, "the server got nothing");
+    task.abort();
     m.routes_down();
 }
 

@@ -309,13 +309,13 @@ fn exiting_relays_by_name_and_by_address_through_the_hub_and_its_own_socket_is_t
         let plan = m.plan(site).expect("a public address exits");
         let remote = SocketAddr::new(site, port);
         // By name: the hub resolves it.
-        let (opened, report) = exit::open(&plan, &*net, &exit::choose_host(Some("echo.test"), site), port, remote).await;
+        let (opened, report) = exit::open(&plan, &m, &*net, &exit::choose_host(Some("echo.test"), site), port, remote, &|| {}).await;
         assert_eq!(report, ExitReport { via: ExitVia::Hub, target: Some(format!("echo.test:{port}")), reason: None, signal: None });
         let mut s = opened.unwrap();
         assert!(matches!(s, Opened::Hub(_)));
         echo_once(&mut s, b"through the hub by name").await;
         // By address, when no name is known.
-        let (opened, report) = exit::open(&plan, &*net, &exit::choose_host(None, "127.0.0.1".parse().unwrap()), port, remote).await;
+        let (opened, report) = exit::open(&plan, &m, &*net, &exit::choose_host(None, "127.0.0.1".parse().unwrap()), port, remote, &|| {}).await;
         assert_eq!(report.target, Some(format!("127.0.0.1:{port}")));
         echo_once(&mut opened.unwrap(), b"through the hub by address").await;
         let row = h.hub.audit_path();
@@ -323,9 +323,8 @@ fn exiting_relays_by_name_and_by_address_through_the_hub_and_its_own_socket_is_t
         assert!(!audit.contains("through the hub"), "the hub never logs payload");
 
         // A hub refusal surfaces with its reason, and is never a reason to go direct.
-        let mut direct_plan = plan.clone();
-        direct_plan.on_hub_down = LinkHubDown::Direct;
-        let (opened, report) = exit::open(&direct_plan, &*net, "private.test", port, remote).await;
+        m.set(exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Direct)).unwrap();
+        let (opened, report) = exit::open(&plan, &m, &*net, "private.test", port, remote, &|| panic!("a refusal never goes direct")).await;
         assert!(opened.is_err());
         assert_eq!((report.via, report.signal), (ExitVia::Refused, Some(Signal::HubRefused)));
         assert!(report.reason.as_deref().is_some_and(|r| r.starts_with("denied")), "{report:?}");
@@ -358,13 +357,13 @@ fn the_hub_down_stops_by_default_and_goes_direct_when_set() {
         let plan = m.plan(site).unwrap();
         // The direct path's target stands in for the site: loopback here.
         let remote: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let (opened, report) = exit::open(&plan, &*net, "echo.test", port, remote).await;
+        let (opened, report) = exit::open(&plan, &m, &*net, "echo.test", port, remote, &|| {}).await;
         assert!(opened.is_err(), "stopped: nothing leaves from this computer");
         assert_eq!((report.via, report.signal), (ExitVia::Stopped, Some(Signal::HubDown)));
         let connects = net.connects.load(Ordering::SeqCst);
         m.set(exiting(LinkRoute::Dial { address: "127.0.0.1:9".into() }, LinkHubDown::Direct)).unwrap();
         let plan = m.plan(site).unwrap();
-        let (opened, report) = exit::open(&plan, &*net, "echo.test", port, remote).await;
+        let (opened, report) = exit::open(&plan, &m, &*net, "echo.test", port, remote, &|| {}).await;
         assert_eq!((report.via, report.signal), (ExitVia::Direct, None));
         assert!(net.connects.load(Ordering::SeqCst) > connects);
         echo_once(&mut opened.unwrap(), b"direct, as set").await;
@@ -400,7 +399,7 @@ fn listening_pairs_and_links_when_the_hub_dials_in_and_says_where_it_listens() {
         assert_eq!(m.status().listening, Some(format!("127.0.0.1:{free}")));
         until("up", || m.status().state == LinkState::Up).await;
         let plan = m.plan(SITE.parse().unwrap()).unwrap();
-        let (opened, _) = exit::open(&plan, &*net, "echo.test", port, SocketAddr::new(SITE.parse().unwrap(), port)).await;
+        let (opened, _) = exit::open(&plan, &m, &*net, "echo.test", port, SocketAddr::new(SITE.parse().unwrap(), port), &|| {}).await;
         echo_once(&mut opened.unwrap(), b"the hub dialled in").await;
         m.routes_down();
         assert!(port_free(free).await, "the port closed with the routes");
@@ -726,9 +725,11 @@ fn off_filter() -> crate::domain::FilterSlot {
     crate::domain::FilterSlot::new(crate::domain::DomainFilter::new(&policy, sieve_filter::rules::RuleSet::empty()))
 }
 
-/// P2-3, and round 2's P1: the open TCP and UDP flows of sieved apps to
-/// destinations the change concerns are ended, once, with one row; an app that
-/// is Off and a local destination are left alone.
+/// P2-3: the open TCP flows of sieved apps to destinations the change concerns
+/// are ended, once, with one row; an app that is Off and a local destination are
+/// left alone. UDP is not ended here (round 3's P3-c): each UDP flow watches the
+/// way out and is decided again, keeping its socket when its way is unchanged
+/// (`stack::relay_tests`).
 #[test]
 fn a_change_of_the_way_out_ends_the_open_connections_it_concerns() {
     use sieve_ipc::FlowProto::{Tcp, Udp};
@@ -744,12 +745,82 @@ fn a_change_of_the_way_out_ends_the_open_connections_it_concerns() {
     let concerns = |ip: IpAddr| sieve_link::rules::denied_class(ip).is_none();
     let n = crate::stack::relay::reconnect_the_new_way(&book, &off_filter(), &concerns, Change::Way(ExitVia::Hub));
     let ended: Vec<bool> = flows.iter().map(|f| f.load(Ordering::SeqCst)).collect();
-    assert_eq!(ended, [true, true, false, false, true, false, false], "a sieved app's and an unknown app's public flows only, UDP too");
-    assert_eq!(n, 3);
+    assert_eq!(ended, [true, true, false, false, false, false, false], "a sieved app's and an unknown app's public TCP flows only");
+    assert_eq!(n, 2);
     let rows = book.lock().unwrap().take_log();
     assert_eq!(rows.len(), 1, "one summary row: {rows:?}");
-    assert!(matches!(&rows[0].outcome, sieve_ipc::LogOutcome::Exit { via: ExitVia::Hub, target: None, reason: Some(r) } if r.contains("3 open connections")), "{rows:?}");
+    assert!(matches!(&rows[0].outcome, sieve_ipc::LogOutcome::Exit { via: ExitVia::Hub, target: None, reason: Some(r) } if r.contains("2 open connections")), "{rows:?}");
     assert_eq!(rows[0].session, Some(0), "every client sees it");
+}
+
+/// Round 3's must-fix: apps switched from Off back to sieved while exiting is on.
+/// Their open TCP flows to public destinations end (one row) so they reconnect
+/// through the hub; another app's, a local destination's and UDP (which follows
+/// the way out) stay. A flow ended once is not ended or counted again.
+#[test]
+fn apps_switched_back_from_off_end_their_open_tcp_flows_to_public_destinations() {
+    use sieve_ipc::FlowProto::{Tcp, Udp};
+    let (book, flows) = book_of(&[
+        (Some("Game"), "81.2.69.170:443", Tcp, false),
+        (Some("game"), "81.2.69.170:3478", Udp, false),
+        (Some("game"), "10.0.0.1:443", Tcp, false),
+        (Some("browser"), "81.2.69.170:443", Tcp, false),
+        (None, "81.2.69.170:443", Tcp, false),
+    ]);
+    let concerns = |ip: IpAddr| sieve_link::rules::denied_class(ip).is_none();
+    let was_off = |key: &str| key.eq_ignore_ascii_case("game");
+    let n = crate::stack::relay::reconnect_sieved_again(&book, &concerns, &was_off);
+    let ended: Vec<bool> = flows.iter().map(|f| f.load(Ordering::SeqCst)).collect();
+    assert_eq!(ended, [true, false, false, false, false]);
+    assert_eq!(n, 1);
+    let rows = book.lock().unwrap().take_log();
+    assert_eq!(rows.len(), 1, "one summary row: {rows:?}");
+    assert!(matches!(&rows[0].outcome, sieve_ipc::LogOutcome::Exit { via: ExitVia::Hub, target: None, reason: Some(r) } if r.contains("1 open connection ended")), "{rows:?}");
+    assert_eq!(crate::stack::relay::reconnect_sieved_again(&book, &concerns, &was_off), 0, "ended once");
+    assert!(book.lock().unwrap().take_log().is_empty(), "no second row");
+}
+
+/// Round 3's cosmetic: a flow a change already ended (and counted in its row)
+/// is known as such when the after-admit check reaches it, so "1 open connection
+/// ended" is not written for it a second time (`handle_tcp`).
+#[test]
+fn a_flow_a_change_already_ended_is_not_said_ended_twice() {
+    use sieve_ipc::FlowProto::Tcp;
+    let (book, _) = book_of(&[(Some("browser"), "81.2.69.170:443", Tcp, false), (Some("browser"), "81.2.69.170:443", Tcp, false)]);
+    let concerns = |ip: IpAddr| sieve_link::rules::denied_class(ip).is_none();
+    let mut b = book.lock().unwrap();
+    let first = b.end_where(|e, _, _| e.id == 1);
+    assert_eq!(first, 1);
+    assert!(!b.release(1), "the change took it, and said so");
+    assert!(b.release(2), "the check takes the other, which no change said");
+    drop(b);
+    assert_eq!(crate::stack::relay::reconnect_the_new_way(&book, &off_filter(), &concerns, Change::Way(ExitVia::Hub)), 0, "released: nothing ends it again");
+}
+
+/// Round 3's must-fix, the manager's side: apps switched back from Off move the
+/// way out (so their flows deciding or connecting meanwhile, and their UDP, look
+/// again) and say which destinations exiting concerns, only while exiting applies.
+#[test]
+fn apps_sieved_again_move_the_way_out_only_while_exiting_applies() {
+    run(async {
+        let h = hub(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        paired(&m, &h).await;
+        m.routes_up(net.clone(), noop_reset());
+        let mut way = m.way_out();
+        assert!(m.sieved_again().is_none(), "exit is off");
+        assert!(!way.has_changed().unwrap(), "nothing moved");
+        m.set(exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Stop)).unwrap();
+        way.borrow_and_update();
+        let concerns = m.sieved_again().expect("exiting applies");
+        assert!(way.has_changed().unwrap(), "the way out moved for those apps");
+        assert!(concerns(SITE.parse().unwrap()) && !concerns("10.0.0.1".parse().unwrap()));
+        m.set_sieving(false);
+        assert!(m.sieved_again().is_none(), "paused: nothing exits");
+        m.routes_down();
+    });
 }
 
 /// Round 2's P3: once the hub is back, or Stop is set, the TCP flows that went
@@ -800,6 +871,106 @@ fn the_manager_tells_of_the_hubs_return_and_of_stop_set() {
         until("the hub's return told", || told.lock().unwrap().contains(&Change::WentDirect { hub_back: true })).await;
         m.set(LinkSettings { on_hub_down: LinkHubDown::Stop, ..direct }).unwrap();
         assert_eq!(told.lock().unwrap().last(), Some(&Change::WentDirect { hub_back: false }), "{:?}", told.lock().unwrap());
+        m.routes_down();
+    });
+}
+
+/// Loopback for an open's direct connect that waits at a gate, so a test can act
+/// while the connect is under way; it notes whether the flow was marked as going
+/// directly by then.
+#[derive(Default)]
+struct GateNet {
+    inner: LoopNet,
+    entered: tokio::sync::Notify,
+    go: tokio::sync::Notify,
+    marked: Arc<std::sync::atomic::AtomicBool>,
+    marked_at_connect: std::sync::atomic::AtomicBool,
+}
+
+impl LinkNet for GateNet {
+    fn connect(&self, target: SocketAddr) -> BoxFuture<'_, Result<TcpStream, String>> {
+        Box::pin(async move {
+            self.marked_at_connect.store(self.marked.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.entered.notify_one();
+            self.go.notified().await;
+            self.inner.connect(target).await
+        })
+    }
+    fn listen_ip(&self) -> Option<IpAddr> {
+        self.inner.listen_ip()
+    }
+    fn is_local(&self, ip: IpAddr) -> bool {
+        self.inner.is_local(ip)
+    }
+}
+
+/// Round 3's P3-b: with the hub down, the hub-down choice is read when the open
+/// needs it (not from the plan the flow took when it was accepted); a flow going
+/// directly is marked before its connect, so a change that ends what went
+/// directly finds it meanwhile; and a direct connect made while the way out moved
+/// is not used.
+#[test]
+fn going_direct_reads_the_choice_now_is_marked_before_its_connect_and_a_move_meanwhile_drops_it() {
+    use crate::stack::book::FlowBook;
+    // The book side: a flow marked going directly is one a Stop or the hub's return ends.
+    {
+        let book = Mutex::new(FlowBook::default());
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let id = {
+            let mut b = book.lock().unwrap();
+            let mut e = crate::stack::book::tests_event(Some(1));
+            e.remote = format!("{SITE}:443");
+            let id = b.open_with(e, Some(Box::new(Ends(ended.clone())))).unwrap();
+            b.own(id, Some("browser".into()));
+            id
+        };
+        book.lock().unwrap().going_direct(id);
+        let concerns = |ip: IpAddr| sieve_link::rules::denied_class(ip).is_none();
+        let n = crate::stack::relay::reconnect_the_new_way(&book, &off_filter(), &concerns, Change::WentDirect { hub_back: true });
+        assert_eq!((n, ended.load(Ordering::SeqCst)), (1, true), "found while it connects");
+    }
+    run(async {
+        let h = hub(true).await;
+        let port = echo().await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        paired(&m, &h).await;
+        let route = LinkRoute::Dial { address: h.addr.to_string() };
+        m.set(exiting(route.clone(), LinkHubDown::Stop)).unwrap();
+        m.routes_up(net.clone(), noop_reset());
+        until("up", || m.status().state == LinkState::Up).await;
+        let site: IpAddr = SITE.parse().unwrap();
+        // Taken while Stop was set, as a flow accepted then.
+        let plan = m.plan(site).unwrap();
+        drop(h);
+        until("down", || m.status().state == LinkState::Down).await;
+        m.set(exiting(route.clone(), LinkHubDown::Direct)).unwrap();
+        let remote: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let marked = std::sync::atomic::AtomicBool::new(false);
+        let (opened, report) = exit::open(&plan, &m, &*net, "echo.test", port, remote, &|| marked.store(true, Ordering::SeqCst)).await;
+        assert_eq!(report.via, ExitVia::Direct, "Direct is set now: {report:?}");
+        assert!(marked.load(Ordering::SeqCst));
+        echo_once(&mut opened.unwrap(), b"direct, as set now").await;
+
+        // The way out moves while a direct connect is under way (Stop set): marked
+        // before it, and its connection is not used.
+        let gate = Arc::new(GateNet::default());
+        let task = {
+            let (plan, m, gate) = (plan.clone(), m.clone(), gate.clone());
+            tokio::spawn(async move {
+                let marked = gate.marked.clone();
+                exit::open(&plan, &m, &*gate, "echo.test", port, remote, &|| marked.store(true, Ordering::SeqCst)).await
+            })
+        };
+        tokio::time::timeout(T, gate.entered.notified()).await.expect("the direct connect started");
+        assert!(gate.marked_at_connect.load(Ordering::SeqCst), "marked before its connect");
+        m.set(exiting(route, LinkHubDown::Stop)).unwrap();
+        gate.go.notify_one();
+        let (opened, report) = tokio::time::timeout(T, task).await.unwrap().unwrap();
+        assert!(opened.is_err(), "a connection made while the way out moved is not used");
+        assert_eq!(report.via, ExitVia::Stopped, "{report:?}");
+        assert!(report.reason.as_deref().is_some_and(|r| r.contains("the way out changed")), "{report:?}");
         m.routes_down();
     });
 }
@@ -882,7 +1053,7 @@ fn a_plan_taken_before_a_restart_opens_on_the_new_link() {
         until("up again", || m.status().state == LinkState::Up).await;
         // The SYN-time plan's own client was shut down by the restart: an open on
         // it would be stopped. The plan reads the running one.
-        let (opened, report) = exit::open(&plan, &*net, "echo.test", port, SocketAddr::new(site, port)).await;
+        let (opened, report) = exit::open(&plan, &m, &*net, "echo.test", port, SocketAddr::new(site, port), &|| {}).await;
         assert_eq!(report.via, ExitVia::Hub, "{report:?}");
         echo_once(&mut opened.unwrap(), b"on the new link").await;
         m.routes_down();

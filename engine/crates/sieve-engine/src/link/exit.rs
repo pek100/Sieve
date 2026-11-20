@@ -161,8 +161,11 @@ pub fn failed(e: LinkError, linked: bool) -> Failed {
 /// directly from this computer to `remote`. A hub that answered and refused, or
 /// that is linked but did not answer in time (busy, slow, a target that takes
 /// long), is never a reason to go direct: only a link that is not there is.
-/// The running link is read now, not when the flow began.
-pub async fn open(plan: &Plan, net: &dyn LinkNet, host: &str, port: u16, remote: SocketAddr) -> (io::Result<Opened>, ExitReport) {
+/// The running link and the hub-down choice are read now, not when the flow
+/// began. Going direct, `going_direct` is called before the connect (the flow's
+/// book marks it, so a change that ends what went directly finds it while it
+/// connects), and a connection made while the way out moved is not used.
+pub async fn open(plan: &Plan, link: &LinkManager, net: &dyn LinkNet, host: &str, port: u16, remote: SocketAddr, going_direct: &(dyn Fn() + Sync)) -> (io::Result<Opened>, ExitReport) {
     let target = Some(shown(host, port));
     let down = |why: String| -> (io::Result<Opened>, ExitReport) {
         (Err(io::Error::new(io::ErrorKind::ConnectionRefused, why.clone())), ExitReport { via: ExitVia::Stopped, target: target.clone(), reason: reason(&why), signal: Some(Signal::HubDown) })
@@ -182,15 +185,26 @@ pub async fn open(plan: &Plan, net: &dyn LinkNet, host: &str, port: u16, remote:
             Failed::Down(why) => why,
         },
     };
-    match plan.on_hub_down {
+    // The way out before the choice is read: any change from here on (the choice
+    // itself, the hub back) shows as a moved value after the connect.
+    let way = link.way_now();
+    match link.on_hub_down() {
         LinkHubDown::Stop => down(format!("{why_down}; stopped, as set")),
-        LinkHubDown::Direct => match net.connect(remote).await {
-            Ok(tcp) => (Ok(Opened::Tcp(tcp)), ExitReport { via: ExitVia::Direct, target, reason: reason(format!("{why_down}; went directly from this computer, as set")), signal: None }),
-            Err(e) => (
-                Err(io::Error::new(io::ErrorKind::ConnectionRefused, e.clone())),
-                ExitReport { via: ExitVia::Direct, target, reason: reason(format!("{why_down}; the direct connect failed too: {e}")), signal: Some(Signal::ConnectFailed) },
-            ),
-        },
+        LinkHubDown::Direct => {
+            going_direct();
+            match net.connect(remote).await {
+                Ok(tcp) if link.way_now() != way => {
+                    drop(tcp);
+                    let why = format!("{why_down}; the way out changed while it connected directly, so that connection was not used");
+                    (Err(io::Error::new(io::ErrorKind::ConnectionAborted, why.clone())), ExitReport { via: ExitVia::Stopped, target, reason: reason(&why), signal: None })
+                }
+                Ok(tcp) => (Ok(Opened::Tcp(tcp)), ExitReport { via: ExitVia::Direct, target, reason: reason(format!("{why_down}; went directly from this computer, as set")), signal: None }),
+                Err(e) => (
+                    Err(io::Error::new(io::ErrorKind::ConnectionRefused, e.clone())),
+                    ExitReport { via: ExitVia::Direct, target, reason: reason(format!("{why_down}; the direct connect failed too: {e}")), signal: Some(Signal::ConnectFailed) },
+                ),
+            }
+        }
     }
 }
 
@@ -405,11 +419,17 @@ pub struct Exit {
 impl Exit {
     async fn fresh(&self, target: SocketAddr, host: Option<&str>, flow: Option<u64>) -> Result<Upstream, String> {
         let Some(plan) = self.link.plan(target.ip()) else { return self.net.connect(target).await.map(Upstream::Tcp) };
-        let (opened, report) = open(&plan, &*self.net, &choose_host(host, target.ip()), target.port(), target).await;
+        let book = || self.book.lock().unwrap_or_else(|p| p.into_inner());
+        let going_direct = || {
+            if let Some(id) = flow {
+                book().going_direct(id);
+            }
+        };
+        let (opened, report) = open(&plan, &self.link, &*self.net, &choose_host(host, target.ip()), target.port(), target, &going_direct).await;
         // A stop or a refusal is the hub's problem on the flow's row, so the
         // flow's failure that follows is not counted as the app's breakage.
         if let Some(id) = flow {
-            self.book.lock().unwrap_or_else(|p| p.into_inner()).exit(id, report);
+            book().exit(id, report);
         }
         opened.map(Upstream::from).map_err(|e| e.to_string())
     }
@@ -464,7 +484,8 @@ impl Connector for DnsExit {
     fn resolver_stream<'a>(&'a self, target: SocketAddr, host: &'a str) -> BoxFuture<'a, Result<ResolverStream, String>> {
         Box::pin(async move {
             let Some(plan) = self.link.plan(target.ip()) else { return self.inner.resolver_stream(target, host).await };
-            match open(&plan, &*self.net, host, target.port(), target).await.0 {
+            // A resolver session has no flow row to mark.
+            match open(&plan, &self.link, &*self.net, host, target.port(), target, &|| {}).await.0 {
                 Ok(Opened::Tcp(tcp)) => {
                     let _ = tcp.set_nodelay(true);
                     Ok(Box::new(tcp) as ResolverStream)
