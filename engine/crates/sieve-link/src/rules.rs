@@ -321,7 +321,7 @@ pub fn check_port(rules: &Rules, port: u16) -> Result<(), String> {
 }
 
 /// `suffix` matches the name itself and every name under it, on label
-/// boundaries ("example.com" matches "a.example.com", not "badexample.com").
+/// boundaries ("site.example" matches "a.site.example", not "badsite.example").
 pub fn suffix_matches(host: &str, suffix: &str) -> bool {
     let h = normalize(host);
     let s = normalize(suffix.trim_start_matches("*.").trim_start_matches('.'));
@@ -822,7 +822,7 @@ mod tests {
         assert!(suffix_matches("a.example.com", "example.com"));
         assert!(suffix_matches("EXAMPLE.com.", "example.com"));
         assert!(suffix_matches("a.example.com", "*.example.com"));
-        assert!(!suffix_matches("badexample.com", "example.com"));
+        assert!(!suffix_matches("badsite.example", "site.example"));
         let r = Rules { deny_suffixes: vec!["tracker.test".into()], ..Default::default() };
         assert!(check_host(&r, "x.tracker.test").is_err());
         assert!(check_host(&r, "tracker.testing").is_ok());

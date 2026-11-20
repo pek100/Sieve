@@ -62,7 +62,7 @@ describe("registry law", () => {
     expect(def.requires).toBe(DNS_ENCRYPTION);
     expect(def.help).toMatch(/can't read them/);
     expect(def.breaks).toMatch(/7 s slower/);
-    expect(def.breaks).toMatch(/sign-in pages/);
+    expect(def.breaks).toMatch(/sign-in page/);
     expect(read("src/data/engine-controller.ts")).toContain("...(settings.get(DNS_CLIENT_CAPTURE) === false ? { skip_dns_capture: true } : {})");
   });
 

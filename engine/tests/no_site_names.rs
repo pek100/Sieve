@@ -27,7 +27,8 @@ const EXEMPT_PATH: &str = "sieve-engine/src/bin/probe/";
 const CRATES: &str = "crates";
 
 /// (file below `crates`, token, why).
-const EXCEPTIONS: [(&str, &str, &str); 12] = [
+const EXCEPTIONS: [(&str, &str, &str); 13] = [
+    ("sieve-engine/src/route/portal.rs", "msftconnecttest.com", "the Host of Windows' own connectivity test, which the sign-in check asks as Windows does so a forwarding proxy answers it truly"),
     ("sieve-engine/src/dns/upstream.rs", "cloudflare-dns.com", "a decided DoH default (plan decision table, encrypted DNS)"),
     ("sieve-engine/src/dns/upstream.rs", "dns.quad9.net", "a decided DoH default (plan decision table, encrypted DNS)"),
     ("sieve-filter/src/catalogue.rs", "filters.adtidy.org", "a list's URL is its identity (plan 5.4)"),
