@@ -32,7 +32,9 @@ Licence
 
 To update
   Clone a newer reviewed tag into an empty folder, run the assembler, review
-  the result, replace this file, change RESOURCE_PIN and the tag above. The
-  review steps of 2026-11-20 are in docs/tasks/2026-11-06-open-decisions.md
-  (content Q1). Once releases are public (slice 13), a signed copy delivered
-  as an update (updates\resources) takes precedence over this one.
+  the result, replace this file, change RESOURCE_PIN, SHIPPED_VERSION and the
+  tag above. The review steps of 2026-11-20 are in
+  docs/tasks/2026-11-06-open-decisions.md (content Q1). Once releases are
+  public (slice 13), a signed copy delivered as an update (updates\resources)
+  takes precedence over this one when its signed version is not lower. A
+  resources version is the uBO tag as a release number (1.76.6 is 1076006).

@@ -415,7 +415,7 @@ impl Lists {
             }).collect();
             let texts: Vec<ListText<'_>> = copies.iter().filter_map(|(s, t)| t.as_deref().map(|text| ListText { id: &s.id, text, trusted: s.trusted })).collect();
             let mut engine = compile(&texts);
-            let (loaded, resource_error) = resources::load(dir.as_deref(), resources::SHIPPED, resources::RESOURCE_PIN);
+            let (loaded, resource_error) = resources::load(dir.as_deref(), resources::THIS_BUILD);
             if let Some(l) = &loaded {
                 engine.use_resources(&l.bundle);
             }
@@ -795,6 +795,14 @@ mod tests {
         assert_eq!(f.asked_urls().len(), 4, "once");
     }
 
+    /// What the update cycle records after placing a signed bundle: its signed
+    /// version, here the shipped one's (a copy as new as the shipped one wins).
+    fn record_signed_resources(dir: &std::path::Path) {
+        let mut record = crate::update::state::Record::default();
+        record.versions.insert(crate::update::Kind::Resources.to_string(), resources::SHIPPED_VERSION);
+        crate::update::state::save_record(dir, &record).unwrap();
+    }
+
     /// Plan 7.5 meets plan 5.5: a bundle the signed path placed is what the next
     /// compile uses, and the report quotes it. A broken one costs scriptlets and
     /// is said; filtering carries on.
@@ -811,6 +819,7 @@ mod tests {
         let path = crate::update::data_path(dir.path(), &crate::update::Kind::Resources).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"[]").unwrap();
+        record_signed_resources(dir.path());
         l.compile_and_swap().await;
         assert_eq!(l.facts().unwrap().resource_pin, Some(format!("sha256:{}", sieve_filter::resources::sha256_hex(b"[]"))));
         assert_eq!(l.compile_error(), None);
@@ -840,6 +849,7 @@ mod tests {
         let path = crate::update::data_path(dir.path(), &crate::update::Kind::Resources).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, FIXTURE).unwrap();
+        record_signed_resources(dir.path());
         l.compile_and_swap().await;
         assert!(scriptlets(&l).contains("sieveSetFlag"), "the bundle reaches the user's engine at the swap");
         assert!(l.user_engine_for(UserRules::of(&policy)).page_cosmetics(URL).scriptlets.contains("sieveSetFlag"), "and a later policy's engine");
