@@ -14,7 +14,7 @@ import type { EngineSource } from "./engine-source";
 import { createMockFilterLists } from "./filter-lists-mock";
 import type { FilterListSource } from "./filter-lists-source";
 import type { Clock } from "./poller";
-import type { EngineDnsUpstreams, EnginePolicy, EngineProbe } from "./protocol";
+import type { CertStatus, EngineDnsUpstreams, EnginePolicy, EngineProbe } from "./protocol";
 import { createSettingsStore, memoryBackend, type SettingsBackend } from "./settings-store";
 
 const SWITCH = ENGINE_SWITCH as SettingKey;
@@ -1200,6 +1200,32 @@ describe("engine controller", () => {
       await s.fc.advance(ENGINE_POLL_MS);
       expect(s.checks.has(HTTPS_SWITCH)).toBe(false);
       expect(engineStatus(s.store.getState().engine)?.upstream_checks, "nothing decrypted, nothing to say").toBeUndefined();
+      s.undo();
+    });
+
+    it("HTTPS and page filtering are proven only while the root is installed and trusted", async () => {
+      const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true, [HTTPS_SWITCH]: true, [CONTENT_SWITCH]: true } }));
+      await s.fc.flush();
+      await s.fc.advance(ENGINE_POLL_MS);
+      const proven = () => [s.checks.has(HTTPS_SWITCH), s.checks.has(CONTENT_SWITCH)];
+      expect(proven(), "decrypting, root installed").toEqual([true, true]);
+      const real = s.fake.source.certStatus;
+      const root = (state: CertStatus["state"]): CertStatus => ({ state, valid_until_ms: null, thumbprint: null, firefox: "uses_windows", last_rotation_ms: null, last_error: null });
+      for (const state of ["removal_pending", "not_installed"] as const) {
+        s.fake.source.certStatus = async () => root(state);
+        await s.fc.advance(ENGINE_POLL_MS);
+        expect(engineStatus(s.store.getState().engine)?.decrypting, state).toBe(true);
+        expect(proven(), state).toEqual([false, false]);
+      }
+      s.fake.source.certStatus = async () => root("expires_soon");
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(proven(), "an expiring root is still trusted").toEqual([true, true]);
+      s.fake.source.certStatus = async () => Promise.reject(new Error("no answer"));
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(proven(), "a failed read is no root").toEqual([false, false]);
+      s.fake.source.certStatus = real;
+      await s.fc.advance(ENGINE_POLL_MS);
+      expect(proven()).toEqual([true, true]);
       s.undo();
     });
 

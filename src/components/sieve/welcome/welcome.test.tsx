@@ -337,9 +337,10 @@ describe("the network proof", () => {
     expect(step()).toBe("https");
     expect(screen.getByText(HTTPS_INVITE.title)).toBeInTheDocument();
     expect(screen.getByText(/opens your browsers' encrypted traffic here on this computer/)).toBeInTheDocument();
-    expect(screen.getByText(/never opens the banking, payment, health/)).toBeInTheDocument();
+    expect(screen.getByText(/Only browsers are decrypted: other apps are never opened/)).toBeInTheDocument();
+    expect(screen.getByText(/such as many banks and payment, health, government/)).toBeInTheDocument();
     expect(screen.getByText(/turn it off at any time/)).toBeInTheDocument();
-    expect(screen.getByText(/removes Sieve's own certificate and leaves every other certificate as it was/)).toBeInTheDocument();
+    expect(screen.getByText(/removes Sieve's own certificate once Windows allows it, which can take a moment, and leaves every other certificate as it was/)).toBeInTheDocument();
     expect(HTTPS_HREF).toBe("/settings/#setting-filtering.https");
     expect(screen.getByRole("link", { name: HTTPS_INVITE.link })).toHaveAttribute("href", expect.stringMatching(/^\/settings\/?#setting-filtering\.https$/));
     expect(rt.settings.get(HTTPS_SWITCH)).toBe(false);

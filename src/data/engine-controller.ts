@@ -38,7 +38,7 @@
  * Update state rides the probe: there is no separate poll.
  */
 import type { PassedChecks } from "@/core/checks";
-import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE as DNS_CLIENT_CAPTURE_KEY, DNS_ENCRYPTION as DNS_ENCRYPTION_KEY, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineVersion, engineTakesPolicy, engineUpdate, httpsInForce, updateBanner, type EngineSlice } from "@/core/engine";
+import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE as DNS_CLIENT_CAPTURE_KEY, DNS_ENCRYPTION as DNS_ENCRYPTION_KEY, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineVersion, engineTakesPolicy, engineUpdate, httpsInForce, httpsWorking, updateBanner, type EngineSlice } from "@/core/engine";
 import type { ExclusionsFacts, HealGroup } from "@/core/exclusions";
 import type { NoticeBus } from "@/core/notices";
 import { selectedListIds } from "@/core/filter-lists";
@@ -301,19 +301,25 @@ export function createEngineController({ engine, store, clock, settings, checks,
     return signInRequest(() => engine.resumeDnsCapture(), `${SIGN_IN_ERROR_PREFIX} did not end`);
   };
 
+  // The passed checks, from the facts alone. HTTPS is proven while the engine
+  // says it decrypts and its root is installed and trusted, and page filtering
+  // while it also holds `content`: what builds on each (the tracking protections) waits for that.
+  const followChecks = () => {
+    const e = get();
+    if (engineRoutes(e)) checks.add(ENGINE_SWITCH);
+    else checks.delete(ENGINE_SWITCH);
+    const working = httpsWorking(e);
+    if (working) checks.add(HTTPS);
+    else checks.delete(HTTPS);
+    if (working && engineStatus(e)?.policy.content === true) checks.add(CONTENT);
+    else checks.delete(CONTENT);
+  };
+
   // Facts in, consequences out: passed check, banner, policy.
   const follow = () => {
     const e = get();
     const phase = enginePhase(e);
-    if (engineRoutes(e)) checks.add(ENGINE_SWITCH);
-    else checks.delete(ENGINE_SWITCH);
-    // HTTPS is proven while the engine says it decrypts, and page filtering while
-    // it also holds `content`: what builds on each (the tracking protections) waits for that.
-    const decrypting = engineRoutes(e) && engineStatus(e)?.decrypting === true;
-    if (decrypting) checks.add(HTTPS);
-    else checks.delete(HTTPS);
-    if (decrypting && engineStatus(e)?.policy.content === true) checks.add(CONTENT);
-    else checks.delete(CONTENT);
+    followChecks();
     if (phase === "crash_loop" && banner === null) banner = notices.push({ kind: "error", surface: "banner", text: CRASH_LOOP_BANNER });
     if (phase !== "crash_loop" && banner !== null) {
       notices.dismiss(banner);
@@ -601,6 +607,8 @@ export function createEngineController({ engine, store, clock, settings, checks,
         follow();
         await syncUpstreams();
         await readCert();
+        // HTTPS is proven only with its root trusted: the checks follow this probe's certificate read.
+        if (!disposed) followChecks();
         await readHeal();
         await readIssues();
       };

@@ -35,7 +35,8 @@ function RemoveDialog({ onCancel, onRemove }: { onCancel: () => void; onRemove: 
       <DialogHeader>
         <DialogTitle className="text-title">Remove certificate</DialogTitle>
         <DialogDescription className="text-body text-on-surface-muted">
-          This turns HTTPS filtering off and removes Sieve&apos;s certificate from Windows and Firefox.
+          This turns HTTPS filtering off and removes Sieve&apos;s certificate from Windows and Firefox once Windows allows it. That can take a
+          moment; until then the certificate shows as Removal pending.
         </DialogDescription>
       </DialogHeader>
       <div className="flex flex-wrap justify-end gap-2">

@@ -59,17 +59,27 @@ describe("Certificate group", () => {
     expect(rows).toHaveTextContent(firefox);
   });
 
-  it("says plainly which upstream checks are skipped, and nothing while both run or nothing is decrypted", async () => {
-    const runtime = await setup(mock("idle"));
-    await settled("Not installed");
+  it("says plainly which upstream checks are skipped, and nothing while both run or HTTPS filtering is not working", async () => {
+    const runtime = await setup(mock("idle", "installed"));
+    await settled("Installed");
     const e = runtime.store.getState().engine;
     const pipe = e.probe!.pipe!;
     if (pipe.kind !== "welcome") throw new Error("idle answers with a Status");
-    const checks = (u?: { ct: boolean; crlite: boolean }) =>
-      act(() => runtime.store.setEngine({ ...e, probe: { ...e.probe!, pipe: { ...pipe, status: { ...pipe.status, ...(u ? { upstream_checks: u } : {}) } } } }));
+    const both = { ct: false, crlite: false };
+    // An engine that routes and says it decrypts, beside the root as `cert` says.
+    const checks = (u?: { ct: boolean; crlite: boolean }, over: { decrypting?: boolean; cert?: CertStatus | null } = {}) =>
+      act(() =>
+        runtime.store.setEngine({
+          ...e,
+          cert: over.cert === undefined ? e.cert : over.cert,
+          probe: { ...e.probe!, pipe: { ...pipe, status: { ...pipe.status, filtering: true, decrypting: over.decrypting ?? true, ...(u ? { upstream_checks: u } : {}) } } },
+        }),
+      );
     const line = () => group().querySelector("[data-upstream-checks]");
-    checks({ ct: false, crlite: false });
-    expect(line()).toHaveTextContent("The Certificate Transparency and CRLite checks are skipped until Sieve publishes their data. Windows still checks each site's certificate, revocation included.");
+    checks(both);
+    expect(line()).toHaveTextContent(
+      "The Certificate Transparency and CRLite checks are skipped until Sieve publishes their data. Windows still checks each site's certificate, and its revocation when it can reach the revocation server.",
+    );
     expect(line()).not.toHaveAttribute("role", "alert");
     checks({ ct: true, crlite: false });
     expect(line()).toHaveTextContent(/^The CRLite check is skipped/);
@@ -77,6 +87,12 @@ describe("Certificate group", () => {
     expect(line()).toBeNull();
     checks();
     expect(line()).toBeNull();
+    checks(both, { decrypting: false });
+    expect(line(), "not decrypting").toBeNull();
+    checks(both, { cert: ipc.certStatuses.removal_pending as CertStatus });
+    expect(line(), "the root is on its way out").toBeNull();
+    checks(both, { cert: null });
+    expect(line(), "no root read yet").toBeNull();
   });
 
   it("not installed: only the state line, no rows and no Remove", async () => {

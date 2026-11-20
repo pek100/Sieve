@@ -325,7 +325,7 @@ export const REGISTRY = {
     kind: "dataSwitch",
     section: "filtering",
     label: "Decrypt HTTPS traffic",
-    help: "Your browsers' encrypted traffic is opened here on this computer, so Sieve can block ads and trackers inside pages, video ads included. Sites on Sieve's never-decrypt list, such as banks, payments, health, government, password and sign-in sites, are never opened, and neither are apps that check their own certificate. It installs Sieve's own certificate; off removes it from Windows and Firefox. While on, a browser set to Off in Apps loses Encrypted Client Hello, so the name of the site it opens can be seen on the network.",
+    help: "Your browsers' encrypted traffic is opened here on this computer, so Sieve can block ads and trackers inside pages, video ads included. Only browsers are decrypted: other apps are never opened, and neither are the sites on Sieve's never-decrypt list, such as many banks and payment, health, government, password and sign-in sites. It installs Sieve's own certificate; off removes it from Windows and Firefox once Windows allows it, which can take a moment. While on, a browser set to Off in Apps loses Encrypted Client Hello, so the name of the site it opens can be seen on the network.",
     default: false,
     liveCheck: "live_https_intercepts_public_and_passes_floor",
     requires: "filtering.engine",
@@ -404,6 +404,16 @@ export const REGISTRY = {
     section: "startup",
     label: "Welcome guide finished",
     help: "Off shows the welcome guide the next time Sieve opens.",
+    default: false,
+    keptByResetAll: true,
+  } satisfies BooleanSetting,
+  // Home's link to HTTPS filtering stays hidden: the person hid it, or HTTPS
+  // filtering was turned on once (hooks/runtime bindHttpsInvite). Changes no traffic.
+  "appearance.httpsLinkHidden": {
+    kind: "boolean",
+    section: "appearance",
+    label: "Home's link to HTTPS filtering hidden",
+    help: "Off shows Home's Filter inside web pages too link again while HTTPS filtering is off. It turns on by itself once HTTPS filtering has been on.",
     default: false,
     keptByResetAll: true,
   } satisfies BooleanSetting,
