@@ -3,6 +3,7 @@
  * store (core) <- poller (data) <- source (data); settings store; notice bus.
  * Tests build their own with createRuntime and inject a source and backend.
  */
+import { HTTPS_LINK_HIDDEN, HTTPS_SWITCH } from "@/core/engine";
 import { createNoticeBus, desktopWorthy, type NoticeBus } from "@/core/notices";
 import { offKeys } from "@/core/policy";
 import { createStore, phase, type SieveStore } from "@/core/store";
@@ -291,6 +292,26 @@ export function bindDesktop(rt: Runtime, fmt: (ms: number) => string = clockTime
     unStore();
     unSettings();
     unTray?.();
+  };
+}
+
+/**
+ * Once HTTPS filtering has been turned on, Home's link to it never shows again:
+ * the switch on (however it got there: a click, an import) records it in
+ * `appearance.httpsLinkHidden`. That write only hides a link and can never turn
+ * anything on, so it does not go through the lock. Returns the undo.
+ */
+export function bindHttpsLink(rt: Runtime): () => void {
+  let cancelled = false;
+  const follow = () => {
+    if (cancelled || rt.settings.get(HTTPS_SWITCH) !== true || rt.settings.get(HTTPS_LINK_HIDDEN)) return;
+    rt.settings.set(HTTPS_LINK_HIDDEN, true).catch((e: unknown) => console.warn(`Home link: ${message(e)}`));
+  };
+  const unSettings = rt.settings.subscribe(follow);
+  void rt.settings.ready.then(follow);
+  return () => {
+    cancelled = true;
+    unSettings();
   };
 }
 
