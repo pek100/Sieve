@@ -2,6 +2,35 @@
 
 2026-11-06, main at 399ae1f. Everything here is built and tested offline. Nothing has run against real traffic, and every question has a default already built, so none of them blocks the code. The sections after "Decisions that block something" are copied from each stream's task doc, unedited, and some were settled later: `encrypted-dns` Q3 (ECH stripping and the canary) was built in `dns-extras`, and merge notes are history.
 
+## Owner's decisions, 2026-11-20: owner took the recommendation
+
+The owner said: take the recommendations; HTTPS and page filtering are the most important feature. Recorded here and in each task doc. `filtering.https` and `filtering.content` are available in the app from branch `https-unlock`; HTTPS filtering stays off on a fresh install, because turning it on installs a root certificate.
+
+1. **Scriptlet bundle source** (`content` Q1, `content-wire` Q1). Owner took the recommendation, 2026-11-20, in its practical form. The recommendation was (a): the owner assembles the bundle at a reviewed uBO tag, publishes the JSON on Sieve's own release, hash pinned in code. The repository is private, so an installed engine cannot fetch a release asset without credentials. What ships now is (b): the bundle assembled at uBlock Origin release tag **1.76.6** (commit bb0648c7, cloned from github.com/gorhill/uBlock) by `scripts/resources/assemble-ubo.mjs` is committed as `engine/crates/sieve-engine/data/ubo-resources.json`, embedded in the engine and pinned (`RESOURCE_PIN` = `21dc25d59fe301f5625dd09aaaa48e987e175ded250fa566cc1fb1bf790d066e`, in `lists/resources.rs`), with a NOTICE beside it (uBO is GPL-3.0, as Sieve is). The download path of (a) is kept as the signed `updates\resources` copy, which wins over the shipped one; it switches on when releases are public and signed (slice 13). Review of the bundle, 2026-11-20:
+   - 200 resources: 130 scripts (scriptlets and neutered ad and analytics scripts), 54 helper functions, 16 other redirect files (images, empty media, VAST/VMAP XML, CSS, HTML, JSON, text). 35 carry the trusted permission (every `trusted-*` name, plus `prevent-clipboard-write.js`, which uBO marks `requiresTrust`). The assembler gave the same hash twice.
+   - Network use: no scriptlet sends anything anywhere. `sendBeacon`, `WebSocket` and dynamic `import()` appear nowhere. `fetch` and `XMLHttpRequest` appear only where scriptlets wrap or answer the page's own requests (`prevent-fetch`, `prevent-xhr`, `json-prune-*`, `m3u-prune`, `trusted-replace-*`). `safe-self` posts to a `BroadcastChannel` only when uBO's logger secret is set, which Sieve never sets (`scriptletGlobals` is empty).
+   - Surprising, noted: `google-ima-dai.js`, a redirect resource taken from AdGuard Scriptlets (GPL-3.0), fetches stream data from `dai.google.com` (fallback `pubads.g.doubleclick.net`) when a list redirects the IMA DAI SDK to it: it does what the real SDK would do minus the ads, so a page that uses it still talks to Google. Only a `$redirect` rule naming it reaches it. `google-ima.js` derives from Mozilla's webcompat shim (MPL-2.0). Comments in several resources link to GitHub and Reddit issues; nothing loads them.
+   - 1.76.6 was tagged on 2026-11-20, the day of this review, after 1.76.4's security fixes; its changelog adds shadow-DOM injection and path-based targets inside uBO's extension, not in the scriptlets Sieve uses.
+2. **CT log list and CRLite publisher** (`validation` Q2). Owner took the recommendation, 2026-11-20: he signs and publishes both by hand at a cadence he picks, with his offline key; no publisher is built. Until he does, CT and CRLite are skipped on every connection, `status.json` counts it (`ct_skipped_no_list`), and the unlock does not wait for them. The app says it in one plain line under Certificate ("The Certificate Transparency and CRLite checks are skipped until Sieve publishes their data. Windows still checks each site's certificate, revocation included."), from the Status fact `upstream_checks` (capability `upstream_checks`). The OS check still runs, revocation included: live U5 of slice 6 (2026-11-08) found the engine's own CryptoAPI fetches refused by the loop guard, and the guard now sends the engine's own port 80 flows out through `Egress` (`stack::attribution::guard_tcp`), after which revoked.badssl.com logged `floor:upstream-revoked`.
+3. **Sensitive (never-decrypt) list** (`tls` Q1). Owner took the recommendation, 2026-11-20: Sieve's own list decides, and the HttpsExclusions fetch stays built and `enabled: false`. The owner did not review the seed; a second reviewer did on 2026-11-20 and widened it from 129 to 553 entries. Summary for the owner: `docs/tasks/2026-11-20-sensitive-list.md`.
+4. **Update key and host** (`updates` Q1). Owner took the recommendation, 2026-11-20: keep the placeholder; updates stay `not_configured` until the owner generates the key offline. This does not block HTTPS filtering. The one-time steps, on his own machine, never in the repo:
+   ```
+   minisign -G -p sieve-update.pub -s <offline folder>\sieve-update.key
+   ```
+   minisign asks for a password for the secret key. Keep `sieve-update.key` offline (law 14 fails on any `*.key` in the tree). Put the second line of `sieve-update.pub` (it starts `RW`) into `PUBLIC_KEY` in `engine/crates/sieve-engine/src/update/trust.rs`, replacing the placeholder, and the release host's base URL into `UPDATE_BASE_URL` beside it. Sign each artefact with `minisign -Sm <file> -s <key> -t "sieve-update kind=<kind> version=<n>"` (docs/live/updates.md).
+
+Defaults accepted with them, 2026-11-20 (owner took the recommendation where a default is listed):
+- `tls` Q2: browsers with their own DoH pass through on a real ECH; host-level filtering only for them, the log shows how often.
+- `tls` Q3: settled by the VM run, not by default: the engine's own port 80 revocation fetches go out through `Egress` (see 2 above).
+- `validation` Q1: `clubcard-crlite` in place of the named filter-cascade crate.
+- `content-wire` Q2: the allowlist stays `@@||host^`; an allowlisted site's pages still get hiding and scriptlets, as in uBO; "Sites not decrypted" or a `$document` rule leaves a site alone.
+- `content-wire` Q3: `Cache-Control` of rewritten pages is left alone, as AdGuard does.
+- `content-wire` O2: `PROTOCOL` stays 3; the new Status fact goes by capability, as the others do.
+- `updates` Q2 (releases install only on click), Q3 (both `app` and `engine` kinds, `engine` only for protocol-stable fixes), Q4 (the daily check runs whatever the switches).
+- `dns-extras` Q2: a browser set to Off loses ECH while HTTPS filtering is on; the switch's help says so.
+
+Still open, not decided here: the Off check U15 on open connections, stapled SCTs, Off on SYSTEM apps, and slice 10's gated uBO lists (`ubo-filters`, `ubo-quick-fixes`, `ubo-unbreak`), which stay gated until slice 10's two arms run from a residential network.
+
 ## Live checks, in order
 
 Each needs an admin terminal and network testing allowed. `docs/live/` holds the runbooks. Later checks assume the earlier ones passed.
@@ -19,10 +48,10 @@ Each needs an admin terminal and network testing allowed. `docs/live/` holds the
 
 ## Decisions that block something
 
-- **Scriptlet bundle source** (`content` Q1). Until this is answered no scriptlet runs on a real machine, and slice 10 cannot pass.
-- **Who publishes the CT log list and CRLite file** (`validation` Q2). Until they are published, CT and CRLite are skipped on every connection.
-- **The sensitive seed list** (`tls` Q1). It was written from general knowledge and needs your review before interception is unlocked.
-- **Update key pair and host** (`updates` Q1). You generate the key offline; the compiled-in key is a marked placeholder.
+- **Scriptlet bundle source** (`content` Q1). Until this is answered no scriptlet runs on a real machine, and slice 10 cannot pass. *Decided 2026-11-20, above.*
+- **Who publishes the CT log list and CRLite file** (`validation` Q2). Until they are published, CT and CRLite are skipped on every connection. *Decided 2026-11-20, above.*
+- **The sensitive seed list** (`tls` Q1). It was written from general knowledge and needs your review before interception is unlocked. *Decided 2026-11-20, above.*
+- **Update key pair and host** (`updates` Q1). You generate the key offline; the compiled-in key is a marked placeholder. *Decided 2026-11-20, above: placeholder kept.*
 - **The Off check U15** (`docs/live/engine-slice-6.md`). It needs a build with the HTTPS switch available, so it cannot gate unlocking that switch. Decide how to prove Off on open connections.
 - **Stapled SCTs** (`validation`, recorded as a TENSION on `policy()`). Two live stapled SCTs still pass Sieve; removing that arm for Chrome 148+ reverses finding F5.
 - **Off on SYSTEM apps.** `console_user_can_open` needs a privilege the install removes, so it falls back to the account rule and that row's Off exempts nothing. It stays filtered, the safe side. Granting the privilege conflicts with a law.

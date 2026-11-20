@@ -280,6 +280,8 @@ Every D-number holds. What the build settled or added:
 
 ## Open questions for the user
 
+**Decided 2026-11-20, owner took the recommendation.** Q1: `clubcard-crlite`. Q2: the owner signs and publishes the log list and the CRLite file by hand at a cadence he picks; no publisher is built, and the unlock does not wait for them. Until he publishes, both checks are skipped and the app says so in one line under Certificate, from the Status fact `upstream_checks` (sent to an app naming the capability `upstream_checks`, while the engine decrypts); the OS check, revocation included, still runs.
+
 **Q1. `clubcard-crlite` in place of the named filter-cascade crate.** The brief and plan 2.6 say Mozilla's filter cascade. Mozilla has moved on: a real published file is refused by `rust_cascade` and read by `clubcard-crlite`, the crate from the same team and the one Firefox uses (F1). Default: `clubcard-crlite`, MPL-2.0 like `adblock-rust`, and the plan gets a dated note. The alternative of building cascades ourselves would mean running Mozilla's whole pipeline.
 
 **Q2. Who publishes the two artefacts, and how often?** This is the real decision here. The brief routes data through `update::data_path`, so each file carries a minisign signature from your offline key (decision of 2026-10-18), but upstream changes constantly: the log list daily with a 70-day limit, CRLite every 12 h.

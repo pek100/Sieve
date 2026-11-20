@@ -8,7 +8,7 @@ All of these must be true, or a run says nothing:
 
 - Slice 6's check passed (`docs/live/engine-slice-6.md`) and slice 9's U1 and U2 (`docs/live/engine-slice-9.md`).
 - Slice 8 is built and on: without QUIC refusal Chrome reaches the site over HTTP/3, which is never decrypted. The script calls such a run inconclusive.
-- A real resource bundle is loaded. `RESOURCE_PIN` is None until open question Q1 of `docs/tasks/2026-11-06-content-wire.md` is answered. Without a bundle no scriptlet runs, and the script calls that inconclusive too.
+- A real resource bundle is loaded. Since 2026-11-20 the engine ships uBO 1.76.6's bundle embedded and pinned (`lists::resources::RESOURCE_PIN`), so any build from then on has it; `status.json`'s `filter.resource_pin` names its hash. Without a bundle no scriptlet runs, and the script calls that inconclusive too.
 - You have reviewed `scripts/live/youtube-videos.json`. The ids were written from memory and never checked. An unavailable video counts as not played, and fewer than 10 played is inconclusive.
 
 ## Running one arm
