@@ -427,7 +427,8 @@ mod imp {
                 EngineMessage::Error { message } => return Err(message),
                 other => return Err(format!("unexpected answer: {other:?}")),
             }
-            write_frame(&mut pipe, &msg).await.map_err(|e| e.to_string())?;
+            // A pairing code's frame is wiped once written (`LinkCode`).
+            sieve_ipc::nonblocking::write_secret_frame(&mut pipe, &msg).await.map_err(|e| e.to_string())?;
             match read_frame(&mut pipe).await.map_err(|e| e.to_string())? {
                 EngineMessage::Status(status) => Ok(status),
                 EngineMessage::Error { message } => Err(message),
@@ -945,28 +946,32 @@ pub fn route_problem(route: &sieve_ipc::LinkRoute) -> Option<&'static str> {
 }
 
 /// `LinkPair` as it is sent: the code checked for size only (the engine reads
-/// it), never logged; the refusal local and without the code.
-pub fn link_pair_message(code: String, route: Option<sieve_ipc::LinkRoute>) -> Result<sieve_ipc::ClientMessage, String> {
-    let code = code.trim().to_string();
-    if code.is_empty() || code.len() > sieve_ipc::LINK_CODE_MAX {
+/// it), never logged; the refusal local and without the code. The code given is
+/// wiped here; the one sent is a [`sieve_ipc::LinkCode`], wiped when dropped.
+pub fn link_pair_message(mut code: String, route: Option<sieve_ipc::LinkRoute>) -> Result<sieve_ipc::ClientMessage, String> {
+    let trimmed = sieve_ipc::LinkCode::from(code.trim());
+    sieve_ipc::wipe(&mut code);
+    if trimmed.expose().is_empty() || trimmed.expose().len() > sieve_ipc::LINK_CODE_MAX {
         return Err(NOT_A_CODE.into());
     }
     if let Some(problem) = route.as_ref().and_then(route_problem) {
         return Err(problem.into());
     }
-    Ok(sieve_ipc::ClientMessage::LinkPair { code: code.into(), route })
+    Ok(sieve_ipc::ClientMessage::LinkPair { code: trimmed, route })
 }
 
 /// Command: pair this computer with another device (a Sieve link hub). `code`
 /// is the hub's pairing code: it goes to the engine and nowhere else, and no
 /// error this returns contains it. `route` None dials the address in the code.
-/// Sent only to an engine whose status carries `link`.
+/// Sent only to an engine whose status carries `link`. Every copy made here is
+/// wiped (see `sieve_ipc::LinkCode` for what is out of reach).
 #[cfg(windows)]
 #[tauri::command]
 pub async fn engine_link_pair(code: String, route: Option<sieve_ipc::LinkRoute>) -> Result<EngineStatus, String> {
-    let trimmed = code.trim().to_string();
+    // Kept only to take the code out of an error: wiped when dropped.
+    let trimmed = sieve_ipc::LinkCode::from(code.trim());
     let msg = link_pair_message(code, route)?;
-    imp::link(PIPE_NAME, msg).await.map_err(|e| without_code(e, &trimmed))
+    imp::link(PIPE_NAME, msg).await.map_err(|e| without_code(e, trimmed.expose()))
 }
 
 #[cfg(not(windows))]

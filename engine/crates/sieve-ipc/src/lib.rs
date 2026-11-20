@@ -273,6 +273,15 @@ pub enum ClientMessage {
 /// A pairing code as [`ClientMessage::LinkPair`] carries it: on the wire a plain
 /// string; in memory never printed (its `Debug` says only that it is there) and
 /// wiped when dropped.
+///
+/// Wiping is best effort, and what it covers is said here plainly. Wiped: this
+/// value (its whole allocation), the app's own copies (`engine_link_pair`), the
+/// frame the app writes it in ([`encode_secret`], built in one buffer so no
+/// outgrown copy is left behind) and the body every [`read_frame`] reads,
+/// the engine's included. Not wiped, out of this code's reach: the webview's
+/// JavaScript string and Tauri's IPC buffers on the app's side, serde's scratch
+/// space for a string with escapes (a code has none), and the named pipe's
+/// buffers in the OS and in tokio's I/O driver on both sides.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LinkCode(String);
@@ -306,13 +315,31 @@ impl std::fmt::Debug for LinkCode {
 /// app's build shares this crate).
 impl Drop for LinkCode {
     fn drop(&mut self) {
-        // SAFETY: zero bytes are valid UTF-8, and each write stays inside the
-        // string's own initialised bytes.
-        for b in unsafe { self.0.as_bytes_mut() } {
-            unsafe { std::ptr::write_volatile(b, 0) };
-        }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        wipe(&mut self.0);
     }
+}
+
+/// Overwrites a string's whole allocation (its bytes and its spare capacity) with
+/// zeros and empties it: for a copy of a secret about to be dropped.
+pub fn wipe(s: &mut String) {
+    // SAFETY: the bytes are only zeroed and then the string is emptied, so it
+    // never holds anything but valid UTF-8 once this returns.
+    wipe_bytes(unsafe { s.as_mut_vec() });
+}
+
+/// [`wipe`] for bytes.
+pub fn wipe_bytes(v: &mut Vec<u8>) {
+    for b in v.iter_mut() {
+        // SAFETY: a valid, aligned pointer to an initialised byte of `v`.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    for b in v.spare_capacity_mut() {
+        // SAFETY: a valid, aligned pointer to a byte of `v`'s allocation; writing
+        // to spare capacity is allowed.
+        unsafe { std::ptr::write_volatile(b.as_mut_ptr(), 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    v.clear();
 }
 
 /// How the engine and its hub meet.
@@ -1544,6 +1571,26 @@ pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
+/// How large a frame [`encode_secret`] builds at most.
+pub const SECRET_FRAME: usize = 4096;
+
+/// [`encode`] for a message that carries a secret (`LinkPair`'s code): built in
+/// one buffer of [`SECRET_FRAME`] bytes allocated once, so serializing leaves no
+/// copy behind in a buffer it outgrew; the caller wipes it ([`wipe_bytes`]) once
+/// written. A larger message is refused, and nothing it held is left.
+pub fn encode_secret<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
+    let mut frame = vec![0u8; SECRET_FRAME];
+    let mut body = std::io::Cursor::new(&mut frame[4..]);
+    let written = serde_json::to_writer(&mut body, msg).map(|()| body.position() as usize);
+    let Ok(len) = written else {
+        wipe_bytes(&mut frame);
+        return Err(FrameError::TooLarge(SECRET_FRAME));
+    };
+    frame[..4].copy_from_slice(&u32::try_from(len).expect("under SECRET_FRAME").to_le_bytes());
+    frame.truncate(4 + len);
+    Ok(frame)
+}
+
 /// The body length a frame header announces, refused over [`MAX_FRAME`].
 pub fn body_len(header: [u8; 4]) -> Result<usize, FrameError> {
     let len = u32::from_le_bytes(header) as usize;
@@ -1562,13 +1609,16 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Fra
 }
 
 /// Reads one frame. A length over [`MAX_FRAME`] is refused without reading
-/// the body; EOF before the length is [`FrameError::Closed`].
+/// the body; EOF before the length is [`FrameError::Closed`]. The body is wiped
+/// once parsed: it may have carried a pairing code ([`LinkCode`]).
 pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
     let mut header = [0u8; 4];
     r.read_exact(&mut header).map_err(header_error)?;
     let mut body = vec![0u8; body_len(header)?];
-    r.read_exact(&mut body)?;
-    Ok(serde_json::from_slice(&body)?)
+    let read = r.read_exact(&mut body);
+    let parsed = read.map_err(FrameError::from).and_then(|()| serde_json::from_slice(&body).map_err(FrameError::from));
+    wipe_bytes(&mut body);
+    parsed
 }
 
 /// The same framing over tokio streams (the engine's pipe server and the
@@ -1579,7 +1629,7 @@ pub mod nonblocking {
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-    use super::{FrameError, body_len, encode, header_error};
+    use super::{FrameError, body_len, encode, encode_secret, header_error, wipe_bytes};
 
     pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
         w.write_all(&encode(msg)?).await?;
@@ -1587,12 +1637,26 @@ pub mod nonblocking {
         Ok(())
     }
 
+    /// [`write_frame`] for a message that carries a secret: [`encode_secret`], and
+    /// the frame wiped once written (or not).
+    pub async fn write_secret_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
+        let mut frame = encode_secret(msg)?;
+        let written = w.write_all(&frame).await;
+        wipe_bytes(&mut frame);
+        written?;
+        w.flush().await?;
+        Ok(())
+    }
+
+    /// Reads one frame; the body is wiped once parsed (`super::read_frame`).
     pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
         let mut header = [0u8; 4];
         r.read_exact(&mut header).await.map_err(header_error)?;
         let mut body = vec![0u8; body_len(header)?];
-        r.read_exact(&mut body).await?;
-        Ok(serde_json::from_slice(&body)?)
+        let read = r.read_exact(&mut body).await;
+        let parsed = read.map_err(FrameError::from).and_then(|_| serde_json::from_slice(&body).map_err(FrameError::from));
+        wipe_bytes(&mut body);
+        parsed
     }
 }
 
@@ -1977,6 +2041,31 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<ClientMessage>(bad).is_err(), "{bad}");
         }
+    }
+
+    /// Round 2's P3: a secret's frame is the same frame, built in one buffer and
+    /// refused whole when too large; a wiped string is empty and its allocation
+    /// zeroed; a read frame parses as before (its body is wiped after).
+    #[test]
+    fn a_secrets_frame_is_the_same_frame_and_wiping_zeroes_the_whole_allocation() {
+        let pair = ClientMessage::LinkPair { code: "SL1-SECRETCODEVALUE".into(), route: Some(LinkRoute::Dial { address: "203.0.113.20:7443".into() }) };
+        let frame = encode_secret(&pair).unwrap();
+        assert_eq!(frame, encode(&pair).unwrap());
+        assert_eq!(frame.capacity(), SECRET_FRAME, "never outgrown, so never copied");
+        let read: ClientMessage = read_frame(&mut frame.as_slice()).unwrap();
+        assert_eq!(read, pair);
+        let huge = ClientMessage::LinkPair { code: "x".repeat(SECRET_FRAME).into(), route: None };
+        assert!(matches!(encode_secret(&huge), Err(FrameError::TooLarge(_))));
+
+        let mut s = String::with_capacity(64);
+        s.push_str("SL1-SECRETCODEVALUE");
+        let (at, capacity) = (s.as_ptr(), s.capacity());
+        wipe(&mut s);
+        assert!(s.is_empty());
+        assert_eq!((s.as_ptr(), s.capacity()), (at, capacity), "the same allocation, kept for the check");
+        // SAFETY: `s` still owns this allocation of `capacity` bytes, all zeroed above.
+        let bytes = unsafe { std::slice::from_raw_parts(at, capacity) };
+        assert!(bytes.iter().all(|&b| b == 0), "every byte of the allocation is zero");
     }
 
     /// The status's filter facts are additive: without them the wire is as
