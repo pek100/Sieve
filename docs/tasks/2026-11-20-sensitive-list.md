@@ -13,7 +13,7 @@ It sits on top of a floor that never decrypts anyway, so the list does not repea
 
 | Category | Before | After |
 |---|---|---|
-| Banking (US, Canada, UK and Ireland, EU and Nordics, Israel incl. credit card companies, Asia-Pacific) | 66 | 188 |
+| Banking (US, Canada, UK and Ireland, EU and Nordics, Israel incl. credit card companies, Asia-Pacific) | 66 | 253 |
 | Finance (brokerage, credit bureaus, payroll, account aggregators) | in banking | 35 |
 | Payments (processors, wallets, cards, 3-D Secure, crypto) | 17 | 52 |
 | Health (portals, insurers, telehealth, labs, pharmacies) | 25 | 64 |
@@ -25,9 +25,20 @@ It sits on top of a floor that never decrypts anyway, so the list does not repea
 | Updates (Windows, Apple, Chrome, Firefox, Linux) | 11 | 29 |
 | Certificates (OCSP, CRL, CA) | 0 | 29 |
 | Pinning apps | 0 | 10 |
-| **Total** | **129** | **553** |
+| **Total** | **129** | **618** |
 
-No duplicates, no entry covered by another entry, nothing the parser skips, plain ASCII.
+No duplicates, no entry covered by another entry, nothing the parser skips, plain ASCII. The banking count includes 9 globs (see the review fixes below).
+
+## Review fixes (2026-11-20, same day)
+
+The merge review found online-banking hosts missing: banks whose sign-in runs on a separate domain from the brand. Added 66 entries, removed 1 (553 to 618), all banking:
+
+- **Named by the review:** UK `nwolb.com` (NatWest online banking), `rbsdigital.com` (RBS), `halifax-online.co.uk`; US `citizensbankonline.com`, `synchronybank.com`; Israel `bankleumi.co.il` (Leumi's online banking), `telebank.co.il` (Discount's); Germany's regional Sparkassen and Kreissparkassen by glob (below), `haspa.de`.
+- **Found in a second pass over the same countries:** US `citicards.com`, `barclaycardus.com`; Canada `pcfinancial.ca`; UK and Ireland `hsbcnet.com`, `co-operativebank.co.uk`, `smile.co.uk`, `sainsburysbank.co.uk`, `danskebank.co.uk`, `365online.com` (Bank of Ireland); Spain `lacaixa.es` (CaixaBank's sign-in), `unicajabanco.es`, `kutxabank.es`, `ibercaja.es`, `abanca.com`; Belgium `bnpparibasfortis.be`; Germany `norisbank.de`, `santander.de`, `1822direkt.de`, `sskm.de`, `sskduesseldorf.de`, the Sparda banks by glob; France `sg.fr` (Societe Generale's online banking is particuliers.sg.fr); Italy `bnl.it`, `credem.it`, `ing.it`; Portugal `novobanco.pt`, `santander.pt`; Austria `bankaustria.at`; Poland `ipko.pl` (PKO BP's online banking), `pekao24.pl`, `bankmillennium.pl`, `aliorbank.pl`; Nordics `danskebank.fi`, `danskebank.se`, `danskebank.no`, `jyskebank.dk`, `sydbank.dk`, `nykredit.dk`, `lansforsakringar.se`, `sparebank1.no`, `s-pankki.fi`; Australia `stgeorge.com.au`, `ing.com.au`, `macquarie.com.au`, `bendigobank.com.au`; New Zealand (the region was listed, its banks were not) `anz.co.nz`, `asb.co.nz`, `westpac.co.nz`, `bnz.co.nz`, `kiwibank.co.nz`; Japan `rakuten-bank.co.jp`, `jp-bank.japanpost.jp`.
+- **Globs:** `sparkasse*.de`, `*.sparkasse*.de`, `*-sparkasse.de` (sparkasse-hannover.de, berliner-sparkasse.de and their www hosts), `ksk-*.de`, `*.ksk-*.de` (Kreissparkassen such as ksk-koeln.de), `sparda-*.de`, `*.sparda-*.de`. The syntax's `*` spans dots, so each glob is anchored on a fixed stem at a label edge: `notsparkasse.de` and `kskkoeln.de` do not match. What a glob can still reach is a host whose owner chose such a label (`sparkasse-x.example.de`): that owner only loses page filtering on their own host, which is the safe direction for this list. Test: `the_seed_globs_reach_regional_banks_and_stop_at_the_stem` in `sieve-engine/src/exclusions/lists.rs`.
+- **Removed:** `sparkasse.de`, now covered by the first two globs.
+
+Still not listed for lack of certainty: Kreissparkassen without the `ksk-` stem (kskbb.de and similar), Volksbanken (each on its own domain; `vr.de` is the shared portal), Clydesdale and Yorkshire Bank's old online-banking hosts, India's public-sector banks beyond SBI.
 
 ## Twenty notable entries
 

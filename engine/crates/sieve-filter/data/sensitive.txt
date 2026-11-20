@@ -29,6 +29,7 @@ ally.com
 discover.com
 americanexpress.com
 citizensbank.com
+citizensbankonline.com
 key.com
 regions.com
 53.com
@@ -44,7 +45,10 @@ becu.org
 marcus.com
 mysynchrony.com
 synchrony.com
+synchronybank.com
+citicards.com
 barclaysus.com
+barclaycardus.com
 chime.com
 sofi.com
 
@@ -61,21 +65,30 @@ tangerine.ca
 nbc.ca
 simplii.com
 eqbank.ca
+pcfinancial.ca
 atb.com
 interac.ca
 
 // Banking: United Kingdom and Ireland
 hsbc.com
 hsbc.co.uk
+hsbcnet.com
 barclays.co.uk
 barclaycard.co.uk
 lloydsbank.com
 lloydsbank.co.uk
 halifax.co.uk
+halifax-online.co.uk
 bankofscotland.co.uk
 natwest.com
+nwolb.com
 rbs.co.uk
+rbsdigital.com
 ulsterbank.co.uk
+co-operativebank.co.uk
+smile.co.uk
+sainsburysbank.co.uk
+danskebank.co.uk
 santander.co.uk
 nationwide.co.uk
 tsb.co.uk
@@ -91,6 +104,7 @@ starlingbank.com
 monzo.com
 aib.ie
 bankofireland.com
+365online.com
 ptsb.ie
 
 // Banking: European Union, Switzerland and Nordics
@@ -98,10 +112,15 @@ santander.com
 bbva.com
 bbva.es
 caixabank.es
+lacaixa.es
 bancosantander.es
 bankinter.com
 bancsabadell.com
 openbank.es
+unicajabanco.es
+kutxabank.es
+ibercaja.es
+abanca.com
 ing.com
 ing.nl
 ing.de
@@ -119,14 +138,31 @@ bunq.com
 kbc.be
 belfius.be
 argenta.be
+bnpparibasfortis.be
 deutsche-bank.de
 commerzbank.de
 postbank.de
+norisbank.de
 comdirect.de
 consorsbank.de
 hypovereinsbank.de
 targobank.de
-sparkasse.de
+santander.de
+1822direkt.de
+// The regional Sparkassen each bank on their own domain (sparkasse-hannover.de,
+// berliner-sparkasse.de, ksk-koeln.de). `*` spans dots, so each glob is anchored
+// on a fixed "sparkasse"/"ksk-" stem at a label edge; the first two also cover
+// sparkasse.de itself and its subdomains.
+sparkasse*.de
+*.sparkasse*.de
+*-sparkasse.de
+ksk-*.de
+*.ksk-*.de
+haspa.de
+sskm.de
+sskduesseldorf.de
+sparda-*.de
+*.sparda-*.de
 vr.de
 dkb.de
 n26.com
@@ -136,6 +172,7 @@ mabanque.bnpparibas
 hellobank.fr
 credit-agricole.fr
 societegenerale.fr
+sg.fr
 labanquepostale.fr
 lcl.fr
 caisse-epargne.fr
@@ -152,15 +189,25 @@ finecobank.com
 bancobpm.it
 mps.it
 bper.it
+bnl.it
+credem.it
+ing.it
 cgd.pt
 millenniumbcp.pt
+novobanco.pt
+santander.pt
 sparkasse.at
 bawag.at
 raiffeisen.at
+bankaustria.at
 pkobp.pl
+ipko.pl
 mbank.pl
 santander.pl
 pekao.com.pl
+pekao24.pl
+bankmillennium.pl
+aliorbank.pl
 ubs.com
 credit-suisse.com
 postfinance.ch
@@ -173,18 +220,29 @@ nordea.dk
 nordea.no
 danskebank.com
 danskebank.dk
+danskebank.fi
+danskebank.se
+danskebank.no
+jyskebank.dk
+sydbank.dk
+nykredit.dk
 seb.se
 swedbank.se
 handelsbanken.se
+lansforsakringar.se
 dnb.no
+sparebank1.no
 op.fi
+s-pankki.fi
 revolut.com
 wise.com
 
 // Banking: Israel (banks and credit card companies)
 bankhapoalim.co.il
 leumi.co.il
+bankleumi.co.il
 discountbank.co.il
+telebank.co.il
 mizrahi-tefahot.co.il
 fibi.co.il
 bankjerusalem.co.il
@@ -204,9 +262,20 @@ westpac.com.au
 anz.com
 anz.com.au
 nab.com.au
+stgeorge.com.au
+ing.com.au
+macquarie.com.au
+bendigobank.com.au
+anz.co.nz
+asb.co.nz
+westpac.co.nz
+bnz.co.nz
+kiwibank.co.nz
 mufg.jp
 smbc.co.jp
 mizuhobank.co.jp
+rakuten-bank.co.jp
+jp-bank.japanpost.jp
 icicibank.com
 hdfcbank.com
 axisbank.com
