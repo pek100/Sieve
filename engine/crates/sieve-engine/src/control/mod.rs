@@ -488,12 +488,13 @@ impl Engine {
             (book.live(), book.guests())
         };
         let dns_unreachable = lock(&self.dns_service).as_ref().is_some_and(|s| s.unreachable());
+        let decrypting = self.decrypting();
         EngineStatus {
             filtering: f.routes_up,
             routes_up: f.routes_up,
             blocking: f.routes_up && self.filter.get().blocks_anything(),
             flows: u32::try_from(live).unwrap_or(u32::MAX),
-            decrypting: self.decrypting(),
+            decrypting,
             last_error: [f.dns_file_error, f.route_error, f.https_error, f.attribution_error, f.policy_save_error, self.lists.compile_error()].into_iter().fold(f.last_error, beside),
             policy,
             blocker,
@@ -504,6 +505,7 @@ impl Engine {
             dns_unreachable,
             dns_capture: if f.routes_up { f.dns_capture } else { None },
             wifi_sign_in: if f.routes_up { self.sign_in().report(std::time::Instant::now()) } else { None },
+            upstream_checks: decrypting.then(|| self.validation.in_use(crate::policy::wall_ms())),
             update,
         }
     }

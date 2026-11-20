@@ -15,6 +15,7 @@ import {
   engineLockReason,
   factDay,
   httpsInForce,
+  upstreamChecksText,
 } from "@/core/engine";
 import { useEngine, useEngineActions, useSetting } from "@/hooks/use-sieve";
 import { useRuntime } from "@/hooks/sieve-provider";
@@ -76,6 +77,7 @@ export function CertificateGroup() {
   // Beside an installed root, this is the one a pending removal has not reached.
   const thumbprint = cert?.thumbprint ?? null;
   const firefox = installed && cert ? (FIREFOX_TEXT[cert.firefox] ?? null) : null;
+  const checks = upstreamChecksText(e);
 
   const copy = () => {
     const done = navigator.clipboard?.writeText(thumbprint ?? "") ?? Promise.reject(new Error("no clipboard"));
@@ -110,6 +112,11 @@ export function CertificateGroup() {
           {problem && (
             <p role="alert" className="text-label text-blocked break-words" data-certificate-error="">
               {problem}
+            </p>
+          )}
+          {checks && (
+            <p className="text-label text-on-surface-muted break-words" data-upstream-checks="">
+              {checks}
             </p>
           )}
         </div>

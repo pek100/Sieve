@@ -28,8 +28,8 @@
  *
  * What is not decrypted answers the `exclusions` example of the IPC fixture;
  * "Try decrypting again" takes an `auto:*` row away, as the engine would.
- * `?heal=1` is an engine that holds `https` on: the app cannot turn it on while
- * `filtering.https` is unavailable, so this mock refuses being told off (refused
+ * `?heal=1` is an engine that holds `https` on whatever the app sends, so this
+ * mock refuses being told off (refused
  * policies are retried at the next probe, not at once), and it has nothing to
  * tell on the first read, then one exclusion, then a second of the same group.
  *
@@ -181,9 +181,12 @@ export function createMockEngine(
     // As the engine: the capture's state while routes are up, off by the user's switch, with plain DNS or while paused.
     if (status.routes_up) status = { ...status, dns_capture: !captureWanted || paused ? { state: "off" } : { state: "working" } };
     if (status.routes_up && captureWanted && signIn !== "none") status = { ...status, wifi_sign_in: { network: MOCK_SIGN_IN_NETWORK, wifi: true, ...(paused ? { paused_left_s: MOCK_PAUSED_LEFT_S } : {}) } };
-    if (!holdsHttps) return { ...status, policy };
-    // As the engine: its switch alone decrypts nothing, with routes down or sieving off.
-    return { ...status, decrypting: status.routes_up && policy.sieving, policy: { ...policy, https: true } };
+    const inForce = holdsHttps ? { ...policy, https: true } : policy;
+    // As the engine: its switch alone decrypts nothing, with routes down or sieving off;
+    // while it decrypts, it says the local upstream checks are skipped (nothing published yet).
+    const decrypting = status.routes_up && inForce.sieving && inForce.https === true;
+    if (!decrypting) return { ...status, decrypting: false, policy: inForce };
+    return { ...status, decrypting, upstream_checks: { ct: false, crlite: false }, policy: inForce };
   };
   const seed = options.seed ?? 1;
   const all = parseLogTail(logFixture).rows;

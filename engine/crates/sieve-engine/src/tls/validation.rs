@@ -137,6 +137,13 @@ impl ValidationSlot {
         into["crlite_filters"] = data.crlite.value.as_ref().map_or(0, |c| c.filters()).into();
     }
 
+    /// Which local checks have data to run on now: the Status's
+    /// `upstream_checks`, so the app can say plainly when they are skipped.
+    pub fn in_use(&self, now_ms: u64) -> sieve_ipc::UpstreamChecks {
+        let data = self.snapshot();
+        sieve_ipc::UpstreamChecks { ct: data.list.value.as_ref().is_some_and(|l| !l.is_stale(now_ms)), crlite: data.crlite.value.is_some() }
+    }
+
     /// Data as a test built it, for lists no real key signed.
     #[cfg(test)]
     pub(crate) fn install(&self, list: Option<LogList>, crlite: Option<Crlite>) {
@@ -317,6 +324,21 @@ pub(crate) mod tests {
         std::fs::remove_file(path).unwrap();
         slot.reload_now(dir.path());
         assert_eq!(slot.check(&chain(), NOW, || Some(issuer())).ct, CtAnswer::Skipped(CtSkip::NoList));
+    }
+
+    /// What the app is told: no data is both checks skipped; a held list counts
+    /// only while it is fresh, as the check itself does.
+    #[test]
+    fn in_use_says_which_checks_have_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = slot();
+        slot.reload_now(dir.path());
+        assert_eq!(slot.in_use(NOW), sieve_ipc::UpstreamChecks { ct: false, crlite: false }, "nothing published: both skipped");
+        put(dir.path(), KIND_LOG_LIST, &envelope());
+        put(dir.path(), KIND_CRLITE, &encode_bundle(&[recorded_filter(false)]).unwrap());
+        slot.reload_now(dir.path());
+        assert_eq!(slot.in_use(NOW), sieve_ipc::UpstreamChecks { ct: true, crlite: true });
+        assert_eq!(slot.in_use(LIST_AT_MS + ct::MAX_LIST_AGE_MS + 1), sieve_ipc::UpstreamChecks { ct: false, crlite: true }, "a stale list is skipped");
     }
 
     #[test]

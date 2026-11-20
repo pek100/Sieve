@@ -40,6 +40,18 @@ export const ENGINE_HREF = `/settings/#${ENGINE_ANCHOR}`;
 export const HTTPS_SWITCH = "filtering.https";
 /** The data switch that rewrites decrypted pages (registry key; UI reads it from here). */
 export const CONTENT_SWITCH = "filtering.content";
+/** The HTTPS switch's row in Settings (setting-row's `setting-<key>` id), where it is turned on. */
+export const HTTPS_HREF = `/settings/#setting-${HTTPS_SWITCH}`;
+/**
+ * What turning HTTPS filtering on does, in plain words, for the first-run guide
+ * and Home. It is off on a fresh install: it installs a root certificate, which
+ * is the person's choice (owner, 2026-11-20).
+ */
+export const HTTPS_INVITE = {
+  title: "Block ads inside pages, video ads included",
+  body: "With the engine on, turn on Decrypt HTTPS traffic in Settings, then Filter inside pages. Sieve then opens your browsers' encrypted traffic here on this computer, so it can remove ads inside pages, such as video ads. It never opens the banking, payment, health, government, password and sign-in sites on its list, or apps that check their own certificate. You can turn it off at any time. Turning it off, or uninstalling Sieve, removes Sieve's own certificate and leaves every other certificate as it was.",
+  link: "Set it up in Settings",
+} as const;
 /** DNS encryption, on by default (registry key). Off is the user's choice of plain DNS; it travels as `plain_dns`. */
 export const DNS_ENCRYPTION = "filtering.dnsEncryption";
 /** "Also encrypt Windows' own lookups", on by default (registry key). Off travels as `skip_dns_capture`, sent only then. */
@@ -359,6 +371,21 @@ export function certInstalled(cert: CertStatus | null | undefined): boolean {
 /** The engine holds `filtering.https` on (its Status's policy), so it can take a Reinstall. */
 export function httpsInForce(e: EngineSlice): boolean {
   return engineStatus(e)?.policy.https === true;
+}
+
+/**
+ * One plain line when a local upstream check is skipped for want of its data
+ * (the owner's decision of 2026-11-20, validation Q2: he publishes the CT log
+ * list and the CRLite file by hand, and until then both are skipped). Null
+ * while both run, while nothing is decrypted, and with an engine that does not say.
+ */
+export function upstreamChecksText(e: EngineSlice): string | null {
+  const checks = engineStatus(e)?.upstream_checks;
+  if (checks === undefined) return null;
+  const skipped = [checks.ct ? null : "Certificate Transparency", checks.crlite ? null : "CRLite"].filter((n): n is string => n !== null);
+  if (skipped.length === 0) return null;
+  const what = skipped.length === 2 ? "The Certificate Transparency and CRLite checks are" : `The ${skipped[0]} check is`;
+  return `${what} skipped until Sieve publishes their data. Windows still checks each site's certificate, revocation included.`;
 }
 
 /** Where signed updates stand; nothing to say when the engine did not answer or said nothing. */
