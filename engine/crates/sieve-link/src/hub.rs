@@ -86,7 +86,9 @@ pub struct HubConfig {
     /// for one of its streams to close (the device and the hub see a stream
     /// end a moment apart) before it is answered `Busy`.
     pub slot_wait: Duration,
-    /// How long the hub waits for a target to accept.
+    /// How long the hub takes at most to resolve a target and have it accept,
+    /// every address tried together. Kept below a device's request timeout
+    /// (`LinkConfig::request_timeout`), so the device hears the answer.
     pub connect_timeout: Duration,
     /// A relay with no byte either way for this long is closed (and its
     /// concurrency slot freed).
@@ -1384,7 +1386,11 @@ async fn connect(inner: &Inner, live: &Live, dev: &DeviceCtx, link: &LinkCtx, mu
         inner.audit.denial(row("denied", why, None));
         return;
     }
-    let addrs = match tokio::time::timeout(inner.cfg.connect_timeout, resolve::resolve(inner.cfg.resolver.as_ref(), &host, port)).await {
+    // One deadline for the resolve and every connect together, so the hub answers
+    // within `connect_timeout`, before a device gives up on the answer (its
+    // `request_timeout`, longer by default); a timeout per address would add up.
+    let deadline = tokio::time::Instant::now() + inner.cfg.connect_timeout;
+    let addrs = match tokio::time::timeout_at(deadline, resolve::resolve(inner.cfg.resolver.as_ref(), &host, port)).await {
         Ok(Ok(a)) if !a.is_empty() => a,
         _ => {
             respond(&mut io, Status::Unreachable, "cannot resolve the name at the hub").await;
@@ -1415,7 +1421,7 @@ async fn connect(inner: &Inner, live: &Live, dev: &DeviceCtx, link: &LinkCtx, mu
     for a in &allowed {
         let attempt = tokio::select! {
             _ = link.cancel.cancelled() => return,
-            r = tokio::time::timeout(inner.cfg.connect_timeout, TcpStream::connect(a)) => r,
+            r = tokio::time::timeout_at(deadline, TcpStream::connect(a)) => r,
         };
         if let Ok(Ok(s)) = attempt {
             upstream = Some((s, *a));

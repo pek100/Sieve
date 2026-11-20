@@ -116,6 +116,9 @@ impl LinkConfig {
             handshake_timeout: Duration::from_secs(10),
             accept_timeout: Duration::from_secs(3),
             gate: GateConfig::device(),
+            // Above the hub's worst case for an answer (its `slot_wait`, 1 s, and
+            // its `connect_timeout`, 10 s, for the resolve and every connect), so
+            // a hub that is up is heard, never taken for one that is down.
             request_timeout: Duration::from_secs(15),
             busy_wait: Duration::from_secs(2),
             dialer: None,
