@@ -18,6 +18,12 @@ export const ARMS = ["adguard", "adguard+ubo"];
 export const VIDEOS_REQUIRED = 10;
 export const SIEVE_ISSUER = "Sieve local filtering CA";
 
+/** The engine's root is named "Sieve local filtering CA (<machine>, <date>)" (ca/root.rs), and a
+ *  browser reports that whole common name as the issuer: the prefix is the engine's, the rest varies. */
+export function isSieveIssuer(issuer) {
+  return typeof issuer === "string" && (issuer === SIEVE_ISSUER || issuer.startsWith(`${SIEVE_ISSUER} (`));
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "../../src/data/fixtures/filter-lists-v1.json");
 const DEFAULT_VIDEOS = join(HERE, "youtube-videos.json");
@@ -141,7 +147,7 @@ export function scriptletDocuments(before, after) {
  *  which no site's script can move. It counts the machine, not this browser. */
 export function runVerdict(videos, day, run) {
   const reasons = [];
-  if (run.readsIssuer !== false && videos.some((v) => v.issuer !== SIEVE_ISSUER)) reasons.push("a document's issuer is not Sieve's");
+  if (run.readsIssuer !== false && videos.some((v) => !isSieveIssuer(v.issuer))) reasons.push("a document's issuer is not Sieve's");
   if (videos.some((v) => v.protocol === "h3")) reasons.push("a document came over HTTP/3, which is never decrypted");
   const watched = videos.filter((v) => v.verdict !== "unplayed").length;
   if (typeof run.scriptletDocuments !== "number") reasons.push("the engine's scriptlet meter could not be read");

@@ -30,7 +30,7 @@ import * as script from "../../scripts/live/youtube.mjs";
 
 const startedAtImport = { spawn: started.spawn, spawnSync: started.spawnSync.length };
 
-const { BidiDriver, CdpDriver, SIEVE_ISSUER, STATUS_SETTLE_MS, VIDEOS_REQUIRED, armLists, heldLists, hitsDelta, normalProtocol, parseArgs, runVerdict, scriptletDocuments, videoVerdict, withBrowser } = script;
+const { BidiDriver, CdpDriver, SIEVE_ISSUER, STATUS_SETTLE_MS, isSieveIssuer, VIDEOS_REQUIRED, armLists, heldLists, hitsDelta, normalProtocol, parseArgs, runVerdict, scriptletDocuments, videoVerdict, withBrowser } = script;
 const SCRIPT = "scripts/live/youtube.mjs";
 
 const sample = (currentTime: number | null, extra = {}) => ({ currentTime, adShowing: false, enforcement: false, ...extra });
@@ -83,8 +83,19 @@ describe("the video site live script", () => {
     expect(runVerdict(withUnplayed, cleanDay, armHeld).verdict).toBe("inconclusive");
   });
 
+  it("the engine's issuer is its root's whole common name, machine and date included (seen live, run 9)", () => {
+    const real = `${SIEVE_ISSUER} (SIEVE-TEST-VM, 2026-11-21)`;
+    expect(isSieveIssuer(real)).toBe(true);
+    expect(isSieveIssuer(SIEVE_ISSUER)).toBe(true);
+    expect(runVerdict(tenPasses().map((v) => ({ ...v, issuer: real })), cleanDay, armHeld).verdict).toBe("pass");
+    for (const other of ["Sieve local filtering CAX", "Not Sieve local filtering CA (BOX, 2026-10-26)", "WE2", "", null, undefined]) {
+      expect(isSieveIssuer(other), String(other)).toBe(false);
+    }
+  });
+
   it.each([
     ["the wrong issuer", { issuer: "A Public CA" }],
+    ["a look-alike issuer", { issuer: "Sieve local filtering CA-like (BOX, 2026-10-26)" }],
     ["no issuer known", { issuer: null }],
     ["http/3", { protocol: "h3" }],
   ])("a run with %s is inconclusive, never pass, and never a fail either", (_, extra) => {
