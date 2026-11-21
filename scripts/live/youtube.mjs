@@ -268,14 +268,22 @@ export class CdpDriver {
   static async connect(child, profile) {
     const portFile = join(profile, "DevToolsActivePort");
     const started = Date.now();
-    while (!existsSync(portFile)) {
+    // The browser creates the file before it has written it, and holds it locked meanwhile
+    // (EBUSY in run 9b): wait for both lines.
+    let port = "";
+    let path = "";
+    while (!port || !path) {
       if (Date.now() - started > START_TIMEOUT_MS) throw new Error("the browser opened no debugging port");
       await sleep(200);
+      try {
+        [port = "", path = ""] = readFileSync(portFile, "utf8").split("\n").map((line) => line.trim());
+      } catch (error) {
+        if (!["ENOENT", "EBUSY", "EPERM"].includes(error.code)) throw error;
+      }
     }
-    const [port, path] = readFileSync(portFile, "utf8").split("\n");
     const driver = new CdpDriver();
     driver.document = NO_DOCUMENT;
-    driver.rpc = await Rpc.open(`ws://127.0.0.1:${port.trim()}${path.trim()}`, (event) => driver.onEvent(event));
+    driver.rpc = await Rpc.open(`ws://127.0.0.1:${port}${path}`, (event) => driver.onEvent(event));
     const { targetId } = await driver.rpc.call("Target.createTarget", { url: "about:blank" });
     const { sessionId } = await driver.rpc.call("Target.attachToTarget", { targetId, flatten: true });
     driver.session = sessionId;
@@ -326,7 +334,10 @@ export class BidiDriver {
   static readsIssuer = false;
 
   static launch(executable, profile) {
-    return spawn(executable, ["--profile", profile, "--no-remote", "--remote-debugging-port=0", "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+    // `--wait-for-browser`: Firefox's launcher process hands over to the browser process and exits,
+    // taking the stderr this reads the BiDi address from with it (seen with Firefox 160 in run 9b:
+    // "the browser opened no BiDi port"); with it, the launcher stays and passes stderr on.
+    return spawn(executable, ["--profile", profile, "--no-remote", "--wait-for-browser", "--remote-debugging-port=0", "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
   }
 
   static async connect(child) {

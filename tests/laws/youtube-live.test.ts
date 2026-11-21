@@ -12,10 +12,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fixture from "@/data/fixtures/filter-lists-v1.json";
 import { read } from "./files";
 
-const started = vi.hoisted(() => ({ spawn: 0, spawnSync: [] as string[][], child: null as unknown }));
+const started = vi.hoisted(() => ({ spawn: 0, spawnArgs: [] as string[][], spawnSync: [] as string[][], child: null as unknown }));
 vi.mock("node:child_process", () => ({
-  spawn: () => {
+  spawn: (_: string, args: string[]) => {
     started.spawn++;
+    started.spawnArgs.push(args);
     if (!started.child) throw new Error("spawned");
     return started.child;
   },
@@ -330,6 +331,26 @@ describe("the script's drivers, against a fake socket", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     await run;
     expect(started.spawnSync).toEqual(KILLED);
+  });
+
+  it("chrome: a port file created before it is written is waited for, not read half (run 9b's EBUSY)", async () => {
+    vi.useFakeTimers();
+    writeFileSync(join(profile, "DevToolsActivePort"), "");
+    FakeSocket.answers = CDP_ANSWERS;
+    const run = withBrowser(CdpDriver, "chrome.exe", profile, work);
+    await vi.advanceTimersByTimeAsync(1_000);
+    portFile();
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.useRealTimers();
+    await expect(run).resolves.toBe("worked");
+  });
+
+  it("firefox: the launcher waits for the browser, so its stderr (the BiDi line) stays (Firefox 160, run 9b)", async () => {
+    FakeSocket.refuse = true;
+    const run = withBrowser(BidiDriver, "firefox.exe", profile, work);
+    child.stderr.emit("data", BIDI_LINE);
+    await expect(run).rejects.toThrow(/cannot open/);
+    expect(started.spawnArgs.at(-1)).toContain("--wait-for-browser");
   });
 
   it("chrome: the socket refuses, and the browser is killed", async () => {
