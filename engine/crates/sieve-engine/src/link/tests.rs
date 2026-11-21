@@ -483,6 +483,155 @@ fn a_listening_port_taken_when_the_link_starts_is_tried_again_until_it_opens() {
     });
 }
 
+/// Loopback as the link's network, counting each start's ask for the address to
+/// listen on: while the link cannot start, that is one per try.
+#[derive(Default)]
+struct CountNet {
+    listen_asks: AtomicUsize,
+}
+
+impl LinkNet for CountNet {
+    fn connect(&self, target: SocketAddr) -> BoxFuture<'_, Result<TcpStream, String>> {
+        Box::pin(async move { Err(format!("{target}: these tests never connect")) })
+    }
+    fn listen_ip(&self) -> Option<IpAddr> {
+        self.listen_asks.fetch_add(1, Ordering::SeqCst);
+        Some(IpAddr::from([127, 0, 0, 1]))
+    }
+    fn is_local(&self, _ip: IpAddr) -> bool {
+        false
+    }
+}
+
+/// The clock of [`a_start_that_keeps_failing_is_tried_again_quietly_and_reads_down_after_a_while`] only.
+static START_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(5_000_000);
+
+fn start_clock() -> u64 {
+    START_CLOCK.load(Ordering::SeqCst)
+}
+
+/// A pairing written as a finished one leaves it (no hub needed): exiting on,
+/// listening on `port`, Stop when the hub cannot be reached.
+fn paired_to_listen(dir: &Path, port: u16) {
+    let stored = Stored {
+        version: 1,
+        hub: sieve_link::Identity::generate().unwrap().fingerprint(),
+        hub_name: "home".into(),
+        settings: exiting(LinkRoute::Listen { port }, LinkHubDown::Stop),
+    };
+    save_new(&dir.join(LINK_DIR), &stored, &sieve_link::Identity::generate().unwrap()).unwrap();
+}
+
+/// Review of dab8643: a start that fails is tried again, but a try that fails
+/// as before changes nothing for a flow. Before, every try moved the way out,
+/// reset the encrypted resolvers' sessions and ended the connections exiting
+/// concerns, every 2 s for as long as the port stayed held; and with nothing
+/// running the status stayed Connecting, so the app never offered its way out
+/// of a stop. Needs no hub and no loopback traffic: only a port held.
+#[test]
+fn a_start_that_keeps_failing_is_tried_again_quietly_and_reads_down_after_a_while() {
+    run(async {
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        paired_to_listen(dir.path(), port);
+        let net = Arc::new(CountNet::default());
+        let fallback = net.clone();
+        let m = Arc::new(LinkManager::new(Some(dir.path()), Box::new(move || Ok(fallback.clone() as Arc<dyn LinkNet>)), start_clock));
+        let told = Arc::new(AtomicUsize::new(0));
+        let t = told.clone();
+        m.on_exit_change(Arc::new(move |_: &dyn Fn(IpAddr) -> bool, _: Change| {
+            t.fetch_add(1, Ordering::SeqCst);
+        }));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let r = resets.clone();
+        m.routes_up(net.clone(), Arc::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        }));
+        let first = m.status();
+        assert_eq!(first.state, LinkState::Connecting);
+        assert!(first.last_error.as_deref().is_some_and(|e| e.contains("could not be opened")), "{first:?}");
+        assert_eq!(net.listen_asks.load(Ordering::SeqCst), 1);
+        let (way, reset_once, told_once) = (m.way_now(), resets.load(Ordering::SeqCst), told.load(Ordering::SeqCst));
+        assert_eq!((reset_once, told_once), (1, 1), "exiting came on: reset and told once");
+        // Tried again soon (a listener let go of a moment late), then after 2 s.
+        until("tried twice more", || net.listen_asks.load(Ordering::SeqCst) >= 3).await;
+        assert_eq!(m.way_now(), way, "a try that fails as before moves nothing");
+        assert_eq!(resets.load(Ordering::SeqCst), reset_once, "nor resets the resolvers");
+        assert_eq!(told.load(Ordering::SeqCst), told_once, "nor ends connections");
+        assert_eq!(m.status().since_ms, first.since_ms, "the status's since stays");
+        assert!(m.plan(SITE.parse().unwrap()).is_some(), "still exiting: Stop holds, nothing leaves directly");
+        // As long as a link that never reached its hub: down, and the opens go by the setting at once.
+        START_CLOCK.fetch_add(CONNECTING_LIMIT_MS - 1_000, Ordering::SeqCst);
+        assert_eq!(m.status().state, LinkState::Connecting, "not yet");
+        START_CLOCK.fetch_add(2_000, Ordering::SeqCst);
+        assert_eq!(m.status().state, LinkState::Down);
+        assert!(m.is_down());
+        // The port comes free: the next try starts the link, with nothing else changed.
+        drop(blocker);
+        until("listening once the port is free", || m.status().listening.is_some()).await;
+        assert_eq!(m.status().state, LinkState::Connecting, "started, waiting for its hub");
+        assert_eq!(m.status().last_error, None);
+        assert_eq!(m.status().listening, Some(format!("127.0.0.1:{port}")));
+        m.set(LinkSettings { exit: false, ..m.status().settings.unwrap() }).unwrap();
+        assert!(port_free(port).await, "exit off: the port is let go of");
+        m.routes_down();
+    });
+}
+
+/// Review of dab8643: every sync that failed spawned its own try, so a few
+/// setting changes while the port was held left as many loops trying it, each
+/// every 2 s, for as long as it stayed held. Now one try is pending at most, the
+/// wait grows while the error repeats, and none is left once the link is not wanted.
+#[test]
+fn one_try_is_pending_at_most_it_waits_longer_each_time_and_none_once_not_wanted() {
+    run(async {
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        paired_to_listen(dir.path(), port);
+        let net = Arc::new(CountNet::default());
+        let fallback = net.clone();
+        let m = Arc::new(LinkManager::new(Some(dir.path()), Box::new(move || Ok(fallback.clone() as Arc<dyn LinkNet>)), crate::policy::wall_ms));
+        m.routes_up(net.clone(), noop_reset());
+        let settings = m.status().settings.unwrap();
+        for on_hub_down in [LinkHubDown::Direct, LinkHubDown::Stop, LinkHubDown::Direct] {
+            m.set(LinkSettings { on_hub_down, ..settings.clone() }).unwrap();
+        }
+        let asks = || net.listen_asks.load(Ordering::SeqCst);
+        assert_eq!(asks(), 4, "routes up and three settings: one start each");
+        // The same error four times: the pending wait is 8 s now (0.25, 2, 4, 8).
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        assert_eq!(asks(), 4, "one try pending, not four loops every 2 s");
+        // Exit off: the pending try goes, and none starts the link.
+        m.set(LinkSettings { exit: false, ..settings }).unwrap();
+        assert_eq!(m.status().state, LinkState::Off);
+        drop(blocker);
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(m.status().listening, None);
+        assert!(port_free(port).await, "nothing took the port once exiting was off");
+        assert_eq!(asks(), 4, "no try after exit off");
+        m.routes_down();
+    });
+}
+
+#[test]
+fn a_failed_start_waits_longer_while_its_error_repeats_and_starts_over_on_a_new_one() {
+    let wait = |previous: Option<(&str, u64)>, error: &str| {
+        let previous = previous.map(|(e, ms)| StartFailing { since_ms: 0, error: e.into(), wait: Duration::from_millis(ms) });
+        StartFailing::next_wait(previous.as_ref(), error).as_millis() as u64
+    };
+    assert_eq!(wait(None, "held"), 250, "the first try again is soon");
+    let mut last = 250;
+    let mut seen = vec![last];
+    for _ in 0..8 {
+        last = wait(Some(("held", last)), "held");
+        seen.push(last);
+    }
+    assert_eq!(seen, [250, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000, 30_000], "never past 30 s, never given up");
+    assert_eq!(wait(Some(("held", 30_000)), "no address"), 2_000, "a new error starts the waits over");
+}
+
 #[test]
 fn lan_loopback_private_and_the_hubs_own_address_never_exit() {
     run(async {
