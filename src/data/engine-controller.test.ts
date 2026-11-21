@@ -730,14 +730,14 @@ describe("engine controller", () => {
     const { lists } = await createMockFilterLists().catalogue();
     const on = lists.find((l) => l.default === "on")!;
     const off = lists.find((l) => l.default === "off")!;
-    const gated = lists.find((l) => l.default === "gated")!;
-    const s = setup("idle", memoryBackend({ schema: 5, values: { [ENGINE_SWITCH]: true, "filters.lists": { [on.id]: "off", [off.id]: "on", [gated.id]: "on" } } }));
+    // No catalogue row is gated now (2026-11-22); selectedListIds' own test keeps a gated row off.
+    const s = setup("idle", memoryBackend({ schema: 5, values: { [ENGINE_SWITCH]: true, "filters.lists": { [on.id]: "off", [off.id]: "on" } } }));
     await s.fc.flush();
     await s.fc.advance(ENGINE_POLL_MS);
     const sent = s.fake.policies.at(-1)!.lists!;
     expect(sent).toContain(off.id);
     expect(sent).not.toContain(on.id);
-    expect(sent, "a gated list stays off whatever is stored").not.toContain(gated.id);
+    expect(sent, "the uBO lists are among the defaults sent").toEqual(expect.arrayContaining(["ubo-filters", "ubo-quick-fixes", "ubo-unbreak"]));
     expect(sent).toEqual(lists.filter((l) => (l.default === "on" && l.id !== on.id) || l.id === off.id).map((l) => l.id));
     const count = s.fake.policies.length;
     await s.fc.advance(ENGINE_POLL_MS * 2);

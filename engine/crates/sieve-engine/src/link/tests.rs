@@ -91,7 +91,22 @@ impl Drop for TestHub {
 pub(crate) async fn hub(listen: bool) -> TestHub {
     let dir = tempfile::tempdir().unwrap();
     Hub::init(dir.path(), "home").unwrap();
-    let mut cfg = HubConfig::new(dir.path());
+    let hub = Hub::open(hub_config(dir.path())).unwrap();
+    let addr = if listen { hub.listen("127.0.0.1:0".parse().unwrap()).await.unwrap() } else { "127.0.0.1:9".parse().unwrap() };
+    TestHub { _dir: dir, hub, addr }
+}
+
+/// The same hub (its key, its devices) started again on the same address,
+/// after `h.hub.shutdown()`: a hub that came back.
+async fn reopened(h: &TestHub) -> Hub {
+    assert!(port_free(h.addr.port()).await, "the stopped hub let go of its port");
+    let hub = Hub::open(hub_config(h._dir.path())).unwrap();
+    hub.listen(h.addr).await.unwrap();
+    hub
+}
+
+fn hub_config(dir: &Path) -> HubConfig {
+    let mut cfg = HubConfig::new(dir);
     let mut names: HashMap<String, Vec<IpAddr>> = HashMap::new();
     for n in ["echo.test", "site.test", "doh.test"] {
         names.insert(n.into(), vec!["127.0.0.1".parse().unwrap()]);
@@ -106,9 +121,7 @@ pub(crate) async fn hub(listen: bool) -> TestHub {
     cfg.dead_after = Duration::from_secs(60);
     cfg.reload_every = Duration::from_millis(100);
     cfg.connect_timeout = Duration::from_secs(3);
-    let hub = Hub::open(cfg).unwrap();
-    let addr = if listen { hub.listen("127.0.0.1:0".parse().unwrap()).await.unwrap() } else { "127.0.0.1:9".parse().unwrap() };
-    TestHub { _dir: dir, hub, addr }
+    cfg
 }
 
 /// The servers of these tests are on this machine's loopback: the hub allows
@@ -333,6 +346,67 @@ fn exiting_relays_by_name_and_by_address_through_the_hub_and_its_own_socket_is_t
     });
 }
 
+/// Run 9 (live, through a real hub): with the link known down and "go direct"
+/// set, every open first waited the client's `hub_wait` (3 s) for a link, which
+/// is all of an encrypted resolver's connect attempt (`dns::pool`'s 3 s), so no
+/// lookup ever went direct and DNS failed for as long as the hub was away. A
+/// link known down now goes direct at once with "go direct". With "stop" it
+/// still waits `hub_wait`: nothing could leave anyway, and the wait is what
+/// lets a link that just dropped redial and carry the open.
+#[test]
+fn a_link_known_down_takes_the_hub_down_path_at_once() {
+    run(async {
+        let h = hub(true).await;
+        let port = echo().await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        paired(&m, &h).await;
+        let stop = exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Stop);
+        m.set(stop.clone()).unwrap();
+        m.routes_up(net.clone(), noop_reset());
+        until("up", || m.status().state == LinkState::Up).await;
+        assert!(!m.is_down());
+        let site: IpAddr = SITE.parse().unwrap();
+        let plan = m.plan(site).unwrap();
+        let remote: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let never_direct: &(dyn Fn() + Sync) = &|| panic!("stopped never goes direct");
+
+        // Stop, the link just dropped: the open waits for the redial and the
+        // hub that came back carries it.
+        h.hub.shutdown();
+        until("down", || m.status().state == LinkState::Down).await;
+        assert!(m.is_down());
+        let started = std::time::Instant::now();
+        let (back, (opened, report)) = tokio::join!(reopened(&h), exit::open(&plan, &m, &*net, "echo.test", port, remote, never_direct));
+        assert_eq!(report.via, ExitVia::Hub, "after {:?}: {report:?}", started.elapsed());
+        echo_once(&mut opened.unwrap(), b"carried by the redial").await;
+
+        // Stop, the hub away: refused, but only after the wait, and nothing leaves.
+        back.shutdown();
+        until("down again", || m.status().state == LinkState::Down).await;
+        assert!(m.is_down());
+        let started = std::time::Instant::now();
+        let (opened, report) = exit::open(&plan, &m, &*net, "echo.test", port, remote, never_direct).await;
+        let took = started.elapsed();
+        assert!(opened.is_err());
+        assert_eq!(report.via, ExitVia::Stopped, "{report:?}");
+        assert!(took >= Duration::from_millis(2500), "stopped after {took:?}: it did not wait the 3 s for a redial");
+        assert!(net.targets.lock().unwrap().iter().all(|t| t.port() != port), "nothing went directly under Stop");
+
+        // Direct, the link known down: directly at once.
+        m.set(LinkSettings { on_hub_down: LinkHubDown::Direct, ..stop }).unwrap();
+        assert!(m.is_down(), "a change of the hub-down choice alone keeps the link as it was");
+        let started = std::time::Instant::now();
+        let (opened, report) = exit::open(&plan, &m, &*net, "echo.test", port, remote, &|| {}).await;
+        let took = started.elapsed();
+        assert_eq!(report.via, ExitVia::Direct, "{report:?}");
+        assert!(took < Duration::from_secs(1), "went direct after {took:?}: it waited for a link it knew was down");
+        echo_once(&mut opened.unwrap(), b"direct at once").await;
+        m.routes_down();
+    });
+}
+
 #[test]
 fn the_hub_down_stops_by_default_and_goes_direct_when_set() {
     run(async {
@@ -404,6 +478,241 @@ fn listening_pairs_and_links_when_the_hub_dials_in_and_says_where_it_listens() {
         m.routes_down();
         assert!(port_free(free).await, "the port closed with the routes");
     });
+}
+
+/// Run 9 (live, after a reboot): the listening port could not be opened when the
+/// link started (os error 10048) and nothing started it again, so exiting stayed
+/// in Connecting and, with Stop, no sieved app reached anything until a setting
+/// changed. A failed start is now tried again while the link is wanted.
+#[test]
+fn a_listening_port_taken_when_the_link_starts_is_tried_again_until_it_opens() {
+    run(async {
+        let h = hub(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        let free = { TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port() };
+        let code = h.hub.create_pairing_code(60, None, "engine").unwrap().encode();
+        m.pair(&code, Some(LinkRoute::Listen { port: free })).unwrap();
+        h.hub.dial(format!("127.0.0.1:{free}"));
+        until("paired", || m.status().state == LinkState::Off).await;
+        let fp = m.status().device_fingerprint.unwrap();
+        allow_loopback(&h, &fp[..16]);
+        // Something else holds the port as the link starts.
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", free)).unwrap();
+        m.set(exiting(LinkRoute::Listen { port: free }, LinkHubDown::Stop)).unwrap();
+        m.routes_up(net.clone(), noop_reset());
+        let first = m.status();
+        assert_eq!(first.listening, None);
+        assert!(first.last_error.as_deref().is_some_and(|e| e.contains("could not be opened")), "{first:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(blocker);
+        until("up once the port is free, with nothing else changed", || m.status().state == LinkState::Up).await;
+        assert_eq!(m.status().listening, Some(format!("127.0.0.1:{free}")));
+        m.routes_down();
+        assert!(port_free(free).await, "the port closed with the routes");
+    });
+}
+
+/// Loopback as the link's network, counting each start's ask for the address to
+/// listen on: while the link cannot start, that is one per try.
+#[derive(Default)]
+struct CountNet {
+    listen_asks: AtomicUsize,
+}
+
+impl LinkNet for CountNet {
+    fn connect(&self, target: SocketAddr) -> BoxFuture<'_, Result<TcpStream, String>> {
+        Box::pin(async move { Err(format!("{target}: these tests never connect")) })
+    }
+    fn listen_ip(&self) -> Option<IpAddr> {
+        self.listen_asks.fetch_add(1, Ordering::SeqCst);
+        Some(IpAddr::from([127, 0, 0, 1]))
+    }
+    fn is_local(&self, _ip: IpAddr) -> bool {
+        false
+    }
+}
+
+/// The clock of [`a_start_that_keeps_failing_is_tried_again_quietly_and_reads_down_after_a_while`] only.
+static START_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(5_000_000);
+
+fn start_clock() -> u64 {
+    START_CLOCK.load(Ordering::SeqCst)
+}
+
+/// The clock of [`a_setting_or_network_change_that_fails_as_before_keeps_the_down_clock`] only.
+static SAME_FAIL_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(9_000_000);
+
+fn same_fail_clock() -> u64 {
+    SAME_FAIL_CLOCK.load(Ordering::SeqCst)
+}
+
+/// A setting change or a network change retries a start that is failing; one
+/// that fails with the same error as before is the same failure, so the status
+/// stays Down on its first clock instead of going back to Connecting for
+/// another `CONNECTING_LIMIT_MS`. A different error is a new failure, and its
+/// clock starts again. Needs no hub: only ports held.
+#[test]
+fn a_setting_or_network_change_that_fails_as_before_keeps_the_down_clock() {
+    run(async {
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let other = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        paired_to_listen(dir.path(), port);
+        let net = Arc::new(CountNet::default());
+        let fallback = net.clone();
+        let m = Arc::new(LinkManager::new(Some(dir.path()), Box::new(move || Ok(fallback.clone() as Arc<dyn LinkNet>)), same_fail_clock));
+        m.routes_up(net.clone(), noop_reset());
+        let first = m.status();
+        assert_eq!(first.state, LinkState::Connecting);
+        assert!(first.last_error.as_deref().is_some_and(|e| e.contains("could not be opened")), "{first:?}");
+        SAME_FAIL_CLOCK.fetch_add(CONNECTING_LIMIT_MS + 1, Ordering::SeqCst);
+        assert_eq!(m.status().state, LinkState::Down);
+
+        let settings = m.status().settings.unwrap();
+        m.set(LinkSettings { on_hub_down: LinkHubDown::Direct, ..settings.clone() }).unwrap();
+        let after_set = m.status();
+        assert!(after_set.last_error.as_deref().is_some_and(|e| e.contains("could not be opened")), "{after_set:?}");
+        assert_eq!((after_set.state, after_set.since_ms), (LinkState::Down, first.since_ms), "a setting change that fails as before");
+        assert!(m.is_down());
+        m.network_changed();
+        let after_net = m.status();
+        assert_eq!((after_net.state, after_net.since_ms), (LinkState::Down, first.since_ms), "a network change that fails as before");
+
+        // Another port, another error: a new failure on a new clock.
+        let port2 = other.local_addr().unwrap().port();
+        m.set(LinkSettings { route: LinkRoute::Listen { port: port2 }, ..settings }).unwrap();
+        let moved = m.status();
+        assert!(moved.last_error.as_deref().is_some_and(|e| e.contains(&port2.to_string())), "{moved:?}");
+        assert_eq!(moved.state, LinkState::Connecting, "a different error starts its own clock");
+        assert_eq!(moved.since_ms, Some(same_fail_clock()));
+        m.routes_down();
+        drop((blocker, other));
+    });
+}
+
+/// A pairing written as a finished one leaves it (no hub needed): exiting on,
+/// listening on `port`, Stop when the hub cannot be reached.
+fn paired_to_listen(dir: &Path, port: u16) {
+    let stored = Stored {
+        version: 1,
+        hub: sieve_link::Identity::generate().unwrap().fingerprint(),
+        hub_name: "home".into(),
+        settings: exiting(LinkRoute::Listen { port }, LinkHubDown::Stop),
+    };
+    save_new(&dir.join(LINK_DIR), &stored, &sieve_link::Identity::generate().unwrap()).unwrap();
+}
+
+/// Review of dab8643: a start that fails is tried again, but a try that fails
+/// as before changes nothing for a flow. Before, every try moved the way out,
+/// reset the encrypted resolvers' sessions and ended the connections exiting
+/// concerns, every 2 s for as long as the port stayed held; and with nothing
+/// running the status stayed Connecting, so the app never offered its way out
+/// of a stop. Needs no hub and no loopback traffic: only a port held.
+#[test]
+fn a_start_that_keeps_failing_is_tried_again_quietly_and_reads_down_after_a_while() {
+    run(async {
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        paired_to_listen(dir.path(), port);
+        let net = Arc::new(CountNet::default());
+        let fallback = net.clone();
+        let m = Arc::new(LinkManager::new(Some(dir.path()), Box::new(move || Ok(fallback.clone() as Arc<dyn LinkNet>)), start_clock));
+        let told = Arc::new(AtomicUsize::new(0));
+        let t = told.clone();
+        m.on_exit_change(Arc::new(move |_: &dyn Fn(IpAddr) -> bool, _: Change| {
+            t.fetch_add(1, Ordering::SeqCst);
+        }));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let r = resets.clone();
+        m.routes_up(net.clone(), Arc::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        }));
+        let first = m.status();
+        assert_eq!(first.state, LinkState::Connecting);
+        assert!(first.last_error.as_deref().is_some_and(|e| e.contains("could not be opened")), "{first:?}");
+        assert_eq!(net.listen_asks.load(Ordering::SeqCst), 1);
+        let (way, reset_once, told_once) = (m.way_now(), resets.load(Ordering::SeqCst), told.load(Ordering::SeqCst));
+        assert_eq!((reset_once, told_once), (1, 1), "exiting came on: reset and told once");
+        // Tried again soon (a listener let go of a moment late), then after 2 s.
+        until("tried twice more", || net.listen_asks.load(Ordering::SeqCst) >= 3).await;
+        assert_eq!(m.way_now(), way, "a try that fails as before moves nothing");
+        assert_eq!(resets.load(Ordering::SeqCst), reset_once, "nor resets the resolvers");
+        assert_eq!(told.load(Ordering::SeqCst), told_once, "nor ends connections");
+        assert_eq!(m.status().since_ms, first.since_ms, "the status's since stays");
+        assert!(m.plan(SITE.parse().unwrap()).is_some(), "still exiting: Stop holds, nothing leaves directly");
+        // As long as a link that never reached its hub: down, and the opens go by the setting at once.
+        START_CLOCK.fetch_add(CONNECTING_LIMIT_MS - 1_000, Ordering::SeqCst);
+        assert_eq!(m.status().state, LinkState::Connecting, "not yet");
+        START_CLOCK.fetch_add(2_000, Ordering::SeqCst);
+        assert_eq!(m.status().state, LinkState::Down);
+        assert!(m.is_down());
+        // The port comes free: the next try starts the link, with nothing else changed.
+        drop(blocker);
+        until("listening once the port is free", || m.status().listening.is_some()).await;
+        assert_eq!(m.status().state, LinkState::Connecting, "started, waiting for its hub");
+        assert_eq!(m.status().last_error, None);
+        assert_eq!(m.status().listening, Some(format!("127.0.0.1:{port}")));
+        m.set(LinkSettings { exit: false, ..m.status().settings.unwrap() }).unwrap();
+        assert!(port_free(port).await, "exit off: the port is let go of");
+        m.routes_down();
+    });
+}
+
+/// Review of dab8643: every sync that failed spawned its own try, so a few
+/// setting changes while the port was held left as many loops trying it, each
+/// every 2 s, for as long as it stayed held. Now one try is pending at most, the
+/// wait grows while the error repeats, and none is left once the link is not wanted.
+#[test]
+fn one_try_is_pending_at_most_it_waits_longer_each_time_and_none_once_not_wanted() {
+    run(async {
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        paired_to_listen(dir.path(), port);
+        let net = Arc::new(CountNet::default());
+        let fallback = net.clone();
+        let m = Arc::new(LinkManager::new(Some(dir.path()), Box::new(move || Ok(fallback.clone() as Arc<dyn LinkNet>)), crate::policy::wall_ms));
+        m.routes_up(net.clone(), noop_reset());
+        let settings = m.status().settings.unwrap();
+        for on_hub_down in [LinkHubDown::Direct, LinkHubDown::Stop, LinkHubDown::Direct] {
+            m.set(LinkSettings { on_hub_down, ..settings.clone() }).unwrap();
+        }
+        let asks = || net.listen_asks.load(Ordering::SeqCst);
+        assert_eq!(asks(), 4, "routes up and three settings: one start each");
+        // The same error four times: the pending wait is 8 s now (0.25, 2, 4, 8).
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        assert_eq!(asks(), 4, "one try pending, not four loops every 2 s");
+        // Exit off: the pending try goes, and none starts the link.
+        m.set(LinkSettings { exit: false, ..settings }).unwrap();
+        assert_eq!(m.status().state, LinkState::Off);
+        drop(blocker);
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(m.status().listening, None);
+        assert!(port_free(port).await, "nothing took the port once exiting was off");
+        assert_eq!(asks(), 4, "no try after exit off");
+        m.routes_down();
+    });
+}
+
+#[test]
+fn a_failed_start_waits_longer_while_its_error_repeats_and_starts_over_on_a_new_one() {
+    let wait = |previous: Option<(&str, u64)>, error: &str| {
+        let previous = previous.map(|(e, ms)| StartFailing { since_ms: 0, error: e.into(), wait: Duration::from_millis(ms) });
+        StartFailing::next_wait(previous.as_ref(), error).as_millis() as u64
+    };
+    assert_eq!(wait(None, "held"), 250, "the first try again is soon");
+    let mut last = 250;
+    let mut seen = vec![last];
+    for _ in 0..8 {
+        last = wait(Some(("held", last)), "held");
+        seen.push(last);
+    }
+    assert_eq!(seen, [250, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000, 30_000], "never past 30 s, never given up");
+    assert_eq!(wait(Some(("held", 30_000)), "no address"), 2_000, "a new error starts the waits over");
 }
 
 #[test]

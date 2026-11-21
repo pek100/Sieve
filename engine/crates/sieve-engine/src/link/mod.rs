@@ -129,6 +129,36 @@ pub type ExitChanged = Arc<dyn Fn(&dyn Fn(IpAddr) -> bool, Change) + Send + Sync
 /// out of a stop (the app's "Turn off exiting"), whether or not this network
 /// ever reached the hub. 20 s is a few of the link's own dial attempts.
 pub const CONNECTING_LIMIT_MS: u64 = 20_000;
+/// A link that could not start (its listening port could not be opened, say) is
+/// started again for as long as it is wanted, never given up on: a port can come
+/// free at any time. The first try again is soon, since the usual cause is the
+/// listener of the link a restart just stopped, which is let go of a moment
+/// later (seen live at boot: os error 10048). Then every [`START_RETRY`], and
+/// while the same error repeats the wait doubles up to [`START_RETRY_MAX`], so a
+/// lasting cause (another program on the port) costs one try every 30 s, not a
+/// spin. A different error starts the waits over.
+const START_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(250);
+const START_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+const START_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A start that keeps failing: since when, with what, and the wait before the next try.
+struct StartFailing {
+    since_ms: u64,
+    error: String,
+    wait: std::time::Duration,
+}
+
+impl StartFailing {
+    /// The wait after one more failure with `error`.
+    fn next_wait(previous: Option<&StartFailing>, error: &str) -> std::time::Duration {
+        match previous {
+            None => START_RETRY_FIRST,
+            Some(p) if p.error != error => START_RETRY,
+            Some(p) if p.wait < START_RETRY => START_RETRY,
+            Some(p) => (p.wait * 2).min(START_RETRY_MAX),
+        }
+    }
+}
 
 struct Running {
     client: LinkClient,
@@ -159,8 +189,22 @@ struct State {
     dns_reset: Option<Arc<dyn Fn() + Send + Sync>>,
     exit_changed: Option<ExitChanged>,
     running: Option<Running>,
+    /// While the link is wanted and could not start: the next try is pending.
+    start_failing: Option<StartFailing>,
+    /// That next try; aborted by any other sync, and when routes go down or on unpair.
+    start_retry: Option<tokio::task::AbortHandle>,
     since_ms: u64,
     last_error: Option<String>,
+}
+
+impl State {
+    /// No try of a failed start is pending any more.
+    fn stop_retrying(&mut self) {
+        if let Some(t) = self.start_retry.take() {
+            t.abort();
+        }
+        self.start_failing = None;
+    }
 }
 
 impl Default for State {
@@ -176,6 +220,8 @@ impl Default for State {
             dns_reset: None,
             exit_changed: None,
             running: None,
+            start_failing: None,
+            start_retry: None,
             since_ms: 0,
             last_error: None,
         }
@@ -298,11 +344,9 @@ impl LinkManager {
         self.way.send_modify(|g| *g = g.wrapping_add(1));
     }
 
-    /// The status line.
-    pub fn status(&self) -> LinkStatus {
-        let st = lock(&self.state);
-        let now = (self.clock)();
-        let state = match (&st.stored, &st.running) {
+    /// Where the link stands, as the status says it.
+    fn state_of(st: &State, now: u64) -> LinkState {
+        match (&st.stored, &st.running) {
             (None, _) if st.pairing.is_some() => LinkState::Pairing,
             (None, _) => LinkState::Unpaired,
             // Paused (the global switch off): nothing runs, as when exiting is off.
@@ -311,8 +355,27 @@ impl LinkManager {
             // Down once it was up, or once it has tried for long enough: a network
             // that never reaches the hub is no less down than one that lost it.
             (Some(_), Some(r)) if r.ever_up || now.saturating_sub(r.started_ms) > CONNECTING_LIMIT_MS => LinkState::Down,
+            // A link that cannot even start (its port held) is as down, after as
+            // long, so the app offers its way out of a stop here too.
+            (Some(_), None) if st.start_failing.as_ref().is_some_and(|f| now.saturating_sub(f.since_ms) > CONNECTING_LIMIT_MS) => LinkState::Down,
             (Some(_), _) => LinkState::Connecting,
-        };
+        }
+    }
+
+    /// The link is down now (the status's `Down`): with "go direct", a new
+    /// connection should not wait for it, but go directly at once
+    /// ([`exit::open`]). Waiting costs the client's `hub_wait` on every open,
+    /// which is all of an encrypted resolver's connect budget. With "stop" it
+    /// still waits, so a link that just dropped can redial and carry it.
+    pub fn is_down(&self) -> bool {
+        Self::state_of(&lock(&self.state), (self.clock)()) == LinkState::Down
+    }
+
+    /// The status line.
+    pub fn status(&self) -> LinkStatus {
+        let st = lock(&self.state);
+        let now = (self.clock)();
+        let state = Self::state_of(&st, now);
         let client_error = st.running.as_ref().filter(|r| !r.up).and_then(|r| r.client.last_error());
         let listening = st.running.as_ref().and_then(|r| r.listening).or(st.pairing_listen).map(|a| a.to_string());
         LinkStatus {
@@ -405,6 +468,7 @@ impl LinkManager {
         st.net = None;
         st.dns_reset = None;
         st.exit_changed = None;
+        st.stop_retrying();
         if let Some(r) = st.running.take() {
             stop(r);
         }
@@ -513,6 +577,7 @@ impl LinkManager {
                 p.abort();
             }
             st.pairing_listen = None;
+            st.stop_retrying();
             let was_running = st.running.take().map(stop).is_some();
             *lock(&self.current) = None;
             let route = st.stored.take().map(|s| s.settings.route);
@@ -568,14 +633,25 @@ impl LinkManager {
 
     /// Starts, stops or restarts the link to match what is wanted.
     fn sync(self: &Arc<Self>) {
-        self.sync_with(false);
+        self.sync_as(false, false);
     }
 
     /// [`Self::sync`]; `restart` restarts a running link even when nothing about
     /// it changed (the network moved under it).
     fn sync_with(self: &Arc<Self>, restart: bool) {
+        self.sync_as(restart, false);
+    }
+
+    /// [`Self::sync_with`]. `retrying`: this is the pending try of a start that
+    /// failed ([`StartFailing`]), and while it fails again nothing else changed,
+    /// so the way out does not move and nothing is reset or told.
+    fn sync_as(self: &Arc<Self>, restart: bool, retrying: bool) {
         let (reset, changed) = {
             let mut st = lock(&self.state);
+            // Whatever this sync decides replaces a try that was pending.
+            if let Some(t) = st.start_retry.take() {
+                t.abort();
+            }
             let wanted = match (&st.stored, &st.identity, &st.net) {
                 (Some(s), Some(id), Some(net)) if s.settings.exit && st.sieving => Some((s.clone(), id.clone(), net.clone())),
                 _ => None,
@@ -594,16 +670,54 @@ impl LinkManager {
                 stop(r);
             }
             *lock(&self.current) = None;
-            if let Some((stored, identity, net)) = &wanted {
-                match self.start(stored, identity, net.clone()) {
+            match &wanted {
+                None => st.start_failing = None,
+                Some((stored, identity, net)) => match self.start(stored, identity, net.clone()) {
                     Ok(r) => {
                         *lock(&self.current) = Some(r.client.clone());
                         st.running = Some(r);
                         st.last_error = None;
+                        st.start_failing = None;
+                        st.since_ms = (self.clock)();
                     }
-                    Err(why) => st.last_error = Some(said(why)),
-                }
-                st.since_ms = (self.clock)();
+                    Err(why) => {
+                        // Nothing else would start it again until a setting or the
+                        // network changed: a port still held for a moment left
+                        // exiting stuck in Connecting, and with Stop no sieved app
+                        // reached anything (run 9, after a reboot). So it is tried
+                        // again while wanted, with waits that grow while the same
+                        // error repeats ([`START_RETRY`]).
+                        let why = said(why);
+                        let failing_before = st.start_failing.as_ref().filter(|_| route_before.is_none());
+                        let again = retrying && failing_before.is_some();
+                        // A setting or the network changed, and the start fails as
+                        // before: the same failure, so its Down clock runs on (a
+                        // fresh one put the status back to Connecting for as long).
+                        let same = again || failing_before.is_some_and(|f| f.error == why);
+                        let wait = StartFailing::next_wait(st.start_failing.as_ref(), &why);
+                        let now = (self.clock)();
+                        let since_ms = failing_before.filter(|_| same).map_or(now, |f| f.since_ms);
+                        st.start_failing = Some(StartFailing { since_ms, error: why.clone(), wait });
+                        st.last_error = Some(why);
+                        let weak = Arc::downgrade(self);
+                        st.start_retry = tokio::runtime::Handle::try_current().ok().map(|rt| {
+                            rt.spawn(async move {
+                                tokio::time::sleep(wait).await;
+                                if let Some(m) = weak.upgrade() {
+                                    m.sync_as(false, true);
+                                }
+                            })
+                            .abort_handle()
+                        });
+                        if again {
+                            // Still not started, as before: nothing changed for a flow.
+                            return;
+                        }
+                        if !same {
+                            st.since_ms = now;
+                        }
+                    }
+                },
             }
             if changed {
                 self.moved();

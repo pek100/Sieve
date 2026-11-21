@@ -243,7 +243,19 @@ describe("list switches", () => {
     expect(rt.settings.get("filters.lists")).toEqual({ "adguard-base": "off" });
     await userEvent.click(on);
     expect(rt.settings.get("filters.lists")).toEqual({});
-    const gated = within(list("ubo-filters"));
+    // The uBO lists are on by default (2026-11-22) and the user can take them out.
+    const ubo = within(list("ubo-filters")).getByRole("switch");
+    expect(ubo).toBeChecked();
+    expect(ubo).toBeEnabled();
+    await userEvent.click(ubo);
+    expect(rt.settings.get("filters.lists")).toEqual({ "ubo-filters": "off" });
+  });
+
+  it("a gated list cannot be turned on", async () => {
+    // No catalogue row is gated now; the mechanism is tried on a row made for it.
+    const ads = fixture.examples.pending.lists.find((l) => l.kind === "ads")!;
+    await setup(answering({ ...fixture.examples.pending, lists: [...fixture.examples.pending.lists, { ...ads, id: "a-gated-list", title: "A gated list", default: "gated", level: "optional" }] }));
+    const gated = within(list("a-gated-list"));
     expect(gated.getByRole("switch")).toBeDisabled();
     expect(gated.getByRole("switch")).not.toBeChecked();
     expect(gated.getByText(/Waiting on testing/)).toBeInTheDocument();

@@ -1,5 +1,119 @@
 # VM live run 2026-11-08: status at the stop
 
+## Run 9 (2026-11-21): exit through the home hub
+
+The first live use of "Exit through another device" (`docs/live/link-exit.md`). The VM ran Sieve (engine and app built from main 60c9651, engine SHA-256 0C0D2CDD…, app 7B3E191D…) with HTTPS and page filtering on, paired in listen mode with `sieve-hub` on the owner's PC, which dialled out to it. The owner approved exactly this: one ordinary program on the home PC, one GCP rule for the link port from the home address only, a Windows Firewall rule on the VM limited the same way; nothing else on the home PC was touched (no AdGuard change, no Sieve engine there). Run over two sessions (paused overnight with exit off and the pairing kept). Pipe traffic went through a VM-only client built against main's `sieve-ipc` with the link verbs (`link_pair` reads the code from stdin; the code was never printed or stored), standing in for `sieve.exe`; the real app went back at the end. No addresses, codes or keys are recorded here.
+
+Branch `live-link-run` (not pushed): 3af1ba4 and 400413d (`scripts/live/youtube.mjs`), dab8643 (the link fixes below). The fixed engine (EE252380…) was installed for the rechecks.
+
+### Setup and the AdGuard question
+
+| Check | Result | Evidence |
+|---|---|---|
+| Hub sees its LAN before running | PASS | `sieve-hub lan`: the Wi-Fi /24 and its gateway, the IPv6 /64 and the /56 around it, VirtualBox, WSL and Hyper-V prefixes, loopback: 20 + 33 blocks; never `--allow-undetected-lan` |
+| Pairing, listen mode, device defaults | PASS | VM `pairing` → `off`; hub audit `paired`; fingerprints equal on both sides; the device has no allow rules, limits 64 concurrent / 600 per minute |
+| Link up | PASS | 1.3 s after exit on; hub audit `link_up` with X25519MLKEM768; the hub learned its public address from the link and denied it to the link (`hub_address_learned`) |
+| AdGuard (a): the link's TLS | PASS, no interference | the pinned raw-key handshake completed every time (no handshake failure in two sessions) |
+| AdGuard (b): upstream certificates | PASS, no interference | from the VM through the hub, session 0 (never decrypted): example.com, wikipedia, youtube and two ad hosts showed their real issuers (Cloudflare, Let's Encrypt, Google Trust Services) and validated on the VM |
+| AdGuard (c): ad blocking at the hub | PASS, no interference | with Sieve's lists emptied: adsbygoogle.js (203 KB), gpt.js (139 KB), show_ads.js over plain HTTP (56 KB) and ad_status.js (`google_ad_status = 1`) came back whole through the hub; a by-address HTTP and HTTPS request got the site's own redirect; no body named AdGuard |
+
+### Exit checks
+
+| Check | Result | Evidence |
+|---|---|---|
+| Exit address | PASS | ipify (IPv4) = the home PC's public address; api64 and ifconfig.me: an address in the home IPv6 prefix; YouTube shows country IL; Cloudflare's trace `colo=TLV loc=IL` |
+| DNS through the hub | PASS | hub audit `stream_open cloudflare-dns.com:443` right after link up; DoH upstream connected |
+| QUIC refused, TCP used | PASS | VM log `exit dropped` "QUIC is refused…" for a test QUIC initial and for Chrome's googlevideo, www.google.com, i.ytimg.com; the same documents came over h2 |
+| Other public UDP dropped | PASS | UDP :12345 and NTP: rows `exit dropped` "UDP is not carried…", no answer |
+| Hub audit matches the VM log | PASS (sample) | the same `target` names on both sides (e.g. c.pki.goog:80, googlevideo hosts) |
+| Hub down, Stop | PASS | hub killed by tree: pktmon on the VirtIO NIC only, filtered to Cloudflare's and Quad9's resolver addresses and api.ipify.org's: 0 packets (the 5 lines are the filter definitions); VM rows `exit stopped` "the other device cannot be reached; stopped, as set"; lookups failed (7 s) |
+| Down detection time | Reported | after the hub process was killed the status stayed `up` for about 29 s (the link's keepalive), then `down`; probes in that window timed out, nothing left directly |
+| "Turn off exiting" offer on Home | SKIP | an app screen; the pipe client stood in for the app. The engine side (`down` with `since_ms`) is above |
+| Hub back | PASS | `up` again about 14 s after the hub restarted; ipify = home |
+| Hub down, Direct | FAIL, fixed in dab8643 | main: flows to names already known went `direct` (rows "went directly from this computer, as set") but encrypted DNS never did: 7 lookups in a row failed (7 s each), both resolvers at 229 and 225 failures, `dns_unreachable` true, so new names failed for minutes. Fixed build: lookups answered (878 ms, then 20 ms), ipify = the VM's own address in 221 ms |
+| Exit off | PASS | ipify = the VM's own address; no listener on the link port; engine row "The way out changed: 5 open connections ended so they reconnect directly from this computer" |
+| Kill the engine with exit on | PASS | +5 s: no engine, no split routes, no Sieve adapter, no listener, ipify = the VM's own address in 204 ms; the service restarted the engine after 10 s and the link was `up` at +13 s, ipify = home |
+| Reboot with exit on | FAIL, fixed in dab8643 | main: after the boot the link stayed `connecting` with "port 7443 … could not be opened … (os error 10048)" for over 3 minutes and, with Stop, nothing sieved reached anything; any `set_link` brought it back at once. Fixed build: `up` 47 s after the boot with no help, ipify = home, no pairing code anywhere in the engine folder |
+| Network move | PASS in part | the metric fix after each boot moved the network under a running link: hub audit `link_down` then `link_up` 4 s later. A real network change was not available |
+
+### YouTube (residential exit)
+
+**Automated browsers are stopped by YouTube about 45 s into playback**, whatever Sieve does: any browser started with remote debugging gets "Something went wrong" (its buffer stops refilling, then a fallback host that does not resolve). Seen with filtering on, with filtering off and the real certificate, with `Runtime` disabled, and with no CDP call at all until 150 s. A plain Chrome through the same hub with filtering on played past 175 s. So the long views used no remote debugging: Edge with an unpacked probe extension (it samples the player every 2 s and drives seek, quality and the jump to the end), and for Chrome an outside watcher (UI Automation for error texts, a yellow ad-progress-bar detector, a screen fingerprint every 20 s, keyboard seek). Run 1's "Something went wrong after about 45 s" was most likely this, not the data-centre address. youtube.mjs's 30 s windows stay under it, but its seek check (a 30 s jump) fails under it in every arm.
+
+Long-view video: a 21-minute video whose player response carries a pre-roll and eight mid-roll placements when nothing filters (found by a scan with filtering off). 15 minutes per view, 480p then 360p, seek +120 s at a third, the end at 15 minutes for autoplay.
+
+| Arm | Browser | Watched | Stalled intervals (2 s) | Seek resume | Ads seen | Player response | Autoplay |
+|---|---|---|---|---|---|---|---|
+| Exit on, filtering off (lists empty, no decryption) | Edge | 886 s | 0 of 438 | 2.0 s | none during the video (YouTube served none of its mid-rolls in this view); a 30 s pre-roll on the next video | 1 start + 9 placements | 14.0 s |
+| same | Chrome | 15 min | picture changed in 42 of 42 samples | not measured | a "Sponsored" ad on the next video (screenshot) | not read | 10.1 s |
+| Filtering on, default lists | Edge | 897 s | 0 of 443 | 2.0 s | none during the video; **an ad on the next video after autoplay** (its player response carried 14 placements) | 0 placements | 14.2 s |
+| same | Chrome | 15 min | picture changed in 41 of 41 | not measured | no ad bar (yellow run at most 16, threshold 40), no error text | not read | not exercised (the End key scrolled the page) |
+| Default plus uBO lists | Edge | 895 s | 0 of 444 | 1.9 s | none, also after autoplay | 0 placements, next video 0 | 14.0 s |
+
+youtube.mjs (10 videos x 30 s, then home page, seek, quality, autoplay), issuer Sieve's and h2 on every document:
+
+| Arm | Chrome | Edge |
+|---|---|---|
+| adguard (default lists) | 8 of 10 clean; 2 with the player's ad state; 6 ad elements on the home page; scriptlets in 9 documents; list hits base 115, tracking 143 | 9 of 10 clean; 1 with the ad state; 0 home-page ads; scriptlets in 12 documents |
+| adguard+ubo | 10 of 10 clean; 0 home-page ads; scriptlets in 12 documents | 10 of 10 clean; 0 home-page ads; ubo-quick-fixes 60 hits |
+
+Seek failed in all four runs (the automation stop, see above); quality and autoplay worked in all four. The script's own verdicts read "inconclusive" for the first runs because it compared the issuer with the root's bare name; fixed in 3af1ba4 (the root is named "Sieve local filtering CA (machine, date)").
+
+Firefox: SKIP. A plain Firefox (fresh profile and a copy of the VM's own profile) opens with a Terms of Use dialog that this run does not accept; and Firefox 159 launched with `--remote-debugging-port` exited at once without output on this VM today, so youtube.mjs and https.mjs could not drive it.
+
+Reading: with the default lists, ads still reach the player on some first loads and after in-page navigation (autoplay); with the uBO rows added none were seen. That is the plan 5.4 comparison: only the adguard+ubo arm passed here.
+
+### HTTPS gate (slice 6 U1-U4, slice 9, never-decrypt)
+
+| Check | Result | Evidence |
+|---|---|---|
+| Slice 6 U1 | PASS (Chrome, Edge); Firefox SKIP | wikipedia and bbc: issuer "Sieve local filtering CA (…)", X25519MLKEM768, TLS 1.3, h2 |
+| U2 | PASS | `upstream_groups.X25519MLKEM768` 369 → 395 → 421 over the U1 loads |
+| U3 | PASS (Chrome) | Secure DNS off: crypto.cloudflare.com trace with Sieve's issuer; on (explicit Cloudflare): issuer WE1, `sni=encrypted`. `floor:ech` rows in the log for other hosts; the trace load's own row was not captured (the log subscriber had ended) |
+| U4 | PASS (Chrome, Edge) | expired, self-signed, untrusted-root: ERR_CERT_AUTHORITY_INVALID; wrong.host: ERR_CERT_COMMON_NAME_INVALID; sha1-intermediate: ERR_CERT_INVALID; rc4, 3des, null, dh1024, tls-v1-0, tls-v1-1: the browser's own cipher/version errors or aborts; incomplete-chain loaded with its real issuer (YR1, the browser's own AIA); badssl.com itself got Sieve's certificate. No bad host ever showed Sieve's certificate. Edge's expired load timed out once |
+| Slice 9 U1 | PASS (Chrome, Edge) | example.com: `<style nonce=` first in the head, `example.com##p` hid 6 of 6, a user `set-attr` scriptlet set the probe attribute, `rewritten` +1 per load |
+| U2 CSP / Trusted Types | PASS | github, youtube, MDN, web.dev, bbc: 0 CSP or Trusted Types reports against the sites' own scripts (one report on the Cloudflare trace page is the page's own image, also with Sieve out of the path) |
+| U3 user scriptlet | PASS in part | the probe attribute appeared on example.com, MDN and github (Chrome), not on youtube or web.dev, nor on github in Edge. Read afterwards (2026-11-22): uBO's `set-attr` waits for the page's load (`runAt` `idle`) and the probe read once, 5 s after the navigation, so a page still loading was read too early; no engine cause found. The check that tells the two apart is in `docs/live/engine-slice-9.md`, "U3 again" |
+| U5 | Reported | adguard-base 73,884 applied / 3,716 skipped, tracking 438,736 / 14, url-tracking 2,550 / 208, dns 192,074 / 7, ubo-badware 4,683 / 63; with the uBO arm ubo-filters 1,640 / 174, quick-fixes 134 / 49, unbreak 1,848 / 126 |
+| U8 | PASS for the service worker; plain http SKIP | squoosh.app: injected on the network load, not on the service worker's; http.badssl.com: Chrome itself answered ERR_BLOCKED_BY_CLIENT |
+| U4, U6, U7 | not run | |
+| Never-decrypt spot check | PASS | Chrome and Edge, 15 sites: chase, bankofamerica, wellsfargo, bankhapoalim, barclays.co.uk (banking); kaiserpermanente, uhc, zocdoc, clalit (health); accounts.google.com, login.microsoftonline.com, okta, paypal sign-in, bitwarden vault (sign-in): every document had its real issuer (DigiCert EV, GlobalSign, Sectigo, WE2, Microsoft, YR1); log rows `not_decrypted` `list:sensitive` |
+| mychart.com | Finding | www.mychart.com redirects to www.mychart.org, which is not on the list (a candidate the list review left for the owner), so the page that loaded was decrypted. Decided 2026-11-22: mychart.org is on the list now |
+
+Gate for pc-rollout stage 4: slice 6 U1-U4 and slice 9's U1-U2 passed through the home connection in Chrome and Edge. Firefox was not checked, so the gate is not fully met.
+
+### Other findings
+
+- **The hub's default of 64 streams per device is tight for a browsing computer.** In the HTTPS checks the VM hit it ("busy: 64 connections already open (this device's limit at the hub)") and pages failed with ERR_CONNECTION_CLOSED. Most of the load here came from 86 browser processes the test tooling had left running in the session, so this does not show normal use exceeding it. With them closed, the same sites loaded. Worth a look before a real device uses the default. Decided 2026-11-22: the default is 128 for a newly paired device (`docs/tasks/2026-11-06-open-decisions.md`, 9).
+- Closing an app's connection reaches the hub within about a second (FIN, RST and a killed process were each seen closing the hub's stream).
+- With sieving off the link reads `off` though exit is set, and traffic leaves directly: by design (`link/mod.rs`).
+- The hub could not connect to neverssl.com (`connect failed`); not tested from the home PC.
+- The first app build stopped with a Next.js "SecurityFatalError" page addressed to an agent (run an upgrade command, ask the user); it was not acted on, and a plain rebuild succeeded.
+
+### Tests that cannot pass on the owner's PC (VM, `--test-threads=4`)
+
+| Binary | Result |
+|---|---|
+| sieve-engine lib (main) | 1514 passed, 2 failed, 12 ignored. The two failures are this setup's: `vendored_ipstack_has_no_build_script` (the vendored crate's files were not copied to the VM) and `a_real_temp_folder_is_refused` (run as SYSTEM, whose temp folder is not a user's). The three `stack::relay_tests` (`an_apps_reset_reaches_the_server_as_a_reset`, `a_half_closed_app_gets_the_servers_answer_through_the_relay`, `a_passed_flow_still_closes_with_a_fin`), the DNS UDP tests and every loopback test passed |
+| sieve-link lib | 72 passed |
+| sieve-link tests/link.rs | 36 passed |
+| sieve-hub / sieve-link bins | 1 / 0 passed |
+| live-link-run: link:: | 29 passed, including the two new tests, which failed on the same build without the fixes (direct after 3.0 s; never up once the port was free); stack:: 106, dns:: 155, control:: 76 passed |
+
+### UNVERIFIED
+
+- Firefox for YouTube and the HTTPS gate.
+- The Home screen's "Turn off exiting" offer (no app screen was driven).
+- A mid-roll ad actually playing in the filtering-off arm (YouTube served none during the views), so "mid-roll handled" rests on the player response's placements (9 off, 0 on) and on no ad state during the filtered views.
+- Chrome's seek resume time and autoplay with filtering on (the outside watcher cannot read them).
+- Whether the boot-time 10048 recurs; the fixed build came up at its first try in the one reboot after the fix.
+- A real network move (Wi-Fi to Ethernet) under a running link.
+- The hub's 64-stream limit under normal browsing without leftover browsers.
+
+### VM state left behind
+
+Engine from main (0C0D2CDD…) put back, the real app (main 7B3E191D…) as `sieve.exe`, paired with the home hub, exit off (no listener), policy `sieving`, `https`, `content` on with the default lists. The link-port firewall rule deleted, the pipe client kept at `C:\sieve\bin\sieve-pipe9.exe`, the fixed engine at `C:\sieve\drop\sieve-engine-fix.exe`, logs under `C:\sieve\r9\`. VM stopped (TERMINATED). GCP rule `sieve-link-home` deleted. On the home PC the hub is stopped and its folder (owner-only: key, store, audit log) is kept under the user profile so a later run needs no new pairing.
+
 ## Run 8 (2026-11-12): sign-in network pause
 
 Engine built from main 90f2e7a (`cargo build --release -p sieve-engine`, SHA-256 6A4BD8A8…E122DE) and installed over the 11/09 engine; policy `engine` and `sieving` true, `skip_dns_capture` absent (the capture on). All pipe traffic went through a VM-only client built against main's `sieve-ipc` (`sieve-pipe8`: Hello with `APP_CAPABILITIES` or with none, Status, SetPolicy merge, `PauseDnsCapture`, `ResumeDnsCapture`, a 1 s status watch), standing in for `sieve.exe`, since the pipe accepts only the installed app path. The real `sieve.exe` went back at the end. Ethernet's IPv4 metric was 1 after each boot (the known quirk) and was set back to automatic. No engine bug found; no code changed.

@@ -186,6 +186,19 @@ mod tests {
         }
     }
 
+    /// A brand whose sign-in or portal lives on a sibling domain: the domain the
+    /// page ends up on is listed too. Run 9 (2026-11-21): a health portal's .com
+    /// sent the browser to its .org, which was decrypted (owner, 2026-11-22).
+    #[test]
+    fn the_seed_holds_where_a_portal_redirects_to() {
+        let entries = parse(SEED).entries;
+        let held = |host: &str| entries.iter().any(|e| e.matches(Some(host), None, None));
+        for host in ["www.mychart.org", "wallet.google.com"] {
+            assert!(held(host), "{host} should never be decrypted");
+        }
+        assert!(!held("mychart.example"), "a name, not a domain, is listed");
+    }
+
     #[test]
     fn signed_copy_replaces_the_seed() {
         let dir = tempfile::tempdir().unwrap();

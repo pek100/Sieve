@@ -1584,10 +1584,7 @@ async fn serve_pairing(inner: Arc<Inner>, est: Established, _pass: Option<Pass>)
                 let idx = f.pending.iter().position(|p| p.secret_bytes().is_some_and(|s| pairing::verify_proof(&s, &exporter, &peer, &hub, &proof)));
                 let Some(i) = idx else { return Ok(None) };
                 f.pending.remove(i);
-                let name = f.unique_name(&wanted);
-                let d = f.defaults.clone();
-                f.devices.push(DeviceRecord { fingerprint: peer, name: name.clone(), paired_at: now_secs(), revoked_at: None, rules: d.rules, limits: d.limits });
-                Ok(Some(name))
+                Ok(Some(f.pair_device(peer, &wanted, now_secs())))
             })
         })
         .await
@@ -1750,12 +1747,13 @@ mod tests {
         live.remove_link(1);
         assert_eq!(live.links.lock().unwrap().len(), 1);
         // A lower limit leaves the link; so does a raise within its spare
-        // streams (64 -> 72 on a link made for 64); a raise beyond relinks.
+        // streams (128 -> 152 on a link made for the default 128); a raise beyond relinks.
+        assert_eq!(Limits::default().max_concurrent, 128);
         assert!(!live.set_limits(Limits { max_concurrent: 8, ..Limits::default() }));
         assert!(!toks[2].is_cancelled());
-        assert!(!live.set_limits(Limits { max_concurrent: 72, ..Limits::default() }));
+        assert!(!live.set_limits(Limits { max_concurrent: 152, ..Limits::default() }));
         assert!(!toks[2].is_cancelled());
-        assert!(live.set_limits(Limits { max_concurrent: 73, ..Limits::default() }));
+        assert!(live.set_limits(Limits { max_concurrent: 153, ..Limits::default() }));
         assert!(toks[2].is_cancelled());
         assert_eq!(flags[2].load(Ordering::SeqCst), ENDED_RESIZED);
     }

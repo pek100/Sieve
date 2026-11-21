@@ -173,6 +173,15 @@ describe("filter list law", () => {
     expect(fixture.examples.pending.lists.every((l) => l.report === null)).toBe(true);
   });
 
+  it("the uBO lists are on in every profile (owner, 2026-11-22: slice 10's uBO arm was the one that passed)", () => {
+    const ubo = rows.filter((r) => ["ubo-filters", "ubo-quick-fixes", "ubo-unbreak"].includes(r.id));
+    expect(ubo.map((r) => [r.default, r.level, r.trusted])).toEqual([
+      ["on", "minimal", true],
+      ["on", "minimal", true],
+      ["on", "minimal", true],
+    ]);
+  });
+
   it("the loaded example is the same lists with counts", () => {
     expect(fixture.examples.loaded.lists.map(asRow)).toEqual(rows);
     const gated = rows.filter((r) => r.default === "gated").map((r) => r.id);

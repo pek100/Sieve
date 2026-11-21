@@ -105,10 +105,6 @@ impl List {
     }
 }
 
-/// Slice 10's rule, from plan 5.4: both arms pass, the gated rows turn on; only
-/// one passes, that arm is the default, with the numbers in the plan. Not decided
-/// here: the one-word change waits for the live result.
-const UBO_SLICE: &str = "slice 10 (video site acceptance, two arms)";
 const ADGUARD_HOME: &str = "https://github.com/AdguardTeam/AdguardFilters";
 const UASSETS_HOME: &str = "https://github.com/uBlockOrigin/uAssets";
 
@@ -168,9 +164,13 @@ pub const LISTS: &[List] = &[
     },
     adguard!("adguard-social", "AdGuard Social Media filter", "4", Tracking, Strict, &[], "Removes share buttons and social widgets that report the pages you read."),
     uassets!("ubo-badware", "uBlock filters: Badware risks", "badware.txt", Security, Balanced, Level::Balanced.default_of(), "Blocks sites known for scams, fake downloads and malware."),
-    uassets!("ubo-filters", "uBlock filters", "filters.txt", Ads, Optional, Default::Gated(UBO_SLICE), "uBlock Origin's own ad list."),
-    uassets!("ubo-quick-fixes", "uBlock filters: Quick fixes", "quick-fixes.txt", Ads, Optional, Default::Gated(UBO_SLICE), "Quick repairs for sites the uBlock lists affect."),
-    uassets!("ubo-unbreak", "uBlock filters: Unbreak", "unbreak.txt", Ads, Optional, Default::Gated(UBO_SLICE), "Exceptions that keep sites working with the uBlock lists."),
+    // On at every level since 2026-11-22 (docs/tasks/2026-11-06-open-decisions.md):
+    // slice 10's two arms ran in run 9 and only the arm with these lists kept
+    // the video site clean (10 of 10 in Chrome and Edge, also after autoplay). They are
+    // ad lists, so Minimal has them too, and a stored Minimal still reads Minimal.
+    uassets!("ubo-filters", "uBlock filters", "filters.txt", Ads, Minimal, Level::Minimal.default_of(), "uBlock Origin's own ad list."),
+    uassets!("ubo-quick-fixes", "uBlock filters: Quick fixes", "quick-fixes.txt", Ads, Minimal, Level::Minimal.default_of(), "Quick repairs for sites the uBlock lists affect."),
+    uassets!("ubo-unbreak", "uBlock filters: Unbreak", "unbreak.txt", Ads, Minimal, Level::Minimal.default_of(), "Exceptions that keep sites working with the uBlock lists."),
     adguard!("adguard-cookies", "AdGuard Annoyances: cookie notices", "18", Annoyances, Strict, &[], "Hides cookie consent banners."),
     adguard!("adguard-popups", "AdGuard Annoyances: popups", "19", Annoyances, Strict, &[], "Blocks pop-ups and newsletter prompts."),
     adguard!("adguard-mobile", "AdGuard Annoyances: mobile app banners", "20", Annoyances, Strict, &[], "Hides banners asking you to install a site's app."),
@@ -195,20 +195,6 @@ pub fn find(id: &str) -> Option<&'static List> {
 /// The lists that are on with no user choice.
 pub fn defaults_on() -> impl Iterator<Item = &'static List> {
     LISTS.iter().filter(|l| l.default == Default::On)
-}
-
-/// The two arms slice 10's acceptance runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListArm {
-    AdguardOnly,
-    WithUbo,
-}
-
-/// An arm's lists, in catalogue order, derived from each row's `default`: the
-/// defaults, or the defaults and every gated row.
-pub fn arm_lists(arm: ListArm) -> Vec<&'static List> {
-    let in_arm = |l: &&List| l.default == Default::On || (arm == ListArm::WithUbo && matches!(l.default, Default::Gated(_)));
-    LISTS.iter().filter(in_arm).collect()
 }
 
 /// The lists the user's choice names, in catalogue order; None means the
@@ -319,23 +305,26 @@ mod tests {
         assert!(scriptlets(find("ubo-filters").unwrap()).contains("sieveTrustedFlag"), "and uBO's own list does");
     }
 
-    #[test]
-    fn arms_differ_exactly_by_the_gated_lists() {
-        let ids = |arm| arm_lists(arm).iter().map(|l| l.id).collect::<Vec<_>>();
-        assert_eq!(ids(ListArm::AdguardOnly), defaults_on().map(|l| l.id).collect::<Vec<_>>());
-        let added: Vec<_> = ids(ListArm::WithUbo).into_iter().filter(|id| !ids(ListArm::AdguardOnly).contains(id)).collect();
-        assert_eq!(added, ["ubo-filters", "ubo-quick-fixes", "ubo-unbreak"]);
-        assert!(ids(ListArm::AdguardOnly).iter().all(|id| ids(ListArm::WithUbo).contains(id)), "nothing leaves");
-        assert!(arm_lists(ListArm::WithUbo).iter().all(|l| l.default != Default::Off), "no off row is in an arm");
-    }
-
+    /// The plan table, with the owner's decision of 2026-11-22: slice 10's uBO
+    /// arm was the only one that passed, so the uBO lists are on by default.
     #[test]
     fn defaults_follow_the_plan_table() {
         let on: Vec<_> = defaults_on().map(|l| l.id).collect();
-        assert_eq!(on, ["adguard-base", "adguard-tracking", "adguard-url-tracking", "adguard-dns", "ubo-badware"]);
-        assert!(LISTS.iter().filter(|l| ["ubo-filters", "ubo-quick-fixes", "ubo-unbreak"].contains(&l.id)).all(|l| l.default == Default::Gated(UBO_SLICE)));
+        assert_eq!(on, ["adguard-base", "adguard-tracking", "adguard-url-tracking", "adguard-dns", "ubo-badware", "ubo-filters", "ubo-quick-fixes", "ubo-unbreak"]);
+        let minimal: Vec<_> = LISTS.iter().filter(|l| l.level == Level::Minimal).map(|l| l.id).collect();
+        assert_eq!(minimal, ["adguard-base", "adguard-dns", "ubo-filters", "ubo-quick-fixes", "ubo-unbreak"], "the uBO ad lists are in every level");
+        assert!(LISTS.iter().filter(|l| l.id.starts_with("ubo-")).all(|l| l.trusted() && l.author == Author::Ubo), "uBO's own lists, trusted by author");
+        assert!(LISTS.iter().all(|l| !matches!(l.default, Default::Gated(_))), "nothing waits on a live check now");
         assert_eq!(find("adguard-cookies").map(|l| l.default), Some(Default::Off));
         assert_eq!(find("nope"), None);
+    }
+
+    /// On by default is not forced: the user's own choice may leave them out.
+    #[test]
+    fn the_ubo_lists_can_be_left_out() {
+        let ids: Vec<String> = defaults_on().filter(|l| !l.id.starts_with("ubo-")).map(|l| l.id.to_string()).collect();
+        let got: Vec<_> = selected(Some(&ids)).iter().map(|l| l.id).collect();
+        assert_eq!(got, ["adguard-base", "adguard-tracking", "adguard-url-tracking", "adguard-dns"]);
     }
 
     /// One fact, two readers: the engine's defaults are the recommended level.

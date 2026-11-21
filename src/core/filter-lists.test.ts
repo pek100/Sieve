@@ -25,6 +25,12 @@ import { CUSTOM } from "./profiles";
 const { lists } = parseFilterCatalogue(fixture.examples.pending);
 const loaded = parseFilterCatalogue(fixture.examples.loaded).lists;
 const byDefault = (d: FilterList["default"]) => lists.find((l) => l.default === d)!;
+/**
+ * No catalogue row waits on a live check since 2026-11-22 (the uBO lists went on);
+ * the mechanism stays for the next one, tried on an ads row made for it.
+ */
+const gatedRow: FilterList = { ...lists.find((l) => l.kind === "ads")!, id: "a-gated-list", title: "A gated list", default: "gated", level: "optional" };
+const withGated = [...lists, gatedRow];
 const group = (id: string) => lists.filter((l) => listGroup(l) === id);
 const onIds = (selection: Record<string, string>) => lists.filter((l) => listOn(l, selection)).map((l) => l.id);
 
@@ -41,8 +47,12 @@ describe("selection", () => {
     expect(setListOn({}, on, true)).toEqual({});
   });
 
+  it("no catalogue row is gated now", () => {
+    expect(lists.some(isGated)).toBe(false);
+  });
+
   it("a stored on for a gated list reads off, and setListOn refuses it", () => {
-    const gated = byDefault("gated");
+    const gated = gatedRow;
     expect(listOn(gated, { [gated.id]: "on" })).toBe(false);
     const selection = {};
     expect(setListOn(selection, gated, true)).toBe(selection);
@@ -62,7 +72,7 @@ describe("groups", () => {
   });
 
   it("setGroupOn skips gated lists", () => {
-    const ads = group("ads");
+    const ads = withGated.filter((l) => listGroup(l) === "ads");
     expect(ads.some(isGated)).toBe(true);
     const next = setGroupOn({}, ads, true);
     for (const l of ads) expect(next[l.id], l.id).toBeUndefined();
@@ -77,8 +87,10 @@ describe("groups", () => {
     const two = setListOn(setListOn({}, annoyances[0], true), annoyances[1], true);
     expect(groupState(annoyances, two)).toMatchObject({ kind: "some", on: 2, text: "2 of 5 on" });
     expect(groupState(annoyances, setGroupOn({}, annoyances, true))).toMatchObject({ kind: "all", text: "5 of 5 on" });
-    // Ads: three gated lists are not offered, so its default is "all".
-    expect(groupState(group("ads"), {})).toMatchObject({ kind: "all", selectable: 2, text: "2 of 2 on" });
+    // Ads: the two AdGuard lists and the three uBO lists, all on by default.
+    expect(groupState(group("ads"), {})).toMatchObject({ kind: "all", selectable: 5, text: "5 of 5 on" });
+    // A gated list is not offered: it counts in neither number.
+    expect(groupState([...group("ads"), gatedRow], {})).toMatchObject({ kind: "all", selectable: 5, text: "5 of 5 on" });
   });
 });
 
@@ -105,7 +117,10 @@ describe("profiles", () => {
       expect(on[i].length, PROFILES[i]).toBeGreaterThan(on[i - 1].length);
       for (const id of on[i - 1]) expect(on[i], `${PROFILES[i]} keeps ${id}`).toContain(id);
     }
-    expect(onIds(withProfile({}, lists, "minimal")).map((id) => lists.find((l) => l.id === id)!.kind)).toEqual(["ads", "ads"]);
+    expect(onIds(withProfile({}, lists, "minimal")).map((id) => lists.find((l) => l.id === id)!.kind)).toEqual(["ads", "ads", "ads", "ads", "ads"]);
+    for (const profile of PROFILES) {
+      expect(onIds(withProfile({}, lists, profile)), `${profile} has the uBO lists`).toEqual(expect.arrayContaining(["ubo-filters", "ubo-quick-fixes", "ubo-unbreak"]));
+    }
     expect(onIds(withProfile({}, lists, "balanced")).map((id) => lists.find((l) => l.id === id)!.kind)).toContain("security");
   });
 
@@ -118,11 +133,11 @@ describe("profiles", () => {
 
   it("language lists, gated lists and unknown ids are outside the profile: changing them keeps it", () => {
     const german = group("language")[0];
-    const gated = byDefault("gated");
+    const gated = gatedRow;
     for (const profile of PROFILES) {
-      const at = { ...withProfile({}, lists, profile), "from-a-newer-sieve": "on" };
-      expect(listProfile(lists, setListOn(at, german, true)), profile).toBe(profile);
-      expect(listProfile(lists, { ...at, [gated.id]: "on" }), profile).toBe(profile);
+      const at = { ...withProfile({}, withGated, profile), "from-a-newer-sieve": "on" };
+      expect(listProfile(withGated, setListOn(at, german, true)), profile).toBe(profile);
+      expect(listProfile(withGated, { ...at, [gated.id]: "on" }), profile).toBe(profile);
     }
   });
 
@@ -172,8 +187,8 @@ describe("selectedListIds", () => {
   it("is the lists on, never a gated one or an id the catalogue lacks", () => {
     const off = byDefault("off");
     const on = byDefault("on");
-    const gated = byDefault("gated");
-    const ids = selectedListIds({ [off.id]: "on", [on.id]: "off", [gated.id]: "on", "from-the-future": "on" }, { lists });
+    const gated = gatedRow;
+    const ids = selectedListIds({ [off.id]: "on", [on.id]: "off", [gated.id]: "on", "from-the-future": "on" }, { lists: withGated });
     expect(ids).toContain(off.id);
     expect(ids).not.toContain(on.id);
     expect(ids).not.toContain(gated.id);

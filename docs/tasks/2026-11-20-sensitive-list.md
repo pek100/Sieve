@@ -15,8 +15,8 @@ It sits on top of a floor that never decrypts anyway, so the list does not repea
 |---|---|---|
 | Banking (US, Canada, UK and Ireland, EU and Nordics, Israel incl. credit card companies, Asia-Pacific) | 66 | 253 |
 | Finance (brokerage, credit bureaus, payroll, account aggregators) | in banking | 35 |
-| Payments (processors, wallets, cards, 3-D Secure, crypto) | 17 | 52 |
-| Health (portals, insurers, telehealth, labs, pharmacies) | 25 | 64 |
+| Payments (processors, wallets, cards, 3-D Secure, crypto) | 17 | 53 |
+| Health (portals, insurers, telehealth, labs, pharmacies) | 25 | 65 |
 | Government, identity and tax outside the floor | 0 | 44 |
 | Password managers and authenticators | 10 | 18 |
 | Identity providers (sign-in hosts) | 0 | 29 |
@@ -25,7 +25,9 @@ It sits on top of a floor that never decrypts anyway, so the list does not repea
 | Updates (Windows, Apple, Chrome, Firefox, Linux) | 11 | 29 |
 | Certificates (OCSP, CRL, CA) | 0 | 29 |
 | Pinning apps | 0 | 10 |
-| **Total** | **129** | **618** |
+| **Total** | **129** | **620** |
+
+The "After" column includes the two entries added on 2026-11-22 (below).
 
 No duplicates, no entry covered by another entry, nothing the parser skips, plain ASCII. The banking count includes 9 globs (see the review fixes below).
 
@@ -39,6 +41,13 @@ The merge review found online-banking hosts missing: banks whose sign-in runs on
 - **Removed:** `sparkasse.de`, now covered by the first two globs.
 
 Still not listed for lack of certainty: Kreissparkassen without the `ksk-` stem (kskbb.de and similar), Volksbanken (each on its own domain; `vr.de` is the shared portal), Clydesdale and Yorkshire Bank's old online-banking hosts, India's public-sector banks beyond SBI.
+
+## Added 2026-11-22, after run 9
+
+- `mychart.org`. Run 9 found that www.mychart.com redirects to www.mychart.org, which was not listed, so the page that loaded was decrypted. The owner delegated the call to the orchestrator's recommendation: add it (`docs/tasks/2026-11-06-open-decisions.md`, 2026-11-22). Hospitals' own MyChart sites (mychart.<hospital>.org) are on each hospital's domain and cannot be listed one by one.
+- `wallet.google.com`. Same pattern: Google's payment pages moved from pay.google.com (listed) to Google Wallet's site.
+
+A pass over the list for the same pattern (a brand whose sign-in or portal runs on a sibling domain) found the rest already covered: Apple's account.apple.com, Google's myaccount and passwords hosts, Microsoft's login.microsoft.com and login.windows.net, the password managers' regional domains (bitwarden.eu, 1password.ca and .eu), kp.org beside kaiserpermanente.org, myuhc.com and optumrx.com, telebank.co.il, bankleumi.co.il, halifax-online.co.uk, metrobankonline.co.uk, merrilledge.com and ml.com, hl.co.uk, card.apple.com, cash.app beside squareup.com, zellepay.com. Test: `the_seed_holds_where_a_portal_redirects_to` in `sieve-engine/src/exclusions/lists.rs`. Still a candidate for lack of certainty: athenahealth's patient app domain.
 
 ## Twenty notable entries
 
@@ -90,4 +99,4 @@ Kept on purpose: `goodrx.com` (prescription data; its FTC case was exactly about
 
 ## Candidates left out for lack of certainty
 
-Owner to confirm the domain before adding: Israeli payment apps Bit, Pepper and PayBox (payboxapp.com?), Diners Israel (diners.co.il?), Israeli processors Cardcom and Pelecard, One Zero bank (onezerobank.com?), Meitav and other Israeli investment houses; Mayo Clinic's patient portal host; mychart.org; itsme (itsme-id.com?); Brave and Opera updater hosts; Hachshara insurance; ancestry.com (DNA data on an ad-funded genealogy site).
+Owner to confirm the domain before adding: Israeli payment apps Bit, Pepper and PayBox (payboxapp.com?), Diners Israel (diners.co.il?), Israeli processors Cardcom and Pelecard, One Zero bank (onezerobank.com?), Meitav and other Israeli investment houses; Mayo Clinic's patient portal host; itsme (itsme-id.com?); Brave and Opera updater hosts; Hachshara insurance; ancestry.com (DNA data on an ad-funded genealogy site).

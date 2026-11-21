@@ -18,6 +18,12 @@ export const ARMS = ["adguard", "adguard+ubo"];
 export const VIDEOS_REQUIRED = 10;
 export const SIEVE_ISSUER = "Sieve local filtering CA";
 
+/** The engine's root is named "Sieve local filtering CA (<machine>, <date>)" (ca/root.rs), and a
+ *  browser reports that whole common name as the issuer: the prefix is the engine's, the rest varies. */
+export function isSieveIssuer(issuer) {
+  return typeof issuer === "string" && (issuer === SIEVE_ISSUER || issuer.startsWith(`${SIEVE_ISSUER} (`));
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "../../src/data/fixtures/filter-lists-v1.json");
 const DEFAULT_VIDEOS = join(HERE, "youtube-videos.json");
@@ -94,11 +100,20 @@ export function parseArgs(argv) {
   return args;
 }
 
-/** An arm's list ids, from each row's `default` in the fixture catalogue.rs is held to by law 13. */
+/** uBO's own lists are served from here (catalogue.rs `uassets!`). */
+const UASSETS = "https://ublockorigin.github.io/uAssets/";
+
+/**
+ * An arm's list ids, from the fixture catalogue.rs is held to by law 13. Since the
+ * uBO lists went on by default (2026-11-22, after run 9), "adguard+ubo" is the
+ * defaults and "adguard" is the defaults without uBO's ad lists: the same two sets
+ * slice 10 compared (uBO's badware list, a security list, is in both).
+ */
 export function armLists(fixture, arm) {
   if (!ARMS.includes(arm)) throw new Error(`unknown arm ${arm}`);
-  const wanted = arm === "adguard" ? ["on"] : ["on", "gated"];
-  return fixture.examples.pending.lists.filter((row) => wanted.includes(row.default)).map((row) => row.id);
+  const on = fixture.examples.pending.lists.filter((row) => row.default === "on");
+  const uboAds = (row) => row.kind === "ads" && row.url.startsWith(UASSETS);
+  return (arm === "adguard" ? on.filter((row) => !uboAds(row)) : on).map((row) => row.id);
 }
 
 /** One video from its samples: pass, fail, or unplayed when no time ever passed. */
@@ -141,7 +156,7 @@ export function scriptletDocuments(before, after) {
  *  which no site's script can move. It counts the machine, not this browser. */
 export function runVerdict(videos, day, run) {
   const reasons = [];
-  if (run.readsIssuer !== false && videos.some((v) => v.issuer !== SIEVE_ISSUER)) reasons.push("a document's issuer is not Sieve's");
+  if (run.readsIssuer !== false && videos.some((v) => !isSieveIssuer(v.issuer))) reasons.push("a document's issuer is not Sieve's");
   if (videos.some((v) => v.protocol === "h3")) reasons.push("a document came over HTTP/3, which is never decrypted");
   const watched = videos.filter((v) => v.verdict !== "unplayed").length;
   if (typeof run.scriptletDocuments !== "number") reasons.push("the engine's scriptlet meter could not be read");
@@ -483,7 +498,13 @@ async function main() {
       process.exitCode = result.verdict === "pass" ? 0 : 1;
     });
   } finally {
-    rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
+    // Firefox's content processes can hold the profile for a moment after the tree is ended; a
+    // profile left in %TEMP% must not throw over the run's own result or error (seen in run 9).
+    try {
+      rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
+    } catch (error) {
+      console.error(`the temporary profile ${profile} was left behind: ${error.code ?? error.message}`);
+    }
   }
 }
 

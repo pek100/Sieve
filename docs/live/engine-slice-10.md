@@ -36,4 +36,6 @@ The script needs an elevated prompt: without `status.json` it cannot say which l
 
 ## After both arms
 
-Fill the results table under slice 10 in `docs/plans/2026-10-17-https-filtering.md`. The rule is plan 5.4: both arms pass, the gated rows turn on; only one passes, that arm is the default. The change is one word per row in `engine/crates/sieve-filter/src/catalogue.rs` (`Default::Gated` to `Default::On`), plus `defaults_follow_the_plan_table`.
+Fill the results table under slice 10 in `docs/plans/2026-10-17-https-filtering.md`. The rule is plan 5.4: both arms pass, the gated rows turn on; only one passes, that arm is the default.
+
+Done 2026-11-22, after run 9 (`docs/tasks/2026-11-08-vm-slices-7-11-status.md`): only the `adguard+ubo` arm passed, so the uBO lists are on by default, at every level (`catalogue.rs`, owner's decision in `docs/tasks/2026-11-06-open-decisions.md`). The default list set is now `adguard-base`, `adguard-tracking`, `adguard-url-tracking`, `adguard-dns`, `ubo-badware`, `ubo-filters`, `ubo-quick-fixes`, `ubo-unbreak`. The arms keep their meaning for a rerun: `adguard+ubo` is the defaults, `adguard` the defaults without uBO's three ad lists (the `-Lists` line above).
