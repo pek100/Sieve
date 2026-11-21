@@ -26,7 +26,7 @@ Branch `live-link-run` (not pushed): 3af1ba4 and 400413d (`scripts/live/youtube.
 | QUIC refused, TCP used | PASS | VM log `exit dropped` "QUIC is refused…" for a test QUIC initial and for Chrome's googlevideo, www.google.com, i.ytimg.com; the same documents came over h2 |
 | Other public UDP dropped | PASS | UDP :12345 and NTP: rows `exit dropped` "UDP is not carried…", no answer |
 | Hub audit matches the VM log | PASS (sample) | the same `target` names on both sides (e.g. c.pki.goog:80, googlevideo hosts) |
-| Hub down, Stop | PASS | hub killed by tree: pktmon on the VirtIO NIC only, filtered to 1.1.1.1, 9.9.9.9 and api.ipify.org's addresses: 0 packets (the 5 lines are the filter definitions); VM rows `exit stopped` "the other device cannot be reached; stopped, as set"; lookups failed (7 s) |
+| Hub down, Stop | PASS | hub killed by tree: pktmon on the VirtIO NIC only, filtered to Cloudflare's and Quad9's resolver addresses and api.ipify.org's: 0 packets (the 5 lines are the filter definitions); VM rows `exit stopped` "the other device cannot be reached; stopped, as set"; lookups failed (7 s) |
 | Down detection time | Reported | after the hub process was killed the status stayed `up` for about 29 s (the link's keepalive), then `down`; probes in that window timed out, nothing left directly |
 | "Turn off exiting" offer on Home | SKIP | an app screen; the pipe client stood in for the app. The engine side (`down` with `since_ms`) is above |
 | Hub back | PASS | `up` again about 14 s after the hub restarted; ipify = home |
