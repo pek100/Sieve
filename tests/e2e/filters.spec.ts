@@ -30,7 +30,7 @@ test.describe("filters", () => {
     expect(errors).toEqual([]);
   });
 
-  test("toggling a list persists across a reload; a gated list is shut", async ({ page }) => {
+  test("toggling a list persists across a reload; the uBO lists are on and can be turned off", async ({ page }) => {
     await open(page);
     const sw = list(page, "adguard-cookies").getByRole("switch");
     await expect(sw).not.toBeChecked();
@@ -38,8 +38,9 @@ test.describe("filters", () => {
     await expect(sw).toBeChecked();
     await page.reload();
     await expect(list(page, "adguard-cookies").getByRole("switch")).toBeChecked();
-    await expect(list(page, "ubo-filters").getByRole("switch")).toBeDisabled();
-    await expect(list(page, "ubo-filters")).toContainText("Waiting on testing");
+    await expect(list(page, "ubo-filters").getByRole("switch")).toBeChecked();
+    await expect(list(page, "ubo-filters").getByRole("switch")).toBeEnabled();
+    await expect(list(page, "ubo-filters")).not.toContainText("Waiting on testing");
     await expect(page.locator('[data-choice="balanced"]').first(), "turning one more list on is no longer Balanced").toHaveAttribute("aria-checked", "false");
   });
 

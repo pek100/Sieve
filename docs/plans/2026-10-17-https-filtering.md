@@ -432,6 +432,8 @@ Downloaded by the engine over its own validated TLS. Never vendored and never in
 
 The uBO lists are gated by measurement, not opinion. Slice 10 runs the YouTube acceptance with two arms, AdGuard lists only and AdGuard plus uBO lists. Both arms passing turns the uBO lists on, because they add the fastest-moving YouTube fixes. If only one arm passes, that arm is the default, and the numbers are recorded in the plan.
 
+Result (run 9, 2026-11-21, through a residential exit): only the AdGuard plus uBO arm passed (youtube.mjs 10 of 10 clean in Chrome and Edge, 0 home-page ads; the AdGuard-only arm 8 of 10 in Chrome, 9 of 10 in Edge, and an ad after autoplay in a 15-minute Edge view). The uBO lists went on by default on 2026-11-22, at every level, removable by the user; numbers in `docs/tasks/2026-11-08-vm-slices-7-11-status.md`.
+
 ### 5.5 Scriptlets, redirects, procedural applier: sources
 
 - **Scriptlets and redirect resources: uBlock Origin's resources** (`gorhill/uBlock`, GPL-3.0), at a release tag pinned in Sieve's code with the archive's SHA-256. The engine downloads that exact archive at first use, verifies the hash, and assembles the resources with adblock-rust's resource assembler. Why uBO's: the dialect and every uBO list name these scriptlets, AdGuard's uBO builds are converted to them, and adblock-rust is built to consume them. AdGuard Scriptlets would need a name-translation layer and a second resource format.

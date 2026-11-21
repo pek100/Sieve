@@ -100,11 +100,20 @@ export function parseArgs(argv) {
   return args;
 }
 
-/** An arm's list ids, from each row's `default` in the fixture catalogue.rs is held to by law 13. */
+/** uBO's own lists are served from here (catalogue.rs `uassets!`). */
+const UASSETS = "https://ublockorigin.github.io/uAssets/";
+
+/**
+ * An arm's list ids, from the fixture catalogue.rs is held to by law 13. Since the
+ * uBO lists went on by default (2026-11-22, after run 9), "adguard+ubo" is the
+ * defaults and "adguard" is the defaults without uBO's ad lists: the same two sets
+ * slice 10 compared (uBO's badware list, a security list, is in both).
+ */
 export function armLists(fixture, arm) {
   if (!ARMS.includes(arm)) throw new Error(`unknown arm ${arm}`);
-  const wanted = arm === "adguard" ? ["on"] : ["on", "gated"];
-  return fixture.examples.pending.lists.filter((row) => wanted.includes(row.default)).map((row) => row.id);
+  const on = fixture.examples.pending.lists.filter((row) => row.default === "on");
+  const uboAds = (row) => row.kind === "ads" && row.url.startsWith(UASSETS);
+  return (arm === "adguard" ? on.filter((row) => !uboAds(row)) : on).map((row) => row.id);
 }
 
 /** One video from its samples: pass, fail, or unplayed when no time ever passed. */

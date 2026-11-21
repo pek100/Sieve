@@ -48,10 +48,11 @@ describe("the video site live script", () => {
     expect(startedAtImport).toEqual({ spawn: 0, spawnSync: 0 });
   });
 
-  it("the arms are the fixture's rows: the defaults, or the defaults and every gated row", () => {
+  it("the arms are the fixture's rows: the defaults without uBO's ad lists, or the defaults", () => {
     const on = ["adguard-base", "adguard-tracking", "adguard-url-tracking", "adguard-dns", "ubo-badware"];
     expect(armLists(fixture, "adguard")).toEqual(on);
     expect(armLists(fixture, "adguard+ubo")).toEqual([...on, "ubo-filters", "ubo-quick-fixes", "ubo-unbreak"]);
+    expect(armLists(fixture, "adguard+ubo")).toEqual(fixture.examples.pending.lists.filter((l) => l.default === "on").map((l) => l.id));
     expect(() => armLists(fixture, "ubo")).toThrow();
   });
 
