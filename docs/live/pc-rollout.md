@@ -25,6 +25,8 @@ Each stage runs for a stated time while the owner works normally, then the check
 
 Gate before stage 4 (decided 2026-11-20, `docs/tasks/2026-11-06-open-decisions.md` item 5): slice 6's live checks U1 to U4 (`docs/live/engine-slice-6.md`) and slice 9's (`docs/live/engine-slice-9.md`) have passed on the VM, run through the owner's home connection. HTTPS filtering is available in the app before then; this PC does not turn it on until they pass.
 
+Gate met 2026-11-22 (Runs 9 and 9b in `docs/tasks/2026-11-08-vm-slices-7-11-status.md`): slice 6 U1, U2 and U4 passed in Chrome, Edge and Firefox, U3 in Chrome; slice 9 U1 in all three and U2 in Chrome and Edge (Firefox's driver reads no console, so its U2 is not checked); YouTube 15-minute views with the default lists clean in all three browsers, also after autoplay.
+
 ## What only this PC can check
 
 - Attribution with WSL, local VMs and real daily apps (the slice 3 gate of 0.95 of all flows).

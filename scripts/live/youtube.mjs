@@ -327,12 +327,12 @@ export class CdpDriver {
   }
 }
 
-/** Firefox has no CDP. BiDi reports no certificate, so the issuer stays unknown and the
- *  engine's scriptlet meter stands in for it (runVerdict): what is in the page cannot,
- *  since a site's own script can have the same shape. */
 /** The fresh profile's prefs: autoplay allowed, as the Chromium drivers' flag does. */
 export const FIREFOX_PREFS = 'user_pref("media.autoplay.default", 0);\nuser_pref("media.autoplay.blocking_policy", 0);\n';
 
+/** Firefox has no CDP. BiDi reports no certificate, so the issuer stays unknown and the
+ *  engine's scriptlet meter stands in for it (runVerdict): what is in the page cannot,
+ *  since a site's own script can have the same shape. */
 export class BidiDriver {
   static readsIssuer = false;
 
