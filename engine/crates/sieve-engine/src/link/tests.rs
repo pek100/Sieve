@@ -333,6 +333,49 @@ fn exiting_relays_by_name_and_by_address_through_the_hub_and_its_own_socket_is_t
     });
 }
 
+/// Run 9 (live, through a real hub): with the link known down and "go direct"
+/// set, every open first waited the client's `hub_wait` (3 s) for a link, which
+/// is all of an encrypted resolver's connect attempt (`dns::pool`'s 3 s), so no
+/// lookup ever went direct and DNS failed for as long as the hub was away. A
+/// link known down now takes the hub-down path at once.
+#[test]
+fn a_link_known_down_takes_the_hub_down_path_at_once() {
+    run(async {
+        let h = hub(true).await;
+        let port = echo().await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        paired(&m, &h).await;
+        m.set(exiting(LinkRoute::Dial { address: h.addr.to_string() }, LinkHubDown::Direct)).unwrap();
+        m.routes_up(net.clone(), noop_reset());
+        until("up", || m.status().state == LinkState::Up).await;
+        assert!(!m.is_down());
+        drop(h);
+        until("down", || m.status().state == LinkState::Down).await;
+        assert!(m.is_down());
+        let site: IpAddr = SITE.parse().unwrap();
+        let plan = m.plan(site).unwrap();
+        let remote: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let started = std::time::Instant::now();
+        let (opened, report) = exit::open(&plan, &m, &*net, "echo.test", port, remote, &|| {}).await;
+        let took = started.elapsed();
+        assert_eq!(report.via, ExitVia::Direct, "{report:?}");
+        assert!(took < Duration::from_secs(1), "went direct after {took:?}: it waited for a link it knew was down");
+        echo_once(&mut opened.unwrap(), b"direct at once").await;
+        // Stop is as quick: refused at once, nothing leaves.
+        m.set(LinkSettings { on_hub_down: LinkHubDown::Stop, ..m.status().settings.unwrap() }).unwrap();
+        if m.is_down() {
+            let started = std::time::Instant::now();
+            let (opened, report) = exit::open(&plan, &m, &*net, "echo.test", port, remote, &|| panic!("stopped never goes direct")).await;
+            assert!(opened.is_err());
+            assert_eq!(report.via, ExitVia::Stopped);
+            assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        }
+        m.routes_down();
+    });
+}
+
 #[test]
 fn the_hub_down_stops_by_default_and_goes_direct_when_set() {
     run(async {
@@ -401,6 +444,40 @@ fn listening_pairs_and_links_when_the_hub_dials_in_and_says_where_it_listens() {
         let plan = m.plan(SITE.parse().unwrap()).unwrap();
         let (opened, _) = exit::open(&plan, &m, &*net, "echo.test", port, SocketAddr::new(SITE.parse().unwrap(), port), &|| {}).await;
         echo_once(&mut opened.unwrap(), b"the hub dialled in").await;
+        m.routes_down();
+        assert!(port_free(free).await, "the port closed with the routes");
+    });
+}
+
+/// Run 9 (live, after a reboot): the listening port could not be opened when the
+/// link started (os error 10048) and nothing started it again, so exiting stayed
+/// in Connecting and, with Stop, no sieved app reached anything until a setting
+/// changed. A failed start is now tried again while the link is wanted.
+#[test]
+fn a_listening_port_taken_when_the_link_starts_is_tried_again_until_it_opens() {
+    run(async {
+        let h = hub(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LoopNet::default());
+        let m = manager(dir.path(), net.clone());
+        let free = { TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port() };
+        let code = h.hub.create_pairing_code(60, None, "engine").unwrap().encode();
+        m.pair(&code, Some(LinkRoute::Listen { port: free })).unwrap();
+        h.hub.dial(format!("127.0.0.1:{free}"));
+        until("paired", || m.status().state == LinkState::Off).await;
+        let fp = m.status().device_fingerprint.unwrap();
+        allow_loopback(&h, &fp[..16]);
+        // Something else holds the port as the link starts.
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", free)).unwrap();
+        m.set(exiting(LinkRoute::Listen { port: free }, LinkHubDown::Stop)).unwrap();
+        m.routes_up(net.clone(), noop_reset());
+        let first = m.status();
+        assert_eq!(first.listening, None);
+        assert!(first.last_error.as_deref().is_some_and(|e| e.contains("could not be opened")), "{first:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(blocker);
+        until("up once the port is free, with nothing else changed", || m.status().state == LinkState::Up).await;
+        assert_eq!(m.status().listening, Some(format!("127.0.0.1:{free}")));
         m.routes_down();
         assert!(port_free(free).await, "the port closed with the routes");
     });

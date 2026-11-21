@@ -129,6 +129,9 @@ pub type ExitChanged = Arc<dyn Fn(&dyn Fn(IpAddr) -> bool, Change) + Send + Sync
 /// out of a stop (the app's "Turn off exiting"), whether or not this network
 /// ever reached the hub. 20 s is a few of the link's own dial attempts.
 pub const CONNECTING_LIMIT_MS: u64 = 20_000;
+/// How long after a failed start (its listening port could not be opened, say)
+/// the link is started again, for as long as it is wanted.
+const START_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
 struct Running {
     client: LinkClient,
@@ -298,11 +301,9 @@ impl LinkManager {
         self.way.send_modify(|g| *g = g.wrapping_add(1));
     }
 
-    /// The status line.
-    pub fn status(&self) -> LinkStatus {
-        let st = lock(&self.state);
-        let now = (self.clock)();
-        let state = match (&st.stored, &st.running) {
+    /// Where the link stands, as the status says it.
+    fn state_of(st: &State, now: u64) -> LinkState {
+        match (&st.stored, &st.running) {
             (None, _) if st.pairing.is_some() => LinkState::Pairing,
             (None, _) => LinkState::Unpaired,
             // Paused (the global switch off): nothing runs, as when exiting is off.
@@ -312,7 +313,22 @@ impl LinkManager {
             // that never reaches the hub is no less down than one that lost it.
             (Some(_), Some(r)) if r.ever_up || now.saturating_sub(r.started_ms) > CONNECTING_LIMIT_MS => LinkState::Down,
             (Some(_), _) => LinkState::Connecting,
-        };
+        }
+    }
+
+    /// The link is down now (the status's `Down`): a new connection should not
+    /// wait for it, but take the hub-down setting at once
+    /// ([`exit::open`]). Waiting costs the client's `hub_wait` on every open,
+    /// which is all of an encrypted resolver's connect budget.
+    pub fn is_down(&self) -> bool {
+        Self::state_of(&lock(&self.state), (self.clock)()) == LinkState::Down
+    }
+
+    /// The status line.
+    pub fn status(&self) -> LinkStatus {
+        let st = lock(&self.state);
+        let now = (self.clock)();
+        let state = Self::state_of(&st, now);
         let client_error = st.running.as_ref().filter(|r| !r.up).and_then(|r| r.client.last_error());
         let listening = st.running.as_ref().and_then(|r| r.listening).or(st.pairing_listen).map(|a| a.to_string());
         LinkStatus {
@@ -601,7 +617,24 @@ impl LinkManager {
                         st.running = Some(r);
                         st.last_error = None;
                     }
-                    Err(why) => st.last_error = Some(said(why)),
+                    Err(why) => {
+                        st.last_error = Some(said(why));
+                        // Nothing else would start it again until a setting or the
+                        // network changed: a port still held for a moment (the link
+                        // a restart just stopped lets go of its listener
+                        // asynchronously; seen live at boot, os error 10048) left
+                        // exiting stuck in Connecting, and with Stop no sieved app
+                        // reached anything. So it is tried again, while still wanted.
+                        let weak = Arc::downgrade(self);
+                        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                            rt.spawn(async move {
+                                tokio::time::sleep(START_RETRY).await;
+                                if let Some(m) = weak.upgrade() {
+                                    m.sync();
+                                }
+                            });
+                        }
+                    }
                 }
                 st.since_ms = (self.clock)();
             }

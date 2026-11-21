@@ -175,6 +175,10 @@ pub async fn open(plan: &Plan, link: &LinkManager, net: &dyn LinkNet, host: &str
     };
     let client = plan.client();
     let outcome = match &client {
+        // Known down: the client would wait its `hub_wait` for a link first, on
+        // every open, which outlasts an encrypted resolver's connect attempt
+        // (`dns::pool`'s 3 s), so with "go direct" no lookup ever went direct.
+        Some(client) if !client.is_up() && link.is_down() => Err(LinkError::HubDown),
         Some(client) => client.open(host, port).await,
         None => Err(LinkError::HubDown),
     };
