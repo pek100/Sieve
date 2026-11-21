@@ -489,7 +489,13 @@ async function main() {
       process.exitCode = result.verdict === "pass" ? 0 : 1;
     });
   } finally {
-    rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
+    // Firefox's content processes can hold the profile for a moment after the tree is ended; a
+    // profile left in %TEMP% must not throw over the run's own result or error (seen in run 9).
+    try {
+      rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
+    } catch (error) {
+      console.error(`the temporary profile ${profile} was left behind: ${error.code ?? error.message}`);
+    }
   }
 }
 
