@@ -37,8 +37,12 @@
 //!
 //! `device_buffer_bound(c) = MAX_LINKS_PER_DEVICE * hub_streams(c) * (256 KiB + 32 KiB)`
 //!
-//! e.g. 2 * 81 * 288 KiB = 45.6 MiB for the default 64, 5.6 MiB for a limit
+//! e.g. 2 * 161 * 288 KiB = 90.6 MiB for the default 128, 5.6 MiB for a limit
 //! of 1, and 180.6 MiB at the largest accepted `max_concurrent` (256).
+//!
+//! The default was 64 (45.6 MiB) until 2026-11-22: run 9 hit it while
+//! browsing, and a browser with many tabs open can hold more than 64
+//! connections. A device paired before keeps the limit stored for it.
 //!
 //! A link keeps the size it came up with. A lowered limit leaves it (the old,
 //! larger bound holds until the device's next link); a raised one that still
@@ -136,8 +140,10 @@ impl tokio::io::AsyncWrite for LinkIo {
 }
 
 /// Most streams one link carries at once on the device's side (the hub, its
-/// peer there, is trusted).
-pub const MAX_STREAMS: usize = 128;
+/// peer there, is trusted): the largest limit a hub accepts plus the control
+/// stream, so the hub's limit is the one a device keeps to. At 128 the device
+/// held itself to 127 streams whatever the hub allowed, under the default of 128.
+pub const MAX_STREAMS: usize = crate::rules::MAX_CONCURRENT as usize + 1;
 
 /// Links one device may hold at once at the hub; a newer one closes the oldest.
 pub const MAX_LINKS_PER_DEVICE: usize = 2;
@@ -324,6 +330,7 @@ mod tests {
         assert_eq!(hub_streams(1), 1 + 1 + MIN_SPARE);
         assert_eq!(hub_streams(2), 11);
         assert_eq!(hub_streams(64), 64 + 1 + 16);
+        assert_eq!(hub_streams(128), 128 + 1 + 32);
         assert_eq!(hub_streams(0), hub_streams(1), "a zero limit is clamped, never a zero-stream session");
         assert_eq!(hub_streams(u32::MAX), MAX_CONCURRENT as usize + 1 + 64);
         // Every limit keeps at least MIN_SPARE spare streams.
@@ -336,14 +343,20 @@ mod tests {
         }
         // The bound, stated in the module docs.
         let d = Limits::default().max_concurrent;
-        assert_eq!(device_buffer_bound(d), MAX_LINKS_PER_DEVICE * 81 * (256 * 1024 + 32 * 1024));
-        assert!(device_buffer_bound(d) < 46 * MIB, "{}", device_buffer_bound(d));
+        assert_eq!(d, 128);
+        assert_eq!(device_buffer_bound(d), MAX_LINKS_PER_DEVICE * 161 * (256 * 1024 + 32 * 1024));
+        assert!(device_buffer_bound(d) < 91 * MIB, "{}", device_buffer_bound(d));
+        assert!(device_buffer_bound(64) < 46 * MIB, "{}", device_buffer_bound(64));
         assert!(device_buffer_bound(MAX_CONCURRENT) < 181 * MIB, "{}", device_buffer_bound(MAX_CONCURRENT));
         assert!(device_buffer_bound(1) < 6 * MIB);
         // Monotonic in the limit.
         for c in 1..MAX_CONCURRENT {
             assert!(device_buffer_bound(c) <= device_buffer_bound(c + 1));
         }
+        // The device's own session carries every limit a hub accepts, with its
+        // control stream, and passes yamux's window assertion.
+        assert_eq!(MAX_STREAMS, MAX_CONCURRENT as usize + 1);
+        let _ = config();
     }
 
     /// A stream read on a session this side ends returns at once (it used to
@@ -413,6 +426,9 @@ mod tests {
         // A link made for 64 carries up to 64 + 16 - 8 = 72 with MIN_SPARE left.
         assert!(link_carries(hub_streams(64), 72));
         assert!(!link_carries(hub_streams(64), 73));
+        // One made for the default 128: up to 128 + 32 - 8 = 152.
+        assert!(link_carries(hub_streams(128), 152));
+        assert!(!link_carries(hub_streams(128), 153));
         // Lowering always fits.
         assert!(link_carries(hub_streams(64), 1));
         assert!(link_carries(hub_streams(2), 2) && !link_carries(hub_streams(2), 3));

@@ -260,9 +260,12 @@ pub struct Limits {
     pub bytes_per_sec: u64,
 }
 
+/// What a newly paired device gets. 128 streams at once (64 until 2026-11-22:
+/// run 9 hit it while browsing, and a browser with many tabs can hold more).
+/// The memory this lets the hub spend on the device: `mux::device_buffer_bound`.
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_concurrent: 64, opens_per_minute: 600, bytes_per_sec: 0 }
+        Limits { max_concurrent: 128, opens_per_minute: 600, bytes_per_sec: 0 }
     }
 }
 

@@ -102,6 +102,13 @@ Things that are true by design, and worth knowing before you rely on it:
   its limit plus spare streams; a raise within that applies at once, a
   larger one makes the device relink (its open connections end), and
   `sieve-hub limit` says so.
+- **A device's limit is memory the hub may spend on it.** A newly paired
+  device gets 128 streams at once and 600 new streams a minute (64 streams
+  until 2026-11-22; a browser with many tabs can hold more than 64). The
+  hub holds at most `mux::device_buffer_bound` for one device: 2 links of
+  161 streams at 288 KiB each, 90.6 MiB, at the default; 180.6 MiB at the
+  largest limit (256). A device paired before keeps the limit stored for
+  it; `sieve-hub limit <device> concurrent 128` raises it.
 - **Keys are files.** `identity.key` is an unencrypted PKCS#8 file protected
   by file permissions: anyone who can act as that user, or as an
   administrator or root, can read it.

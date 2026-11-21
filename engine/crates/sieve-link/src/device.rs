@@ -709,3 +709,26 @@ impl AsyncWrite for LinkStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::{Limits, MAX_CONCURRENT};
+
+    /// The device keeps to the hub's limit, not a lower one of its own: the
+    /// default of 128 used to be held to 127 here (the device's session had
+    /// room for 128 streams, the control stream among them).
+    #[test]
+    fn the_device_keeps_to_every_limit_a_hub_accepts() {
+        let default = Limits::default().max_concurrent;
+        assert_eq!(Slots::new(default).limit(), default);
+        assert_eq!(Slots::new(MAX_CONCURRENT).limit(), MAX_CONCURRENT);
+        let slots = Slots::new(1);
+        slots.set_limit(default);
+        assert_eq!(slots.limit(), default);
+        let held: Vec<_> = (0..default).map(|_| slots.try_take().expect("a slot under the limit")).collect();
+        assert!(slots.try_take().is_none(), "one over the hub's limit is the device's own Busy");
+        drop(held);
+        assert!(slots.try_take().is_some());
+    }
+}
