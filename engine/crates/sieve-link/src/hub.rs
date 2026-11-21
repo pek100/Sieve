@@ -1584,10 +1584,7 @@ async fn serve_pairing(inner: Arc<Inner>, est: Established, _pass: Option<Pass>)
                 let idx = f.pending.iter().position(|p| p.secret_bytes().is_some_and(|s| pairing::verify_proof(&s, &exporter, &peer, &hub, &proof)));
                 let Some(i) = idx else { return Ok(None) };
                 f.pending.remove(i);
-                let name = f.unique_name(&wanted);
-                let d = f.defaults.clone();
-                f.devices.push(DeviceRecord { fingerprint: peer, name: name.clone(), paired_at: now_secs(), revoked_at: None, rules: d.rules, limits: d.limits });
-                Ok(Some(name))
+                Ok(Some(f.pair_device(peer, &wanted, now_secs())))
             })
         })
         .await

@@ -64,9 +64,11 @@ Home PC (hub):
   resolver's name (Sieve's encrypted DNS asks the hub for the resolver by
   name, e.g. `dns.google` or `cloudflare-dns.com`; a resolver given as an IP
   address needs `allow-cidr <ip>/32` instead). Limits: a device paired now
-  gets 128 concurrent and 600 per minute (run 9's VM, paired under the old
-  default of 64, hit 64 while browsing: raise it with
-  `sieve-hub limit <vm> concurrent 128`). (`<vm>` is the name
+  gets 128 concurrent and 600 per minute, also from a hub made before
+  2026-11-22 (its stored default of 64 now reads as the built-in default). A
+  device already paired keeps its stored limit until raised: run 9's VM,
+  paired under the old default of 64, hit 64 while browsing, so raise it with
+  `sieve-hub limit <vm> concurrent 128`. (`<vm>` is the name
   or fingerprint `sieve-hub devices` shows after pairing; the rules can be set
   right after pairing, before "exit through" is turned on.)
 

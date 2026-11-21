@@ -107,8 +107,30 @@ impl PendingCode {
 pub struct Defaults {
     #[serde(default)]
     pub rules: Rules,
-    #[serde(default)]
-    pub limits: Limits,
+    /// The owner's limits for newly paired devices; None (the usual case)
+    /// means the built-in `Limits::default()` at the moment of pairing, so a
+    /// later build's default reaches an existing hub. A stored value equal to
+    /// [`OLD_BUILT_IN_LIMITS`] reads as None: `sieve-hub init` wrote the
+    /// built-in default into every `hub.json` made before 2026-11-22, and
+    /// that was never the owner's choice. A device already paired keeps its
+    /// own stored limits until `sieve-hub limit` changes them.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "stored_default_limits")]
+    pub limits: Option<Limits>,
+}
+
+/// The built-in default for new devices before 2026-11-22, which `sieve-hub
+/// init` stored in `hub.json` as the hub's own default.
+pub const OLD_BUILT_IN_LIMITS: Limits = Limits { max_concurrent: 64, opens_per_minute: 600, bytes_per_sec: 0 };
+
+fn stored_default_limits<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Limits>, D::Error> {
+    Ok(Option::<Limits>::deserialize(d)?.filter(|l| *l != OLD_BUILT_IN_LIMITS))
+}
+
+impl Defaults {
+    /// The limits a device paired now gets.
+    pub fn limits(&self) -> Limits {
+        self.limits.unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,6 +210,16 @@ impl HubFile {
             return name.to_string();
         }
         (2u32..).map(|i| format!("{name}-{i}")).find(|n| !taken(n)).expect("some suffix is free")
+    }
+
+    /// Adds a newly paired device with this hub's defaults (`Defaults::limits`)
+    /// under a unique form of `wanted`; returns the name it got.
+    pub fn pair_device(&mut self, fingerprint: Fingerprint, wanted: &str, paired_at: u64) -> String {
+        let name = self.unique_name(wanted);
+        let limits = self.defaults.limits();
+        let rules = self.defaults.rules.clone();
+        self.devices.push(DeviceRecord { fingerprint, name: name.clone(), paired_at, revoked_at: None, rules, limits });
+        name
     }
 
     pub fn purge_expired(&mut self, now_secs: u64) {
@@ -482,6 +514,41 @@ mod tests {
         f.devices.push(rec(0x22, "phone"));
         assert!(f.find("phone").is_err(), "a duplicated name is ambiguous");
         assert_eq!(f.find(&fp(0x22).to_string()).unwrap(), fp(0x22));
+    }
+
+    /// A `hub.json` written by `sieve-hub init` before 2026-11-22 holds the
+    /// then built-in default (64 streams): pairing on it gets today's
+    /// built-in default, and the file drops the stale value on the next write.
+    /// A default the owner changed is kept.
+    #[test]
+    fn pairing_on_an_old_hub_gets_the_built_in_default_and_a_custom_default_is_kept() {
+        assert_eq!(Limits::default().max_concurrent, 128);
+        let t = tempfile::tempdir().unwrap();
+        let st = HubStore::new(t.path());
+        st.create("h").unwrap();
+        let old = r#"{"version":1,"name":"h","defaults":{"limits":{"max_concurrent":64,"opens_per_minute":600,"bytes_per_sec":0}}}"#;
+        std::fs::write(st.file_path(), old).unwrap();
+        let name = st.update(|f| Ok(f.pair_device(fp(1), "laptop", 5))).unwrap();
+        let f = st.load().unwrap();
+        assert_eq!(f.defaults.limits, None);
+        assert_eq!(f.device(&fp(1)).unwrap().limits, Limits::default());
+        assert_eq!(f.device(&fp(1)).unwrap().name, name);
+        assert!(!std::fs::read_to_string(st.file_path()).unwrap().contains("\"limits\":{\"max_concurrent\":64"));
+        // Written before bytes_per_sec existed: still the old built-in.
+        let older = r#"{"version":1,"name":"h","defaults":{"limits":{"max_concurrent":64,"opens_per_minute":600}}}"#;
+        let f: HubFile = serde_json::from_str(older).unwrap();
+        assert_eq!(f.defaults.limits(), Limits::default());
+
+        let custom = Limits { max_concurrent: 32, opens_per_minute: 600, bytes_per_sec: 0 };
+        let mut f: HubFile = serde_json::from_str(&old.replace("\"max_concurrent\":64", "\"max_concurrent\":32")).unwrap();
+        assert_eq!(f.defaults.limits, Some(custom));
+        f.pair_device(fp(2), "phone", 5);
+        assert_eq!(f.device(&fp(2)).unwrap().limits, custom);
+        let back: HubFile = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(back.defaults.limits, Some(custom), "a custom default survives a write");
+        // No defaults at all (a fresh `init`): the built-in.
+        let fresh: HubFile = serde_json::from_str(r#"{"version":1,"name":"h"}"#).unwrap();
+        assert_eq!(fresh.defaults.limits(), Limits::default());
     }
 
     #[test]

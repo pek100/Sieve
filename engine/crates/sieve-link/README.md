@@ -107,8 +107,11 @@ Things that are true by design, and worth knowing before you rely on it:
   until 2026-11-22; a browser with many tabs can hold more than 64). The
   hub holds at most `mux::device_buffer_bound` for one device: 2 links of
   161 streams at 288 KiB each, 90.6 MiB, at the default; 180.6 MiB at the
-  largest limit (256). A device paired before keeps the limit stored for
-  it; `sieve-hub limit <device> concurrent 128` raises it.
+  largest limit (256). This holds on a hub made before too: its `hub.json`
+  stored the old built-in default (64), which now reads as "the built-in
+  default" (a default the owner changed by hand is kept). A device already
+  paired keeps the limit stored for it until
+  `sieve-hub limit <device> concurrent 128` raises it.
 - **Keys are files.** `identity.key` is an unencrypted PKCS#8 file protected
   by file permissions: anyone who can act as that user, or as an
   administrator or root, can read it.

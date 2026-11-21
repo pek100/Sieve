@@ -362,10 +362,11 @@ impl LinkManager {
         }
     }
 
-    /// The link is down now (the status's `Down`): a new connection should not
-    /// wait for it, but take the hub-down setting at once
+    /// The link is down now (the status's `Down`): with "go direct", a new
+    /// connection should not wait for it, but go directly at once
     /// ([`exit::open`]). Waiting costs the client's `hub_wait` on every open,
-    /// which is all of an encrypted resolver's connect budget.
+    /// which is all of an encrypted resolver's connect budget. With "stop" it
+    /// still waits, so a link that just dropped can redial and carry it.
     pub fn is_down(&self) -> bool {
         Self::state_of(&lock(&self.state), (self.clock)()) == LinkState::Down
     }
@@ -687,10 +688,15 @@ impl LinkManager {
                         // again while wanted, with waits that grow while the same
                         // error repeats ([`START_RETRY`]).
                         let why = said(why);
-                        let again = retrying && route_before.is_none() && st.start_failing.is_some();
+                        let failing_before = st.start_failing.as_ref().filter(|_| route_before.is_none());
+                        let again = retrying && failing_before.is_some();
+                        // A setting or the network changed, and the start fails as
+                        // before: the same failure, so its Down clock runs on (a
+                        // fresh one put the status back to Connecting for as long).
+                        let same = again || failing_before.is_some_and(|f| f.error == why);
                         let wait = StartFailing::next_wait(st.start_failing.as_ref(), &why);
                         let now = (self.clock)();
-                        let since_ms = st.start_failing.as_ref().filter(|_| again).map_or(now, |f| f.since_ms);
+                        let since_ms = failing_before.filter(|_| same).map_or(now, |f| f.since_ms);
                         st.start_failing = Some(StartFailing { since_ms, error: why.clone(), wait });
                         st.last_error = Some(why);
                         let weak = Arc::downgrade(self);
@@ -707,7 +713,9 @@ impl LinkManager {
                             // Still not started, as before: nothing changed for a flow.
                             return;
                         }
-                        st.since_ms = now;
+                        if !same {
+                            st.since_ms = now;
+                        }
                     }
                 },
             }
