@@ -31,6 +31,27 @@ Then the checks. Afterwards `-Step off`.
 | U7 | Kill, reboot and uninstall tests of `docs/conventions.md` section 0, with content on. A page with a `max-age`, loaded while on, reloaded after off. | The network is normal in all three. Record how long the cached page keeps its injected elements (open question Q3). |
 | U8 | A site served by a service worker. A plain `http://` page. | Neither is injected. Record how many sites lose what. |
 
+## U3 again: the user scriptlet probe (after run 9)
+
+Run 9 (`docs/tasks/2026-11-08-vm-slices-7-11-status.md`) put `<hosts>##+js(set-attr, html, data-sieve-probe, 1)` in the user rules and found the attribute on example.com, MDN and github in Chrome, not on youtube or web.dev, nor on github in Edge. Reading the code and the bundle found no engine cause; the likeliest one is the probe's timing:
+
+- uBO's `set-attr` runs at `runAt` `idle` unless told otherwise (`set-attr.fn` calls `runAt(start, options.runAt || 'idle')`, and `run-at.fn` maps `idle` to `document.readyState === "complete"`, the window's load). It does nothing before the page has finished loading every subresource.
+- The probe read the attribute once, 5 s after `Page.navigate` returned (`SETTLE_MS` in `scripts/live/youtube.mjs`), so a page still loading then (a video site's home page through a residential hub; github in a fresh Edge profile) was read before the scriptlet ran.
+- The same runs show the engine does inject scriptlets into the video site's documents (youtube.mjs counted them in 9 to 12 documents), no CSP or Trusted Types report against our script (U2), and the rule's hosts match subdomains (`www.` included).
+
+What would still be an engine fault: the payload missing the rule for a listed host, or the payload there, the page complete, and the attribute absent. The check below tells these apart. Per browser (Chrome, Edge, and Firefox once it can be driven), each URL in a fresh profile, with HTTPS and content on and the default lists:
+
+1. User rules, both at once (the second does not wait for the load):
+   ```
+   youtube.com,github.com,example.com,developer.mozilla.org,web.dev##+js(set-attr, html, data-sieve-probe, 1)
+   youtube.com,github.com,example.com,developer.mozilla.org,web.dev##+js(set-attr, html, data-sieve-early, 1, runAt, interactive)
+   ```
+2. Load `https://www.youtube.com/`, `https://github.com/`, `https://example.com/`, `https://developer.mozilla.org/en-US/`, `https://web.dev/`, one per fresh browser.
+3. Read the main document's response body through the driver (CDP `Network.getResponseBody`). Record whether it holds `<script nonce=`, `scriptletGlobals` and `data-sieve-probe` (the payload for this host), and the issuer.
+4. From navigation, every 500 ms for 30 s: `document.readyState`, `document.documentElement.getAttribute('data-sieve-probe')` and `... 'data-sieve-early'`. Record when the page reached `complete` and when each attribute appeared. Collect console errors.
+
+Pass when, on every URL: the body holds the payload for the host; `data-sieve-early` is there by `interactive`; `data-sieve-probe` is there within 1 s of `complete`. If the payload is missing for a listed host, it is an engine fault in matching (read the log row for the document). If the payload is there and `complete` came but the attribute did not, look at the console for an error in our script (one throwing scriptlet does not stop the others: adblock-rust wraps each call in `try { } catch`, `get_scriptlet_resources`; a syntax error in a bundled resource would stop them all), and save the body.
+
 ## Reading a result
 
 - `content.resets` growing: a page was cut. Read the log for the row and compare with the page's own encoding; a body past `InjectLimits` is a real cap breach, anything else is a bug.
