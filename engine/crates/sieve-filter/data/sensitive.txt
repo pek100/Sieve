@@ -361,6 +361,8 @@ cardinalcommerce.com
 arcot.com
 pay.google.com
 payments.google.com
+// Google Wallet's web site; pay.google.com sends people here.
+wallet.google.com
 "apple-pay-gateway.apple.com"
 "card.apple.com"
 pay.amazon.com
@@ -378,6 +380,8 @@ ledger.com
 
 // Health: patient portals, insurers, telehealth, labs
 mychart.com
+// www.mychart.com redirects here (run 9, 2026-11-21); owner's decision 2026-11-22.
+mychart.org
 followmyhealth.com
 athenahealth.com
 healow.com
