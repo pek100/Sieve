@@ -1,5 +1,46 @@
 # VM live run 2026-11-08: status at the stop
 
+## Run 9b (2026-11-21/22): main ae82507 through the home hub, Firefox, the new defaults
+
+Follow-up to run 9 on main ae82507 (uBO lists on by default, the two link fixes, 128 streams per device, mychart.org and wallet.google.com never decrypted). Engine 52FF7459…, app 79D97343…, sieve-hub 2FA76F5C… built from it; the VM device raised to 128 streams on the hub (`sieve-hub limit … concurrent 128`). AdGuard is no longer on the owner's PC. Same limits on that PC as run 9: only `sieve-hub` ran there. Run over three sessions (paused twice with exit off). Firefox's Terms of Use were accepted on the VM by the orchestrator, on the owner's direct approval, in a template profile (`C:\sieve\r9\ff-template`) used for the plain-Firefox view; this agent wrote the script and did not run it. Branch `live-link-run-2` (not pushed): c1dc7af and 5bc21cf (`scripts/live/youtube.mjs`, tests in `tests/laws/youtube-live.test.ts`, each failing without its fix).
+
+| Check | Result | Evidence |
+|---|---|---|
+| Link and onward connections clean (AdGuard gone) | PASS | no AdGuard process or service; `link_up` X25519MLKEM768; from the VM through the hub, real issuers (Cloudflare, Let's Encrypt, Google Trust Services) that validated there; with Sieve's lists emptied, adsbygoogle.js (203 KB), gpt.js (139 KB) and show_ads.js over plain HTTP came back whole |
+| Set-up | PASS | `sieve-hub lan`: the Wi-Fi /24, the IPv6 /64 and /56; exit on with Stop; `up`; ipify = the home IPv4, IPv6 checks in the home prefix |
+| Default lists | Confirmed | with `lists` unset the engine held all eight: the five AdGuard/ubo-badware lists and ubo-filters, ubo-quick-fixes, ubo-unbreak |
+| Firefox's root | Recorded | the enterprise-roots path: Sieve set `HKLM\SOFTWARE\Policies\Mozilla\Firefox\Certificates\ImportEnterpriseRoots = 1` (`ca.json` `firefox_policy_set: true`, no policies.json); Firefox 160 took Sieve's certificate through it |
+| Driving Firefox | Fixed (tooling) | Firefox 160's launcher hands over and exits with the stderr the BiDi address is read from ("no BiDi port"): `--wait-for-browser` (c1dc7af). A fresh profile blocks audible autoplay, so 10 of 10 videos read "no playback seen": the driver writes a user.js allowing it (5bc21cf). Chrome and Edge create `DevToolsActivePort` before writing it (EBUSY once): the driver waits for both lines (c1dc7af) |
+| Firefox slice 6 U1/U2 | PASS (meter witness) | wikipedia and bbc over h2; `intercepted` 143 → 169, `upstream_groups.X25519MLKEM768` 129 → 149. BiDi reports no issuer |
+| Firefox slice 6 U4 | PASS | expired, wrong.host, self-signed, untrusted-root, sha1-intermediate, incomplete-chain: Firefox's own `about:certerror` (nssBadCert); rc4, 3des, null, dh1024, tls-v1-0, tls-v1-1: `about:neterror` (nssFailure2); badssl.com itself loaded |
+| Firefox slice 9 U1 | PASS | example.com with `example.com##p`: 6 of 6 hidden, `rewritten` +1 per page |
+| Firefox slice 9 U2 | SKIP | the BiDi driver collects no console messages |
+| Never-decrypt in Firefox | PASS | `not_decrypted list:sensitive` rows for firefox.exe on chase, bankhapoalim, kaiserpermanente, clalit, accounts.google.com, login.microsoftonline.com, paypal |
+| mychart.com → mychart.org, wallet.google.com | PASS, all three browsers | Chrome and Edge issuers GeoTrust and WE2; `not_decrypted list:sensitive` rows for www.mychart.com, www.mychart.org and wallet.google.com in chrome.exe, msedge.exe and firefox.exe |
+| Slice 9 "U3 again", Chrome | PASS 5 of 5 | youtube, github, example.com, MDN, web.dev: the body holds `<script nonce=`, `scriptletGlobals` and both probes; `data-sieve-early` by `interactive`, `data-sieve-probe` at `complete`. Run 9's misses were the probe's timing |
+| "U3 again", Edge | PASS 5 of 5 | the same (github after the EBUSY fix; its one console error is the site's own hero video) |
+| "U3 again", Firefox | Attributes PASS; timing not measurable | both attributes appeared on all five pages, no errors; the BiDi driver's first readings came from the previous `about:blank` document, so "by interactive" and "within 1 s of complete" cannot be judged with it |
+
+YouTube on the new defaults (uBO included), the same 21-minute video with pre-roll and mid-roll slots, 15 minutes each, through the home hub:
+
+| Browser | Method | Result |
+|---|---|---|
+| Edge | probe extension | 898 s watched, 0 stalled of 444 intervals, seek resumed in 2.0 s, 480p → 360p applied, 0 ad samples, 0 ad slots in the player response; autoplay to the next video in 14.0 s, which also carried 0 slots and no ad |
+| Chrome | outside watcher | picture changed in 42 of 42 samples, no error or ad text, no ad bar; autoplay in 10.0 s; the next video played content (screenshot) |
+| Firefox | outside watcher, accepted template profile | picture changed in 43 of 43 samples, no error or ad text, no ad bar; autoplay in 10.1 s; the next video played content (screenshot) |
+
+youtube.mjs, 10 × 30 s: Chrome 10 of 10 clean, 0 home-page ads, scriptlets in 12 documents; Edge 10 of 10, 0 home-page ads, 13 documents; Firefox (after 5bc21cf) 10 of 10, 0 home-page ads, 14 documents. Quality and autoplay worked in all three; seek failed in Chrome and Edge, the automation stop that run 9 recorded (YouTube stops a remote-debugged session about 45 s in). The Chrome and Edge runs were started with `--arm adguard`, which on main is now the five-list arm, so the script called them inconclusive for holding eight lists; the counts above are its own per-video and day-one readings, with the eight lists held at both ends. Run 9's ad leaks on first loads and after autoplay were not seen with the new defaults.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Home's "Turn off exiting" offer (real app, sievedesk session) | PASS | The app started with that user's own settings (routing off, its onboarding not done): routing was switched on in the app, hub stopped, Stop set. Home showed "Home cannot be reached from this network. Sieved apps' connections are stopped, as set…" with the button 27 s after routing came on (screenshot). Pressed by UI Automation: no password prompt (none set), the notice went away, `link.json` exit false |
+| Network move | PASS | Ethernet disabled for 10 s (a 2-minute dead-man task re-enables it), then: `connecting` at +12 s, `down` at +33 s, `up` at +51 s with no help, ipify = home |
+| Port held at start | PASS (main's retry) | engine started while a test listener held port 7443: "could not be opened … (os error 10048)", `connecting`; the listener released, the link was `up` 10 s later, ipify = home |
+
+UNVERIFIED in 9b: Firefox's console (U2) and its "U3 again" timings; seek resume in Chrome and Firefox (the outside watcher cannot read it); a mid-roll actually playing (none was served in either run).
+
+VM state left: main ae82507's engine and app (the real `sieve.exe`), paired, exit off, the link-port rule deleted, policy routing, HTTPS and page filtering on with the default lists; the template Firefox profile `C:\sieve\r9\ff-template` kept. VM stopped (TERMINATED); GCP rule `sieve-link-home` deleted; the hub stopped on the owner's PC with its folder kept (device limit 128).
+
 ## Run 9 (2026-11-21): exit through the home hub
 
 The first live use of "Exit through another device" (`docs/live/link-exit.md`). The VM ran Sieve (engine and app built from main 60c9651, engine SHA-256 0C0D2CDD…, app 7B3E191D…) with HTTPS and page filtering on, paired in listen mode with `sieve-hub` on the owner's PC, which dialled out to it. The owner approved exactly this: one ordinary program on the home PC, one GCP rule for the link port from the home address only, a Windows Firewall rule on the VM limited the same way; nothing else on the home PC was touched (no AdGuard change, no Sieve engine there). Run over two sessions (paused overnight with exit off and the pairing kept). Pipe traffic went through a VM-only client built against main's `sieve-ipc` with the link verbs (`link_pair` reads the code from stdin; the code was never printed or stored), standing in for `sieve.exe`; the real app went back at the end. No addresses, codes or keys are recorded here.

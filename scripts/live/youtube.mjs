@@ -268,14 +268,22 @@ export class CdpDriver {
   static async connect(child, profile) {
     const portFile = join(profile, "DevToolsActivePort");
     const started = Date.now();
-    while (!existsSync(portFile)) {
+    // The browser creates the file before it has written it, and holds it locked meanwhile
+    // (EBUSY in run 9b): wait for both lines.
+    let port = "";
+    let path = "";
+    while (!port || !path) {
       if (Date.now() - started > START_TIMEOUT_MS) throw new Error("the browser opened no debugging port");
       await sleep(200);
+      try {
+        [port = "", path = ""] = readFileSync(portFile, "utf8").split("\n").map((line) => line.trim());
+      } catch (error) {
+        if (!["ENOENT", "EBUSY", "EPERM"].includes(error.code)) throw error;
+      }
     }
-    const [port, path] = readFileSync(portFile, "utf8").split("\n");
     const driver = new CdpDriver();
     driver.document = NO_DOCUMENT;
-    driver.rpc = await Rpc.open(`ws://127.0.0.1:${port.trim()}${path.trim()}`, (event) => driver.onEvent(event));
+    driver.rpc = await Rpc.open(`ws://127.0.0.1:${port}${path}`, (event) => driver.onEvent(event));
     const { targetId } = await driver.rpc.call("Target.createTarget", { url: "about:blank" });
     const { sessionId } = await driver.rpc.call("Target.attachToTarget", { targetId, flatten: true });
     driver.session = sessionId;
@@ -322,11 +330,20 @@ export class CdpDriver {
 /** Firefox has no CDP. BiDi reports no certificate, so the issuer stays unknown and the
  *  engine's scriptlet meter stands in for it (runVerdict): what is in the page cannot,
  *  since a site's own script can have the same shape. */
+/** The fresh profile's prefs: autoplay allowed, as the Chromium drivers' flag does. */
+export const FIREFOX_PREFS = 'user_pref("media.autoplay.default", 0);\nuser_pref("media.autoplay.blocking_policy", 0);\n';
+
 export class BidiDriver {
   static readsIssuer = false;
 
   static launch(executable, profile) {
-    return spawn(executable, ["--profile", profile, "--no-remote", "--remote-debugging-port=0", "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+    // Firefox blocks audible autoplay in a fresh profile, so no video ever started (run 9b: 10 of
+    // 10 "no playback seen"); Chrome and Edge get `--autoplay-policy=no-user-gesture-required`.
+    writeFileSync(join(profile, "user.js"), FIREFOX_PREFS);
+    // `--wait-for-browser`: Firefox's launcher process hands over to the browser process and exits,
+    // taking the stderr this reads the BiDi address from with it (seen with Firefox 160 in run 9b:
+    // "the browser opened no BiDi port"); with it, the launcher stays and passes stderr on.
+    return spawn(executable, ["--profile", profile, "--no-remote", "--wait-for-browser", "--remote-debugging-port=0", "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
   }
 
   static async connect(child) {
