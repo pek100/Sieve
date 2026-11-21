@@ -5,7 +5,7 @@
  * and have never met a browser.
  */
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -351,6 +351,14 @@ describe("the script's drivers, against a fake socket", () => {
     child.stderr.emit("data", BIDI_LINE);
     await expect(run).rejects.toThrow(/cannot open/);
     expect(started.spawnArgs.at(-1)).toContain("--wait-for-browser");
+  });
+
+  it("firefox: the fresh profile allows autoplay, or no video starts (run 9b: 10 of 10 unplayed)", async () => {
+    FakeSocket.refuse = true;
+    const run = withBrowser(BidiDriver, "firefox.exe", profile, work);
+    child.stderr.emit("data", BIDI_LINE);
+    await expect(run).rejects.toThrow(/cannot open/);
+    expect(readFileSync(join(profile, "user.js"), "utf8")).toContain('user_pref("media.autoplay.default", 0);');
   });
 
   it("chrome: the socket refuses, and the browser is killed", async () => {

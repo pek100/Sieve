@@ -330,10 +330,16 @@ export class CdpDriver {
 /** Firefox has no CDP. BiDi reports no certificate, so the issuer stays unknown and the
  *  engine's scriptlet meter stands in for it (runVerdict): what is in the page cannot,
  *  since a site's own script can have the same shape. */
+/** The fresh profile's prefs: autoplay allowed, as the Chromium drivers' flag does. */
+export const FIREFOX_PREFS = 'user_pref("media.autoplay.default", 0);\nuser_pref("media.autoplay.blocking_policy", 0);\n';
+
 export class BidiDriver {
   static readsIssuer = false;
 
   static launch(executable, profile) {
+    // Firefox blocks audible autoplay in a fresh profile, so no video ever started (run 9b: 10 of
+    // 10 "no playback seen"); Chrome and Edge get `--autoplay-policy=no-user-gesture-required`.
+    writeFileSync(join(profile, "user.js"), FIREFOX_PREFS);
     // `--wait-for-browser`: Firefox's launcher process hands over to the browser process and exits,
     // taking the stderr this reads the BiDi address from with it (seen with Firefox 160 in run 9b:
     // "the browser opened no BiDi port"); with it, the launcher stays and passes stderr on.
