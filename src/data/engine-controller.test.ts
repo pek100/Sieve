@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createPassedChecks } from "@/core/checks";
-import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE, DNS_ENCRYPTION, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineStatus, engineUpdate } from "@/core/engine";
+import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE, DNS_ENCRYPTION, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineLockReason, enginePhase, engineStatus, engineUpdate, restartText } from "@/core/engine";
 import { createNoticeBus } from "@/core/notices";
 import { MAX_POLICY_BYTES, settingDef, type SettingKey } from "@/core/settings/registry";
 import { GLOBAL_SWITCH } from "@/core/policy";
@@ -14,7 +14,7 @@ import type { EngineSource } from "./engine-source";
 import { createMockFilterLists } from "./filter-lists-mock";
 import type { FilterListSource } from "./filter-lists-source";
 import type { Clock } from "./poller";
-import type { CertStatus, EngineDnsUpstreams, EnginePolicy, EngineProbe } from "./protocol";
+import type { CertStatus, EngineDnsUpstreams, EnginePolicy, EngineProbe, RestartApp } from "./protocol";
 import { createSettingsStore, memoryBackend, type SettingsBackend } from "./settings-store";
 
 const SWITCH = ENGINE_SWITCH as SettingKey;
@@ -69,11 +69,16 @@ function fakeEngine(start: EngineScenario) {
   const issueReads: number[] = [];
   const signInCalls: string[] = [];
   const linkCalls: Record<string, unknown>[] = [];
+  // The apps the engine names as needing a restart, over whatever the mock says.
+  let restartApps: RestartApp[] | null = null;
   const source: EngineSource = {
     kind: "mock",
-    probe: () => {
+    probe: async () => {
       probes++;
-      return mock.probe();
+      const p = await mock.probe();
+      const pipe = p.pipe;
+      if (restartApps === null || pipe?.kind !== "welcome") return p;
+      return { ...p, pipe: { ...pipe, status: { ...pipe.status, restart_to_trust: restartApps } } };
     },
     setPolicy: (p) => {
       policies.push(p);
@@ -143,6 +148,7 @@ function fakeEngine(start: EngineScenario) {
     set: (s: EngineScenario) => void (mock = createMockEngine(s)),
     setCert: (c: CertScenario) => void (mock = createMockEngine(start, { cert: c })),
     holdHttps: (run?: number) => void (mock = createMockEngine(start, { heal: true, run })),
+    restart: (apps: RestartApp[] | null) => void (restartApps = apps),
     probes: () => probes,
     certReads: () => certReads,
     rowReads: () => rowReads,
@@ -480,6 +486,80 @@ describe("engine controller, apps' problems", () => {
     s.fake.set("stopped");
     await s.fc.advance(ENGINE_POLL_MS);
     expect(slice(s).issues ?? null).toBeNull();
+  });
+});
+
+describe("engine controller, restarting browsers (slice 7, 2026-11-22)", () => {
+  const banners = (s: ReturnType<typeof setup>) => s.notices.list().filter((n) => n.surface === "banner");
+  const texts = (s: ReturnType<typeof setup>) => banners(s).map((n) => n.text);
+  const PLAIN = restartText([]);
+  const firefox: RestartApp = { exe: "firefox.exe", session: 1 };
+  /** The engine's HTTPS seen off, then on by this app's switch, while this window watched. */
+  async function turnedOn() {
+    const s = setup("idle");
+    await s.fc.flush();
+    expect(texts(s)).toEqual([]);
+    await s.settings.set(HTTPS_SWITCH as SettingKey, true);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(engineStatus(s.store.getState().engine)?.policy.https, "the engine took it").toBe(true);
+    return s;
+  }
+
+  it("turning HTTPS on says to restart the open browsers, once, and a dismiss holds", async () => {
+    const s = await turnedOn();
+    expect(texts(s)).toEqual([PLAIN]);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(texts(s), "not pushed again").toEqual([PLAIN]);
+    s.notices.dismiss(banners(s)[0].id);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(texts(s)).toEqual([]);
+    s.undo();
+  });
+
+  it("names the apps the engine names, and goes once none is running", async () => {
+    const s = await turnedOn();
+    s.fake.restart([firefox, { exe: "firefox.exe", session: 1 }, { exe: "thunderbird.exe", session: 1 }]);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(texts(s)).toEqual([restartText(["Firefox", "Thunderbird"])]);
+    expect(texts(s)[0]).toBe("Restart Firefox and Thunderbird so they trust Sieve's certificate. Until then, their pages load without filtering.");
+    s.fake.restart([firefox]);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(texts(s)).toEqual(["Restart Firefox so it trusts Sieve's certificate. Until then, its pages load without filtering."]);
+    s.fake.restart(null);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(texts(s), "restarted: nothing, and not the plain line again").toEqual([]);
+    s.undo();
+  });
+
+  it("a dismissed name stays away until another app is named", async () => {
+    const s = await turnedOn();
+    s.fake.restart([firefox]);
+    await s.fc.advance(ENGINE_POLL_MS);
+    s.notices.dismiss(banners(s)[0].id);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(texts(s)).toEqual([]);
+    s.fake.restart([firefox, { exe: "waterfox.exe", session: 1 }]);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(texts(s)).toEqual([restartText(["Firefox", "Waterfox"])]);
+    s.undo();
+  });
+
+  it("an engine holding HTTPS on by itself says nothing until it names an app; off says nothing", async () => {
+    const s = setup("idle");
+    await s.fc.flush();
+    s.fake.holdHttps();
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(texts(s), "not this app's act").toEqual([]);
+    s.fake.restart([firefox]);
+    await s.fc.advance(ENGINE_POLL_MS);
+    expect(texts(s)).toEqual([restartText(["Firefox"])]);
+    s.undo();
+    const off = setup("idle");
+    off.fake.restart([firefox]);
+    await off.fc.flush();
+    await off.fc.advance(ENGINE_POLL_MS);
+    expect(texts(off), "HTTPS off: nothing is decrypted, so no restart helps").toEqual([]);
+    off.undo();
   });
 });
 

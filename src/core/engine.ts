@@ -410,6 +410,20 @@ export function upstreamChecksText(e: EngineSlice): string | null {
   return `${what} skipped until Sieve publishes their data. Windows still checks each site's certificate, and its revocation when it can reach the revocation server.`;
 }
 
+/**
+ * The Home notice that a browser needs a restart (slice 7, 2026-11-22). A browser
+ * open before Sieve's certificate was installed may trust it only once restarted
+ * (Firefox reads it at its start). With no names: HTTPS filtering was just turned
+ * on. With names: the engine saw those apps refuse the certificate for that reason,
+ * and passes their connections through until they restart.
+ */
+export function restartText(names: readonly string[]): string {
+  if (names.length === 0) return "Restart your open browsers so they trust Sieve's certificate.";
+  const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  const one = names.length === 1;
+  return `Restart ${list} so ${one ? "it trusts" : "they trust"} Sieve's certificate. Until then, ${one ? "its" : "their"} pages load without filtering.`;
+}
+
 /** Where signed updates stand; nothing to say when the engine did not answer or said nothing. */
 export function engineUpdate(e: EngineSlice): EngineUpdate {
   return engineStatus(e)?.update ?? NO_UPDATE_NEWS;

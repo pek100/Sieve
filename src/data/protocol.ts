@@ -502,6 +502,24 @@ export interface EngineStatus {
   /** Exiting through another device. Absent: an engine that cannot do it (or an app that did not name `link`); the app then shows nothing of it. */
   link?: LinkStatus;
   update: EngineUpdate;
+  /** Apps of this session with a process open since before Sieve's certificate was installed: each trusts it once restarted. Absent: none, or an engine or app from before it. */
+  restart_to_trust?: RestartApp[];
+}
+
+/** sieve-ipc `RestartApp`: an exe file name, lower case, and its session. */
+export interface RestartApp {
+  exe: string;
+  session: number;
+}
+
+/** A fact, as `upstream_checks`: an odd row is left out and an odd list reads as nothing to say, never a refused Status. */
+export function parseRestartToTrust(raw: unknown): RestartApp[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((r: unknown) => {
+    if (typeof r !== "object" || r === null) return [];
+    const a = r as Record<string, unknown>;
+    return typeof a.exe === "string" && a.exe.length > 0 && Number.isInteger(a.session) ? [{ exe: a.exe, session: a.session as number }] : [];
+  });
 }
 
 /** sieve-ipc `UpstreamChecks`: true means the check has its data and runs. */
@@ -634,6 +652,7 @@ export function parseWifiSignIn(raw: unknown): WifiSignIn | null {
 
 const withSignIn = (w: WifiSignIn | null): { wifi_sign_in?: WifiSignIn } => (w === null ? {} : { wifi_sign_in: w });
 const withUpstreamChecks = (u: UpstreamChecks | null): { upstream_checks?: UpstreamChecks } => (u === null ? {} : { upstream_checks: u });
+const withRestart = (apps: RestartApp[]): { restart_to_trust?: RestartApp[] } => (apps.length === 0 ? {} : { restart_to_trust: apps });
 
 /** sieve-ipc `CaptureReason`, in declaration order. */
 export const CAPTURE_REASONS = ["tie", "ipv6_off", "no_answer", "no_ipv4", "failed", "nothing_to_catch"] as const;
@@ -836,6 +855,7 @@ export function parseEngineStatus(raw: unknown): EngineStatus {
     ...withUpstreamChecks(parseUpstreamChecks(s.upstream_checks)),
     ...withLink(parseLinkStatus(s.link)),
     update: engineUpdate(s.update),
+    ...withRestart(parseRestartToTrust(s.restart_to_trust)),
   };
 }
 
