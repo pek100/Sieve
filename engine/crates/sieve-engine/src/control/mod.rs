@@ -188,6 +188,8 @@ impl Engine {
         let exclusions = Arc::new(ExclusionSlot::new(dir.as_deref(), &policy.exclusions, policy::wall_ms()));
         let meters: Arc<Meters> = Arc::default();
         let heal = Arc::new(Heal::new(exclusions.clone(), meters.clone()));
+        let book: Arc<Mutex<FlowBook>> = Arc::default();
+        heal.log_to(book.clone());
         let validation = Arc::new(crate::tls::validation::ValidationSlot::new(meters.clone()));
         let link = Arc::new(crate::link::LinkManager::new(dir.as_deref(), Box::new(net_now), policy::wall_ms));
         link.set_sieving(policy.sieving);
@@ -204,7 +206,7 @@ impl Engine {
             facts: Mutex::new(Facts { dns_file_error: unused_dns_file, ..Facts::default() }),
             dns_upstreams: Mutex::new(dns_upstreams),
             dns_service: Mutex::new(None),
-            book: Arc::default(),
+            book,
             names: Arc::default(),
             meters,
             filter,
@@ -551,6 +553,8 @@ impl Engine {
             upstream_checks: decrypting.then(|| self.validation.in_use(crate::policy::wall_ms())),
             update,
             link: Some(self.link.status()),
+            // Nothing is decrypted otherwise, so no restart would change anything.
+            restart_to_trust: if decrypting { self.heal.restart_to_trust() } else { Vec::new() },
         }
     }
 }
@@ -1519,7 +1523,7 @@ mod tests {
         assert!(production.contains("watch: engine.heal.clone(),"));
         assert!(!production.contains("NoWatch"));
         let e = Engine::new(None, PathBuf::new(), Policy::default(), Runs::default(), None);
-        let pair = crate::tls::intercept::Pair { exe: Some(r"C:\Apps\Client.exe".into()), host: "pin.example".into(), session: Some(1) };
+        let pair = crate::tls::intercept::Pair::of(Some(r"C:\Apps\Client.exe"), "pin.example", Some(1));
         use crate::tls::intercept::ClientWatch;
         e.heal.handshake_failed(&pair, Some(rustls::AlertDescription::UnknownCA));
         let ip = "192.0.2.1".parse().unwrap();

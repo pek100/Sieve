@@ -95,6 +95,18 @@ pub struct Pair {
     pub host: String,
     /// The flow's Windows session: what a notice of this pair is scoped to.
     pub session: Option<u32>,
+    /// The flow's process, when attribution named one.
+    pub pid: Option<u32>,
+    /// When the root that minted this connection's leaf was installed
+    /// (`Minter::installed_ms`); None before a leaf was minted.
+    pub root_ms: Option<u64>,
+}
+
+impl Pair {
+    /// A pair of no process and no leaf yet, as tests and the HTTP layer name one.
+    pub fn of(exe: Option<&str>, host: &str, session: Option<u32>) -> Self {
+        Self { exe: exe.map(str::to_string), host: host.to_string(), session, pid: None, root_ms: None }
+    }
 }
 
 /// How a client ended an accepted connection on which it sent no request.
@@ -120,6 +132,13 @@ pub trait ClientWatch: Send + Sync {
     /// An accepted connection ended. `silence` is there only when the client ended
     /// it without one request; an end by the engine or the upstream has none.
     fn ended(&self, pair: &Pair, silence: Option<Silence>);
+    /// True while this process is known to refuse Sieve's certificate because it
+    /// started before Sieve's root was installed (`heal`): its flows pass through
+    /// until it restarts. Asked once per flow, by pid.
+    fn distrusts(&self, pid: u32) -> bool {
+        let _ = pid;
+        false
+    }
 }
 
 pub struct NoWatch;
@@ -180,6 +199,7 @@ pub struct FlowMeta<'a> {
     pub remote: SocketAddr,
     pub exe: Option<&'a str>,
     pub session: Option<u32>,
+    pub pid: Option<u32>,
     /// Whose flow. Its row can turn Off while the flow waits, so every judgment
     /// asks the snapshot of that moment and nothing here holds the answer.
     pub owner: Owner<'a>,
@@ -195,6 +215,7 @@ pub struct Who<'a> {
     pub remote: SocketAddr,
     pub exe: Option<&'a str>,
     pub session: Option<u32>,
+    pub pid: Option<u32>,
     pub may_decrypt: bool,
     pub app_off: bool,
     pub names_now_ms: u64,
@@ -203,7 +224,7 @@ pub struct Who<'a> {
 impl FlowMeta<'_> {
     /// This flow as `filter` reads it now.
     pub fn who(&self, filter: &FilterSlot) -> Who<'_> {
-        Who { remote: self.remote, exe: self.exe, session: self.session, may_decrypt: self.owner.may_decrypt(), app_off: filter.get().is_off(self.owner), names_now_ms: self.names_now_ms }
+        Who { remote: self.remote, exe: self.exe, session: self.session, pid: self.pid, may_decrypt: self.owner.may_decrypt(), app_off: filter.get().is_off(self.owner), names_now_ms: self.names_now_ms }
     }
 }
 
@@ -317,6 +338,7 @@ impl<C: Dial> Interception<C> {
             app_in_scope: self.exclusions.in_scope(who.exe),
             app_off: who.app_off,
             upstream: None,
+            root_not_trusted: who.pid.is_some_and(|pid| self.watch.distrusts(pid)),
         }
     }
 
@@ -571,9 +593,10 @@ where
     });
     let config = minted.and_then(|(minter, minted)| {
         let alpn = shaken.alpn.iter().cloned().collect();
-        server_config(minted.der.clone(), minter.root_der().to_vec(), minter.leaf_key_pkcs8().to_vec(), alpn).map_err(|_| PassReason::Floor(Floor::NoRoot))
+        let config = server_config(minted.der.clone(), minter.root_der().to_vec(), minter.leaf_key_pkcs8().to_vec(), alpn).map_err(|_| PassReason::Floor(Floor::NoRoot))?;
+        Ok((config, minter.installed_ms()))
     });
-    let config = match config {
+    let (config, root_ms) = match config {
         Ok(config) => config,
         Err(reason) => {
             let host = host.to_string();
@@ -583,7 +606,7 @@ where
             return deps.fresh_splice(&mut app, flow.id, flow.remote, &host, &held).await;
         }
     };
-    let pair = Pair { exe: flow.exe.map(str::to_string), host: host.to_string(), session: flow.session };
+    let pair = Pair { exe: flow.exe.map(str::to_string), host: host.to_string(), session: flow.session, pid: flow.pid, root_ms: Some(root_ms) };
     // The client has our answer by now, so a close can only end the flow. That
     // says nothing about the client, so the watch does not hear of it.
     let accepted = tokio::select! {
@@ -599,7 +622,11 @@ where
         Ok(Err(e)) => {
             let alert = alert_in(&e);
             deps.watch.handshake_failed(&pair, alert);
-            lock(&deps.book).problem(flow.id, if alert.is_some() { Signal::AppRefusedCertificate } else { Signal::HandshakeAbandoned });
+            // A process that only needs a restart to trust the root is no problem of
+            // the app's: the watch logged it once, and its next flows pass through.
+            if !flow.pid.is_some_and(|pid| deps.watch.distrusts(pid)) {
+                lock(&deps.book).problem(flow.id, if alert.is_some() { Signal::AppRefusedCertificate } else { Signal::HandshakeAbandoned });
+            }
             return FlowAction::Failed;
         }
         Err(_) => {

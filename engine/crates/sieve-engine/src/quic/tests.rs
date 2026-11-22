@@ -70,7 +70,7 @@ impl Case {
     }
 
     fn who(&self) -> Who<'static> {
-        Who { remote: self.remote, exe: self.exe, session: self.session, may_decrypt: self.may_decrypt, app_off: self.app_off, names_now_ms: 0 }
+        Who { remote: self.remote, exe: self.exe, session: self.session, pid: None, may_decrypt: self.may_decrypt, app_off: self.app_off, names_now_ms: 0 }
     }
 }
 
@@ -197,7 +197,7 @@ fn refused_iff_decrypt_intercepts() {
             let alpn: Vec<String> = ALPNS[alpn].iter().map(ToString::to_string).collect();
             let decoded = Decoded { kind: Some(Kind::Quic), domain: HOSTS[host].map(str::to_string), alpn: alpn.clone(), ech, failure: None, offer: if compatible { good_offer() } else { TlsOffer::default() } };
             let remote = SocketAddr::new(REMOTE.parse::<SocketAddr>().unwrap().ip(), port);
-            let who = Who { remote, exe: EXES[exe], session: SESSIONS[session], may_decrypt, app_off, names_now_ms: 0 };
+            let who = Who { remote, exe: EXES[exe], session: SESSIONS[session], pid: None, may_decrypt, app_off, names_now_ms: 0 };
 
             // The same inputs, written out by hand, to the one function.
             let upstream = match (HOSTS[host], VERDICTS[verdict]) {
@@ -219,6 +219,7 @@ fn refused_iff_decrypt_intercepts() {
                 app_in_scope: EXES[exe] == Some(CHROME),
                 app_off,
                 upstream,
+                root_not_trusted: false,
             };
             let store = deps.exclusions.get_at(now);
             let switches = deps.exclusions.switches(!deps.active.is_closed(), *root_ready);
@@ -569,7 +570,7 @@ async fn an_app_turned_off_ends_its_refused_flow_and_no_other() {
     assert_eq!(tokio::time::Instant::now(), started, "ended on that datagram, not by idling");
     assert_eq!(sink.count(), 1, "and no reply went");
     // What the new flow is told: relayed, for the reason the log gives.
-    let who = Who { remote: REMOTE.parse().unwrap(), exe: Some(CHROME), session: Some(1), may_decrypt: true, app_off: true, names_now_ms: 0 };
+    let who = Who { remote: REMOTE.parse().unwrap(), exe: Some(CHROME), session: Some(1), pid: None, may_decrypt: true, app_off: true, names_now_ms: 0 };
     assert_eq!(path(Action::Pass, &slot, &h3(HOST), &who, rig.open_flow()), UdpPath::Relay);
 }
 
@@ -730,7 +731,7 @@ async fn through_the_stack(rig: &Rig, local: SocketAddr, remote: SocketAddr, arm
 
     let slot = slot_of(rig);
     let id = rig.open_flow();
-    let who = Who { remote, exe: Some(CHROME), session: Some(1), may_decrypt: true, app_off: false, names_now_ms: 0 };
+    let who = Who { remote, exe: Some(CHROME), session: Some(1), pid: None, may_decrypt: true, app_off: false, names_now_ms: 0 };
     let answer = path(Action::Pass, &slot, &decoded, &who, id);
     let sink = FakeSink::default();
     if let UdpPath::Refuse(_) = answer {

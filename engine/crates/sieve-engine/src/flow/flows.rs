@@ -524,6 +524,14 @@ pub enum Action {
     Drop,
 }
 
+/// 100 ns ticks from 1601-01-01 between a FILETIME's epoch and Unix's.
+const FILETIME_UNIX_TICKS: u64 = 116_444_736_000_000_000;
+
+/// A FILETIME (100 ns ticks since 1601) as ms since the Unix epoch; None before it.
+pub fn filetime_ms(ticks: u64) -> Option<u64> {
+    ticks.checked_sub(FILETIME_UNIX_TICKS).map(|t| t / 10_000)
+}
+
 /// The OS lookups the probe uses. Read only.
 #[cfg(windows)]
 pub mod os {
@@ -601,6 +609,32 @@ pub mod os {
         let _ = unsafe { CloseHandle(handle) };
         ok.ok()?;
         buf.get(..len as usize).map(String::from_utf16_lossy).filter(|p| !p.is_empty())
+    }
+
+    /// When a running process started, ms since the Unix epoch; None when Windows
+    /// refuses, or the process has exited (a handle someone still holds keeps its
+    /// pid, and its times say it ended). With the pid it names one process: a pid
+    /// reused later has another start.
+    pub fn started_ms(pid: u32) -> Option<u64> {
+        use windows::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+        if pid == 0 || pid == 4 {
+            return None;
+        }
+        // SAFETY: plain call; the handle is closed below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let (mut created, mut exited, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        // SAFETY: four valid out pointers to locals.
+        let read = unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
+        // SAFETY: `handle` came from OpenProcess and is closed once.
+        let _ = unsafe { CloseHandle(handle) };
+        read.ok()?;
+        let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+        if ticks(exited) != 0 {
+            return None;
+        }
+        super::filetime_ms(ticks(created))
     }
 
     /// The name the app shows for `pid` when its exe is hidden from the app.
@@ -829,6 +863,25 @@ mod tests {
 
     fn udp(local: &str, remote: &str) -> FiveTuple {
         FiveTuple { proto: Proto::Udp, local: sa(local), remote: sa(remote) }
+    }
+
+    #[test]
+    fn a_filetime_reads_as_unix_ms() {
+        assert_eq!(filetime_ms(FILETIME_UNIX_TICKS), Some(0));
+        // 2026-10-26T08:53:20Z, the tests' NOW elsewhere.
+        assert_eq!(filetime_ms(FILETIME_UNIX_TICKS + 1_793_000_000_000 * 10_000 + 9_999), Some(1_793_000_000_000));
+        assert_eq!(filetime_ms(FILETIME_UNIX_TICKS - 1), None, "before 1970 is no time this engine compares");
+    }
+
+    /// This test's own process: running, so it has a start, and that start is in the past.
+    #[cfg(windows)]
+    #[test]
+    fn this_process_has_a_start_and_a_pid_of_none_does_not() {
+        let started = os::started_ms(std::process::id()).expect("our own start");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        assert!(started <= now && now - started < 24 * 3_600_000, "{started} vs {now}");
+        assert_eq!(os::started_ms(0), None);
+        assert_eq!(os::started_ms(4), None);
     }
 
     fn port_dword(p: u16) -> [u8; 4] {

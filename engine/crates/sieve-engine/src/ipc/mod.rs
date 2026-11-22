@@ -180,7 +180,7 @@ where
         Err(FrameError::Closed) => return Ok(()),
         Err(e) => return refuse(stream, &e.to_string()).await,
     };
-    let status = |s: EngineStatus| EngineMessage::Status(s.for_app(&capabilities));
+    let status = |s: EngineStatus| EngineMessage::Status(s.for_app(&capabilities).for_session(session_id));
     loop {
         let reply = match read_frame::<_, ClientMessage>(stream).await {
             Ok(ClientMessage::Status) => status(backend.status()),

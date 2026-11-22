@@ -128,7 +128,9 @@ pub const TRACKING_NAMES: &[&str] = &["gpc", "searchQueries", "clientData", "ref
 /// field added to a message the app reads strictly goes only to an app that names
 /// it, so an app from before the field keeps reading the message. An engine
 /// ignores a name it does not know.
-pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE, CAPABILITY_WIFI_SIGN_IN, CAPABILITY_UPSTREAM_CHECKS, CAPABILITY_LINK];
+pub const APP_CAPABILITIES: &[&str] = &[CAPABILITY_DNS_CAPTURE, CAPABILITY_WIFI_SIGN_IN, CAPABILITY_UPSTREAM_CHECKS, CAPABILITY_LINK, CAPABILITY_RESTART_TO_TRUST];
+/// [`EngineStatus::restart_to_trust`].
+pub const CAPABILITY_RESTART_TO_TRUST: &str = "restart_to_trust";
 /// [`EngineStatus::upstream_checks`].
 pub const CAPABILITY_UPSTREAM_CHECKS: &str = "upstream_checks";
 /// [`EngineStatus::link`]: exiting through another device (a Sieve link hub).
@@ -1150,6 +1152,24 @@ pub struct EngineStatus {
     /// for an app that does not name [`CAPABILITY_LINK`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkStatus>,
+    /// Apps with a process open that refused Sieve's certificate because it
+    /// started before Sieve's root was installed: each trusts the root once it
+    /// restarts, and until then its connections are not decrypted. Gone when the
+    /// process is. The receiving session's only ([`EngineStatus::for_session`]).
+    /// Left out while empty, by an engine from before it, and for an app that does
+    /// not name [`CAPABILITY_RESTART_TO_TRUST`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_to_trust: Vec<RestartApp>,
+}
+
+/// One app that needs a restart to trust Sieve's root. Takes unknown fields, as
+/// [`EngineStatus`] does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartApp {
+    /// The exe's file name, lower case (`firefox.exe`).
+    pub exe: String,
+    /// Its Windows session.
+    pub session: u32,
 }
 
 /// The local checks of an upstream chain (plan 2.6, slice 11) that have data.
@@ -1182,6 +1202,16 @@ impl EngineStatus {
         if !capabilities.iter().any(|c| c == CAPABILITY_LINK) {
             self.link = None;
         }
+        if !capabilities.iter().any(|c| c == CAPABILITY_RESTART_TO_TRUST) {
+            self.restart_to_trust.clear();
+        }
+        self
+    }
+
+    /// The status as the app of `session` may read it: another user's apps are not its news.
+    #[must_use]
+    pub fn for_session(mut self, session: u32) -> Self {
+        self.restart_to_trust.retain(|a| a.session == session);
         self
     }
 }
@@ -2343,7 +2373,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&parsed).unwrap(), bare, "empty is left out");
         let named = ClientMessage::Hello { protocol: PROTOCOL, app_version: "0.2.0".into(), capabilities: APP_CAPABILITIES.iter().map(ToString::to_string).collect() };
         let wire = serde_json::to_value(&named).unwrap();
-        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture", "wifi_sign_in", "upstream_checks", "link"]));
+        assert_eq!(wire["capabilities"], serde_json::json!(["dns_capture", "wifi_sign_in", "upstream_checks", "link", "restart_to_trust"]));
         assert_eq!(serde_json::from_value::<ClientMessage>(wire).unwrap(), named);
 
         let status = EngineStatus { routes_up: true, dns_capture: Some(DnsCapture::Working), ..EngineStatus::default() };
@@ -2391,6 +2421,29 @@ mod tests {
         newer["wifi_sign_in"] = serde_json::json!({ "network": "n", "paused_left_s": 9, "later": true });
         let EngineMessage::Status(read) = serde_json::from_value(newer).unwrap() else { panic!("a status") };
         assert_eq!(read.wifi_sign_in, Some(WifiSignIn { network: "n".into(), paused_left_s: Some(9), wifi: false }));
+    }
+
+    /// The apps that need a restart (2026-11-22): only to an app that names the
+    /// capability, only its own session's, left out while empty; an engine from
+    /// before it says nothing, and a later engine's row with a field more still reads.
+    #[test]
+    fn restart_to_trust_goes_only_to_an_app_that_names_it_and_only_its_sessions() {
+        assert!(serde_json::to_value(EngineStatus::default()).unwrap().get("restart_to_trust").is_none(), "nothing to say is left out");
+        let firefox = |session| RestartApp { exe: "firefox.exe".into(), session };
+        let status = EngineStatus { routes_up: true, restart_to_trust: vec![firefox(1), firefox(2)], ..EngineStatus::default() };
+        assert_eq!(serde_json::from_value::<EngineStatus>(serde_json::to_value(&status).unwrap()).unwrap(), status, "the round trip");
+        let older_app = status.clone().for_app(&[CAPABILITY_DNS_CAPTURE.into(), CAPABILITY_LINK.into()]);
+        assert!(serde_json::to_value(&older_app).unwrap().get("restart_to_trust").is_none(), "an app from before it reads what it always did");
+        let all: Vec<String> = APP_CAPABILITIES.iter().map(ToString::to_string).collect();
+        assert_eq!(status.clone().for_app(&all).for_session(2).restart_to_trust, [firefox(2)], "another user's apps are not this one's news");
+        assert!(status.clone().for_app(&all).for_session(3).restart_to_trust.is_empty());
+        let f = fixture();
+        let mut old_engine = f["engine"].as_array().unwrap().iter().find(|m| m["type"] == "status").unwrap().clone();
+        let EngineMessage::Status(read) = serde_json::from_value(old_engine.clone()).unwrap() else { panic!("a status") };
+        assert!(read.restart_to_trust.is_empty(), "an engine from before it");
+        old_engine["restart_to_trust"] = serde_json::json!([{ "exe": "firefox.exe", "session": 1, "later": 1 }]);
+        let EngineMessage::Status(read) = serde_json::from_value(old_engine).unwrap() else { panic!("a status") };
+        assert_eq!(read.restart_to_trust, [firefox(1)]);
     }
 
     /// The upstream checks' fact goes only to an app that names it, is left out
