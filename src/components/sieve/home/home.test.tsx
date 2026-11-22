@@ -210,7 +210,7 @@ describe("home copy and KPIs", () => {
     await vi.waitFor(() => expect(engine()).toHaveAttribute("data-engine-phase", "filtering"));
     expect(within(engine()).getByText("Filtering hosts")).toBeInTheDocument();
     expect(document.body.textContent ?? "").not.toMatch(CLAIMS);
-    // HTTPS filtering is off on a fresh install: the tile points at its switch, and claims nothing.
+    // HTTPS filtering is off for an install from before: the tile points at its switch, and claims nothing.
     expect(within(engine()).getByRole("link", { name: "Filter inside web pages too" })).toHaveAttribute("href", expect.stringMatching(/^\/settings\/?#setting-filtering\.https$/));
   });
 

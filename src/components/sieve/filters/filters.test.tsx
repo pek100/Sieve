@@ -605,7 +605,7 @@ describe("your own lists", () => {
   });
 });
 
-/** The options are offered since the HTTPS switch is (2026-11-20); with it off on a fresh install, each waits for it. */
+/** The options are offered since the HTTPS switch is (2026-11-20); with it off (an install from before 2026-11-22), each waits for it. */
 describe("tracking protection, offered with the HTTPS switch", () => {
   it("is at Balanced, the recommended level, every option locked with the reason once, and nothing can change it", async () => {
     // An install from before 2026-11-22 with nothing set: routing, HTTPS and page filtering off.

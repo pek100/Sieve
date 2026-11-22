@@ -1264,12 +1264,12 @@ describe("engine controller", () => {
       s.undo();
     });
 
-    it("the HTTPS switch is off on a fresh install, and sent as stored once the person turns it on", async () => {
-      const fresh = setup("idle", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
-      await fresh.fc.flush();
-      expect(fresh.fake.policies).toEqual([policy(1, true)]);
-      expect(fresh.fake.policies[0].https).toBe(false);
-      fresh.undo();
+    it("the HTTPS switch stays off for an install from before with routing on, and is sent as stored once the person turns it on", async () => {
+      const old = setup("idle", memoryBackend({ schema: 5, values: { [SWITCH]: true } }));
+      await old.fc.flush();
+      expect(old.fake.policies).toEqual([policy(1, true)]);
+      expect(old.fake.policies[0].https).toBe(false);
+      old.undo();
       const s = setup("idle", memoryBackend({ schema: 4, values: { [SWITCH]: true, [HTTPS_SWITCH]: true } }));
       await s.fc.flush();
       expect(s.fake.policies[0]).toMatchObject({ engine: true, https: true, content: false });
