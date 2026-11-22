@@ -22,6 +22,14 @@
 //! so its pages work undecrypted until it restarts; one log row says so, and the
 //! status names it for the app's notice. A process whose start cannot be read
 //! counts as before.
+//!
+//! Only a refused handshake with a trust alert ([`dials::TRUST_ALERTS`]) marks a
+//! process, and never one seen to complete a handshake under that root (review of
+//! 2026-11-22, P1): Chrome, Edge and Brave read the Windows store live, and Edge
+//! with startup boost runs from logon, so an old process is no sign of an untrusting
+//! one. A process that accepted a leaf trusts the root; its later refusals are about
+//! the site and score as they always did. An alert after the handshake, a silent
+//! end, `ech_required` or a weak alert score as they always did, too.
 
 pub mod dials;
 pub mod notices;
@@ -47,10 +55,16 @@ use score::{Evidence, Ledger};
 /// be read or the process has exited.
 pub type ProcessStart = Box<dyn Fn(u32) -> Option<u64> + Send + Sync>;
 
-/// Processes remembered at once as needing a restart, oldest first out: one per
-/// browser process a person has open, with room to spare. A forgotten one counts
-/// its next refusal again, which only puts it back.
+/// Processes remembered at once as needing a restart, least recently seen first
+/// out: one per browser process a person has open, with room to spare. A forgotten
+/// one counts its next refusal again, which only puts it back.
 pub const MAX_UNTRUSTING: usize = 64;
+/// (process, root) pairs remembered as having completed a handshake under that
+/// root, least recently seen first out: one per process that makes TLS connections,
+/// with room to spare. A forgotten process that then refuses with a trust alert and
+/// started before the root is taken for one that needs a restart, which only lets
+/// its flows through undecrypted until it restarts.
+pub const MAX_TRUSTING: usize = 256;
 
 /// The log reason of the one row per such process.
 pub const RESTART_TO_TRUST: &str = "restart-to-trust";
@@ -75,19 +89,38 @@ fn process_start() -> ProcessStart {
     Box::new(|_| None)
 }
 
-/// Evidence that can exclude: a refusal, or a connection the client ended unused.
-fn could_exclude(evidence: Evidence) -> bool {
-    matches!(evidence, Evidence::Refused(_) | Evidence::Ended(Some(_)))
+/// A handshake refused because the client does not trust the issuer: the only
+/// evidence that can say a process has not read Sieve's root. An end, even with
+/// an alert, followed a completed handshake, so that client trusted the leaf.
+fn refused_for_trust(evidence: Evidence) -> bool {
+    matches!(evidence, Evidence::Refused(Some(alert)) if dials::TRUST_ALERTS.contains(&alert))
 }
 
-/// The same connection with what it said taken away: a handshake it refused opened
-/// nothing, and an end still closes its connection in the count.
-fn without_evidence(evidence: Evidence) -> Option<Evidence> {
+/// The client's alert, in the handshake or on a connection it never used.
+fn alert_of(evidence: Evidence) -> Option<AlertDescription> {
     match evidence {
-        Evidence::Refused(_) => None,
-        Evidence::Ended(Some(_)) => Some(Evidence::Ended(None)),
-        other => Some(other),
+        Evidence::Refused(alert) | Evidence::Ended(Some(Silence { alert, .. })) => alert,
+        _ => None,
     }
+}
+
+/// Moves `item` to the back of `list` (the most recently seen), adding it if new,
+/// and drops the front past `cap`. True when it was new.
+fn seen<T: PartialEq>(list: &mut Vec<T>, item: T, cap: usize) -> bool {
+    let new = match list.iter().position(|x| *x == item) {
+        Some(at) => {
+            let item = list.remove(at);
+            list.push(item);
+            false
+        }
+        None => {
+            list.push(item);
+            true
+        }
+    };
+    let over = list.len().saturating_sub(cap);
+    list.drain(..over);
+    new
 }
 
 /// What "Try decrypting again" names. Only ever `auto:*` entries.
@@ -105,6 +138,11 @@ struct State {
     notices: Notices,
     trouble: trouble::Trouble,
     untrusting: Vec<Untrusting>,
+    /// (pid, root's install time) of processes that completed a handshake under
+    /// that root. The pid alone names the process here: one that accepted a leaf
+    /// of a root was running after the root's install, so a later process with
+    /// its pid started after the install too, and is never taken for older.
+    trusting: Vec<(u32, u64)>,
 }
 
 pub struct Heal {
@@ -142,12 +180,20 @@ impl Heal {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// True when this evidence comes from a process that started before the root
-    /// that minted its leaf: it is then no evidence. Remembers the process, and
-    /// logs it the first time. Unknown pid, root or start: false, as before.
+    /// True when this evidence is a trust refusal from a process that started
+    /// before the root that minted its leaf and never completed a handshake under
+    /// it: it is then no evidence. Remembers the process, and logs it the first
+    /// time. A completed handshake is remembered as trust, and forgets the process
+    /// as needing a restart. Unknown pid, root or start: false, as before.
     fn before_root(&self, pair: &Pair, exe: &str, session: u32, evidence: Evidence) -> bool {
         let (Some(pid), Some(root_ms)) = (pair.pid, pair.root_ms) else { return false };
-        if !could_exclude(evidence) {
+        if evidence == Evidence::Accepted {
+            let mut state = self.state();
+            seen(&mut state.trusting, (pid, root_ms), MAX_TRUSTING);
+            state.untrusting.retain(|u| u.pid != pid);
+            return false;
+        }
+        if !refused_for_trust(evidence) || self.state().trusting.contains(&(pid, root_ms)) {
             return false;
         }
         let Some(started_ms) = (self.started)(pid) else { return false };
@@ -159,13 +205,7 @@ impl Heal {
             let mut state = self.state();
             // A pid seen with another start was another process: it is gone.
             state.untrusting.retain(|u| u.pid != pid || u.started_ms == started_ms);
-            let new = !state.untrusting.contains(&process);
-            if new {
-                state.untrusting.push(process);
-                let over = state.untrusting.len().saturating_sub(MAX_UNTRUSTING);
-                state.untrusting.drain(..over);
-            }
-            new
+            seen(&mut state.untrusting, process, MAX_UNTRUSTING)
         };
         if new && let Some(book) = self.book.get() {
             let outcome = LogOutcome::NotDecrypted { reason: RESTART_TO_TRUST.to_string() };
@@ -193,9 +233,11 @@ impl Heal {
     pub fn hear(&self, pair: &Pair, evidence: Evidence, now_ms: u64) {
         let (Some(exe), Some(session)) = (pair.exe.as_deref(), pair.session) else { return };
         let Some(evidence) = silence_only_for_apps(evidence, self.exclusions.in_scope(Some(exe))) else { return };
-        // After the browser rule, so a process start is read only for what could still exclude.
-        let evidence = if self.before_root(pair, exe, session, evidence) { without_evidence(evidence) } else { Some(evidence) };
-        let Some(evidence) = evidence else { return };
+        // After the browser rule, so a process start is read only for what could still
+        // exclude. A handshake it refused opened nothing, so nothing is left to count.
+        if self.before_root(pair, exe, session, evidence) {
+            return;
+        }
         let mut state = self.state();
         let app = trouble::key(exe, session);
         state.trouble.heard(&app, now_ms);
@@ -213,7 +255,8 @@ impl Heal {
             return;
         }
         // A second refusal of a held entry says nothing new, and raises no notice.
-        if self.exclusions.add_auto(AutoEntry::for_app(&pair.host, exe, AutoReason::Pinning, now_ms), now_ms) {
+        let entry = AutoEntry { ech: alert_of(evidence) == Some(AlertDescription::EncryptedClientHelloRequired), ..AutoEntry::for_app(&pair.host, exe, AutoReason::Pinning, now_ms) };
+        if self.exclusions.add_auto(entry, now_ms) {
             Meters::bump(&self.meters.https.healed);
             state.notices.push(session, &exe_file_name(exe), &pair.host.to_ascii_lowercase(), now_ms);
         }
@@ -308,15 +351,24 @@ impl ClientWatch for Heal {
         self.hear(pair, Evidence::Ended(silence), wall_ms());
     }
 
-    /// A process remembered as needing a restart, still the same process. Windows
-    /// is asked only for a pid that is remembered.
+    /// A process remembered as needing a restart, still the same process; each hit
+    /// makes it the most recently seen. Windows is asked only for a pid that is
+    /// remembered.
     fn distrusts(&self, pid: u32) -> bool {
         let Some(started_ms) = self.state().untrusting.iter().find(|u| u.pid == pid).map(|u| u.started_ms) else { return false };
-        if (self.started)(pid) == Some(started_ms) {
-            return true;
+        let same = (self.started)(pid) == Some(started_ms);
+        let mut state = self.state();
+        match state.untrusting.iter().position(|u| u.pid == pid && u.started_ms == started_ms) {
+            Some(at) if same => {
+                let process = state.untrusting.remove(at);
+                state.untrusting.push(process);
+            }
+            Some(at) => {
+                state.untrusting.remove(at);
+            }
+            None => return false,
         }
-        self.state().untrusting.retain(|u| u.pid != pid || u.started_ms != started_ms);
-        false
+        same
     }
 }
 
@@ -679,7 +731,7 @@ mod tests {
         let (h, _, book) = heal_with_starts();
         for (n, host) in ["youtube.example", "a.example", "b.example", "c.example"].into_iter().enumerate() {
             h.hear(&of(OLD, host, ROOT), refused(), NOW + n as u64);
-            h.hear(&of(OLD, host, ROOT), Evidence::Ended(Some(Silence { after: std::time::Duration::ZERO, alert: Some(FATAL_ALERTS[0]) })), NOW + n as u64);
+            h.hear(&of(OLD, host, ROOT), refused(), NOW + n as u64 + BURST_MS + 1);
         }
         assert!(h.exclusions.rows(NOW + 10).is_empty(), "no Rejected row, and not the whole app either");
         assert!(h.notices(0).1.is_empty() && h.meters.https.healed.load(Ordering::Relaxed) == 0);
@@ -739,7 +791,89 @@ mod tests {
         starts.lock().unwrap().remove(&OLD);
         assert!(h.restart_to_trust().is_empty(), "exited");
         assert!(!h.distrusts(OLD));
-        let _ = book;
+        assert_eq!(restart_rows(&book).len(), 1, "the first process's one row");
+    }
+
+    /// P1 of the 2026-11-22 review: Chrome, Edge and Brave read the Windows store
+    /// live, and Edge with startup boost is older than almost any root. One that
+    /// completed a handshake under the root trusts it: a later refusal is about the
+    /// site, excluded as always, and the process is not marked.
+    #[test]
+    fn an_old_process_that_accepted_a_leaf_of_the_root_is_judged_as_before() {
+        let (h, _, book) = heal_with_starts();
+        h.hear(&of(OLD, "other.example", ROOT), Evidence::Accepted, NOW);
+        h.hear(&of(OLD, HOST, ROOT), refused(), NOW + 1);
+        assert_eq!(found(&h, CLIENT, NOW + 1), Some(Src::Auto(AutoReason::Pinning)), "a refusal, excluded at once as before");
+        assert!(!h.distrusts(OLD) && h.restart_to_trust().is_empty() && restart_rows(&book).is_empty());
+        // A leaf of another root says nothing of this one: after a rotation it is judged by its start again.
+        let rotated = NOW + 3_600_000;
+        h.hear(&of(OLD, "late.example", rotated), refused(), rotated + 1);
+        assert!(h.distrusts(OLD), "older than the new root and never seen to trust it");
+    }
+
+    /// The same process, marked first, then seen to complete a handshake under the
+    /// root (a connection that was in flight): it trusts the root, so it is no longer named.
+    #[test]
+    fn a_completed_handshake_takes_a_process_off_the_list() {
+        let (h, _, _) = heal_with_starts();
+        h.hear(&of(OLD, HOST, ROOT), refused(), NOW);
+        assert!(h.distrusts(OLD));
+        h.hear(&of(OLD, HOST, ROOT), Evidence::Accepted, NOW + 1);
+        assert!(!h.distrusts(OLD) && h.restart_to_trust().is_empty());
+    }
+
+    /// Only a refused handshake with a trust alert marks a process. A weak alert,
+    /// `ech_required`, a silent give-up, or any end (the handshake completed, so
+    /// the client trusted the leaf) scores as it always did.
+    #[test]
+    fn only_a_trust_alert_in_the_handshake_marks_an_old_process() {
+        let quiet = |alert| Evidence::Ended(Some(Silence { after: std::time::Duration::ZERO, alert }));
+        let cases = [
+            ("weak", Evidence::Refused(Some(AlertDescription::HandshakeFailure)), false),
+            ("ech", Evidence::Refused(Some(AlertDescription::EncryptedClientHelloRequired)), true),
+            ("decrypt_error", Evidence::Refused(Some(AlertDescription::DecryptError)), true),
+            ("given up", Evidence::Refused(None), false),
+            ("ended with unknown_ca", quiet(Some(AlertDescription::UnknownCA)), true),
+            ("ended silently", quiet(None), false),
+        ];
+        for (name, evidence, excludes_at_once) in cases {
+            let (h, _, book) = heal_with_starts();
+            h.hear(&of(OLD, HOST, ROOT), evidence, NOW);
+            assert!(!h.distrusts(OLD) && h.restart_to_trust().is_empty() && restart_rows(&book).is_empty(), "{name}: not marked");
+            assert_eq!(found(&h, CLIENT, NOW).is_some(), excludes_at_once, "{name}: scored as before");
+        }
+        for alert in dials::TRUST_ALERTS {
+            let (h, _, _) = heal_with_starts();
+            h.hear(&of(OLD, HOST, ROOT), Evidence::Refused(Some(alert)), NOW);
+            assert!(h.distrusts(OLD) && found(&h, CLIENT, NOW).is_none(), "{alert:?} marks it and excludes nothing");
+        }
+    }
+
+    /// P3-4: the list keeps the processes most recently seen. One whose flows keep
+    /// asking stays while newer refusals push the rest out.
+    #[test]
+    fn the_list_drops_the_least_recently_seen_process() {
+        let (h, starts, _) = heal_with_starts();
+        h.hear(&of(OLD, HOST, ROOT), refused(), NOW);
+        for pid in 100..100 + MAX_UNTRUSTING as u32 * 2 {
+            starts.lock().unwrap().insert(pid, ROOT - 1);
+            h.hear(&Pair { pid: Some(pid), ..of(OLD, HOST, ROOT) }, refused(), NOW);
+            assert!(h.distrusts(OLD), "pid {pid}: its next flow keeps it");
+        }
+        assert!(!h.distrusts(100), "the least recently seen went");
+        assert_eq!(h.state().untrusting.len(), MAX_UNTRUSTING);
+    }
+
+    /// P3-7: an exclusion for `ech_required` is about the name, not the root, so a
+    /// new root does not try it again; a trust refusal heard as long ago is tried.
+    #[test]
+    fn a_new_root_does_not_retry_an_ech_exclusion() {
+        let h = heal();
+        h.hear(&pair(CLIENT, "ech.example"), Evidence::Refused(Some(AlertDescription::EncryptedClientHelloRequired)), NOW);
+        h.hear(&pair(CLIENT, HOST), refused(), NOW);
+        assert_eq!(h.exclusions.retry_before_root(NOW + 10, NOW + 20), 1);
+        let held: Vec<String> = h.exclusions.rows(NOW + 20).into_iter().filter(|r| r.reason == "auto:pinning").map(|r| r.line).collect();
+        assert_eq!(held, ["\"ech.example\""]);
     }
 
     #[test]

@@ -59,6 +59,7 @@ struct Case {
     remote: SocketAddr,
     exe: Option<&'static str>,
     session: Option<u32>,
+    pid: Option<u32>,
     may_decrypt: bool,
     app_off: bool,
     decoded: Decoded,
@@ -66,11 +67,30 @@ struct Case {
 
 impl Case {
     fn base() -> Self {
-        Self { remote: REMOTE.parse().unwrap(), exe: Some(CHROME), session: Some(1), may_decrypt: true, app_off: false, decoded: h3(HOST) }
+        Self { remote: REMOTE.parse().unwrap(), exe: Some(CHROME), session: Some(1), pid: Some(OTHER_PID), may_decrypt: true, app_off: false, decoded: h3(HOST) }
     }
 
     fn who(&self) -> Who<'static> {
-        Who { remote: self.remote, exe: self.exe, session: self.session, pid: None, may_decrypt: self.may_decrypt, app_off: self.app_off, names_now_ms: 0 }
+        Who { remote: self.remote, exe: self.exe, session: self.session, pid: self.pid, may_decrypt: self.may_decrypt, app_off: self.app_off, names_now_ms: 0 }
+    }
+}
+
+/// The base flow's process, which no watch distrusts.
+const OTHER_PID: u32 = 40;
+/// A process the watch says needs a restart to trust Sieve's root (slice 7).
+const UNTRUSTING_PID: u32 = 41;
+
+/// A watch that hears nothing and distrusts [`UNTRUSTING_PID`] only, as `heal` does
+/// for a browser started before the root that refused its leaf.
+struct Untrusting;
+
+impl crate::tls::intercept::ClientWatch for Untrusting {
+    fn handshake_failed(&self, _: &crate::tls::intercept::Pair, _: Option<rustls::AlertDescription>) {}
+    fn accepted(&self, _: &crate::tls::intercept::Pair) {}
+    fn request_seen(&self, _: &crate::tls::intercept::Pair) {}
+    fn ended(&self, _: &crate::tls::intercept::Pair, _: Option<crate::tls::intercept::Silence>) {}
+    fn distrusts(&self, pid: u32) -> bool {
+        pid == UNTRUSTING_PID
     }
 }
 
@@ -118,6 +138,9 @@ fn the_base_flow_is_refused() {
     assert_eq!(judged(&rig, &Case::base()), (UdpPath::Refuse(REFUSAL), vec![QUIC_REFUSED.to_string()]));
     assert_eq!(rig.deps.meters.https.passed.load(Ordering::Relaxed), 0, "a refusal is not a pass-through");
     assert_eq!(rig.deps.connector.count(), 0, "nothing was dialled");
+    // The control of the root-not-trusted row: the same watch, another process.
+    let watched = rig_with(|o| o.watch = Arc::new(Untrusting));
+    assert_eq!(judged(&watched, &Case::base()), (UdpPath::Refuse(REFUSAL), vec![QUIC_REFUSED.to_string()]));
 }
 
 #[test]
@@ -126,7 +149,9 @@ fn relayed_table() {
     fn no_prep(_: &Rig) {}
     type Row = (&'static str, fn(&mut RigOpts), fn(&Rig), fn(&mut Case));
     const LISTED: &str = "listed.example\n";
-    let rows: [Row; 18] = [
+    let rows: [Row; 19] = [
+        // Slice 7: its next flows, QUIC too, go to the site undecrypted, not refused.
+        ("floor:root-not-trusted", |o| o.watch = Arc::new(Untrusting), no_prep, |c| c.pid = Some(UNTRUSTING_PID)),
         ("app_off", no_change, no_prep, |c| c.app_off = true),
         ("user", no_change, |r| r.deps.exclusions.set_user(&[HOST.to_string()], wall_ms()), |_| {}),
         ("list:sensitive", |o| o.sources = vec![seeded("sensitive", LISTED)], no_prep, |c| c.decoded = h3("www.listed.example")),

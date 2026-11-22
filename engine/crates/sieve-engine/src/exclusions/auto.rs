@@ -81,12 +81,34 @@ pub struct AutoEntry {
     /// older engine reads past it, and loses it when it rewrites the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heard_ms: Option<u64>,
+    /// Written for an `ech_required` alert: what it said was about the name, not
+    /// Sieve's root, so a new root does not try it again (review of 2026-11-22,
+    /// P3-7). An entry from before it reads false. Left out while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ech: bool,
+    /// The root (its install time) a new root's retry last tried this entry for,
+    /// kept when the entry is written again: tried at most once per root whatever
+    /// the clocks say ([`Self::heard_before`]). None until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retried_for_root: Option<u64>,
 }
 
 impl AutoEntry {
     /// An entry for exactly this host and every app.
     pub fn host(host: &str, reason: AutoReason, created_ms: u64, expires_ms: Option<u64>) -> Self {
-        Self { pattern: Pattern::Exact(host.to_ascii_lowercase()), app: None, reason, created_ms, expires_ms, retries: 0, retrying: false, rule: PINNING_RULE, heard_ms: Some(created_ms) }
+        Self {
+            pattern: Pattern::Exact(host.to_ascii_lowercase()),
+            app: None,
+            reason,
+            created_ms,
+            expires_ms,
+            retries: 0,
+            retrying: false,
+            rule: PINNING_RULE,
+            heard_ms: Some(created_ms),
+            ech: false,
+            retried_for_root: None,
+        }
     }
 
     /// Written by an evidence rule this engine no longer believes.
@@ -95,9 +117,10 @@ impl AutoEntry {
     }
 
     /// A refusal of a leaf of a root older than the one installed at `root_ms`:
-    /// what it said was about that root, so the new root deserves one try.
+    /// what it said was about that root, so the new root deserves one try, and
+    /// only one. Never an `ech_required` one, which is about the name.
     pub fn heard_before(&self, root_ms: u64) -> bool {
-        self.reason == AutoReason::Pinning && self.heard_ms.unwrap_or(self.created_ms) < root_ms
+        self.reason == AutoReason::Pinning && !self.ech && self.retried_for_root != Some(root_ms) && self.heard_ms.unwrap_or(self.created_ms) < root_ms
     }
 
     /// An entry for exactly this host and one app.

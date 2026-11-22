@@ -2053,7 +2053,8 @@ arms!(a_browser_started_before_the_root_passes_through_and_excludes_nothing, |ar
     let stale = super::client_config(Pki::new("Roots Read At Start").roots(), &[]).unwrap();
     assert!(tokio_rustls::TlsConnector::from(Arc::new(stale)).connect(ServerName::try_from(HOST).unwrap(), app).await.is_err());
     assert_eq!(task.await.unwrap().action, FlowAction::Failed);
-    let _ = rig.reasons();
+    let problems: Vec<LogOutcome> = rig.deps.book.lock().unwrap().take_log().into_iter().map(|r| r.outcome).filter(|o| matches!(o, LogOutcome::Problem { .. })).collect();
+    assert_eq!(problems, [], "no AppRefusedCertificate for a process that only needs a restart");
     assert!(heal.notices(0).1.is_empty() && rig.deps.meters.https.healed.load(Ordering::Relaxed) == 0, "nothing excluded");
     assert!(rig.deps.exclusions.rows(wall_ms()).iter().all(|r| !r.reason.starts_with("auto:")));
     // Its next connection: the real certificate, which it trusts.
@@ -2073,6 +2074,8 @@ arms!(a_browser_started_before_the_root_passes_through_and_excludes_nothing, |ar
     task.await.unwrap();
     assert_eq!(heal.notices(0).1.len(), 1);
     assert!(rig.deps.exclusions.rows(wall_ms()).iter().any(|r| r.reason == "auto:pinning"));
+    let problems: Vec<LogOutcome> = rig.deps.book.lock().unwrap().take_log().into_iter().map(|r| r.outcome).filter(|o| matches!(o, LogOutcome::Problem { .. })).collect();
+    assert_eq!(problems, [LogOutcome::Problem { signal: sieve_ipc::Signal::AppRefusedCertificate, cause: sieve_ipc::Cause::Sieve }], "the control: its refusal is the flow's problem");
 });
 
 /// A client that handshakes and leaves without a word.

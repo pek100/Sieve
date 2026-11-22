@@ -144,9 +144,12 @@ mod tests {
         until("the row heard before it is tried again", || lines().is_empty()).await;
         let after = r.ca.minter().unwrap().installed_ms() + 1_000;
         r.engine.exclusions.add_auto(AutoEntry::for_app("new.example", "firefox.exe", AutoReason::Pinning, after), after);
+        // The signal that a pass ran over both: a second row heard before the root goes.
+        r.engine.exclusions.add_auto(AutoEntry::for_app("late.example", "firefox.exe", AutoReason::Pinning, before), before);
+        assert_eq!(lines().len(), 2, "the control: both held");
         r.engine.ca_wake.notify_one();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(lines(), ["\"new.example\""], "a refusal under this root stands");
+        until("the pass tried the row heard before the root", || !lines().contains(&"\"late.example\"".to_string())).await;
+        assert_eq!(lines(), ["\"new.example\""], "and the refusal under this root stands");
         stop.send(true).unwrap();
         task.await.unwrap();
     }

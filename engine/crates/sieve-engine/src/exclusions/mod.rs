@@ -463,6 +463,7 @@ impl ExclusionSlot {
         if let Some(before) = &before {
             entry.retries = before.retries;
             entry.created_ms = before.created_ms;
+            entry.retried_for_root = entry.retried_for_root.or(before.retried_for_root);
         }
         let newly = before.is_none_or(|b| b.retrying);
         layers.auto.push(entry);
@@ -536,14 +537,22 @@ impl ExclusionSlot {
     /// refuses writes the entry again, heard now, so it is not tried again for this
     /// root; a refusal by a process older than the root is no evidence (`heal`) and
     /// writes none. Idempotent: the certificate loop calls it after every reconcile.
+    /// Each entry records the root it was tried for and is tried once per root, so a
+    /// clock that went back cannot make a loop of it; a root dated after now (the
+    /// clock went back since it was made) tries nothing, since "heard before" means
+    /// nothing then. An `ech_required` entry is about the name and is left alone.
     /// (`auto:failing` is left alone: it is memory only, goes within a day, and keeps
     /// its first date when written again, so this would try it at every call.) The
     /// entries tried.
     pub fn retry_before_root(&self, root_ms: u64, now_ms: u64) -> usize {
+        if root_ms > now_ms {
+            return 0;
+        }
         let mut layers = lock(&self.layers);
         let mut tried = 0;
         for entry in layers.auto.iter_mut().filter(|e| e.is_held(now_ms) && e.heard_before(root_ms)) {
             entry.retrying = true;
+            entry.retried_for_root = Some(root_ms);
             tried += 1;
         }
         if tried > 0 {
@@ -772,6 +781,30 @@ mod tests {
         let restarted = ExclusionSlot::new(Some(dir.path()), &[], root + 7);
         assert_eq!(restarted.retry_before_root(root, root + 7), 0, "the time it was heard survives a restart");
         assert!(!restarted.rows(root + 7).iter().any(|r| r.line == "\"legacy.example\""), "and so does the try");
+    }
+
+    /// P3-3 of the 2026-11-22 review: clocks. A root dated after now tries nothing;
+    /// a row refused again under the root with a clock that went back is still
+    /// tried only once for that root, and that survives a restart.
+    #[test]
+    fn a_new_root_retries_a_row_once_whatever_the_clocks_say() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        let root = NOW + DAY;
+        slot.add_auto(AutoEntry::for_app("old.example", "firefox.exe", AutoReason::Pinning, NOW), NOW);
+        let held = |at: u64| slot.rows(at).into_iter().any(|r| r.line == "\"old.example\"");
+        assert_eq!(slot.retry_before_root(root, root - 1), 0, "a root from the future: the clock went back");
+        assert!(held(root - 1));
+        assert_eq!(slot.retry_before_root(root, root), 1);
+        // Refused again, heard by a clock an hour behind: before the root by the clock.
+        let behind = root - 3_600_000;
+        slot.add_auto(AutoEntry::for_app("old.example", "firefox.exe", AutoReason::Pinning, behind), behind);
+        assert_eq!(slot.retry_before_root(root, root + 1), 0, "tried for this root already");
+        assert!(held(root + 1));
+        slot.flush();
+        let restarted = ExclusionSlot::new(Some(dir.path()), &[], root + 2);
+        assert_eq!(restarted.retry_before_root(root, root + 2), 0, "and after a restart");
+        assert_eq!(restarted.retry_before_root(root + DAY, root + DAY), 1, "the next root tries it once more");
     }
 
     #[test]
