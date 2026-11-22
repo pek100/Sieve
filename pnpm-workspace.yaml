@@ -1,3 +1,13 @@
 allowBuilds:
   sharp: false
   unrs-resolver: false
+
+# Patched versions of packages that only the shadcn CLI (a development tool) pulls in,
+# for advisories in them (audit of 2026-11-22). None of them ships with Sieve.
+overrides:
+  body-parser@>=2.0.0 <2.4.0: ">=2.4.0"
+  systeminformation@<5.33.16: ">=5.33.16"
+  zod@<4.6.6: "^4.6.6"
+  fast-uri@>=3.0.0 <3.1.9: ">=3.1.9"
+  hono@<4.13.16: ">=4.13.16"
+  "@hono/node-server@>=2.0.0 <2.1.6": ">=2.1.6"
