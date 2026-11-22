@@ -80,11 +80,12 @@ pub fn notice_visible_to(notice: &sieve_ipc::HealNotice, session: u32) -> bool {
 }
 
 /// What a decision says in the log; None when nothing was decided. With the
-/// switch off the engine sieves nothing, and a lookup is never a decision.
+/// switch off the engine sieves nothing, and a lookup is never a decision. Windows'
+/// own internet test is no filtering decision either (`stack::connectivity`).
 pub fn log_outcome(decision: &Decision) -> Option<LogOutcome> {
     let passed = |reason: &str| Some(LogOutcome::Passed { reason: reason.to_string() });
     match decision.reason {
-        Reason::Disabled | Reason::Dns => None,
+        Reason::Disabled | Reason::Dns | Reason::ConnectivityProbe => None,
         Reason::NamedBlock | Reason::AllResolvedNamesBlocked => Some(LogOutcome::Blocked),
         Reason::AppExempt => passed("app_off"),
         Reason::NamedAllow => passed("exception"),
@@ -634,6 +635,7 @@ mod tests {
         let id = b.open(event(Some(1))).unwrap();
         b.log_decision(id, &decided(Reason::Disabled, None, None), 1);
         b.log_decision(id, &decided(Reason::Dns, None, None), 1);
+        b.log_decision(id, &crate::domain::Decision::connectivity_probe(), 1);
         assert!(b.take_log().is_empty());
         b.close(id, FlowAction::Relayed, 0, 0);
         b.log_decision(id, &decided(Reason::NamedNoRule, None, None), 1);
