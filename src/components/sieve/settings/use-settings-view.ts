@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useMemo, useSyncExternalStore } from "react";
-import { engineInForce, engineLockReason } from "@/core/engine";
+import { engineLockReason } from "@/core/engine";
 import { isShut, type LockPhase } from "@/core/lock";
 import { ROUTES, type RouteDef } from "@/core/routes";
 import { readValue, type SettingsDoc } from "@/core/settings/document";
@@ -28,19 +28,36 @@ export type Lock =
   | { kind: "requires"; label: string; checking: boolean; unavailable?: boolean }
   /**
    * The engine carries it out (registry `needsEngine`) and cannot take a
-   * policy now. `reason` is one line from the engine's phase; `inForce` is
-   * the engine's own value, null when it did not say (the row shows off).
+   * policy now. `reason` is one line from the engine's phase; the row shows
+   * the saved choice (`valueInForce`).
    */
-  | { kind: "engine"; reason: string; inForce: boolean | null };
+  | { kind: "engine"; reason: string };
 
 /**
- * A setting's value in force: what the engine itself holds for a setting it
- * carries out but cannot take now (off when it did not say), else the stored value.
+ * A setting's value as the row shows it: the saved choice, also for a setting the
+ * engine carries out but cannot take now. The engine lock's note says the choice
+ * waits for the engine (`ENGINE_WAITS_TEXT`), so the row never reads as the
+ * person's setting having changed (owner's decision of 2026-11-22: rows that read
+ * off right after an install looked like the switches had been turned off).
  */
-export function valueInForce(key: SettingKey, doc: SettingsDoc, lock: Lock | null): unknown {
-  const engineLock = lock?.kind === "password" ? lock.beneath : lock;
-  return engineLock?.kind === "engine" ? engineLock.inForce === true : readValue(doc, key);
+export function valueInForce(key: SettingKey, doc: SettingsDoc): unknown {
+  return readValue(doc, key);
 }
+
+/** Whether a row's saved choice waits for the engine (an engine lock, also under the password). */
+export function waitsForEngine(lock: Lock | null): boolean {
+  return (lock?.kind === "password" ? lock.beneath : lock)?.kind === "engine";
+}
+
+/**
+ * A switch whose choice waits for the engine: the logo's dashes, moving
+ * (globals.css), on a plain track with the knob ringed when on, as the master
+ * switch's partial state draws it.
+ */
+export const PENDING_SWITCH_CLASS = "switch-partial animate-dashes data-checked:bg-surface-3 [&>[data-slot=switch-thumb]]:ring-2 [&>[data-slot=switch-thumb]]:ring-primary";
+
+/** Added to an engine lock's reason: the row shows the saved choice, not the engine's. */
+export const ENGINE_WAITS_TEXT = "Your choice here is saved and takes effect once the engine can take it.";
 
 export interface SettingsView {
   doc: SettingsDoc;
@@ -93,7 +110,7 @@ export function useSettingsView(query: string, blocks: ReadonlySet<Section>): Se
       if (d.desktopOnly && !(hydrated && isTauri)) return { kind: "desktop" };
       if (needsEngine(key)) {
         const reason = engineLockReason(engine);
-        if (reason !== null) return { kind: "engine", reason, inForce: engineInForce(engine) };
+        if (reason !== null) return { kind: "engine", reason };
       }
       if (d.requires) {
         const label = isSettingKey(d.requires) ? REGISTRY[d.requires].label : d.requires;

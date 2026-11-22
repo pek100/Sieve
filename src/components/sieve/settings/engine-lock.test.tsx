@@ -8,6 +8,7 @@ import type { EngineSource } from "@/data/engine-source";
 import { createMockSource } from "@/data/mock-source";
 import type { EnginePolicy } from "@/data/protocol";
 import { memoryBackend } from "@/data/settings-store";
+import { ENGINE_WAITS_TEXT } from "./use-settings-view";
 import { createRuntime } from "@/hooks/runtime";
 import { SieveProvider } from "@/hooks/sieve-provider";
 import { SettingsScreen } from "./settings-screen";
@@ -56,7 +57,7 @@ describe("a setting the engine carries out is locked while the engine cannot tak
   });
 
   it.each(["checking", ...ENGINE_SCENARIOS] as const)("law: every needsEngine switch follows the engine lock in %s", async (scenario) => {
-    // Stored on, as an old file or another window would leave it: the row must not show it as in force.
+    // Stored on: the row shows that saved choice, disabled and moving, and says it waits for the engine.
     const s = await setup(scenario, true);
     const phase = s.phase();
     const unreached = (ENGINE_UNREACHED as readonly string[]).includes(phase);
@@ -66,11 +67,14 @@ describe("a setting the engine carries out is locked while the engine cannot tak
       const lock = r.querySelector("[data-lock=engine]");
       if (unreached) {
         expect(sw, `${scenario} ${key}`).toBeDisabled();
-        expect(sw, `${scenario} ${key}`).not.toBeChecked();
+        expect(sw, `${scenario} ${key}`).toBeChecked();
+        expect(sw, `${scenario} ${key}`).toHaveAttribute("data-pending");
         expect(lock, `${scenario} ${key}`).toHaveTextContent(ENGINE_LOCK_TEXT[phase as EngineUnreached]);
+        expect(lock, `${scenario} ${key}`).toHaveTextContent(ENGINE_WAITS_TEXT);
         expect(s.runtime.settings.get(key), `${scenario} ${key}`).toBe(true);
       } else {
         expect(lock, `${scenario} ${key}`).toBeNull();
+        expect(sw, `${scenario} ${key}`).not.toHaveAttribute("data-pending");
         // A switch that builds on another (HTTPS on routing, page filtering on HTTPS)
         // may still wait for that one: that is its own lock, never the engine's.
         if (r.querySelector("[data-lock]") === null) expect(sw, `${scenario} ${key}`).toBeEnabled();
@@ -97,7 +101,7 @@ describe("a setting the engine carries out is locked while the engine cannot tak
     expect(s.policies).toEqual([]);
   });
 
-  it("a locked row uses the known engine policy even when the saved wish differs", async () => {
+  it("a locked row shows the saved choice even when the engine holds another", async () => {
     const s = await setup("idle", false);
     const e = s.runtime.store.getState().engine;
     const pipe = e.probe!.pipe!;
@@ -113,7 +117,8 @@ describe("a setting the engine carries out is locked while the engine cannot tak
     for (const key of ENGINE_KEYS) {
       const sw = within(row(key)).getByRole("switch");
       expect(sw).toBeDisabled();
-      expect(sw).toBeChecked();
+      expect(sw).not.toBeChecked();
+      expect(sw).toHaveAttribute("data-pending");
       await userEvent.click(sw);
       expect(s.runtime.settings.get(key)).toBe(false);
     }

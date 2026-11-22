@@ -145,6 +145,8 @@
   --ease-emph-out: var(--easing-emph-out);
   --animate-breathe: breathe var(--motion-pulse) var(--easing-standard) infinite;
   --animate-shimmer: shimmer 1.2s linear infinite;
+  /* One stripe period of switch-partial (6px across, at 45deg: 6 * sqrt 2 along x). */
+  --animate-dashes: dashes 0.8s linear infinite;
 
   @keyframes breathe {
     0%,
@@ -161,6 +163,14 @@
     }
     to {
       background-position: -200% 0;
+    }
+  }
+  @keyframes dashes {
+    from {
+      background-position: 0 0;
+    }
+    to {
+      background-position: 8.4853px 0;
     }
   }
 }
@@ -326,7 +336,8 @@
     display: none;
   }
   .animate-breathe,
-  .animate-shimmer {
+  .animate-shimmer,
+  .animate-dashes {
     animation: none;
   }
 }

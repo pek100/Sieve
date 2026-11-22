@@ -6,8 +6,8 @@ import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { LockNote } from "@/components/sieve/settings/setting-row";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { useSettingsView, valueInForce } from "@/components/sieve/settings/use-settings-view";
-import { ADGUARD_PAUSE_TEXT, HTTPS_HREF, HTTPS_INVITE, HTTPS_SWITCH } from "@/core/engine";
+import { PENDING_SWITCH_CLASS, useSettingsView, valueInForce, waitsForEngine } from "@/components/sieve/settings/use-settings-view";
+import { ADGUARD_PAUSE_TEXT, HTTPS_HREF, HTTPS_INVITE, HTTPS_SWITCH, engineInForce } from "@/core/engine";
 import type { Section } from "@/core/settings/registry";
 import { dataSwitchSummary, switchesState, welcomeAdguard, welcomeSteps } from "@/core/welcome";
 import { useEngine, useEngineActions } from "@/hooks/use-sieve";
@@ -30,16 +30,18 @@ export function WelcomeScreen({ onDone }: { onDone: () => void }) {
   const [offerSeen, setOfferSeen] = useState(false);
   const switches = dataSwitchSummary().map((s) => {
     const lock = lockOf(s.key);
-    return { ...s, lock, on: valueInForce(s.key, doc, lock) === true };
+    const on = valueInForce(s.key, doc) === true;
+    // The switch shows the saved choice; what the guide says is in force is the engine's own.
+    return { ...s, lock, on, inForce: waitsForEngine(lock) ? engineInForce(engine) === true : on };
   });
   const steps = welcomeSteps(
     engine,
     offerSeen,
     switchesState(
-      switches.map((s) => s.on),
+      switches.map((s) => s.inForce),
       engine,
     ),
-    switches.some((s) => s.key === HTTPS_SWITCH && s.on),
+    switches.some((s) => s.key === HTTPS_SWITCH && s.inForce),
   );
   const index = Math.min(at, steps.length - 1);
   const step = steps[index];
@@ -78,7 +80,7 @@ export function WelcomeScreen({ onDone }: { onDone: () => void }) {
                       {s.lock && <LockNote lock={s.lock} />}
                     </div>
                     <div className="flex min-h-11 shrink-0 items-center">
-                      <Switch checked={s.on} disabled={s.lock !== null} onCheckedChange={(v) => set(s.key, v)} aria-labelledby={labelId} aria-describedby={helpId} />
+                      <Switch checked={s.on} disabled={s.lock !== null} data-pending={waitsForEngine(s.lock) ? "" : undefined} className={waitsForEngine(s.lock) ? PENDING_SWITCH_CLASS : undefined} onCheckedChange={(v) => set(s.key, v)} aria-labelledby={labelId} aria-describedby={helpId} />
                     </div>
                   </li>
                 );

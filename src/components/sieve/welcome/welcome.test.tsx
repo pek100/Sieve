@@ -242,11 +242,13 @@ describe("the steps", () => {
     expect(step()).toBe("switches");
     const switches = [...document.querySelectorAll("[data-welcome-switch]")].map((e) => e.getAttribute("data-welcome-switch"));
     expect(switches).toEqual(SETTING_KEYS.filter((k) => settingDef(k).kind === "dataSwitch" && isAvailable(k)));
-    // No engine installed: as on the Settings row, the engine's own value (none, so off), locked, and why.
+    // No engine installed: as on the Settings row, the saved choice (a new install's: on), locked,
+    // moving, and why; the step's words say what is in force (off).
     for (const s of dataSwitchSummary()) {
       const sw = screen.getByRole("switch", { name: s.label });
       expect(sw).toBeDisabled();
-      expect(sw).not.toBeChecked();
+      expect(sw).toBeChecked();
+      expect(sw).toHaveAttribute("data-pending");
       expect(document.querySelector(`[data-welcome-switch="${s.key}"] [data-lock=engine]`), s.key).not.toBeNull();
     }
     expect(screen.getByText(/and they are off/)).toBeInTheDocument();
@@ -351,15 +353,16 @@ describe("the steps", () => {
       expect(screen.queryByText("Your network is as it was")).toBeNull();
     });
 
-    it("the engine stopped: its own value is in force, as on the Settings row, so off", async () => {
+    it("the engine stopped: the switch shows the saved choice, waiting; the step says off, the engine's own", async () => {
       const sw = await walk("stopped");
-      expect(sw).not.toBeChecked();
+      expect(sw).toBeChecked();
+      expect(sw).toHaveAttribute("data-pending");
       expect(sw).toBeDisabled();
       expect(screen.getByText(/and they are off/)).toBeInTheDocument();
     });
 
     it.each(["refused", "error"] as const)("%s: the engine did not say, so the step does not claim off", async (scenario) => {
-      expect(await walk(scenario)).not.toBeChecked();
+      expect(await walk(scenario)).toHaveAttribute("data-pending");
       expect(screen.queryByText(/and they are off/)).toBeNull();
       expect(screen.getByText(/Sieve cannot read the engine/)).toBeInTheDocument();
     });

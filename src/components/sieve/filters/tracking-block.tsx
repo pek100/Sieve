@@ -72,7 +72,7 @@ export function TrackingBlock() {
         <ul aria-label="Tracking protection options" className="flex flex-col gap-4">
           {offered.map((k) => (
             // A locked option shows what is in effect, off, never the wish it keeps: the level above says the choice.
-            <TrackingOption key={k} k={k} lock={locks.get(k) ?? null} reason={reasons.get(k) ?? null} showLock={shared === null} on={hydrated && locks.get(k) === null && valueInForce(k, doc, null) === true} onSet={(v) => view.set(k, v)} />
+            <TrackingOption key={k} k={k} lock={locks.get(k) ?? null} reason={reasons.get(k) ?? null} showLock={shared === null} on={hydrated && locks.get(k) === null && valueInForce(k, doc) === true} onSet={(v) => view.set(k, v)} />
           ))}
         </ul>
       </div>

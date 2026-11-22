@@ -12,7 +12,7 @@ import type { SettingsDoc } from "@/core/settings/document";
 import { defaultValue, settingDef, type SettingKey } from "@/core/settings/registry";
 import { formatNumber, formatValue, numberChoices } from "@/core/settings/transfer";
 import { UpstreamRow } from "./upstream-row";
-import { valueInForce, type Lock } from "./use-settings-view";
+import { ENGINE_WAITS_TEXT, PENDING_SWITCH_CLASS, valueInForce, waitsForEngine, type Lock } from "./use-settings-view";
 
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -33,7 +33,7 @@ export function LockNote({ lock }: { lock: Lock }) {
         {lock.kind === "desktop" ? (
           "Only the desktop app can change this."
         ) : lock.kind === "engine" ? (
-          lock.reason
+          `${lock.reason} ${ENGINE_WAITS_TEXT}`
         ) : lock.checking ? (
           `Needs ${lock.label} to pass its self check.`
         ) : lock.unavailable ? (
@@ -51,9 +51,8 @@ export function LockNote({ lock }: { lock: Lock }) {
  * boolean and data switch as a switch, number as a select of its steps, map
  * and list as a summary (they are edited on their own screen) with a reset, a
  * list of upstreams as its editor, chosen by the element's shape.
- * A locked row shows its control disabled at the value in force, with the
- * reason under the help text (an engine lock: the engine's own value, never
- * the stored wish it could not send).
+ * A locked row shows its control disabled at the saved value, with the reason
+ * under the help text (an engine lock also says the choice waits for the engine).
  */
 export function SettingRow({
   k,
@@ -74,7 +73,7 @@ export function SettingRow({
   note?: React.ReactNode;
 }) {
   const d = settingDef(k);
-  const value = valueInForce(k, doc, lock);
+  const value = valueInForce(k, doc);
   const labelId = `setting-${k}-label`;
   const helpId = `setting-${k}-help`;
   const disabled = lock !== null;
@@ -137,6 +136,8 @@ export function SettingRow({
         <Switch
           checked={value === true}
           disabled={disabled}
+          data-pending={waitsForEngine(lock) ? "" : undefined}
+          className={waitsForEngine(lock) ? PENDING_SWITCH_CLASS : undefined}
           onCheckedChange={(v) => onSet(k, v)}
           aria-labelledby={labelId}
           aria-describedby={helpId}
