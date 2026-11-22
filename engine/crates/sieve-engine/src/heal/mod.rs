@@ -23,13 +23,15 @@
 //! status names it for the app's notice. A process whose start cannot be read
 //! counts as before.
 //!
-//! Only a refused handshake with a trust alert ([`dials::TRUST_ALERTS`]) marks a
-//! process, and never one seen to complete a handshake under that root (review of
-//! 2026-11-22, P1): Chrome, Edge and Brave read the Windows store live, and Edge
-//! with startup boost runs from logon, so an old process is no sign of an untrusting
-//! one. A process that accepted a leaf trusts the root; its later refusals are about
-//! the site and score as they always did. An alert after the handshake, a silent
-//! end, `ech_required` or a weak alert score as they always did, too.
+//! Only a trust alert ([`dials::TRUST_ALERTS`]), in the handshake or right after
+//! it on a connection never used, marks a process, and never one seen to send a
+//! request under that root (review of 2026-11-22, P1): Chrome, Edge and Brave read
+//! the Windows store live, and Edge with startup boost runs from logon, so an old
+//! process is no sign of an untrusting one. A process that sent a request trusts the
+//! root; its later refusals are about the site and score as they always did. A
+//! completed handshake proves nothing (round 2, P1): Firefox without the root
+//! completes it on Sieve's side and then sends unknown_ca. A silent end,
+//! `ech_required` or a weak alert score as they always did.
 
 pub mod dials;
 pub mod notices;
@@ -89,11 +91,14 @@ fn process_start() -> ProcessStart {
     Box::new(|_| None)
 }
 
-/// A handshake refused because the client does not trust the issuer: the only
-/// evidence that can say a process has not read Sieve's root. An end, even with
-/// an alert, followed a completed handshake, so that client trusted the leaf.
+/// A trust alert from the client: the only evidence that can say a process has not
+/// read Sieve's root. Measured (`docs/tasks/2026-11-08-vm-slices-7-11-status.md`):
+/// Firefox without the root sends unknown_ca in the handshake (`Refused`), and also
+/// right after a handshake that completed on Sieve's side (`Ended` with the alert,
+/// about 1 ms later, no request), so both forms count. A completed handshake is no
+/// proof of trust; a request is.
 fn refused_for_trust(evidence: Evidence) -> bool {
-    matches!(evidence, Evidence::Refused(Some(alert)) if dials::TRUST_ALERTS.contains(&alert))
+    matches!(evidence, Evidence::Refused(Some(alert)) | Evidence::Ended(Some(Silence { alert: Some(alert), .. })) if dials::TRUST_ALERTS.contains(&alert))
 }
 
 /// The client's alert, in the handshake or on a connection it never used.
@@ -138,10 +143,10 @@ struct State {
     notices: Notices,
     trouble: trouble::Trouble,
     untrusting: Vec<Untrusting>,
-    /// (pid, root's install time) of processes that completed a handshake under
-    /// that root. The pid alone names the process here: one that accepted a leaf
-    /// of a root was running after the root's install, so a later process with
-    /// its pid started after the install too, and is never taken for older.
+    /// (pid, root's install time) of processes that sent a request under a leaf of
+    /// that root. The pid alone names the process here: one that used a leaf of a
+    /// root was running after the root's install, so a later process with its pid
+    /// started after the install too, and is never taken for older.
     trusting: Vec<(u32, u64)>,
 }
 
@@ -181,13 +186,14 @@ impl Heal {
     }
 
     /// True when this evidence is a trust refusal from a process that started
-    /// before the root that minted its leaf and never completed a handshake under
-    /// it: it is then no evidence. Remembers the process, and logs it the first
-    /// time. A completed handshake is remembered as trust, and forgets the process
-    /// as needing a restart. Unknown pid, root or start: false, as before.
+    /// before the root that minted its leaf and never sent a request under it: it
+    /// is then no evidence. Remembers the process, and logs it the first time. A
+    /// request is remembered as trust, and forgets the process as needing a
+    /// restart; a completed handshake is not (an untrusting Firefox completes one
+    /// and then sends unknown_ca). Unknown pid, root or start: false, as before.
     fn before_root(&self, pair: &Pair, exe: &str, session: u32, evidence: Evidence) -> bool {
         let (Some(pid), Some(root_ms)) = (pair.pid, pair.root_ms) else { return false };
-        if evidence == Evidence::Accepted {
+        if evidence == Evidence::Used {
             let mut state = self.state();
             seen(&mut state.trusting, (pid, root_ms), MAX_TRUSTING);
             state.untrusting.retain(|u| u.pid != pid);
@@ -236,6 +242,11 @@ impl Heal {
         // After the browser rule, so a process start is read only for what could still
         // exclude. A handshake it refused opened nothing, so nothing is left to count.
         if self.before_root(pair, exe, session, evidence) {
+            // An end still closes its connection in the count, scoring nothing, or
+            // the pair would look busy to the next process of this exe.
+            if matches!(evidence, Evidence::Ended(_)) {
+                self.state().ledger.hear(exe, &pair.host, Evidence::Ended(None), now_ms);
+            }
             return;
         }
         let mut state = self.state();
@@ -796,12 +807,14 @@ mod tests {
 
     /// P1 of the 2026-11-22 review: Chrome, Edge and Brave read the Windows store
     /// live, and Edge with startup boost is older than almost any root. One that
-    /// completed a handshake under the root trusts it: a later refusal is about the
-    /// site, excluded as always, and the process is not marked.
+    /// sent a request under the root trusts it: a later refusal is about the site,
+    /// excluded as always, and the process is not marked. A completed handshake
+    /// alone proves nothing (round 2, P1).
     #[test]
     fn an_old_process_that_accepted_a_leaf_of_the_root_is_judged_as_before() {
         let (h, _, book) = heal_with_starts();
         h.hear(&of(OLD, "other.example", ROOT), Evidence::Accepted, NOW);
+        h.hear(&of(OLD, "other.example", ROOT), Evidence::Used, NOW);
         h.hear(&of(OLD, HOST, ROOT), refused(), NOW + 1);
         assert_eq!(found(&h, CLIENT, NOW + 1), Some(Src::Auto(AutoReason::Pinning)), "a refusal, excluded at once as before");
         assert!(!h.distrusts(OLD) && h.restart_to_trust().is_empty() && restart_rows(&book).is_empty());
@@ -809,37 +822,97 @@ mod tests {
         let rotated = NOW + 3_600_000;
         h.hear(&of(OLD, "late.example", rotated), refused(), rotated + 1);
         assert!(h.distrusts(OLD), "older than the new root and never seen to trust it");
+        // Accepted only, then unknown_ca on the unused connection: no trust, marked, nothing excluded.
+        let (h, _, book) = heal_with_starts();
+        h.hear(&of(OLD, HOST, ROOT), Evidence::Accepted, NOW);
+        h.hear(&of(OLD, HOST, ROOT), Evidence::Ended(Some(Silence { after: std::time::Duration::from_millis(1), alert: Some(AlertDescription::UnknownCA) })), NOW);
+        assert!(h.distrusts(OLD) && found(&h, CLIENT, NOW).is_none() && h.exclusions.rows(NOW).is_empty(), "a handshake is no proof of trust");
+        assert_eq!(restart_rows(&book).len(), 1);
     }
 
-    /// The same process, marked first, then seen to complete a handshake under the
-    /// root (a connection that was in flight): it trusts the root, so it is no longer named.
+    /// Chromium: an old process that accepted a leaf and sent a request, then a weak
+    /// alert, is not marked and scores exactly as a flow with no pid does.
     #[test]
-    fn a_completed_handshake_takes_a_process_off_the_list() {
+    fn an_old_process_that_sent_a_request_then_a_weak_alert_scores_as_before() {
+        let weak = Evidence::Ended(Some(Silence { after: std::time::Duration::ZERO, alert: Some(AlertDescription::HandshakeFailure) }));
+        let run = |p: &dyn Fn(&str) -> Pair| {
+            let (h, _, book) = heal_with_starts();
+            let burst = |n: u64| NOW + n * (BURST_MS + 1);
+            h.hear(&p("other.example"), Evidence::Accepted, NOW);
+            h.hear(&p("other.example"), Evidence::Used, NOW);
+            h.hear(&p("other.example"), Evidence::Ended(None), NOW);
+            let mut seen = Vec::new();
+            for n in 1..4 {
+                h.hear(&p(HOST), Evidence::Accepted, burst(n));
+                h.hear(&p(HOST), weak, burst(n));
+                seen.push(found(&h, CLIENT, burst(n)).is_some());
+            }
+            assert!(!h.distrusts(OLD) && h.restart_to_trust().is_empty() && restart_rows(&book).is_empty(), "not marked");
+            seen
+        };
+        let old = run(&|host| of(OLD, host, ROOT));
+        let control = run(&|host| Pair { pid: None, ..of(OLD, host, ROOT) });
+        assert_eq!(old, control, "scored as before");
+        assert!(old.contains(&true), "the control: weak alerts do exclude in the end");
+    }
+
+    /// The measured Firefox without Sieve's root (vm-slices-7-11 status, enterprise roots off): a
+    /// handshake completed on Sieve's side, unknown_ca about 1 ms after it, then
+    /// unknown_ca in the next handshake. Marked once, nothing excluded, one row; the
+    /// unused connection is closed in the count, so a later process is judged freely.
+    #[test]
+    fn firefox_without_the_root_is_marked_once_and_excludes_nothing() {
+        let (h, _, book) = heal_with_starts();
+        let unknown_ca = Some(AlertDescription::UnknownCA);
+        h.hear(&of(OLD, HOST, ROOT), Evidence::Accepted, NOW);
+        h.hear(&of(OLD, HOST, ROOT), Evidence::Ended(Some(Silence { after: std::time::Duration::from_millis(1), alert: unknown_ca })), NOW);
+        h.hear(&of(OLD, HOST, ROOT), Evidence::Refused(unknown_ca), NOW + 1);
+        assert!(h.distrusts(OLD));
+        assert!(h.exclusions.rows(NOW + 1).is_empty() && h.notices(0).1.is_empty(), "no exclusion, no notice");
+        assert_eq!(restart_rows(&book), [(Some(OLD), HOST.to_string(), Some(1))], "one restart row");
+        assert_eq!(h.restart_to_trust(), [RestartApp { exe: "client.exe".into(), session: 1 }]);
+        // The connection the old process left is not open: a new process's weak refusals score.
+        let weak = Evidence::Refused(Some(AlertDescription::HandshakeFailure));
+        h.hear(&of(NEW, HOST, ROOT), weak, NOW + 2);
+        h.hear(&of(NEW, HOST, ROOT), weak, NOW + 3 + BURST_MS);
+        assert_eq!(found(&h, CLIENT, NOW + 3 + BURST_MS), Some(Src::Auto(AutoReason::Pinning)));
+    }
+
+    /// The same process, marked first, then seen to send a request under the root
+    /// (a connection that was in flight): it trusts the root, so it is no longer named.
+    #[test]
+    fn a_request_takes_a_process_off_the_list() {
         let (h, _, _) = heal_with_starts();
         h.hear(&of(OLD, HOST, ROOT), refused(), NOW);
         assert!(h.distrusts(OLD));
         h.hear(&of(OLD, HOST, ROOT), Evidence::Accepted, NOW + 1);
+        assert!(h.distrusts(OLD), "a completed handshake alone is no proof");
+        h.hear(&of(OLD, HOST, ROOT), Evidence::Used, NOW + 1);
         assert!(!h.distrusts(OLD) && h.restart_to_trust().is_empty());
     }
 
-    /// Only a refused handshake with a trust alert marks a process. A weak alert,
-    /// `ech_required`, a silent give-up, or any end (the handshake completed, so
-    /// the client trusted the leaf) scores as it always did.
+    /// Only a trust alert, in the handshake or right after it on an unused
+    /// connection, marks a process. A weak alert, `ech_required`, `decrypt_error`,
+    /// a silent give-up or a silent end scores as it always did.
     #[test]
-    fn only_a_trust_alert_in_the_handshake_marks_an_old_process() {
+    fn only_a_trust_alert_marks_an_old_process() {
         let quiet = |alert| Evidence::Ended(Some(Silence { after: std::time::Duration::ZERO, alert }));
+        // (name, evidence, marks, excludes at once)
         let cases = [
-            ("weak", Evidence::Refused(Some(AlertDescription::HandshakeFailure)), false),
-            ("ech", Evidence::Refused(Some(AlertDescription::EncryptedClientHelloRequired)), true),
-            ("decrypt_error", Evidence::Refused(Some(AlertDescription::DecryptError)), true),
-            ("given up", Evidence::Refused(None), false),
-            ("ended with unknown_ca", quiet(Some(AlertDescription::UnknownCA)), true),
-            ("ended silently", quiet(None), false),
+            ("weak", Evidence::Refused(Some(AlertDescription::HandshakeFailure)), false, false),
+            ("ech", Evidence::Refused(Some(AlertDescription::EncryptedClientHelloRequired)), false, true),
+            ("decrypt_error", Evidence::Refused(Some(AlertDescription::DecryptError)), false, true),
+            ("given up", Evidence::Refused(None), false, false),
+            ("ended with unknown_ca", quiet(Some(AlertDescription::UnknownCA)), true, false),
+            ("ended with a weak alert", quiet(Some(AlertDescription::HandshakeFailure)), false, false),
+            ("ended silently", quiet(None), false, false),
         ];
-        for (name, evidence, excludes_at_once) in cases {
+        for (name, evidence, marks, excludes_at_once) in cases {
             let (h, _, book) = heal_with_starts();
             h.hear(&of(OLD, HOST, ROOT), evidence, NOW);
-            assert!(!h.distrusts(OLD) && h.restart_to_trust().is_empty() && restart_rows(&book).is_empty(), "{name}: not marked");
+            assert_eq!(h.distrusts(OLD), marks, "{name}: marked");
+            assert_eq!(h.restart_to_trust().len(), usize::from(marks), "{name}: named");
+            assert_eq!(restart_rows(&book).len(), usize::from(marks), "{name}: rows");
             assert_eq!(found(&h, CLIENT, NOW).is_some(), excludes_at_once, "{name}: scored as before");
         }
         for alert in dials::TRUST_ALERTS {
