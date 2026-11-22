@@ -50,7 +50,7 @@ export function MasterSwitch({ className }: { className?: string }) {
         onCheckedChange={(v) => void setEnabled(v)}
         aria-label={def.label}
         title={title}
-        className={cn(enabled && "animate-breathe", partial && "switch-partial data-checked:bg-surface-3")}
+        className={cn(enabled && "animate-breathe", partial && "switch-partial data-checked:bg-surface-3 [&>[data-slot=switch-thumb]]:ring-2 [&>[data-slot=switch-thumb]]:ring-primary")}
       />
       <span role="status" aria-live="polite" className="sr-only">
         {spoken}
