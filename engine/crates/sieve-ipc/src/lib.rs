@@ -2473,6 +2473,21 @@ mod tests {
         assert!(serde_json::from_str::<Policy>(r#"{"revision":4,"engine":true,"x":1}"#).is_err(), "unknown fields stay refused");
     }
 
+    /// The app's routing, HTTPS and page filtering are on for a new install since
+    /// 2026-11-22, and the engine does not follow that default: its own stays off.
+    /// A missing `policy.json`, `Policy::default()` and a file or peer without a
+    /// field all read off, so only a policy the app sent turns one on, and a new
+    /// install's first one is the app's defaults (the engine controller).
+    #[test]
+    fn the_engine_never_takes_the_apps_new_install_defaults_by_itself() {
+        let none = Policy::default();
+        assert_eq!((none.revision, none.engine, none.https, none.content), (0, false, false, false));
+        let old: Policy = serde_json::from_str(r#"{"revision":9,"engine":false}"#).unwrap();
+        assert_eq!((old.engine, old.https, old.content), (false, false, false));
+        let bare: Policy = serde_json::from_str(r#"{"revision":0,"engine":false}"#).unwrap();
+        assert_eq!(bare, Policy::default());
+    }
+
     #[test]
     fn every_fixture_update_round_trips_and_a_v2_status_is_refused() {
         let updates = fixture()["updates"].as_array().unwrap().clone();
