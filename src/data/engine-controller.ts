@@ -41,8 +41,7 @@
  * Update state rides the probe: there is no separate poll.
  */
 import type { PassedChecks } from "@/core/checks";
-import { exeStem } from "@/core/apps";
-import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE as DNS_CLIENT_CAPTURE_KEY, DNS_ENCRYPTION as DNS_ENCRYPTION_KEY, ENGINE_POLL_MS, ENGINE_SWITCH, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineVersion, engineTakesPolicy, engineUpdate, httpsInForce, httpsWorking, restartText, updateBanner, type EngineSlice } from "@/core/engine";
+import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE as DNS_CLIENT_CAPTURE_KEY, DNS_ENCRYPTION as DNS_ENCRYPTION_KEY, ENGINE_POLL_MS, ENGINE_SWITCH, FIREFOX_EXE, HTTPS_SWITCH, engineRoutes, engineStatus, enginePhase, engineVersion, engineTakesPolicy, engineUpdate, httpsInForce, httpsWorking, restartText, updateBanner, type EngineSlice } from "@/core/engine";
 import { runningApp, type ExclusionsFacts, type HealGroup } from "@/core/exclusions";
 import type { NoticeBus } from "@/core/notices";
 import { selectedListIds } from "@/core/filter-lists";
@@ -255,11 +254,12 @@ export function createEngineController({ engine, store, clock, settings, checks,
   let update: { id: number; text: string } | null = null;
   // The restart notice (slice 7): the engine's `policy.https` at the last answer,
   // whether it turned on while this window watched, the notice shown, and the text
-  // the user dismissed (not shown again until it changes or HTTPS turns on again).
+  // the user dismissed with the root it was about (not shown again until the text
+  // or the root changes, or HTTPS turns on again).
   let httpsWas: boolean | null = null;
   let restartAsked = false;
-  let restart: { id: number; text: string } | null = null;
-  let restartDismissed: string | null = null;
+  let restart: { id: number; text: string; root: string | null } | null = null;
+  let restartDismissed: { text: string; root: string | null } | null = null;
   let probeNow: () => Promise<void> = async () => {};
   // Null until the first read. The engine is a service that outlives this window,
   // so what it did before that read is not news: the rows show it, and no toast does.
@@ -323,12 +323,18 @@ export function createEngineController({ engine, store, clock, settings, checks,
     return signInRequest(() => engine.resumeDnsCapture(), `${SIGN_IN_ERROR_PREFIX} did not end`);
   };
 
-  // Restart your browsers (slice 7, 2026-11-22). A browser open before Sieve's
-  // certificate was installed may trust it only once restarted. When the engine's
-  // HTTPS switch turns on while this window watches, the plain line; when the engine
-  // names apps that refused the certificate for that reason, the line names them,
-  // and goes once none of them is running (the engine stops naming it). Dismissed,
-  // a text stays away until it changes or HTTPS turns on again. Off: no notice.
+  // Restart Firefox (slice 7, 2026-11-22). Firefox reads the Windows roots only at
+  // its start, so one open before Sieve's certificate was installed trusts it only
+  // once restarted; Chromium browsers read them live. Only while the certificate
+  // read says Firefox uses the Windows roots: otherwise a restart changes nothing.
+  // When the engine's HTTPS switch turns on while this window watches, the "if it
+  // is open" line; when the engine names a Firefox that refused the certificate for
+  // that reason, the line asks for its restart, and goes once it is not running (the
+  // engine stops naming it). Another app the engine names is not asked to restart:
+  // its own roots, not the time it started, decide. Dismissed, a text stays away
+  // until it changes, the root changes (a rotation: the same Firefox may need
+  // another restart) or HTTPS turns on again. Off: no notice. Read after each
+  // certificate read, which says what Firefox does.
   const followRestart = () => {
     const status = engineStatus(get());
     if (status === null) return;
@@ -341,21 +347,28 @@ export function createEngineController({ engine, store, clock, settings, checks,
     httpsWas = on;
     if (!on) restartAsked = false;
     if (restart !== null && !notices.list().some((n) => n.id === restart?.id)) {
-      restartDismissed = restart.text;
+      restartDismissed = { text: restart.text, root: restart.root };
       restart = null;
       restartAsked = false;
     }
-    const snapshot = newest(store.getState());
-    // The name the Apps page shows while it runs, else the file's ("Firefox" for firefox.exe).
-    const fileName = (exe: string) => exeStem(exe).charAt(0).toUpperCase() + exeStem(exe).slice(1);
-    const names = [...new Set((status.restart_to_trust ?? []).map((a) => runningApp(snapshot, a.exe)?.name ?? fileName(a.exe)))];
-    // Named, the engine has said which: the plain line is no longer wanted.
-    if (names.length > 0) restartAsked = false;
-    const text = !on ? null : names.length > 0 ? restartText(names) : restartAsked ? restartText([]) : null;
-    const shown = text === restartDismissed ? null : text;
+    const cert = get().cert;
+    const root = cert?.thumbprint ?? null;
+    if (restartDismissed !== null && restartDismissed.root === null) restartDismissed.root = root;
+    const firefoxTrusts = cert?.firefox === "uses_windows";
+    const seen = (status.restart_to_trust ?? []).some((a) => a.exe === FIREFOX_EXE);
+    // Named, the engine has said which: the "if it is open" line is no longer wanted.
+    if (seen) restartAsked = false;
+    // The name the Apps page shows while it runs.
+    const name = runningApp(newest(store.getState()), FIREFOX_EXE)?.name ?? "Firefox";
+    const text = !on || !firefoxTrusts ? null : seen ? restartText(name, true) : restartAsked ? restartText(name, false) : null;
+    // A root not read this time is no change of root.
+    const dismissed = restartDismissed !== null && restartDismissed.text === text && (root === null || restartDismissed.root === null || restartDismissed.root === root);
+    const shown = dismissed ? null : text;
     if (shown !== (restart?.text ?? null)) {
       if (restart !== null) notices.dismiss(restart.id);
-      restart = shown === null ? null : { id: notices.push({ kind: "info", surface: "banner", text: shown }), text: shown };
+      restart = shown === null ? null : { id: notices.push({ kind: "info", surface: "banner", text: shown }), text: shown, root };
+    } else if (restart !== null && root !== null) {
+      restart.root = root;
     }
   };
 
@@ -424,7 +437,6 @@ export function createEngineController({ engine, store, clock, settings, checks,
       if (update !== null) notices.dismiss(update.id);
       update = text === null ? null : { id: notices.push({ kind: "info", surface: "banner", text }), text };
     }
-    followRestart();
     void syncPolicy();
   };
 
@@ -708,8 +720,12 @@ export function createEngineController({ engine, store, clock, settings, checks,
         follow();
         await syncUpstreams();
         await readCert();
-        // HTTPS is proven only with its root trusted: the checks follow this probe's certificate read.
-        if (!disposed) followChecks();
+        // HTTPS is proven only with its root trusted: the checks follow this probe's certificate read,
+        // and so does the restart notice, which needs to know what Firefox does.
+        if (!disposed) {
+          followChecks();
+          followRestart();
+        }
         await readHeal();
         await readIssues();
       };

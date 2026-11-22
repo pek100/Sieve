@@ -410,18 +410,24 @@ export function upstreamChecksText(e: EngineSlice): string | null {
   return `${what} skipped until Sieve publishes their data. Windows still checks each site's certificate, and its revocation when it can reach the revocation server.`;
 }
 
+/** The exe the restart notice is about: Firefox reads the Windows roots only at its start. */
+export const FIREFOX_EXE = "firefox.exe";
+
 /**
- * The Home notice that a browser needs a restart (slice 7, 2026-11-22). A browser
- * open before Sieve's certificate was installed may trust it only once restarted
- * (Firefox reads it at its start). With no names: HTTPS filtering was just turned
- * on. With names: the engine saw those apps refuse the certificate for that reason,
- * and passes their connections through until they restart.
+ * The Home notice that Firefox needs a restart (slice 7, 2026-11-22). Firefox
+ * reads the Windows roots (Sieve's policy) only at its start, so one open before
+ * Sieve's certificate was installed refuses it until restarted; Chrome, Edge and
+ * Brave read them live. Only for a Firefox that uses the Windows roots: for one
+ * whose policy says no, or another app with its own roots, a restart changes
+ * nothing, and the notice does not ask for one. `seen`: the engine saw this
+ * Firefox refuse the certificate and passes its connections through until it
+ * restarts; else HTTPS filtering was just turned on. The connection it refused
+ * is lost, so that page shows a certificate warning until reloaded.
  */
-export function restartText(names: readonly string[]): string {
-  if (names.length === 0) return "Restart your open browsers so they trust Sieve's certificate.";
-  const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
-  const one = names.length === 1;
-  return `Restart ${list} so ${one ? "it trusts" : "they trust"} Sieve's certificate. Until then, ${one ? "its" : "their"} pages load without filtering.`;
+export function restartText(name: string, seen: boolean): string {
+  const ask = seen ? `Restart ${name} so it trusts Sieve's certificate.` : `If ${name} is open, restart it so it trusts Sieve's certificate.`;
+  const warning = seen ? "A page that showed a certificate warning loads when you reload it." : "A page that shows a certificate warning before then loads when you reload it.";
+  return `${ask} Until then, Sieve still blocks ad and tracker sites in ${name}, but not ads inside its HTTPS pages, such as video ads. ${warning}`;
 }
 
 /** Where signed updates stand; nothing to say when the engine did not answer or said nothing. */
