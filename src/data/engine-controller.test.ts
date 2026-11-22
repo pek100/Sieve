@@ -403,7 +403,13 @@ describe("engine controller, what is not decrypted", () => {
   });
 });
 
-function setup(start: EngineScenario, backend: SettingsBackend = memoryBackend(), filterLists: FilterListSource = createMockFilterLists()) {
+/**
+ * An install from before 2026-11-22 with nothing set: routing, HTTPS and page filtering off
+ * (settings migration 5 -> 6). Most tests start here; the new install's are under "a new install".
+ */
+const OLD_INSTALL = { schema: 5, values: {} };
+
+function setup(start: EngineScenario, backend: SettingsBackend = memoryBackend(OLD_INSTALL), filterLists: FilterListSource = createMockFilterLists()) {
   const fc = fakeClock();
   const store = createStore();
   const fake = fakeEngine(start);
@@ -593,13 +599,84 @@ describe("engine controller", () => {
     s.undo();
   });
 
-  it("the switch defaults off: an idle engine is never told to route", async () => {
+  it("an install from before with nothing set: an idle engine is never told to route, decrypt or filter pages", async () => {
     const s = setup("idle");
     await s.fc.flush();
     await s.fc.advance(ENGINE_POLL_MS * 3);
     expect(s.fake.policies).toEqual([]);
     expect(s.phase()).toBe("idle");
     s.undo();
+  });
+
+  describe("a new install (nothing stored): the engine's first answer settles it", () => {
+    const ON = (revision: number): EnginePolicy => ({ ...policy(revision, true), https: true, content: true, tracking: ["gpc", "searchQueries", "clientData", "queryParams"] });
+
+    it("a new engine too (revision 0): its first policy is the app's defaults, all three on", async () => {
+      const backend = memoryBackend();
+      const s = setup("idle", backend);
+      await s.fc.flush();
+      expect(s.fake.policies[0]).toEqual(ON(1));
+      expect(s.settings.unsettled()).toBe(false);
+      expect(await backend.load()).toEqual({ schema: 6, values: {} });
+      s.undo();
+    });
+
+    it("an engine an older Sieve set up (a later revision, routing off): nothing turns on, and the next run keeps it", async () => {
+      const held = memoryBackend();
+      // The mock's idle example is at revision 0: this one is an engine that was sent a policy before.
+      const engine = createMockEngine("idle");
+      const older: EngineSource = {
+        ...engine,
+        probe: async () => {
+          const p = await engine.probe();
+          const pipe = p.pipe;
+          return pipe?.kind === "welcome" ? { ...p, pipe: { ...pipe, status: { ...pipe.status, policy: { ...pipe.status.policy, revision: 7 } } } } : p;
+        },
+      };
+      const sent: EnginePolicy[] = [];
+      const fc = fakeClock();
+      const settings = createSettingsStore(held);
+      const undo = createEngineController({ engine: { ...older, setPolicy: (p) => (sent.push(p), older.setPolicy(p)) }, store: createStore(), clock: fc.clock, settings, checks: createPassedChecks(), notices: createNoticeBus(), filterLists: createMockFilterLists() }).bind();
+      await fc.flush();
+      await fc.advance(ENGINE_POLL_MS * 2);
+      expect(sent.filter((p) => p.engine || p.https || p.content)).toEqual([]);
+      for (const k of [ENGINE_SWITCH, HTTPS_SWITCH, CONTENT_SWITCH] as SettingKey[]) expect(settings.get(k), k).toBe(false);
+      undo();
+      const next = createSettingsStore(held);
+      await next.ready;
+      expect(next.unsettled()).toBe(false);
+      for (const k of [ENGINE_SWITCH, HTTPS_SWITCH, CONTENT_SWITCH] as SettingKey[]) expect(next.get(k), `${k}, next run`).toBe(false);
+    });
+
+    it("an engine already routing for an older Sieve keeps routing, and HTTPS stays as it held it: off", async () => {
+      const s = setup("filtering", memoryBackend());
+      await s.fc.flush();
+      expect(s.settings.get(SWITCH)).toBe(true);
+      expect(s.settings.get(HTTPS_SWITCH as SettingKey)).toBe(false);
+      expect(s.settings.get(CONTENT_SWITCH as SettingKey)).toBe(false);
+      expect(s.fake.policies.filter((p) => p.https || p.content)).toEqual([]);
+      s.undo();
+    });
+
+    it("nothing is sent before the settings are read and the engine answered", async () => {
+      let release: (doc: unknown) => void = () => {};
+      const slow: SettingsBackend = { kind: "memory", load: () => new Promise((r) => (release = r)), save: async () => {} };
+      const s = setup("idle", slow);
+      await s.fc.flush();
+      expect(s.fake.policies).toEqual([]);
+      release(undefined);
+      await s.fc.flush();
+      expect(s.fake.policies[0]).toEqual(ON(1));
+      s.undo();
+    });
+
+    it("a person's off on a new install is kept and sent", async () => {
+      const s = setup("idle", memoryBackend({ schema: 6, values: { [HTTPS_SWITCH]: false } }));
+      await s.fc.flush();
+      expect(s.fake.policies[0]).toMatchObject({ engine: true, https: false, content: true });
+      expect(s.fake.policies[0].tracking ?? [], "no protection without HTTPS").toEqual([]);
+      s.undo();
+    });
   });
 
   it("turning the switch on sends it once with the next revision, and the engine routes", async () => {
@@ -1123,7 +1200,7 @@ describe("engine controller", () => {
         return new Promise((r) => (resolve = r));
       },
     };
-    const deps = { settings: createSettingsStore(memoryBackend()), checks: createPassedChecks(), notices: createNoticeBus(), filterLists: createMockFilterLists() };
+    const deps = { settings: createSettingsStore(memoryBackend(OLD_INSTALL)), checks: createPassedChecks(), notices: createNoticeBus(), filterLists: createMockFilterLists() };
     const undo = createEngineController({ engine: slow, store, clock: fc.clock, ...deps }).bind();
     await fc.advance(ENGINE_POLL_MS * 5);
     expect(calls).toBe(1);
@@ -1148,7 +1225,7 @@ describe("engine controller", () => {
     const store = createStore();
     let resolve: ((p: EngineProbe) => void) | null = null;
     const mock = createMockEngine("idle");
-    const deps = { settings: createSettingsStore(memoryBackend()), checks: createPassedChecks(), notices: createNoticeBus(), filterLists: createMockFilterLists() };
+    const deps = { settings: createSettingsStore(memoryBackend(OLD_INSTALL)), checks: createPassedChecks(), notices: createNoticeBus(), filterLists: createMockFilterLists() };
     const undo = createEngineController({ engine: { ...mock, probe: () => new Promise((r) => (resolve = r)) }, store, clock: fc.clock, ...deps }).bind();
     undo();
     resolve!(await mock.probe());

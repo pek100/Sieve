@@ -40,9 +40,15 @@ describe("unavailable settings law", () => {
     expect(searchSettings("filter inside pages")).toContain(CONTENT_SWITCH);
     expect(searchSettings("decrypt https")).toContain(HTTPS_SWITCH);
     expect(JSON.parse(exportText(stored)).values).toEqual(stored.values);
-    expect(resetPlan(stored).changes.map((c) => c.key).sort()).toEqual(["appearance.theme", CONTENT_SWITCH, HTTPS_SWITCH].sort());
+    // On is their default, so a reset leaves them; one stored off stays off too (a reset never turns one on).
+    expect(resetPlan(stored).changes.map((c) => c.key)).toEqual(["appearance.theme"]);
+    const off = { schema: SETTINGS_SCHEMA, values: { [HTTPS_SWITCH]: false, [CONTENT_SWITCH]: false } };
+    expect(resetPlan(off).changes).toEqual([]);
     expect(readValue(stored, CONTENT_SWITCH)).toBe(true);
-    expect(readValue({ schema: SETTINGS_SCHEMA, values: {} }, HTTPS_SWITCH), "off on a fresh install: it installs a root certificate").toBe(false);
+    // The owner's decision of 2026-11-22: on for a new install, which then holds Sieve's
+    // root certificate; an install from before keeps it off unless its person turned it on.
+    expect(readValue({ schema: SETTINGS_SCHEMA, values: {} }, HTTPS_SWITCH), "on for a new install").toBe(true);
+    expect(readValue(normalizeDoc({ schema: 5, values: {} }), HTTPS_SWITCH), "off for an install from before").toBe(false);
   });
 
   it("every key unavailable of its own names a plan step whose plan exists and names the key", () => {
@@ -63,7 +69,7 @@ describe("unavailable settings law", () => {
   });
 
   it("the retired keys are not in the registry, and the kept one is shown", () => {
-    expect(SETTINGS_SCHEMA).toBe(5);
+    expect(SETTINGS_SCHEMA).toBe(6);
     for (const k of RETIRED) expect(REGISTRY, k).not.toHaveProperty(k);
     expect(isAvailable("filtering.upstreams")).toBe(true);
     expect(searchSettings("upstream")).toEqual(["filtering.upstreams"]);
@@ -72,13 +78,14 @@ describe("unavailable settings law", () => {
   it.each([1, 2, 3, 4])("schema 5 drops the retired keys from schema %i, on or off", (schema) => {
     for (const on of [true, false]) {
       const out = migrate({ schema, values: { "filtering.dns": on, "filtering.perApp": on } });
-      expect(out).toEqual({ schema: SETTINGS_SCHEMA, values: {} });
+      expect(out.schema).toBe(SETTINGS_SCHEMA);
+      for (const k of RETIRED) expect(out.values, k).not.toHaveProperty(k);
     }
   });
 
   it.each([1, 2, 3, 4])("a stored bare upstream from schema %i reads as the encrypted defaults", (schema) => {
     const doc = normalizeDoc({ schema, values: { "filtering.upstreams": ["9.9.9.9"] } });
-    expect(doc.values).toEqual({});
+    expect(doc.values).not.toHaveProperty("filtering.upstreams");
     expect(readValue(doc, "filtering.upstreams")).toEqual(settingDef("filtering.upstreams").default);
   });
 });

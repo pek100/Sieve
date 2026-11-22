@@ -5,7 +5,8 @@
  * Import replaces: the file is the whole truth, so a known key the file does
  * not carry goes back to its default. The preview lists every key that would
  * change and every entry that is refused, before anything is applied. A data
- * switch is never turned on by an import; that entry is refused with the reason.
+ * switch is never turned on by an import (nor by leaving it out, when its
+ * default is on); that entry is refused with the reason. Nor by a reset of everything.
  * An unavailable setting (`unavailableUntil`) is not exported, searched,
  * imported or reset: its stored value stays as it is.
  */
@@ -121,6 +122,12 @@ export function planImport(current: SettingsDoc, text: string): ImportPlan {
     }
     values[key] = v;
   }
+  // A data switch the file leaves out takes its default, which may be on (registry
+  // `ON_FOR_NEW_INSTALLS`): that is turned on by an import too, so it is refused the same way.
+  for (const key of shownKeys()) {
+    if (settingDef(key).kind !== "dataSwitch" || key in incoming.values || defaultValue(key) !== true || readValue(current, key) === true) continue;
+    refused.push({ key, reason: "An import never turns this on; turn it on yourself in Settings" });
+  }
   // A refused known key keeps its current value rather than dropping to the default
   // (an unavailable one is kept as stored by docWith).
   for (const r of refused) if (isSettingKey(r.key)) values[r.key] = readValue(current, r.key);
@@ -142,9 +149,14 @@ export function planImport(current: SettingsDoc, text: string): ImportPlan {
 /** The keys a reset of everything leaves as they are. */
 const keptByReset = () => shownKeys().filter((key) => settingDef(key).keptByResetAll === true);
 
-/** Every known key back to its default, but for those it keeps; unknown keys (from a newer Sieve) are kept. */
+/**
+ * Every known key back to its default, but for those it keeps; unknown keys (from a newer Sieve) are kept.
+ * A data switch that is off stays off: its default may be on (registry `ON_FOR_NEW_INSTALLS`), and a
+ * reset, like an import, never turns one on. One that is on is at its default or goes off.
+ */
 export function resetPlan(current: SettingsDoc): { changes: Change[]; next: SettingsDoc } {
   const kept = Object.fromEntries(keptByReset().map((key) => [key, readValue(current, key)]));
+  for (const key of shownKeys()) if (settingDef(key).kind === "dataSwitch" && readValue(current, key) !== true) kept[key] = readValue(current, key);
   const next = docWith(current, kept);
   return { changes: changesBetween(current, next), next };
 }
@@ -152,7 +164,7 @@ export function resetPlan(current: SettingsDoc): { changes: Change[]; next: Sett
 /** What a reset of everything does, in the person's words. */
 export function resetAllText(): string {
   const kept = keptByReset().map((key) => settingDef(key).label);
-  return `Every setting goes back to its default${kept.length > 0 ? `, except ${kept.join(", ")}` : ""}. You can undo it right after.`;
+  return `Every setting goes back to its default${kept.length > 0 ? `, except ${kept.join(", ")}` : ""}. A switch that changes traffic is never turned on by it. You can undo it right after.`;
 }
 
 const sectionLabel = (id: string) => SECTIONS.find((s) => s.id === id)?.label ?? id;

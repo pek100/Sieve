@@ -207,11 +207,12 @@ describe("settings view (rendered from the registry)", () => {
   });
 
   it("export shows only changed settings; reset to defaults confirms with the list, applies, and can be undone", async () => {
-    const rt = await setup({ schema: 1, values: { "sampling.intervalMs": 2000 } });
+    // With HTTPS on (a new install's default), Home's link to it is hidden for good, and that is stored too.
+    const rt = await setup({ schema: SETTINGS_SCHEMA, values: { "sampling.intervalMs": 2000, "appearance.httpsLinkHidden": true } });
     await userEvent.click(screen.getByRole("button", { name: "Settings actions" }));
     await userEvent.click(await screen.findByRole("menuitem", { name: "Export settings" }));
     const text = (screen.getByRole("textbox", { name: "Exported settings" }) as HTMLTextAreaElement).value;
-    expect(JSON.parse(text).values).toEqual({ "sampling.intervalMs": 2000 });
+    expect(JSON.parse(text).values).toEqual({ "sampling.intervalMs": 2000, "appearance.httpsLinkHidden": true });
     await userEvent.click(screen.getByRole("button", { name: "Done" }));
 
     await userEvent.click(screen.getByRole("button", { name: "Settings actions" }));

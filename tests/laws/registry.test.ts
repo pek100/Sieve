@@ -1,24 +1,39 @@
 /**
- * Law 4, settings registry: every data switch defaults to false and names a
- * live check; every `requires` points at a data switch; defaults are valid;
- * settings are declared nowhere else.
+ * Law 4, settings registry: every data switch defaults to false, but for those
+ * the owner put on for a new install (`ON_FOR_NEW_INSTALLS`, 2026-11-22), and
+ * names a live check; an install from before keeps those off, so nothing turns
+ * on without a new install's default or a person's click; every `requires`
+ * points at a data switch; defaults are valid; settings are declared nowhere else.
  */
 import { describe, expect, it } from "vitest";
 import { CONTENT_SWITCH, DNS_CLIENT_CAPTURE, DNS_ENCRYPTION, ENGINE_SWITCH, HTTPS_SWITCH } from "@/core/engine";
-import { normalizeDoc, readValue } from "@/core/settings/document";
-import { REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, isValidValue, needsEngine, settingDef, type SettingDef, type SettingKey } from "@/core/settings/registry";
+import { EMPTY_DOC, normalizeDoc, readValue } from "@/core/settings/document";
+import { SCHEMA_BEFORE_ON_DEFAULTS } from "@/core/settings/migrate";
+import { ON_FOR_NEW_INSTALLS, REGISTRY, SECTIONS, SETTING_KEYS, isSettingKey, isValidValue, needsEngine, settingDef, type SettingDef, type SettingKey } from "@/core/settings/registry";
 import { hits, read, walk } from "./files";
 
 const defs = SETTING_KEYS.map((k) => [k, settingDef(k)] as const);
 const isDataSwitch = (key: string) => (REGISTRY as Record<string, SettingDef>)[key]?.kind === "dataSwitch";
+const onForNew = ON_FOR_NEW_INSTALLS as readonly string[];
 
 describe("registry law", () => {
-  it("data switches default to off and name a live_ check", () => {
+  it("data switches default to off, but for those on for a new install, and name a live_ check", () => {
     for (const [key, def] of defs) {
       if (def.kind !== "dataSwitch") continue;
-      expect(def.default, key).toBe(false);
+      expect(def.default, key).toBe(onForNew.includes(key));
       expect(def.liveCheck, key).toMatch(/^live_[a-z0-9_]+$/);
     }
+    for (const key of onForNew) expect(isDataSwitch(key), key).toBe(true);
+  });
+
+  it("a data switch on for a new install is off for every install from before, unless its person turned it on", () => {
+    for (let schema = 1; schema <= SCHEMA_BEFORE_ON_DEFAULTS; schema++) {
+      const old = normalizeDoc({ schema, values: {} });
+      for (const key of onForNew) expect(readValue(old, key as SettingKey), `${key}, schema ${schema}`).toBe(false);
+      const chose = normalizeDoc({ schema, values: Object.fromEntries(onForNew.map((k) => [k, true])) });
+      for (const key of onForNew) expect(readValue(chose, key as SettingKey), `${key} chosen on, schema ${schema}`).toBe(true);
+    }
+    for (const key of onForNew) expect(readValue(EMPTY_DOC, key as SettingKey), `${key}, a new install`).toBe(true);
   });
 
   it("every data switch's live check is an ignored Rust test of that name (the app's or the engine's)", () => {
@@ -39,10 +54,10 @@ describe("registry law", () => {
     expect(defs.filter(([k]) => needsEngine(k)).map(([k]) => k)).toEqual([ENGINE_SWITCH, HTTPS_SWITCH, CONTENT_SWITCH]);
   });
 
-  it("the content switch defaults off, names its live check and needs the HTTPS switch", () => {
+  it("the content switch is on for a new install, names its live check and needs the HTTPS switch", () => {
     const def = settingDef(CONTENT_SWITCH);
     expect(def.kind).toBe("dataSwitch");
-    expect(def.default).toBe(false);
+    expect(def.default).toBe(true);
     expect(def.requires).toBe(HTTPS_SWITCH);
     if (def.kind === "dataSwitch") expect(def.liveCheck).toBe("live_content_injects_into_test_page");
   });

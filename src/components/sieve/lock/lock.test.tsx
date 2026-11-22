@@ -7,6 +7,7 @@ import { EngineCard } from "@/components/sieve/settings/engine-card";
 import { SettingsScreen } from "@/components/sieve/settings/settings-screen";
 import { AppShell } from "@/components/sieve/shell/app-shell";
 import { LOCK_UNREADABLE_TEXT } from "@/core/lock";
+import { SETTINGS_SCHEMA } from "@/core/settings/registry";
 import { exportText, resetPlan } from "@/core/settings/transfer";
 import { createMockEngine } from "@/data/engine-mock";
 import type { EngineSource } from "@/data/engine-source";
@@ -149,7 +150,7 @@ describe("the write gate, one test per writer, while locked", () => {
     const box = await screen.findByRole("textbox", { name: "Settings file to import" });
     await act(async () => {
       await userEvent.click(box);
-      await userEvent.paste(JSON.stringify({ kind: "sieve.settings", schema: 4, values: { "sampling.intervalMs": 2000 } }));
+      await userEvent.paste(JSON.stringify({ kind: "sieve.settings", schema: SETTINGS_SCHEMA, values: { "sampling.intervalMs": 2000 } }));
     });
     await userEvent.click(screen.getByRole("button", { name: "Preview changes" }));
     await userEvent.click(screen.getByRole("button", { name: "Apply 1 change" }));

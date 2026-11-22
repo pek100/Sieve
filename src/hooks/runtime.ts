@@ -299,12 +299,14 @@ export function bindDesktop(rt: Runtime, fmt: (ms: number) => string = clockTime
  * Once HTTPS filtering has been turned on, Home's link to it never shows again:
  * the switch on (however it got there: a click, an import) records it in
  * `appearance.httpsLinkHidden`. That write only hides a link and can never turn
- * anything on, so it does not go through the lock. Returns the undo.
+ * anything on, so it does not go through the lock. A new install's default on
+ * counts only once the engine's first answer settled it (an engine an older
+ * Sieve set up may hold it off). Returns the undo.
  */
 export function bindHttpsLink(rt: Runtime): () => void {
   let cancelled = false;
   const follow = () => {
-    if (cancelled || rt.settings.get(HTTPS_SWITCH) !== true || rt.settings.get(HTTPS_LINK_HIDDEN)) return;
+    if (cancelled || rt.settings.unsettled() || rt.settings.get(HTTPS_SWITCH) !== true || rt.settings.get(HTTPS_LINK_HIDDEN)) return;
     rt.settings.set(HTTPS_LINK_HIDDEN, true).catch((e: unknown) => console.warn(`Home link: ${message(e)}`));
   };
   const unSettings = rt.settings.subscribe(follow);
