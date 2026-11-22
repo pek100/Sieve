@@ -153,6 +153,42 @@ FunctionEnd
   Pop $R8
 !macroend
 
+; Waits, up to 30 s, until $INSTDIR's engine exe can be opened for writing, so
+; the copy below never meets a file Windows still holds. `restore` returns once
+; it has asked the service to stop, and the process can still be exiting (an
+; update on 2026-11-22 met "Error opening file for writing" on the engine);
+; a service that came back meanwhile is asked to stop again every 5 s. A file
+; still held after that is left to the copy's own Retry, Ignore or Abort.
+!macro SIEVE_WAIT_ENGINE_FREE
+  Push $R7
+  Push $R6
+  StrCpy $R7 0
+  ${If} ${FileExists} "$INSTDIR\${SIEVE_ENGINE_EXE}"
+    ${Do}
+      ClearErrors
+      FileOpen $R6 "$INSTDIR\${SIEVE_ENGINE_EXE}" a
+      ${IfNot} ${Errors}
+        FileClose $R6
+        ${ExitDo}
+      ${EndIf}
+      ${If} $R7 >= 60
+        DetailPrint "Sieve's engine still holds its file after 30 s"
+        ${ExitDo}
+      ${EndIf}
+      IntOp $R6 $R7 % 10
+      ${If} $R6 = 0
+        DetailPrint "Waiting for Sieve's engine to stop"
+        nsExec::ExecToLog '"$SYSDIR\sc.exe" stop sieve-engine'
+        Pop $R6
+      ${EndIf}
+      Sleep 500
+      IntOp $R7 $R7 + 1
+    ${Loop}
+  ${EndIf}
+  Pop $R6
+  Pop $R7
+!macroend
+
 ; An update replaces a running engine: stop it first (`restore` removes
 ; Sieve's routes and stops the service; certificates and data stay). Then
 ; lock the folder, before Tauri copies the first file.
@@ -173,6 +209,7 @@ FunctionEnd
 ; user turns "Route traffic through the engine" on.
 !macro NSIS_HOOK_POSTINSTALL
   SetOutPath "$INSTDIR"
+  !insertmacro SIEVE_WAIT_ENGINE_FREE
   File "/oname=${SIEVE_ENGINE_EXE}" "${SIEVE_ENGINE_SRC}"
   File "/oname=${SIEVE_WINTUN_DLL}" "${SIEVE_WINTUN_SRC}"
   File "/oname=${SIEVE_WINTUN_LICENSE}" "${SIEVE_WINTUN_LICENSE_SRC}"
