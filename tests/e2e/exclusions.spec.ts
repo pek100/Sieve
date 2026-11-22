@@ -1,8 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
+import { asOldInstall } from "./old-install";
 
 /**
  * Settings > Filtering, "Not decrypted", against the mock engine that holds HTTPS on
- * (`?heal=1`: an engine holding it on whatever the app sends).
+ * (`?heal=1`: an engine holding it on whatever the app sends), on an install from before
+ * whose switches are off.
  */
 const noHorizontalScroll = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
 
@@ -10,6 +12,7 @@ async function openGroup(page: Page, extra = "") {
   const errors: string[] = [];
   page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
   page.on("pageerror", (e) => errors.push(e.message));
+  await asOldInstall(page);
   await page.goto(`/settings/?source=mock&seed=1&engine=idle&heal=1${extra}#not-decrypted`);
   const group = page.getByRole("region", { name: "Not decrypted" });
   await expect(group).toBeVisible();
@@ -58,6 +61,7 @@ test.describe("exclusions", () => {
   });
 
   test("the toast appears once with two grouped exclusions, and Show opens the filtered view", async ({ page }, info) => {
+    await asOldInstall(page);
     await page.goto("/?source=mock&seed=1&engine=idle&heal=1");
     const first = page.getByText("rejected Sieve's certificate for pin.example");
     const grouped = page.getByText("rejected Sieve's certificate for 2 sites");
@@ -74,6 +78,7 @@ test.describe("exclusions", () => {
   });
 
   test("the group filters in place when the toast is followed from Settings", async ({ page }) => {
+    await asOldInstall(page);
     await page.goto("/settings/?source=mock&seed=1&engine=idle&heal=1");
     const group = page.getByRole("region", { name: "Not decrypted" });
     await expect(lines(group)).toHaveCount(4);
@@ -82,6 +87,7 @@ test.describe("exclusions", () => {
   });
 
   test("with the engine not holding HTTPS, the user's rows and one line", async ({ page }) => {
+    await asOldInstall(page);
     await page.goto("/settings/?source=mock&seed=1&engine=idle#not-decrypted");
     const group = page.getByRole("region", { name: "Not decrypted" });
     await expect(group).toContainText("Sieve is not decrypting HTTPS right now");

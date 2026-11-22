@@ -1,10 +1,16 @@
 import { expect, test, type Page } from "@playwright/test";
+import { asOldInstall } from "./old-install";
 
-/** Settings > Filtering, the Engine block, against the mock engine's fixture answers. */
+/**
+ * Settings > Filtering, the Engine block, against the mock engine's fixture answers. An
+ * install from before with nothing stored has routing off, as these tests mean; a spec's own
+ * stored settings (`switchedOn`) win, being written first.
+ */
 async function openEngine(page: Page, scenario?: string) {
   const errors: string[] = [];
   page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
   page.on("pageerror", (e) => errors.push(e.message));
+  await asOldInstall(page);
   await page.goto(`/settings/?source=mock&seed=1${scenario ? `&engine=${scenario}` : ""}`);
   const block = page.getByRole("region", { name: "Engine" });
   await expect(block).toBeVisible();

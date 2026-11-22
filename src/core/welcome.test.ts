@@ -6,7 +6,7 @@ import { SETTING_KEYS, isAvailable, settingDef } from "./settings/registry";
 import { dataSwitchSummary, switchesState, welcomeAdguard, welcomeSteps } from "./welcome";
 
 const slice = (name: keyof typeof fixture.examples): EngineSlice => ({ probe: parseEngineProbe(fixture.examples[name]), error: null });
-const ids = (e: EngineSlice, keep = false) => welcomeSteps(e, keep, "off").map((s) => s.id);
+const ids = (e: EngineSlice, keep = false, httpsShown = false) => welcomeSteps(e, keep, "off", httpsShown).map((s) => s.id);
 const unknown: EngineSlice = { probe: null, error: null };
 
 describe("welcome steps", () => {
@@ -25,8 +25,9 @@ describe("welcome steps", () => {
     expect(ids(slice("filtering"), true)).toEqual(["what", "switches", "https", "adguard"]);
   });
 
-  it("explains HTTPS filtering and where to turn it on, unless the engine already holds it on", () => {
-    const https = welcomeSteps(unknown, false, "off").find((s) => s.id === "https");
+  it("explains HTTPS filtering and where to turn it on, unless it is on: shown on in the switches step, or held on by the engine", () => {
+    expect(ids(slice("idle"), false, true), "a new install: shown on").toEqual(["what", "switches"]);
+    const https = welcomeSteps(unknown, false, "off", false).find((s) => s.id === "https");
     expect(https?.body).toMatch(/here on this computer/);
     expect(https?.body).toMatch(/turn it off at any time/);
     const probe = parseEngineProbe(fixture.examples.filtering);
@@ -35,14 +36,23 @@ describe("welcome steps", () => {
     expect(ids(on)).toEqual(["what", "switches"]);
   });
 
-  it("says nothing is blocked", () => {
-    expect(welcomeSteps(unknown, false, "off")[0].body).toContain("blocks nothing until you turn the engine on");
+  it("says what the engine does only while it routes, and claims nothing was blocked", () => {
+    const what = welcomeSteps(unknown, false, "off", false)[0].body;
+    expect(what).toContain("While its engine routes your traffic, it also closes connections");
+    expect(what).not.toMatch(/blocked/);
   });
 
-  it("words the switches step by what is in force", () => {
-    const body = (s: Parameters<typeof welcomeSteps>[2]) => welcomeSteps(unknown, false, s)[1].body;
-    expect(body("off")).toContain("They are off");
-    for (const s of ["on", "unknown"] as const) expect(body(s), s).not.toContain("They are off");
+  it("words the switches step by what is in force, says each can be changed here, and that off returns that part to normal", () => {
+    const body = (s: Parameters<typeof welcomeSteps>[2]) => welcomeSteps(unknown, false, s, false)[1].body;
+    expect(body("off")).toContain("and they are off");
+    for (const s of ["on", "unknown"] as const) expect(body(s), s).not.toContain("they are off");
+    for (const s of ["on", "off"] as const) {
+      expect(body(s), s).toMatch(/here or later in Settings/);
+      expect(body(s), s).toMatch(/returns that part to normal/);
+    }
+    expect(body("unknown")).toMatch(/Sieve cannot read the engine/);
+    // The guide never says it leaves the switches alone: they are the person's to change.
+    for (const s of ["on", "off", "unknown"] as const) expect(body(s), s).not.toMatch(/leaves them|changes none/);
   });
 });
 

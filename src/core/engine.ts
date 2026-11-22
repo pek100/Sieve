@@ -51,8 +51,9 @@ export function showHttpsLink(e: EngineSlice, hidden: boolean): boolean {
 }
 /**
  * What turning HTTPS filtering on does, in plain words, for the first-run guide
- * and Home. It is off on a fresh install: it installs a root certificate, which
- * is the person's choice (owner, 2026-11-20).
+ * and Home, shown while it is off. It is on for a new install since 2026-11-22
+ * and off for an install from before unless its person turned it on (owner,
+ * docs/tasks/2026-11-06-open-decisions.md).
  */
 export const HTTPS_INVITE = {
   title: "Block ads inside pages, video ads included",

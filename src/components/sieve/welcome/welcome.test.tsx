@@ -1,8 +1,8 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { AppShell } from "@/components/sieve/shell/app-shell";
-import { HTTPS_HREF, HTTPS_INVITE, HTTPS_SWITCH } from "@/core/engine";
+import { ENGINE_SWITCH, HTTPS_HREF, HTTPS_INVITE, HTTPS_SWITCH } from "@/core/engine";
 import { SETTING_KEYS, isAvailable, settingDef } from "@/core/settings/registry";
 import { resetPlan } from "@/core/settings/transfer";
 import { dataSwitchSummary } from "@/core/welcome";
@@ -231,19 +231,106 @@ describe("when the guide shows", () => {
   });
 });
 
+/** An install from before 2026-11-22 with nothing set: routing, HTTPS and page filtering off. */
+const OLD_INSTALL = { schema: 5, values: {} };
+const ROUTE = settingDef(ENGINE_SWITCH).label;
+
 describe("the steps", () => {
-  it("the data-switch step lists the registry's available switches, read only and off", async () => {
+  it("the data-switch step lists the registry's available switches at their value in force; an engine that cannot take them locks each, with the reason", async () => {
     await setup();
     await press("Next");
     expect(step()).toBe("switches");
     const switches = [...document.querySelectorAll("[data-welcome-switch]")].map((e) => e.getAttribute("data-welcome-switch"));
     expect(switches).toEqual(SETTING_KEYS.filter((k) => settingDef(k).kind === "dataSwitch" && isAvailable(k)));
+    // No engine installed: as on the Settings row, the engine's own value (none, so off), locked, and why.
     for (const s of dataSwitchSummary()) {
       const sw = screen.getByRole("switch", { name: s.label });
       expect(sw).toBeDisabled();
       expect(sw).not.toBeChecked();
+      expect(document.querySelector(`[data-welcome-switch="${s.key}"] [data-lock=engine]`), s.key).not.toBeNull();
     }
-    expect(screen.getByText(/They are off, and this guide leaves them off/)).toBeInTheDocument();
+    expect(screen.getByText(/and they are off/)).toBeInTheDocument();
+  });
+
+  describe("a new install: the switches are on and the person can turn them off", () => {
+    it("routing shows on and is a real switch; a click turns it off through Settings' write, and the engine is told", async () => {
+      const spy = spyEngine("idle");
+      const rt = await setup({ engine: spy.engine });
+      await settle();
+      await press("Next");
+      expect(step()).toBe("switches");
+      expect(screen.getByText("What Sieve changes on your network")).toBeInTheDocument();
+      expect(screen.getByText(/Turning one off returns that part to normal/)).toBeInTheDocument();
+      const sw = screen.getByRole("switch", { name: ROUTE });
+      expect(sw).toBeChecked();
+      expect(sw).toBeEnabled();
+      // The defaults were the engine's first policy; the guide sent nothing of its own.
+      expect(spy.policies[0]).toMatchObject({ engine: true, https: true, content: true });
+      await userEvent.click(sw);
+      await settle();
+      expect(rt.settings.get(ENGINE_SWITCH)).toBe(false);
+      expect(spy.policies.at(-1)?.engine).toBe(false);
+      expect(screen.getByRole("switch", { name: ROUTE })).not.toBeChecked();
+    });
+
+    it("with HTTPS on there is no step inviting the person to turn it on", async () => {
+      await setup({ engine: spyEngine("idle").engine });
+      await settle();
+      await press("Next");
+      expect(screen.getByRole("switch", { name: settingDef(HTTPS_SWITCH).label })).toBeChecked();
+      expect(screen.getByRole("button", { name: "Finish" })).toBeInTheDocument();
+      expect(screen.queryByText(HTTPS_INVITE.title)).toBeNull();
+    });
+
+    it("walking the guide without a click changes no setting but its flag", async () => {
+      const spy = spyEngine("idle");
+      const rt = await setup({ engine: spy.engine });
+      await settle();
+      const before = JSON.stringify(rt.settings.doc().values);
+      const sent = spy.policies.length;
+      await press("Next");
+      await press("Finish");
+      await settle();
+      expect(rt.settings.doc().values).toEqual({ ...JSON.parse(before), "startup.welcomeDone": true });
+      expect(spy.policies.length, "nothing more was sent").toBe(sent);
+    });
+  });
+
+  it("an install from before keeps them off; turning one on is the person's click, and it is sent", async () => {
+    const spy = spyEngine("idle");
+    const rt = await setup({ stored: OLD_INSTALL, engine: spy.engine });
+    await press("Next");
+    expect(screen.getByText("Your network is as it was")).toBeInTheDocument();
+    expect(spy.policies.filter((p) => p.engine || p.https || p.content)).toEqual([]);
+    const sw = screen.getByRole("switch", { name: ROUTE });
+    expect(sw).not.toBeChecked();
+    await userEvent.click(sw);
+    await settle();
+    expect(rt.settings.get(ENGINE_SWITCH)).toBe(true);
+    expect(spy.policies.at(-1)?.engine).toBe(true);
+    // Still off until routing is on and checked: as on the Settings row, locked with the reason.
+    expect(rt.settings.get(HTTPS_SWITCH)).toBe(false);
+  });
+
+  it("a switch whose prerequisite is off is locked with Settings' reason", async () => {
+    await setup({ stored: OLD_INSTALL, engine: spyEngine("idle").engine });
+    await press("Next");
+    const https = document.querySelector(`[data-welcome-switch="${HTTPS_SWITCH}"]`)!;
+    expect(within(https as HTMLElement).getByRole("switch")).toBeDisabled();
+    expect(https).toHaveTextContent(`Needs ${ROUTE}, which is off.`);
+  });
+
+  it("with a password set the switches wait for it: locked, with the way to unlock, and nothing written", async () => {
+    const spy = spyEngine("idle");
+    const rt = await setup({ engine: spy.engine, lock: "set" });
+    await settle();
+    await press("Next");
+    const sw = screen.getByRole("switch", { name: ROUTE });
+    expect(sw).toBeDisabled();
+    expect(document.querySelector(`[data-welcome-switch="${ENGINE_SWITCH}"] [data-lock=password]`)).not.toBeNull();
+    expect(within(document.querySelector(`[data-welcome-switch="${ENGINE_SWITCH}"]`) as HTMLElement).getByRole("button", { name: "Unlock" })).toBeInTheDocument();
+    await userEvent.click(sw);
+    expect(rt.settings.get(ENGINE_SWITCH)).toBe(true);
   });
 
   describe("an existing install, with the engine's switch stored on", () => {
@@ -252,32 +339,36 @@ describe("the steps", () => {
       await setup({ stored: ON, engine: spyEngine(scenario).engine });
       await press("Next");
       expect(step()).toBe("switches");
-      return screen.getByRole("switch", { name: settingDef("filtering.engine").label });
+      return screen.getByRole("switch", { name: ROUTE });
     };
 
-    it("routing: the switch shows on, and the step does not say the network is untouched", async () => {
+    it("routing: the switch shows on and can be changed, and the step does not say the network is untouched", async () => {
       const sw = await walk("filtering");
       expect(sw).toBeChecked();
-      expect(sw).toBeDisabled();
-      expect(screen.getByText(/A switch shown on is on now/)).toBeInTheDocument();
-      expect(screen.queryByText(/They are off/)).toBeNull();
-      expect(screen.queryByText("Your network stays as it is")).toBeNull();
+      expect(sw).toBeEnabled();
+      expect(screen.getByText(/Each is on or off as shown/)).toBeInTheDocument();
+      expect(screen.queryByText(/and they are off/)).toBeNull();
+      expect(screen.queryByText("Your network is as it was")).toBeNull();
     });
 
     it("the engine stopped: its own value is in force, as on the Settings row, so off", async () => {
-      expect(await walk("stopped")).not.toBeChecked();
-      expect(screen.getByText(/They are off/)).toBeInTheDocument();
+      const sw = await walk("stopped");
+      expect(sw).not.toBeChecked();
+      expect(sw).toBeDisabled();
+      expect(screen.getByText(/and they are off/)).toBeInTheDocument();
     });
 
     it.each(["refused", "error"] as const)("%s: the engine did not say, so the step does not claim off", async (scenario) => {
       expect(await walk(scenario)).not.toBeChecked();
-      expect(screen.queryByText(/They are off/)).toBeNull();
+      expect(screen.queryByText(/and they are off/)).toBeNull();
       expect(screen.getByText(/Sieve cannot read the engine/)).toBeInTheDocument();
     });
   });
 });
 
+/** On an install from before, whose switches are off: what a walk without a switch click leaves. */
 describe("the network proof", () => {
+  const OFF_SWITCHES = dataSwitchSummary().map((s) => s.key);
   async function walkToEnd() {
     await press("Next");
     await press("Next");
@@ -288,7 +379,7 @@ describe("the network proof", () => {
 
   it("running the guide to the end while skipping the offer changes nothing", async () => {
     const spy = spyEngine("adguard");
-    const rt = await setup({ engine: spy.engine });
+    const rt = await setup({ stored: OLD_INSTALL, engine: spy.engine });
     await walkToEnd();
     await press("Finish");
     await settle();
@@ -297,12 +388,13 @@ describe("the network proof", () => {
     expect(spy.stop).not.toHaveBeenCalled();
     expect(spy.startAdguard).not.toHaveBeenCalled();
     for (const s of dataSwitchSummary()) expect(rt.settings.get(s.key), s.key).toBe(false);
-    expect(Object.keys(rt.settings.doc().values)).toEqual(["startup.welcomeDone"]);
+    // The switches' stored offs are the upgrade's (migrate 5 -> 6); the guide added its flag only.
+    expect(Object.keys(rt.settings.doc().values).sort()).toEqual([...OFF_SWITCHES, "startup.welcomeDone"].sort());
   });
 
   it("stopAdguard is called exactly once, only on its click, and the step stays", async () => {
     const spy = spyEngine("adguard");
-    const rt = await setup({ engine: spy.engine });
+    const rt = await setup({ stored: OLD_INSTALL, engine: spy.engine });
     await walkToEnd();
     expect(spy.stop).not.toHaveBeenCalled();
     await press("Pause AdGuard");
@@ -320,7 +412,7 @@ describe("the network proof", () => {
 
   it("with no AdGuard there is no such step", async () => {
     const spy = spyEngine("idle");
-    await setup({ engine: spy.engine });
+    await setup({ stored: OLD_INSTALL, engine: spy.engine });
     await press("Next");
     await press("Next");
     expect(step()).toBe("https");
@@ -331,7 +423,7 @@ describe("the network proof", () => {
 
   it("the HTTPS step explains in plain words and links to the switch, which it never turns on", async () => {
     const spy = spyEngine("idle");
-    const rt = await setup({ engine: spy.engine });
+    const rt = await setup({ stored: OLD_INSTALL, engine: spy.engine });
     await press("Next");
     await press("Next");
     expect(step()).toBe("https");
@@ -350,7 +442,7 @@ describe("the network proof", () => {
   it("a stopping failure is said on the step", async () => {
     const spy = spyEngine("adguard");
     spy.stop.mockRejectedValueOnce(new Error("The user declined"));
-    await setup({ engine: spy.engine });
+    await setup({ stored: OLD_INSTALL, engine: spy.engine });
     await walkToEnd();
     await press("Pause AdGuard");
     await settle();
