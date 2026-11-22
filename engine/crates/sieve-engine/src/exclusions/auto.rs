@@ -28,7 +28,7 @@ const VERSION: u32 = 1;
 /// rule excluded browsers' unused preconnects (2026-11-08). 1 took the refusal of a
 /// browser started before Sieve's root was installed, which reads its roots only at
 /// its start and so refuses every leaf until it restarts (2026-11-22: Firefox open
-/// since the day before excluded YouTube when HTTPS filtering was turned on). Its
+/// since the day before excluded a video site when HTTPS filtering was turned on). Its
 /// entries carry no time of the process, so none of a browser's can be told apart.
 pub const PINNING_RULE: u32 = 2;
 /// Beside [`FILE`]: the newest [`PINNING_RULE`] whose one-time drop has run, so
