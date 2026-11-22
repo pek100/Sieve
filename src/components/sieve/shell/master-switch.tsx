@@ -2,7 +2,7 @@
 
 import { Switch } from "@/components/ui/switch";
 import { GLOBAL_SWITCH } from "@/core/policy";
-import { REGISTRY } from "@/core/settings/registry";
+import { ON_FOR_NEW_INSTALLS, REGISTRY } from "@/core/settings/registry";
 import { phase, type Phase } from "@/core/store";
 import { useSetting, useSieve } from "@/hooks/use-sieve";
 import { cn } from "@/lib/utils";
@@ -30,19 +30,27 @@ function clock(ms: number): string {
  */
 export function MasterSwitch({ className }: { className?: string }) {
   const [enabled, setEnabled] = useSetting(GLOBAL_SWITCH);
+  const [routing] = useSetting(ON_FOR_NEW_INSTALLS[0]);
+  const [https] = useSetting(ON_FOR_NEW_INSTALLS[1]);
+  const [content] = useSetting(ON_FOR_NEW_INSTALLS[2]);
   const p = useSieve(phase);
   const pausedUntil = useSieve((s) => s.status.pausedUntil);
   const def = REGISTRY[GLOBAL_SWITCH];
   const spoken = p === "paused" && pausedUntil !== null ? `Paused until ${clock(pausedUntil)}` : SPOKEN[p];
+  // On, but not filtering everything it can: the track shows the logo's diagonal lines, and the
+  // tooltip names what is off.
+  const missing = ON_FOR_NEW_INSTALLS.filter((_, i) => ![routing, https, content][i]);
+  const partial = enabled && missing.length > 0;
+  const title = partial ? `${def.help} Off now: ${missing.map((k) => REGISTRY[k].label).join(", ")}.` : def.help;
   return (
-    <label data-phase={p} className={cn("inline-flex cursor-pointer items-center gap-2 text-label text-on-surface-muted", className)}>
+    <label data-phase={p} data-coverage={enabled ? (partial ? "partial" : "full") : "off"} className={cn("inline-flex cursor-pointer items-center gap-2 text-label text-on-surface-muted", className)}>
       <span className="max-[640px]:sr-only">{def.label}</span>
       <Switch
         checked={enabled}
         onCheckedChange={(v) => void setEnabled(v)}
         aria-label={def.label}
-        title={def.help}
-        className={cn(enabled && "animate-breathe")}
+        title={title}
+        className={cn(enabled && "animate-breathe", partial && "switch-partial data-checked:bg-surface-3")}
       />
       <span role="status" aria-live="polite" className="sr-only">
         {spoken}

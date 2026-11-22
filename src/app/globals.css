@@ -211,6 +211,11 @@
   margin-inline: auto;
   padding-inline: var(--page-pad);
 }
+/* A switch that is on while part of what it governs is off: the track carries the
+   logo's diagonal lines instead of a solid fill (master-switch.tsx). */
+@utility switch-partial {
+  background-image: repeating-linear-gradient(-45deg, var(--primary) 0 3px, transparent 3px 6px);
+}
 @utility layout-grid {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));

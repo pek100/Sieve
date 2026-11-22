@@ -65,11 +65,14 @@ export function ExclusionsGroup() {
           </div>
         )}
         {m.shown.length > 0 ? (
-          <ul aria-label="Sites not decrypted" className="flex flex-col">
-            {m.shown.map((row) => (
-              <ExclusionsRow key={row.key} row={row} model={m} />
-            ))}
-          </ul>
+          // The list scrolls on its own, so the add field, filters and search above it stay in view.
+          <div className="max-h-[50dvh] overflow-y-auto" data-exclusions-scroll="">
+            <ul aria-label="Sites not decrypted" className="flex flex-col">
+              {m.shown.map((row) => (
+                <ExclusionsRow key={row.key} row={row} model={m} />
+              ))}
+            </ul>
+          </div>
         ) : filtered ? (
           <EmptyState
             line="No row matches"
