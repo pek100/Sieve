@@ -1208,3 +1208,42 @@ async fn a_passed_flow_still_closes_with_a_fin() {
         bed.task.abort();
     }
 }
+
+/// Half-open flows cancelled at once, many more than the runtime has threads.
+const HALF_OPEN: u16 = 64;
+
+/// The engine's dump of 2026-11-22: a routes take-down cancelled its flows, and every
+/// thread of the runtime (all 540: 28 workers and the 512 blocking threads) sat in
+/// ipstack's stream drop, waiting in `block_in_place` + `block_on` for a session task
+/// that no thread was left to run. The stop hung with them. Here the runtime has 4
+/// threads in all and 64 half-open streams are cancelled: the take-down must end.
+#[test]
+fn cancelling_more_half_open_flows_than_the_runtime_has_threads_ends() {
+    use crate::flow::tasks::{FlowTasks, ShutdownReport};
+    let (done, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).max_blocking_threads(2).enable_all().build().unwrap();
+        let report = rt.block_on(async {
+            let mut wire = wire();
+            let remote: SocketAddr = "198.51.100.7:443".parse().unwrap();
+            let mut tasks = FlowTasks::new();
+            for i in 0..HALF_OPEN {
+                let local = SocketAddr::from(([10, 9, 0, 2], 40_000 + i));
+                wire.to_stack.send(segment(local, remote, CLIENT_ISN, Flags { syn: true, ..Flags::default() }, &[])).unwrap();
+                let Ok(IpStackStream::Tcp(app)) = wire.stack.accept().await else { panic!("no TCP stream") };
+                // A flow that holds its app side and never finishes its handshake.
+                tasks.spawn(async move {
+                    let _app = app;
+                    std::future::pending::<()>().await;
+                });
+            }
+            let report = tasks.shutdown(Duration::from_secs(3)).await;
+            drop(wire);
+            report
+        });
+        rt.shutdown_timeout(Duration::from_secs(1));
+        let _ = done.send(report);
+    });
+    let report = heard.recv_timeout(Duration::from_secs(20)).expect("the cancelled flows held every thread of the runtime");
+    assert_eq!(report, ShutdownReport { live: usize::from(HALF_OPEN), drained: true });
+}
