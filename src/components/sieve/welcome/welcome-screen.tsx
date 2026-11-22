@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import { Page } from "@/components/sieve/shell/page";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -47,10 +46,14 @@ export function WelcomeScreen({ onDone }: { onDone: () => void }) {
     if (steps[to]?.id === "adguard") setOfferSeen(true);
   };
 
+  // The guide fills the content area: the step sits in the middle, one readable column wide,
+  // and the step count and buttons sit at the foot, where they stay put from step to step.
   return (
-    <Page title="Welcome">
-      <div className="flex flex-col gap-6 py-6" data-welcome-step={step.id}>
-        <EmptyState line={step.title} body={step.body} className="p-0" />
+    <main className="page-container flex min-h-full flex-1 flex-col pb-6" data-welcome-step={step.id}>
+      <div className="flex flex-1 flex-col items-center justify-center py-10">
+        <div className="flex w-full max-w-2xl flex-col gap-6">
+          <h1 className="text-center text-title-lg text-on-surface-muted">Welcome</h1>
+          <EmptyState line={step.title} body={step.body} className="p-0" />
         {step.id === "switches" && (
           <ul aria-label="What can change traffic" className="flex flex-col gap-3">
             {switches.map((s) => (
@@ -90,25 +93,26 @@ export function WelcomeScreen({ onDone }: { onDone: () => void }) {
             )}
           </div>
         )}
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-label text-on-surface-muted tabular">
-            Step {index + 1} of {steps.length}
-          </p>
-          <div className="flex flex-wrap justify-end gap-2">
-            {!last && (
-              <Button variant="ghost" onClick={onDone}>
-                Skip
-              </Button>
-            )}
-            {index > 0 && (
-              <Button variant="secondary" onClick={() => go(index - 1)}>
-                Back
-              </Button>
-            )}
-            {last ? <Button onClick={onDone}>Finish</Button> : <Button onClick={() => go(index + 1)}>Next</Button>}
-          </div>
         </div>
       </div>
-    </Page>
+      <div className="mx-auto flex w-full max-w-2xl flex-wrap items-center justify-between gap-2">
+        <p className="text-label text-on-surface-muted tabular">
+          Step {index + 1} of {steps.length}
+        </p>
+        <div className="flex flex-wrap justify-end gap-2">
+          {!last && (
+            <Button variant="ghost" onClick={onDone}>
+              Skip
+            </Button>
+          )}
+          {index > 0 && (
+            <Button variant="secondary" onClick={() => go(index - 1)}>
+              Back
+            </Button>
+          )}
+          {last ? <Button onClick={onDone}>Finish</Button> : <Button onClick={() => go(index + 1)}>Next</Button>}
+        </div>
+      </div>
+    </main>
   );
 }
