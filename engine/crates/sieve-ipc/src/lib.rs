@@ -1370,6 +1370,10 @@ pub enum FlowReason {
     MixedResolvedNames,
     /// The flow carries no name and its address has none alive.
     UnknownDomain,
+    /// Windows' own internet test bound to Sieve's adapter, refused whatever the
+    /// switch and the rules say, so Windows keeps the physical network as its
+    /// internet connection (`stack::connectivity` in the engine).
+    ConnectivityProbe,
 }
 
 /// One flow as the engine saw it (plan 1.3 `Flows`).

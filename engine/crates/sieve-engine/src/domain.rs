@@ -39,6 +39,12 @@ impl Decision {
         Self { action: Action::Pass, reason, rule: None, list: None }
     }
 
+    /// Windows' own internet test through Sieve (`stack::connectivity`): closed,
+    /// by no rule and whatever the switch says.
+    pub fn connectivity_probe() -> Self {
+        Self { action: Action::Drop, reason: Reason::ConnectivityProbe, rule: None, list: None }
+    }
+
     fn from_host(d: HostDecision, reason: Reason) -> Self {
         let action = if d.verdict == HostVerdict::Block { Action::Drop } else { Action::Pass };
         Self { action, reason, rule: d.rule, list: d.list }
@@ -416,6 +422,12 @@ mod tests {
     #[test]
     fn unknown_owner_is_sieved() {
         assert_eq!(named(Some(BLOCKED), Owner::Unknown).action, Action::Drop);
+    }
+
+    #[test]
+    fn windows_internet_test_is_closed_by_no_rule() {
+        let got = Decision::connectivity_probe();
+        assert_eq!((got.action, got.reason, got.rule, got.list), (Action::Drop, Reason::ConnectivityProbe, None, None));
     }
 
     #[test]

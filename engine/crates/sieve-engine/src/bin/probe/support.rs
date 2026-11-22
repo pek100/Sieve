@@ -332,6 +332,7 @@ pub fn reason_label(r: Reason) -> String {
         Reason::NamedAllow => "allow rule".into(),
         Reason::NamedNoRule => "no rule".into(),
         Reason::NamedBlock | Reason::AllResolvedNamesBlocked => "block rule".into(),
+        Reason::ConnectivityProbe => "Windows' internet test".into(),
     }
 }
 

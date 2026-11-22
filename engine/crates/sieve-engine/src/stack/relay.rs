@@ -42,7 +42,7 @@ use crate::dns::NameMap;
 use crate::link::exit::{self, Exit, ExitReport, Upstream};
 use crate::link::{Change, LinkManager, LinkNet, Plan};
 use crate::dns::service::Service;
-use crate::domain::{FilterSlot, Flow};
+use crate::domain::{Decision, FilterSlot, Flow};
 use crate::flow::classify::{Decoded, UdpClassifier};
 use crate::flow::etw::PidWitness;
 use crate::flow::flows::os::IpHelper;
@@ -165,6 +165,8 @@ type HiddenNameLookup = fn(u32) -> Option<String>;
 pub(super) struct Admitted {
     pub(super) id: u64,
     owner: HeldOwner,
+    /// The host process the flow is attributed to, if any.
+    pid: Option<u32>,
 }
 
 impl Admitted {
@@ -379,14 +381,20 @@ impl Relay {
         let id = book.open_with(event, idle)?;
         let owner = attribution.row_owner(app, &book);
         book.own(id, owner.row_key());
-        Some(Admitted { id, owner })
+        Some(Admitted { id, owner, pid })
     }
 
     /// The one decision for a flow whose first bytes were decoded, in the book.
     /// The snapshot is read here, so a flow decided keeps its decision. Port 53
-    /// never comes here (`dns_flow`), so `dns` is false.
+    /// never comes here (`dns_flow`), so `dns` is false. Windows' own internet test
+    /// is refused before any rule (`super::connectivity`).
     fn decide(&self, admitted: &Admitted, d: &Decoded, flow: &FiveTuple) -> Action {
-        let decision = self.filter.get().decide(Flow::from_decoded(d, false, flow.remote.ip(), admitted.owner.as_owner()), &self.names, monotonic_ms());
+        let now = monotonic_ms();
+        let decision = if super::connectivity::refuses(flow.proto, flow.remote.port(), admitted.pid, now) {
+            Decision::connectivity_probe()
+        } else {
+            self.filter.get().decide(Flow::from_decoded(d, false, flow.remote.ip(), admitted.owner.as_owner()), &self.names, now)
+        };
         let mut book = lock(&self.book);
         book.update(admitted.id, |e| record_decision(e, d, false, &decision));
         book.log_decision(admitted.id, &decision, wall_ms());

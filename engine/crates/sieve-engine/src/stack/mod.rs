@@ -12,10 +12,12 @@
 //! - `egress` (Windows): the pinned sockets both of them leave through;
 //! - `path_mtu` (Windows): a relayed UDP datagram too big for the real path;
 //! - [`retry`]: the upstream connect, tried again before the app sees anything;
-//! - [`progress`]: a relayed flow's last bytes each way, for a stall.
+//! - [`progress`]: a relayed flow's last bytes each way, for a stall;
+//! - [`connectivity`]: Windows' own internet test, refused through Sieve.
 
 pub mod attribution;
 pub mod book;
+pub mod connectivity;
 pub mod progress;
 pub mod retry;
 #[cfg(feature = "attribution-diagnostics")]
