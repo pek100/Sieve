@@ -95,7 +95,7 @@ function EngineTile() {
           Details in Settings
         </Link>
       </p>
-      {/* The way to HTTPS filtering, off on a fresh install, while the engine routes without it,
+      {/* The way to HTTPS filtering, off for an install from before 2026-11-22, while the engine routes without it,
           until the person hides it or HTTPS filtering has been on once. */}
       {showHttpsLink(e, hidden) && (
         <p className="flex flex-wrap items-baseline gap-x-3" data-home-https="">

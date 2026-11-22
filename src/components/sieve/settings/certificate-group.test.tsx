@@ -19,7 +19,8 @@ afterEach(cleanup);
 const THUMBPRINT = ipc.certStatuses.installed.thumbprint;
 
 async function setup(engine: EngineSource, https = false) {
-  const settings = memoryBackend(https ? { schema: 4, values: { [ENGINE_SWITCH]: false, [HTTPS_SWITCH]: true } } : undefined);
+  // Off: an install from before 2026-11-22 with nothing set, so routing, HTTPS and page filtering are off.
+  const settings = memoryBackend(https ? { schema: 4, values: { [ENGINE_SWITCH]: false, [HTTPS_SWITCH]: true } } : { schema: 5, values: {} });
   const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings, engine });
   render(
     <SieveProvider runtime={runtime}>

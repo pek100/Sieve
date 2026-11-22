@@ -4,8 +4,11 @@
  * data-switch gating are all derived from this list.
  *
  * Data switches: anything that would change traffic or the system is kind
- * "dataSwitch", defaults to false and names the live check that proves it
- * works on the real machine (a `live_*` test). The registry law enforces it.
+ * "dataSwitch" and names the live check that proves it works on the real
+ * machine (a `live_*` test). One defaults to false unless the owner decided it
+ * is on for a new install (`ON_FOR_NEW_INSTALLS`); then an install from before
+ * that decision keeps it off (migrate.ts) and nothing else ever turns it on:
+ * only a person's click. The registry law enforces it.
  * No switch may write persistent system network state (DNS servers, routes,
  * proxy settings, firewall rules): Sieve off means a normal network.
  */
@@ -17,10 +20,20 @@ import { parseUpstream } from "../upstream";
 /**
  * 2: apps.levels became on/off per app. 3: filtering.systemDns is gone. 4: a
  * stored unavailable data switch is dropped, so it is off. 5: filtering.dns
- * and filtering.perApp are gone; filtering.upstreams holds encrypted upstreams
- * (see migrate.ts).
+ * and filtering.perApp are gone; filtering.upstreams holds encrypted upstreams.
+ * 6: routing, HTTPS and page filtering are on for a new install; a document
+ * from before keeps them off (see migrate.ts).
  */
-export const SETTINGS_SCHEMA = 5;
+export const SETTINGS_SCHEMA = 6;
+
+/**
+ * The data switches on for a new install (the owner's decision of 2026-11-22,
+ * "Editable, on by default": Sieve replaces AdGuard, which filters from install;
+ * docs/tasks/2026-11-06-open-decisions.md). Each reads off in a settings document
+ * from before schema 6, and off whenever an engine an older Sieve set up holds it
+ * off (the engine controller's first read): an upgrade never turns one on.
+ */
+export const ON_FOR_NEW_INSTALLS = ["filtering.engine", "filtering.https", "filtering.content"] as const;
 
 /** Settings sections in the order the settings view shows them; a key's prefix is its section. */
 export const SECTIONS = [
@@ -289,12 +302,13 @@ export const REGISTRY = {
   // app sends it to the engine (the engine controller, `SetPolicy`); off, the
   // engine has no adapter and no route. The live check is run by the user
   // (docs/live/engine-slice-3.md) and read back by the ignored test of its name.
+  // On for a new install (ON_FOR_NEW_INSTALLS); an older install keeps what it had.
   "filtering.engine": {
     kind: "dataSwitch",
     section: "filtering",
     label: "Route traffic through the engine",
     help: "Sends this computer's traffic through Sieve's engine, so Home and Apps show each app's connections as the engine sees them and connections to blocked hosts are closed. The Engine block below says what it filters. Off: the engine adds no adapter and no route, and your network is as it was.",
-    default: false,
+    default: true,
     liveCheck: "live_engine_full_route_relays_and_restores",
     needsEngine: true,
   } satisfies DataSwitchSetting,
@@ -317,28 +331,29 @@ export const REGISTRY = {
     of: { type: "domain" },
   } satisfies ListSetting<string>,
   // The root certificate and interception (docs/plans/2026-10-17-https-filtering.md,
-  // slices 5 and 6). Available since the owner's decisions of 2026-11-20
-  // (docs/tasks/2026-11-06-open-decisions.md). Off by default: turning it on
-  // installs a root certificate, which is the user's explicit choice (law 4).
-  // Settings' Certificate group turns it off; uninstall removes the root.
+  // slices 5 and 6). Available since the owner's decisions of 2026-11-20, on for
+  // a new install since 2026-11-22 (docs/tasks/2026-11-06-open-decisions.md):
+  // a new install holds Sieve's root certificate, an older one keeps what it had.
+  // Off removes the root; uninstall removes it too.
   "filtering.https": {
     kind: "dataSwitch",
     section: "filtering",
     label: "Decrypt HTTPS traffic",
     help: "Your browsers' encrypted traffic is opened here on this computer, so Sieve can block ads and trackers inside pages, video ads included. Only browsers are decrypted: other apps are never opened, and neither are the sites on Sieve's never-decrypt list, such as many banks and payment, health, government, password and sign-in sites. It installs Sieve's own certificate; off removes it from Windows and Firefox once Windows allows it, which can take a moment. While on, a browser set to Off in Apps loses Encrypted Client Hello, so the name of the site it opens can be seen on the network.",
-    default: false,
+    default: true,
     liveCheck: "live_https_intercepts_public_and_passes_floor",
     requires: "filtering.engine",
     needsEngine: true,
   } satisfies DataSwitchSetting,
   // Rewriting decrypted pages (slice 9), available with the HTTPS switch since
-  // 2026-11-20. The scriptlets come from the uBO bundle the engine ships.
+  // 2026-11-20, on for a new install since 2026-11-22. The scriptlets come from
+  // the uBO bundle the engine ships.
   "filtering.content": {
     kind: "dataSwitch",
     section: "filtering",
     label: "Filter inside pages",
     help: "Hides ads and other page elements and runs the lists' page fixes, such as those that remove video ads, on decrypted pages. Off: pages arrive exactly as the site sent them.",
-    default: false,
+    default: true,
     liveCheck: "live_content_injects_into_test_page",
     requires: "filtering.https",
     needsEngine: true,

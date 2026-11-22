@@ -1,10 +1,11 @@
 /**
  * Settings migrations. Adding a key with a default never bumps the schema.
- * Renaming or retyping a key does: bump SETTINGS_SCHEMA and add a step here
- * that maps documents of schema N to N + 1.
+ * Renaming or retyping a key does, and so does changing a default that a stored
+ * document relies on (absence reads as the default): bump SETTINGS_SCHEMA and
+ * add a step here that maps documents of schema N to N + 1.
  */
 import { parseUpstream } from "../upstream";
-import { SETTINGS_SCHEMA, SETTING_KEYS, defaultValue, isAvailable, settingDef, type SettingKey } from "./registry";
+import { ON_FOR_NEW_INSTALLS, SETTINGS_SCHEMA, SETTING_KEYS, defaultValue, isAvailable, settingDef, type SettingKey } from "./registry";
 
 type Values = Record<string, unknown>;
 
@@ -82,12 +83,34 @@ export function retireDnsProxy(values: Values): Values {
   return next;
 }
 
+/** The last schema whose documents read routing, HTTPS and page filtering as off when nothing was stored. */
+export const SCHEMA_BEFORE_ON_DEFAULTS = 5;
+
+/**
+ * 5 -> 6: routing, HTTPS and page filtering became on for a new install (the
+ * owner's decision of 2026-11-22, registry `ON_FOR_NEW_INSTALLS`). A document
+ * from before was written by an install that had them off unless its person
+ * turned one on, and absence read as off. So absence, or anything that is not a
+ * stored boolean, becomes a stored off (off is no longer the default, so it is
+ * stored), and a stored on is the new default, so it goes. The install reads
+ * exactly what it read before: an upgrade never turns one on.
+ */
+export function keepSwitchesAsTheyWere(values: Values): Values {
+  const next: Values = { ...values };
+  for (const k of ON_FOR_NEW_INSTALLS) {
+    if (next[k] === true) delete next[k];
+    else next[k] = false;
+  }
+  return next;
+}
+
 /** STEPS[n] upgrades a schema-n document to schema n + 1. */
 const STEPS: Record<number, (values: Values) => Values> = {
   1: levelsToOnOff,
   2: dropSystemDns,
   3: offUnavailableSwitches,
   4: retireDnsProxy,
+  [SCHEMA_BEFORE_ON_DEFAULTS]: keepSwitchesAsTheyWere,
 };
 
 export function migrate(doc: { schema: number; values: Values }): { schema: number; values: Values } {

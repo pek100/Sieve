@@ -2,7 +2,8 @@
  * What `unavailableUntil` does, with two real keys mocked unavailable, a switch
  * and a list (the real registry's list is one switch, so a loop over it would
  * never see a list; law 11 holds that list). An unavailable key has no row,
- * search, export, import or reset, reads as its default and takes no other value.
+ * search, export, import or reset, reads as its default (a data switch: off) and
+ * takes no other value.
  */
 import { describe, expect, it, vi } from "vitest";
 
@@ -22,8 +23,10 @@ import { EXPORT_KIND, exportText, planImport, resetPlan, searchSettings } from "
 const stored = { schema: SETTINGS_SCHEMA, values: { [SWITCH]: true, [LIST]: ["C:\\a.exe"], "appearance.theme": "light" } };
 
 describe("an unavailable setting", () => {
-  it("reads as its default whatever is stored", () => {
+  it("reads as its default whatever is stored, and a data switch off though its default is on", () => {
+    expect(defaultValue(SWITCH)).toBe(true);
     expect(readValue(stored, SWITCH)).toBe(false);
+    expect(readValue(EMPTY_DOC, SWITCH)).toBe(false);
     expect(readValue(stored, LIST)).toEqual(defaultValue(LIST));
     expect(readValue(stored, "appearance.theme")).toBe("light");
   });
@@ -66,7 +69,8 @@ describe("an unavailable setting", () => {
   it("schema 3 -> 4: a stored unavailable data switch is dropped; other unavailable values are kept, unread", () => {
     expect(offUnavailableSwitches(stored.values)).toEqual({ [LIST]: ["C:\\a.exe"], "appearance.theme": "light" });
     const doc = normalizeDoc({ schema: 3, values: stored.values });
-    expect(doc.values).not.toHaveProperty(SWITCH);
+    // Dropped, then 5 -> 6 stores it off, as every document from before reads it.
+    expect(doc.values[SWITCH]).toBe(false);
     expect(readValue(doc, SWITCH)).toBe(false);
   });
 });

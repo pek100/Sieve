@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { EMPTY_DOC, readValue, writeValue, type SettingsDoc } from "./document";
-import { SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef } from "./registry";
+import { EMPTY_DOC, OLD_INSTALL_DOC, readValue, writeValue, type SettingsDoc } from "./document";
+import { ON_FOR_NEW_INSTALLS, SETTINGS_SCHEMA, SETTING_KEYS, isAvailable, settingDef } from "./registry";
 
 // One test runs the import rules for a data switch as a build where one is available would.
 const availability = vi.hoisted(() => ({ every: false }));
@@ -23,7 +23,7 @@ describe("settings export and import", () => {
   });
 
   it("import replaces: lists every key that changes, and keys missing from the file go back to default", () => {
-    const file = JSON.stringify({ kind: EXPORT_KIND, schema: 1, values: { "sampling.intervalMs": 2000 } });
+    const file = JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "sampling.intervalMs": 2000 } });
     const plan = planImport(changed, file);
     if (!plan.ok) throw new Error(plan.error);
     expect(plan.changes.map((c) => [c.key, c.from, c.to])).toEqual([
@@ -33,6 +33,12 @@ describe("settings export and import", () => {
     ]);
     expect(readValue(plan.next, "sampling.intervalMs")).toBe(2000);
     expect(readValue(plan.next, "appearance.theme")).toBe("dark");
+  });
+
+  it("a file from before schema 6 carries the switches on for a new install off, as its Sieve read them", () => {
+    const plan = planImport(changed, JSON.stringify({ kind: EXPORT_KIND, schema: 5, values: {} }));
+    if (!plan.ok) throw new Error(plan.error);
+    for (const k of ON_FOR_NEW_INSTALLS) expect(readValue(plan.next, k), k).toBe(false);
   });
 
   it("refuses unknown keys, invalid values and turning on any data switch, keeping the current value", () => {
@@ -68,22 +74,32 @@ describe("settings export and import", () => {
     ]);
     // A refused known key keeps its current value: the theme stays light.
     expect(readValue(plan.next, "appearance.theme")).toBe("light");
-    // Every data switch, every time: no import path turns one on.
+    // Every data switch, every time: no import path turns one on, by naming it or by leaving it out.
     for (const key of SETTING_KEYS.filter((k) => settingDef(k).kind === "dataSwitch")) {
-      const one = planImport(EMPTY_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: 1, values: { [key]: true } }));
-      expect(one.ok && readValue(one.next, key), key).toBe(false);
+      for (const schema of [1, SETTINGS_SCHEMA]) {
+        const one = planImport(OLD_INSTALL_DOC, JSON.stringify({ kind: EXPORT_KIND, schema, values: { [key]: true } }));
+        expect(one.ok && readValue(one.next, key), `${key}, schema ${schema}`).toBe(false);
+        const none = planImport(OLD_INSTALL_DOC, JSON.stringify({ kind: EXPORT_KIND, schema, values: {} }));
+        expect(none.ok && readValue(none.next, key), `${key} left out, schema ${schema}`).toBe(false);
+      }
     }
   });
 
   it("an available data switch: an import never turns it on, turning it off is imported, one already on stays on", () => {
-    const refused = planImport(EMPTY_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filtering.engine": true } }));
+    const refused = planImport(OLD_INSTALL_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filtering.engine": true } }));
     expect(refused.ok && refused.refused.find((r) => r.key === "filtering.engine")?.reason).toMatch(/never turns this on/);
     expect(refused.ok && readValue(refused.next, "filtering.engine")).toBe(false);
-    const on = writeValue(EMPTY_DOC, "filtering.engine", true);
-    const off = planImport(on, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: {} }));
+    // Left out of a current file, its default is on: refused the same way, with the same words.
+    const absent = planImport(OLD_INSTALL_DOC, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: {} }));
+    expect(absent.ok && absent.refused.map((r) => [r.key, r.reason])).toEqual(ON_FOR_NEW_INSTALLS.map((k) => [k, "An import never turns this on; turn it on yourself in Settings"]));
+    expect(absent.ok && absent.changes).toEqual([]);
+    const on = EMPTY_DOC;
+    const off = planImport(on, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filtering.engine": false } }));
     expect(off.ok && readValue(off.next, "filtering.engine")).toBe(false);
     const kept = planImport(on, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: { "filtering.engine": true } }));
     expect(kept.ok && readValue(kept.next, "filtering.engine")).toBe(true);
+    const keptByAbsence = planImport(on, JSON.stringify({ kind: EXPORT_KIND, schema: SETTINGS_SCHEMA, values: {} }));
+    expect(keptByAbsence.ok && readValue(keptByAbsence.next, "filtering.engine")).toBe(true);
   });
 
   it("DNS encryption off round-trips through export and import, and a file without it is encrypted", () => {
@@ -127,6 +143,16 @@ describe("settings export and import", () => {
     expect(plan.changes.map((c) => c.key)).toEqual(["appearance.theme"]);
     expect(resetPlan(EMPTY_DOC).next.values).toEqual({});
     expect(resetAllText()).toContain(settingDef("startup.welcomeDone").label);
+  });
+
+  it("reset to defaults never turns a data switch on: one off stays off, one on stays on", () => {
+    const doc = writeValue(writeValue(OLD_INSTALL_DOC, "filtering.engine", true), "appearance.theme", "light");
+    const plan = resetPlan(doc);
+    expect(plan.changes.map((c) => c.key)).toEqual(["appearance.theme"]);
+    expect(readValue(plan.next, "filtering.engine")).toBe(true);
+    expect(readValue(plan.next, "filtering.https")).toBe(false);
+    expect(readValue(plan.next, "filtering.content")).toBe(false);
+    expect(resetAllText()).toMatch(/A switch that changes traffic is never turned on by it/);
   });
 });
 

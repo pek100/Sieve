@@ -605,16 +605,17 @@ describe("your own lists", () => {
   });
 });
 
-/** The options are offered since the HTTPS switch is (2026-11-20); with it off on a fresh install, each waits for it. */
+/** The options are offered since the HTTPS switch is (2026-11-20); with it off (an install from before 2026-11-22), each waits for it. */
 describe("tracking protection, offered with the HTTPS switch", () => {
   it("is at Balanced, the recommended level, every option locked with the reason once, and nothing can change it", async () => {
-    await setup();
+    // An install from before 2026-11-22 with nothing set: routing, HTTPS and page filtering off.
+    await setup("pending", { schema: 5, values: {} });
     const block = document.querySelector<HTMLElement>("[data-tracking]")!;
     for (const level of ["Minimal", "Balanced", "Strict"]) expect(within(block).getByRole("radio", { name: new RegExp(`^${level}`) })).toBeInTheDocument();
     expect(within(block).getByRole("radio", { name: /^Balanced/ })).toHaveAttribute("aria-checked", "true");
     expect(within(block).getByRole("radio", { name: /^Balanced/ })).toBeDisabled();
     expect(block.querySelectorAll("[data-lock]")).toHaveLength(1);
-    // A fresh install: the first switch on the way is the engine's, named once for every option.
+    // The first switch on the way is the engine's, named once for every option.
     expect(block.querySelector("[data-tracking-locked]")).toHaveTextContent("Needs Route traffic through the engine, which is off.");
     expect(block.querySelector("[data-tracking-locked]")).toHaveTextContent("None of these is in effect yet");
     for (const s of within(block).getAllByRole("switch")) expect(s).toBeDisabled();

@@ -1,10 +1,12 @@
 import { expect, test, type Page } from "@playwright/test";
+import { asOldInstall } from "./old-install";
 
-/** Settings > Filtering, the Certificate group, against the mock engine's fixture answers. */
-async function openCertificate(page: Page, query: string) {
+/** Settings > Filtering, the Certificate group, against the mock engine's fixture answers. An install from before unless `fresh`. */
+async function openCertificate(page: Page, query: string, fresh = false) {
   const errors: string[] = [];
   page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
   page.on("pageerror", (e) => errors.push(e.message));
+  if (!fresh) await asOldInstall(page);
   await page.goto(`/settings/?source=mock&seed=1&${query}`);
   const group = page.getByRole("region", { name: "Certificate" });
   await expect(group).toBeVisible();
@@ -60,11 +62,16 @@ test.describe("certificate", () => {
     expect(errors).toEqual([]);
   });
 
-  test("the HTTPS switch has its row, off on a fresh install, beside page filtering", async ({ page }) => {
+  test("the HTTPS switch has its row, off for an install from before, beside page filtering", async ({ page }) => {
     await openCertificate(page, "engine=idle");
     const https = page.locator('[data-setting="filtering.https"]');
     await expect(https).toHaveCount(1);
     await expect(https.getByRole("switch")).not.toBeChecked();
     await expect(page.locator('[data-setting="filtering.content"]')).toHaveCount(1);
+  });
+
+  test("on a new install the HTTPS switch is on (the owner's decision of 2026-11-22)", async ({ page }) => {
+    await openCertificate(page, "engine=idle", true);
+    await expect(page.locator('[data-setting="filtering.https"]').getByRole("switch")).toBeChecked();
   });
 });

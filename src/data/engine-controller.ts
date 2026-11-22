@@ -11,8 +11,11 @@
  *   turned off, the filter list selection, the domain lists, the user's rules
  *   and exclusions, and DNS encryption (`plain_dns` only when the user turned it off). Whenever the engine answers with anything different, order
  *   aside, the whole policy is sent with the next revision (`setPolicy`): a
- *   part-filled one would clear the rest. The switch defaults off, so the engine
- *   routes nothing until the user turns it on. Nothing is sent while the engine
+ *   part-filled one would clear the rest. Routing, HTTPS and page filtering are
+ *   on for a new install and off for one from before (registry
+ *   `ON_FOR_NEW_INSTALLS`); with a new settings file, the engine's first answer
+ *   settles which (`settings.settle`) before anything is sent, so the engine never
+ *   infers a default and a lost file never turns one on. Nothing is sent while the engine
  *   cannot take a policy (`engineTakesPolicy`); the stored values then wait
  *   untouched. A policy that is over the engine's limit or is refused gives way to
  *   one with the rules as the engine holds them (`policyParts`), so the off
@@ -239,7 +242,7 @@ export function createEngineController({ engine, store, clock, settings, checks,
   let upstreamsInFlight = false;
   let catalogue: Pick<FilterCatalogue, "lists"> | null = null;
   let catalogueInFlight = false;
-  // The switch is read only after the settings loaded: before that it reads as its default (off).
+  // The switch is read only after the settings loaded: before that it reads off, whatever is stored.
   let settingsReady = false;
   let banner: number | null = null;
   let dnsBanner: { id: number; text: string } | null = null;
@@ -388,6 +391,23 @@ export function createEngineController({ engine, store, clock, settings, checks,
     const e = get();
     const status = engineStatus(e);
     if (disposed || !settingsReady || policyInFlight || !engineTakesPolicy(e) || status === null) return;
+    if (settings.unsettled()) {
+      // A new settings file, and the engine's first answer. An engine at revision 0 was
+      // never sent a policy: the install is new and its defaults stand, so its first
+      // policy is the app's defaults. One at a later revision was set up by an older
+      // Sieve (a lost settings file, another Windows account): its switches are kept as
+      // it holds them, so a missing file never turns routing, HTTPS or page filtering on.
+      policyInFlight = true;
+      const held = status.policy;
+      try {
+        await settings.settle(held.revision > 0 ? { [ENGINE_SWITCH]: held.engine, [HTTPS_SWITCH]: held.https, [CONTENT_SWITCH]: held.content ?? false } : null);
+      } catch {
+        // Not saved: this run reads them as settled all the same, and the next run settles again.
+      } finally {
+        policyInFlight = false;
+      }
+      if (disposed) return;
+    }
     if (catalogue === null && Object.keys(settings.get("filters.lists")).length > 0) void readCatalogue();
     const version = engineVersion(e);
     const wanted = wantedPolicy(settings, catalogue, status.policy.lists);

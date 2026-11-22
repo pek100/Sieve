@@ -109,9 +109,11 @@ describe("normal network law", () => {
     for (const k of RETIRED_KEYS) expect(SETTING_KEYS as readonly string[]).not.toContain(k);
     for (const on of [true, false]) {
       const doc = normalizeDoc({ schema: 2, values: { "filtering.systemDns": on, "appearance.theme": "light" } });
-      expect(doc).toEqual({ schema: SETTINGS_SCHEMA, values: { "appearance.theme": "light" } });
+      expect(doc.schema).toBe(SETTINGS_SCHEMA);
+      expect(doc.values).not.toHaveProperty("filtering.systemDns");
+      expect(doc.values["appearance.theme"]).toBe("light");
     }
     // Written by schema 1 too.
-    expect(normalizeDoc({ schema: 1, values: { "filtering.systemDns": true } }).values).toEqual({});
+    expect(normalizeDoc({ schema: 1, values: { "filtering.systemDns": true } }).values).not.toHaveProperty("filtering.systemDns");
   });
 });

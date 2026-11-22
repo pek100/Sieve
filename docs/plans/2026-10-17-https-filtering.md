@@ -674,7 +674,7 @@ Buttons: "Copy report", and "Open issue page", which opens the matching list's p
 
 Rules for every slice:
 - Each slice is independently verifiable and lands in its own worktree.
-- Every traffic-changing feature is a `dataSwitch` (default off) whose `liveCheck` names an ignored `live_*` test. It stays locked until that check passed in the app (`passedChecks`).
+- Every traffic-changing feature is a `dataSwitch` (default off) whose `liveCheck` names an ignored `live_*` test. It stays locked until that check passed in the app (`passedChecks`). Since 2026-11-22 (the owner's decision, `docs/tasks/2026-11-06-open-decisions.md` decision 10) routing, HTTPS decryption and page filtering default on for a new install; an install from before keeps them off unless its person turned one on (settings schema 6).
 - Agents never run elevation, route changes, certificate installs or the service installer. Only the user does. The live checks below are run by the user, with a verifier reading the evidence.
 - Every slice that changes traffic passes the kill, reboot and uninstall tests of the rule above, in addition to its own acceptance.
 - Commands run in PowerShell. Processes started are killed by tree. Browser checks run under the GPU lease.

@@ -3,10 +3,11 @@
 import Link from "next/link";
 import { useState } from "react";
 import { EmptyState } from "@/components/sieve/shell/empty-state";
+import { LockNote } from "@/components/sieve/settings/setting-row";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { useSettingsView, valueInForce } from "@/components/sieve/settings/use-settings-view";
-import { ADGUARD_PAUSE_TEXT, HTTPS_HREF, HTTPS_INVITE } from "@/core/engine";
+import { ADGUARD_PAUSE_TEXT, HTTPS_HREF, HTTPS_INVITE, HTTPS_SWITCH } from "@/core/engine";
 import type { Section } from "@/core/settings/registry";
 import { dataSwitchSummary, switchesState, welcomeAdguard, welcomeSteps } from "@/core/welcome";
 import { useEngine, useEngineActions } from "@/hooks/use-sieve";
@@ -14,18 +15,23 @@ import { useEngine, useEngineActions } from "@/hooks/use-sieve";
 const NO_BLOCKS: ReadonlySet<Section> = new Set();
 
 /**
- * The first-run guide. It explains; it never changes the network: no step writes
- * a data switch, they show read only at the value in force (as a Settings row
- * does), and the one action is the existing pause offer, on the person's click.
- * Skip is always one click (plan D14).
+ * The first-run guide. It explains, and changes the network only on the person's
+ * click: its switches are Settings' own (the settings view's `set`, so the
+ * password gate, `requires` and the engine's locks hold as on the Settings row,
+ * and a locked one shows why), each at its value in force; the other action is
+ * the existing pause offer. No step writes a switch by itself. Skip is always one
+ * click (plan D14).
  */
 export function WelcomeScreen({ onDone }: { onDone: () => void }) {
   const engine = useEngine();
   const { stopAdguard } = useEngineActions();
-  const { doc, lockOf } = useSettingsView("", NO_BLOCKS);
+  const { doc, lockOf, set } = useSettingsView("", NO_BLOCKS);
   const [at, setAt] = useState(0);
   const [offerSeen, setOfferSeen] = useState(false);
-  const switches = dataSwitchSummary().map((s) => ({ ...s, on: valueInForce(s.key, doc, lockOf(s.key)) === true }));
+  const switches = dataSwitchSummary().map((s) => {
+    const lock = lockOf(s.key);
+    return { ...s, lock, on: valueInForce(s.key, doc, lock) === true };
+  });
   const steps = welcomeSteps(
     engine,
     offerSeen,
@@ -33,6 +39,7 @@ export function WelcomeScreen({ onDone }: { onDone: () => void }) {
       switches.map((s) => s.on),
       engine,
     ),
+    switches.some((s) => s.key === HTTPS_SWITCH && s.on),
   );
   const index = Math.min(at, steps.length - 1);
   const step = steps[index];
@@ -54,45 +61,56 @@ export function WelcomeScreen({ onDone }: { onDone: () => void }) {
         <div className="flex w-full max-w-2xl flex-col gap-6">
           <h1 className="text-center text-title-lg text-on-surface-muted">Welcome</h1>
           <EmptyState line={step.title} body={step.body} className="p-0" />
-        {step.id === "switches" && (
-          <ul aria-label="What can change traffic" className="flex flex-col gap-3">
-            {switches.map((s) => (
-              <li key={s.key} className="flex min-h-11 items-center justify-between gap-4" data-welcome-switch={s.key}>
-                <div className="min-w-0">
-                  <p className="text-body-strong text-on-surface">{s.label}</p>
-                  <p className="text-label text-on-surface-muted">{s.help}</p>
-                </div>
-                <Switch checked={s.on} disabled aria-label={s.label} />
-              </li>
-            ))}
-          </ul>
-        )}
-        {step.id === "https" && (
-          <Link href={HTTPS_HREF} onClick={onDone} className="text-label text-primary underline-offset-4 hover:underline" data-welcome-https="">
-            {HTTPS_INVITE.link}
-          </Link>
-        )}
-        {step.id === "adguard" && (
-          <div className="flex flex-col items-start gap-2" data-welcome-adguard="">
-            {canPause ? (
-              <>
-                <p className="text-label text-on-surface-muted break-words">{ADGUARD_PAUSE_TEXT}</p>
-                <Button variant="secondary" disabled={busy} onClick={() => void stopAdguard()}>
-                  {busy ? "Pausing AdGuard" : "Pause AdGuard"}
-                </Button>
-              </>
-            ) : (
-              <p role="status" className="text-label text-on-surface-muted break-words">
-                AdGuard is not running now. You can start it again in Settings.
-              </p>
-            )}
-            {engine.actionError && (
-              <p role="alert" className="text-label text-blocked break-words">
-                {engine.actionError}
-              </p>
-            )}
-          </div>
-        )}
+          {step.id === "switches" && (
+            <ul aria-label="What can change traffic" className="flex flex-col gap-5">
+              {switches.map((s) => {
+                const labelId = `welcome-${s.key}-label`;
+                const helpId = `welcome-${s.key}-help`;
+                return (
+                  <li key={s.key} className="flex items-start justify-between gap-6" data-welcome-switch={s.key}>
+                    <div className="flex min-w-0 flex-1 flex-col gap-1">
+                      <p id={labelId} className="text-body-strong text-on-surface">
+                        {s.label}
+                      </p>
+                      <p id={helpId} className="text-label text-on-surface-muted">
+                        {s.help}
+                      </p>
+                      {s.lock && <LockNote lock={s.lock} />}
+                    </div>
+                    <div className="flex min-h-11 shrink-0 items-center">
+                      <Switch checked={s.on} disabled={s.lock !== null} onCheckedChange={(v) => set(s.key, v)} aria-labelledby={labelId} aria-describedby={helpId} />
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {step.id === "https" && (
+            <Link href={HTTPS_HREF} onClick={onDone} className="text-label text-primary underline-offset-4 hover:underline" data-welcome-https="">
+              {HTTPS_INVITE.link}
+            </Link>
+          )}
+          {step.id === "adguard" && (
+            <div className="flex flex-col items-start gap-2" data-welcome-adguard="">
+              {canPause ? (
+                <>
+                  <p className="text-label text-on-surface-muted break-words">{ADGUARD_PAUSE_TEXT}</p>
+                  <Button variant="secondary" disabled={busy} onClick={() => void stopAdguard()}>
+                    {busy ? "Pausing AdGuard" : "Pause AdGuard"}
+                  </Button>
+                </>
+              ) : (
+                <p role="status" className="text-label text-on-surface-muted break-words">
+                  AdGuard is not running now. You can start it again in Settings.
+                </p>
+              )}
+              {engine.actionError && (
+                <p role="alert" className="text-label text-blocked break-words">
+                  {engine.actionError}
+                </p>
+              )}
+            </div>
+          )}
         </div>
       </div>
       <div className="mx-auto flex w-full max-w-2xl flex-wrap items-center justify-between gap-2">

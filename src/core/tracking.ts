@@ -61,10 +61,18 @@ export function trackingValues(level: TrackingLevel): Record<string, boolean> {
   return Object.fromEntries(TRACKING_KEYS.map((k) => [k, inPreset(TRACKING_LEVELS, level, settingDef(k).preset ?? null)]));
 }
 
-/** The options the policy carries: available, on, and with the switch each requires on. `read` gives the value in force. */
+/** The HTTPS switch: the engine holds no option while it is off (`sieve_engine::policy::accept`). */
+const HTTPS = "filtering.https" satisfies SettingKey;
+
+/**
+ * The options the policy carries: available, on, with the switch each requires on, and with
+ * HTTPS on, as the engine holds them (page filtering can stay on with HTTPS off, and then an
+ * in-page option sent would be dropped by the engine and sent again at every probe). `read`
+ * gives the value in force.
+ */
 export function trackingInForce(read: (key: SettingKey) => unknown): string[] {
   return TRACKING_KEYS.filter((k) => {
     const needs = settingDef(k).requires as SettingKey | undefined;
-    return isAvailable(k) && read(k) === true && (needs === undefined || read(needs) === true);
+    return isAvailable(k) && read(k) === true && (needs === undefined || read(needs) === true) && read(HTTPS) === true;
   }).map(trackingName);
 }

@@ -90,11 +90,14 @@ describe("once offered, a locked option is never sent as on", () => {
     expect(offeredTrackingKeys().map(trackingName)).toEqual(["gpc", "clientData", "searchQueries", "queryParams", "referrer", "thirdPartyCookies", "webRtc", "push", "location", "firstPartyCookies"]);
   });
 
-  it("is not sent while HTTPS filtering is off, whatever is stored, and the default is off", () => {
-    const doc = withValues(Object.fromEntries(TRACKING_KEYS.map((k) => [k, true])));
-    expect(readValue(doc, "filtering.https"), "a fresh install: off").toBe(false);
+  it("is not sent while HTTPS filtering is off, whatever is stored", () => {
+    // An install from before 2026-11-22 reads HTTPS off unless its person turned it on (migrate.ts).
+    const doc = withValues({ ...Object.fromEntries(TRACKING_KEYS.map((k) => [k, true])), "filtering.https": false });
+    expect(readValue(doc, "filtering.https")).toBe(false);
     expect(readValue(doc, "tracking.webRtc"), "the wish is kept").toBe(true);
     expect(trackingInForce(readOf(doc))).toEqual([]);
+    // A new install has HTTPS and page filtering on, so Balanced is sent.
+    expect(trackingInForce(readOf(EMPTY_DOC)), "a new install").toEqual(["gpc", "searchQueries", "clientData", "queryParams"]);
     expect(defaultValue("tracking.gpc"), "on by default: so the switch, not the value, keeps it out").toBe(true);
   });
 

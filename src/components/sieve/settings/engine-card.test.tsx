@@ -18,7 +18,8 @@ vi.setConfig({ testTimeout: 20_000 });
 const SWITCHED_ON = new Set<EngineScenario>(["filtering", "hosts", "adguard", "adguard_paused", "vpn", "crash_loop", "setup"]);
 
 async function setup(engine: EngineSource, on = false) {
-  const settings = memoryBackend(on ? { schema: 4, values: { [ENGINE_SWITCH]: true } } : undefined);
+  // Off: an install from before 2026-11-22 with nothing set, so routing, HTTPS and page filtering are off.
+  const settings = memoryBackend(on ? { schema: 4, values: { [ENGINE_SWITCH]: true } } : { schema: 5, values: {} });
   const runtime = createRuntime({ source: createMockSource({ seed: 1 }), settings, engine });
   render(
     <SieveProvider runtime={runtime}>

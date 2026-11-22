@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { asOldInstall } from "./old-install";
 
 const SETTINGS = "/settings/?source=mock&seed=1";
 
@@ -52,6 +53,8 @@ test.describe("settings", () => {
 
   test("the upstream editor: add, reorder, read back, and it fits at every width", async ({ page }, info) => {
     await page.route("**/*", (route) => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
+    // An install from before, routing off, as this test was written for.
+    await asOldInstall(page);
     await page.goto(`${SETTINGS}&engine=idle`);
     const editor = row(page, "filtering.upstreams");
     await editor.scrollIntoViewIfNeeded();

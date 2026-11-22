@@ -1,7 +1,8 @@
 /**
  * Law 14, the settings password and the first-run guide. The hash stays in Rust
  * and off the wire; every UI write passes the one gate, except the guide's one
- * flag, which is the only setting it writes.
+ * flag, the only setting it writes by itself. Its switches change only on the
+ * person's click, through the same gated write as Settings (since 2026-11-22).
  */
 import { describe, expect, it } from "vitest";
 import { MIN_PASSWORD_CHARS } from "@/core/lock";
@@ -68,7 +69,7 @@ describe("settings password law", () => {
 describe("first-run guide law", () => {
   const guide = [...code("src/components/sieve/welcome"), "src/core/welcome.ts", "src/hooks/use-welcome.ts"];
 
-  it("it never writes a setting other than its own flag, and that write is its only way past the gate", () => {
+  it("by itself it writes only its own flag, and that write is its only way past the gate", () => {
     expect(WELCOME_DONE).toBe("startup.welcomeDone");
     // Skip is always one click, so this one write does not wait on a password.
     // It changes no traffic and no protected setting, and it can only say "done".
@@ -79,8 +80,24 @@ describe("first-run guide law", () => {
     const reads = guide.flatMap((f) => [...read(f).matchAll(/useSetting\(([^)]*)\)/g)].map((m) => m[1]));
     expect(reads).toEqual(["WELCOME_DONE"]);
     expect(read("src/hooks/use-welcome.ts")).toMatch(/const \[finished\] = useSetting\(WELCOME_DONE\)/);
+  });
+
+  // The owner's decision of 2026-11-22: the guide's switches are editable. They are
+  // Settings' own write, so the password gate, `requires` and the engine's locks hold.
+  it("it writes a switch only on the person's click, through the settings view's gated write", () => {
     const view = guide.flatMap((f) => hits(f, /useSettingsView\(/));
-    for (const line of view) expect(line).toMatch(/const \{ doc, lockOf \} = useSettingsView\(/);
+    expect(view).toHaveLength(1);
+    expect(view[0]).toMatch(/const \{ doc, lockOf, set \} = useSettingsView\(/);
+    // That write is the settings view's: through the lock's guard, and refused for a locked row.
+    const settingsView = read("src/components/sieve/settings/use-settings-view.ts");
+    expect(settingsView).toMatch(/if \(unpasswordedLock\(key\) !== null\) return;\s*void guard\(\(\) => settings\.set\(key, value as never\)\);/);
+    // Called once, from a switch's change handler, and nowhere else (no effect, no step change).
+    const screen = read("src/components/sieve/welcome/welcome-screen.tsx");
+    expect(screen.match(/\bset\(/g)).toHaveLength(1);
+    expect(screen).toMatch(/onCheckedChange=\{\(v\) => set\(s\.key, v\)\}/);
+    // A locked switch cannot be clicked, and says why, as on the Settings row.
+    expect(screen).toMatch(/disabled=\{s\.lock !== null\}/);
+    expect(screen).toMatch(/\{s\.lock && <LockNote lock=\{s\.lock\} \/>\}/);
   });
 
   it("it never names the engine's policy", () => {
