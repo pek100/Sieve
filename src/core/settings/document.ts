@@ -50,8 +50,10 @@ export function normalizeDoc(raw: unknown): SettingsDoc {
   if (raw === undefined) return EMPTY_DOC;
   if (typeof raw !== "object" || raw === null) return OLD_INSTALL_DOC;
   const r = raw as { schema?: unknown; values?: unknown };
-  const values = typeof r.values === "object" && r.values !== null && !Array.isArray(r.values) ? r.values : {};
-  const schema = typeof r.schema === "number" ? r.schema : SCHEMA_BEFORE_ON_DEFAULTS;
+  const valid = typeof r.values === "object" && r.values !== null && !Array.isArray(r.values);
+  const values = valid ? r.values : {};
+  // Values that are not a record cannot say what the switches were: read them as an older install's (off).
+  const schema = typeof r.schema === "number" && valid ? r.schema : SCHEMA_BEFORE_ON_DEFAULTS;
   return migrate({ schema, values: values as Record<string, unknown> });
 }
 
@@ -68,7 +70,10 @@ function unavailableValue<K extends SettingKey>(key: K): SettingValue<K> {
 export function readValue<K extends SettingKey>(doc: SettingsDoc, key: K): SettingValue<K> {
   if (!isAvailable(key)) return unavailableValue(key);
   const v = doc.values[key];
-  return v !== undefined && isValidValue(key, v) ? (v as SettingValue<K>) : defaultValue(key);
+  if (v !== undefined && isValidValue(key, v)) return v as SettingValue<K>;
+  // A data switch whose stored value is damaged reads off, never its default (which may be on).
+  if (v !== undefined && settingDef(key).kind === "dataSwitch") return false as SettingValue<K>;
+  return defaultValue(key);
 }
 
 /**

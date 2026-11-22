@@ -138,6 +138,17 @@ describe("5 -> 6: routing, HTTPS and page filtering are on for a new install onl
     expect(keepSwitchesAsTheyWere({ "filtering.engine": false, "filtering.https": "yes", "filtering.content": 1 })).toEqual(KEPT_OFF);
   });
 
+  it("a current document with a damaged switch value, or values that are not a record, reads the switches off", () => {
+    const damaged = normalizeDoc({ schema: SETTINGS_SCHEMA, values: { "filtering.engine": "yes", "filtering.https": 1 } });
+    expect(readValue(damaged, "filtering.engine")).toBe(false);
+    expect(readValue(damaged, "filtering.https")).toBe(false);
+    expect(readValue(damaged, "filtering.content")).toBe(true);
+    for (const values of [[], "x", null]) {
+      const doc = normalizeDoc({ schema: SETTINGS_SCHEMA, values });
+      for (const k of ON_FOR_NEW_INSTALLS) expect(readValue(doc, k), `${JSON.stringify(values)} ${k}`).toBe(false);
+    }
+  });
+
   it("a current document keeps a person's off and reads absence as on", () => {
     const doc = normalizeDoc({ schema: SETTINGS_SCHEMA, values: { "filtering.https": false } });
     expect(readValue(doc, "filtering.engine")).toBe(true);
