@@ -11,6 +11,10 @@
 //! 6. It reports Running, starts the watchdog thread, the updater's thread, the
 //!    routing loop and the pipe, until Windows asks it to stop or shut down; then
 //!    it takes the routes down, records a clean stop and reports Stopped.
+//!    StopPending goes to the SCM as the stop arrives; a stop that has not
+//!    finished within [`STOP_BOUND`] cleans up by itself and ends the process
+//!    (`guard_stop`), so a part of shutdown that hangs cannot keep the engine,
+//!    or its file, alive.
 //!
 //! A panic on any thread but a flow worker deletes Sieve's routes and stops
 //! the ETW session before the process dies (plan 1.6.6); a flow task's panic
@@ -21,15 +25,16 @@
 //! recorded CA keys and stops: no routing, no pipe.
 
 use std::ffi::OsString;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use sieve_ipc::PIPE_NAME;
 use tokio::sync::{mpsc, watch};
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
 use windows_service::{define_windows_service, service_dispatcher};
 
 use super::acl::pipe_sddl;
@@ -93,29 +98,132 @@ fn purge_ca_keys() {
     }
 }
 
-fn service_main(args: Vec<OsString>) {
-    system32_only();
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let handler = move |control| match control {
+/// From the stop's start (the SCM's request, or the pipe ending by itself) to
+/// Stopped, at most this long. Past it the process cleans up by itself and ends
+/// ([`stop_overran`]). Under `restore`'s wait ([`super::STOP_WAIT`]), so an
+/// installer never meets an engine that still holds its file.
+const STOP_BOUND: Duration = Duration::from_secs(15);
+/// What Windows is told the stop may take (the SCM's `WaitHint`).
+const STOP_HINT: Duration = Duration::from_secs(20);
+/// The cleanup past [`STOP_BOUND`] waits this long for the routes; a hang there
+/// must not keep the process alive.
+const ROUTES_BOUND: Duration = Duration::from_secs(3);
+
+/// The stop is under way: set by the control handler, or by `serve` when the
+/// pipe ended by itself.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+/// Windows asked for the stop (not the pipe ending by itself).
+static ASKED: AtomicBool = AtomicBool::new(false);
+/// Everything is down: [`guard_stop`] has nothing more to watch.
+static DONE: AtomicBool = AtomicBool::new(false);
+/// The thread that runs [`guard_stop`], woken by [`begin_stop`] and [`DONE`].
+static GUARD: OnceLock<std::thread::Thread> = OnceLock::new();
+/// The SCM status handle, and whether Stopped was reported (nothing is
+/// reported after it).
+static STATUS: Mutex<Option<(ServiceStatusHandle, bool)>> = Mutex::new(None);
+
+/// Reports `state` to the SCM, unless Stopped was reported already.
+fn report(state: ServiceState, accept: ServiceControlAccept, code: ServiceExitCode) {
+    let mut status = STATUS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((handle, stopped)) = status.as_mut() else { return };
+    if *stopped {
+        return;
+    }
+    let pending = state == ServiceState::StopPending;
+    let _ = handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: state,
+        controls_accepted: accept,
+        exit_code: code,
+        checkpoint: u32::from(pending),
+        wait_hint: if pending { STOP_HINT } else { Duration::ZERO },
+        process_id: None,
+    });
+    *stopped = state == ServiceState::Stopped;
+}
+
+/// Starts the stop once: StopPending to the SCM at once, then the guard thread
+/// takes it from there. Never waits on the engine: only an atomic, the status
+/// report and a wake.
+fn begin_stop() {
+    if STOPPING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    report(ServiceState::StopPending, ServiceControlAccept::empty(), ServiceExitCode::Win32(0));
+    if let Some(guard) = GUARD.get() {
+        guard.unpark();
+    }
+}
+
+/// The SCM's control handler, on its dispatcher thread. A plain function, so of
+/// size zero: windows-service frees the handler after the first Stop and still
+/// calls it for every later control, harmless only when there is nothing to
+/// free. It hands the stop on and returns; a second Stop is answered too.
+fn on_control(control: ServiceControl) -> ServiceControlHandlerResult {
+    match control {
         ServiceControl::Stop | ServiceControl::Shutdown => {
-            let _ = stop_tx.send(true);
+            ASKED.store(true, Ordering::SeqCst);
+            begin_stop();
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
         _ => ServiceControlHandlerResult::NotImplemented,
+    }
+}
+
+/// The guard thread's whole job: wait for the stop (`stopping`), pass it on to
+/// the engine (`pass_on`, which may wait on the engine's locks, so it runs here
+/// and not on the dispatcher thread), then give the stop `bound` to finish
+/// (`done`); past it, `overran` runs. Woken by `unpark`; a spurious wake only
+/// looks again.
+fn guard_stop(stopping: &AtomicBool, done: &AtomicBool, bound: Duration, pass_on: impl FnOnce(), overran: impl FnOnce()) {
+    while !stopping.load(Ordering::SeqCst) {
+        if done.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::park();
+    }
+    pass_on();
+    let deadline = Instant::now() + bound;
+    while !done.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        if now >= deadline {
+            overran();
+            return;
+        }
+        std::thread::park_timeout(deadline - now);
+    }
+}
+
+/// The stop did not finish within [`STOP_BOUND`]: the same cleanup as an
+/// emergency exit (routes, then the ETW session, each bounded), the reason on
+/// disk, Stopped to the SCM, and the process ends at once, whatever its other
+/// threads hold. The code is 0 when Windows asked for the stop, so the SCM's
+/// recovery does not start the engine again in the middle of an install; a pipe
+/// that ended by itself is a failure, and recovery restarts the engine.
+fn stop_overran() {
+    let routes = || {
+        let journal = state::program_data().map(|pd| Journal::new(&state::engine_dir(&pd)));
+        match journal {
+            Ok(journal) => within(ROUTES_BOUND, move || clear_stale(&journal)).unwrap_or_else(|why| format!("routes: FAILED, {why}")),
+            Err(why) => format!("routes: FAILED, {why}"),
+        }
     };
-    let Ok(handle) = service_control_handler::register(SERVICE_NAME, handler) else { return };
-    let report = |state, accept, code| {
-        let _ = handle.set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: state,
-            controls_accepted: accept,
-            exit_code: code,
-            checkpoint: 0,
-            wait_hint: Duration::ZERO,
-            process_id: None,
-        });
-    };
+    let cleaned = emergency_cleanup(routes, stop_stale);
+    record_failure(&format!("the stop did not finish within {} s; {cleaned}", STOP_BOUND.as_secs()));
+    let code = if ASKED.load(Ordering::SeqCst) { ServiceExitCode::Win32(0) } else { ServiceExitCode::ServiceSpecific(FAILED) };
+    report(ServiceState::Stopped, ServiceControlAccept::empty(), code);
+    use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    // SAFETY: ends this process; the pseudo handle needs no closing.
+    let _ = unsafe { TerminateProcess(GetCurrentProcess(), 0) };
+    std::process::abort();
+}
+
+fn service_main(args: Vec<OsString>) {
+    system32_only();
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let Ok(handle) = service_control_handler::register(SERVICE_NAME, on_control) else { return };
+    *STATUS.lock().unwrap_or_else(|p| p.into_inner()) = Some((handle, false));
     // Every start, before anything runs: a LocalSystem service whose files
     // users can change must not run (the ACL may have changed since install).
     if let Err(why) = check_this_exe() {
@@ -131,6 +239,22 @@ fn service_main(args: Vec<OsString>) {
         report(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::Win32(0));
         return;
     }
+    let guard = std::thread::Builder::new().name("sieve-stop-guard".into()).spawn(move || {
+        guard_stop(&STOPPING, &DONE, STOP_BOUND, move || {
+            let _ = stop_tx.send(true);
+        }, stop_overran);
+    });
+    match guard {
+        Ok(guard) => {
+            let _ = GUARD.set(guard.thread().clone());
+        }
+        Err(e) => {
+            // No guard, no bounded stop: refuse to run rather than risk a hung one.
+            record_failure(&format!("stop guard thread: {e}"));
+            report(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::ServiceSpecific(FAILED));
+            return;
+        }
+    }
     report(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, ServiceExitCode::Win32(0));
     let code = match serve(stop_rx) {
         Ok(()) => ServiceExitCode::Win32(0),
@@ -139,6 +263,10 @@ fn service_main(args: Vec<OsString>) {
             ServiceExitCode::ServiceSpecific(FAILED)
         }
     };
+    DONE.store(true, Ordering::SeqCst);
+    if let Some(guard) = GUARD.get() {
+        guard.unpark();
+    }
     report(ServiceState::Stopped, ServiceControlAccept::empty(), code);
 }
 
@@ -165,18 +293,23 @@ fn emergency_cleanup(routes: impl FnOnce() -> String, session: impl FnOnce() -> 
 }
 
 fn stop_session_within(stop: impl FnOnce() -> Result<String, String> + Send + 'static, bound: Duration) -> String {
-    let (done, wait) = std::sync::mpsc::sync_channel(1);
-    let stopper = std::thread::Builder::new().name("sieve-etw-stop".into()).spawn(move || {
-        let _ = done.send(stop());
-    });
-    if let Err(e) = stopper {
-        return format!("attribution session: FAILED, no thread to stop it: {e}");
-    }
-    match wait.recv_timeout(bound) {
+    match within(bound, stop) {
         Ok(Ok(what)) => format!("attribution session: {what}"),
-        Ok(Err(why)) => format!("attribution session: FAILED, {why}"),
-        Err(_) => format!("attribution session: FAILED, no answer within {} s", bound.as_secs()),
+        Ok(Err(why)) | Err(why) => format!("attribution session: FAILED, {why}"),
     }
+}
+
+/// `work` on a thread of its own, waited for up to `bound`; one that hangs is
+/// left behind, so it cannot hold the caller.
+fn within<T: Send + 'static>(bound: Duration, work: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    let (done, wait) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("sieve-bounded".into())
+        .spawn(move || {
+            let _ = done.send(work());
+        })
+        .map_err(|e| format!("no thread to run it: {e}"))?;
+    wait.recv_timeout(bound).map_err(|_| format!("no answer within {bound:?}"))
 }
 
 /// The watchdog's trip: routes first (named and journalled), then the ETW
@@ -304,7 +437,9 @@ fn serve(stop: watch::Receiver<bool>) -> Result<(), String> {
             });
         }
         let served = server::serve(&sddl, engine.clone(), stop).await;
-        // The pipe ended (a stop, or a pipe error): the routes go down either way.
+        // The pipe ended (a stop, or a pipe error): the routes go down either way,
+        // within the stop's bound.
+        begin_stop();
         let _ = halt_tx.send(true);
         let _ = tokio::time::timeout(TAKE_DOWN_BOUND, routing).await;
         served
@@ -364,6 +499,75 @@ mod tests {
         );
         assert!(said.starts_with("attribution session: FAILED, no answer"), "{said}");
         drop(release);
+    }
+
+    /// windows-service frees the handler after the first Stop and calls it again
+    /// for later controls: only a handler of size zero survives that.
+    #[test]
+    fn the_control_handler_has_nothing_to_free_and_answers_every_stop() {
+        assert_eq!(std::mem::size_of_val(&on_control), 0);
+        for control in [ServiceControl::Stop, ServiceControl::Stop, ServiceControl::Interrogate, ServiceControl::Shutdown] {
+            assert_eq!(on_control(control).to_raw(), ServiceControlHandlerResult::NoError.to_raw(), "{control:?}");
+        }
+        assert!(STOPPING.load(Ordering::SeqCst) && ASKED.load(Ordering::SeqCst));
+    }
+
+    /// Runs `guard_stop` on a thread, as the service does; returns what it did.
+    fn guard(stopping: Arc<AtomicBool>, done: Arc<AtomicBool>, bound: Duration) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<&'static str>) {
+        let (said, heard) = std::sync::mpsc::channel();
+        let passed = said.clone();
+        let thread = std::thread::spawn(move || {
+            guard_stop(&stopping, &done, bound, move || passed.send("passed on").unwrap(), move || said.send("overran").unwrap());
+        });
+        (thread, heard)
+    }
+
+    #[test]
+    fn a_stop_that_finishes_in_time_is_only_passed_on() {
+        let (stopping, done) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (thread, heard) = guard(stopping.clone(), done.clone(), Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(heard.try_recv().is_err(), "nothing before the stop");
+        stopping.store(true, Ordering::SeqCst);
+        thread.thread().unpark();
+        assert_eq!(heard.recv_timeout(Duration::from_secs(5)), Ok("passed on"));
+        done.store(true, Ordering::SeqCst);
+        thread.thread().unpark();
+        thread.join().unwrap();
+        assert!(heard.try_recv().is_err(), "no overrun");
+    }
+
+    #[test]
+    fn a_stop_that_hangs_overruns_at_its_bound() {
+        let (stopping, done) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+        let started = Instant::now();
+        let (thread, heard) = guard(stopping, done, Duration::from_millis(200));
+        assert_eq!(heard.recv_timeout(Duration::from_secs(5)), Ok("passed on"));
+        assert_eq!(heard.recv_timeout(Duration::from_secs(5)), Ok("overran"));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(3), "{took:?}");
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_run_that_ends_without_a_stop_passes_nothing_on() {
+        let (stopping, done) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (thread, heard) = guard(stopping, done.clone(), Duration::from_millis(50));
+        done.store(true, Ordering::SeqCst);
+        thread.thread().unpark();
+        thread.join().unwrap();
+        assert!(heard.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_hung_task_is_left_behind_within_its_bound() {
+        let (release, hung) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        let got = within(Duration::from_millis(50), move || hung.recv());
+        assert_eq!(got.err().as_deref(), Some("no answer within 50ms"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(release);
+        assert_eq!(within(Duration::from_secs(5), || 7), Ok(7));
     }
 
     /// `last_error` as `status.json` says it, after a start with a bad `dns.json`.
