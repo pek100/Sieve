@@ -618,11 +618,17 @@ impl Drop for IpStackTcpStream {
         }
         if let Some(task_handle) = self.task_handle.take() {
             if !task_handle.is_finished() {
+                // Sieve (2026-11-23): the task is told to end and left to end by itself;
+                // the drop never waits for it. Upstream waited here, in `block_in_place` +
+                // `block_on`: each stream dropped this way held a runtime thread until its
+                // task had run, and the task queued behind the other cancelled flows. A
+                // take-down that cancelled more of them than the runtime has threads held
+                // every thread (the engine's dump: all 540), and nothing ran again. Every
+                // message on this channel means exit, so a full one has one queued already.
                 if let Some(notifier) = self.exit_notifier.take() {
-                    _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(notifier.send(())));
+                    _ = notifier.try_send(());
                 }
-                // synchronously wait for the task to finish
-                _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(task_handle));
+                drop(task_handle);
             } else {
                 log::trace!("{nt} {state:?}: [drop] task already finished, no need to wait exiting");
             }

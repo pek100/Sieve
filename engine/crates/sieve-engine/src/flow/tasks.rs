@@ -3,9 +3,11 @@
 //! Live run 2 (AdGuard on, thousands of stuck flows) printed its summary and
 //! then never exited: the probe left every flow task running and let the
 //! tokio runtime's drop tear them down. Each task owned an ipstack TCP
-//! stream, whose `Drop` uses `block_in_place` + `block_on` to wait for the
+//! stream, whose `Drop` used `block_in_place` + `block_on` to wait for the
 //! stream's own session task; while the runtime is shutting down nothing
-//! drives that task any more, so the drop waits forever.
+//! drives that task any more, so the drop waited forever. Since 2026-11-23 the
+//! drop no longer waits: a take-down that cancelled more such streams than the
+//! runtime has threads held every one of them (`stack::relay_tests`).
 //!
 //! [`FlowTasks`] keeps every flow task in one `JoinSet`. [`FlowTasks::shutdown`]
 //! aborts them all and waits (bounded) for them to finish while the runtime
