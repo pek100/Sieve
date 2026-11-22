@@ -183,10 +183,21 @@ pub(crate) fn stop() -> Result<String, String> {
     let Some(service) = open(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)? else {
         return Ok("not installed".into());
     };
-    if service.query_status().map_err(|e| e.to_string())?.current_state == ServiceState::Stopped {
-        return Ok("already stopped".into());
+    let state = || service.query_status().map(|s| s.current_state).map_err(|e| e.to_string());
+    match state()? {
+        ServiceState::Stopped => return Ok("already stopped".into()),
+        // A stop already under way (another `restore`, the installer's own
+        // `sc stop`) refuses a second one: wait for it instead.
+        ServiceState::StopPending => {}
+        _ => {
+            if let Err(e) = service.stop() {
+                match state()? {
+                    ServiceState::StopPending | ServiceState::Stopped => {}
+                    _ => return Err(format!("stop: {e}")),
+                }
+            }
+        }
     }
-    service.stop().map_err(|e| format!("stop: {e}"))?;
     wait_for(&service, ServiceState::Stopped)?;
     Ok("stopped".into())
 }
