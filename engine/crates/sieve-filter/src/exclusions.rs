@@ -297,6 +297,10 @@ pub enum Floor {
     AppScope,
     /// No installed, in-date root to mint from.
     NoRoot,
+    /// The app's process started before Sieve's root was installed and refused
+    /// Sieve's certificate: it reads its trusted roots at start, so it trusts the
+    /// root only once it restarts (slice 7, 2026-11-22).
+    RootNotTrusted,
     NoExclusionList,
     NoSni,
     /// A real ECH cannot be ruled out (task D9).
@@ -314,12 +318,13 @@ pub enum Floor {
 
 impl Floor {
     /// Every floor fact, for the coverage law and the property tests.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Forwarded,
         Self::UnknownApp,
         Self::Service,
         Self::AppScope,
         Self::NoRoot,
+        Self::RootNotTrusted,
         Self::NoExclusionList,
         Self::NoSni,
         Self::Ech,
@@ -340,6 +345,7 @@ impl Floor {
             Self::Service => "floor:service",
             Self::AppScope => "floor:app-scope",
             Self::NoRoot => "floor:no-root",
+            Self::RootNotTrusted => "floor:root-not-trusted",
             Self::NoExclusionList => "floor:no-exclusion-list",
             Self::NoSni => "floor:no-sni",
             Self::Ech => "floor:ech",
@@ -431,6 +437,9 @@ pub struct FlowFacts<'a> {
     pub app_in_scope: bool,
     pub app_off: bool,
     pub upstream: Option<UpstreamVerdict>,
+    /// The flow's process refused Sieve's certificate and started before the root
+    /// that minted it was installed ([`Floor::RootNotTrusted`]).
+    pub root_not_trusted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,6 +491,9 @@ fn floor(facts: &FlowFacts<'_>, switches: &Switches) -> Option<Floor> {
     }
     if !switches.root_ready {
         return Some(Floor::NoRoot);
+    }
+    if facts.root_not_trusted {
+        return Some(Floor::RootNotTrusted);
     }
     if !switches.lists_ready {
         return Some(Floor::NoExclusionList);
@@ -669,6 +681,7 @@ mod decrypt_tests {
             app_in_scope: true,
             app_off: false,
             upstream: Some(UpstreamVerdict::Eligible),
+            root_not_trusted: false,
         }
     }
 
@@ -683,6 +696,7 @@ mod decrypt_tests {
             Floor::Service => f.session = Some(0),
             Floor::AppScope => f.app_in_scope = false,
             Floor::NoRoot => s.root_ready = false,
+            Floor::RootNotTrusted => f.root_not_trusted = true,
             Floor::NoExclusionList => s.lists_ready = false,
             Floor::NoSni => f.host = None,
             Floor::Ech => f.ech = true,
@@ -968,7 +982,7 @@ mod decrypt_tests {
         ) {
             let store = store_of(&text, &auto);
             prop_assume!(!name_may_intercept(&host, &store, &sw));
-            let facts = FlowFacts { transport, may_decrypt, exe, session, host: Some(&host), ip: ip(), port: 443, alpn: &names, ech, client_compatible: compatible, app_in_scope: in_scope, app_off, upstream };
+            let facts = FlowFacts { transport, may_decrypt, exe, session, host: Some(&host), ip: ip(), port: 443, alpn: &names, ech, client_compatible: compatible, app_in_scope: in_scope, app_off, upstream, root_not_trusted: false };
             prop_assert!(matches!(decrypt(&facts, &store, &sw), Decrypt::PassThrough(_)));
         }
 

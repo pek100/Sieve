@@ -463,6 +463,7 @@ impl ExclusionSlot {
         if let Some(before) = &before {
             entry.retries = before.retries;
             entry.created_ms = before.created_ms;
+            entry.retried_for_root = entry.retried_for_root.or(before.retried_for_root);
         }
         let newly = before.is_none_or(|b| b.retrying);
         layers.auto.push(entry);
@@ -527,6 +528,38 @@ impl ExclusionSlot {
             return self.try_again_whole_app(app, now_ms).into_iter().map(|_| Pattern::Wildcard("*".into())).collect();
         }
         self.take_back(now_ms, |e| e.reason == reason && e.app.as_deref() == Some(app))
+    }
+
+    /// A new root (HTTPS filtering turned on, a reinstall or a rotation), installed
+    /// at `root_ms`: every held `auto:pinning` entry last heard before it is tried
+    /// once more, as "Try decrypting again" does, but not counted as the user's try.
+    /// What it said was a refusal of an older root's leaves. A client that still
+    /// refuses writes the entry again, heard now, so it is not tried again for this
+    /// root; a refusal by a process older than the root is no evidence (`heal`) and
+    /// writes none. Idempotent: the certificate loop calls it after every reconcile.
+    /// Each entry records the root it was tried for and is tried once per root, so a
+    /// clock that went back cannot make a loop of it; a root dated after now (the
+    /// clock went back since it was made) tries nothing, since "heard before" means
+    /// nothing then. An `ech_required` entry is about the name and is left alone.
+    /// (`auto:failing` is left alone: it is memory only, goes within a day, and keeps
+    /// its first date when written again, so this would try it at every call.) The
+    /// entries tried.
+    pub fn retry_before_root(&self, root_ms: u64, now_ms: u64) -> usize {
+        if root_ms > now_ms {
+            return 0;
+        }
+        let mut layers = lock(&self.layers);
+        let mut tried = 0;
+        for entry in layers.auto.iter_mut().filter(|e| e.is_held(now_ms) && e.heard_before(root_ms)) {
+            entry.retrying = true;
+            entry.retried_for_root = Some(root_ms);
+            tried += 1;
+        }
+        if tried > 0 {
+            self.rebuild(&layers, now_ms);
+            self.write(&layers);
+        }
+        tried
     }
 
     fn take_back(&self, now_ms: u64, named: impl Fn(&AutoEntry) -> bool) -> Vec<Pattern> {
@@ -720,6 +753,60 @@ mod tests {
         assert!(slot.revision() > added);
     }
 
+    /// 2026-11-22: a new root gives each Rejected row heard before it one more try,
+    /// once; a row heard after it stands, and so does every other reason.
+    #[test]
+    fn a_new_root_retries_the_rejected_rows_heard_before_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        let root = NOW + DAY;
+        slot.add_auto(AutoEntry::for_app("old.example", "firefox.exe", AutoReason::Pinning, NOW), NOW);
+        slot.add_auto(AutoEntry::for_app("new.example", "firefox.exe", AutoReason::Pinning, root + 1), root + 1);
+        slot.add_auto(AutoEntry::host("cert.example", AutoReason::ClientCert, NOW, None), NOW);
+        let legacy = AutoEntry { heard_ms: None, ..AutoEntry::for_app("legacy.example", "client.exe", AutoReason::Pinning, NOW) };
+        slot.add_auto(legacy, NOW);
+        let held = |at: u64| slot.rows(at).into_iter().filter(|r| r.reason.starts_with("auto:")).map(|r| r.line).collect::<Vec<_>>();
+        assert_eq!(slot.retry_before_root(NOW, NOW), 0, "the root they were heard under: nothing");
+        assert_eq!(slot.retry_before_root(root, root + 2), 2, "the row heard before it, and one from before the field, by its first date");
+        assert_eq!(held(root + 2), ["\"new.example\"", "\"cert.example\""]);
+        assert_eq!(slot.retry_before_root(root, root + 3), 0, "once");
+        let rows = |at| slot.rows(at);
+        assert!(rows(root + 2).iter().all(|r| r.retries == 0), "not the user's try");
+        // Still refused under the new root: back, heard now, and not tried again for it.
+        assert!(slot.add_auto(AutoEntry::for_app("old.example", "firefox.exe", AutoReason::Pinning, root + 5), root + 5));
+        assert_eq!(slot.retry_before_root(root, root + 6), 0);
+        let back = rows(root + 6).into_iter().find(|r| r.line == "\"old.example\"").unwrap();
+        assert_eq!((back.created_ms, back.retries), (Some(NOW), 0), "with its first date");
+        slot.flush();
+        let restarted = ExclusionSlot::new(Some(dir.path()), &[], root + 7);
+        assert_eq!(restarted.retry_before_root(root, root + 7), 0, "the time it was heard survives a restart");
+        assert!(!restarted.rows(root + 7).iter().any(|r| r.line == "\"legacy.example\""), "and so does the try");
+    }
+
+    /// P3-3 of the 2026-11-22 review: clocks. A root dated after now tries nothing;
+    /// a row refused again under the root with a clock that went back is still
+    /// tried only once for that root, and that survives a restart.
+    #[test]
+    fn a_new_root_retries_a_row_once_whatever_the_clocks_say() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        let root = NOW + DAY;
+        slot.add_auto(AutoEntry::for_app("old.example", "firefox.exe", AutoReason::Pinning, NOW), NOW);
+        let held = |at: u64| slot.rows(at).into_iter().any(|r| r.line == "\"old.example\"");
+        assert_eq!(slot.retry_before_root(root, root - 1), 0, "a root from the future: the clock went back");
+        assert!(held(root - 1));
+        assert_eq!(slot.retry_before_root(root, root), 1);
+        // Refused again, heard by a clock an hour behind: before the root by the clock.
+        let behind = root - 3_600_000;
+        slot.add_auto(AutoEntry::for_app("old.example", "firefox.exe", AutoReason::Pinning, behind), behind);
+        assert_eq!(slot.retry_before_root(root, root + 1), 0, "tried for this root already");
+        assert!(held(root + 1));
+        slot.flush();
+        let restarted = ExclusionSlot::new(Some(dir.path()), &[], root + 2);
+        assert_eq!(restarted.retry_before_root(root, root + 2), 0, "and after a restart");
+        assert_eq!(restarted.retry_before_root(root + DAY, root + DAY), 1, "the next root tries it once more");
+    }
+
     #[test]
     fn the_user_layer_is_not_sent() {
         let slot = ExclusionSlot::new(None, &["mine.example".to_string()], NOW);
@@ -781,6 +868,23 @@ mod tests {
         assert_eq!(auto::load(dir.path()).unwrap(), kept, "from the disk too; another app's, another reason's and the current rule's stay");
         assert_eq!(auto::rule_applied(dir.path()), auto::PINNING_RULE, "recorded");
         assert_eq!(slot.error(), None);
+    }
+
+    /// The migration of 2026-11-22: rule 1 took a refusal by a browser started before
+    /// the root for evidence, and its rows carry nothing to tell which, so a browser's
+    /// rule-1 rows go once; another app's stay, as with every rule drop.
+    #[test]
+    fn a_browsers_rejected_rows_of_rule_1_go_once() {
+        assert_eq!(auto::PINNING_RULE, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let rule_1 = |host: &str, exe: &str| AutoEntry { rule: 1, heard_ms: None, ..AutoEntry::for_app(host, exe, AutoReason::Pinning, NOW) };
+        auto::save(dir.path(), &[rule_1("youtube.example", r"C:\b\browser.exe"), rule_1("pinned.example", r"C:\Apps\Client.exe")]).unwrap();
+        std::fs::write(dir.path().join(auto::RULE_FILE), r#"{"pinning_rule":1}"#).unwrap();
+        let slot = ExclusionSlot::new(Some(dir.path()), &[], NOW);
+        slot.set_browsers(BrowserSet::read(&TheBrowser), NOW);
+        assert_eq!(find(&slot, "youtube.example", NOW), None, "decrypted again");
+        assert_eq!(auto::load(dir.path()).unwrap().iter().map(|e| e.pattern.line()).collect::<Vec<_>>(), ["\"pinned.example\""]);
+        assert_eq!(auto::rule_applied(dir.path()), 2);
     }
 
     /// P3 of the 2026-11-08 review: an older engine rewrites the file without `rule`.

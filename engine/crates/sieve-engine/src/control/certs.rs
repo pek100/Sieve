@@ -25,9 +25,15 @@ pub async fn run(engine: Arc<Engine>, ca: Arc<Ca>, mut stop: watch::Receiver<boo
         let wanted = engine.policy().https;
         let reinstall = engine.take_reinstall();
         let job = ca.clone();
+        let exclusions = engine.exclusions.clone();
         // The system calls block; the failures are in status.
         let done = tokio::task::spawn_blocking(move || {
             let _ = if reinstall && wanted { job.reinstall(wall_ms()) } else { job.reconcile(wanted, wall_ms()) };
+            // A root newer than what a Rejected row heard: that row gets one more try
+            // (slice 7, 2026-11-22). Nothing new after the first pass for a root.
+            if let Some(minter) = job.minter() {
+                exclusions.retry_before_root(minter.installed_ms(), wall_ms());
+            }
             job.holding()
         });
         let holding = done.await.unwrap_or(true);
@@ -117,6 +123,33 @@ mod tests {
         let first = r.store.thumbprints();
         r.engine.install_root().unwrap();
         until("a new root replaced it", || r.store.thumbprints().len() == 1 && r.store.thumbprints() != first).await;
+        stop.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    /// Slice 7, 2026-11-22: turning HTTPS on makes a root, and a Rejected row heard
+    /// before it is tried once more; one heard after it stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turning_https_on_retries_the_rejected_rows_heard_before_the_new_root() {
+        use crate::exclusions::AutoEntry;
+        use sieve_filter::exclusions::AutoReason;
+        let r = rig(Policy::default());
+        let before = wall_ms() - 60_000;
+        r.engine.exclusions.add_auto(AutoEntry::for_app("old.example", "firefox.exe", AutoReason::Pinning, before), before);
+        let lines = || r.engine.exclusions.rows(wall_ms()).into_iter().filter(|row| row.reason == "auto:pinning").map(|row| row.line).collect::<Vec<_>>();
+        let (stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run(r.engine.clone(), r.ca.clone(), stop_rx));
+        r.engine.set_policy(Policy { revision: 1, https: true, ..Policy::default() }).unwrap();
+        until("the root is installed", || r.store.thumbprints().len() == 1).await;
+        until("the row heard before it is tried again", || lines().is_empty()).await;
+        let after = r.ca.minter().unwrap().installed_ms() + 1_000;
+        r.engine.exclusions.add_auto(AutoEntry::for_app("new.example", "firefox.exe", AutoReason::Pinning, after), after);
+        // The signal that a pass ran over both: a second row heard before the root goes.
+        r.engine.exclusions.add_auto(AutoEntry::for_app("late.example", "firefox.exe", AutoReason::Pinning, before), before);
+        assert_eq!(lines().len(), 2, "the control: both held");
+        r.engine.ca_wake.notify_one();
+        until("the pass tried the row heard before the root", || !lines().contains(&"\"late.example\"".to_string())).await;
+        assert_eq!(lines(), ["\"new.example\""], "and the refusal under this root stands");
         stop.send(true).unwrap();
         task.await.unwrap();
     }

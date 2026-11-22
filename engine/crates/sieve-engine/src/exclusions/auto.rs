@@ -25,8 +25,12 @@ const VERSION: u32 = 1;
 /// [`RULE_FILE`] and `ExclusionSlot::set_browsers`): that rule took what browsers
 /// do for a rejection, so they cannot be believed. Raise it whenever that rule
 /// starts excluding on less. 0 is an entry from before rules were recorded, whose
-/// rule excluded browsers' unused preconnects (2026-11-08).
-pub const PINNING_RULE: u32 = 1;
+/// rule excluded browsers' unused preconnects (2026-11-08). 1 took the refusal of a
+/// browser started before Sieve's root was installed, which reads its roots only at
+/// its start and so refuses every leaf until it restarts (2026-11-22: Firefox open
+/// since the day before excluded YouTube when HTTPS filtering was turned on). Its
+/// entries carry no time of the process, so none of a browser's can be told apart.
+pub const PINNING_RULE: u32 = 2;
 /// Beside [`FILE`]: the newest [`PINNING_RULE`] whose one-time drop has run, so
 /// it runs once per rule and not at every start.
 ///
@@ -72,17 +76,51 @@ pub struct AutoEntry {
     /// ([`RULE_FILE`]). Read for `auto:pinning` only.
     #[serde(default)]
     pub rule: u32,
+    /// When the evidence that last wrote it was heard; None in an entry from before
+    /// it was recorded (2026-11-22), which then reads as [`Self::created_ms`]. An
+    /// older engine reads past it, and loses it when it rewrites the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heard_ms: Option<u64>,
+    /// Written for an `ech_required` alert: what it said was about the name, not
+    /// Sieve's root, so a new root does not try it again (review of 2026-11-22,
+    /// P3-7). An entry from before it reads false. Left out while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ech: bool,
+    /// The root (its install time) a new root's retry last tried this entry for,
+    /// kept when the entry is written again: tried at most once per root whatever
+    /// the clocks say ([`Self::heard_before`]). None until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retried_for_root: Option<u64>,
 }
 
 impl AutoEntry {
     /// An entry for exactly this host and every app.
     pub fn host(host: &str, reason: AutoReason, created_ms: u64, expires_ms: Option<u64>) -> Self {
-        Self { pattern: Pattern::Exact(host.to_ascii_lowercase()), app: None, reason, created_ms, expires_ms, retries: 0, retrying: false, rule: PINNING_RULE }
+        Self {
+            pattern: Pattern::Exact(host.to_ascii_lowercase()),
+            app: None,
+            reason,
+            created_ms,
+            expires_ms,
+            retries: 0,
+            retrying: false,
+            rule: PINNING_RULE,
+            heard_ms: Some(created_ms),
+            ech: false,
+            retried_for_root: None,
+        }
     }
 
     /// Written by an evidence rule this engine no longer believes.
     pub fn outdated(&self) -> bool {
         self.reason == AutoReason::Pinning && self.rule < PINNING_RULE
+    }
+
+    /// A refusal of a leaf of a root older than the one installed at `root_ms`:
+    /// what it said was about that root, so the new root deserves one try, and
+    /// only one. Never an `ech_required` one, which is about the name.
+    pub fn heard_before(&self, root_ms: u64) -> bool {
+        self.reason == AutoReason::Pinning && !self.ech && self.retried_for_root != Some(root_ms) && self.heard_ms.unwrap_or(self.created_ms) < root_ms
     }
 
     /// An entry for exactly this host and one app.
@@ -432,7 +470,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(path(dir.path()), r#"{"v":1,"entries":[{"pattern":{"Exact":"a.example"},"app":null,"reason":"client-cert","created_ms":5,"expires_ms":null}]}"#).unwrap();
         let loaded = load(dir.path()).unwrap();
-        assert_eq!(loaded, [AutoEntry { rule: 0, ..AutoEntry::host("a.example", AutoReason::ClientCert, 5, None) }]);
+        assert_eq!(loaded, [AutoEntry { rule: 0, heard_ms: None, ..AutoEntry::host("a.example", AutoReason::ClientCert, 5, None) }]);
         assert_eq!((loaded[0].retries, loaded[0].retrying), (0, false));
     }
 

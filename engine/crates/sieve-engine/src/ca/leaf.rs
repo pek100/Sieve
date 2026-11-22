@@ -101,6 +101,16 @@ impl Minter {
         &self.thumbprint
     }
 
+    /// When this root was made and put in the store, to the second below: `root::build`
+    /// dates its notAfter [`super::ROOT_LIFETIME_MS`] from then, and the store add
+    /// follows the build at once. Derived from the certificate, not recorded: a
+    /// process started before this cannot have read the root at its start (slice 7,
+    /// `heal`). A rounding at worst makes a process started in that second count as
+    /// newer, which is how every refusal counted before.
+    pub fn installed_ms(&self) -> u64 {
+        self.root_not_after_ms.saturating_sub(super::ROOT_LIFETIME_MS)
+    }
+
     /// The chain's root, for the handshake.
     pub fn root_der(&self) -> &[u8] {
         &self.root_der

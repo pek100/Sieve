@@ -189,6 +189,26 @@ fn new_leaves_come_from_the_new_root_at_once() {
     assert_ne!(issuer_of(&before.der), issuer_of(&after.der));
 }
 
+/// Slice 7, 2026-11-22: what `heal` compares a process's start with. A restart
+/// reads it from the stored root, a rotation and an off-and-on move it, and it is
+/// never later than the store add.
+#[test]
+fn the_minter_says_when_its_root_was_installed() {
+    let rig = Rig::new();
+    let ca = rig.on();
+    assert_eq!(ca.minter().unwrap().installed_ms(), T0);
+    assert_eq!(rig.ca().minter().map(|_| ()), None, "a new Ca holds no minter before its reconcile");
+    let restarted = rig.ca();
+    restarted.reconcile(true, T0 + MIN).unwrap();
+    assert_eq!(restarted.minter().unwrap().installed_ms(), T0, "after a restart, from the stored root");
+    ca.reconcile(true, WINDOW).unwrap();
+    assert_eq!(ca.minter().unwrap().installed_ms(), WINDOW, "a rotation is a new root");
+    let at = WINDOW + MIN + 999;
+    ca.reconcile(false, at).unwrap();
+    ca.reconcile(true, at).unwrap();
+    assert_eq!(ca.minter().unwrap().installed_ms(), at - 999, "off and on: a new root, to the second below");
+}
+
 #[test]
 fn old_root_stays_until_remove_at_and_goes_at_it() {
     let rig = Rig::new();

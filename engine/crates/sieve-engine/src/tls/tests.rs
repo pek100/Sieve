@@ -455,6 +455,8 @@ pub(crate) struct RigOpts {
     /// build decrypts it (every app in scope, no browser registered): the case of
     /// self-healing's quiet-close rule, which a browser's closes never feed.
     pub(crate) app: bool,
+    /// With `heals`: processes' starts from the test, not from Windows.
+    pub(crate) starts: Option<fn(u32) -> Option<u64>>,
     pub(crate) clock: fn() -> u64,
     /// The exclusion lists the store loads.
     pub(crate) sources: Vec<crate::exclusions::lists::Source>,
@@ -465,7 +467,7 @@ pub(crate) struct RigOpts {
 
 impl RigOpts {
     pub(crate) fn new(roots: Arc<RootCertStore>) -> Self {
-        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, app: false, clock: wall_ms, sources: Vec::new(), ech: FakeLookup::none(), filter: None }
+        Self { roots, trust: FakeTrust::says(TrustAnswer::Trusted), trust_timeout: TRUST_TIMEOUT, rules: RuleSet::empty(), hook: Arc::new(NoRewrite), minter: true, skip_ev: true, ca_made_ms: wall_ms(), watch: Arc::new(NoWatch), heals: false, app: false, starts: None, clock: wall_ms, sources: Vec::new(), ech: FakeLookup::none(), filter: None }
     }
 }
 
@@ -491,7 +493,14 @@ impl Rig {
         let minted = (ca.clone(), opts.minter);
         let slot = Arc::new(slot);
         let meters = Arc::new(Meters::default());
-        let heal = opts.heals.then(|| Arc::new(Heal::new(slot.clone(), meters.clone())));
+        let starts = opts.starts;
+        let heal = opts.heals.then(|| {
+            let heal = Heal::new(slot.clone(), meters.clone());
+            Arc::new(match starts {
+                Some(starts) => heal.with_process_start(starts),
+                None => heal,
+            })
+        });
         let watch: Arc<dyn ClientWatch> = heal.clone().map_or(opts.watch, |h| h);
         let validation = Arc::new(ValidationSlot::new(meters.clone()));
         let deps = Interception {
@@ -554,7 +563,7 @@ impl Rig {
         let deps = self.deps.clone();
         tokio::spawn(async move {
             let decide = move |_: &Decoded| opts.action;
-            let meta = FlowMeta { id, remote: opts.remote, exe: opts.exe, session: opts.session, owner: opts.owner, names_now_ms: 0, decide: &decide };
+            let meta = FlowMeta { id, remote: opts.remote, exe: opts.exe, session: opts.session, pid: opts.pid, owner: opts.owner, names_now_ms: 0, decide: &decide };
             let out = run(&deps, stack_end, upstream, meta).await;
             deps.book.lock().unwrap().close(id, out.action, out.bytes_up, out.bytes_down);
             out
@@ -586,12 +595,14 @@ pub(crate) struct FlowOpts {
     pub(crate) remote: SocketAddr,
     pub(crate) exe: Option<&'static str>,
     pub(crate) session: Option<u32>,
+    /// None by default: the real `Heal` would read that pid's start from Windows.
+    pub(crate) pid: Option<u32>,
     pub(crate) owner: Owner<'static>,
     pub(crate) action: Action,
 }
 
 pub(crate) fn flow_opts() -> FlowOpts {
-    FlowOpts { remote: "192.0.2.1:443".parse().unwrap(), exe: Some(CHROME), session: Some(1), owner: BROWSER, action: Action::Pass }
+    FlowOpts { remote: "192.0.2.1:443".parse().unwrap(), exe: Some(CHROME), session: Some(1), pid: None, owner: BROWSER, action: Action::Pass }
 }
 
 /// The rig's filter, with only `key` turned Off, as `set_policy` swaps it.
@@ -2019,6 +2030,54 @@ arms!(a_client_with_its_own_bundle_is_excluded_after_one_failure_and_its_retry_p
     assert_eq!(rig.deps.meters.https.healed.load(Ordering::Relaxed), 1);
 });
 
+// Slice 7, 2026-11-22: Firefox open since before HTTPS filtering was turned on
+// refuses every leaf until it restarts. Its refusal excludes nothing; its next
+// connection passes through untouched so the page works, by a floor that names
+// it; the same browser started after the root is excluded as before.
+arms!(a_browser_started_before_the_root_passes_through_and_excludes_nothing, |arm| async move {
+    const OLD: u32 = 7;
+    const NEW: u32 = 8;
+    let pki = Pki::new("Test Public Root");
+    let chain = pki.leaf(HOST, GOOD);
+    let upstream_leaf = chain.0[0].to_vec();
+    let handler = tls_server(vec![server_tls(chain, &[], None)], Arc::default(), |_, tls| async move { echo(tls).await });
+    let starts: fn(u32) -> Option<u64> = |pid| match pid {
+        OLD => Some(1),
+        NEW => Some(u64::MAX / 2),
+        _ => None,
+    };
+    let rig = Rig::new(TestDial::new(arm, handler), RigOpts { heals: true, starts: Some(starts), ..RigOpts::new(pki.roots()) });
+    let heal = rig.heal.clone().expect("heals");
+    let old = FlowOpts { pid: Some(OLD), ..flow_opts() };
+    let (app, task) = rig.flow(old).await;
+    let stale = super::client_config(Pki::new("Roots Read At Start").roots(), &[]).unwrap();
+    assert!(tokio_rustls::TlsConnector::from(Arc::new(stale)).connect(ServerName::try_from(HOST).unwrap(), app).await.is_err());
+    assert_eq!(task.await.unwrap().action, FlowAction::Failed);
+    let problems: Vec<LogOutcome> = rig.deps.book.lock().unwrap().take_log().into_iter().map(|r| r.outcome).filter(|o| matches!(o, LogOutcome::Problem { .. })).collect();
+    assert_eq!(problems, [], "no AppRefusedCertificate for a process that only needs a restart");
+    assert!(heal.notices(0).1.is_empty() && rig.deps.meters.https.healed.load(Ordering::Relaxed) == 0, "nothing excluded");
+    assert!(rig.deps.exclusions.rows(wall_ms()).iter().all(|r| !r.reason.starts_with("auto:")));
+    // Its next connection: the real certificate, which it trusts.
+    let (app, task) = rig.flow(old).await;
+    let (client, shown) = client_tls(&[], None);
+    let mut tls = connect(app, client, HOST).await.unwrap_or_else(|(e, _)| panic!("{e}"));
+    assert_eq!(shown.leaf(), upstream_leaf, "the upstream's chain unchanged");
+    round_trip(&mut tls).await;
+    drop(tls);
+    task.await.unwrap();
+    assert_eq!(rig.reasons(), ["floor:root-not-trusted"]);
+    assert_eq!(heal.restart_to_trust(), [sieve_ipc::RestartApp { exe: "chrome.exe".into(), session: 1 }]);
+    // The control: the same browser started after the root is excluded at its first refusal.
+    let (app, task) = rig.flow(FlowOpts { pid: Some(NEW), ..flow_opts() }).await;
+    let pinned = super::client_config(Pki::new("Its Own Bundle").roots(), &[]).unwrap();
+    assert!(tokio_rustls::TlsConnector::from(Arc::new(pinned)).connect(ServerName::try_from(HOST).unwrap(), app).await.is_err());
+    task.await.unwrap();
+    assert_eq!(heal.notices(0).1.len(), 1);
+    assert!(rig.deps.exclusions.rows(wall_ms()).iter().any(|r| r.reason == "auto:pinning"));
+    let problems: Vec<LogOutcome> = rig.deps.book.lock().unwrap().take_log().into_iter().map(|r| r.outcome).filter(|o| matches!(o, LogOutcome::Problem { .. })).collect();
+    assert_eq!(problems, [LogOutcome::Problem { signal: sieve_ipc::Signal::AppRefusedCertificate, cause: sieve_ipc::Cause::Sieve }], "the control: its refusal is the flow's problem");
+});
+
 /// A client that handshakes and leaves without a word.
 async fn silent_client(rig: &Rig, alpn: &[&str]) {
     let (app, task) = rig.flow(flow_opts()).await;
@@ -2336,7 +2395,7 @@ arms!(a_flood_of_pinning_hosts_stays_bounded_and_one_group, |_arm| async move {
     let now = wall_ms();
     let flood = 3 * MAX_PER_REASON;
     for i in 0..flood {
-        let pair = Pair { exe: Some(CHROME.into()), host: format!("h{i}.flood.example"), session: Some(1) };
+        let pair = Pair::of(Some(CHROME), &format!("h{i}.flood.example"), Some(1));
         heal.hear(&pair, Evidence::Refused(Some(rustls::AlertDescription::UnknownCA)), now);
     }
     let (_, notices) = heal.notices(0);

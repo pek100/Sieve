@@ -406,6 +406,15 @@ impl FlowBook {
         self.log.push(row);
     }
 
+    /// One row about a process rather than a flow (no flow id): seen in that
+    /// process's session only, as its flows' rows are.
+    pub fn note_app(&mut self, pid: u32, exe: &str, session: u32, host: &str, outcome: LogOutcome) {
+        self.note(outcome);
+        if let Some(row) = self.log.last_mut().filter(|r| r.id == self.next_log_id) {
+            (row.pid, row.exe, row.session, row.host, row.kind) = (Some(pid), Some(exe.to_string()), Some(session), host.to_string(), sieve_ipc::FlowKind::Tls);
+        }
+    }
+
     /// Flows ended to make room since the engine started.
     pub fn evicted(&self) -> u64 {
         self.evicted

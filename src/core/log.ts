@@ -143,6 +143,8 @@ export const REASON_TEXT: Readonly<Record<string, string>> = {
   mixed_names: "the address also serves names no rule blocks",
   no_name: "no name known for this address",
   params_kept: "the site sends this page back to its tracking parameters, so they were kept",
+  // The engine's one row per app process open since before Sieve's certificate (heal::RESTART_TO_TRUST).
+  "restart-to-trust": "this app was open before Sieve's certificate was installed; restart it so it trusts the certificate",
 };
 
 /** A reason in words; one this build does not know shows its slug with spaces. */

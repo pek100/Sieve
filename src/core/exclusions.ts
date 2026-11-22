@@ -146,6 +146,7 @@ export const FLOOR_WORDS: Readonly<Record<string, string>> = {
   "floor:service": "Windows services",
   "floor:app-scope": "apps that are not browsers, for now",
   "floor:no-root": "anything while no certificate is installed",
+  "floor:root-not-trusted": "apps open since before Sieve's certificate was installed, until they restart",
   "floor:no-exclusion-list": "anything while this list cannot be read",
   "floor:no-sni": "connections that name no site",
   "floor:ech": "connections that hide their site name",

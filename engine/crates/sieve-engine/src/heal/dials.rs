@@ -79,6 +79,18 @@ pub const FATAL_ALERTS: [AlertDescription; 7] = [
     AlertDescription::AccessDenied,
     AlertDescription::EncryptedClientHelloRequired,
 ];
+/// The alerts that say "I do not trust the certificate's issuer": what a client
+/// sends for a root it has not read. Only one of these, from a process started
+/// before the root and never seen to complete a handshake under it, marks that
+/// process as needing a restart (`heal`, review of 2026-11-22). The rest of
+/// [`FATAL_ALERTS`] are about something else: `ech_required` about the name,
+/// `decrypt_error` and `access_denied` about the handshake or the client.
+pub const TRUST_ALERTS: [AlertDescription; 4] = [
+    AlertDescription::UnknownCA,
+    AlertDescription::BadCertificate,
+    AlertDescription::CertificateUnknown,
+    AlertDescription::UnsupportedCertificate,
+];
 /// Exclusions of one app this close to its group's first join that group: a fixed
 /// window, so a slow trickle cannot hold one group open for ever (plan 4.3).
 pub const NOTICE_WINDOW_MS: u64 = 10 * 60_000;

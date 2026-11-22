@@ -158,6 +158,18 @@ describe("engine IPC law", () => {
     expect(rustConst("CAPABILITY_UPSTREAM_CHECKS")).toBe('"upstream_checks"');
   });
 
+  it("the app reads the apps that need a restart; absent, empty or odd is nothing to say, never a refused Status", () => {
+    const status = fixture.engine.find((m) => m.type === "status")!;
+    const body = Object.fromEntries(Object.entries(status).filter(([k]) => k !== "type"));
+    expect(parseEngineStatus(body), "an older engine says nothing").not.toHaveProperty("restart_to_trust");
+    const firefox = { exe: "firefox.exe", session: 1 };
+    expect(parseEngineStatus({ ...body, restart_to_trust: [firefox] }).restart_to_trust).toEqual([firefox]);
+    expect(parseEngineStatus({ ...body, restart_to_trust: [{ ...firefox, later: 1 }, { exe: "", session: 1 }, { exe: "x.exe" }, 7] }).restart_to_trust, "a later field is ignored, an odd row left out").toEqual([firefox]);
+    for (const odd of [[], 1, "x", { exe: "a" }]) expect(parseEngineStatus({ ...body, restart_to_trust: odd }), JSON.stringify(odd)).not.toHaveProperty("restart_to_trust");
+    expect(RUST).toMatch(/skip_serializing_if = "Vec::is_empty"\)\]\s*pub restart_to_trust: Vec<RestartApp>/);
+    expect(rustConst("CAPABILITY_RESTART_TO_TRUST")).toBe('"restart_to_trust"');
+  });
+
   it("the app reads every certificate status, and its enums are the crate's", () => {
     const message = fixture.engine.find((m) => m.type === "cert_status")!;
     const body = Object.fromEntries(Object.entries(message).filter(([k]) => k !== "type"));
